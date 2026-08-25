@@ -8,12 +8,15 @@ from cryptography.fernet import Fernet
 from fastapi import HTTPException
 
 from skyvern.config import settings
+from skyvern.exceptions import CredentialVaultShapeMismatchError
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
+    CredentialItem,
     CredentialType,
     CredentialVaultType,
+    CreditCardCredential,
     NonEmptyPasswordCredential,
 )
 from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import (
@@ -114,13 +117,12 @@ class _CapturingCreateCredentialRepository(_FakeCredentialRepository):
 
 def _password_request(
     name: str = "Login",
-    password: str = "secret-password",
+    password: str | object = "secret-password",
     metadata: dict[str, str] | None | object = _UNSET,
 ) -> CreateCredentialRequest:
-    credential_data: dict[str, object] = {
-        "username": "user@example.com",
-        "password": password,
-    }
+    credential_data: dict[str, object] = {"username": "user@example.com"}
+    if password is not _UNSET:
+        credential_data["password"] = password
     if metadata is not _UNSET:
         credential_data["metadata"] = metadata
     return CreateCredentialRequest(
@@ -205,6 +207,92 @@ async def test_skyvern_credential_vault_update_creates_new_item_and_cleans_old(t
     assert item.name == "Login Updated"
     assert item.credential.password == "new-password"
     assert item.credential.metadata == _PASSWORD_METADATA
+
+
+@pytest.mark.asyncio
+async def test_skyvern_credential_vault_update_preserves_omitted_password(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    monkeypatch.setattr(app.DATABASE, "credentials", _FakeCredentialRepository())
+
+    service = SkyvernCredentialVaultService()
+    credential = await service.create_credential(
+        "org_test", _password_request(password="old-password", metadata=_PASSWORD_METADATA)
+    )
+
+    updated = await service.update_credential(credential, _password_request(name="Login Renamed", password=_UNSET))
+
+    item = await service.get_credential_item(updated)
+    assert item.credential.password == "old-password"
+    assert item.credential.metadata == _PASSWORD_METADATA
+
+
+@pytest.mark.asyncio
+async def test_skyvern_credential_vault_update_blanks_explicitly_empty_password(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    monkeypatch.setattr(app.DATABASE, "credentials", _FakeCredentialRepository())
+
+    service = SkyvernCredentialVaultService()
+    credential = await service.create_credential("org_test", _password_request(password="old-password"))
+
+    updated = await service.update_credential(credential, _password_request(password=""))
+
+    item = await service.get_credential_item(updated)
+    assert item.credential.password == ""
+
+
+@pytest.mark.asyncio
+async def test_skyvern_credential_vault_update_rejects_non_password_vault_item(tmp_path, monkeypatch) -> None:
+    """A row/vault type disagreement must fail the update, not blank the stored secret.
+
+    The relaxed schema defaults `password` to "", so an omitted password on a credential whose
+    vault item is not password-shaped would otherwise overwrite the real secret with "".
+    """
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    monkeypatch.setattr(app.DATABASE, "credentials", _FakeCredentialRepository())
+
+    service = SkyvernCredentialVaultService()
+    credential = await service.create_credential("org_test", _password_request(password="old-password"))
+
+    card = CreditCardCredential(
+        card_number="4242424242424242",
+        card_cvv="123",
+        card_exp_month="12",
+        card_exp_year="2030",
+        card_brand="visa",
+        card_holder_name="Test Person",
+    )
+    monkeypatch.setattr(
+        service,
+        "get_credential_item",
+        AsyncMock(
+            return_value=CredentialItem(
+                item_id="i",
+                name="Login",
+                credential_type=CredentialType.CREDIT_CARD,
+                credential=card,
+            )
+        ),
+    )
+
+    with pytest.raises(CredentialVaultShapeMismatchError):
+        await service.update_credential(credential, _password_request(name="Renamed", password=_UNSET))
+
+
+@pytest.mark.asyncio
+async def test_skyvern_credential_vault_create_stores_omitted_password_as_empty(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    monkeypatch.setattr(app.DATABASE, "credentials", _FakeCredentialRepository())
+
+    service = SkyvernCredentialVaultService()
+    credential = await service.create_credential("org_test", _password_request(password=_UNSET))
+
+    item = await service.get_credential_item(credential)
+    assert item.credential.password == ""
+    assert item.credential.username == "user@example.com"
 
 
 @pytest.mark.asyncio

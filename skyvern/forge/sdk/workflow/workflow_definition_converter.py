@@ -503,7 +503,7 @@ def block_yaml_to_block(
 
         loop_over_parameter: Parameter | None = None
         if block_yaml.loop_over_parameter_key:
-            loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
+            loop_over_parameter = parameters.get(block_yaml.loop_over_parameter_key)
 
         if block_yaml.loop_variable_reference:
             # it's backaward compatible with jinja style parameter and context paramter
@@ -1065,10 +1065,17 @@ def _collect_undefined_parameters(
     undefined_params: dict[str, list[str]] = {}
 
     for block_yaml in block_yamls:
-        if hasattr(block_yaml, "parameter_keys") and block_yaml.parameter_keys:
-            undefined_for_block = [param_key for param_key in block_yaml.parameter_keys if param_key not in parameters]
-            if undefined_for_block:
-                undefined_params[block_yaml.label] = undefined_for_block
+        undefined_for_block = [
+            param_key for param_key in getattr(block_yaml, "parameter_keys", []) or [] if param_key not in parameters
+        ]
+        if (
+            isinstance(block_yaml, ForLoopBlockYAML)
+            and block_yaml.loop_over_parameter_key
+            and block_yaml.loop_over_parameter_key not in parameters
+        ):
+            undefined_for_block.append(block_yaml.loop_over_parameter_key)
+        if undefined_for_block:
+            undefined_params[block_yaml.label] = undefined_for_block
 
         # Recursively check nested blocks in loop blocks
         if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block_yaml.loop_blocks:

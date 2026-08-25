@@ -3298,6 +3298,30 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
 
     assert repair_context is not None
     summaries = repair_context.page_obstruction_summaries
+    source_obstructions = ctx.composition_page_evidence["page_obstructions"]
+    assert [obstruction.model_dump(exclude_none=True) for obstruction in repair_context.page_obstructions] == (
+        source_obstructions
+    )
+    assert [
+        [candidate.model_dump() for candidate in control.selector_candidates]
+        for obstruction in repair_context.page_obstructions
+        for control in obstruction.visible_controls
+    ] == [
+        control["selector_candidates"]
+        for obstruction in source_obstructions
+        for control in obstruction["visible_controls"]
+    ]
+    assert [
+        control.identity.model_dump()
+        for obstruction in repair_context.page_obstructions
+        for control in obstruction.visible_controls
+        if control.identity is not None
+    ] == [
+        control["identity"]
+        for obstruction in source_obstructions
+        for control in obstruction["visible_controls"]
+        if "identity" in control
+    ]
     assert [summary.split()[1] for summary in summaries] == ["#terms-overlay", "#terms-modal"]
     for summary in summaries:
         assert "#accept-terms" in summary
@@ -3375,13 +3399,14 @@ def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> No
         "page_action_summaries",
         "page_challenge_summaries",
         "page_obstruction_summaries",
+        "page_obstructions",
+        "page_obstruction_omission_notices",
     }
 
 
-def test_modal_overlay_dismiss_controls_are_read_only_without_page_obstructions() -> None:
+def test_modal_overlay_dismiss_controls_are_read_only_when_page_obstructions_is_absent() -> None:
     ctx = _overlay_repair_ctx(
         {
-            "page_obstructions": [],
             "modal_overlays": [
                 {
                     "selector": "#gate-modal",
@@ -3399,6 +3424,18 @@ def test_modal_overlay_dismiss_controls_are_read_only_without_page_obstructions(
 
     assert repair_context is not None
     assert repair_context.page_obstruction_summaries == ["#gate-modal Accept All button.accept"]
+    assert [obstruction.model_dump(exclude_none=True) for obstruction in repair_context.page_obstructions] == [
+        {
+            "selector": "#gate-modal",
+            "visible_controls": [
+                {
+                    "text": "Accept All",
+                    "selector": "button.accept",
+                    "selector_candidates": [],
+                }
+            ],
+        }
+    ]
 
 
 def test_page_free_of_obstructions_renders_no_obstruction_line() -> None:
@@ -3417,7 +3454,22 @@ def test_page_free_of_obstructions_renders_no_obstruction_line() -> None:
 
     assert repair_context is not None
     assert repair_context.page_obstruction_summaries == []
+    assert repair_context.page_obstructions == []
     assert "page_obstructions:" not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_malformed_canonical_obstruction_is_omitted_with_an_exact_notice() -> None:
+    evidence = _obstruction_only_page_evidence()
+    evidence["page_obstructions"].append("malformed")
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert len(repair_context.page_obstructions) == 1
+    assert repair_context.page_obstruction_omission_notices == [
+        "failure.page_state.obstructions omitted: 1 malformed item(s)."
+    ]
 
 
 def test_page_obstruction_summaries_separate_runtime_repair_root_cause_signatures() -> None:

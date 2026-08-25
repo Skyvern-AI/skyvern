@@ -392,7 +392,10 @@ def code_is_download_intent(code: str) -> bool:
     """True when a code block authors a download: it uses the `page.expect_download` context-manager
     idiom, any event-based `"download"` capture (`wait_for_event`/`expect_event`/`on`/`once`/
     `add_listener`), or the `click_and_claim_download` helper anywhere, or returns/binds a dict
-    literal carrying an execution-layer download registration key."""
+    literal carrying an execution-layer download registration key. It stays deliberately broader
+    than the runner's own policy — the denied `page.expect_download` idiom still counts — because
+    its consumer is the unregistered-download telemetry in workflow/models/block.py, which measures
+    authorship rather than validity."""
     if not code.strip():
         return False
     try:

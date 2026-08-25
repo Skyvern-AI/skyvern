@@ -21,7 +21,7 @@ export const COPILOT_WORKING_VERBS = [
   "Scanning the horizon",
 ];
 
-export const VERB_CYCLE_MS = 3000;
+export const VERB_CYCLE_MS = 6000;
 
 export function pickWorkingVerb(previous?: string): string {
   const pool = COPILOT_WORKING_VERBS.filter((verb) => verb !== previous);

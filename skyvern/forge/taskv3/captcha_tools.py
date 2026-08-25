@@ -22,10 +22,11 @@ from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, s
 
 LOG = structlog.get_logger()
 
-# The ladder's own arms are already bounded (anchor 5s + extension 12s + token 90s). This is a safety
-# ceiling above their worst-case sum, well under the run deadline, so a wedged solver cannot outlive the
-# tool. NB: should_cancel is checked by the loop BETWEEN tool calls, not inside a handler, so a solve in
-# flight blocks cancellation for up to this ceiling (accepted; v1's cascade blocks up to 600s).
+# The ladder clamps its bounded arms to _LADDER_BUDGET_SECONDS (110s), but its DOM-checkbox arm relies on
+# Playwright's own click timeouts rather than that budget; this ceiling is the hard stop above both, well
+# under the run deadline, so a wedged solver cannot outlive the tool. NB: should_cancel is checked by the
+# loop BETWEEN tool calls, not inside a handler, so a solve in flight blocks cancellation for up to this
+# ceiling (accepted; v1's cascade blocks up to 600s).
 _SOLVE_CAPTCHA_CEILING_SECONDS = 120
 
 # A pathological loop must not keep running the solver on an unsolvable gate. Bounds CONSECUTIVE FAILED
@@ -105,8 +106,8 @@ def build_captcha_tools(
     tool = ToolSpec(
         name="solve_captcha",
         description=(
-            "Detect and solve a captcha / anti-bot challenge (Cloudflare Turnstile or reCAPTCHA) blocking "
-            "the page, including one rendered inside an iframe you cannot otherwise interact with. Call "
+            "Detect and solve a captcha / anti-bot challenge (Cloudflare Turnstile, reCAPTCHA, or hCaptcha) "
+            "blocking the page, including one rendered inside an iframe you cannot otherwise interact with. Call "
             "this when a submit does not advance or a 'verify you are human' challenge is present, then "
             "re-observe. Returns whether a captcha was solved, was absent, or could not be solved."
         ),

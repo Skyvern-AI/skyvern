@@ -1,11 +1,60 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
+
+
+class _LaunchBrowserSessionsRepository:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, object]] = []
+        self.session = SimpleNamespace(
+            status="created",
+            completed_at=None,
+            proxy_location=None,
+            proxy_session_id=None,
+            browser_profile_id=None,
+            browser_address=None,
+            upstream_cdp_url=None,
+            started_at=None,
+        )
+
+    async def get_persistent_browser_session(self, session_id: str, organization_id: str) -> SimpleNamespace:
+        return self.session
+
+    async def update_persistent_browser_session(
+        self,
+        session_id: str,
+        *,
+        organization_id: str,
+        **updates: object,
+    ) -> SimpleNamespace:
+        self.updates.append(updates)
+        for name, value in updates.items():
+            setattr(self.session, name, value)
+        return self.session
+
+    async def set_persistent_browser_session_browser_address(
+        self,
+        browser_session_id: str,
+        browser_address: str | None,
+        ip_address: str | None,
+        ecs_task_arn: str | None,
+        organization_id: str | None = None,
+        upstream_cdp_url: str | None = None,
+    ) -> None:
+        raise AssertionError("launch readiness must be published in the status update")
+
+
+def _launch_manager() -> tuple[DefaultPersistentSessionsManager, _LaunchBrowserSessionsRepository]:
+    DefaultPersistentSessionsManager.instance = None
+    DefaultPersistentSessionsManager._browser_sessions = {}
+    repository = _LaunchBrowserSessionsRepository()
+    database = SimpleNamespace(browser_sessions=repository)
+    return DefaultPersistentSessionsManager(database=database), repository
 
 
 @pytest.fixture
@@ -128,3 +177,124 @@ async def test_owning_run_is_active_releases_a_task_that_no_longer_exists(
     manager.database.tasks.get_task = AsyncMock(return_value=None)
 
     assert await manager._owning_run_is_active("tsk_gone", PBS_TASK_RUNNABLE_TYPE, "org_1") is False
+
+
+@pytest.mark.asyncio
+async def test_launch_standalone_browser_publishes_cdp_address() -> None:
+    manager, repository = _launch_manager()
+    browser_state = MagicMock()
+    browser_state.get_or_create_page = AsyncMock(return_value=MagicMock())
+    browser_state.close = AsyncMock()
+    browser_manager = MagicMock()
+    browser_manager._create_browser_state = AsyncMock(return_value=browser_state)
+    agent_function = MagicMock()
+    agent_function.build_proxy_session_extra_http_headers.return_value = {}
+    cdp_url = "ws://127.0.0.1:9242/devtools/browser/local"
+    cdp_writer = MagicMock()
+    cdp_writer.wait_closed = AsyncMock()
+    open_connection = AsyncMock(return_value=(MagicMock(), cdp_writer))
+    get_json = AsyncMock(return_value={"webSocketDebuggerUrl": cdp_url})
+
+    with (
+        patch.object(
+            manager_mod, "app", SimpleNamespace(BROWSER_MANAGER=browser_manager, AGENT_FUNCTION=agent_function)
+        ),
+        patch.object(manager_mod.settings, "BROWSER_TYPE", "chromium-headful"),
+        patch.object(manager_mod, "_allocate_cdp_port", return_value=9242),
+        patch.object(manager_mod.asyncio, "open_connection", new=open_connection),
+        patch.object(manager_mod, "aiohttp_get_json", new=get_json),
+    ):
+        await manager._launch_browser_for_session("pbs_local", "org_local")
+
+    open_connection.assert_awaited_once_with("127.0.0.1", 9242)
+    cdp_writer.close.assert_called_once_with()
+    cdp_writer.wait_closed.assert_awaited_once_with()
+    get_json.assert_awaited_once_with(
+        "http://127.0.0.1:9242/json/version",
+        retry=2,
+        retry_timeout=0.25,
+        timeout=1,
+    )
+    assert browser_manager._create_browser_state.await_args.kwargs["cdp_port"] == 9242
+    assert manager._browser_sessions["pbs_local"].cdp_port == 9242
+    assert repository.session.status == "running"
+    assert repository.session.started_at is not None
+    assert repository.session.browser_address == cdp_url
+    assert repository.session.upstream_cdp_url == cdp_url
+    assert len(repository.updates) == 1
+    assert repository.updates[0] == {
+        "status": "running",
+        "completed_at": None,
+        "started_at": repository.session.started_at,
+        "browser_address": cdp_url,
+        "upstream_cdp_url": cdp_url,
+    }
+
+
+@pytest.mark.asyncio
+async def test_launch_standalone_browser_continues_when_cdp_probe_fails() -> None:
+    manager, repository = _launch_manager()
+    browser_state = MagicMock()
+    browser_state.get_or_create_page = AsyncMock(return_value=MagicMock())
+    browser_state.close = AsyncMock()
+    browser_manager = MagicMock()
+    browser_manager._create_browser_state = AsyncMock(return_value=browser_state)
+    agent_function = MagicMock()
+    agent_function.build_proxy_session_extra_http_headers.return_value = {}
+    cdp_writer = MagicMock()
+    cdp_writer.wait_closed = AsyncMock()
+    open_connection = AsyncMock(return_value=(MagicMock(), cdp_writer))
+    get_json = AsyncMock(side_effect=RuntimeError("CDP endpoint unavailable"))
+
+    with (
+        patch.object(
+            manager_mod, "app", SimpleNamespace(BROWSER_MANAGER=browser_manager, AGENT_FUNCTION=agent_function)
+        ),
+        patch.object(manager_mod.settings, "BROWSER_TYPE", "chromium-headful"),
+        patch.object(manager_mod, "_allocate_cdp_port", return_value=9243),
+        patch.object(manager_mod.asyncio, "open_connection", new=open_connection),
+        patch.object(manager_mod, "aiohttp_get_json", new=get_json),
+    ):
+        await manager._launch_browser_for_session("pbs_local", "org_local")
+
+    open_connection.assert_awaited_once_with("127.0.0.1", 9243)
+    get_json.assert_awaited_once_with(
+        "http://127.0.0.1:9243/json/version",
+        retry=2,
+        retry_timeout=0.25,
+        timeout=1,
+    )
+    assert manager._browser_sessions["pbs_local"].cdp_port == 9243
+    assert repository.session.status == "running"
+    assert repository.session.started_at is not None
+    assert repository.session.browser_address is None
+    assert repository.session.upstream_cdp_url is None
+    assert len(repository.updates) == 1
+    assert repository.updates[0] == {
+        "status": "running",
+        "completed_at": None,
+        "started_at": repository.session.started_at,
+        "browser_address": None,
+        "upstream_cdp_url": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_probe_local_cdp_address_stops_after_connection_refusal() -> None:
+    open_connection = AsyncMock(side_effect=ConnectionRefusedError)
+    wait_for = AsyncMock(wraps=manager_mod.asyncio.wait_for)
+    get_json = AsyncMock()
+    log = MagicMock()
+
+    with (
+        patch.object(manager_mod.asyncio, "open_connection", new=open_connection),
+        patch.object(manager_mod.asyncio, "wait_for", new=wait_for),
+        patch.object(manager_mod, "aiohttp_get_json", new=get_json),
+        patch.object(manager_mod, "LOG", new=log),
+    ):
+        assert await manager_mod._probe_local_cdp_address(9244) is None
+
+    open_connection.assert_awaited_once_with("127.0.0.1", 9244)
+    wait_for.assert_awaited_once_with(ANY, timeout=1)
+    get_json.assert_not_awaited()
+    log.info.assert_called_once_with("Local browser did not open requested CDP port", cdp_port=9244)

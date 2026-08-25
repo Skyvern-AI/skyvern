@@ -5,6 +5,7 @@ from typing import Any, TypeGuard
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
+from pydantic import ValidationError
 
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     RUNTIME_SOLVABLE_CHALLENGE_KINDS,
@@ -15,7 +16,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
@@ -198,24 +199,47 @@ def _runtime_result_summaries(value: Any) -> list[str]:
     return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
-def _obstruction_entries(evidence: dict[str, Any]) -> list[dict[str, Any]]:
-    page_obstructions = evidence.get("page_obstructions")
-    if isinstance(page_obstructions, list):
-        entries = [entry for entry in page_obstructions if isinstance(entry, dict)]
-        if entries:
-            return entries
+def _raw_obstruction_entries(evidence: dict[str, Any]) -> tuple[list[Any], list[str]]:
+    if "page_obstructions" in evidence:
+        page_obstructions = evidence.get("page_obstructions")
+        if isinstance(page_obstructions, list):
+            return page_obstructions, []
+        return [], ["failure.page_state.obstructions omitted: canonical page_obstructions was malformed."]
     modal_overlays = evidence.get("modal_overlays")
     if not isinstance(modal_overlays, list):
-        return []
-    return [
-        {"selector": overlay.get("selector"), "visible_controls": overlay.get("dismiss_controls")}
-        for overlay in modal_overlays
-        if isinstance(overlay, dict)
-    ]
+        return [], []
+    return (
+        [
+            {"selector": overlay.get("selector"), "visible_controls": overlay.get("dismiss_controls") or []}
+            for overlay in modal_overlays
+            if isinstance(overlay, dict)
+        ],
+        [],
+    )
+
+
+def _typed_runtime_page_obstructions(evidence: Any) -> tuple[list[PageObstruction], list[str]]:
+    if not isinstance(evidence, dict):
+        return [], []
+    raw_entries, notices = _raw_obstruction_entries(evidence)
+    obstructions: list[PageObstruction] = []
+    malformed = 0
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            malformed += 1
+            continue
+        try:
+            obstructions.append(PageObstruction.model_validate(entry))
+        except ValidationError:
+            malformed += 1
+    if malformed:
+        notices.append(f"failure.page_state.obstructions omitted: {malformed} malformed item(s).")
+    return obstructions, notices
 
 
 def _has_page_obstruction(evidence: dict[str, Any]) -> bool:
-    return bool(_obstruction_entries(evidence))
+    obstructions, _ = _typed_runtime_page_obstructions(evidence)
+    return bool(obstructions)
 
 
 def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
@@ -235,11 +259,10 @@ def _joined_obstruction_summary(obstruction: str, control: str) -> str:
     return f"{obstruction[:budget]} {control}".strip()
 
 
-def _runtime_obstruction_summaries(evidence: Any) -> list[str]:
-    if not isinstance(evidence, dict):
-        return []
+def _runtime_obstruction_summaries(obstructions: list[PageObstruction]) -> list[str]:
     summaries: list[str] = []
-    for entry in _obstruction_entries(evidence)[:_RUNTIME_SUMMARY_MAX_ITEMS]:
+    for obstruction_entry in obstructions[:_RUNTIME_SUMMARY_MAX_ITEMS]:
+        entry = obstruction_entry.model_dump(mode="json", exclude_none=True)
         obstruction = _runtime_summary_entry(
             entry, _OBSTRUCTION_KEYS, _OBSTRUCTION_FIELD_MAX_CHARS, OBSTRUCTION_SUMMARY_MAX_CHARS
         )
@@ -517,7 +540,8 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
     page_challenge_summaries = _runtime_summary_list(
         evidence.get("challenge_controls"), ("text", "selector", "disabled")
     )
-    page_obstruction_summaries = _runtime_obstruction_summaries(evidence)
+    page_obstructions, page_obstruction_omission_notices = _typed_runtime_page_obstructions(evidence)
+    page_obstruction_summaries = _runtime_obstruction_summaries(page_obstructions)
     finalized = pending.model_copy(
         update={
             "current_origin": _origin_from_runtime_url(current_url),
@@ -529,13 +553,15 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
                 or page_result_summaries
                 or page_action_summaries
                 or page_challenge_summaries
-                or page_obstruction_summaries
+                or page_obstructions
             ),
             "page_form_summaries": page_form_summaries,
             "page_result_summaries": page_result_summaries,
             "page_action_summaries": page_action_summaries,
             "page_challenge_summaries": page_challenge_summaries,
             "page_obstruction_summaries": page_obstruction_summaries,
+            "page_obstructions": page_obstructions,
+            "page_obstruction_omission_notices": page_obstruction_omission_notices,
         }
     )
     copilot_ctx.last_code_authoring_repair_context = finalized
@@ -572,5 +598,6 @@ def inject_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, 
         page_result_summary_count=len(repair_context.page_result_summaries),
         page_action_summary_count=len(repair_context.page_action_summaries),
         page_obstruction_summary_count=len(repair_context.page_obstruction_summaries),
+        page_obstruction_count=len(repair_context.page_obstructions),
     )
     data["authoring_repair_context"] = repair_context.model_dump(mode="json")
