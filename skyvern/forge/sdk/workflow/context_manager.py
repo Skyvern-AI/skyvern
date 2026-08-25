@@ -1721,20 +1721,23 @@ class WorkflowRunContext:
         return f"{totp_secret_id}_value"
 
     def is_registered_credential_parameter_key(self, key: str) -> bool:
-        """Whether ``key`` was registered as one of the credential parameter types.
+        """Whether ``key`` names a parameter that may own a credential-backed TOTP secret.
 
-        Ordinary workflow/run inputs can share the dict-with-``totp`` shape but are not
-        credentials; only a registered credential parameter owns a credential-backed TOTP
-        secret. Callers use this to keep arbitrary run inputs out of credential-only paths.
+        Ordinary workflow/run inputs can share the dict-with-``totp`` shape without being
+        credentials, so callers use this to keep them out of credential-only paths; a credential
+        is bound either as a credential parameter class or as a ``credential_id`` workflow
+        parameter, and callers still gate on the value's shape.
         """
-        return isinstance(self.parameters.get(key), _CREDENTIAL_PARAMETER_TYPES)
+        parameter = self.parameters.get(key)
+        if isinstance(parameter, _CREDENTIAL_PARAMETER_TYPES):
+            return True
+        return isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type()
 
     def find_credential_parameter_key_for_secret(self, secret_id: str) -> str | None:
         for parameter_key, value in self.values.items():
             if not isinstance(value, dict):
                 continue
-            parameter = self.parameters.get(parameter_key)
-            if not isinstance(parameter, _CREDENTIAL_PARAMETER_TYPES):
+            if not self.is_registered_credential_parameter_key(parameter_key):
                 continue
             for field_value in value.values():
                 if field_value == secret_id:

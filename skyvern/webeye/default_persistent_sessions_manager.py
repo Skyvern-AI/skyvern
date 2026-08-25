@@ -149,7 +149,9 @@ async def validate_session_for_renewal(
     return browser_session, started_at_utc, browser_session.timeout_minutes
 
 
-async def renew_session(database: AgentDB, session_id: str, organization_id: str) -> PersistentBrowserSession:
+async def renew_session(
+    database: AgentDB, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
+) -> PersistentBrowserSession:
     """
     Renew a specific browser session, if it is deemed renewable.
     """
@@ -180,6 +182,9 @@ async def renew_session(database: AgentDB, session_id: str, organization_id: str
             minutes_diff=minutes_diff,
             session_id=session_id,
             organization_id=organization_id,
+            lifecycle_event="browser_session_timeout_extended",
+            browser_session_id=session_id,
+            workflow_run_id=workflow_run_id,
         )
 
         return browser_session
@@ -453,6 +458,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         bound_key: str | None = None,
         wait_for_startup: bool = True,
         needs_live_view: bool = False,
+        request_deadline_epoch_ms: int | None = None,
+        queue_deadline_epoch_ms: int | None = None,
+        workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         LOG.info(
@@ -617,9 +625,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             download_run_id=download_run_id,
         )
 
-    async def renew_or_close_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:
+    async def renew_or_close_session(
+        self, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
+    ) -> PersistentBrowserSession:
         try:
-            return await renew_session(self.database, session_id, organization_id)
+            return await renew_session(self.database, session_id, organization_id, workflow_run_id=workflow_run_id)
         except BrowserSessionNotRenewable:
             session = await self.get_session(session_id, organization_id)
             # Don't close sessions that haven't started yet (browser still launching)

@@ -1208,10 +1208,9 @@ class TasksRepository(BaseRepository):
         organization_id: str,
         run_id: str,
         instance_type: str | None = None,
-        vcpu_millicores: int | None = None,
-        memory_mb: int | None = None,
         duration_ms: int | None = None,
         compute_cost: Decimal | None = None,
+        compute_hourly_rate_id: int | None = None,
         llm_cost: Decimal | None = None,
         proxy_cost: Decimal | None = None,
         captcha_cost: Decimal | None = None,
@@ -1233,14 +1232,12 @@ class TasksRepository(BaseRepository):
 
             if instance_type is not None:
                 task_run.instance_type = instance_type
-            if vcpu_millicores is not None:
-                task_run.vcpu_millicores = vcpu_millicores
-            if memory_mb is not None:
-                task_run.memory_mb = memory_mb
             if duration_ms is not None:
                 task_run.duration_ms = duration_ms
             if compute_cost is not None:
                 task_run.compute_cost = compute_cost
+            if compute_hourly_rate_id is not None:
+                task_run.compute_hourly_rate_id = compute_hourly_rate_id
             if llm_cost is not None:
                 task_run.llm_cost = llm_cost
             if proxy_cost is not None:

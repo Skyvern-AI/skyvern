@@ -243,6 +243,11 @@ class Settings(BaseSettings):
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
     # Per-environment canary; default off until we are confident.
     ENABLE_WORKFLOW_COPILOT_V2: bool = False
+    # Internal eval-only selector for the least-privileged direct-browser Copilot surface.
+    WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED: bool = False
+    # Enabling the process-level kill switch is insufficient on a shared deployment: only API
+    # credentials belonging to these explicitly configured eval organizations may select the mode.
+    WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS: list[str] = []
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
@@ -290,6 +295,11 @@ class Settings(BaseSettings):
     # Custom SMTP sends connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SMTP relays can enable.
     ALLOW_SMTP_INTERNAL_HOSTS: bool = False
+    # A customer-supplied S3-compatible endpoint_url is dialed directly from the worker on the
+    # non-proxied upload path, so private/internal hosts are blocked by default. Enabling this
+    # also permits plaintext http:// endpoints, for self-hosted deployments pointing at an
+    # object store on their own network (e.g. MinIO).
+    ALLOW_S3_ENDPOINT_INTERNAL_HOSTS: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
@@ -418,6 +428,20 @@ class Settings(BaseSettings):
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
+    # A logged-in CLI session is kept per vault identity and reused across runs, so a batch of
+    # runs for one organization pays a single login/unlock instead of one per run. Each cached
+    # identity holds its own on-disk vault copy, so the cache is bounded.
+    BITWARDEN_SESSION_CACHE_SIZE: int = 8
+    # How long a cached vault may go without a `bw sync`. A miss forces a sync and one retry,
+    # so this is the staleness ceiling for an *edit*, not for a newly created item.
+    BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS: float = 60.0
+    # How long an unused session may keep an unlocked vault in memory and on disk before it is
+    # logged out. Long enough that a batch stays warm throughout, short enough that an idle pod is
+    # not sitting on someone's open vault. Set to 0 to keep sessions for the pod's lifetime.
+    BITWARDEN_SESSION_MAX_IDLE_SECONDS: float = 900.0
+    # Each `bw` invocation is a Node process costing real CPU and ~hundreds of MB. Bound how many
+    # run at once so a burst of runs cannot starve the browsers sharing the pod.
+    BITWARDEN_MAX_CONCURRENT_CLI_COMMANDS: int = 4
 
     # task generation settings
     PROMPT_CACHE_WINDOW_HOURS: int = 24

@@ -37,9 +37,11 @@ from skyvern.forge.taskv3.loop import (
     LoopOutcome,
     SubmitWatch,
     ToolSpec,
+    VerificationBlocker,
     make_finish_tool,
     run_agent_tool_loop,
 )
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.tools import PageProvider, build_browser_tools
 
 LOG = structlog.get_logger()
@@ -85,6 +87,9 @@ Rules:
 - When a submit is refused, find the page's own message in `observe`: a `text:` line that reads as a rejection or validation message, or a field marked `*invalid`. Fix the named field if the task's data allows; otherwise finish and quote that message as the reason. A captcha widget that is merely present on the page is not evidence that it blocked the submission.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
+OPAQUE_URL_GUIDANCE = """
+
+Some values in the data provided are shown as `opaque_url_xxxxxxxx` instead of a real URL: these are references to URLs from the task data, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
 DOWNLOAD_COMPLETION_GUIDANCE = """
 
 This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
@@ -188,6 +193,7 @@ async def run_task_v3_agent_loop(
     completion_probe: CompletionProbe | None = None,
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
+    verification_blocker: VerificationBlocker | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -198,6 +204,14 @@ async def run_task_v3_agent_loop(
     for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
     only. `max_settle_deferrals=0` disables that completed-side re-verification while leaving the
     failure-evidence gate, which shares the sampler, intact."""
+    # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
+    # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
+    # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
+    # tools to resolve a token with, so the payload stays verbatim for the model to judge directly.
+    refs = mask_opaque_urls(parameters) if not page_free else OpaqueUrlRefs(masked=parameters, refs={})
+    if refs.refs:
+        resolve_typed_text = refs.chain(resolve_typed_text)
+
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
     browser_tools = (
@@ -219,10 +233,11 @@ async def run_task_v3_agent_loop(
     if staged_downloads is None:
         staged_downloads = set()
     # A page-free run has no tool that could trigger a download, so a blocker would refuse every
-    # completed verdict forever.
+    # completed verdict forever; it has nothing to type a verification code into either.
     if page_free:
         completion_probe = None
         completion_blocker = None
+        verification_blocker = None
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         max_settle_deferrals=max_settle_deferrals,
@@ -233,6 +248,7 @@ async def run_task_v3_agent_loop(
         activity=activity,
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
+        verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
@@ -242,10 +258,13 @@ async def run_task_v3_agent_loop(
         extra_system_guidance = extra_system_guidance + DOWNLOAD_COMPLETION_GUIDANCE
     elif completion_blocker is not None and completion_probe is None:
         extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
+    system_prompt = base_system_prompt + extra_system_guidance
+    if refs.refs:
+        system_prompt += OPAQUE_URL_GUIDANCE
     outcome = await run_agent_tool_loop(
         llm_caller=llm_caller,
-        system_prompt=base_system_prompt + extra_system_guidance,
-        user_prompt=_build_user_prompt(goal, parameters, starting_url),
+        system_prompt=system_prompt,
+        user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
         tools=tools,
         max_turns=max_turns,
         max_tool_calls=max_tool_calls,
@@ -265,6 +284,9 @@ async def run_task_v3_agent_loop(
         completion_probe=completion_probe,
         staged_downloads=staged_downloads,
     )
+    if refs.refs:
+        outcome.reason = refs.resolve(outcome.reason)
+        outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)
     LOG.info(
         "taskv3 engine loop finished",
         status=outcome.status,

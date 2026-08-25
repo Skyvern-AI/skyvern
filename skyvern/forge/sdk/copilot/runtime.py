@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -60,7 +59,6 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
 
@@ -69,20 +67,11 @@ LOG = structlog.get_logger()
 FrontierStartProvenance = Literal["initial", "replayed", "resumed", "unanchored"]
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
-# Sized to cover the manager's COMMON recovery so this deadline stops cancelling it midway and
-# reporting a session unverified that was about to be handed back: a 2s cached-handle probe, a
-# stale teardown the manager documents as additive (5s close + 5s driver stop), then a CDP
-# re-attach — roughly 12s of the 15s. It does NOT dominate the worst case, and is not meant to: a
-# cached wrapper that fails ``is_connected()`` routes to an unbounded close budgeted at
-# ``BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT`` (~9.5 min), which needs
-# bounding in cloud/ rather than a larger number here. ``ensure_browser_session`` applies this
-# twice in sequence — probe, then attach-verify — so the worst-case turn stall is double.
-_BROWSER_PROBE_WAIT_SECONDS = 15.0
 # Browser contexts can lag the persistent-session row under load; this keeps
 # Copilot from handing a not-yet-attachable session to the next MCP tool.
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
-_FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+_ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
 CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
@@ -94,6 +83,13 @@ class CopilotBrowserSessionUnavailable(RuntimeError):
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         super().__init__("No browser context for copilot session")
+
+
+class CopilotBrowserLivenessUndetermined(RuntimeError):
+    def __init__(self) -> None:
+        # Distinct wording on purpose: _is_unrecoverable_browser_session_error reads this text, and
+        # an undetermined signal must not count toward aborting the turn as session loss.
+        super().__init__("Browser liveness for this copilot session could not be determined")
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -110,12 +106,6 @@ class BrowserProbeOutcome(StrEnum):
     attachable = "attachable"
     positively_unreachable = "positively_unreachable"
     could_not_determine = "could_not_determine"
-
-
-@dataclass(frozen=True)
-class BrowserProbeFault:
-    error_type: str
-    timed_out: bool
 
 
 def _browser_context_attachability(browser_context: object | None) -> BrowserProbeOutcome:
@@ -149,19 +139,6 @@ def _browser_context_is_attachable(browser_context: object | None) -> bool:
 
 def _copilot_session_can_access_localhost() -> bool:
     return settings.ENV == "local"
-
-
-def _browser_session_status_is_final(status: str | None) -> bool:
-    return status in _FINAL_BROWSER_SESSION_STATUSES
-
-
-async def _get_persistent_browser_session(session_id: str, organization_id: str) -> PersistentBrowserSession | None:
-    browser_sessions_repo = app.DATABASE.browser_sessions
-    persistent_result = browser_sessions_repo.get_persistent_browser_session(session_id, organization_id)
-    # Production returns an awaitable; sync test doubles keep this edge branch easy to exercise.
-    if inspect.isawaitable(persistent_result):
-        return await cast("Awaitable[PersistentBrowserSession | None]", persistent_result)
-    return cast("PersistentBrowserSession | None", persistent_result)
 
 
 @dataclass
@@ -226,6 +203,7 @@ class ScoutedDynamicRowEvidence(TypedDict):
 class ScoutedSelectorCandidate(TypedDict):
     selector: str
     source: str
+    match_count: int | None
 
 
 class ScoutedInteraction(TypedDict):
@@ -234,6 +212,7 @@ class ScoutedInteraction(TypedDict):
     # raw value — a literal, page text — has to be listed there too; nothing enforces the pair.
     tool_name: str
     selector: NotRequired[str]
+    executed_selector: NotRequired[str]
     selector_candidates: NotRequired[list[ScoutedSelectorCandidate]]
     selector_match_count: NotRequired[int]
     source_url: NotRequired[str]
@@ -695,10 +674,50 @@ async def resolve_browser_state_for_context(
             return browser_state
         except HealAdoptionFailed:
             return None
-    return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+    return await resolve_persistent_browser_state(
         session_id=resolved_session_id,
         organization_id=ctx.organization_id,
     )
+
+
+def _abandonable_browser_state_resolve(session_id: str, organization_id: str) -> asyncio.Task[BrowserState | None]:
+    """A fresh determination per caller, owned by the module rather than by the awaiting task."""
+    task = asyncio.ensure_future(
+        app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+            session_id=session_id,
+            organization_id=organization_id,
+        )
+    )
+    _ABANDONED_BROWSER_STATE_RESOLVES.add(task)
+
+    def _release(finished: asyncio.Task[BrowserState | None]) -> None:
+        _ABANDONED_BROWSER_STATE_RESOLVES.discard(finished)
+        # Nobody is necessarily still waiting, and an abandoned determination must not surface as
+        # "exception was never retrieved".
+        if not finished.cancelled():
+            finished.exception()
+
+    task.add_done_callback(_release)
+    return task
+
+
+async def resolve_persistent_browser_state(
+    *,
+    session_id: str,
+    organization_id: str,
+) -> BrowserState | None:
+    """The manager bounds this work; Copilot waits for the determination it asked for.
+
+    Cancelling the manager's teardown-and-reattach mid-flight leaves it undone, so the next call
+    repeats it from zero and a session whose determination outlasts one caller is never judged. A
+    caller cancelled from outside therefore leaves the determination running: the manager
+    serializes per session, so the next caller queues behind the work completing rather than
+    redoing it.
+
+    Every caller still issues its OWN lookup. A determination that is merely stuck must never be
+    inherited by a later attach, which is the oracle and has to be free to answer on its own.
+    """
+    return await asyncio.shield(_abandonable_browser_state_resolve(session_id, organization_id))
 
 
 async def close_browser_session_quietly(organization_id: str, session_id: str) -> None:
@@ -781,9 +800,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             if retiring:
                 retire_browser_session_id(ctx, browser_session_id)
                 raise CopilotBrowserSessionUnavailable(browser_session_id)
-            # Distinct wording on purpose: _is_unrecoverable_browser_session_error reads this text,
-            # and an undetermined signal must not count toward aborting the turn as session loss.
-            raise RuntimeError("Browser liveness for this copilot session could not be determined")
+            raise CopilotBrowserLivenessUndetermined()
 
     override_token = set_api_key_override(ctx.api_key)
     try:
@@ -837,91 +854,11 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         reset_api_key_override(override_token)
 
 
-async def _probe_browser_session(
-    ctx: AgentContext, session_id: str
-) -> tuple[BrowserProbeOutcome, BrowserProbeFault | None]:
-    """Classify by what completed, never by exception type. Reaching `positively_unreachable`
-    needs both a lookup that returned and a health signal that answered; either failing to
-    complete is undetermined, since neither is evidence about the browser."""
-    try:
-        async with asyncio.timeout(_BROWSER_PROBE_WAIT_SECONDS):
-            state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                session_id=session_id,
-                organization_id=ctx.organization_id,
-            )
-        if state is None:
-            return BrowserProbeOutcome.positively_unreachable, None
-        attachability = _browser_context_attachability(state.browser_context)
-    except Exception as exc:
-        error_type = type(exc).__name__
-        LOG.warning(
-            "Browser state probe failed; liveness undetermined",
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-            error_type=error_type,
-            exc_info=True,
-        )
-        return BrowserProbeOutcome.could_not_determine, BrowserProbeFault(
-            error_type=error_type,
-            timed_out=isinstance(exc, TimeoutError),
-        )
-    return attachability, None
+async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
+    """Create a browser session if the context holds none. Returns None on success, error dict on failure.
 
-
-def _unverified_browser_session_facts(fault: BrowserProbeFault | None) -> dict[str, Any]:
-    if fault is None:
-        cause = "the browser's connectivity signal never answered"
-    elif fault.timed_out:
-        cause = f"the liveness probe did not answer within {_BROWSER_PROBE_WAIT_SECONDS}s ({fault.error_type})"
-    else:
-        cause = f"the liveness probe raised {fault.error_type}"
-    return {
-        "ok": False,
-        "error": (
-            f"The browser session could not be verified: {cause}. "
-            "An indeterminate probe is not evidence the browser is dead."
-        ),
-        "probe_error_type": fault.error_type if fault is not None else None,
-        "probe_timed_out": fault is not None and fault.timed_out,
-    }
-
-
-async def _try_attach_verify_browser_session(
-    ctx: AgentContext, session_id: str
-) -> tuple[bool, BrowserProbeOutcome | None, BrowserProbeFault | None]:
-    """Complete the determination the probe could not, bounded at the probe's own deadline: this
-    re-enters the same lookup that just failed to answer."""
-    try:
-        async with asyncio.timeout(_BROWSER_PROBE_WAIT_SECONDS):
-            state = await resolve_browser_state_for_context(ctx, session_id=session_id)
-        if state is None:
-            return False, BrowserProbeOutcome.positively_unreachable, None
-        attachability = _browser_context_attachability(state.browser_context)
-        if attachability == BrowserProbeOutcome.attachable:
-            return True, None, None
-        return False, attachability, None
-    except Exception as exc:
-        error_type = type(exc).__name__
-        LOG.warning(
-            "Browser session escalation failed; liveness still undetermined",
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-            error_type=error_type,
-            exc_info=True,
-        )
-        return (
-            False,
-            BrowserProbeOutcome.could_not_determine,
-            BrowserProbeFault(error_type=error_type, timed_out=isinstance(exc, TimeoutError)),
-        )
-
-
-async def ensure_browser_session(ctx: AgentContext, *, require_verified_session: bool = False) -> dict[str, Any] | None:
-    """Create a browser session if needed. Returns None on success, error dict on failure.
-
-    Callers that hand the id onward without ever attaching cannot discover a dead session, so they
-    pass require_verified_session=True to have the determination completed here: the session is
-    attached, replaced, or reported unverified with the facts that prevented an answer.
+    An existing id is not probed here: the attach in mcp_browser_context is the oracle, and a
+    session it finds gone is retired and replaced where that is discovered.
 
     Exception: the self-heal path raises HealAdoptionFailed instead of returning an
     error dict, so a failed adoption aborts the turn rather than degrading to a normal
@@ -941,51 +878,7 @@ async def ensure_browser_session(ctx: AgentContext, *, require_verified_session:
         ctx.browser_session_id = None
 
     if ctx.browser_session_id:
-        try:
-            persistent = await _get_persistent_browser_session(ctx.browser_session_id, ctx.organization_id)
-        except Exception as exc:
-            LOG.warning(
-                "Browser session record lookup failed; status unknown",
-                session_id=ctx.browser_session_id,
-                organization_id=ctx.organization_id,
-                error_type=type(exc).__name__,
-                exc_info=True,
-            )
-            persistent = None
-        if persistent is not None and _browser_session_status_is_final(persistent.status):
-            LOG.warning(
-                "Supplied browser_session_id is closed or missing; auto-creating",
-                session_id=ctx.browser_session_id,
-                organization_id=ctx.organization_id,
-                status=persistent.status,
-            )
-            ctx.browser_session_id = None
-
-    if ctx.browser_session_id:
-        probed_session_id = ctx.browser_session_id
-        outcome, fault = await _probe_browser_session(ctx, probed_session_id)
-        if outcome == BrowserProbeOutcome.attachable:
-            return None
-        if outcome == BrowserProbeOutcome.could_not_determine:
-            # A caller that never attaches gets the determination completed once here; anything
-            # short of a completed resolve leaves the session unjudged, so its id survives.
-            if not require_verified_session:
-                return None
-            attached, attach_outcome, attach_fault = await _try_attach_verify_browser_session(ctx, probed_session_id)
-            if attached:
-                return None
-            if attach_outcome != BrowserProbeOutcome.positively_unreachable:
-                return _unverified_browser_session_facts(attach_fault or fault)
-        LOG.warning(
-            "Supplied browser_session_id is no longer attachable; auto-creating",
-            session_id=probed_session_id,
-            organization_id=ctx.organization_id,
-        )
-        retire_browser_session_id(ctx, probed_session_id)
-        if ctx.browser_session_id:
-            # The retire declined: a concurrent call installed a replacement while the probe was in
-            # flight. Use it rather than minting a third session on top of it.
-            return None
+        return None
 
     session = None
     installed_session_id: str | None = None
@@ -1055,3 +948,36 @@ async def ensure_browser_session(ctx: AgentContext, *, require_verified_session:
         # LLM-visible or user-visible output, so strip raw exception text
         # that may carry internal URLs, paths, or backend identifiers.
         return {"ok": False, "error": "Failed to create browser session"}
+
+
+async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
+    """For callers that hand the id to an out-of-process run without attaching: one attach here is
+    the oracle. A session the manager says is gone is replaced; an attach that could not complete
+    returns the facts instead of forwarding an unverified id."""
+    if not ctx.browser_session_id:
+        return await ensure_browser_session(ctx)
+    examined_session_id = ctx.browser_session_id
+    try:
+        async with mcp_browser_context(ctx):
+            return None
+    except CopilotBrowserSessionUnavailable:
+        retire_browser_session_id(ctx, examined_session_id)
+        return await ensure_browser_session(ctx)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        LOG.warning(
+            "Browser session attach could not complete; liveness undetermined",
+            session_id=examined_session_id,
+            organization_id=ctx.organization_id,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "error": (
+                f"The browser session could not be verified: the attach raised {type(exc).__name__}. "
+                "An indeterminate attach is not evidence the browser is dead."
+            ),
+            "probe_error_type": type(exc).__name__,
+        }

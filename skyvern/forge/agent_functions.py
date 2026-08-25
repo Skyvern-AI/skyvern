@@ -147,6 +147,7 @@ DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG = "DISABLE_SVG_CONVERT_CACHE_RESILIENC
 SVG_LOCAL_CACHE_MAX_ITEMS = 4096
 SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME = timedelta(hours=1)
 SVGLocalCacheValue = tuple[str, float | None]
+PageOperationContracts = dict[str, dict[str, str | list[str]]]
 
 # TTLCache has one global TTL, so each value also carries an optional shorter
 # expiry timestamp for negative cache entries.
@@ -1108,6 +1109,9 @@ class AgentFunction:
     def serialize_codeblock_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
         """Cloud overrides this with the runner's canonical parameter serialization."""
         return parameters
+
+    def page_operation_contracts(self) -> PageOperationContracts | None:
+        return None
 
     def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
         """Cloud overrides this with the runner's canonical parameter scrubber."""
@@ -2307,6 +2311,8 @@ class AgentFunction:
                 aws_access_key_id=destination.aws_access_key_id,
                 aws_secret_access_key=destination.aws_secret_access_key,
                 region_name=destination.aws_region_name,
+                endpoint_url=destination.endpoint_url,
+                endpoint_resolved_ips=destination.endpoint_resolved_ips,
             )
             await aws_client.upload_file_from_path(
                 uri=destination.sdk_uri,

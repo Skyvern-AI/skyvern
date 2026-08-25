@@ -1405,10 +1405,15 @@ class PersistentBrowserSessionModel(Base):
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     instance_type = Column(String, nullable=True)
+    # Retained, unwritten columns: the pod-share estimator that filled them was replaced by the
+    # pool rate card, which prices whole run-hours and has no per-pod share to record.
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
     duration_ms = Column(BigInteger, nullable=True)
     compute_cost = Column(Numeric, nullable=True)
+    # Which compute_hourly_rates row priced this session. No FK: an audit pointer that must never
+    # make a rate row undeletable, nor fail a session write when the card is missing.
+    compute_hourly_rate_id = Column(BigInteger, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     # Last client CDP command seen by the proxy; drives activity-based lease renewal so an
@@ -1417,6 +1422,7 @@ class PersistentBrowserSessionModel(Base):
     # Set when a close is requested, so the session activity can observe it without waiting for the
     # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
     close_requested_at = Column(DateTime, nullable=True)
+    cdp_unreachable_at = Column(DateTime, nullable=True)
     # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,
     # and dropping it would rewrite a hot table for no gain. Keep it in sync with `alembic check`.
     provisioning_deadline_at = Column(DateTime, nullable=True)
@@ -1522,12 +1528,15 @@ class TaskRunModel(Base):
     parent_workflow_run_id = Column(String, nullable=True)
     debug_session_id = Column(String, nullable=True)
     searchable_text = Column(Text, nullable=True)
-    # Compute cost tracking fields
+    # Compute cost tracking fields. instance_type names the provider that ran the compute since
+    # SKY-14848, not the machine shape; vcpu_millicores and memory_mb are retained but unwritten.
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
     duration_ms = Column(BigInteger, nullable=True)
     compute_cost = Column(Numeric, nullable=True)
+    # Which compute_hourly_rates row priced this run; see PersistentBrowserSessionModel.
+    compute_hourly_rate_id = Column(BigInteger, nullable=True)
     llm_cost = Column(Numeric, nullable=True)
     proxy_cost = Column(Numeric, nullable=True)
     captcha_cost = Column(Numeric, nullable=True)

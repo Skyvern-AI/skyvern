@@ -3896,6 +3896,7 @@ class WorkflowService:
                     browser_profile_id=browser_profile_id,
                     proxy_location=proxy_location,
                     inherit_profile_proxy=True,
+                    workflow_run_id=workflow_run_id,
                 )
             except BrowserSessionStartupTimeout:
                 if time.monotonic() >= deadline:
@@ -5126,7 +5127,7 @@ class WorkflowService:
                 return workflow_run
             # Start background task to periodically renew the browser session
             renewal_task = asyncio.create_task(
-                self._renew_browser_session_loop(browser_session_id, organization.organization_id),
+                self._renew_browser_session_loop(browser_session_id, organization.organization_id, workflow_run_id),
                 name=f"browser_session_renewal_{workflow_run_id}",
             )
 
@@ -5624,7 +5625,9 @@ class WorkflowService:
 
         return workflow_run
 
-    async def _renew_browser_session_loop(self, browser_session_id: str, organization_id: str) -> None:
+    async def _renew_browser_session_loop(
+        self, browser_session_id: str, organization_id: str, workflow_run_id: str
+    ) -> None:
         """Periodically renew a browser session to prevent timeout during long-running workflows."""
         max_renewal_seconds = 2 * 60 * 60  # 2 hours
         start_time = asyncio.get_event_loop().time()
@@ -5640,7 +5643,11 @@ class WorkflowService:
                         elapsed_seconds=elapsed,
                     )
                     return
-                await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(browser_session_id, organization_id)
+                await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
+                    browser_session_id,
+                    organization_id,
+                    workflow_run_id=workflow_run_id,
+                )
                 LOG.debug(
                     "Browser session renewal check completed",
                     browser_session_id=browser_session_id,
@@ -5760,10 +5767,13 @@ class WorkflowService:
                         script_revision_id=script.script_revision_id,
                         organization_id=organization_id,
                     )
-                    await script_service.load_scripts(script, script_files)
+                    written_paths = await script_service.load_scripts(script, script_files)
 
                     script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
-                    if os.path.exists(script_path):
+                    # Gate on what this run wrote, not on what is on disk. TEMP_PATH is reused
+                    # across runs and keyed by script_id rather than revision, so an earlier run's
+                    # copy can outlive the code it came from and make os.path.exists lie.
+                    if script_path in written_paths:
                         # setup script run
                         parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
                             workflow_run_id=workflow_run.workflow_run_id
@@ -5834,11 +5844,16 @@ class WorkflowService:
                                     script_id=script.script_id,
                                 )
                     else:
+                        # This run has no code for the script: either the revision's stored code
+                        # is gone, or the fetch failed. Either way every run_signature would resolve
+                        # against an empty namespace, and keeping the block map would report the run
+                        # as "code" and suppress the regeneration below.
                         LOG.warning(
                             "Script file not found at path",
                             script_path=script_path,
                             script_id=script.script_id,
                         )
+                        script_blocks_by_label = {}
             except InProcessScriptExecutionDenied as denial:
                 if denial.fail_closed:
                     raise

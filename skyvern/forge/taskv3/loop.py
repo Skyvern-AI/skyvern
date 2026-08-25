@@ -58,6 +58,9 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 # receive the basenames tools staged into the downloads dir this run, to exclude from detection.
 CompletionProbe = Callable[[frozenset[str]], Awaitable[str | None]]
 CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
+# Consulted from finish(completed) like CompletionBlocker, but takes no arguments -- it gates on
+# state the caller already tracks (e.g. a verification-code budget), not on staged downloads.
+VerificationBlocker = Callable[[], Awaitable[str | None]]
 
 
 @dataclass
@@ -543,6 +546,7 @@ def make_finish_tool(
     submit_watch: SubmitWatch | None = None,
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
+    verification_blocker: VerificationBlocker | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -654,6 +658,19 @@ def make_finish_tool(
                 )
             if blocker_message:
                 return ToolResult.error(blocker_message)
+        if status == "completed" and verification_blocker is not None:
+            try:
+                verification_message = await verification_blocker()
+            except Exception:
+                # Fail closed: an exception here must not let a blank verification step read as done.
+                LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
+                return ToolResult.error(
+                    "Could not verify that the verification-code step completed cleanly; retry "
+                    "finish(status=completed) once verified, or finish with status=failed or "
+                    "status=terminated."
+                )
+            if verification_message:
+                return ToolResult.error(verification_message)
         if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
             try:
                 settled = await _settled()

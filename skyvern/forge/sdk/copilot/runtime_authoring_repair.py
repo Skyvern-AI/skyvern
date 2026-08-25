@@ -14,7 +14,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     is_carrier_backed_category_entry,
     typed_challenge_kind,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, model_visible_composition_evidence
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
@@ -29,8 +29,8 @@ _MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
-_OBSTRUCTION_KEYS = ("kind", "selector", "text", "visual_location")
-_OBSTRUCTION_CONTROL_KEYS = ("text", "selector")
+_OBSTRUCTION_KEYS = ("kind", "text", "visual_location")
+_OBSTRUCTION_CONTROL_KEYS = ("text",)
 _OBSTRUCTION_FIELD_MAX_CHARS = 160
 OBSTRUCTION_SUMMARY_MAX_CHARS = 1200
 _NO_DISMISS_CONTROL_SUMMARY = "obstruction present, no dismiss control found in page evidence"
@@ -167,11 +167,11 @@ def _runtime_form_summaries(value: Any) -> list[str]:
         if not isinstance(form, dict):
             continue
         for field in form.get("fields") or []:
-            summary = _runtime_summary_entry(field, ("label", "selector"))
+            summary = _runtime_summary_entry(field, ("label", "type"))
             if summary:
                 summaries.append(summary)
         for control in form.get("submit_controls") or []:
-            summary = _runtime_summary_entry(control, ("text", "selector", "disabled"))
+            summary = _runtime_summary_entry(control, ("text", "disabled"))
             if summary:
                 summaries.append(summary)
     return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
@@ -184,13 +184,9 @@ def _runtime_result_summaries(value: Any) -> list[str]:
     for container in value:
         if not isinstance(container, dict):
             continue
-        primary = _runtime_summary_entry(container, ("selector", "text_excerpt", "row_selector"))
+        primary = _runtime_summary_entry(container, ("text_excerpt",))
         if primary:
             summaries.append(primary)
-        for toggle in container.get("expand_toggle_candidates") or []:
-            summary = _bounded_runtime_text(toggle, 80)
-            if summary:
-                summaries.append(summary)
         for row in container.get("sample_rows") or []:
             summary = _bounded_runtime_text(row, 80)
             if summary:
@@ -210,7 +206,7 @@ def _raw_obstruction_entries(evidence: dict[str, Any]) -> tuple[list[Any], list[
         return [], []
     return (
         [
-            {"selector": overlay.get("selector"), "visible_controls": overlay.get("dismiss_controls") or []}
+            {"visible_controls": overlay.get("dismiss_controls") or []}
             for overlay in modal_overlays
             if isinstance(overlay, dict)
         ],
@@ -229,7 +225,7 @@ def _typed_runtime_page_obstructions(evidence: Any) -> tuple[list[PageObstructio
             malformed += 1
             continue
         try:
-            obstructions.append(PageObstruction.model_validate(entry))
+            obstructions.append(PageObstruction.model_validate(model_visible_composition_evidence(entry)))
         except ValidationError:
             malformed += 1
     if malformed:
@@ -536,10 +532,8 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
     page_title = evidence.get("page_title") or evidence.get("title")
     page_form_summaries = _runtime_form_summaries(evidence.get("forms"))
     page_result_summaries = _runtime_result_summaries(evidence.get("result_containers"))
-    page_action_summaries = _runtime_summary_list(evidence.get("navigation_targets"), ("text", "selector", "disabled"))
-    page_challenge_summaries = _runtime_summary_list(
-        evidence.get("challenge_controls"), ("text", "selector", "disabled")
-    )
+    page_action_summaries = _runtime_summary_list(evidence.get("navigation_targets"), ("text", "disabled"))
+    page_challenge_summaries = _runtime_summary_list(evidence.get("challenge_controls"), ("text", "disabled"))
     page_obstructions, page_obstruction_omission_notices = _typed_runtime_page_obstructions(evidence)
     page_obstruction_summaries = _runtime_obstruction_summaries(page_obstructions)
     finalized = pending.model_copy(

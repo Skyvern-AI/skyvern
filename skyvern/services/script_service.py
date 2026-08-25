@@ -461,8 +461,18 @@ async def create_script(
 async def load_scripts(
     script: Script,
     script_files: list[ScriptFile],
-) -> None:
+) -> set[str]:
+    """Copy the revision's files locally and return the paths actually written by THIS call.
+
+    Callers must gate on the returned set rather than os.path.exists: TEMP_PATH is reused across
+    runs and keyed by script_id rather than revision, so a file on disk may belong to an earlier
+    run whose code has since been retention-deleted. Absence from the set means "this run has no
+    code for that path", which is the only question the caller can answer from here -- a retention
+    deletion and an exhausted-retry S3 failure both surface as empty content and are not
+    distinguishable at this layer.
+    """
     organization_id = script.organization_id
+    written: set[str] = set()
     for file in script_files:
         # retrieve the artifact
         if not file.artifact_id:
@@ -472,9 +482,9 @@ async def load_scripts(
             LOG.error("Artifact not found", artifact_id=file.artifact_id, script_id=script.script_id)
             continue
         file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        file_path = os.path.join(settings.TEMP_PATH, script.script_id, file.file_path)
         if not file_content:
             continue
-        file_path = os.path.join(settings.TEMP_PATH, script.script_id, file.file_path)
         # create the directory if it doesn't exist
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -495,6 +505,8 @@ async def load_scripts(
             # Fallback to binary mode if text decoding fails
             with open(file_path, "wb") as f:
                 f.write(file_content)
+        written.add(file_path)
+    return written
 
 
 async def execute_script(
@@ -2167,6 +2179,7 @@ async def download(
     aws_access_key_id: str | None = None,
     aws_secret_access_key: str | None = None,
     region_name: str | None = None,
+    endpoint_url: str | None = None,
     azure_storage_account_name: str | None = None,
     azure_storage_account_key: str | None = None,
     azure_blob_container_name: str | None = None,
@@ -2194,6 +2207,8 @@ async def download(
         aws_secret_access_key = _render_template_with_label(aws_secret_access_key, cache_key)
     if region_name:
         region_name = _render_template_with_label(region_name, cache_key)
+    if endpoint_url:
+        endpoint_url = _render_template_with_label(endpoint_url, cache_key)
     if azure_storage_account_name:
         azure_storage_account_name = _render_template_with_label(azure_storage_account_name, cache_key)
     if azure_storage_account_key:
@@ -2230,6 +2245,7 @@ async def download(
         "aws_access_key_id": aws_access_key_id,
         "aws_secret_access_key": aws_secret_access_key,
         "region_name": region_name,
+        "endpoint_url": endpoint_url,
         "azure_storage_account_name": azure_storage_account_name,
         "azure_storage_account_key": azure_storage_account_key,
         "azure_blob_container_name": azure_blob_container_name,
@@ -3439,6 +3455,7 @@ async def upload_file(
     aws_access_key_id: str | None = None,
     aws_secret_access_key: str | None = None,
     region_name: str | None = None,
+    endpoint_url: str | None = None,
     azure_storage_account_name: str | None = None,
     azure_storage_account_key: str | None = None,
     azure_blob_container_name: str | None = None,
@@ -3464,6 +3481,8 @@ async def upload_file(
         aws_secret_access_key = _render_template_with_label(aws_secret_access_key, label)
     if region_name:
         region_name = _render_template_with_label(region_name, label)
+    if endpoint_url:
+        endpoint_url = _render_template_with_label(endpoint_url, label)
     if azure_storage_account_name:
         azure_storage_account_name = _render_template_with_label(azure_storage_account_name, label)
     if azure_storage_account_key:
@@ -3501,6 +3520,7 @@ async def upload_file(
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
         region_name=region_name,
+        endpoint_url=endpoint_url,
         azure_storage_account_name=azure_storage_account_name,
         azure_storage_account_key=azure_storage_account_key,
         azure_blob_container_name=azure_blob_container_name,

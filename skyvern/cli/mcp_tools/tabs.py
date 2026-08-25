@@ -33,6 +33,7 @@ from .browser import _must_reject_localhost_url
 LOG = structlog.get_logger(__name__)
 
 _MAX_OPEN_TABS_PER_CALL = 40
+TAB_TITLE_TIMEOUT_SECONDS = 5.0
 _STATELESS_TAB_MSG = (
     "Tab management tools that rely on persisted state (switch, close, wait_for_new) "
     "are not supported in stateless HTTP mode. Use stdio transport (Claude Code, gstack)."
@@ -67,7 +68,7 @@ def _tab_info(page: Any, *, index: int, is_active: bool) -> TabInfo:
 async def _tab_info_with_title(page: Any, *, index: int, is_active: bool) -> TabInfo:
     info = _tab_info(page, index=index, is_active=is_active)
     try:
-        info.title = await page.title()
+        info.title = await asyncio.wait_for(page.title(), timeout=TAB_TITLE_TIMEOUT_SECONDS)
     except Exception:
         pass  # title defaults to ""
     return info
@@ -381,15 +382,6 @@ async def skyvern_tab_switch(
     Provide either tab_id (from skyvern_tab_list) or index (0-based position).
     Use skyvern_tab_list first to see available tabs and their IDs.
     """
-    from skyvern.cli.core.session_manager import is_stateless_http_mode
-
-    if is_stateless_http_mode():
-        return make_result(
-            "skyvern_tab_switch",
-            ok=False,
-            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
-        )
-
     if tab_id is None and index is None:
         return make_result(
             "skyvern_tab_switch",
@@ -407,6 +399,14 @@ async def skyvern_tab_switch(
         return make_result("skyvern_tab_switch", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
+    if not state.tab_state_persists:
+        return make_result(
+            "skyvern_tab_switch",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
+        )
+
     browser = state.browser
     if browser is None:
         return make_result("skyvern_tab_switch", ok=False, error=no_browser_error())
@@ -458,21 +458,20 @@ async def skyvern_tab_close(
     If the last tab is closed, a new blank tab is created automatically.
     If the active tab is closed, the most recent remaining tab becomes active.
     """
-    from skyvern.cli.core.session_manager import is_stateless_http_mode
-
-    if is_stateless_http_mode():
-        return make_result(
-            "skyvern_tab_close",
-            ok=False,
-            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
-        )
-
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:
         return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
+    if not state.tab_state_persists:
+        return make_result(
+            "skyvern_tab_close",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
+        )
+
     browser = state.browser
     if browser is None:
         return make_result("skyvern_tab_close", ok=False, error=no_browser_error())
@@ -546,21 +545,20 @@ async def skyvern_tab_wait_for_new(
     Returns one tab per call. If multiple popups may open, call repeatedly to drain them.
     Does NOT auto-switch to the new tab. Use skyvern_tab_switch after if desired.
     """
-    from skyvern.cli.core.session_manager import is_stateless_http_mode
-
-    if is_stateless_http_mode():
-        return make_result(
-            "skyvern_tab_wait_for_new",
-            ok=False,
-            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
-        )
-
     try:
         _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:
         return make_result("skyvern_tab_wait_for_new", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
+    if not state.tab_state_persists:
+        return make_result(
+            "skyvern_tab_wait_for_new",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
+        )
+
     browser = state.browser
     if browser is None:
         return make_result("skyvern_tab_wait_for_new", ok=False, error=no_browser_error())

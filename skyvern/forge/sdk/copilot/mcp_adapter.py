@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.output_utils import mark_mcp_result_untrusted_for
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
+    _BROWSER_BOOT_WAIT_SECONDS,
     AgentContext,
     CopilotBrowserSessionUnavailable,
     close_browser_session_quietly,
@@ -410,12 +411,18 @@ class SchemaOverlay:
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 _SESSION_EXPIRED_ERROR_CODE = "SESSION_EXPIRED"
-_SESSION_REESTABLISH_TIMEOUT_SECONDS = 35.0
 _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
 _SESSION_LOST_USER_FACING_REASON = (
     "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
 )
 _FALLBACK_LOGGER = logging.getLogger(__name__)
+
+
+def _reestablish_lock_seconds() -> int:
+    """The re-create is bounded by the manager's own startup timeout plus the boot poll; the
+    coordination lock only has to outlive that."""
+    startup = app.PERSISTENT_SESSIONS_MANAGER.get_browser_session_startup_timeout_seconds()
+    return int(startup + _BROWSER_BOOT_WAIT_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -468,8 +475,8 @@ async def _browser_session_continuity_lock(organization_id: str, lost_session_id
             else:
                 async with app.CACHE.get_lock(
                     lock_key,
-                    blocking_timeout=int(_SESSION_REESTABLISH_TIMEOUT_SECONDS + 5),
-                    timeout=int(_SESSION_REESTABLISH_TIMEOUT_SECONDS + 10),
+                    blocking_timeout=_reestablish_lock_seconds() + 5,
+                    timeout=_reestablish_lock_seconds() + 10,
                 ):
                     yield
     finally:
@@ -666,6 +673,8 @@ def _log_mcp_timing(
     raw_mcp: dict[str, Any],
     call_path: Literal["model", "internal"],
     call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
+    *,
+    dispatch_started: bool | None = None,
 ) -> None:
     with contained_effect("emit MCP tool timing", tool_name=tool_name, call_status=call_status):
         reported = _server_mark(raw_mcp, "total")
@@ -689,6 +698,7 @@ def _log_mcp_timing(
             server_attach_ms=attach_ms,
             call_path=call_path,
             call_status=call_status,
+            dispatch_started=dispatch_started,
             phase_session_prepare_ms=spent["session_prepare"],
             phase_context_enter_ms=spent["context_enter"],
             phase_dispatch_ms=dispatch_ms,
@@ -792,8 +802,7 @@ async def _handle_browser_session_loss(
             )
         else:
             try:
-                async with asyncio.timeout(_SESSION_REESTABLISH_TIMEOUT_SECONDS):
-                    recovery_error = await ensure_browser_session(ctx)
+                recovery_error = await ensure_browser_session(ctx)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -850,8 +859,6 @@ def _emit_continuity_event(
             "continuity_disposition": disposition,
             **_copilot_log_fields(cast("CopilotContext", ctx)),
         }
-        if disposition != "detected":
-            fields["reestablish_budget_seconds"] = _SESSION_REESTABLISH_TIMEOUT_SECONDS
         log = LOG.info if disposition == "reestablished" else LOG.warning
         try:
             log("copilot_browser_session_continuity_loss", **fields)
@@ -915,46 +922,8 @@ async def _prepare_browser_session_for_dispatch(
             if recorded is not None:
                 _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
                 return None, _browser_session_loss_result({}, disposition=recorded.disposition), recorded.disposition
-
-            # No preflight verdict here: the attach below is the oracle, and an indeterminate probe
-            # is not evidence of loss.
-            error = await ensure_browser_session(ctx)
-            if (
-                getattr(ctx, "turn_origin", TurnOrigin.interactive) == TurnOrigin.runtime_self_heal
-                or ctx.browser_session_id == prior_session_id
-            ):
-                return None, None, None
-
-            _emit_continuity_event(
-                ctx,
-                tool_name=tool_name,
-                call_path=call_path,
-                lost_session_id=prior_session_id,
-                replacement_session_id=None,
-                disposition="detected",
-            )
-            replacement_session_id = ctx.browser_session_id if error is None else None
-            if error is not None and ctx.browser_session_id is not None:
-                await close_browser_session_quietly(ctx.organization_id, ctx.browser_session_id)
-                retire_browser_session_id(ctx, ctx.browser_session_id)
-            await close_browser_session_quietly(ctx.organization_id, prior_session_id)
-            outcome = _BrowserSessionContinuityOutcome(
-                lost_session_id=prior_session_id,
-                root_session_id=prior_session_id,
-                disposition="reestablished" if replacement_session_id is not None else "failed",
-                replacement_session_id=replacement_session_id,
-            )
-            await _store_continuity_outcome(ctx.organization_id, outcome)
-            _apply_continuity_outcome(ctx, outcome, tool_name=tool_name, call_path=call_path)
-            _emit_continuity_event(
-                ctx,
-                tool_name=tool_name,
-                call_path=call_path,
-                lost_session_id=prior_session_id,
-                replacement_session_id=outcome.replacement_session_id,
-                disposition=outcome.disposition,
-            )
-            return None, _browser_session_loss_result({}, disposition=outcome.disposition), outcome.disposition
+        # The attach in mcp_browser_context is the oracle; a lost session is handled where it is discovered.
+        return None, None, None
 
 
 def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
@@ -1110,12 +1079,17 @@ class SkyvernOverlayMCPServer(MCPServer):
         alias_map: dict[str, str],
         allowlist: frozenset[str],
         context_provider: Callable[[], Any],
+        *,
+        ordered_allowlist: tuple[str, ...] | None = None,
+        enforce_dispatch_allowlist: bool = False,
     ) -> None:
         super().__init__(use_structured_content=False)
         self._transport = transport
         self._overlays = overlays
         self._alias_map = alias_map  # copilot_name -> mcp_name
         self._reverse_alias: dict[str, str] = {v: k for k, v in alias_map.items()}
+        self._ordered_allowlist = ordered_allowlist
+        self._enforce_allowlist_on_dispatch = enforce_dispatch_allowlist
         self._allowlist = allowlist
         self._context_provider = context_provider
         self._client: Client | None = None
@@ -1237,7 +1211,17 @@ class SkyvernOverlayMCPServer(MCPServer):
         except Exception:
             requested_output_path_choices = []
 
-        for tool in raw_tools:
+        selected_tools = raw_tools
+        if self._ordered_allowlist is not None:
+            raw_by_name = {tool.name: tool for tool in raw_tools}
+            if len(raw_by_name) != len(raw_tools):
+                raise RuntimeError("MCP transport returned duplicate tool names")
+            missing = [name for name in self._ordered_allowlist if name not in raw_by_name]
+            if missing:
+                raise RuntimeError(f"MCP transport omitted allowed tools: {', '.join(missing)}")
+            selected_tools = [raw_by_name[name] for name in self._ordered_allowlist]
+
+        for tool in selected_tools:
             if tool.name not in self._allowlist:
                 continue
 
@@ -1290,12 +1274,17 @@ class SkyvernOverlayMCPServer(MCPServer):
         arguments = arguments or {}
         arguments = {k: v for k, v in arguments.items() if k not in _INTERNAL_TOOL_ARG_KEYS}
         copilot_ctx = self._context_provider()
+        if self._enforce_allowlist_on_dispatch and tool_name not in self._alias_map:
+            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
         overlay = self._overlays.get(tool_name, SchemaOverlay())
+        mcp_name = self._alias_map.get(tool_name, tool_name)
+        if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
+            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
         observed_continuity_generation = copilot_ctx.browser_session_continuity_generation
         attempt_browser_session_id = getattr(copilot_ctx, "browser_session_id", None)
-        mcp_name = self._alias_map.get(tool_name, tool_name)
         uses_shared_browser_outcome = mcp_name in _SHARED_BROWSER_OUTCOME_TOOLS
         dispatch_started = False
+        phases = _PhaseClock()
 
         policy = copilot_ctx.request_policy
         if overlay.requires_browser and isinstance(policy, RequestPolicy) and policy.raw_secret_detected:
@@ -1351,7 +1340,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
 
-        phases = _PhaseClock()
         mcp_args = _transform_args(arguments, overlay)
 
         if overlay.requires_browser:
@@ -1427,9 +1415,9 @@ class SkyvernOverlayMCPServer(MCPServer):
         call_browser_session_generation = copilot_ctx.browser_session_continuity_generation
 
         try:
-            # wait_for(timeout=None) is a plain await, so only overlays that declare a ceiling get
-            # one. The ceiling bounds every await under the call — a page evaluate, but also a stale
-            # session handle whose CDP request never answers, which held a turn for 307s (SKY-13226).
+            # wait_for(timeout=None) is a plain await, so only overlays that declare an action
+            # ceiling get one. Browser-state resolution has its own shared typed ceiling before
+            # dispatch, where expiry can still truthfully report that no browser action started.
             if overlay.requires_browser:
                 phases.enter("context_enter")
                 async with mcp_browser_context(copilot_ctx):

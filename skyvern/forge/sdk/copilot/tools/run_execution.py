@@ -61,7 +61,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_html
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    has_bounded_page_schema,
+    model_visible_composition_evidence,
+    parse_composition_html,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext, PageObstruction
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -104,6 +108,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
     ensure_browser_session,
+    resolve_persistent_browser_state,
+    verify_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     inject_runtime_authoring_repair_context,
@@ -167,9 +173,7 @@ from .blockers import (
     _safe_read_workflow_run,
     _trusted_post_drain_status,
 )
-from .completion import (
-    _artifact_health_blocker_from_result,
-)
+from .completion import _artifact_health_blocker_from_result
 from .composition_capture import (
     _read_run_session_page_evidence,
     store_post_run_page_evidence,
@@ -196,6 +200,7 @@ from .guardrails import (
 from .scouting import _mark_post_run_page_observed, _redact_codeblock_value
 
 LOG = structlog.get_logger()
+
 
 _INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY = "_copilot_registered_output_identity_mismatch"
 _MAX_REGISTERED_ARTIFACTS = 3
@@ -2111,7 +2116,7 @@ async def _run_blocks_and_collect_debug(
     else:
         # This id is dispatched into a workflow run without ever being attached here, so an
         # unverified session cannot be discovered later and must fail now instead.
-        session_err = await ensure_browser_session(ctx, require_verified_session=True)
+        session_err = await verify_browser_session_by_attaching(ctx)
         if session_err is not None:
             return session_err
         run_session_id = ctx.browser_session_id
@@ -2648,7 +2653,7 @@ async def _run_blocks_and_collect_debug(
         # grab the live page over CDP. Their at-failure frames come from worker-persisted artifacts.
         if not dispatch_to_worker and not run_ok and run_session_id:
             try:
-                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                browser_state = await resolve_persistent_browser_state(
                     session_id=run_session_id,
                     organization_id=ctx.organization_id,
                 )
@@ -2723,7 +2728,7 @@ async def _run_blocks_and_collect_debug(
             result_data["current_url_evidence"] = NO_PERSISTED_END_URL
         post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id)
         if post_run_page_evidence is not None:
-            result_data["post_run_page_evidence"] = post_run_page_evidence
+            result_data["post_run_page_evidence"] = model_visible_composition_evidence(post_run_page_evidence)
         _attach_run_session_facts(
             result_data,
             used_fresh_run_session=used_fresh_run_session,
@@ -3710,7 +3715,7 @@ def _packet_page_obstructions(value: Any, omission_notices: list[str]) -> list[P
     malformed = 0
     for item in value:
         try:
-            obstructions.append(PageObstruction.model_validate(item))
+            obstructions.append(PageObstruction.model_validate(model_visible_composition_evidence(item)))
         except ValueError:
             malformed += 1
     if malformed:

@@ -1238,11 +1238,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
             return "Evaluated JavaScript"
         return f"Evaluated JavaScript — returned {_describe_value_shape(result_val)}"
     if tool_name == "click":
-        target = data.get("effective_target") or data.get("selector") or data.get("resolved_selector") or "?"
+        target = (
+            data.get("effective_target")
+            or data.get("selector")
+            or data.get("executed_selector")
+            or data.get("resolved_selector")
+            or "?"
+        )
         return f"Clicked '{target}'"
     if tool_name == "type_text":
         length = data.get("typed_length") or data.get("text_length", "?")
-        return f"Typed {length} chars into '{data.get('selector', '?')}'"
+        target = data.get("effective_target") or data.get("selector") or data.get("executed_selector") or "?"
+        return f"Typed {length} chars into '{target}'"
     if tool_name == "scroll":
         return f"Scrolled {data.get('direction', '?')}"
     if tool_name == "console_messages":
