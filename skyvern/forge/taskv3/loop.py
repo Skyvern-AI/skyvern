@@ -52,6 +52,13 @@ class ToolResult:
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 
+# A probe consulted after a billable/download-signaling tool result; a truthy return ends the run as
+# completed with that reason, without the model ever calling finish. A blocker consulted from
+# finish(completed) itself; a truthy return rejects that verdict with the message as the reason. Both
+# receive the basenames tools staged into the downloads dir this run, to exclude from detection.
+CompletionProbe = Callable[[frozenset[str]], Awaitable[str | None]]
+CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
+
 
 @dataclass
 class ToolSpec:
@@ -534,6 +541,8 @@ def make_finish_tool(
     failure_settle_max_seconds: float = FAILURE_EVIDENCE_SETTLE_MAX_SECONDS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     submit_watch: SubmitWatch | None = None,
+    completion_blocker: CompletionBlocker | None = None,
+    staged_downloads: set[str] | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -633,6 +642,18 @@ def make_finish_tool(
                     "Finish with status=completed only once the page shows the submission "
                     "landed; if it never resolves, say so with status=terminated."
                 )
+        if status == "completed" and completion_blocker is not None:
+            try:
+                blocker_message = await completion_blocker(frozenset(staged_downloads or ()))
+            except Exception:
+                # Fail closed: a download-gated task must not complete on a storage hiccup with no file.
+                LOG.warning("taskv3 completion_blocker failed; failing closed", exc_info=True)
+                return ToolResult.error(
+                    "Could not verify that a file download has finished; retry finish(status=completed) "
+                    "once the download has landed, or finish with status=failed or status=terminated."
+                )
+            if blocker_message:
+                return ToolResult.error(blocker_message)
         if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
             try:
                 settled = await _settled()
@@ -790,6 +811,8 @@ async def run_agent_tool_loop(
     activity: ActivityRecency | None = None,
     submit_watch: SubmitWatch | None = None,
     telemetry_salt: str | None = None,
+    completion_probe: CompletionProbe | None = None,
+    staged_downloads: set[str] | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     # Per run, never logged: the hashes it keys are stable within this run (the only scope any guard
@@ -1049,6 +1072,8 @@ async def run_agent_tool_loop(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
             result_data = result.data or {}
+            if staged_downloads is not None and result_data.get("staged_download"):
+                staged_downloads.add(result_data["staged_download"])
             if spec is not None and (result_data.get("download_notice") or result_data.get("page_state_changed")):
                 # A download landing or a navigation is progress no matter which tool witnessed it
                 # or whether that call itself errored: re-clicking the button that produces a file
@@ -1167,6 +1192,25 @@ async def run_agent_tool_loop(
                     submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
                     if submit_selector is not None:
                         submit_watch.record(submit_selector)
+
+            if (
+                completion_probe is not None
+                and spec is not None
+                and (spec.billable or result_data.get("download_notice"))
+                # file_upload stages an http(s) source file into the same downloads dir; that landed
+                # file is not the run's OWN download unless the wrapper also flagged download_notice.
+                and not (result_data.get("staged_download") and not result_data.get("download_notice"))
+            ):
+                try:
+                    completion_reason = await completion_probe(frozenset(staged_downloads or ()))
+                except Exception:
+                    LOG.warning("taskv3 completion_probe failed; not treating it as complete", exc_info=True)
+                    completion_reason = None
+                if completion_reason:
+                    LOG.info("taskv3 loop completion probe fired", tool=tool_name, turn=turns)
+                    outcome = LoopOutcome("completed", completion_reason)
+                    _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "completion probe fired")
+                    break
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}

@@ -41,8 +41,10 @@ import {
   Outlet,
   useLocation,
   useNavigate,
+  useParams,
   useSearchParams,
 } from "react-router-dom";
+import { runViewTabBasePath } from "@/routes/runs/runViewTabBasePath";
 import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
@@ -563,26 +565,28 @@ function WorkflowRun() {
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
+  const runBasePath =
+    runViewTabBasePath(useParams()) ?? `/runs/${workflowRunId}`;
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {
       label: "Overview",
-      to: "overview",
+      to: `${runBasePath}/overview`,
     },
     {
       label: "Output",
-      to: "output",
+      to: `${runBasePath}/output`,
     },
     {
       label: "Inputs",
-      to: "parameters",
+      to: `${runBasePath}/parameters`,
     },
     {
       label: "Recording",
-      to: "recording",
+      to: `${runBasePath}/recording`,
     },
     {
       label: "Code",
-      to: "code",
+      to: `${runBasePath}/code`,
       icon: !isGeneratingCode ? (
         <CodeIcon className="inline-block size-5" />
       ) : (

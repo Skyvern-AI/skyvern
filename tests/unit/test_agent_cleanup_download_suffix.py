@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import DownloadFileMaxWaitingTime
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.schemas.runs import RunEngine
@@ -739,3 +741,134 @@ async def test_execute_step_complete_on_download_emits_finalize_lineage(tmp_path
     assert event["passed_download_suffix_fp"] == expected_fingerprint(suffix)
     assert event["context_download_suffix_fp"] == expected_fingerprint(suffix)
     assert (download_dir / f"{suffix}.zip").exists()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_in_flight_downloads_caps_timeout_and_skips_exhausted_paths() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task_block = SimpleNamespace(download_timeout=500.0)
+
+    wait_mock = AsyncMock()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value="/tmp/downloads"),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=["a.pdf", "b.pdf"]),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.wait_for_download_finished", wait_mock),
+    ):
+        exhausted = {"a.pdf"}
+        await agent._wait_for_in_flight_downloads(
+            task, task_block, task.organization_id, timeout_cap=30.0, exhausted=exhausted
+        )
+
+    # The block's 500s download_timeout is capped to the caller's 30s remaining budget, and the
+    # already-exhausted path is excluded rather than re-awaited for its full timeout.
+    wait_mock.assert_awaited_once()
+    assert wait_mock.await_args.kwargs["downloading_files"] == ["b.pdf"]
+    assert wait_mock.await_args.kwargs["timeout"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_in_flight_downloads_skips_entirely_when_cap_is_spent() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task_block = SimpleNamespace(download_timeout=None)
+
+    wait_mock = AsyncMock()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value="/tmp/downloads"),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=["a.pdf"]),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.wait_for_download_finished", wait_mock),
+    ):
+        await agent._wait_for_in_flight_downloads(task, task_block, task.organization_id, timeout_cap=0.0)
+
+    wait_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_in_flight_downloads_adds_timed_out_paths_to_exhausted() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task_block = SimpleNamespace(download_timeout=None)
+
+    wait_mock = AsyncMock(side_effect=DownloadFileMaxWaitingTime(downloading_files=["stuck.pdf"]))
+    exhausted: set[str] = set()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value="/tmp/downloads"),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=["stuck.pdf"]),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.wait_for_download_finished", wait_mock),
+    ):
+        await agent._wait_for_in_flight_downloads(task, task_block, task.organization_id, exhausted=exhausted)
+
+    assert exhausted == {"stuck.pdf"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_in_flight_downloads_cancels_promptly_when_should_cancel_fires() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task_block = SimpleNamespace(download_timeout=None)
+
+    was_cancelled = False
+
+    async def _slow_wait_for_download_finished(**_kwargs) -> None:
+        nonlocal was_cancelled
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            was_cancelled = True
+            raise
+
+    should_cancel_calls = 0
+
+    async def _should_cancel() -> bool:
+        nonlocal should_cancel_calls
+        should_cancel_calls += 1
+        return should_cancel_calls >= 2
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value="/tmp/downloads"),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=["a.pdf"]),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.wait_for_download_finished", _slow_wait_for_download_finished),
+    ):
+        start = time.monotonic()
+        cancelled = await agent._wait_for_in_flight_downloads(
+            task, task_block, task.organization_id, should_cancel=_should_cancel
+        )
+        elapsed = time.monotonic() - start
+
+    assert elapsed < 5
+    assert was_cancelled is True
+    assert cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_in_flight_downloads_completes_normally_when_should_cancel_never_fires() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task_block = SimpleNamespace(download_timeout=None)
+
+    completed = False
+
+    async def _fast_wait_for_download_finished(**_kwargs) -> None:
+        nonlocal completed
+        completed = True
+
+    async def _should_cancel() -> bool:
+        return False
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value="/tmp/downloads"),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=["a.pdf"]),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.wait_for_download_finished", _fast_wait_for_download_finished),
+    ):
+        cancelled = await agent._wait_for_in_flight_downloads(
+            task, task_block, task.organization_id, should_cancel=_should_cancel
+        )
+
+    assert completed is True
+    assert cancelled is False
