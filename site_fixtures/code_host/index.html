@@ -307,6 +307,11 @@ function renderRepo() {
   S.setItem("wh_view", "code");
   document.title = `${ORG}/${REPO}: Automate browser based workflows with AI`;
   const vis = IS_PRIVATE ? "Private" : "Public";
+  const starLabelState = document.cookie.split("; ").find((item) => item.startsWith("code_host_star_label_state="))?.split("=")[1];
+  const starValueState = document.cookie.split("; ").find((item) => item.startsWith("code_host_star_value_state="))?.split("=")[1];
+  const publicStarValue = starValueState ? decodeURIComponent(starValueState) : "22.6k";
+  const publicStarExpandedValue = publicStarValue === "17.3k" ? "17,300" : "22,600";
+  const starAriaLabel = !IS_PRIVATE && starLabelState === "public" ? "" : ' aria-label="You must be signed in to star a repository"';
   app.innerHTML = chrome("Code") + `
   <div class="layout">
     <div class="maincol">
@@ -315,7 +320,7 @@ function renderRepo() {
         <div class="actions">
           <button class="pill">&#128065; Watch<span class="n">101</span></button>
           <button class="pill">&#127860; Fork<span class="n">2.1k</span></button>
-          <button class="pill">&#11088; Star<span class="n">${IS_PRIVATE ? "3" : "22.6k"}</span></button>
+          <button class="pill"${starAriaLabel}>&#11088; <span>Star</span><span class="n">${IS_PRIVATE ? "3" : publicStarValue}</span></button>
         </div>
       </div>
       <div class="files">
@@ -352,7 +357,7 @@ function renderRepo() {
       <ul>
         <li>&#128214; <strong>Readme</strong></li>
         <li>&#9878; <strong>AGPL-3.0</strong> license</li>
-        <li>&#11088; <strong>${IS_PRIVATE ? "3" : "22.6k"}</strong> stars</li>
+        <li>&#11088; <strong>${IS_PRIVATE ? "3" : publicStarExpandedValue}</strong> stars</li>
         <li>&#128065; <strong>101</strong> watching</li>
         <li>&#127860; <strong>2.1k</strong> forks</li>
       </ul>
