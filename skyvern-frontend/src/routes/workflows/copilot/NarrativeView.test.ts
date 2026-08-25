@@ -196,6 +196,39 @@ describe("applyNarrativeEvent — design phase", () => {
     });
   });
 
+  it("shows a write's patch at write time, before its run reports back", () => {
+    // update_and_run_blocks writes and runs inside one tool call, so waiting for the
+    // tool_result would put the patch on screen only after the test had finished.
+    const diffs = [
+      { label: "star_count", added: 15, removed: 0, patch: "@@\n+code" },
+    ];
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall());
+    s = applyNarrativeEvent(
+      s,
+      workflowDraft({ code_diffs: diffs, tool_call_id: "call-1" }),
+    );
+
+    // No tool_result yet: the run is still in flight.
+    const call = s.designActivity.find((e) => e.id === "tc-call-1");
+    expect(call?.codeDiffs).toHaveLength(1);
+    expect(call?.codeDiffs?.[0]).toMatchObject({
+      label: "star_count",
+      added: 15,
+      removed: 0,
+      patch: "@@\n+code",
+    });
+    expect(s.designActivity.some((e) => e.id === "tr-call-1")).toBe(false);
+  });
+
+  it("a draft naming no call leaves the activity log untouched", () => {
+    // Older backends send no tool_call_id; the row must not guess which call to attach to.
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall());
+    const before = s.designActivity;
+    s = applyNarrativeEvent(s, workflowDraft());
+
+    expect(s.designActivity).toEqual(before);
+  });
+
   it("last workflow_draft wins on multi-iteration designs", () => {
     let s = applyNarrativeEvent(EMPTY_NARRATIVE, workflowDraft());
     s = applyNarrativeEvent(

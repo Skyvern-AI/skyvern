@@ -511,4 +511,26 @@ describe("hydrateNarrativeFromPayload — client_block_actions fields", () => {
     expect(hydrated.blocks[0]!.recordedActions).toBeUndefined();
     expect(hydrated.blocks[0]!.recordedActionsAt).toBeUndefined();
   });
+
+  it("keeps narration in design activity while a block is running", () => {
+    // Mirrors the backend bucket rule; without it live shows the sentence on the
+    // block card while a reload shows it in the design step.
+    const state = reduce([
+      turnStart(),
+      blockProgress({ block_label: "open_search", status: "running" }),
+      {
+        type: "narration",
+        narration: "Checking whether the invoices need a login",
+        iteration: 2,
+        timestamp: "2026-06-10T00:00:05Z",
+      },
+    ]);
+
+    expect(state.designActivity.map((e) => e.text)).toContain(
+      "Checking whether the invoices need a login",
+    );
+    expect(
+      state.blocks.flatMap((b) => b.activity.map((e) => e.text)),
+    ).not.toContain("Checking whether the invoices need a login");
+  });
 });

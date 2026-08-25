@@ -16,7 +16,7 @@ type ReturnType = {
   isOpen: boolean;
   type: CredentialModalType;
   setIsOpen: (isOpen: boolean) => void;
-  setType: (type: CredentialModalType) => void;
+  openModal: (type: CredentialModalType) => void;
 };
 
 function getCredentialModalType(type: string): CredentialModalType {
@@ -42,8 +42,12 @@ function useCredentialModalState(): ReturnType {
     });
   };
 
-  const setType = (type: CredentialModalType) => {
+  // Both params must be written in one update: react-router hands each
+  // functional update a fresh copy of the current location's params, so a
+  // second setSearchParams call in the same handler discards the first write.
+  const openModal = (type: CredentialModalType) => {
     setSearchParams((prev) => {
+      prev.set(modalParam, "true");
       prev.set(typeParam, type);
       return prev;
     });
@@ -53,7 +57,7 @@ function useCredentialModalState(): ReturnType {
     isOpen,
     type,
     setIsOpen,
-    setType,
+    openModal,
   };
 }
 

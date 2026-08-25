@@ -519,6 +519,14 @@ describe("a stopped block stays inspectable", () => {
     expect(screen.queryByText("Halted")).toBeNull();
   });
 
+  // A non-solo run row keeps its block cards in the collapsed body, so the log
+  // is not a substitute for the summary list on a finished turn.
+  it("still names a stopped block on the activity-log surface", () => {
+    render(<NarrativeView turn={stoppedTurn()} uxV1 />);
+
+    expect(screen.getByText("Stopped", { selector: "div" })).toBeTruthy();
+  });
+
   // A stop is not a failure, so the row must not auto-open and shout — but what
   // the block did before the stop still has to be reachable.
   it("can be expanded to reveal what ran before the stop", () => {
@@ -532,5 +540,64 @@ describe("a stopped block stays inspectable", () => {
     fireEvent.click(screen.getByTitle("Highlight log_in on canvas"));
 
     expect(screen.getByText("opened the sign-in page")).toBeTruthy();
+  });
+
+  // A two-block turn is the case a one-block fixture hides: the run row is not a
+  // solo block, so its cards sit in the collapsed body and name nothing there.
+  it("names a failed block on a two-block turn, on both surfaces", () => {
+    const twoBlockTurn = (): TurnNarrativeState => ({
+      ...terminalBuildTurn(),
+      designActivity: [
+        {
+          kind: "tool_result",
+          toolName: "update_and_run_blocks",
+          text: "Ran the blocks",
+          success: true,
+          iteration: 0,
+          id: "tr-run",
+        },
+      ],
+      blocks: [completedBlock("log_in"), failedBlock("download")],
+    });
+
+    const legacy = render(<NarrativeView turn={twoBlockTurn()} />);
+    expect(screen.getAllByText(/download/i).length).toBeGreaterThan(0);
+    legacy.unmount();
+
+    render(<NarrativeView turn={twoBlockTurn()} uxV1 />);
+    expect(screen.getAllByText(/download/i).length).toBeGreaterThan(0);
+  });
+
+  // The write/run row the design shows titled renders as a block card, which
+  // previously discarded the narrator title entirely.
+  it("titles a solo block row with the narrator label, without losing the block name", () => {
+    const narratedRunTurn = (): TurnNarrativeState => ({
+      ...terminalBuildTurn(),
+      designActivity: [
+        {
+          kind: "tool_result",
+          toolName: "update_and_run_blocks",
+          text: "Ran the blocks",
+          success: true,
+          iteration: 0,
+          id: "tr-run",
+        },
+        {
+          kind: "narration",
+          text: "Checking the saved steps survive a real run",
+          iteration: 0,
+          activeLabel: "Running it",
+          outcomeLabel: "Rewrote the download step",
+          id: "n-run",
+        },
+      ],
+      blocks: [completedBlock("download_report")],
+    });
+
+    render(<NarrativeView turn={narratedRunTurn()} uxV1 />);
+
+    expect(screen.getByText("Rewrote the download step")).toBeTruthy();
+    // The block itself is still named by the rollup's own list.
+    expect(screen.getAllByText(/download.report/i).length).toBeGreaterThan(0);
   });
 });

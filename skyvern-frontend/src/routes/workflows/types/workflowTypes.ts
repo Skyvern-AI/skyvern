@@ -432,6 +432,7 @@ export type FileUploadBlock = WorkflowBlockBase & {
   storage_type: "s3" | "azure" | "google_drive" | "sftp";
   s3_bucket: string | null;
   region_name: string | null;
+  endpoint_url: string | null;
   aws_access_key_id: string | null;
   aws_secret_access_key: string | null;
   azure_storage_account_name: string | null;
@@ -589,6 +590,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   prompt: string | null;
   s3_bucket: string | null;
   region_name: string | null;
+  endpoint_url: string | null;
   aws_access_key_id: string | null;
   aws_secret_access_key: string | null;
   azure_storage_account_name: string | null;

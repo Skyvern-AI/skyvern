@@ -10,7 +10,10 @@ import {
   vi,
 } from "vitest";
 
-import type { CredentialApiResponse } from "@/api/types";
+import type {
+  CredentialApiResponse,
+  OnePasswordItemApiResponse,
+} from "@/api/types";
 import CloudContext from "@/store/CloudContext";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
@@ -28,6 +31,13 @@ const mocks = vi.hoisted(() => ({
   credentialDetailsById: new Map<string, CredentialApiResponse>(),
   searchValues: [] as Array<string | undefined>,
   useCredentialsQuery: vi.fn(),
+  onePasswordItems: {
+    data: undefined as
+      | { configured: boolean; items: Array<OnePasswordItemApiResponse> }
+      | undefined,
+    isLoading: false,
+    isError: false,
+  },
   nodes: [] as Array<{
     id: string;
     type: "start";
@@ -52,6 +62,9 @@ vi.mock("@/routes/workflows/hooks/useCredentialQuery", () => ({
       (credentialId && mocks.credentialDetailsById.get(credentialId)) ??
       mocks.credentialDetail.data,
   }),
+}));
+vi.mock("@/routes/workflows/hooks/useOnePasswordItemsQuery", () => ({
+  useOnePasswordItemsQuery: () => mocks.onePasswordItems,
 }));
 vi.mock("@/routes/credentials/CredentialsModal", () => ({
   CredentialsModal: () => null,
@@ -93,6 +106,9 @@ beforeEach(() => {
   mocks.credentialDetail.isError = false;
   mocks.credentialDetail.isPending = false;
   mocks.credentialDetailsById.clear();
+  mocks.onePasswordItems.data = undefined;
+  mocks.onePasswordItems.isLoading = false;
+  mocks.onePasswordItems.isError = false;
   mocks.searchValues.length = 0;
   mocks.nodes = [];
   mocks.updateNodeData.mockImplementation(
@@ -536,5 +552,123 @@ describe("LoginBlockCredentialSelector browser session reuse", () => {
 
     view.rerender(cloudTree(selector));
     expect(getToggle().getAttribute("data-state")).toBe("unchecked");
+  });
+});
+
+describe("LoginBlockCredentialSelector 1Password items", () => {
+  const loginItem: OnePasswordItemApiResponse = {
+    item_id: "op_item_1",
+    title: "Portal Login",
+    vault_id: "op_vault_1",
+    vault_name: "Engineering",
+    category: "LOGIN",
+    url: "https://portal.example.invalid/signin",
+  };
+  const cardItem: OnePasswordItemApiResponse = {
+    item_id: "op_item_2",
+    title: "Corporate Card",
+    vault_id: "op_vault_1",
+    vault_name: "Engineering",
+    category: "CREDIT_CARD",
+    url: null,
+  };
+
+  beforeEach(() => {
+    mocks.useCredentialsQuery.mockReturnValue({
+      data: [],
+      isFetching: false,
+      isLoading: false,
+    });
+    mocks.onePasswordItems.data = {
+      configured: true,
+      items: [loginItem, cardItem],
+    };
+  });
+
+  it("binds a picked 1Password item to an onepassword parameter and autofills the URL", async () => {
+    const onChange = vi.fn();
+    const onUrlAutoFill = vi.fn();
+
+    renderInCloud(
+      <LoginBlockCredentialSelector
+        nodeId="login-node"
+        value=""
+        onChange={onChange}
+        onUrlAutoFill={onUrlAutoFill}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("combobox", { name: "Select a credential" }),
+    );
+    // Only login-category items are offered for a login block.
+    expect(screen.queryByText("Corporate Card")).toBeNull();
+    fireEvent.click(await screen.findByText("Portal Login"));
+
+    expect(onChange).toHaveBeenCalledWith("credentials");
+    expect(onUrlAutoFill).toHaveBeenCalledWith(
+      "https://portal.example.invalid/signin",
+    );
+    expect(useWorkflowParametersStore.getState().parameters).toContainEqual({
+      key: "credentials",
+      parameterType: "onepassword",
+      vaultId: "op_vault_1",
+      itemId: "op_item_1",
+    });
+  });
+
+  it("renders a saved 1Password selection as the item, not the raw parameter key", async () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "credentials",
+          parameterType: "onepassword",
+          vaultId: "op_vault_1",
+          itemId: "op_item_1",
+        },
+      ],
+    });
+
+    renderInCloud(
+      <LoginBlockCredentialSelector nodeId="login-node" value="credentials" />,
+    );
+
+    expect(await screen.findByText("Portal Login")).toBeTruthy();
+    expect(screen.queryByText("Select a credential")).toBeNull();
+  });
+
+  it("drops the auto-generated 1Password wrapper when a Skyvern credential replaces it", async () => {
+    mocks.useCredentialsQuery.mockReturnValue({
+      data: [credential("cred_test_1", "Skyvern Login")],
+      isFetching: false,
+      isLoading: false,
+    });
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "credentials",
+          parameterType: "onepassword",
+          vaultId: "op_vault_1",
+          itemId: "op_item_1",
+        },
+      ],
+    });
+
+    renderInCloud(
+      <LoginBlockCredentialSelector nodeId="login-node" value="credentials" />,
+    );
+
+    fireEvent.click(screen.getByRole("combobox"));
+    fireEvent.click(await screen.findByText("Skyvern Login"));
+
+    // A stale onepassword wrapper would keep resolving a secret the block no
+    // longer uses, and would collide with the next auto-generated key.
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([
+      {
+        key: "credentials",
+        parameterType: "credential",
+        credentialId: "cred_test_1",
+      },
+    ]);
   });
 });
