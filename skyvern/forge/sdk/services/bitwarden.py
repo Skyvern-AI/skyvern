@@ -1,7 +1,7 @@
 import asyncio
 import atexit
 import contextlib
-import hmac
+import hashlib
 import json
 import os
 import random
@@ -14,6 +14,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
+from functools import cached_property
 from typing import Any, Tuple, TypeVar
 
 import structlog
@@ -78,10 +79,11 @@ _EXPIRED_SESSION_MARKERS = (
 # worth one forced sync before believing the miss.
 _STALE_VAULT_MARKERS = ("not found", "no items found", "no item found")
 
-# The fingerprint is only ever compared against others made in this process, so key it with a random
-# per-process secret. An unkeyed digest would turn any log line carrying it into an offline oracle for
-# guessing the master password.
-_IDENTITY_FINGERPRINT_KEY = secrets.token_bytes(32)
+# The fingerprint is only ever compared against others made in this process. A random per-process
+# salt prevents cross-process correlation, while a password KDF prevents a log line carrying the
+# fingerprint from becoming a cheap offline oracle for guessing the master password.
+_IDENTITY_FINGERPRINT_SALT = secrets.token_bytes(32)
+_IDENTITY_FINGERPRINT_ITERATIONS = 120_000
 
 
 class _SessionRepair(StrEnum):
@@ -129,7 +131,7 @@ class _VaultIdentity:
     def uses_email_auth(self) -> bool:
         return bool(self.email and self.master_password)
 
-    @property
+    @cached_property
     def fingerprint(self) -> str:
         """A stable, non-reversible name for this identity, safe to log and to use as a directory."""
         material = (
@@ -137,7 +139,12 @@ class _VaultIdentity:
             if self.uses_email_auth
             else ["apikey", self.client_id or "", self.client_secret or "", self.master_password]
         )
-        return hmac.digest(_IDENTITY_FINGERPRINT_KEY, "\x00".join(material).encode(), "sha256").hex()
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            "\x00".join(material).encode(),
+            _IDENTITY_FINGERPRINT_SALT,
+            _IDENTITY_FINGERPRINT_ITERATIONS,
+        ).hex()
 
     def __repr__(self) -> str:
         return f"_VaultIdentity(fingerprint={self.fingerprint[:12]})"

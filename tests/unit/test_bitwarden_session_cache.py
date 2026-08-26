@@ -728,19 +728,22 @@ async def test_a_burst_across_more_vaults_than_the_cache_holds_drains_back_to_ca
     assert len(bitwarden_module._cli_sessions._sessions) <= capacity
 
 
-def test_the_identity_fingerprint_is_keyed_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_identity_fingerprint_is_salted_per_process_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     """A log reader who knows the email must not be able to confirm password guesses against it."""
     email, master_password = "user@example.com", "hunter2"
-    identity = bitwarden_module._VaultIdentity.resolve(
+    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_SALT", b"a" * 32)
+    first_process = bitwarden_module._VaultIdentity.resolve(
+        client_id=None, client_secret=None, email=email, master_password=master_password
+    )
+    fingerprint = first_process.fingerprint
+
+    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_SALT", b"b" * 32)
+    second_process = bitwarden_module._VaultIdentity.resolve(
         client_id=None, client_secret=None, email=email, master_password=master_password
     )
 
-    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_KEY", b"a" * 32)
-    first_process = identity.fingerprint
-    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_KEY", b"b" * 32)
-
-    assert identity.fingerprint != first_process
-    assert identity.fingerprint == identity.fingerprint
+    assert first_process.fingerprint == fingerprint
+    assert second_process.fingerprint != fingerprint
 
 
 def test_an_identity_never_reveals_its_secrets_when_logged() -> None:
