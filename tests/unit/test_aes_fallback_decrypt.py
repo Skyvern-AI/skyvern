@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from skyvern.forge.sdk.encrypt.aes import AES
@@ -84,3 +86,30 @@ async def test_decrypt_tries_multiple_fallbacks_in_order() -> None:
         ],
     )
     assert await aes.decrypt(ciphertext) == "third match"
+
+
+@pytest.mark.asyncio
+async def test_decrypt_reads_sha256_normalized_ciphertext() -> None:
+    # Open-source releases normalized salt/IV with sha256 for a window. A deployment
+    # upgrading off one of those has stored ciphertext that only those parameters open.
+    writer = AES(secret_key=SECRET, salt=PRIMARY_SALT, iv=PRIMARY_IV)
+    writer.salt = hashlib.sha256(PRIMARY_SALT.encode("utf-8")).digest()
+    writer.iv = hashlib.sha256(PRIMARY_IV.encode("utf-8")).digest()[:16]
+    ciphertext = await writer.encrypt("sha normalized")
+
+    assert await AES(secret_key=SECRET, salt=PRIMARY_SALT, iv=PRIMARY_IV).decrypt(ciphertext) == "sha normalized"
+
+
+@pytest.mark.asyncio
+async def test_encrypt_output_still_opens_with_md5_parameters_alone() -> None:
+    # Guards the rollback path: a release that knows only md5 normalization has to be
+    # able to read anything this code writes, so encrypt must not move off md5 yet.
+    ciphertext = await AES(secret_key=SECRET, salt=PRIMARY_SALT, iv=PRIMARY_IV).encrypt("md5 normalized")
+
+    # Derive the reader's parameters here rather than through AES, so this still
+    # fails if the encrypt path moves off md5.
+    md5_only = AES(secret_key=SECRET, salt=PRIMARY_SALT, iv=PRIMARY_IV)
+    md5_only.salt = hashlib.md5(PRIMARY_SALT.encode("utf-8"), usedforsecurity=False).digest()
+    md5_only.iv = hashlib.md5(PRIMARY_IV.encode("utf-8"), usedforsecurity=False).digest()
+    md5_only._fallback_decrypt_params = []
+    assert await md5_only.decrypt(ciphertext) == "md5 normalized"
