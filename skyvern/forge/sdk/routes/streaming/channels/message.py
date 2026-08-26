@@ -16,6 +16,7 @@ import asyncio
 import dataclasses
 import enum
 import math
+import time
 import typing as t
 
 import structlog
@@ -24,6 +25,8 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedError
 
+from skyvern.forge import app
+from skyvern.forge.sdk.routes.streaming import latency_probe
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
 from skyvern.forge.sdk.routes.streaming.channels.cdp import ChannelContext
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_for_message_channel
@@ -43,7 +46,25 @@ from skyvern.forge.sdk.streaming.registries import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.services.browser_recording.session_registry import interpretation_registry
-from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
+from skyvern.services.browser_recording.types import (
+    RecordingDraftStep,
+    RecordingInterpretationUpdate,
+)
+from skyvern.services.browser_recording.v2.render import (
+    RenderMode,
+    overlay_from_draft_steps,
+    render_blocks,
+    render_code,
+)
+from skyvern.services.browser_recording.v2.session import (
+    RecordingSessionV2,
+    RecordingUpdateV2,
+    discard_session_v2,
+    get_session_v2,
+    start_session_v2,
+)
+from skyvern.services.browser_recording.v2.tap import tap_paste
+from skyvern.services.browser_recording.v2.wire import draft_steps_from_v2
 
 LOG = structlog.get_logger()
 _MAX_IN_FLIGHT_CLIPBOARD_TASKS = 2
@@ -74,6 +95,8 @@ class MessageKind(enum.StrEnum):
     RECORDING_CAPTURE_RESUME = "recording-capture-resume"
     RECORDING_REARM_CAPTURE = "recording-rearm-capture"
     RECORDING_INTERPRETATION_UPDATE = "recording-interpretation-update"
+    RECORDING_COMMIT = "recording-commit"
+    RECORDING_COMMITTED = "recording-committed"
     SCREENSHOT = "screenshot"
     TAKE_CONTROL = "take-control"
     TAKE_SCREENSHOT = "take-screenshot"
@@ -120,6 +143,8 @@ MessageKinds = t.Literal[
     MessageKind.RECORDING_CAPTURE_RESUME,
     MessageKind.RECORDING_REARM_CAPTURE,
     MessageKind.RECORDING_INTERPRETATION_UPDATE,
+    MessageKind.RECORDING_COMMIT,
+    MessageKind.RECORDING_COMMITTED,
     MessageKind.SCREENSHOT,
     MessageKind.TAKE_CONTROL,
     MessageKind.TAKE_SCREENSHOT,
@@ -162,6 +187,14 @@ class MessageInRecordingCaptureResume(Message):
 @dataclasses.dataclass
 class MessageInRecordingRearmCapture(Message):
     kind: t.Literal[MessageKind.RECORDING_REARM_CAPTURE] = MessageKind.RECORDING_REARM_CAPTURE
+
+
+@dataclasses.dataclass
+class MessageInRecordingCommit(Message):
+    kind: t.Literal[MessageKind.RECORDING_COMMIT] = MessageKind.RECORDING_COMMIT
+    mode: t.Literal["blocks", "auto"] = "auto"
+    # The panel's edits (deletions, renames); None means commit every interpreted step.
+    draft_steps: list[dict] | None = None
 
 
 @dataclasses.dataclass
@@ -284,6 +317,15 @@ class MessageOutRecordingInterpretationUpdate(Message):
 
 
 @dataclasses.dataclass
+class MessageOutRecordingCommitted(Message):
+    kind: t.Literal[MessageKind.RECORDING_COMMITTED] = MessageKind.RECORDING_COMMITTED
+    blocks: list[dict] = dataclasses.field(default_factory=list)
+    parameters: list[dict] = dataclasses.field(default_factory=list)
+    mode: RenderMode = "blocks"
+    diagnostics: dict = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class MessageOutTabInfo(Message):
     kind: t.Literal[MessageKind.BROWSER_TABS] = MessageKind.BROWSER_TABS
     tabs: list[TabInfo] = dataclasses.field(default_factory=list)
@@ -305,6 +347,7 @@ MessageIn = (
     | MessageInNavigate
     | MessageInRecordingCapturePause
     | MessageInRecordingCaptureResume
+    | MessageInRecordingCommit
     | MessageInRecordingRearmCapture
     | MessageInReload
     | MessageInTakeControl
@@ -316,6 +359,7 @@ MessageOut = (
     MessageOutBrowserUrl
     | MessageOutError
     | MessageOutExfiltratedEvent
+    | MessageOutRecordingCommitted
     | MessageOutRecordingInterpretationUpdate
     | MessageOutScreenshot
     | MessageOutTabInfo
@@ -359,6 +403,15 @@ def reify_channel_message(data: dict) -> MessageIn:
             return MessageInRecordingCaptureResume()
         case MessageKind.RECORDING_REARM_CAPTURE:
             return MessageInRecordingRearmCapture()
+        case MessageKind.RECORDING_COMMIT:
+            mode = data.get("mode")
+            draft_steps = data.get("draft_steps")
+            return MessageInRecordingCommit(
+                mode="blocks" if mode == "blocks" else "auto",
+                draft_steps=[step for step in draft_steps if isinstance(step, dict)]
+                if isinstance(draft_steps, list)
+                else None,
+            )
         case MessageKind.GET_BROWSER_URL:
             return MessageInGetBrowserUrl()
         case MessageKind.GO_BACK:
@@ -526,6 +579,13 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     class_name = message_channel.class_name
     exfiltration_channel: ExfiltrationChannel | None = None
     live_interpretation_browser_session_id: str | None = None
+    # Latched at the first begin-exfiltration: one socket drives one recorder, so a stale
+    # v2 registry entry cannot hijack a v1 recording and a mid-socket flag flip cannot start both.
+    recording_v2: bool | None = None
+    # Captured once, like live_interpretation_browser_session_id, so cleanup can find the
+    # session even after message_channel.browser_session goes None (e.g. the browser session
+    # times out mid-recording while the live-view socket stays open).
+    recording_v2_browser_session_id: str | None = None
     clipboard_tasks: set[asyncio.Task[None]] = set()
     clipboard_task_count = 0
 
@@ -546,6 +606,11 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         task.add_done_callback(clipboard_tasks.discard)
         return True
 
+    def recording_session_v2() -> RecordingSessionV2 | None:
+        if not recording_v2 or recording_v2_browser_session_id is None:
+            return None
+        return get_session_v2(recording_v2_browser_session_id)
+
     async def send(message: MessageOut) -> None:
         # Single-writer: enqueue only; backend_to_frontend is the sole task that
         # writes to the websocket, so responses and out-of-band messages (event
@@ -556,6 +621,8 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         nonlocal class_name
         nonlocal exfiltration_channel
         nonlocal live_interpretation_browser_session_id
+        nonlocal recording_v2
+        nonlocal recording_v2_browser_session_id
         message: MessageIn
 
         # receive_json returns whatever the client's JSON parses to — a top-level
@@ -630,6 +697,39 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     if message_channel.browser_session
                     else None
                 )
+                if browser_session_id:
+                    latency_probe.set_recording(browser_session_id, True)
+
+                if recording_v2 is None:
+                    recording_v2 = bool(browser_session_id) and await app.AGENT_FUNCTION.is_record_browser_v2_enabled(
+                        message_channel.organization_id
+                    )
+
+                if recording_v2 and browser_session_id:
+                    recording_v2_browser_session_id = browser_session_id
+
+                    def on_v2_update(update: RecordingUpdateV2) -> None:
+                        message_channel.send_nowait(
+                            messages=[
+                                MessageOutRecordingInterpretationUpdate(
+                                    interpretation_session_id=browser_session_id or "",
+                                    session_revision=update.session_revision,
+                                    steps=draft_steps_from_v2(update.steps, update.epoch_offset_ms),
+                                    changed_steps=draft_steps_from_v2(update.changed_steps, update.epoch_offset_ms),
+                                    is_snapshot=update.is_snapshot,
+                                    pending=update.pending,
+                                    finalized=update.finalized,
+                                )
+                            ]
+                        )
+
+                    start_session_v2(
+                        browser_session_id=browser_session_id,
+                        organization_id=message_channel.organization_id,
+                        workflow_permanent_id=message.workflow_permanent_id,
+                        on_update=on_v2_update,
+                    )
+                    return
 
                 def on_interpretation_update(update: RecordingInterpretationUpdate) -> None:
                     message_channel.send_nowait(
@@ -816,6 +916,13 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
                     try:
                         async with execution_for_message_channel(message_channel) as execute:
+                            tap_paste(
+                                message_channel.browser_session.persistent_browser_session_id
+                                if message_channel.browser_session
+                                else None,
+                                text,
+                                time.monotonic(),
+                            )
                             await execute.paste_text(text)
                     except Exception:
                         LOG.exception(
@@ -828,6 +935,14 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await send_error(message.kind, "Clipboard is busy; try again.")
 
             case MessageKind.END_EXFILTRATION:
+                if message_channel.browser_session:
+                    latency_probe.set_recording(message_channel.browser_session.persistent_browser_session_id, False)
+                if recording_v2:
+                    if (v2_session := recording_session_v2()) is not None:
+                        # Seal only: the ledger is the commit's sole input and lives on this pod,
+                        # so the session stays in the registry until recording-commit or teardown.
+                        await v2_session.seal()
+                    return
                 # Channel teardown is best-effort: a browser whose target already
                 # closed raises here, and that must never skip the interpretation
                 # flush below — losing every draft the user just recorded.
@@ -848,18 +963,28 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     live_interpretation_browser_session_id = None
 
             case MessageKind.RECORDING_CAPTURE_PAUSE:
+                if recording_v2:
+                    if (v2_session := recording_session_v2()) is not None:
+                        v2_session.pause()
+                    return
                 if exfiltration_channel is not None:
                     exfiltration_channel.pause_capture()
                 if live_interpretation_browser_session_id:
                     interpretation_registry.pause_capture(live_interpretation_browser_session_id)
 
             case MessageKind.RECORDING_CAPTURE_RESUME:
+                if recording_v2:
+                    if (v2_session := recording_session_v2()) is not None:
+                        v2_session.resume()
+                    return
                 if exfiltration_channel is not None:
                     exfiltration_channel.resume_capture()
                 if live_interpretation_browser_session_id:
                     interpretation_registry.resume_capture(live_interpretation_browser_session_id)
 
             case MessageKind.RECORDING_REARM_CAPTURE:
+                if recording_v2:
+                    return
                 if exfiltration_channel is not None:
                     try:
                         await exfiltration_channel.rearm_all_pages()
@@ -869,6 +994,37 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                             **message_channel.identity,
                         )
                         await send_error(message.kind, "Failed to re-arm recording capture.")
+
+            case MessageKind.RECORDING_COMMIT:
+                commit_session = recording_session_v2()
+                if commit_session is None:
+                    await send_error(message.kind, "No recording to commit.")
+                    return
+                try:
+                    if not commit_session.sealed:
+                        await commit_session.seal()
+                    overlay = overlay_from_draft_steps(message.draft_steps)
+                    result = render_code(commit_session, overlay) if message.mode != "blocks" else None
+                    if result is None:
+                        result = render_blocks(commit_session, overlay)
+                except Exception:
+                    # The session stays in the registry so the client can retry the commit.
+                    LOG.exception(
+                        f"{class_name} failed to render the recording.",
+                        **message_channel.identity,
+                    )
+                    await send_error(message.kind, "Failed to render the recording.")
+                    return
+
+                await send(
+                    MessageOutRecordingCommitted(
+                        blocks=result.blocks,
+                        parameters=result.parameters,
+                        mode=result.mode,
+                        diagnostics=result.diagnostics,
+                    )
+                )
+                discard_session_v2(commit_session.browser_session_id)
 
             case MessageKind.GET_BROWSER_URL:
                 try:
@@ -1062,6 +1218,12 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         if pending_clipboard_tasks:
             await asyncio.gather(*pending_clipboard_tasks, return_exceptions=True)
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
+        # A live v2 recording survives a socket reconnect (begin-exfiltration restarts the
+        # ticker); only a sealed one is dropped here.
+        if (v2_session := recording_session_v2()) is not None:
+            await v2_session.stop_ticker()
+            if v2_session.sealed:
+                discard_session_v2(v2_session.browser_session_id)
         if exfiltration_channel is not None:
             try:
                 await exfiltration_channel.stop()

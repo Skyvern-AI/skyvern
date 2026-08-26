@@ -30,6 +30,8 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR,
     _RENDERED_STYLE_SNAPSHOT_ATTR,
     _RESULT_CONTAINER_HINTS,
+    OBSERVED_CHECKED_FIELD_TYPES,
+    OBSERVED_VALUE_FIELD_TYPES,
 )
 
 # Keep stripped-body evaluate results under the shared MCP response cap while
@@ -482,6 +484,8 @@ _STRUCTURED_CONST_HEADER = (
     f"const MODAL_IDENTITY_PATTERNS={json.dumps(sorted(_MODAL_IDENTITY_PATTERNS))};"
     f"const MODAL_ROLE_VALUES={json.dumps(sorted(_MODAL_ROLE_VALUES))};"
     f"const RESULT_CONTAINER_HINTS={json.dumps(sorted(_RESULT_CONTAINER_HINTS))};"
+    f"const OBSERVED_VALUE_TYPES=new Set({json.dumps(sorted(OBSERVED_VALUE_FIELD_TYPES))});"
+    f"const OBSERVED_CHECKED_TYPES=new Set({json.dumps(sorted(OBSERVED_CHECKED_FIELD_TYPES))});"
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
@@ -856,6 +860,21 @@ const isFilled = (el) => {
     return false;
   }
 };
+// Live DOM property state, which diverges from the markup attribute once the agent interacts.
+const observedValue = (el) => {
+  try {
+    return typeof el.value === 'string' ? cap(el.value.trim()) : '';
+  } catch (e) {
+    return '';
+  }
+};
+const observedChecked = (el) => {
+  try {
+    return el.checked === true;
+  } catch (e) {
+    return false;
+  }
+};
 const FIELD_TAGS = new Set(['input', 'select', 'textarea', 'button']);
 const adjacentText = (field) => {
   for (const dir of ['next', 'prev']) {
@@ -906,7 +925,7 @@ const selectOptions = (el) => {
   const out = [];
   const opts = el.querySelectorAll('option');
   for (let i = 0; i < opts.length && out.length < MAX_SELECT_OPTIONS; i++) {
-    out.push({ text: nodeText(opts[i]), value: attr(opts[i], 'value'), selected: opts[i].hasAttribute('selected') });
+    out.push({ text: nodeText(opts[i]), value: attr(opts[i], 'value'), selected: opts[i].hasAttribute('selected'), observed_selected: opts[i].selected === true });
   }
   return out;
 };
@@ -1075,6 +1094,12 @@ for (const form of document.querySelectorAll('form')) {
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
     const options = tag === 'select' ? selectOptions(node) : [];
     const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
+    // Observed state needs both a real <input> tag here and the reported attribute type at the
+    // Python and replay re-gates; the pair is deliberately an AND so a page that declares
+    // type="date" on a textarea mirroring a password acquires no observed value.
+    const observedType = tag === 'input' ? lower(node.type) : '';
+    if (OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
+    if (OBSERVED_CHECKED_TYPES.has(observedType)) field.observed_checked = observedChecked(node);
     if (tag === 'select') {
       field.option_count = node.querySelectorAll('option').length;
       field.options_omitted = field.option_count > options.length;

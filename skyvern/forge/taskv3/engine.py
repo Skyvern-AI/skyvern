@@ -222,6 +222,7 @@ async def run_task_v3_agent_loop(
             downloads_dir=downloads_dir,
             organization_id=organization_id,
             resolve_typed_text=resolve_typed_text,
+            opaque_refs=refs,
         )
     )
 

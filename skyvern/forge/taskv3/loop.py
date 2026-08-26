@@ -324,6 +324,107 @@ class _PerceptionLedger:
         return False
 
 
+# Net-progress ledger (SKY-15020 Lever C). The repetition guards above ask whether the page or
+# action REPEATED; this asks whether the run made NET PROGRESS. Real stuck-ness is often VARIED
+# actions with zero net progress (SKY-14998: 21 input-timeouts on different selectors — varied
+# actions, varied perception — so no repetition guard trips and the run oscillates to the cap). The
+# ledger is SHADOW-ONLY and ADDITIVE: it emits a "would fail-fast" event but terminates nothing and
+# leaves the three guards untouched. Adding live terminations is a release-posture change gated on
+# this event's own decision precision plus operator sign-off.
+PROGRESS_LEDGER_WINDOW = 8
+# Facetable event names; the offline precision/survival metrics key on these — change only with the
+# dashboards that read them.
+PROGRESS_LEDGER_SHADOW_EVENT = "taskv3 loop progress ledger would fail-fast"
+PROGRESS_LEDGER_FINAL_EVENT = "taskv3 loop progress ledger final"
+
+
+@dataclass
+class _ProgressLedger:
+    """Billable actions since the last net-progress signal, plus its per-run peak.
+
+    The already-computed distance-to-done metric is the observe summary's ``invalid_fields`` count.
+    Net progress is any of: a navigation or download landing (hard progress), the count reaching a
+    NEW LOW (a real form advance), or the count RISING since the last look (a fresh page's required
+    fields, or a submit that surfaced new errors — either way the context changed, so the prior
+    no-progress streak is stale). Novelty is deliberately NOT progress: varied thrash produces novel
+    perception, which is why the streak is counted against the invalid-field trend, not the page
+    digest.
+
+    Two invariants keep the over-termination direction safe:
+    - The verdict is taken on an OBSERVE that CONFIRMS no progress, never on the raw action count: a
+      run that batches several fixes before re-observing (markers stay valid until the page
+      re-renders) has not yet shown a stalled look, so the streak withholds rather than fires.
+    - ``form_armed`` reflects the CURRENT look, not a sticky earlier one, so a form-less page (a
+      confirmation/extraction page, or a solved form) can never be judged stuck here.
+
+    The design is intentionally biased toward PRECISION over recall — a shadow verdict headed for a
+    future live terminator must not fire on a progressing run. A real page-transition signal (the click
+    tool's ``page_transitioned``, from its already-computed url_before/url_after) closes ONE precision
+    gap the rise heuristic left: a click that moves the URL re-baselines cleanly as hard progress, so a
+    fresh page whose ``invalid_fields`` count coincidentally equals the prior page's no longer reads as a
+    stalled look. Only the POSITIVE direction is used — a URL change proves a transition — because URL
+    equality does NOT prove same-page (a URL-stable SPA multi-step form advances without moving the URL),
+    so the ledger never suppresses a re-baseline on an unchanged URL. That leaves known false-NEGATIVES
+    (the SAFE direction) the shadow numbers under-count: a run whose ``invalid_fields`` OSCILLATES or
+    CREEPS still re-baselines on every up-swing (the rise heuristic cannot separate same-page thrash from
+    a real advance without a stronger same-page oracle — the Lever C recall follow-up), and a form
+    silently rejected while showing zero invalid fields never arms.
+
+    Reads only what the loop already computed — no extra LLM turn, no re-observe.
+    """
+
+    window: int = PROGRESS_LEDGER_WINDOW
+    actions_since_progress: int = 0
+    peak_actions_since_progress: int = 0
+    invalid_baseline: int | None = None  # floor for the current page/context; rebased on rise or new low
+    last_invalid: int | None = None
+    form_armed: bool = False
+    ever_armed: bool = False  # a form was seen at least once — the runs the survival record is emitted for
+    shadow_reported: bool = False
+
+    def observe(self, invalid_fields: int) -> bool:
+        """Record an observation; return True the first time one CONFIRMS window-length no-progress."""
+        prev = self.last_invalid
+        self.last_invalid = invalid_fields
+        # Reflects THIS look only: a page with no invalid fields must not be judged stuck here.
+        self.form_armed = invalid_fields > 0
+        self.ever_armed = self.ever_armed or self.form_armed
+        if self.invalid_baseline is None:
+            self.invalid_baseline = invalid_fields
+            return False
+        if invalid_fields < self.invalid_baseline:
+            # A new low: real net progress on the form. Reset the streak and re-baseline.
+            self.actions_since_progress = 0
+            self.invalid_baseline = invalid_fields
+            return False
+        if prev is not None and invalid_fields > prev:
+            # The count rose since the last look: a new page's fresh required fields, or a submit that
+            # surfaced new errors. Re-baseline to the new floor instead of measuring it against a
+            # stale, lower one. A real click-driven transition instead arrives as hard_progress()
+            # upstream (baseline cleared); this rise path is the fallback for same-page count changes
+            # and for transitions no tool witnessed.
+            self.actions_since_progress = 0
+            self.invalid_baseline = invalid_fields
+            return False
+        # Flat, with no new low and no rise: this look confirms no net progress since the last one.
+        if self.actions_since_progress >= self.window and self.form_armed and not self.shadow_reported:
+            self.shadow_reported = True
+            return True
+        return False
+
+    def hard_progress(self) -> None:
+        # Navigation or a download landing: unambiguous progress. The old page's distance metric is
+        # stale, so drop the baseline; the next observe re-arms from the new page.
+        self.actions_since_progress = 0
+        self.form_armed = False
+        self.invalid_baseline = None
+
+    def on_billable(self) -> None:
+        """Count one billable action toward the no-progress streak (the verdict is taken on observe)."""
+        self.actions_since_progress += 1
+        self.peak_actions_since_progress = max(self.peak_actions_since_progress, self.actions_since_progress)
+
+
 # Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
 # solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
 # complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
@@ -825,6 +926,7 @@ async def run_agent_tool_loop(
     stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
     action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
     action_terminate_after: int | None = ACTION_LOOP_TERMINATE_AFTER,
+    progress_window: int | None = PROGRESS_LEDGER_WINDOW,
     activity: ActivityRecency | None = None,
     submit_watch: SubmitWatch | None = None,
     telemetry_salt: str | None = None,
@@ -850,6 +952,8 @@ async def run_agent_tool_loop(
     # compaction can keep only the newest of each without inferring "real snapshot" from content size.
     snapshot_indices: set[int] = set()
     perception = _PerceptionLedger()
+    # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
+    progress = _ProgressLedger(window=progress_window) if progress_window is not None else None
     # The action-loop counter: (repeat count, first turn of the streak) per billable action
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
@@ -1089,6 +1193,21 @@ async def run_agent_tool_loop(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
             result_data = result.data or {}
+            if progress is not None and observe_summary:
+                invalid_fields = observe_summary.get("invalid_fields")
+                if invalid_fields is not None and progress.observe(invalid_fields):
+                    # Shadow only: a full window of billable actions passed and this look confirms no
+                    # net progress (a formful page whose invalid-field count never improved). Emit,
+                    # never terminate.
+                    LOG.info(
+                        PROGRESS_LEDGER_SHADOW_EVENT,
+                        actions=progress.actions_since_progress,
+                        invalid_fields=progress.last_invalid,
+                        form_armed=progress.form_armed,
+                        tool=tool_name,
+                        turn=turns,
+                        **attribution,
+                    )
             if staged_downloads is not None and result_data.get("staged_download"):
                 staged_downloads.add(result_data["staged_download"])
             if spec is not None and (result_data.get("download_notice") or result_data.get("page_state_changed")):
@@ -1097,6 +1216,17 @@ async def run_agent_tool_loop(
                 # (a "download next" flow), or re-trying after navigating to a fresh page, is a
                 # healthy loop, not a stuck one.
                 _clear_action_state()
+                if progress is not None:
+                    progress.hard_progress()
+            # A click that moved the URL is a real page transition (H1 hard progress) for the shadow
+            # ledger: re-baseline so a fresh page whose invalid-field count coincidentally matches the
+            # prior page's does not read as a stalled look. Only the POSITIVE (True) direction is acted
+            # on — a URL change proves a transition, but URL equality does NOT prove same-page (a
+            # URL-stable SPA form advance), so page_transitioned=False is left to the rise heuristic and
+            # never suppresses a re-baseline. Kept OUT of the live page_state_changed branch above so it
+            # does not clear the action-loop guard's state — this signal is shadow-only and additive.
+            if result_data.get("page_transitioned") is True and progress is not None:
+                progress.hard_progress()
             if content_digest is not None:
                 snap = perception.record(action_key, content_digest)
                 if snap.progressed:
@@ -1155,6 +1285,8 @@ async def run_agent_tool_loop(
                     # crosses the threshold exactly once per streak and before any live verdict.
                     stall_nudges_due.append((tool_name, snap.tool_identical))
             if spec is not None and spec.billable:
+                if progress is not None:
+                    progress.on_billable()
                 # Errored dispatches count too: a failed attempt consumed a step (see the action-step
                 # accounting above) and a repeat-failing action is the same no-progress pathology.
                 repeat_count, first_turn = action_counts.get(action_key, (0, turns))
@@ -1285,6 +1417,24 @@ async def run_agent_tool_loop(
 
     if outcome is None:
         outcome = LoopOutcome("loop_error", "loop exited without an outcome")
+
+    if progress is not None and progress.ever_armed:
+        # Per-run survival record, emitted only for runs that ever saw a form (the population the
+        # ledger applies to — this bounds the added log volume to formful runs, not every v3 run):
+        # the peak no-progress streak and whether the shadow verdict would have fired, tagged with the
+        # terminal outcome — joined offline (by task_id via log context) to grade the ledger's
+        # precision and to pick an enforce window from the streak distribution at completion vs
+        # budget-death, not by gut. Read fire-precision as trustworthy but recall as a FLOOR: the
+        # ledger is precision-biased (see _ProgressLedger), so FEW FIRES != FEW STUCK RUNS.
+        LOG.info(
+            PROGRESS_LEDGER_FINAL_EVENT,
+            peak_actions_since_progress=progress.peak_actions_since_progress,
+            actions_since_progress=progress.actions_since_progress,
+            form_armed=progress.form_armed,
+            would_fire=progress.shadow_reported,
+            outcome_status=outcome.status,
+            turns=turns,
+        )
 
     outcome.turns = turns
     outcome.no_tool_call_turns = no_tool_call_turns

@@ -61,6 +61,10 @@ _MAX_TABLE_HEADERS = 12
 _MAX_RESULT_SAMPLE_ROWS = 5
 _MAX_NAVIGATION_TARGETS = 20
 _MAX_SELECT_OPTIONS = 30
+# Live DOM property state is admitted only for a real <input> whose browser-normalized property type
+# is listed here, so a page declaring type="date" on a textarea cannot mint an observed value.
+OBSERVED_VALUE_FIELD_TYPES: frozenset[str] = frozenset({"date", "datetime-local", "time", "month", "week"})
+OBSERVED_CHECKED_FIELD_TYPES: frozenset[str] = frozenset({"checkbox", "radio"})
 _MAX_CHALLENGE_CONTROLS = 8
 _MAX_MODAL_OVERLAYS = 5
 _MAX_MODAL_DISMISS_CONTROLS = 6
@@ -3355,20 +3359,21 @@ def _structured_classes(value: Any) -> str:
     return " ".join(classes[:5])[:160]
 
 
-def _structured_select_options(value: Any) -> list[dict[str, Any]]:
+def _structured_select_options(value: Any, *, admit_observed: bool) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     if not isinstance(value, list):
         return options
     for option in value[:_MAX_SELECT_OPTIONS]:
         if not isinstance(option, dict):
             continue
-        options.append(
-            {
-                "text": _structured_str(option.get("text"))[:120],
-                "value": _structured_str(option.get("value")).strip()[:160],
-                "selected": option.get("selected") is True,
-            }
-        )
+        entry = {
+            "text": _structured_str(option.get("text"))[:120],
+            "value": _structured_str(option.get("value")).strip()[:160],
+            "selected": option.get("selected") is True,
+        }
+        if admit_observed and isinstance(option.get("observed_selected"), bool):
+            entry["observed_selected"] = option["observed_selected"]
+        options.append(entry)
     return options
 
 
@@ -3507,7 +3512,8 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         if not isinstance(node, dict) or len(fields) >= _MAX_FIELDS_PER_FORM:
             continue
         field_type = (_structured_str(node.get("type")) or "text").lower()
-        options = _structured_select_options(node.get("options"))
+        real_tag = (_structured_identity(node.get("identity")) or {}).get("tag", "")
+        options = _structured_select_options(node.get("options"), admit_observed=real_tag == "select")
         field = {
             "name": _structured_str(node.get("name"))[:120],
             "id": _structured_str(node.get("id"))[:120],
@@ -3524,6 +3530,11 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
             "options": options,
             "selector": _bounded_selector(_structured_str(node.get("selector"))),
         }
+        if real_tag == "input":
+            if field_type in OBSERVED_VALUE_FIELD_TYPES and isinstance(node.get("observed_value"), str):
+                field["observed_value"] = _structured_str(node["observed_value"]).strip()[:160]
+            if field_type in OBSERVED_CHECKED_FIELD_TYPES and isinstance(node.get("observed_checked"), bool):
+                field["observed_checked"] = node["observed_checked"]
         if field_type == "select":
             field.update(_structured_select_option_facts(node, options))
         if isinstance(node.get("visible"), bool):

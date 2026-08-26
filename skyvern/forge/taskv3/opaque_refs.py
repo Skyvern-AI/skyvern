@@ -6,6 +6,7 @@ Never import this from tools.py, loop.py, or auth_tools.py: it imports auth_tool
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -203,6 +204,24 @@ class OpaqueUrlRefs:
             if token in resolved:
                 resolved = resolved.replace(token, url)
         return resolved
+
+    def mask(self, text: str) -> str:
+        """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token —
+        the inverse of resolve(). Masking is by PROVENANCE, not URL shape: only a URL we minted from
+        the payload is rewritten, so a live-page URL the model must reason about is never touched, even
+        when it is itself signing-shaped (a ``?gclid=``/``?token=`` landing page). Output-only surfaces
+        never resolve the token back; the token is the same one the payload masker minted for that URL."""
+        masked = text
+        # Longest URL first so a payload URL that is a prefix of another is not partially rewritten.
+        for token, url in sorted(self.refs.items(), key=lambda item: len(item[1]), reverse=True):
+            # A URL rendered inside HTML (get_html) has its query separators entity-encoded (& -> &amp;),
+            # so a multi-parameter presigned URL — the dominant signed-payload shape — never matches its
+            # raw form there; match the escaped form too. Plain-text surfaces only carry the raw form,
+            # where html.escape is a no-op, so the extra variant is harmless (dedup collapses it).
+            for variant in dict.fromkeys((url, html.escape(url, quote=False))):
+                if variant in masked:
+                    masked = masked.replace(variant, token)
+        return masked
 
     def resolve_deep(self, value: Any) -> Any:
         if isinstance(value, str):

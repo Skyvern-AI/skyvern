@@ -17,13 +17,18 @@ import json
 import os
 import random
 import re
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
+
+if TYPE_CHECKING:
+    # opaque_refs imports auth_tools which imports this module, so it can only be referenced for
+    # typing; the OpaqueUrlRefs instance is passed in at runtime, never imported here.
+    from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs
 
 LOG = structlog.get_logger()
 
@@ -2837,8 +2842,16 @@ def build_browser_tools(
     downloads_dir: str | None = None,
     organization_id: str | None = None,
     resolve_typed_text: Callable[[str], Any] | None = None,
+    opaque_refs: OpaqueUrlRefs | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call."""
+
+    def _mask_refs(text: str) -> str:
+        # A signed payload URL masked to a token in the payload must not reappear verbatim through a
+        # free-text emit surface (observe's url= line, get_html, a download error) and get retyped by
+        # the model. Masking is by provenance: only URLs the payload masker minted are rewritten, so a
+        # live-page URL the model reasons about is never touched. No refs (page-free) → identity.
+        return opaque_refs.mask(text) if opaque_refs is not None else text
 
     def _resolve_text(text: str) -> str:
         # Workflow credential values reach the model only as secret placeholders; resolve them to the
@@ -2911,7 +2924,7 @@ def build_browser_tools(
                 listed=len(elements),
             )
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
-        raw_url = str(data.get("url") or "")
+        raw_url = _mask_refs(str(data.get("url") or ""))
         # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
         # the note is measured against the sanitized length rather than the raw one.
         sanitized_url = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", raw_url)
@@ -3092,7 +3105,11 @@ def build_browser_tools(
             "markers_reused": data.get("markersReused") or 0,
             "group_texts_found": sum(1 for e in elements if e.get("group")),
         }
-        return ToolResult.ok("\n".join(lines), data={"count": len(elements), "summary": summary})
+        # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
+        # text or a field value the model previously typed (a token resolved back to its URL), and
+        # those lines would otherwise leak the signing artifact. Provenance-only, so benign page text
+        # is untouched. url= is already masked before truncation above; re-masking a token is a no-op.
+        return ToolResult.ok(_mask_refs("\n".join(lines)), data={"count": len(elements), "summary": summary})
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -3118,6 +3135,7 @@ def build_browser_tools(
         # probe stamps data-tv3-proxy on one label; both are internal bookkeeping, and left in place the
         # first costs a third of the truncation budget below in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-proxy="1"', "")
+        html = _mask_refs(html)
         if len(html) > 20000:
             return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]")
         return ToolResult.ok(html)
@@ -3602,6 +3620,15 @@ def build_browser_tools(
                 raise
             base = f"clicked {selector} — now at {await _url(page)}"
 
+        # url_after vs url_before is the real page-transition signal the shadow net-progress ledger
+        # reads (loop.py _ProgressLedger). Surfaced, not newly computed: _url is the page.url property,
+        # not a probe, so this adds no evaluate. history.pushState can move the URL without leaving the
+        # document, so this is a hint the ledger treats as re-baseline evidence, not a hard assertion.
+        url_after = await _url(page)
+        transition_data: dict[str, Any] = {
+            "page_transitioned": bool(url_before and url_after and url_after != url_before)
+        }
+
         if skinned:
             try:
                 checked_after = await page.evaluate(_CHECKBOX_CHECKED_JS, await _probe_arg(page, selector))
@@ -3610,25 +3637,27 @@ def build_browser_tools(
             if checked_after is None:
                 return ToolResult.ok(
                     f"{base} — the control left the page after the click, so its state could not be "
-                    "verified; re-observe before relying on it"
+                    "verified; re-observe before relying on it",
+                    data=transition_data,
                 )
             if checked_after == checked_before:
                 return ToolResult.error(
                     f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
                     "the styled proxy may not sync from its hidden control; re-observe and act on the visible "
-                    "proxy instead"
+                    "proxy instead",
+                    data=transition_data,
                 )
 
         if pre is None:
-            return ToolResult.ok(base)
+            return ToolResult.ok(base, data=transition_data)
         try:
             note, commit_error = await _click_reaction(page, selector, pre, url_before, doc_planted=doc_planted)
         except Exception:
             LOG.debug("taskv3 click reaction probe failed", selector=selector, exc_info=True)
-            return ToolResult.ok(base)
+            return ToolResult.ok(base, data=transition_data)
         if commit_error is not None:
-            return ToolResult.error(commit_error)
-        return ToolResult.ok(base + "\n" + note if note else base)
+            return ToolResult.error(commit_error, data=transition_data)
+        return ToolResult.ok(base + "\n" + note if note else base, data=transition_data)
 
     async def hover(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -4053,7 +4082,15 @@ def build_browser_tools(
         if ambiguous is not None:
             return ambiguous
         source = _resolve_text(args["file"])
-        local_path = await download_file(source, output_dir=downloads_dir, organization_id=organization_id)
+        try:
+            local_path = await download_file(source, output_dir=downloads_dir, organization_id=organization_id)
+        except Exception as exc:
+            # Catching here (rather than letting the loop's handler catch) is only to mask the URL:
+            # a failed download echoes the source back in its message, and a signed payload URL would
+            # otherwise leak its signing artifact to the model (the SKY-14492 retype case). Re-emit the
+            # traceback log the loop's handler would have produced so the local catch doesn't swallow it.
+            LOG.warning("taskv3 tool handler raised", tool="file_upload", exc_info=True)
+            return ToolResult.error(_mask_refs(f"tool_error: {type(exc).__name__}: {exc}"))
         # For http(s) sources download_file stages into downloads_dir; naming the file lets the
         # download-signal wrapper suppress it without swallowing unrelated downloads that complete
         # during this call (for other schemes the key is inert — nothing in the dir matches).
