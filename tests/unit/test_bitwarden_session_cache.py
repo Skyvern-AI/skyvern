@@ -13,7 +13,6 @@ before an item miss is believed.
 """
 
 import asyncio
-import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -729,16 +728,18 @@ async def test_a_burst_across_more_vaults_than_the_cache_holds_drains_back_to_ca
     assert len(bitwarden_module._cli_sessions._sessions) <= capacity
 
 
-def test_the_identity_fingerprint_is_not_an_offline_oracle_for_the_master_password() -> None:
+def test_the_identity_fingerprint_is_keyed_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
     """A log reader who knows the email must not be able to confirm password guesses against it."""
     email, master_password = "user@example.com", "hunter2"
     identity = bitwarden_module._VaultIdentity.resolve(
         client_id=None, client_secret=None, email=email, master_password=master_password
     )
-    unsalted = hashlib.sha256(f"email\x00{email}\x00{master_password}".encode()).hexdigest()
 
-    assert identity.fingerprint != unsalted
-    # Still stable within the process, which is all the cache keys on.
+    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_KEY", b"a" * 32)
+    first_process = identity.fingerprint
+    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_KEY", b"b" * 32)
+
+    assert identity.fingerprint != first_process
     assert identity.fingerprint == identity.fingerprint
 
 

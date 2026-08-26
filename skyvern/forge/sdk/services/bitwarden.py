@@ -1,7 +1,7 @@
 import asyncio
 import atexit
 import contextlib
-import hashlib
+import hmac
 import json
 import os
 import random
@@ -78,10 +78,10 @@ _EXPIRED_SESSION_MARKERS = (
 # worth one forced sync before believing the miss.
 _STALE_VAULT_MARKERS = ("not found", "no items found", "no item found")
 
-# The fingerprint is only ever compared against others made in this process, so salt it with a random
-# per-process key. An unsalted digest would be a fast, unkeyed function of the master password, which
-# would turn any log line carrying it into an offline oracle for guessing that password.
-_IDENTITY_FINGERPRINT_SALT = secrets.token_bytes(32)
+# The fingerprint is only ever compared against others made in this process, so key it with a random
+# per-process secret. An unkeyed digest would turn any log line carrying it into an offline oracle for
+# guessing the master password.
+_IDENTITY_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 class _SessionRepair(StrEnum):
@@ -137,9 +137,7 @@ class _VaultIdentity:
             if self.uses_email_auth
             else ["apikey", self.client_id or "", self.client_secret or "", self.master_password]
         )
-        digest = hashlib.sha256(_IDENTITY_FINGERPRINT_SALT)
-        digest.update("\x00".join(material).encode())
-        return digest.hexdigest()
+        return hmac.digest(_IDENTITY_FINGERPRINT_KEY, "\x00".join(material).encode(), "sha256").hex()
 
     def __repr__(self) -> str:
         return f"_VaultIdentity(fingerprint={self.fingerprint[:12]})"
