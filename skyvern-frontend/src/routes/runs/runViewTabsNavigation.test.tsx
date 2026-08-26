@@ -154,20 +154,19 @@ describe("run view tab navigation stays in its mounted route family", () => {
     function RelativeSplat() {
       return (
         <Routes>
+          <Route index element={<Navigate to="overview" replace />} />
           <Route
+            path="overview"
             element={
               <div>
                 <SwitchBarNavigation
                   options={[{ label: "output", to: "output" }]}
                 />
-                <Outlet />
+                <div>PANEL_overview</div>
               </div>
             }
-          >
-            <Route index element={<Navigate to="overview" replace />} />
-            <Route path="overview" element={<div>PANEL_overview</div>} />
-            <Route path="output" element={<div>PANEL_output</div>} />
-          </Route>
+          />
+          <Route path="output" element={<div>PANEL_output</div>} />
         </Routes>
       );
     }
