@@ -10,7 +10,9 @@ meters per action exactly like the step engine.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,6 +34,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
     ExtractionBlock,
+    FileDownloadBlock,
     HumanInteractionBlock,
     LoginBlock,
     NavigationBlock,
@@ -872,8 +875,9 @@ _ALLOWED_BLOCK_CASES: list[tuple[type[BaseTaskBlock], dict[str, Any]]] = [
     (ActionBlock, {}),
     (ValidationBlock, {}),
     (ExtractionBlock, {"data_extraction_goal": "Extract the price"}),
+    (FileDownloadBlock, {"complete_on_download": True}),
 ]
-_ALLOWED_BLOCK_IDS = ["task", "navigation", "login", "action", "validation", "extraction"]
+_ALLOWED_BLOCK_IDS = ["task", "navigation", "login", "action", "validation", "extraction", "file_download"]
 
 
 @pytest.mark.parametrize("block_cls,overrides", _ALLOWED_BLOCK_CASES, ids=_ALLOWED_BLOCK_IDS)
@@ -897,8 +901,27 @@ def test_task_block_supports_v3_denies_unsupported_block_type() -> None:
     ],
     ids=["complete_on_download", "download_suffix", "download_timeout"],
 )
-def test_task_block_supports_v3_denies_download_semantics(overrides: dict[str, Any]) -> None:
-    assert agent_module._task_block_supports_v3(_make_block(ActionBlock, **overrides)) is False
+def test_task_block_supports_v3_allows_download_semantics(overrides: dict[str, Any]) -> None:
+    assert agent_module._task_block_supports_v3(_make_block(ActionBlock, **overrides)) is True
+
+
+@pytest.mark.parametrize(
+    "block_cls", [ActionBlock, TaskBlock, FileDownloadBlock], ids=["action", "task", "file_download"]
+)
+def test_task_block_supports_v3_allows_complete_on_download_for_non_validation(
+    block_cls: type[BaseTaskBlock],
+) -> None:
+    assert agent_module._task_block_supports_v3(_make_block(block_cls, complete_on_download=True)) is True
+
+
+def test_task_block_supports_v3_denies_download_gated_validation() -> None:
+    # A validation block never acts on the page, so it can't trigger the download it would
+    # complete on; this combination must stay on the step engine (SKY-14905).
+    assert agent_module._task_block_supports_v3(_make_block(ValidationBlock, complete_on_download=True)) is False
+
+
+def test_task_block_supports_v3_allows_validation_without_complete_on_download() -> None:
+    assert agent_module._task_block_supports_v3(_make_block(ValidationBlock)) is True
 
 
 class _StepEngineDispatched(BaseException):
@@ -991,11 +1014,12 @@ async def test_execute_step_dispatches_supported_block_types_to_v3(
     ],
     ids=["complete_on_download", "download_suffix", "download_timeout"],
 )
-async def test_execute_step_falls_through_to_step_engine_on_download_semantics(overrides: dict[str, Any]) -> None:
+async def test_execute_step_dispatches_download_semantics_blocks_to_v3(overrides: dict[str, Any]) -> None:
     block = _make_block(ActionBlock, **overrides)
     v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=block)
-    v3_mock.assert_not_awaited()
-    step_engine_mock.assert_awaited_once()
+    v3_mock.assert_awaited_once()
+    assert v3_mock.await_args.kwargs["task_block"] is block
+    step_engine_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1033,6 +1057,417 @@ async def test_execute_step_bare_task_with_verification_url_dispatches_to_v3() -
     )
     v3_mock.assert_awaited_once()
     step_engine_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# P2b: complete_on_download wiring -- the completion_probe/completion_blocker
+# handed to run_task_v3_agent_loop, backed by the same finalize-and-rename path
+# v1 uses (ForgeAgent._finalize_downloaded_files_for_task).
+# ---------------------------------------------------------------------------
+
+
+async def _run_execute_task_v3_download(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    drop_file: bool,
+    block_cls: type[BaseTaskBlock] = ActionBlock,
+    task_id: str = "task-123",
+    step_id: str = "step-download",
+    download_suffix: str = "invoice",
+    dropped_filename: str = "report.pdf",
+    loop_fn: Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
+) -> dict[str, Any]:
+    """Drive _execute_task_v3 for a complete_on_download block, capturing the loop kwargs.
+
+    The fake loop stands in for run_task_v3_agent_loop: it optionally drops a new file into the
+    run's download directory (mimicking a tool call that triggered a download), then awaits the
+    completion_probe/completion_blocker it was handed, exactly like the real loop does.
+
+    ``loop_fn``, when given, fully replaces the default drop-then-probe-once loop body -- used to
+    drive a block through a custom probe/blocker sequence (e.g. a second block in the same run,
+    checked against a baseline that already contains an earlier block's file).
+    """
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        task_id=task_id,
+        workflow_run_id="wr-download-test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    step = make_step(now, task, step_id=step_id, status=StepStatus.created, order=0, output=None)
+    browser_state, _, page = make_browser_state()
+    browser_state.must_get_working_page = AsyncMock(return_value=page)
+    browser_state.get_working_page = AsyncMock(return_value=page)
+    browser_state.take_post_action_screenshot = AsyncMock(return_value=b"png-bytes")
+
+    block = _make_block(block_cls, complete_on_download=True, download_suffix=download_suffix)
+
+    captured: dict[str, Any] = {}
+
+    async def _default_loop_body(**kwargs: Any) -> LoopOutcome:
+        if drop_file:
+            (tmp_path / dropped_filename).write_bytes(b"file-bytes")
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
+        captured["blocker_message"] = await kwargs["completion_blocker"](frozenset())
+        if captured["probe_reason"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    async def _loop(**kwargs: Any) -> LoopOutcome:
+        if loop_fn is not None:
+            return await loop_fn(kwargs, captured)
+        return await _default_loop_body(**kwargs)
+
+    loop_mock = AsyncMock(side_effect=_loop)
+    monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
+    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    # get_path_for_workflow_download_directory (imported by agent.py) resolves through this same
+    # module-level name at call time, so patching it here also redirects that call.
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", AsyncMock(return_value="artifact-1")
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_params.create_action",
+        AsyncMock(side_effect=lambda action: action),
+    )
+    monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", AsyncMock())
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.gate_step_completion", AsyncMock(return_value=True))
+
+    async def fake_update_step(
+        step: Step, status: StepStatus | None = None, output: Any = None, **_kwargs: Any
+    ) -> Step:
+        if status is not None:
+            step.status = status
+        if output is not None:
+            step.output = output
+        return step
+
+    async def fake_update_task(task: Any, status: Any = None, **_kwargs: Any) -> Any:
+        if status is not None:
+            task.status = status
+        if "failure_reason" in _kwargs:
+            task.failure_reason = _kwargs["failure_reason"]
+        return task
+
+    agent.update_step = AsyncMock(side_effect=fake_update_step)
+    agent.update_task = AsyncMock(side_effect=fake_update_task)
+    agent.clean_up_task = AsyncMock()
+
+    context = SkyvernContext(
+        task_id=task.task_id,
+        step_id=step.step_id,
+        organization_id=task.organization_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+    skyvern_context.set(context)
+    try:
+        await agent._execute_task_v3(
+            task=task,
+            step=step,
+            browser_state=browser_state,
+            organization=organization,
+            api_key=None,
+            close_browser_on_completion=True,
+            browser_session_id=None,
+            task_block=block,
+        )
+    finally:
+        skyvern_context.reset()
+
+    captured["clean_up_kwargs"] = agent.clean_up_task.await_args.kwargs if agent.clean_up_task.await_args else {}
+    return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_cls", [ActionBlock, FileDownloadBlock], ids=["action", "file_download"])
+async def test_execute_task_v3_download_completion_probe_finalizes_and_ends_the_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, block_cls: type[BaseTaskBlock]
+) -> None:
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=True, block_cls=block_cls)
+
+    assert captured["probe_reason"]
+    # Renamed per download_suffix="invoice", same as v1's finalize path.
+    assert (tmp_path / "invoice.pdf").exists()
+    assert not (tmp_path / "report.pdf").exists()
+    # The probe already finalized against the pre-loop baseline; clean_up_task must not
+    # finalize again (v1's no-double-finalize contract).
+    assert captured["clean_up_kwargs"]["list_files_before"] is None
+    assert captured["clean_up_kwargs"]["download_suffix"] == "invoice"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_cls", [ActionBlock, FileDownloadBlock], ids=["action", "file_download"])
+async def test_execute_task_v3_download_completion_probe_no_file_blocks_finish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, block_cls: type[BaseTaskBlock]
+) -> None:
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, block_cls=block_cls)
+
+    assert captured["probe_reason"] is None
+    assert captured["blocker_message"]
+    assert isinstance(captured["blocker_message"], str)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_completion_probe_returns_none_when_wait_reports_cancellation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A run being canceled races with a download landing: the wait reports the cancellation, but
+    # a file already sits in the directory. The probe must not finalize it into a `completed`
+    # result out from under the cancellation -- it must return None and leave finalize untouched.
+    finalize_mock = AsyncMock()
+    monkeypatch.setattr(ForgeAgent, "_wait_for_in_flight_downloads", AsyncMock(return_value=True))
+    monkeypatch.setattr(ForgeAgent, "_finalize_downloaded_files_for_task", finalize_mock)
+
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=True)
+
+    assert captured["probe_reason"] is None
+    finalize_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_completion_with_extraction_goal_is_blocker_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A data-extraction goal needs the model to keep the turn and call finish(completed,
+    # extracted_output=...) itself; the probe would otherwise end the loop the moment a billable
+    # action lands the download, before extraction ever happens.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock, complete_on_download=True, download_suffix="invoice")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_extract",
+        data_extraction_goal="Extract the invoice total",
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["completion_probe"] is None
+    assert loop_mock.await_args.kwargs["completion_blocker"] is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_timeout_only_gets_wait_only_probe_no_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # download_timeout alone carries no completion semantics; it must not go inert on v3 -- v1
+    # bounds a post-action download-settle wait with it, so v3 gets an equivalent wait-only probe
+    # that awaits the same in-flight-download wait and never ends the run or blocks finish.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock, download_timeout=5.0)
+    assert block.complete_on_download is False
+    wait_mock = AsyncMock()
+    monkeypatch.setattr(ForgeAgent, "_wait_for_in_flight_downloads", wait_mock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_wait_only",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    probe = loop_mock.await_args.kwargs["completion_probe"]
+    assert probe is not None
+    assert loop_mock.await_args.kwargs["completion_blocker"] is None
+
+    result = await probe(frozenset())
+    assert result is None
+    wait_mock.assert_awaited_once()
+    assert wait_mock.await_args.kwargs["timeout_cap"] is not None
+    assert isinstance(wait_mock.await_args.kwargs["exhausted"], set)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_baseline_is_scoped_per_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Two complete_on_download blocks in the same workflow run, sharing one download directory:
+    # block 1 (ActionBlock) lands a.pdf and completes on it; block 2 (FileDownloadBlock) starts
+    # with block 1's renamed file already sitting in the directory. Block 2's own baseline -- taken
+    # fresh at the top of its own _execute_task_v3 call -- must already contain that leftover file,
+    # so it is never mistaken for something block 2 downloaded.
+    captured_block1 = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=True,
+        block_cls=ActionBlock,
+        task_id="task-block-1",
+        step_id="step-block-1",
+        download_suffix="first.pdf",
+        dropped_filename="a.pdf",
+    )
+    assert captured_block1["probe_reason"]
+    assert (tmp_path / "first.pdf").exists()
+    assert not (tmp_path / "a.pdf").exists()
+    assert captured_block1["clean_up_kwargs"]["list_files_before"] is None
+
+    async def _block2_loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        # No new file yet: block 2's baseline already contains first.pdf, so the probe must not
+        # mistake it for a fresh download, and the blocker must withhold completion.
+        captured["probe_before_new_file"] = await kwargs["completion_probe"](frozenset())
+        captured["blocker_before_new_file"] = await kwargs["completion_blocker"](frozenset())
+
+        (tmp_path / "b.pdf").write_bytes(b"file-bytes-b")
+        captured["probe_after_new_file"] = await kwargs["completion_probe"](frozenset())
+        if captured["probe_after_new_file"]:
+            return LoopOutcome(status="completed", reason=captured["probe_after_new_file"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    captured_block2 = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        block_cls=FileDownloadBlock,
+        task_id="task-block-2",
+        step_id="step-block-2",
+        download_suffix="second.pdf",
+        loop_fn=_block2_loop,
+    )
+
+    assert captured_block2["probe_before_new_file"] is None
+    assert isinstance(captured_block2["blocker_before_new_file"], str)
+    assert captured_block2["blocker_before_new_file"]
+    assert captured_block2["probe_after_new_file"]
+
+    # Only b.pdf was new to block 2's run: it alone is finalized/renamed, and first.pdf (block 1's
+    # already-baselined file) is left untouched.
+    assert (tmp_path / "second.pdf").exists()
+    assert not (tmp_path / "b.pdf").exists()
+    assert (tmp_path / "first.pdf").exists()
+
+    assert captured_block2["clean_up_kwargs"]["list_files_before"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_completion_excludes_staged_download_persistently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # file_upload's staged http(s) source file sits in the same download directory and never goes
+    # away on its own; the probe/blocker must exclude it by name on every later call this run, not
+    # just the one call that staged it, or it gets finalized/renamed as if it were a real download.
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "in.pdf").write_bytes(b"staged-input-bytes")
+        staged = frozenset({"in.pdf"})
+        captured["probe_before_download"] = await kwargs["completion_probe"](staged)
+        captured["blocker_before_download"] = await kwargs["completion_blocker"](staged)
+
+        (tmp_path / "out.pdf").write_bytes(b"real-download-bytes")
+        captured["probe_after_download"] = await kwargs["completion_probe"](staged)
+        if captured["probe_after_download"]:
+            return LoopOutcome(status="completed", reason=captured["probe_after_download"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, loop_fn=_loop)
+
+    assert captured["probe_before_download"] is None
+    assert isinstance(captured["blocker_before_download"], str)
+    assert captured["blocker_before_download"]
+    assert captured["probe_after_download"]
+
+    # Only the real download was finalized/renamed per download_suffix; the staged input is
+    # untouched -- neither renamed nor deleted.
+    assert (tmp_path / "invoice.pdf").exists()
+    assert not (tmp_path / "out.pdf").exists()
+    assert (tmp_path / "in.pdf").exists()
+    assert (tmp_path / "in.pdf").read_bytes() == b"staged-input-bytes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_exists_at_add_time", "expect_finalized"),
+    [
+        pytest.param(False, True, id="managed_storage_source_not_shadowed"),
+        pytest.param(True, False, id="http_staged_source_still_excluded"),
+    ],
+)
+async def test_execute_task_v3_download_completion_staged_add_gated_by_existence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, file_exists_at_add_time: bool, expect_finalized: bool
+) -> None:
+    # file_upload reports staged_download=<basename> for every source, but managed-file/s3://
+    # sources are written to a temp file OUTSIDE the downloads dir -- only http(s) sources are
+    # actually staged into it. Recording the name unconditionally would let a genuine later
+    # browser download that happens to share the name (upload report.csv, site returns a
+    # processed report.csv) get excluded and never finalized. Recording is gated on the file
+    # existing in the downloads dir at add()-time, so the http-staged case still gets excluded.
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        staged_downloads = kwargs["staged_downloads"]
+        if file_exists_at_add_time:
+            (tmp_path / "report.csv").write_bytes(b"staged-input-bytes")
+        staged_downloads.add("report.csv")
+        if not file_exists_at_add_time:
+            (tmp_path / "report.csv").write_bytes(b"real-download-bytes")
+
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset(staged_downloads))
+        if captured["probe_reason"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, download_suffix="processed", loop_fn=_loop
+    )
+
+    if expect_finalized:
+        assert captured["probe_reason"]
+        assert (tmp_path / "processed.csv").exists()
+        assert not (tmp_path / "report.csv").exists()
+    else:
+        assert captured["probe_reason"] is None
+        assert (tmp_path / "report.csv").exists()
+        assert (tmp_path / "report.csv").read_bytes() == b"staged-input-bytes"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_completion_probe_does_not_refinalize_once_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A finish(completed) deferred by the settle gate re-probes after the first probe already
+    # finalized the download. Without download_suffix, finalize renames to a fresh random name
+    # every call, so re-finalizing on the re-probe would rename the file again and return a
+    # different (but still truthy) reason. The cached-reason short-circuit must make every later
+    # probe/blocker call a no-op: same reason, same directory listing, one finalize call total.
+    original_finalize = ForgeAgent._finalize_downloaded_files_for_task
+    finalize_calls = 0
+
+    async def _spy_finalize(self: ForgeAgent, *args: Any, **kwargs: Any) -> Any:
+        nonlocal finalize_calls
+        finalize_calls += 1
+        return await original_finalize(self, *args, **kwargs)
+
+    monkeypatch.setattr(ForgeAgent, "_finalize_downloaded_files_for_task", _spy_finalize)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "a.pdf").write_bytes(b"file-bytes")
+        captured["probe_reason_1"] = await kwargs["completion_probe"](frozenset())
+        captured["listing_1"] = sorted(p.name for p in tmp_path.iterdir())
+
+        captured["probe_reason_2"] = await kwargs["completion_probe"](frozenset())
+        captured["listing_2"] = sorted(p.name for p in tmp_path.iterdir())
+
+        captured["blocker_reason_3"] = await kwargs["completion_blocker"](frozenset())
+        captured["listing_3"] = sorted(p.name for p in tmp_path.iterdir())
+
+        if captured["probe_reason_1"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason_1"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, download_suffix=None, loop_fn=_loop
+    )
+
+    assert captured["probe_reason_1"]
+    assert captured["probe_reason_2"] == captured["probe_reason_1"]
+    assert captured["blocker_reason_3"] is None
+
+    assert captured["listing_2"] == captured["listing_1"]
+    assert captured["listing_3"] == captured["listing_1"]
+
+    assert finalize_calls == 1
 
 
 # ---------------------------------------------------------------------------

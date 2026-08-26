@@ -33,6 +33,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     TaskBlock,
     UrlBlock,
+    ValidationBlock,
     get_all_blocks,
     run_is_eligible_for_v3_ab,
 )
@@ -96,20 +97,33 @@ async def _resolve(
         )
 
 
-def test_mixed_eligibility_run_download_block_disqualifies(scoped_context: SkyvernContext) -> None:
+def test_mixed_eligibility_run_download_block_is_eligible(scoped_context: SkyvernContext) -> None:
     eligible_1 = _make_block(TaskBlock, label="t1")
     eligible_2 = _make_block(NavigationBlock, label="t2", navigation_goal="Apply to the job")
     download_block = _make_block(ActionBlock, label="dl", complete_on_download=True)
     blocks: list[BaseTaskBlock] = [eligible_1, eligible_2, download_block]
 
-    assert run_is_eligible_for_v3_ab(blocks, is_script_run=False) is False
+    assert run_is_eligible_for_v3_ab(blocks, is_script_run=False) is True
 
 
-def test_mixed_eligibility_run_file_download_block_disqualifies(scoped_context: SkyvernContext) -> None:
+def test_mixed_eligibility_run_file_download_block_is_eligible(scoped_context: SkyvernContext) -> None:
     eligible_1 = _make_block(TaskBlock, label="t1")
     eligible_2 = _make_block(NavigationBlock, label="t2", navigation_goal="Apply to the job")
     file_download_block = _make_block(FileDownloadBlock, label="fd")
     blocks: list[BaseTaskBlock] = [eligible_1, eligible_2, file_download_block]
+
+    assert run_is_eligible_for_v3_ab(blocks, is_script_run=False) is True
+
+
+def test_mixed_eligibility_run_download_gated_validation_block_is_not_eligible(
+    scoped_context: SkyvernContext,
+) -> None:
+    # A validation block never acts on the page, so it can't trigger the download it would
+    # complete on (SKY-14905); it must disqualify the whole run from the v3 A/B.
+    eligible_1 = _make_block(TaskBlock, label="t1")
+    eligible_2 = _make_block(NavigationBlock, label="t2", navigation_goal="Apply to the job")
+    download_gated_validation = _make_block(ValidationBlock, label="dlv", complete_on_download=True)
+    blocks: list[BaseTaskBlock] = [eligible_1, eligible_2, download_gated_validation]
 
     assert run_is_eligible_for_v3_ab(blocks, is_script_run=False) is False
 
@@ -311,7 +325,7 @@ def test_non_task_blocks_ignored_but_nested_loop_task_blocks_considered() -> Non
     flat_without_loop = get_all_blocks([code_block, eligible])
     assert run_is_eligible_for_v3_ab(flat_without_loop, is_script_run=False) is True
 
-    ineligible_nested = _make_block(ActionBlock, label="nested_dl", complete_on_download=True)
+    ineligible_nested = _make_block(TaskBlock, label="nested_pinned", engine=RunEngine.openai_cua)
     loop = ForLoopBlock(
         label="loop",
         output_parameter=_make_output_parameter("loop"),

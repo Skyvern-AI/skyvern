@@ -7,12 +7,13 @@ import os
 import random
 import re
 import string
+import time
 import uuid
 from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Literal, Tuple, cast
+from typing import Any, Awaitable, Callable, Iterable, Literal, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -1003,6 +1004,107 @@ class ForgeAgent:
 
         return files_to_rename
 
+    async def _wait_for_in_flight_downloads(
+        self,
+        task: Task,
+        task_block: BaseTaskBlock,
+        organization_id: str,
+        *,
+        timeout_cap: float | None = None,
+        exhausted: set[str] | None = None,
+        should_cancel: Callable[[], Awaitable[bool]] | None = None,
+    ) -> bool:
+        """Block until any download the task already kicked off settles (or times out).
+
+        `timeout_cap`, when given, only ever shrinks the wait to the caller's remaining budget
+        (e.g. the v3 loop's deadline); `exhausted` excludes paths that already hit
+        DownloadFileMaxWaitingTime once so they aren't re-awaited on every subsequent call.
+        `should_cancel`, when given, is polled every second while the download wait is in flight
+        (the v3 loop otherwise only polls between tool calls, which this wait can outlast) and
+        cancels the wait early if it fires.
+
+        Returns True only when `should_cancel` fired and cut the wait short; False in every other
+        case (no in-flight downloads, budget already spent, normal completion, or a
+        DownloadFileMaxWaitingTime timeout) so callers can tell a cancel apart from a landed file.
+        """
+        if timeout_cap is not None and timeout_cap <= 0:
+            return False
+        context = skyvern_context.current()
+        workflow_download_directory = get_path_for_workflow_download_directory(
+            resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+        )
+
+        downloading_files = list_downloading_files_in_directory(workflow_download_directory)
+        if task.browser_session_id:
+            browser_session_downloading_files = await app.STORAGE.list_downloading_files_in_browser_session(
+                organization_id=organization_id,
+                browser_session_id=task.browser_session_id,
+            )
+            downloading_files = downloading_files + browser_session_downloading_files
+        if exhausted:
+            downloading_files = [path for path in downloading_files if path not in exhausted]
+        if len(downloading_files) > 0:
+            LOG.info(
+                "Detecting files are still downloading, waiting for files to be completely downloaded.",
+                downloading_files=downloading_files,
+            )
+            timeout = task_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
+            if timeout_cap is not None:
+                timeout = min(timeout, timeout_cap)
+            try:
+                if should_cancel is None:
+                    await wait_for_download_finished(
+                        downloading_files=downloading_files,
+                        timeout=timeout,
+                    )
+                else:
+                    return await self._wait_for_download_finished_cancellable(
+                        downloading_files=downloading_files,
+                        timeout=timeout,
+                        should_cancel=should_cancel,
+                    )
+            except DownloadFileMaxWaitingTime as e:
+                LOG.warning(
+                    "There're several long-time downloading files, these files might be broken",
+                    downloading_files=e.downloading_files,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                if exhausted is not None:
+                    exhausted.update(e.downloading_files)
+        return False
+
+    async def _wait_for_download_finished_cancellable(
+        self,
+        *,
+        downloading_files: list[str],
+        timeout: float,
+        should_cancel: Callable[[], Awaitable[bool]],
+    ) -> bool:
+        """Returns True when should_cancel fired and the wait was cut short; False on normal completion."""
+        wait_task = asyncio.ensure_future(
+            wait_for_download_finished(downloading_files=downloading_files, timeout=timeout)
+        )
+        try:
+            while True:
+                done, _pending = await asyncio.wait({wait_task}, timeout=1.0)
+                if wait_task in done:
+                    await wait_task
+                    return False
+                if await should_cancel():
+                    LOG.info(
+                        "Cancelling in-flight download wait: run was canceled",
+                        downloading_files=downloading_files,
+                    )
+                    wait_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await wait_task
+                    return True
+        finally:
+            if not wait_task.done():
+                wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wait_task
+
     async def create_task_and_step_from_block(
         self,
         task_block: BaseTaskBlock,
@@ -1219,12 +1321,13 @@ class ForgeAgent:
         from skyvern.forge.taskv3.auth_tools import build_auth_tools
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
+            DEFAULT_DEADLINE_SECONDS,
             MIN_ACTION_STEPS,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
         )
-        from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS
+        from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.tools import pending_marker
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
@@ -1369,6 +1472,133 @@ class ForgeAgent:
             return False
 
         download_id = resolve_run_download_id(context, fallback_run_id=task.task_id)
+
+        # Same baseline v1 takes before its per-step download check, so a file that was already
+        # sitting in the run's download directory before this block started is never mistaken for
+        # one this block produced.
+        download_baseline_files: list[str] | None = None
+        # Staged basenames are joined onto this dir so they match the full paths the finalizer diffs.
+        workflow_download_directory: Path | None = None
+        if (
+            task_block is not None
+            and task.workflow_run_id
+            and (task_block.complete_on_download or task_block.download_suffix)
+        ):
+            workflow_download_directory = get_path_for_workflow_download_directory(
+                resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+            )
+            download_baseline_files = list_files_in_directory(workflow_download_directory)
+            if task.browser_session_id:
+                browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=organization.organization_id,
+                    browser_session_id=task.browser_session_id,
+                )
+                download_baseline_files = download_baseline_files + browser_session_downloaded_files
+
+        # Passed to the loop below as well, so a download-wait probe caps its wait at what's left
+        # of the same deadline the loop enforces.
+        loop_deadline_seconds = DEFAULT_DEADLINE_SECONDS
+        loop_deadline_at = time.monotonic() + loop_deadline_seconds
+        # Shared across every probe call: a path that already hit DownloadFileMaxWaitingTime once
+        # is excluded from later waits instead of being re-awaited on every subsequent action.
+        download_wait_exhausted: set[str] = set()
+
+        download_finalized = False
+        download_completion_reason: str | None = None
+
+        # Owned here (not by the engine) so the final clean_up_task below can also exclude names
+        # tools staged into the downloads dir this run, whether or not the probe ever finalized.
+        class _StagedDownloads(set[str]):
+            # file_upload reports a basename for every source, but only http(s) sources are staged
+            # into the downloads dir; a name that isn't there must not shadow a later real download.
+            def add(self, name: str) -> None:
+                if workflow_download_directory is not None and (workflow_download_directory / name).exists():
+                    super().add(name)
+
+        staged_downloads: set[str] = _StagedDownloads()
+        completion_probe: CompletionProbe | None = None
+        completion_blocker: CompletionBlocker | None = None
+        if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
+            complete_on_download_block = task_block
+
+            async def _download_completion_probe(staged: frozenset[str]) -> str | None:
+                nonlocal download_finalized, download_completion_reason
+                # A finish deferred by the settle gate re-probes; finalizing again would re-rename
+                # the same file (or re-fetch a browser-session download).
+                if download_finalized:
+                    return download_completion_reason
+                assert workflow_download_directory is not None  # set alongside complete_on_download above
+                cancelled = await self._wait_for_in_flight_downloads(
+                    task,
+                    complete_on_download_block,
+                    organization.organization_id,
+                    timeout_cap=loop_deadline_at - time.monotonic(),
+                    exhausted=download_wait_exhausted,
+                    should_cancel=_should_cancel,
+                )
+                if cancelled:
+                    # The run is being canceled; even if a file landed while we waited, don't
+                    # finalize it into a `completed` result out from under the cancellation.
+                    return None
+                staged_paths = [str(workflow_download_directory / name) for name in sorted(staged)]
+                new_files = await self._finalize_downloaded_files_for_task(
+                    task,
+                    organization_id=organization.organization_id,
+                    download_suffix=complete_on_download_block.download_suffix,
+                    list_files_before=[*(download_baseline_files or []), *staged_paths],
+                    randomize_if_missing=True,
+                )
+                if not new_files:
+                    return None
+                download_finalized = True
+                download_completion_reason = f"download completed ({len(new_files)} new file(s))"
+                LOG.info(
+                    "Task V3 task completed due to download",
+                    task_id=task.task_id,
+                    num_new_files=len(new_files),
+                )
+                return download_completion_reason
+
+            async def _download_completion_blocker(staged: frozenset[str]) -> str | None:
+                reason = await _download_completion_probe(staged)
+                if reason:
+                    return None
+                return (
+                    "This task only completes once a file download finishes, and no download has "
+                    "been detected yet. Trigger the download, or finish with status=failed or "
+                    "status=terminated if it cannot be triggered."
+                )
+
+            # A data-extraction goal needs the model to keep the turn and call finish() itself;
+            # ending the loop from the probe would drop the extraction. The blocker still
+            # withholds completion until the download lands.
+            if not (task.data_extraction_goal or task.extracted_information_schema):
+                completion_probe = _download_completion_probe
+            completion_blocker = _download_completion_blocker
+        elif (
+            task_block is not None
+            and task_block.download_timeout is not None
+            and not task_block.complete_on_download
+            and task.workflow_run_id
+        ):
+            # download_timeout alone carries no completion semantics; v1 bounds a post-action
+            # download-settle wait with it, so v3 gets an equivalent wait-only probe that never
+            # ends the run or blocks finish.
+            wait_only_block = task_block
+
+            async def _download_wait_only_probe(staged: frozenset[str]) -> str | None:
+                await self._wait_for_in_flight_downloads(
+                    task,
+                    wait_only_block,
+                    organization.organization_id,
+                    timeout_cap=loop_deadline_at - time.monotonic(),
+                    exhausted=download_wait_exhausted,
+                    should_cancel=_should_cancel,
+                )
+                return None
+
+            completion_probe = _download_wait_only_probe
+
         # Honor a step cap (per-request override, task, or org, else the same MAX_STEPS_PER_RUN default
         # the step engine uses) as the ACTION-round budget: a v3 step is one action round (a turn that
         # mutates the page), matching a step-engine step, so perception rounds (observe/get_html) don't
@@ -1602,6 +1832,10 @@ class ForgeAgent:
                 extra_system_guidance="\n\n".join(
                     part for part in (auth_guidance, captcha_guidance, task.workflow_system_prompt) if part
                 ),
+                completion_probe=completion_probe,
+                completion_blocker=completion_blocker,
+                staged_downloads=staged_downloads,
+                deadline_seconds=loop_deadline_seconds,
             )
         finally:
             if context and credential_parameter_key is not None:
@@ -1779,6 +2013,15 @@ class ForgeAgent:
             )
             if refreshed:
                 task = refreshed
+        # A probe-finalized run must not be finalized again (double rename); otherwise the fallback
+        # finalize still has to exclude tool-staged inputs from what counts as a download.
+        cleanup_list_files_before: list[str] | None = None
+        if not download_finalized and download_baseline_files is not None:
+            assert workflow_download_directory is not None  # set alongside download_baseline_files above
+            cleanup_list_files_before = [
+                *download_baseline_files,
+                *(str(workflow_download_directory / name) for name in sorted(staged_downloads)),
+            ]
         await self.clean_up_task(
             task=task,
             last_step=step,
@@ -1786,6 +2029,8 @@ class ForgeAgent:
             need_call_webhook=need_call_webhook,
             close_browser_on_completion=close_browser_on_completion,
             browser_session_id=browser_session_id,
+            download_suffix=task_block.download_suffix if task_block else None,
+            list_files_before=cleanup_list_files_before,
         )
         return step, task
 
@@ -1967,8 +2212,7 @@ class ForgeAgent:
                 )
                 return step, detailed_output, None
 
-            # A bare task always qualifies; a workflow block must be an allowed type with no
-            # download semantics (v3 doesn't implement complete_on_download/download_suffix).
+            # A bare task always qualifies; a workflow block must be an allowed type.
             task_block_supports_v3 = task_block is None or _task_block_supports_v3(task_block)
             if engine == RunEngine.skyvern_v3 and task_block is not None and not task_block_supports_v3:
                 LOG.info(
@@ -2061,33 +2305,7 @@ class ForgeAgent:
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
-                workflow_download_directory = get_path_for_workflow_download_directory(
-                    resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
-                )
-
-                downloading_files = list_downloading_files_in_directory(workflow_download_directory)
-                if task.browser_session_id:
-                    browser_session_downloading_files = await app.STORAGE.list_downloading_files_in_browser_session(
-                        organization_id=organization.organization_id,
-                        browser_session_id=task.browser_session_id,
-                    )
-                    downloading_files = downloading_files + browser_session_downloading_files
-                if len(downloading_files) > 0:
-                    LOG.info(
-                        "Detecting files are still downloading, waiting for files to be completely downloaded.",
-                        downloading_files=downloading_files,
-                    )
-                    try:
-                        await wait_for_download_finished(
-                            downloading_files=downloading_files,
-                            timeout=task_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
-                        )
-                    except DownloadFileMaxWaitingTime as e:
-                        LOG.warning(
-                            "There're several long-time downloading files, these files might be broken",
-                            downloading_files=e.downloading_files,
-                            workflow_run_id=task.workflow_run_id,
-                        )
+                await self._wait_for_in_flight_downloads(task, task_block, organization.organization_id)
 
                 files_to_rename = await self._finalize_downloaded_files_for_task(
                     task,

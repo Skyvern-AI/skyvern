@@ -1288,7 +1288,7 @@ class SkyvernFrame:
             if expression != JS_FUNCTION_DEFS:
                 inject_budget = min(per_attempt_seconds, _remaining_seconds())
                 if inject_budget <= 0:
-                    LOG.error(
+                    LOG.warning(
                         "Skyvern timed out trying to analyze the page after navigation recovery",
                         expression=expression,
                     )
@@ -1321,7 +1321,7 @@ class SkyvernFrame:
 
             retry_budget = min(per_attempt_seconds, _remaining_seconds())
             if retry_budget <= 0:
-                LOG.error(
+                LOG.warning(
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )

@@ -35,7 +35,8 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet } from "react-router-dom";
+import { Link, Outlet, useParams } from "react-router-dom";
+import { runViewTabBasePath } from "@/routes/runs/runViewTabBasePath";
 import { statusIsCancellable, statusIsFinalized } from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
@@ -59,6 +60,7 @@ function createTaskRequestObject(values: TaskApiResponse) {
 
 function TaskDetails() {
   const taskId = useFirstParam("taskId", "runId");
+  const runBasePath = runViewTabBasePath(useParams()) ?? `/runs/${taskId}`;
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
@@ -367,19 +369,19 @@ function TaskDetails() {
         options={[
           {
             label: "Actions",
-            to: "actions",
+            to: `${runBasePath}/actions`,
           },
           {
             label: "Recording",
-            to: "recording",
+            to: `${runBasePath}/recording`,
           },
           {
             label: "Inputs",
-            to: "parameters",
+            to: `${runBasePath}/parameters`,
           },
           {
             label: "Diagnostics",
-            to: "diagnostics",
+            to: `${runBasePath}/diagnostics`,
           },
         ]}
       />

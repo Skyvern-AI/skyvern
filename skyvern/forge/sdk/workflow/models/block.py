@@ -1319,7 +1319,7 @@ class BaseTaskBlock(Block):
     totp_identifier: str | None = None
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
-    download_timeout: float | None = None  # minutes
+    download_timeout: float | None = None  # seconds
     include_extracted_text: bool = True
     _data_extraction_goal_is_prerendered: bool = PrivateAttr(default=False)
 
@@ -15019,6 +15019,7 @@ _TASK_V3_SUPPORTED_BLOCK_TYPES = frozenset(
         BlockType.ACTION,
         BlockType.VALIDATION,
         BlockType.EXTRACTION,
+        BlockType.FILE_DOWNLOAD,
     }
 )
 
@@ -15030,16 +15031,12 @@ _ENGINE_INERT_BLOCK_TYPES = frozenset({BlockType.GOTO_URL, BlockType.HUMAN_INTER
 
 
 def _task_block_supports_v3(task_block: BaseTaskBlock) -> bool:
-    """Whether a workflow task block is eligible to dispatch to the Task V3 native engine.
-
-    v3 doesn't implement download-completion semantics yet, so a block relying on them
-    (complete_on_download / download_suffix / download_timeout) stays on the step engine.
-    """
-    if task_block.block_type not in _TASK_V3_SUPPORTED_BLOCK_TYPES:
+    """Whether a workflow task block is eligible to dispatch to the Task V3 native engine."""
+    if task_block.block_type == BlockType.VALIDATION and task_block.complete_on_download:
+        # A validation block never acts on the page, so it has no way to trigger the download it
+        # would complete on.
         return False
-    if task_block.complete_on_download or task_block.download_suffix or task_block.download_timeout is not None:
-        return False
-    return True
+    return task_block.block_type in _TASK_V3_SUPPORTED_BLOCK_TYPES
 
 
 def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
