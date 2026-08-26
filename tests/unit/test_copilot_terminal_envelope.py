@@ -643,6 +643,31 @@ def test_render_terminal_message_completed_turn_is_not_stamped_by_deadline_cause
     assert replaced is False
 
 
+def test_run_without_output_projects_unverified_blocker_never_success() -> None:
+    blocker = "The run stayed queued and produced no terminal result before the deadline."
+    envelope = _assemble(
+        proposal_disposition="auto_applicable",
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", output_report=None)],
+        blocker_reason=blocker,
+        halt_kind="deadline_expired",
+        terminal_cause="deadline_expired",
+    )
+    finalized = finalize_applied_state(envelope, applied=False)
+
+    rendered, replaced = render_terminal_message(finalized, agent_module._TIMEOUT_REPLY_DEFAULT, cancelled=False)
+
+    assert finalized.verified is False
+    assert finalized.workflow_applied is False
+    assert finalized.next_state == "stopped"
+    assert finalized.response_kind == "stopped"
+    assert finalized.run_output_report is None
+    assert finalized.blocker_reason == blocker
+    assert rendered == agent_module._TIMEOUT_REPLY_DEFAULT
+    assert replaced is True
+    assert "completed" not in rendered.lower()
+    assert "success" not in rendered.lower()
+
+
 def test_deadline_cause_survives_envelope_round_trip() -> None:
     envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
 

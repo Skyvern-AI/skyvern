@@ -24,6 +24,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3.loop import (
+    ACTION_LOOP_REASON_PREFIX,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     NO_TOOL_CALL_NUDGE,
@@ -32,6 +33,9 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_SHADOW_EVENT,
     PERCEPTION_STALL_SUPPRESSED_EVENT,
     PERCEPTION_STALL_TERMINATE_AFTER,
+    PROGRESS_LEDGER_FINAL_EVENT,
+    PROGRESS_LEDGER_SHADOW_EVENT,
+    PROGRESS_LEDGER_WINDOW,
     ActivityRecency,
     LoopOutcome,
     SubmitWatch,
@@ -40,6 +44,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     _canonical_perception_content,
     _PerceptionLedger,
+    _ProgressLedger,
     make_finish_tool,
     run_agent_tool_loop,
 )
@@ -3674,3 +3679,291 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
     # call's probe already carries the name it staged.
     assert probe_seen == [frozenset({"in.pdf"})]
     assert blocker_seen == [frozenset({"in.pdf"})]
+
+
+# --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
+
+
+def _form_observe(name: str, invalid_seq: list[int]) -> ToolSpec:
+    """Observe fake: call i returns UNIQUE content plus summary.invalid_fields=invalid_seq[i] (last
+    value repeats). Unique content each call keeps the perception-stall / oscillation guards from
+    firing, isolating the net-progress ledger as the only thing under test."""
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        i = min(calls["n"], len(invalid_seq) - 1)
+        inv = invalid_seq[i]
+        calls["n"] += 1
+        return ToolResult.ok(f"url=x round={calls['n']} err-{i}", data={"summary": {"invalid_fields": inv}})
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_shadow_fires_on_varied_action_zero_net_progress() -> None:
+    # SKY-14998 shape: varied actions (a fresh selector every turn) against a form whose invalid-field
+    # count never improves. Each observe differs and each click's args differ, so NONE of the three
+    # repetition guards trip — yet net progress is zero, so the ledger shadow-fires (and only shadows:
+    # the run is not terminated).
+    rounds = 10
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    fires = [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+    assert len(fires) == 1  # one-shot per run
+    assert fires[0]["form_armed"] is True
+    assert fires[0]["actions"] >= PROGRESS_LEDGER_WINDOW
+    assert fires[0]["invalid_fields"] == 3
+    assert outcome.status == "completed"
+    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_when_invalid_fields_ratchets_down() -> None:
+    # A slow-but-progressing form: the invalid-field count reaches a NEW LOW every few actions, which
+    # is real net progress and resets the ledger, so it must never shadow-fire however long the run.
+    invalid_seq = [6, 6, 6, 5, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 0]
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", invalid_seq), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_never_arms_without_a_form() -> None:
+    # A run with no form fields (invalid_fields always 0) has no distance-to-done metric, so the
+    # ledger must never arm — the primary guard against false-fail-fast on non-form work (reading,
+    # extraction) that legitimately shows no navigation for long stretches.
+    rounds = 14
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [0] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_across_a_click_driven_multipage_form() -> None:
+    # The dominant healthy shape: a multi-page application wizard. An ordinary billable "Next" click —
+    # NOT the explicit navigate tool, so no page_state_changed — advances to page 2, whose fresh
+    # required fields make invalid_fields RISE above page 1's floor. The run makes continuous real
+    # progress (each page's count ratchets to a new low), so the ledger must stay silent; measuring
+    # page 2 against page 1's minimum is the false-fire this guards. The tail stays above zero so the
+    # deciding observe is form_armed — otherwise the run stays silent whether or not the rise branch
+    # fires, and the test would not discriminate the branch it names (per review).
+    invalid_seq = [4, 3, 2, 1, 0, 9, 9, 8, 8, 7, 7, 6, 6, 5, 5]  # page 1 ratchets to 0, page 2 rises then ratchets
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", invalid_seq), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_when_downloads_keep_landing() -> None:
+    # A "download next file" flow on a formful page clicks the same control many times against a page
+    # whose invalid_fields never moves, but each click lands a download — hard progress that resets
+    # the window, so the ledger stays silent (mirrors the action-loop guard's download exemption).
+    rounds = 15
+    dl: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", [3] * rounds),
+        _billable_tool("download", dl, data={"download_notice": True}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("download", {"selector": "#next-file"})] for _ in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+def test_progress_ledger_unit_takes_the_verdict_on_a_confirming_observe() -> None:
+    # No form in view → an observe never fires, however many billable actions accrue; the peak streak
+    # is still tracked for the survival record.
+    unarmed = _ProgressLedger()
+    for _ in range(PROGRESS_LEDGER_WINDOW * 2):
+        unarmed.on_billable()
+    assert unarmed.observe(0) is False
+    assert unarmed.peak_actions_since_progress >= PROGRESS_LEDGER_WINDOW
+
+    # Armed and flat → the confirming observe fires once at the window, then latches.
+    armed = _ProgressLedger()
+    assert armed.observe(3) is False  # arms + baselines, no actions yet
+    for _ in range(PROGRESS_LEDGER_WINDOW):
+        armed.on_billable()
+    assert armed.observe(3) is True  # a full window of actions, and this look confirms no progress
+    for _ in range(PROGRESS_LEDGER_WINDOW):
+        armed.on_billable()
+    assert armed.observe(3) is False  # one-shot latch
+
+    # The verdict waits for a confirming look: a window of actions batched before re-observing does
+    # NOT fire, and the confirming look then shows a new low (real progress).
+    deferred = _ProgressLedger()
+    deferred.observe(10)
+    for _ in range(PROGRESS_LEDGER_WINDOW * 3):
+        deferred.on_billable()
+    assert deferred.observe(2) is False
+
+    # A rise re-baselines (a new page's fresh required fields), so the streak cannot carry across it.
+    paged = _ProgressLedger()
+    paged.observe(4)
+    for _ in range(PROGRESS_LEDGER_WINDOW - 1):
+        paged.on_billable()
+    assert paged.observe(9) is False  # rose → reset + re-baseline
+    for _ in range(PROGRESS_LEDGER_WINDOW - 1):
+        paged.on_billable()
+    assert paged.observe(9) is False  # only window-1 actions since that reset
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_on_click_driven_equal_count_transition() -> None:
+    # SKY-15020 Lever C #3 (was a false-positive): every click drives a REAL page transition
+    # (page_transitioned=True) to a fresh page that happens to show the SAME invalid_fields count. The
+    # real transition signal is hard progress, so the coincidentally-equal count is never read as a
+    # stalled look and the ledger stays silent. Before the flag the click surfaced nothing, the equal
+    # count read as flat, and the ledger false-fired on a progressing multi-page run (RED against main).
+    rounds = 12
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", [3] * rounds),
+        _billable_tool("click", clicks, data={"page_transitioned": True}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_on_url_stable_spa_advance() -> None:
+    # SKY-15020 Lever C, the regression the CP ruling guards against: a URL-STABLE multi-step SPA form
+    # (Workday/Greenhouse/iCIMS-style) advances page-to-page WITHOUT moving the URL, so every click
+    # reports page_transitioned=False, yet each fresh step surfaces MORE required fields — a rising
+    # invalid_fields count that is genuine progress. URL-unchanged does NOT prove same-page, so the
+    # ledger must NEVER suppress the rise re-baseline on a False signal: the rise re-baselines exactly
+    # as on main, the streak never accrues, and a healthy progressing run stays silent. RED against the
+    # rejected (A) impl, which suppressed the re-baseline on False and would false-fire here.
+    invalid_seq = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24]
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", invalid_seq),
+        _billable_tool("click", clicks, data={"page_transitioned": False}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_documented_fn_oscillating_same_page_stays_silent() -> None:
+    # SKY-15020 Lever C KNOWN LIMITATION: a genuinely-stuck form whose invalid_fields OSCILLATES on the
+    # SAME page (a submit that keeps surfacing a different error set without advancing) is NOT caught.
+    # page_transitioned=False cannot distinguish this oscillating-stuck run from a URL-stable SPA
+    # advance (test above) — both report False with a rising count — so the ledger takes the SAFE
+    # direction and re-baselines on every up-swing, exactly as on main. This documents the accepted
+    # false-negative (no regression, no new FP); the same-page-oracle follow-up is what would close it.
+    invalid_seq = [3, 5, 3, 5, 3, 5, 3, 5, 3, 5, 3, 5]
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", invalid_seq),
+        _billable_tool("click", clicks, data={"page_transitioned": False}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_emits_terminal_survival_record() -> None:
+    # Per-run terminal instrumentation: the ledger's peak no-progress streak and whether it would
+    # have fired, tagged with the run's outcome — the survival-distribution data for choosing an
+    # enforce threshold from data rather than gut.
+    rounds = 10
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    final = [e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]
+    assert len(final) == 1
+    assert final[0]["outcome_status"] == "completed"
+    assert final[0]["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
+    assert final[0]["would_fire"] is True
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_when_actions_batch_before_a_confirming_observe() -> None:
+    # Healthy batch: the model fixes several fields in one turn before re-observing (markers stay
+    # valid until the page re-renders, so acting several times per observe is expected). The
+    # confirming observe then reveals the invalid-field count dropped — real progress. The verdict
+    # must wait for that look, never fire on the action count alone.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [10, 2]), _billable_tool("click", clicks), make_finish_tool()]
+    batch = [("click", {"selector": f"#f{i}"}) for i in range(PROGRESS_LEDGER_WINDOW)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        batch,
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_fires_at_the_confirming_observe_after_a_fruitless_batch() -> None:
+    # Same batch shape, but the confirming observe shows NO improvement: the run acted a full window
+    # of times and, when it finally looked, nothing advanced. The verdict lands on that observe.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [10, 10]), _billable_tool("click", clicks), make_finish_tool()]
+    batch = [("click", {"selector": f"#f{i}"}) for i in range(PROGRESS_LEDGER_WINDOW)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        batch,
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    fires = [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+    assert len(fires) == 1
+    assert fires[0]["actions"] >= PROGRESS_LEDGER_WINDOW
+    assert outcome.status == "completed"

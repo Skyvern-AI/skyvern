@@ -260,6 +260,43 @@ async def test_click_type_select_dispatch_raw_ops(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_click_surfaces_page_transitioned_when_url_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-15020 Lever C: a click that navigates surfaces page_transitioned=True in ToolResult.data so
+    # the shadow ledger can read a REAL page transition (H1 hard progress) instead of inferring one
+    # from an invalid_fields rise. The URL delta is already computed for the tool's own note; this
+    # only exposes it — no extra probe.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _FakePage()
+
+    async def _click_navigates(selector: str, timeout: int | None = None) -> None:
+        page.calls.append(("click", {"selector": selector}))
+        page.url = "https://example.test/apply/step2"
+
+    page.click = _click_navigates  # type: ignore[assignment]
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": "#next"})
+    assert r.status == "ok"
+    assert (r.data or {}).get("page_transitioned") is True
+
+
+@pytest.mark.asyncio
+async def test_click_reports_no_transition_when_url_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A click that does not move the URL reports page_transitioned=False. This is the raw URL-delta
+    # signal; only the POSITIVE (True) direction is acted on downstream (a URL change proves a
+    # transition), because URL equality does not prove same-page. The tool still surfaces it faithfully.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _FakePage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": "#submit"})
+    assert r.status == "ok"
+    assert (r.data or {}).get("page_transitioned") is False
+
+
+@pytest.mark.asyncio
 async def test_navigate_and_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     import skyvern.utils.url_validators as urlv
 
@@ -10089,3 +10126,170 @@ async def test_settle_after_upload_swallows_errors(monkeypatch: pytest.MonkeyPat
 
     # Must not raise.
     await tools_module._settle_after_upload(object())
+
+
+# --- SKY-14933: signed payload URLs reach the model only as opaque tokens on the three free-text
+# emit surfaces (observe url=, get_html, file_upload download error). Masking is by PROVENANCE:
+# build_browser_tools receives the payload's OpaqueUrlRefs and rewrites only URLs it minted, so a
+# benign live-page URL — even a signing-shaped one — is never masked (the false-positive centerpiece).
+_SIGNED_REF_URL = (
+    "https://files.example.test/uploads/a1b2c3d4/resume.pdf"
+    "?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.Q29ycmVjdEhvcnNlQmF0dGVyeVN0YXBsZTAxMjM0NTY3ODk"
+)
+_SIGNED_REF_ARTIFACT = "token=eyJhbGciOiJIUzI1NiJ9"
+# is_signed_url() flags this benign ATS landing URL, but it was never in the payload — provenance
+# must leave the model's live-page anchor intact where the shape-only masker would have blinded it.
+_FP_SIGNED_SHAPED_URL = "https://jobs.example.test/apply?token=abcdefABCDEF0123456789ghijklMNOPqrstuvwx"
+
+
+def _refs_for(*urls: str) -> Any:
+    from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+
+    return mask_opaque_urls({f"u{i}": url for i, url in enumerate(urls)})
+
+
+@pytest.mark.asyncio
+async def test_observe_masks_payload_ref_page_url() -> None:
+    page = _FakePage()
+    page.url = _SIGNED_REF_URL
+    refs = _refs_for(_SIGNED_REF_URL)
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=refs)
+    result = await _tool(tools, "observe").handler({})
+    assert _SIGNED_REF_ARTIFACT not in result.content
+    assert next(iter(refs.refs)) in result.content
+
+
+@pytest.mark.asyncio
+async def test_observe_leaves_signing_shaped_benign_page_url_unmasked() -> None:
+    page = _FakePage()
+    page.url = _FP_SIGNED_SHAPED_URL
+    # refs are minted from a DIFFERENT signed URL, so the benign page URL is not among them.
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_SIGNED_REF_URL))
+    result = await _tool(tools, "observe").handler({})
+    assert _FP_SIGNED_SHAPED_URL in result.content
+    assert "opaque_url_" not in result.content
+
+
+class _FakePageWithHtml(_FakePage):
+    def __init__(self, html_body: str) -> None:
+        super().__init__()
+        self._html_body = html_body
+
+    async def content(self) -> str:
+        return self._html_body
+
+
+@pytest.mark.asyncio
+async def test_get_html_masks_inline_payload_ref() -> None:
+    page = _FakePageWithHtml(f'<html><body><a href="{_SIGNED_REF_URL}">dl</a></body></html>')
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_SIGNED_REF_URL))
+    result = await _tool(tools, "get_html").handler({})
+    assert _SIGNED_REF_ARTIFACT not in result.content
+    assert "opaque_url_" in result.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_leaves_inline_signing_shaped_benign_url_unmasked() -> None:
+    page = _FakePageWithHtml(f'<html><body><a href="{_FP_SIGNED_SHAPED_URL}">apply</a></body></html>')
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_SIGNED_REF_URL))
+    result = await _tool(tools, "get_html").handler({})
+    assert _FP_SIGNED_SHAPED_URL in result.content
+    assert "opaque_url_" not in result.content
+
+
+async def _run_file_upload_with_failing_download(source: str, opaque_refs: Any, error_url: str) -> Any:
+    page = _FakePage()
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=opaque_refs)
+    import skyvern.forge.sdk.api.files as files_module
+
+    async def failing_download_file(
+        source: str, output_dir: str | None = None, organization_id: str | None = None
+    ) -> str:
+        raise Exception(f"Failed to download managed storage file: {error_url}")
+
+    original = files_module.download_file
+    files_module.download_file = failing_download_file  # type: ignore[assignment]
+    try:
+        return await _tool(tools, "file_upload").handler({"selector": "#cv", "file": source})
+    finally:
+        files_module.download_file = original
+
+
+@pytest.mark.asyncio
+async def test_file_upload_masks_payload_ref_in_download_error() -> None:
+    result = await _run_file_upload_with_failing_download(_SIGNED_REF_URL, _refs_for(_SIGNED_REF_URL), _SIGNED_REF_URL)
+    assert result.status == "error"
+    assert _SIGNED_REF_ARTIFACT not in result.content
+    assert "opaque_url_" in result.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_leaves_signing_shaped_benign_url_in_download_error_unmasked() -> None:
+    result = await _run_file_upload_with_failing_download(
+        _FP_SIGNED_SHAPED_URL, _refs_for(_SIGNED_REF_URL), _FP_SIGNED_SHAPED_URL
+    )
+    assert result.status == "error"
+    assert _FP_SIGNED_SHAPED_URL in result.content
+    assert "opaque_url_" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_emit_surfaces_are_noop_without_refs() -> None:
+    # Page-free / no payload refs → the surfaces never mask, even a signed live-page URL.
+    page = _FakePage()
+    page.url = _SIGNED_REF_URL
+    tools = build_browser_tools(_fixed_page_provider(page))
+    result = await _tool(tools, "observe").handler({})
+    assert _SIGNED_REF_ARTIFACT in result.content
+    assert "opaque_url_" not in result.content
+
+
+# A multi-parameter presigned URL (S3/Azure/GCS — the dominant signed-payload shape) is entity-escaped
+# inside serialized HTML, so get_html must mask its escaped form or the signing artifact leaks.
+_MULTIPARAM_SIGNED_REF_URL = (
+    "https://bucket.s3.amazonaws.example.test/uploads/resume.pdf"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE0000&X-Amz-Signature=abcd1234ef567890abcd1234ef56"
+)
+_MULTIPARAM_SIGNED_ARTIFACT = "X-Amz-Signature=abcd1234"
+
+
+@pytest.mark.asyncio
+async def test_get_html_masks_multiparam_signed_ref_in_escaped_html() -> None:
+    # Literal &amp; (what a real HTML serializer emits), not html.escape() of the URL, so this pins
+    # that the masker matches the on-page escaped form rather than merely its own escaping.
+    escaped_href = _MULTIPARAM_SIGNED_REF_URL.replace("&", "&amp;")
+    assert "&amp;" in escaped_href and "&amp;amp;" not in escaped_href
+    page = _FakePageWithHtml(f'<html><body><a href="{escaped_href}">dl</a></body></html>')
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_MULTIPARAM_SIGNED_REF_URL))
+    result = await _tool(tools, "get_html").handler({})
+    assert _MULTIPARAM_SIGNED_ARTIFACT not in result.content
+    assert "opaque_url_" in result.content
+
+
+class _FakePageWithText(_FakePage):
+    def __init__(self, text_items: list[str]) -> None:
+        super().__init__()
+        self._text_items = text_items
+
+    async def evaluate(self, _js: str) -> str:
+        return json.dumps({"url": self.url, "title": "Apply", "elements": [], "text": self._text_items})
+
+
+@pytest.mark.asyncio
+async def test_observe_masks_payload_ref_in_page_text() -> None:
+    # A signed payload ref can surface as page text (not just the url= line) — observe masks the whole
+    # rendered output, so it never leaks there either.
+    page = _FakePageWithText([f"Your download link: {_SIGNED_REF_URL}"])
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_SIGNED_REF_URL))
+    result = await _tool(tools, "observe").handler({})
+    assert _SIGNED_REF_ARTIFACT not in result.content
+    assert "opaque_url_" in result.content
+
+
+@pytest.mark.asyncio
+async def test_observe_leaves_benign_page_text_unmasked() -> None:
+    page = _FakePageWithText([f"Apply here: {_FP_SIGNED_SHAPED_URL}"])
+    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_SIGNED_REF_URL))
+    result = await _tool(tools, "observe").handler({})
+    assert _FP_SIGNED_SHAPED_URL in result.content
+    assert "opaque_url_" not in result.content
