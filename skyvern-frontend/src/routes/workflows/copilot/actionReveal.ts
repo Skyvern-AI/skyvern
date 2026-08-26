@@ -43,3 +43,12 @@ export function revealedCountAt(
   }
   return count;
 }
+
+const MS_PER_CHAR = 14;
+
+// Characters of a narration revealed by `elapsedMs`. A missing arrival stamp
+// yields a far-past elapsed, so a hydrated row lands on the full string.
+export function revealedCharsAt(total: number, elapsedMs: number): number {
+  if (elapsedMs < 0) return 0;
+  return Math.min(total, Math.floor(elapsedMs / MS_PER_CHAR));
+}

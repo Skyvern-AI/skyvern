@@ -427,7 +427,7 @@ class TestClickAdapter:
 
         adapted = await _click_post_hook(result, raw, ctx)
 
-        assert adapted["data"]["selector"] == "#btn"
+        assert adapted["data"]["executed_selector"] == "#btn"
         assert adapted["data"]["url"] == "https://ex.com/"
         assert adapted["data"]["title"] == "Page"
         assert "sdk_equivalent" not in adapted["data"]
@@ -447,7 +447,7 @@ class TestTypeTextAdapter:
 
         adapted = await _type_text_post_hook(result, raw, ctx)
 
-        assert adapted["data"]["selector"] == "#email"
+        assert adapted["data"]["executed_selector"] == "#email"
         assert adapted["data"]["typed_length"] == 15
         assert adapted["data"]["url"] == "https://ex.com"
         assert "text_length" not in adapted["data"]

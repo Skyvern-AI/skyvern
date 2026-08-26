@@ -1,18 +1,13 @@
-import type { OnePasswordItemApiResponse } from "@/api/types";
 import { OnePasswordIcon } from "@/components/icons/OnePasswordIcon";
 import { getHostname } from "@/util/getHostname";
 import { useOnePasswordItemsQuery } from "@/routes/workflows/hooks/useOnePasswordItemsQuery";
 import { useMemo } from "react";
+import { isOnePasswordItemOfType } from "./onePasswordItems";
 
 type Props = {
   search?: string;
   folderId?: string | null;
 };
-
-function isPasswordItem(item: OnePasswordItemApiResponse) {
-  const category = item.category.toLowerCase();
-  return category.includes("login") || category.includes("password");
-}
 
 function OnePasswordCredentialsList({ search, folderId }: Props) {
   const { data, isLoading, isError } = useOnePasswordItemsQuery();
@@ -20,7 +15,7 @@ function OnePasswordCredentialsList({ search, folderId }: Props) {
 
   const filteredItems = useMemo(() => {
     return (data?.items ?? []).filter((item) => {
-      if (!isPasswordItem(item)) {
+      if (!isOnePasswordItemOfType(item, "password")) {
         return false;
       }
 

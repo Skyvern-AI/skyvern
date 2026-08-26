@@ -395,6 +395,7 @@ async def test_auto_create_browser_session_for_code_block_loads_managed_profile_
         browser_profile_id="bp_managed",
         proxy_location=None,
         inherit_profile_proxy=True,
+        workflow_run_id="wr_test",
     )
 
 

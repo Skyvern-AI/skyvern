@@ -15,7 +15,7 @@ type Props = {
 };
 
 function CredentialSelector({ value, onChange, placeholder, required }: Props) {
-  const { setIsOpen, setType } = useCredentialModalState();
+  const { setIsOpen, openModal } = useCredentialModalState();
 
   const renderCredentialItem = (credential: CredentialApiResponse) => (
     <div className="space-y-2">
@@ -51,8 +51,7 @@ function CredentialSelector({ value, onChange, placeholder, required }: Props) {
         selectedCredentialId={value || undefined}
         onValueChange={(nextValue) => onChange(nextValue)}
         onAddNew={() => {
-          setIsOpen(true);
-          setType(CredentialModalTypes.PASSWORD);
+          openModal(CredentialModalTypes.PASSWORD);
         }}
         renderCredentialItem={renderCredentialItem}
         placeholder={placeholder}

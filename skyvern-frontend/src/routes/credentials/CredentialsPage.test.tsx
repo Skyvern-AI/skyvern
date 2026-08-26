@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   cleanup,
@@ -20,18 +21,6 @@ vi.mock("@/components/PushTotpCodeForm", () => ({
 
 vi.mock("@/hooks/useTotpCodesQuery", () => ({
   useTotpCodesQuery: vi.fn(),
-}));
-
-vi.mock("./useCredentialModalState", () => ({
-  CredentialModalTypes: {
-    PASSWORD: "password",
-    CREDIT_CARD: "credit_card",
-    SECRET: "secret",
-  },
-  useCredentialModalState: () => ({
-    setIsOpen: vi.fn(),
-    setType: vi.fn(),
-  }),
 }));
 
 vi.mock("./useBackgroundCredentialTest", () => ({
@@ -59,9 +48,34 @@ vi.mock("./OnePasswordCredentialsList", () => ({
   OnePasswordCredentialsList: () => <div />,
 }));
 
-vi.mock("./CredentialsModal", () => ({
-  CredentialsModal: () => <div />,
-}));
+// Stand in for the heavy modal but keep it wired to the real URL-backed state,
+// so a test can observe whether a click actually opens it.
+vi.mock("./CredentialsModal", async () => {
+  const { useCredentialModalState } = await import("./useCredentialModalState");
+  return {
+    CredentialsModal: () => {
+      const { isOpen, type } = useCredentialModalState();
+      return isOpen ? <div data-testid="credentials-modal">{type}</div> : null;
+    },
+  };
+});
+
+// Flatten the Radix menu so the Add items render inline and are clickable.
+vi.mock("@/components/ui/dropdown-menu", () => {
+  const Pass = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  return {
+    DropdownMenu: Pass,
+    DropdownMenuTrigger: Pass,
+    DropdownMenuContent: Pass,
+    DropdownMenuItem: ({
+      children,
+      onSelect,
+    }: {
+      children?: ReactNode;
+      onSelect?: () => void;
+    }) => <button onClick={onSelect}>{children}</button>,
+  };
+});
 
 vi.mock("./CreateCredentialFolderDialog", () => ({
   CreateCredentialFolderDialog: () => <div />,
@@ -96,6 +110,31 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("CredentialsPage add menu", () => {
+  it.each([
+    ["Password", "password"],
+    ["Credit Card", "credit-card"],
+    ["Secret", "secret"],
+  ])("opens the %s modal from the Add menu", async (label, expectedType) => {
+    mockedUseTotpCodesQuery.mockReturnValue({
+      data: [],
+      isLoading: false,
+      isFetching: false,
+      isFeatureUnavailable: false,
+    } as unknown as ReturnType<typeof useTotpCodesQuery>);
+
+    renderPage("/credentials");
+
+    fireEvent.click(screen.getByRole("button", { name: label }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("credentials-modal").textContent).toBe(
+        expectedType,
+      );
+    });
+  });
 });
 
 describe("CredentialsPage tabs", () => {

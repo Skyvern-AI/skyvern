@@ -6,7 +6,7 @@ import json
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agents import ModelSettings, function_tool
@@ -20,8 +20,10 @@ from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
     current_model_call_telemetry,
@@ -940,3 +942,71 @@ def test_a_scope_spanning_the_whole_iteration_does_not_emit_the_slow_line(
             pass
 
     assert [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_result_names_the_fallback_model_that_actually_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRateLimitError(Exception):
+        pass
+
+    FakeRateLimitError.__module__ = "openai"
+
+    class FakeMCPServerManager:
+        def __init__(self, servers: object) -> None:
+            self.active_servers = servers
+
+        async def __aenter__(self) -> FakeMCPServerManager:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    def fake_resolve_model_config(
+        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+    ) -> tuple[str, object, str, bool]:
+        del copilot_config
+        key = llm_key_override or "PRIMARY"
+        return f"model-{key}", object(), key, True
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+        AsyncMock(
+            side_effect=[
+                FakeRateLimitError("rate limit"),
+                SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": "ok"}), new_items=[]),
+            ]
+        ),
+    )
+
+    result = await copilot_agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=SimpleNamespace(
+            message="build it",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+            browser_session_id=None,
+            product_action=None,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(fallback_llm_key="SECONDARY"),
+    )
+
+    assert result.resolved_model == "model-SECONDARY"
+    assert result.resolved_model != "model-PRIMARY"

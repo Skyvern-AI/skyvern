@@ -49,7 +49,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
@@ -236,6 +236,7 @@ from skyvern.schemas.workflows import (
     FileType,
     FileUploadDestination,
     _direct_code_block_error_code_raises,
+    _normalize_optional_endpoint_url,
     _validate_code_block_error_code_calls,
     _validate_code_block_error_code_mapping,
 )
@@ -8194,6 +8195,7 @@ class FileDestinationBlock(Block):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    endpoint_url: str | None = None
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
@@ -8221,6 +8223,8 @@ class FileDestinationBlock(Block):
         ),
     )
 
+    _normalize_endpoint_url = field_validator("endpoint_url")(_normalize_optional_endpoint_url)
+
     def _get_destination_parameters(self, workflow_run_context: WorkflowRunContext) -> list[PARAMETER_TYPE]:
         parameters = []
 
@@ -8238,6 +8242,9 @@ class FileDestinationBlock(Block):
 
         if self.aws_secret_access_key and workflow_run_context.has_parameter(self.aws_secret_access_key):
             parameters.append(workflow_run_context.get_parameter(self.aws_secret_access_key))
+
+        if self.endpoint_url and workflow_run_context.has_parameter(self.endpoint_url):
+            parameters.append(workflow_run_context.get_parameter(self.endpoint_url))
 
         if self.azure_storage_account_name and workflow_run_context.has_parameter(self.azure_storage_account_name):
             parameters.append(workflow_run_context.get_parameter(self.azure_storage_account_name))
@@ -8297,6 +8304,10 @@ class FileDestinationBlock(Block):
         if self.aws_secret_access_key:
             self.aws_secret_access_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.aws_secret_access_key, workflow_run_context
+            )
+        if self.endpoint_url:
+            self.endpoint_url = self.format_block_parameter_template_from_workflow_run_context(
+                self.endpoint_url, workflow_run_context
             )
         if self.azure_storage_account_name:
             self.azure_storage_account_name = self.format_block_parameter_template_from_workflow_run_context(
@@ -8412,12 +8423,57 @@ class FileDestinationBlock(Block):
             f"https://{azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
         )
 
+    async def _resolve_validated_s3_endpoint(self) -> tuple[str | None, tuple[str, ...] | None]:
+        """Normalize and SSRF-check a customer-supplied S3-compatible endpoint.
+
+        Mirrors the SFTP/SMTP siblings: resolve the customer-supplied host, refuse private,
+        loopback, link-local, and metadata targets, and return the validated addresses so the
+        S3 client dials those instead of re-resolving a name that could rebind. The hostname
+        stays the TLS and ``Host`` identity, so SigV4 signing is unaffected.
+
+        Returns ``(None, None)`` when unset, which routes to AWS S3.
+        """
+        endpoint_url = _normalize_optional_endpoint_url(self.endpoint_url)
+        if endpoint_url is None:
+            return None, None
+
+        parsed = urlparse(endpoint_url)
+        host = parsed.hostname
+        if settings.ALLOW_S3_ENDPOINT_INTERNAL_HOSTS:
+            # Self-hosted deployments point at an object store on their own network, which is
+            # commonly plaintext; the operator has accepted both risks by enabling this.
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError("S3 endpoint_url must be an http:// or https:// URL")
+            if not host:
+                raise ValueError("S3 endpoint_url must include a hostname")
+            return endpoint_url, None
+
+        if parsed.scheme != "https":
+            raise ValueError(
+                "S3 endpoint_url must be an https:// URL: plaintext http would put the request "
+                "signature on the wire in cleartext and is rejected by the upload proxy"
+            )
+        if not host:
+            raise ValueError("S3 endpoint_url must include a hostname")
+
+        try:
+            resolved_ips = await asyncio.to_thread(resolve_fetch_host_ips, host)
+        except UnresolvableHost:
+            raise ValueError(f"S3 endpoint_url host could not be resolved: {host}") from None
+        except BlockedHost:
+            raise ValueError(
+                f"S3 endpoint_url host resolves to a private or internal address, which is not allowed: {host}"
+            ) from None
+        return endpoint_url, resolved_ips
+
     def _build_s3_destination(
         self,
         workflow_run_id: str,
         file_path: str,
         aws_access_key_id: str | None,
         aws_secret_access_key: str | None,
+        endpoint_url: str | None,
+        endpoint_resolved_ips: tuple[str, ...] | None,
     ) -> FileUploadDestination:
         s3_uri = self._get_s3_uri(workflow_run_id, file_path)
         # ``_get_s3_uri`` returns ``s3://{bucket}/{key}`` — split it back out for
@@ -8433,6 +8489,8 @@ class FileDestinationBlock(Block):
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             aws_region_name=self.region_name,
+            endpoint_url=endpoint_url,
+            endpoint_resolved_ips=endpoint_resolved_ips,
         )
 
     def _build_azure_destination(
@@ -8534,12 +8592,15 @@ class FileDestinationBlock(Block):
                 or not actual_aws_secret_access_key.strip()
             ):
                 raise ValueError("S3 is not configured: resolved AWS credentials are empty")
+            endpoint_url, endpoint_resolved_ips = await self._resolve_validated_s3_endpoint()
             for file_path in files_to_upload:
                 destination = self._build_s3_destination(
                     workflow_run_id=workflow_run_id,
                     file_path=file_path,
                     aws_access_key_id=actual_aws_access_key_id,
                     aws_secret_access_key=actual_aws_secret_access_key,
+                    endpoint_url=endpoint_url,
+                    endpoint_resolved_ips=endpoint_resolved_ips,
                 )
                 customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
                     file_path=file_path,

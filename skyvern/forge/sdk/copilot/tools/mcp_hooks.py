@@ -10,6 +10,7 @@ from typing import Any
 
 import structlog
 
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
@@ -23,7 +24,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
 )
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.output_extraction_plan import unbound_candidate_relations
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    requested_output_designation_capability,
+    unbound_candidate_relations,
+)
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -106,8 +110,12 @@ def _selector_candidates_from_tool_data(data: dict[str, Any]) -> list[ScoutedSel
                 continue
             selector = str(raw_candidate.get("selector") or "").strip()
             source = str(raw_candidate.get("source") or "browser").strip()
+            raw_count = raw_candidate.get("match_count")
+            match_count = (
+                raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0 else None
+            )
             if selector and not any(candidate["selector"] == selector for candidate in candidates):
-                candidates.append({"selector": selector, "source": source})
+                candidates.append({"selector": selector, "source": source, "match_count": match_count})
     for key, source in (("selector", "requested"), ("resolved_selector", "resolved")):
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -115,7 +123,7 @@ def _selector_candidates_from_tool_data(data: dict[str, Any]) -> list[ScoutedSel
         selector = value.strip()
         if any(candidate["selector"] == selector for candidate in candidates):
             continue
-        candidates.append({"selector": selector, "source": source})
+        candidates.append({"selector": selector, "source": source, "match_count": None})
     return candidates
 
 
@@ -124,8 +132,11 @@ def _merge_selector_candidates(
 ) -> list[ScoutedSelectorCandidate]:
     merged = list(pending or [])
     for candidate in observed:
-        if not any(item["selector"] == candidate["selector"] for item in merged):
+        existing = next((item for item in merged if item["selector"] == candidate["selector"]), None)
+        if existing is None:
             merged.append(candidate)
+        elif existing["match_count"] is None and candidate["match_count"] is not None:
+            existing["match_count"] = candidate["match_count"]
     return merged
 
 
@@ -246,6 +257,9 @@ async def _get_block_schema_post_hook(
             data["code_only_note"] = _code_only_browser_unavailable_summary()
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
+            page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
+            if page_operation_contracts is not None:
+                data["page_operation_contracts"] = page_operation_contracts
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
@@ -269,9 +283,8 @@ async def _get_workflow_knowledge_post_hook(
 
 _MODEL_SCOUT_FACT_KEYS = (
     "tool_name",
-    "selector",
+    "executed_selector",
     "selector_candidates",
-    "selector_match_count",
     "role",
     "accessible_name",
     "role_name_match_count",
@@ -314,7 +327,6 @@ _MODEL_SCOUT_FACT_KEYS = (
 
 _MODEL_SCOUT_NULLABLE_FACT_KEYS = (
     "selector_candidates",
-    "selector_match_count",
     "role",
     "accessible_name",
     "role_name_match_count",
@@ -334,6 +346,17 @@ def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
     for interaction in ctx.scout_trajectory:
         interaction_mapping: Mapping[str, Any] = interaction
         fact = {key: interaction_mapping[key] for key in _MODEL_SCOUT_FACT_KEYS if key in interaction_mapping}
+        internal_selector = interaction_mapping.get("selector")
+        if "executed_selector" not in fact and isinstance(internal_selector, str) and internal_selector:
+            fact["executed_selector"] = internal_selector
+        raw_candidates = fact.get("selector_candidates")
+        if isinstance(raw_candidates, list):
+            fact["selector_candidates"] = [
+                {key: value for key, value in candidate.items() if key != "match_count"}
+                if isinstance(candidate, dict) and isinstance(candidate.get("selector"), str)
+                else candidate
+                for candidate in raw_candidates
+            ]
         for key in ("source_url", "result_url"):
             value = fact.get(key)
             if isinstance(value, str):
@@ -600,7 +623,7 @@ async def _wait_for_either_state_post_hook(
     selector_a = data.get("selector_a")
     selector_b = data.get("selector_b")
     candidates: list[ScoutedSelectorCandidate] = [
-        {"selector": selector, "source": source}
+        {"selector": selector, "source": source, "match_count": None}
         for selector, source in ((selector_a, "selector_a"), (selector_b, "selector_b"))
         if isinstance(selector, str) and selector
     ]
@@ -666,7 +689,7 @@ async def _click_post_hook(
         url, title = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
         result["data"] = {
-            "selector": selector,
+            "executed_selector": selector,
             "url": safe_page_origin(url) or "",
             "title": title,
         }
@@ -938,7 +961,7 @@ async def _type_text_post_hook(
         typed_length = data.get("text_length", 0)
         url, _ = await _resolve_url_title(raw, ctx)
         result["data"] = {
-            "selector": selector,
+            "executed_selector": selector,
             "typed_length": typed_length,
             "url": url,
         }
@@ -1210,13 +1233,7 @@ async def _evaluate_post_hook(
         claimed_path = str(recorded.get("read_output_path") or "")
         if claimed_path.startswith("output.") and not recorded.get("read_result_value"):
             data["claimed_output_without_a_single_value"] = claimed_path
-            data["requested_output_designation_capability"] = {
-                "tool": "inspect_page_for_composition",
-                "argument": "requested_output_reads",
-                "page_reference": "current_page",
-                "citation_fields": ["output_path", "value_text", "label"],
-                "effect": "browser verifies the cited rendered value and returns selector candidates with cardinality",
-            }
+            data["requested_output_designation_capability"] = requested_output_designation_capability([claimed_path])
             LOG.info(
                 "copilot_scouted_read_claimed_output_without_value",
                 read_output_path_present=bool(claimed_path),
@@ -1305,7 +1322,7 @@ async def _select_option_post_hook(
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="select_option", url=url)
         result["data"] = {
-            "selector": selector,
+            "executed_selector": selector,
             "value": data.get("value", ""),
             "url": url,
         }
@@ -1387,7 +1404,7 @@ async def _press_key_post_hook(
         _mark_pending_browser_interaction_observation(ctx, tool_name="press_key", url=url)
         result["data"] = {
             "key": data.get("key", ""),
-            "selector": selector,
+            "executed_selector": selector,
             "url": url,
         }
         await _bind_login_credential_for_observed_url(ctx, url, result)

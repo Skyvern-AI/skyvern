@@ -103,6 +103,245 @@ def test_option_helper_empty_target_is_false() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# aria-disabled empty-state placeholder must not admit the force-select gate
+# (an empty-state row rendered as role=option aria-disabled=true echoing
+#  "No results for <target>" alongside a genuine unrelated enabled option)
+# --------------------------------------------------------------------------- #
+def _listbox_disabled_placeholder_plus_enabled(
+    target: str, *, aria_disabled: str = "true", enabled_label: str = "Frontend Developer"
+) -> list[dict]:
+    return [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option", "aria-disabled": aria_disabled},
+                    "id": "OPTD",
+                    "text": f"No results for {target}",
+                },
+                {"tagName": "li", "attributes": {"role": "option"}, "id": "OPT9", "text": enabled_label},
+            ],
+        }
+    ]
+
+
+def _listbox_disabled_nested_placeholder(target: str) -> list[dict]:
+    # The echoed target is split across nested spans (the disabled row has empty own text), so it is only
+    # reachable through the subtree-text arm.
+    return [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option", "aria-disabled": "true"},
+                    "id": "OPTD",
+                    "children": [
+                        {"tagName": "span", "text": "No results for "},
+                        {"tagName": "span", "text": target},
+                    ],
+                },
+                {"tagName": "li", "attributes": {"role": "option"}, "id": "OPT9", "text": "Frontend Developer"},
+            ],
+        }
+    ]
+
+
+def test_option_helper_excludes_aria_disabled_placeholder_echo() -> None:
+    # RED on the starting head: the disabled placeholder's label "No results for <target>" is admitted as an
+    # option candidate, so the gate returns True and force_select would commit against a disabled placeholder.
+    tree = _listbox_disabled_placeholder_plus_enabled(_TARGET)
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is False
+
+
+def test_option_subtree_gate_excludes_aria_disabled_nested_echo() -> None:
+    tree = _listbox_disabled_nested_placeholder(_TARGET)
+    assert handler._incremental_tree_contains_option_subtree_with_target_value(tree, _TARGET) is False
+
+
+# positive controls: enabled representations must stay eligible after the disabled exclusion
+def test_option_subtree_gate_matches_enabled_deferred_nested_target() -> None:
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option"},
+                    "id": "OPT1",
+                    "children": [
+                        {"tagName": "span", "text": _TARGET[:4]},
+                        {"tagName": "span", "text": _TARGET[4:]},
+                    ],
+                }
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_subtree_with_target_value(tree, _TARGET) is True
+
+
+def test_option_gate_matches_enabled_roleless_li_in_choice_surface() -> None:
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [{"tagName": "li", "id": "OPT1", "text": _TARGET}],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is True
+
+
+def test_option_gate_aria_disabled_false_option_still_eligible() -> None:
+    # aria-disabled="false" is not disabled, so an enabled option carrying the target stays eligible.
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option", "aria-disabled": "false"},
+                    "id": "OPT1",
+                    "text": _TARGET,
+                }
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is True
+
+
+# --------------------------------------------------------------------------- #
+# INHERITED disabled state must exclude descendant options/choices from the
+# custom-select candidate/gate seams (a disabled ancestor disables the subtree)
+# --------------------------------------------------------------------------- #
+def _disabled_listbox_with_target_option(target: str, *, container_disabled: str = "true") -> list[dict]:
+    return [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox", "aria-disabled": container_disabled},
+            "children": [{"tagName": "li", "attributes": {"role": "option"}, "id": "OPT1", "text": target}],
+        }
+    ]
+
+
+def test_option_helper_excludes_option_under_aria_disabled_listbox() -> None:
+    # RED on starting head: the option's own attrs are not disabled, so it is admitted even though its
+    # listbox ancestor is aria-disabled=true.
+    tree = _disabled_listbox_with_target_option(_TARGET)
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is False
+
+
+def test_option_subtree_gate_excludes_option_under_aria_disabled_container() -> None:
+    tree = [
+        {
+            "tagName": "div",
+            "attributes": {"role": "listbox", "aria-disabled": "true"},
+            "children": [
+                {
+                    "tagName": "div",
+                    "attributes": {"role": "option"},
+                    "id": "OPT1",
+                    "children": [{"tagName": "span", "text": _TARGET[:4]}, {"tagName": "span", "text": _TARGET[4:]}],
+                }
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_subtree_with_target_value(tree, _TARGET) is False
+
+
+def test_option_helper_excludes_choice_input_under_disabled_fieldset() -> None:
+    # A radio/checkbox descendant of an HTML-disabled <fieldset> (boolean attribute) is disabled by
+    # inheritance. On the starting head the input's own attrs are enabled and its aria-label carries the
+    # target, so it is admitted as a choice-input candidate; only ancestor inheritance excludes it.
+    tree = [
+        {
+            "tagName": "fieldset",
+            "attributes": {"disabled": ""},
+            "children": [
+                {"tagName": "input", "attributes": {"type": "radio", "aria-label": _TARGET}, "id": "INP1"},
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is False
+
+
+def test_option_helper_excludes_nested_input_under_disabled_label_wrapper() -> None:
+    # Skipped-wrapper / eligible-child leak: the label wrapper is aria-disabled=true, so the current head
+    # skips the wrapper candidate but still admits the nested input as a separate eligible candidate.
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "label",
+                    "attributes": {"aria-disabled": "true"},
+                    "id": "LBL",
+                    "children": [
+                        {"tagName": "input", "attributes": {"type": "radio", "aria-label": _TARGET}, "id": "INP1"}
+                    ],
+                }
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is False
+
+
+def test_candidates_excludes_inherited_disabled_option() -> None:
+    # Candidate-production boundary: no candidate carrying the target may be produced under a disabled ancestor.
+    cands = handler._custom_select_candidates_from_elements(_disabled_listbox_with_target_option(_TARGET))
+    assert all(_TARGET.lower() not in str(c.get("label") or "").lower() for c in cands)
+
+
+def test_option_helper_inherited_disabled_not_overridden_by_child_aria_disabled_false() -> None:
+    # Monotonic inheritance: a descendant aria-disabled=false cannot re-enable an inherited-disabled ancestor.
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox", "aria-disabled": "true"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option", "aria-disabled": "false"},
+                    "id": "OPT1",
+                    "text": _TARGET,
+                }
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is False
+
+
+def test_option_helper_ancestor_aria_disabled_false_keeps_option_eligible() -> None:
+    tree = _disabled_listbox_with_target_option(_TARGET, container_disabled="false")
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is True
+
+
+def test_option_helper_disabled_sibling_does_not_suppress_enabled_sibling() -> None:
+    # A disabled option sibling must not suppress an enabled sibling that carries the target.
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option", "aria-disabled": "true"},
+                    "id": "OPTD",
+                    "text": "Frontend Developer",
+                },
+                {"tagName": "li", "attributes": {"role": "option"}, "id": "OPT2", "text": _TARGET},
+            ],
+        }
+    ]
+    assert handler._incremental_tree_contains_option_with_target_value(tree, _TARGET) is True
+
+
+# --------------------------------------------------------------------------- #
 # _is_commit_required_combobox — combobox (role/aria-autocomplete) AND aria-invalid
 # --------------------------------------------------------------------------- #
 def _element_with_attrs(attrs: dict[str, object]) -> MagicMock:
@@ -755,3 +994,528 @@ async def test_base_action_input_text_does_not_raise_and_keeps_default_probe() -
     entered = [call.args[0] for call in el.input_sequentially.await_args_list if call.args]
     assert _TARGET not in entered
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+# --------------------------------------------------------------------------- #
+# handle_input_text_action — search-bar deferred-render re-observation (SKY-14275)
+#
+# A search-bar combobox whose filtered option is absent from the first post-input snapshot must
+# render-settle and re-read until it surfaces, then reach the custom-select owner seam. When the target
+# is already present, or the field is not a search bar, no settle happens.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_search_bar", "attrs", "target_present_first", "expect_settle"),
+    [
+        pytest.param(True, {"role": "combobox", "aria-autocomplete": "list"}, False, True, id="search-bar-deferred"),
+        pytest.param(True, {"role": "combobox", "aria-autocomplete": "list"}, True, False, id="search-bar-present"),
+        pytest.param(False, {"role": "textbox"}, True, False, id="ordinary-no-settle"),
+    ],
+)
+async def test_search_bar_render_settle_re_observation(
+    is_search_bar: bool,
+    attrs: dict[str, object],
+    target_present_first: bool,
+    expect_settle: bool,
+) -> None:
+    state = {"settled": False, "calls": 0}
+
+    async def _settle_spy(_element: object) -> None:
+        state["calls"] += 1
+        state["settled"] = True
+
+    def _incremental(*_a: object, **_k: object) -> list[dict]:
+        # The target surfaces on the first read only when present-first; otherwise only after a settle.
+        if target_present_first or state["settled"]:
+            return _listbox_with_option(_TARGET)
+        return []
+
+    skyvern_el = make_input_element_mock(element_id="CBX", attrs=attrs)
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(side_effect=_incremental)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"CBX": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=is_search_bar)
+
+    select_result = MagicMock()
+    select_result.action_result = ActionSuccess()
+    select_mock = AsyncMock(return_value=select_result)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value=_TARGET),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=_settle_spy),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
+    ):
+        await handle_input_text_action(
+            action=InputTextAction(element_id="CBX", text=_TARGET, reasoning="type it"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            task=_TASK,
+            step=_STEP,
+        )
+
+    assert (state["calls"] > 0) is expect_settle
+    # The search-bar path reaches the owner seam with the target once it surfaces (immediately when
+    # present, after the settle when deferred); the ordinary path here only asserts it adds no settle.
+    if is_search_bar:
+        select_mock.assert_awaited_once()
+        assert select_mock.await_args.kwargs["target_value"] == _TARGET
+
+
+@pytest.mark.asyncio
+async def test_search_bar_banner_only_target_does_not_force_select() -> None:
+    """Adversarial safety: the target text appears only in a non-option status banner while an unrelated
+    selectable option is present. The forced search-bar custom-select must NOT be entered -- otherwise
+    force_select=True would commit the unrelated option. The seam mock here would report a committed
+    selection if awaited (it is not stubbed to a quiet no-match), so a wrong entry is caught."""
+    banner_only_tree = [
+        {"tagName": "div", "attributes": {"role": "status"}, "text": f"Showing results for {_TARGET}", "children": []},
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {"tagName": "li", "attributes": {"role": "option"}, "id": "OPT9", "text": "Frontend Developer"}
+            ],
+        },
+    ]
+
+    async def _settle_spy(_element: object) -> None:
+        return None
+
+    skyvern_el = make_input_element_mock(element_id="CBX", attrs={"role": "combobox", "aria-autocomplete": "list"})
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(return_value=banner_only_tree)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"CBX": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=True)
+
+    committed = MagicMock()
+    committed.action_result = ActionSuccess()  # a forced selection would look like a committed success
+    select_mock = AsyncMock(return_value=committed)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value=_TARGET),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=_settle_spy),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
+    ):
+        await handle_input_text_action(
+            action=InputTextAction(element_id="CBX", text=_TARGET, reasoning="type it"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            task=_TASK,
+            step=_STEP,
+        )
+
+    # No selectable option carries the target, so the forced custom-select sink must never be reached.
+    select_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_bar_aria_disabled_placeholder_does_not_force_select() -> None:
+    """Adversarial safety: the target text appears only in an aria-disabled empty-state option
+    ("No results for <target>") while an unrelated enabled option is present. The forced search-bar
+    custom-select must NOT be entered -- otherwise force_select=True would commit against the disabled
+    placeholder (or the unrelated enabled option). The seam mock reports a committed selection if awaited."""
+    disabled_placeholder_tree = _listbox_disabled_placeholder_plus_enabled(_TARGET)
+
+    async def _settle_spy(_element: object) -> None:
+        return None
+
+    skyvern_el = make_input_element_mock(element_id="CBX", attrs={"role": "combobox", "aria-autocomplete": "list"})
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(return_value=disabled_placeholder_tree)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"CBX": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=True)
+
+    committed = MagicMock()
+    committed.action_result = ActionSuccess()  # a forced selection would look like a committed success
+    select_mock = AsyncMock(return_value=committed)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value=_TARGET),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=_settle_spy),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
+    ):
+        await handle_input_text_action(
+            action=InputTextAction(element_id="CBX", text=_TARGET, reasoning="type it"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            task=_TASK,
+            step=_STEP,
+        )
+
+    # The only target-bearing option is aria-disabled, so the forced custom-select sink must never be reached.
+    select_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "surfaced_tree",
+    [
+        pytest.param(
+            # Real ui-select shape: the option's value renders in nested spans, the option node's own text is
+            # empty. Reducing the match to node.get("text") (no subtree walk) would miss it and go RED.
+            [
+                {
+                    "tagName": "div",
+                    "attributes": {"role": "option"},
+                    "text": "",
+                    "children": [
+                        {"tagName": "span", "text": "ACME", "children": []},
+                        {"tagName": "b", "text": _TARGET, "children": []},
+                    ],
+                }
+            ],
+            id="nested-spans-option",
+        ),
+        pytest.param(
+            # Role-less <li> option inside a role=listbox choice surface (jQuery-UI / select2 v3 / typeahead
+            # family) -- eligible via the selector's `tag == "li" and in_choice_surface`, previously dropped.
+            [
+                {
+                    "tagName": "ul",
+                    "attributes": {"role": "listbox"},
+                    "children": [
+                        {"tagName": "li", "text": "", "children": [{"tagName": "a", "text": _TARGET, "children": []}]}
+                    ],
+                }
+            ],
+            id="roleless-li-in-choice-surface",
+        ),
+        pytest.param(
+            # Target split across sibling text nodes in document order. A reverse-order subtree walk would
+            # scramble it ("EngineerBackend") and miss the match, so this guards the document-order collector.
+            [
+                {
+                    "tagName": "div",
+                    "attributes": {"role": "option"},
+                    "text": "",
+                    "children": [
+                        {"tagName": "b", "text": "Backend ", "children": []},
+                        {"tagName": "b", "text": "Engineer", "children": []},
+                    ],
+                }
+            ],
+            id="split-across-siblings-document-order",
+        ),
+        pytest.param(
+            # Multi-select filter combobox: a bare checkbox row labelled via aria-label (selector admits via
+            # is_choice_input). Covered by the label-candidate arm, not the subtree pass.
+            [{"tagName": "input", "id": "CHK", "attributes": {"type": "checkbox", "aria-label": _TARGET}}],
+            id="checkbox-input-aria-label",
+        ),
+        pytest.param(
+            # A <label> wrapping a checkbox, target in the label text (selector admits via is_label_choice).
+            [
+                {
+                    "tagName": "label",
+                    "id": "LBL",
+                    "text": _TARGET,
+                    "children": [{"tagName": "input", "id": "CHK2", "attributes": {"type": "checkbox"}}],
+                }
+            ],
+            id="label-wrapped-checkbox",
+        ),
+        pytest.param(
+            # An option whose label lives only in aria-label (empty text), so the subtree pass alone would
+            # miss it -- the label-candidate arm covers it via _select_shadow_label_from_node.
+            [{"tagName": "div", "id": "OPT", "attributes": {"role": "option", "aria-label": _TARGET}, "text": ""}],
+            id="attribute-only-label-option",
+        ),
+    ],
+)
+async def test_search_bar_gate_admits_selector_eligible_option(surfaced_tree: list[dict]) -> None:
+    """Eligibility mirrors the selector's candidate set: an option whose value renders in nested spans, and a
+    role-less <li> in a choice surface, must reach the forced custom-select seam with the target."""
+
+    async def _settle_spy(_element: object) -> None:
+        return None
+
+    skyvern_el = make_input_element_mock(element_id="CBX", attrs={"role": "combobox", "aria-autocomplete": "list"})
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(return_value=surfaced_tree)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"CBX": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=True)
+
+    select_result = MagicMock()
+    select_result.action_result = ActionSuccess()
+    select_mock = AsyncMock(return_value=select_result)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value=_TARGET),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=_settle_spy),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
+    ):
+        await handle_input_text_action(
+            action=InputTextAction(element_id="CBX", text=_TARGET, reasoning="type it"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            task=_TASK,
+            step=_STEP,
+        )
+
+    select_mock.assert_awaited_once()
+    assert select_mock.await_args.kwargs["target_value"] == _TARGET
+
+
+# --------------------------------------------------------------------------- #
+# _incremental_tree_has_enabled_selectable_option — the deferred-settle entry gate
+# reads "no enabled selectable option candidate at all" straight off the canonical
+# candidate producer, so disabled-only snapshots stay settle-eligible.
+# --------------------------------------------------------------------------- #
+def test_enabled_selectable_gate_true_for_enabled_option() -> None:
+    assert handler._incremental_tree_has_enabled_selectable_option(_listbox_with_option(_TARGET)) is True
+
+
+def test_enabled_selectable_gate_false_for_disabled_only_snapshot() -> None:
+    # A snapshot whose only options sit under an aria-disabled container yields no candidate, so it reads as
+    # "no enabled selectable option" and the single deferred settle stays eligible.
+    tree = _disabled_listbox_with_target_option("Frontend Developer")
+    assert handler._incremental_tree_has_enabled_selectable_option(tree) is False
+
+
+def test_enabled_selectable_gate_false_for_empty_snapshot() -> None:
+    assert handler._incremental_tree_has_enabled_selectable_option([]) is False
+
+
+# --------------------------------------------------------------------------- #
+# handle_input_text_action — deferred settle is exactly ONE bounded attempt, gated
+# on a live combobox/typeahead whose first snapshot has no enabled option (SKY-6657).
+# --------------------------------------------------------------------------- #
+async def _drive_search_bar_input(
+    *,
+    attrs: dict[str, object],
+    incremental_side_effect,
+    settle_spy,
+    select_mock,
+    is_search_bar: bool = True,
+) -> MagicMock:
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(side_effect=incremental_side_effect)
+
+    skyvern_el = make_input_element_mock(element_id="CBX", attrs=attrs)
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"CBX": {"tagName": "input"}}
+    context = InputOrSelectContext(field="Account", is_search_bar=is_search_bar)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value=_TARGET),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
+        patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=settle_spy),
+        patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
+    ):
+        await handle_input_text_action(
+            action=InputTextAction(element_id="CBX", text=_TARGET, reasoning="type it"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            task=_TASK,
+            step=_STEP,
+        )
+    return inc
+
+
+@pytest.mark.asyncio
+async def test_search_bar_deferred_settles_exactly_once_when_target_never_surfaces() -> None:
+    # Deferred-empty race where the target never surfaces: the first snapshot has no enabled option, so
+    # exactly one settle + one re-read runs; the still-empty re-read yields no second settle. RED on the
+    # pre-fix head, which looped up to three settles (four incremental reads).
+    state = {"calls": 0}
+
+    async def _settle_spy(_element: object) -> None:
+        state["calls"] += 1
+
+    inc = await _drive_search_bar_input(
+        attrs={"role": "combobox", "aria-autocomplete": "list"},
+        incremental_side_effect=lambda *_a, **_k: [],
+        settle_spy=_settle_spy,
+        select_mock=AsyncMock(),
+    )
+
+    assert state["calls"] == 1
+    assert inc.get_incremental_element_tree.await_count == 2  # initial read + exactly one re-read
+
+
+@pytest.mark.asyncio
+async def test_search_bar_no_settle_when_live_element_not_combobox() -> None:
+    # A search-bar context whose live element is a plain textbox (not combobox/typeahead) must not settle,
+    # even with an empty first snapshot. RED on the pre-fix head, which had no combobox/typeahead gate.
+    state = {"calls": 0}
+
+    async def _settle_spy(_element: object) -> None:
+        state["calls"] += 1
+
+    inc = await _drive_search_bar_input(
+        attrs={"role": "textbox"},
+        incremental_side_effect=lambda *_a, **_k: [],
+        settle_spy=_settle_spy,
+        select_mock=AsyncMock(),
+    )
+
+    assert state["calls"] == 0
+    assert inc.get_incremental_element_tree.await_count == 1  # initial read only, no re-read
+
+
+@pytest.mark.asyncio
+async def test_search_bar_no_settle_when_populated_no_match() -> None:
+    # The first snapshot already carries an enabled (non-target) option: a populated no-match state, not the
+    # deferred-empty race. No settle, and the forced custom-select sink is never reached. RED on the pre-fix
+    # head, which settled whenever the target was merely absent.
+    state = {"calls": 0}
+
+    async def _settle_spy(_element: object) -> None:
+        state["calls"] += 1
+
+    select_mock = AsyncMock()
+    inc = await _drive_search_bar_input(
+        attrs={"role": "combobox", "aria-autocomplete": "list"},
+        incremental_side_effect=lambda *_a, **_k: _listbox_with_option("Frontend Developer"),
+        settle_spy=_settle_spy,
+        select_mock=select_mock,
+    )
+
+    assert state["calls"] == 0
+    assert inc.get_incremental_element_tree.await_count == 1
+    select_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_bar_disabled_only_snapshot_settles_once_then_commits() -> None:
+    # Disabled-only first snapshot (no enabled candidate) is the deferred-empty race: the single settle stays
+    # eligible, and once the enabled target surfaces on the re-read the real owner seam commits it.
+    state = {"calls": 0, "settled": False}
+
+    async def _settle_spy(_element: object) -> None:
+        state["calls"] += 1
+        state["settled"] = True
+
+    def _incremental(*_a: object, **_k: object) -> list[dict]:
+        if state["settled"]:
+            return _listbox_with_option(_TARGET)
+        return _disabled_listbox_with_target_option("Frontend Developer")
+
+    select_result = MagicMock()
+    select_result.action_result = ActionSuccess()
+    select_mock = AsyncMock(return_value=select_result)
+
+    await _drive_search_bar_input(
+        attrs={"role": "combobox", "aria-autocomplete": "list"},
+        incremental_side_effect=_incremental,
+        settle_spy=_settle_spy,
+        select_mock=select_mock,
+    )
+
+    assert state["calls"] == 1
+    select_mock.assert_awaited_once()
+    assert select_mock.await_args.kwargs["target_value"] == _TARGET
+
+
+@pytest.mark.asyncio
+async def test_search_bar_no_settle_when_enabled_nested_span_target_present() -> None:
+    # Fast-path preservation: the first snapshot already carries an ENABLED target option whose value renders
+    # only in nested spans (empty own text). The label-candidate producer yields no candidate for such a row,
+    # so the enabled-selectable predicate reads False -- but the option-subtree gate recognizes the enabled
+    # target, so this is a populated present-target state, not the deferred-empty race. No settle, only the
+    # initial read, and the existing owner seam still commits. RED on the v9 head, which settled once here.
+    tree = [
+        {
+            "tagName": "ul",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "tagName": "li",
+                    "attributes": {"role": "option"},
+                    "id": "OPT1",
+                    "text": "",
+                    "children": [
+                        {"tagName": "span", "text": _TARGET[:4]},
+                        {"tagName": "span", "text": _TARGET[4:]},
+                    ],
+                }
+            ],
+        }
+    ]
+    state = {"calls": 0}
+
+    async def _settle_spy(_element: object) -> None:
+        state["calls"] += 1
+
+    select_result = MagicMock()
+    select_result.action_result = ActionSuccess()
+    select_mock = AsyncMock(return_value=select_result)
+
+    inc = await _drive_search_bar_input(
+        attrs={"role": "combobox", "aria-autocomplete": "list"},
+        incremental_side_effect=lambda *_a, **_k: tree,
+        settle_spy=_settle_spy,
+        select_mock=select_mock,
+    )
+
+    assert state["calls"] == 0
+    assert inc.get_incremental_element_tree.await_count == 1  # initial read only, no settle re-read
+    select_mock.assert_awaited_once()
+    assert select_mock.await_args.kwargs["target_value"] == _TARGET

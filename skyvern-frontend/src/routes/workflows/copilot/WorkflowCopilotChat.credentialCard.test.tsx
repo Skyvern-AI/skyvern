@@ -465,6 +465,36 @@ afterEach(() => {
   cleanup();
 });
 
+const scoutResult = () => ({
+  type: "tool_result",
+  tool_name: "navigate_browser",
+  display_label: "Opening page",
+  success: true,
+  summary: "Opened the sign-in page",
+  iteration: 0,
+  tool_call_id: "tc-1",
+});
+
+const streamScoutTurn = async () => {
+  await renderChat();
+  await submit("build me a workflow");
+  await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+  await act(async () => {
+    streamCalls[0]!.onMessage(turnStart());
+    streamCalls[0]!.onMessage({ type: "design_start" });
+    streamCalls[0]!.onMessage(scoutResult());
+  });
+};
+
+describe("WorkflowCopilotChat — activity log", () => {
+  it("renders the flat log, not the retired phase rail", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await streamScoutTurn();
+    expect(screen.getByText("Opened the sign-in page")).toBeTruthy();
+    expect(screen.queryByText("Explore site")).toBeNull();
+  });
+});
+
 describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   it("sends supports_credential_pause on the request", async () => {
     flagMap.current = { [COPILOT_UX_V1_FLAG]: true };

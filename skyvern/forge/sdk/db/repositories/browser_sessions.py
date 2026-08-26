@@ -825,6 +825,23 @@ class BrowserSessionsRepository(BaseRepository):
             )
             await session.commit()
 
+    @db_operation("mark_persistent_browser_session_cdp_unreachable")
+    async def mark_persistent_browser_session_cdp_unreachable(
+        self, session_id: str, unreachable_at: datetime | None = None
+    ) -> None:
+        """The CDP relay lost this session's browser. Unscoped like touch_last_activity: the relay
+        passes only the server-assigned id. Write-once via COALESCE; a no-op once the row completed."""
+        ts = to_naive_utc(unreachable_at) if unreachable_at is not None else naive_utc_now()
+        async with self.Session() as session:
+            await session.execute(
+                update(PersistentBrowserSessionModel)
+                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+                .where(PersistentBrowserSessionModel.deleted_at.is_(None))
+                .where(PersistentBrowserSessionModel.completed_at.is_(None))
+                .values(cdp_unreachable_at=func.coalesce(PersistentBrowserSessionModel.cdp_unreachable_at, ts))
+            )
+            await session.commit()
+
     @db_operation("mark_persistent_browser_session_close_requested")
     async def mark_persistent_browser_session_close_requested(
         self, session_id: str, organization_id: str, close_requested_at: datetime | None = None
@@ -949,7 +966,9 @@ class BrowserSessionsRepository(BaseRepository):
         upstream_cdp_url: str | None = None,
         generate_browser_profile: bool | None = None,
         browser_profile_loaded: bool | None = None,
+        workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
+        # Cloud consumes this out-of-band context when a terminal write emits lifecycle telemetry.
         async with self.Session() as session:
             persistent_browser_session = (
                 await session.scalars(
@@ -1053,13 +1072,16 @@ class BrowserSessionsRepository(BaseRepository):
         self,
         session_id: str,
         organization_id: str,
-        instance_type: str,
-        vcpu_millicores: int,
-        memory_mb: int,
+        instance_type: str | None,
         duration_ms: int,
         compute_cost: float,
+        compute_hourly_rate_id: int | None = None,
     ) -> None:
-        """Update the compute cost fields for a persistent browser session"""
+        """Update the compute cost fields for a persistent browser session.
+
+        ``instance_type`` is None for a session that ran on no machine of ours -- a zero-cost
+        session that never started -- and the column is then left as it was rather than blanked.
+        """
         async with self.Session() as session:
             persistent_browser_session = (
                 await session.scalars(
@@ -1070,11 +1092,11 @@ class BrowserSessionsRepository(BaseRepository):
                 )
             ).first()
             if persistent_browser_session:
-                persistent_browser_session.instance_type = instance_type
-                persistent_browser_session.vcpu_millicores = vcpu_millicores
-                persistent_browser_session.memory_mb = memory_mb
+                if instance_type is not None:
+                    persistent_browser_session.instance_type = instance_type
                 persistent_browser_session.duration_ms = duration_ms
                 persistent_browser_session.compute_cost = compute_cost
+                persistent_browser_session.compute_hourly_rate_id = compute_hourly_rate_id
                 await session.commit()
                 await session.refresh(persistent_browser_session)
             else:
@@ -1226,8 +1248,15 @@ class BrowserSessionsRepository(BaseRepository):
             return PersistentBrowserSession.model_validate(persistent_browser_session)
 
     @db_operation("close_persistent_browser_session")
-    async def close_persistent_browser_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:
+    async def close_persistent_browser_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        workflow_run_id: str | None = None,
+    ) -> PersistentBrowserSession:
         """Close a specific persistent browser session."""
+        # Cloud consumes this out-of-band context when close emits lifecycle telemetry.
         async with self.Session() as session:
             persistent_browser_session = (
                 await session.scalars(

@@ -90,9 +90,8 @@ async def test_code_block_schema_carries_the_steps_already_demonstrated() -> Non
 
     demonstrated = result["data"]["demonstrated_steps"]
     assert demonstrated[0]["tool_name"] == "click"
-    assert demonstrated[0]["selector"] == 'button[aria-label="Log in"]'
+    assert demonstrated[0]["executed_selector"] == 'button[aria-label="Log in"]'
     assert demonstrated[0]["source_url"] == "https://example.com/"
-    assert demonstrated[0]["selector_match_count"] is None
 
 
 @pytest.mark.asyncio
@@ -115,7 +114,7 @@ async def test_demonstrated_steps_preserve_trajectory_order_without_synthesizing
 
     demonstrated = result["data"]["demonstrated_steps"]
     assert [step["tool_name"] for step in demonstrated] == ["click", "click", "press_key"]
-    assert [step.get("selector") for step in demonstrated] == [
+    assert [step.get("executed_selector") for step in demonstrated] == [
         'button[aria-label="Log in"]',
         "button",
         None,
@@ -145,11 +144,10 @@ async def test_code_block_schema_exposes_opaque_input_id_but_never_private_value
     assert result["data"]["demonstrated_steps"] == [
         {
             "tool_name": "type_text",
-            "selector": "#search",
+            "executed_selector": "#search",
             "input_id": "input_opaque_1",
             "typed_length": 17,
             "selector_candidates": None,
-            "selector_match_count": None,
             "role": None,
             "accessible_name": None,
             "role_name_match_count": None,
@@ -215,6 +213,26 @@ async def test_download_claim_helper_contract_is_scoped_to_code_only_code_schema
 
     assert "download_claim_helper_contract" not in standard["data"]
     assert "download_claim_helper_contract" not in non_code["data"]
+
+
+@pytest.mark.asyncio
+async def test_oss_code_only_code_schema_omits_cloud_page_operation_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge import app
+    from skyvern.forge.agent_functions import AgentFunction
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
+
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    ctx = SimpleNamespace(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        code_only_code_schema_seen=False,
+        scout_trajectory=[],
+    )
+
+    result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+
+    assert "page_operation_contracts" not in result["data"]
 
 
 def test_code_only_evaluate_guidance_supports_grounded_download_authoring() -> None:

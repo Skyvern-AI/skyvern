@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 from typing import Any, Awaitable, Callable
 
@@ -40,6 +41,17 @@ OBSERVE_URL_MAX_CHARS = 300
 # click menu probe. Either exists only where we set it, so one that matches nothing now cannot
 # reappear without a fresh observe / menu-opening click.
 _TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu)?="[^"\\]+"\]$')
+# Whitespace outside a quoted attribute value is a combinator: only hostAnchored composes selectors
+# that way, while a natural `[name="first name"]` keeps its single round trip.
+_TV3_QUOTED_VALUE_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+_TV3_ANCHORED_SELECTOR_RE = re.compile(r"^\S+\s+\S.*$")
+
+
+# Relies on observe emitting a combinator only from hostAnchored; every natural selector is one
+# compound, with any whitespace inside a quoted value.
+def _is_host_anchored_selector(selector: str) -> bool:
+    return bool(_TV3_ANCHORED_SELECTOR_RE.match(_TV3_QUOTED_VALUE_RE.sub('""', selector.strip())))
+
 
 # ARIA combobox signals — used by observe() only to add a hint that a field is a typeahead. This is a
 # nudge for the model, not load-bearing: type() handles typeaheads behaviorally (see _FIND_SUGGESTION_JS),
@@ -611,6 +623,413 @@ _TYPE_TARGET_PROBE_JS = (
   const inFieldsOwnSubtree =
     related(top, el) || (unitOwnsOnlyThisField && related(unit, top) && related(unit, el));
   out.skinned = !pinned && !coversTheView && !declaresItselfALayer && inFieldsOwnSubtree;
+  // An OPEN combobox's own popup is not a foreign occluder: the field aria-owns/controls the list it
+  // just opened, so being "covered" by it means the widget is working, not blocked. Treat it like the
+  // field's own skin -- force past it -- rather than refusing to type into the list the field opened.
+  // Gated on aria-expanded="true" so this only fires for a combobox the page itself reports as OPEN,
+  // never for a static field that merely happens to reference another element. Only the field's OWN
+  // popup qualifies; a shared or unrelated layer never does.
+  // Wrapped whole: a page can override getAttribute to throw (the same threat model the naming block
+  // below guards against), and an escape here would fault page.evaluate and disable occlusion entirely.
+  try {
+    if (out.occluded && !out.skinned && el.getAttribute && el.getAttribute('aria-expanded') === 'true') {
+      const popupIds = [];
+      for (const a of ['aria-controls', 'aria-owns']) {
+        const v = el.getAttribute && el.getAttribute(a);
+        if (v) for (const id of v.split(/\s+/)) if (id) popupIds.push(id);
+      }
+      if (popupIds.length) {
+        let ownRoot = null;
+        try { ownRoot = Node.prototype.getRootNode.call(el); } catch (e) { ownRoot = null; }
+        for (const id of popupIds.slice(0, 20)) {
+          let pop = null;
+          try { pop = ownRoot && ownRoot.getElementById ? ownRoot.getElementById(id) : document.getElementById(id); }
+          catch (e) { pop = null; }
+          // aria-controls/aria-owns express arbitrary relationships, so require the referenced element
+          // to actually be a popup (listbox/menu/tree/grid/dialog -- the ARIA combobox-popup roles)
+          // before forcing past it. Without this a field pointing at a plain region that happens to
+          // hold a real occluder would type straight through it.
+          const popRole = ((pop && pop.getAttribute && pop.getAttribute('role')) || '').toLowerCase();
+          if (!/^(listbox|menu|tree|grid|dialog)$/.test(popRole)) continue;
+          if (pop === top || related(pop, top)) {
+            // The exemption forces past ONLY the layer-self-declaration, never the view-covering guard
+            // the outer skin test applies: a full-screen dialog/listbox sheet, or a normal popup that
+            // hosts a full-screen wall, hides what a person plainly sees, so it is a real occluder, not
+            // the widget's working list. Refuse when EITHER the actually-hit occluder covers the view
+            // (coversTheView, computed on `top` above -- catches a small popup hosting a fixed
+            // full-screen child) OR the referenced popup itself does (catches a big sheet the hit
+            // landed on a small option inside). A normal dropdown is a fraction of the viewport on
+            // both counts and still qualifies. A thrown getBoundingClientRect reads as view-sized,
+            // so a hostile page cannot forge its way back into the exemption.
+            let popBig = true;
+            try { popBig = area(pop.getBoundingClientRect()) > 0.6 * viewport; } catch (e) { popBig = true; }
+            if (!coversTheView && !popBig) out.skinned = true;
+            break;
+          }
+        }
+      }
+    }
+  } catch (e) { /* best-effort: a thrown getAttribute must not disable occlusion detection */ }
+  // The model needs a handle on the thing in the way, not just the fact that something is. Walk from
+  // the hit element outward and stop at the FIRST ancestor that still reads as a layer -- pinned,
+  // view-sized, or self-declared -- so a small dialog panel that happened to be hit directly is walked
+  // past in favor of the backdrop wrapping it, but a real backdrop is never walked past in favor of a
+  // still-more-outer app shell or scroll-lock wrapper that also happens to qualify (e.g. is itself
+  // view-sized): the backdrop is closer to the hit, so it wins.
+  // Named regardless of skinned: the typing path ignores the name when it forces past a skin, but the
+  // CLICK path has no force fallback -- a click covered by the field's own open listbox times out, and
+  // the model needs the occluder named (its options listed) rather than a bare 15s Page.click Timeout.
+  if (out.occluded && top !== document.body && top !== document.documentElement) {
+   // A throw anywhere below would otherwise escape page.evaluate() entirely and be read upstream
+   // as "the probe failed" -- which _reachable_for_typing treats as reachable=True, skipping
+   // occlusion detection altogether. Naming the occluder is best-effort; out.occluded/out.skinned
+   // are already decided above and must survive regardless of what happens in here.
+   try {
+    // Same set observe() already rejects raw ids/testids on: a bidi override or zero-width
+    // character in page-authored text can make the rendered guidance read as something different
+    // from what the string actually is. Stripped, not rejected -- this is a label the model reads,
+    // not an identifier trusted for its exact bytes, so the text minus the forgeable characters is
+    // still useful.
+    // Two copies, not one reused: a `g`-flagged regex is stateful across .test() calls (lastIndex
+    // persists and silently skips matches on alternating calls), so .replace() and .test() each get
+    // their own instance rather than sharing one that would behave correctly for only one of them.
+    const FORGEABLE = /[\x00-\x1f\x7f\u0085\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]/;
+    const FORGEABLE_G = /[\x00-\x1f\x7f\u0085\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
+    const clean = (s) => (s || '').replace(FORGEABLE_G, '').replace(/\s+/g, ' ').trim();
+    // A page-controlled string (innerText, an attribute value) is unbounded, so the regex in
+    // clean() runs on a capped prefix first -- never on the raw string -- and the result is
+    // capped again to the field's display length.
+    const boundedClean = (s, cap) => clean(String(s == null ? '' : s).slice(0, 2000)).slice(0, cap);
+    // The mint shape observe() uses for data-tv3. A value that does not match it is not a marker
+    // we minted, so it must never be interpolated into a selector -- that would let page content
+    // forge a selector (e.g. break out of the quoted attribute value) that the model then acts on.
+    const MINTED_MARKER_RE = /^t\d+(-\d+)?$/;
+    // A selector is only safe to recommend if it is the ONLY match across every root -- _q.all()
+    // already pierces open shadow roots, so a control named by an id or marker scoped to its own
+    // component (the usual shape) is still counted, unlike a plain document.querySelectorAll would.
+    // A cloned subtree (a templated dialog re-rendered from a copy that already carried a live
+    // marker) can leave two elements sharing one data-tv3 value just as easily as two elements
+    // sharing one id -- the marker's regex shape says it looks minted, not that it is still unique.
+    // count === 1 alone is not enough: CSS selector matching reads the real id ATTRIBUTE, not the
+    // JS `.id` property, so a page that overrides the property's getter to report a decoy value
+    // gets a selector that resolves to whatever element genuinely owns that attribute -- one match,
+    // just not `n`. The sole match must be `n` itself, not merely unique.
+    const uniqueSelector = (s, n) => {
+      let matches = [];
+      try { matches = _q.all(s); } catch (e) { matches = []; }
+      return matches.length === 1 && matches[0] === n ? s : null;
+    };
+    // An id carrying a forgeable character (the same set stripped from name/label text above) would
+    // still reach the model unstripped here: CSS.escape() preserves it, and this string is a
+    // selector interpolated straight into the message, not display text run through clean(). A
+    // very long id is capped for the same reason boundedClean caps text -- an uncapped
+    // page-controlled string turns into an uncapped escape+query, and this runs on every diagnosis.
+    const idSelector = (n) =>
+      n.id && n.id.length <= 200 && !FORGEABLE.test(n.id) ? uniqueSelector('#' + CSS.escape(n.id), n) : null;
+    const markerSelector = (n) => {
+      const m = n.getAttribute && n.getAttribute('data-tv3');
+      return m && MINTED_MARKER_RE.test(m) ? uniqueSelector('[data-tv3="' + m + '"]', n) : null;
+    };
+    // A wizard's inactive step is a common shape for opacity:0 + pointer-events:none applied to the
+    // STEP's own wrapper, not each control inside it -- a control's own computed style stays
+    // untouched, so the ancestor chain (bounded: a pathological page cannot make this unbounded)
+    // has to be walked too, not just the candidate itself.
+    // forPaint asks "would a person SEE this", not "could a person interact with it": a scrim with
+    // pointer-events:none is still seen even though clicks pass through it, so the paint scan
+    // (layerShowsPaint) passes forPaint=true to keep such a child in view. Every other caller omits it
+    // and keeps the interaction-strict default.
+    const visible = (n, forPaint) => {
+      const r = n.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return false;
+      // pointer-events and visibility are both inherited, but either can be explicitly overridden by
+      // a descendant (a click-through overlay with a poking-through button; a hidden wrapper with one
+      // child restored via visibility:visible) -- the candidate's own computed value already resolves
+      // cascade + override in one read, so both are checked once here, not per-ancestor below.
+      // display has no such override: display:none removes the whole subtree from the render tree,
+      // so it stays an ancestor-walk check, same as opacity and overflow.
+      let ownCs;
+      try { ownCs = getComputedStyle(n); } catch (e) { return false; }
+      if ((!forPaint && ownCs.pointerEvents === 'none') || ownCs.visibility === 'hidden') return false;
+      let steps = 0;
+      for (
+        let a = n;
+        a && a !== document.body && a !== document.documentElement && steps < 40;
+        a = a.parentNode || a.host || null, steps++
+      ) {
+        // A ShadowRoot reached mid-walk (nodeType 11, not 1) carries no style of its own -- skip
+        // straight to its host via the update expression's `.host` fallback rather than stopping
+        // the walk there, or a hidden host (or anything above it) never gets checked.
+        if (a.nodeType !== 1) continue;
+        // inert makes a subtree non-focusable and non-actionable without changing any computed style
+        // property -- the .inert IDL property reflects the attribute directly, no matching needed.
+        if (a.inert) return false;
+        let cs;
+        try { cs = getComputedStyle(a); } catch (e) { return false; }
+        if (cs.display === 'none') return false;
+        if (parseFloat(cs.opacity) === 0) return false;
+        // A carousel/wizard routinely keeps an inactive slide's markup in the DOM, translated out of
+        // its own overflow:hidden container -- present, sized, but never painted. Only 'hidden' is
+        // checked (not scroll/auto): those stay reachable via the ordinary auto-scroll a click does
+        // on its own, so treating them as clipped would wrongly drop a control that only needs that.
+        // The two axes are independent: setting overflow-x:hidden alone computes overflow-y to
+        // 'auto' (the CSS interop rule for a hidden/visible pair), so a control merely scrolled out
+        // vertically must not be treated as X-clipped just because the container clips X.
+        if (a !== n) {
+          const clipX = cs.overflowX === 'hidden';
+          const clipY = cs.overflowY === 'hidden';
+          if (clipX || clipY) {
+            const ar = a.getBoundingClientRect();
+            if (clipX && (r.right <= ar.left || r.left >= ar.right)) return false;
+            if (clipY && (r.bottom <= ar.top || r.top >= ar.bottom)) return false;
+          }
+        }
+      }
+      return true;
+    };
+    // elementFromPoint retargets a hit inside a component to its host, so the layer is often a host
+    // whose name and controls live in its OPEN shadow tree, not its (usually empty) light DOM.
+    // Bounded so a pathological page (many nested open roots) cannot make this walk unbounded.
+    // shadowRoot reads are guarded like every other one in this file: a sealed host (its getter
+    // overridden to throw) must drop out of the walk, not crash the whole probe -- a probe that
+    // throws is caught upstream and read as "reachable", which skips occlusion detection entirely.
+    const deepAll = (node, sel, pred) => {
+      const out2 = [];
+      let visited = 0;
+      const visit = (n, depth) => {
+        if (!n || depth > 12 || visited > 5000) return;
+        let sr = null;
+        try { sr = n.shadowRoot; } catch (e) { sr = null; }
+        if (sr) { visited++; visit(sr, depth + 1); }
+        let matched = [];
+        try { matched = n.querySelectorAll(sel); } catch (e) { matched = []; }
+        // The 5000 budget is spent by the shadow-root walk below via `visited`, but a single
+        // querySelectorAll on a pathological layer (thousands of matching elements in one root) can
+        // otherwise still return an unbounded NodeList here -- cap what actually gets collected too.
+        for (const m of matched) {
+          if (out2.length >= 5000) return;
+          if (!pred || pred(m)) out2.push(m);
+        }
+        let all = [];
+        try { all = n.querySelectorAll('*'); } catch (e) { all = []; }
+        for (const child of all) {
+          if (++visited > 5000) return;
+          let csr = null;
+          try { csr = child.shadowRoot; } catch (e) { csr = null; }
+          if (csr) visit(csr, depth + 1);
+        }
+      };
+      visit(node, 0);
+      return out2;
+    };
+    const ownName = (n) => {
+      if (!n) return '';
+      const al = n.getAttribute && n.getAttribute('aria-label');
+      if (al) { const v = boundedClean(al, 80); if (v) return v; }
+      const lb = n.getAttribute && n.getAttribute('aria-labelledby');
+      if (lb) {
+        // Root-scoped, not document.getElementById: an id inside an open shadow root is only
+        // visible to a getElementById call on that root.
+        let root = null;
+        try { root = Node.prototype.getRootNode.call(n); } catch (e) { root = null; }
+        // Capped before splitting, same as every other page-controlled string here: an uncapped
+        // attribute value turns into an uncapped token list, each doing a root lookup, inside
+        // page.evaluate() where nothing else bounds the work.
+        const txt = lb
+          .slice(0, 2000)
+          .split(/\s+/)
+          .slice(0, 20)
+          .map((id) => { const t = root && root.getElementById ? root.getElementById(id) : null; return t ? boundedClean(t.textContent, 2000) : ''; })
+          .filter(Boolean)
+          .join(' ');
+        if (txt) return txt.slice(0, 80);
+      }
+      return '';
+    };
+    // Visibility-filtered like the controls loop below: an invisible heading or dialog inside the
+    // layer (a hidden template, a not-yet-shown step) is not what a person actually sees naming it.
+    const headingNameOf = (n) => {
+      const h = deepAll(n, 'h1,h2,h3,h4,h5,h6', visible)[0];
+      return h ? boundedClean(h.textContent, 80) : '';
+    };
+    // Does an element draw a surface a person can see -- a non-transparent background, an image, a
+    // border, or a shadow? The alpha-0 forms of a color (`transparent`, `rgba(...,0)`) paint nothing.
+    // A color is invisible only when its ALPHA is zero -- parse the alpha channel, never a trailing
+    // ",0)", which also matches an opaque color whose blue channel is 0 (rgb(0,0,0), rgb(255,0,0)).
+    // A form we can't parse is treated as paint, so the failure mode is under-suppression, not over.
+    const opaquePaint = (color) => {
+      const c = (color || '').replace(/\s+/g, '');
+      if (!c || c === 'transparent') return false;
+      const m = c.match(/^rgba?\(([\d.,-]+)\)$/);
+      if (!m) return true;
+      const comps = m[1].split(',');
+      const alpha = comps.length >= 4 ? parseFloat(comps[3]) : 1;
+      return !(alpha === 0);
+    };
+    // A replaced/embedded element paints pixels with no CSS surface of its own -- an icon-only spinner
+    // or logo (img/svg/canvas/video/iframe) is plainly visible even though backgroundColor/border are
+    // empty, so it must count as paint or such a layer reads as an invisible ghost. The caller filters
+    // by visible(), so a zero-sized or hidden replaced element never reaches here.
+    const REPLACED_PAINT = /^(img|svg|image|canvas|video|picture|object|embed|iframe)$/;
+    const paintsSurface = (n) => {
+      if (REPLACED_PAINT.test((n.tagName || '').toLowerCase())) return true;
+      let s;
+      try { s = getComputedStyle(n); } catch (e) { return false; }
+      if (opaquePaint(s.backgroundColor)) return true;
+      if (s.backgroundImage && s.backgroundImage !== 'none') return true;
+      if (s.boxShadow && s.boxShadow !== 'none') return true;
+      // A backdrop-filter (a frosted/blur wall) paints a plainly visible effect with no CSS surface of
+      // its own -- no background, border, or shadow -- so without this such a wall reads as an
+      // invisible ghost and the model is wrongly told to press Escape at a layer it can see.
+      const bdf = s.backdropFilter || s.webkitBackdropFilter;
+      if (bdf && bdf !== 'none') return true;
+      const bw = (v) => parseFloat(v || '0') || 0;
+      if (
+        s.borderStyle !== 'none' &&
+        bw(s.borderTopWidth) + bw(s.borderBottomWidth) + bw(s.borderLeftWidth) + bw(s.borderRightWidth) > 0
+      ) return true;
+      return false;
+    };
+    const hasDirectText = (n) => {
+      for (const c of n.childNodes) if (c.nodeType === 3 && c.nodeValue && c.nodeValue.trim()) return true;
+      return false;
+    };
+    // Whether the LAYER shows a person any paint of its own -- a surface, or a visible descendant that
+    // paints a surface or renders text. opacity:0 anywhere in its chain zeroes all of it. The covered
+    // field's OWN paint (it sits inside the layer in the ancestor case) is never the layer's, so it is
+    // excluded. Bounded so a pathological layer cannot make the scan unbounded; the caller runs it only
+    // for a control-less layer, keeping it off the hot path for ordinary dialogs.
+    const layerShowsPaint = (root2) => {
+      for (
+        let n = root2;
+        n && n.nodeType === 1 && n !== document.body && n !== document.documentElement;
+        n = n.parentNode || n.host || null
+      ) {
+        let s;
+        try { s = getComputedStyle(n); } catch (e) { break; }
+        if (parseFloat(s.opacity) === 0) return false;
+      }
+      if (root2 !== el && !related(el, root2) && visible(root2, true) && (paintsSurface(root2) || hasDirectText(root2))) {
+        return true;
+      }
+      // deepAll (not querySelectorAll) so the scan pierces open shadow roots -- a consent widget that
+      // renders its visible surface/text entirely inside its own shadow tree must count as paint, the
+      // same shadow-aware treatment the control and heading lookups already use. Bounded by deepAll.
+      let nodes = [];
+      try { nodes = deepAll(root2, '*', (n) => visible(n, true)); } catch (e) { nodes = []; }
+      for (const n of nodes) {
+        if (n === el || related(el, n)) continue;
+        if (paintsSurface(n) || hasDirectText(n)) return true;
+      }
+      return false;
+    };
+    // Pinning (fixed/sticky) is a strong enough signal on its own -- a small cookie banner docked
+    // to the viewport edge is exactly as real an occluder as a full-screen one. Being merely
+    // ABSOLUTE and view-sized is weaker evidence (an ordinary in-flow-adjacent block can be
+    // absolutely positioned for layout reasons having nothing to do with occlusion), so that path
+    // still requires bigness. Either way, a wrongly-oversized OUTER ancestor (a scroll-lock shell
+    // wrapping the real banner/backdrop) can never win: the walk below stops at the first qualifying
+    // ancestor, and the real occluder is always closer to the hit point than any shell wrapping it.
+    // The document root is layout, never content, and must never stand in as the thing blocking a click.
+    const isLayer = (n, isHit) => {
+      if (n === document.body || n === document.documentElement) return false;
+      let pos = '';
+      try { pos = getComputedStyle(n).position; } catch (e) { pos = ''; }
+      if (pos === 'fixed' || pos === 'sticky') return true;
+      const role = n.getAttribute && n.getAttribute('role');
+      if ((role && LAYER_ROLE.test(role.trim())) || (n.hasAttribute && n.hasAttribute('aria-modal')) || n.tagName === 'DIALOG') {
+        return true;
+      }
+      // Bigness alone is only trustworthy for an element that is NOT an ancestor of the field --
+      // a clipped (not covered) field's hit-point routinely lands on the static layout/clipping
+      // container that wraps it, and that container is exactly as big as a genuine backdrop. A
+      // real full-screen blocking wrapper is always pinned or role-bearing (both already handled
+      // above), so excluding an unpinned ancestor here costs nothing real.
+      if (related(n, el)) return false;
+      const big = area(n.getBoundingClientRect()) > 0.6 * viewport;
+      return isHit ? big : pos === 'absolute' && big;
+    };
+    let layer = null;
+    for (let n = top; n && n.nodeType === 1 && n !== document.body; n = n.parentNode || n.host || null) {
+      if (isLayer(n, n === top)) { layer = n; break; }
+    }
+    if (!layer) {
+      // Nothing in the walk qualified, and top is merely an ancestor/clipping container of the
+      // field -- there is no honest occluder to name (the field is clipped, not covered). Bail
+      // with out.occluder left unset so the caller falls back to its generic message instead of
+      // naming a layout wrapper and listing every unrelated button on it.
+      if (related(top, el)) {
+        // One exception: a view-sized ancestor that paints NOTHING, over a field that is itself
+        // un-clipped and visible, is not a clip -- it is a ghost cover (a leftover full-page consent
+        // shield that still intercepts the pointer). Report it as invisible so the model is not told
+        // to dismiss an overlay it cannot see. A truly clipped field fails visible(el), and a real
+        // layout shell paints (its nav/content), so neither is caught here.
+        if (visible(el) && coversTheView && !layerShowsPaint(top)) out.occluder = { invisible: true };
+        return out;
+      }
+      layer = top;
+    }
+    // Own name, then whichever names the DIALOG this layer wraps (deepAll pierces into the layer's
+    // shadow tree, since a component-hosted consent widget renders entirely inside one), then a
+    // heading anywhere in the layer, then its own text, then its tag -- in that order.
+    let layerName = ownName(layer);
+    if (!layerName) {
+      const dialog = deepAll(layer, '[role="dialog"],[role="alertdialog"],[aria-modal]', visible)[0];
+      if (dialog) layerName = ownName(dialog) || headingNameOf(dialog);
+    }
+    if (!layerName) layerName = headingNameOf(layer);
+    if (!layerName) layerName = boundedClean(layer.textContent, 60);
+    if (!layerName) layerName = layer.tagName ? layer.tagName.toLowerCase() : 'layer';
+    const layerSelector = idSelector(layer) || markerSelector(layer);
+    const allControls = [];
+    // observe() never mints data-tv3 inside a component, so a marker-shaped selector below can only
+    // ever come from the light DOM -- a shadow-piercing find here does not risk minting a fresh one.
+    // The role list mirrors observe()'s own _WIDGET_ROLES answer to "is this a control?" (minus the
+    // form-field roles observe treats as fillable, not actionable), so a consent switch or a
+    // role=menuitem Close action is not omitted just because it isn't a <button>.
+    const found = deepAll(
+      layer,
+      'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
+      + 'input[type="reset"],[role="button"],'
+      + '[role="checkbox"],[role="radio"],[role="combobox"],[role="option"],[role="menuitem"],'
+      + '[role="menuitemcheckbox"],[role="menuitemradio"],[role="listbox"],[role="switch"],'
+      + '[role="spinbutton"],[role="tab"]'
+    );
+    // A disabled control cannot be the thing to click -- recommending one wastes a click timeout on
+    // a target Playwright will refuse, and can crowd the real dismisser out of the eight-slot cap.
+    // :disabled (not the .disabled IDL property) is what the browser actually uses to decide this,
+    // so it is also true for a button whose OWN disabled attribute is unset but sits inside a
+    // <fieldset disabled> -- the property alone would miss exactly that inherited case.
+    const isDisabled = (n) => {
+      let matched = false;
+      try { matched = !!(n.matches && n.matches(':disabled')); } catch (e) { matched = false; }
+      return matched || (n.getAttribute && n.getAttribute('aria-disabled') === 'true');
+    };
+    for (const c of found) {
+      if (c === el || !visible(c) || isDisabled(c)) continue;
+      const csel = idSelector(c) || markerSelector(c);
+      // ownName covers aria-label and root-scoped aria-labelledby, same priority order and same
+      // shadow-aware resolution the layer's own name uses.
+      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title')) || '', 60);
+      if (!label && !csel) continue;
+      allControls.push({ selector: csel, label });
+    }
+    // A real dismisser (Accept, Confirm, Close) routinely comes AFTER a list of category rows or
+    // toggles in document order -- a Privacy Preference Center's footer buttons follow its list of
+    // per-vendor switches. Capping at the first eight would drop exactly the control the model
+    // needs and keep only the toggles it was already flailing between, reproducing the ticket's own
+    // motivating bug with more words. Keep both ends: the first few for context, the last few
+    // because that is where a footer actually lives.
+    const truncated = allControls.length > 8;
+    const controls = truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls;
+    out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    // Whether a PERSON would see this layer at all. A leftover consent backdrop still intercepts the
+    // pointer (elementFromPoint returned it) but can paint nothing -- fully transparent, no visible
+    // control, heading or text -- so the field looks clear on screen and "dismiss the overlay you
+    // see" is a false instruction. Gated on there being no visible control (a real dialog has some),
+    // so the bounded paint scan runs only for the ambiguous, control-less layer.
+    if (!controls.length && !layerShowsPaint(layer)) out.occluder.invisible = true;
+   } catch (e) { /* best-effort */ }
+  }
   return out;
 }"""
 )
@@ -634,6 +1053,11 @@ _ACTIVE_IS_JS = (
 
 class _FieldCovered(Exception):
     """The field exists and is rendered, but something unrelated is on top of it."""
+
+    def __init__(self, selector: str, occluder: dict[str, Any] | None = None) -> None:
+        super().__init__(selector)
+        self.selector = selector
+        self.occluder = occluder
 
 
 class _FieldNotEditable(Exception):
@@ -1019,7 +1443,7 @@ OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
 _OBSERVE_JS = (
     r"""
-() => {
+async () => {
   const _GROUP_TEXT_TOTAL_CAP = """
     + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
     + r""";
@@ -1039,6 +1463,7 @@ _OBSERVE_JS = (
     return d && d.get ? d.get : function () { return this[name]; };
   };
   const _parentOf = _getter(Node.prototype, 'parentElement');
+  const _scrollLeftOf = _getter(Element.prototype, 'scrollLeft');
   const _prevOf = _getter(Node.prototype, 'previousSibling');
   const _nextOf = _getter(Node.prototype, 'nextSibling');
   const _firstChildOf = _getter(Node.prototype, 'firstChild');
@@ -1358,6 +1783,10 @@ _OBSERVE_JS = (
   // strips is uncounted again.
   let markersWritten = 0;
   let markersReused = 0;
+  // Bumped before every attribute write we make, verified or not: each one can run page code.
+  let pageCodeEpoch = 0;
+  const _isConnectedDesc = Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected');
+  const _isConnected = _isConnectedDesc && _isConnectedDesc.get ? _isConnectedDesc.get : function () { return document.contains(this); };
   const mintOn = (el) => {
     let m = el.getAttribute('data-tv3');
     // A marker already on the element is page-controlled text like any other attribute: it is
@@ -1408,6 +1837,7 @@ _OBSERVE_JS = (
     try { rootNow = Node.prototype.getRootNode.call(el); } catch (e) { return null; }
     if (!rootNow || rootNow.nodeType === 11) return null;
     try { if (!Node.prototype.contains.call(document, el)) return null; } catch (e) { return null; }
+    pageCodeEpoch++;
     el.setAttribute('data-tv3', m);
     // Verify AFTER the write, against the live DOM rather than the gather. The candidate search
     // reads a snapshot taken before any mint on this page, so it cannot see a value the page added
@@ -1419,6 +1849,7 @@ _OBSERVE_JS = (
     // which is what made the old per-attempt re-query unaffordable.
     checkInconclusive = false;
     if (!resolvesTo(attr('data-tv3', m), el) && !checkInconclusive) {
+      pageCodeEpoch++;
       el.removeAttribute('data-tv3');
       return null;
     }
@@ -1430,7 +1861,22 @@ _OBSERVE_JS = (
   // and any root nested beneath either. A descendant combinator is shadow-transparent to the
   // executor, so content SLOTTED into the component matches `#host #ctrl` too -- counting the root
   // alone undercounts, and an undercount is what hands out a selector that denotes two elements.
+  // Memoised per host for the walk, or every control under one shell host pays for a fresh walk of
+  // that shell's entire subtree. The only thing that runs page code during the evaluate is our own
+  // marker write (an attributeChangedCallback can attach a root), so the memo is dropped after every
+  // such write; a clobbered getter that mutates on read is left to the executor-side count that
+  // gates every action.
+  const hostScopeCache = new Map();
+  let hostScopeEpoch = -1;
   const hostScopes = (host) => {
+    const epoch = pageCodeEpoch;
+    if (epoch !== hostScopeEpoch) { hostScopeCache.clear(); hostScopeEpoch = epoch; }
+    if (hostScopeCache.has(host)) return hostScopeCache.get(host);
+    const scopes = hostScopesWalk(host);
+    hostScopeCache.set(host, scopes);
+    return scopes;
+  };
+  const hostScopesWalk = (host) => {
     const scopes = [host];
     const stack = [host];
     const own = host.shadowRoot;
@@ -1468,25 +1914,175 @@ _OBSERVE_JS = (
   // every instance and no unscoped selector can single one out. The host itself is outside the root
   // it owns, so it can be named the ordinary way, and anchoring on it scopes the reused id without
   // writing anything into the component.
-  const hostAnchored = (el, host) => {
-    if (!host || !el.id) return null;
-    const raw = String(el.id);
-    if (_FORGEABLE.test(raw)) return null;
-    const esc = window.CSS && CSS.escape ? CSS.escape(raw) : null;
-    const ctrl = esc === raw && raw === raw.trimEnd() ? '#' + esc : attr('id', raw);
-    if (!scopedResolvesTo(host, ctrl, el)) return null;
-    // naturalSelector reports its cause through shared state; the control's own cause is already
-    // settled by the time we get here and must survive naming the host.
-    const why = naturalWhy;
-    const inconclusive = checkInconclusive;
-    const hostSel = naturalSelector(host);
-    naturalWhy = why;
-    checkInconclusive = inconclusive;
-    // A host we could not name is left alone rather than marked. Minting here would hand out a
-    // handle on the one page where uniqueness could not be checked -- an unreadable root makes the
-    // host's own count inconclusive, and mintOn keeps a marker it could not verify.
+  // The host of the root `n` lives in, read through the prototype so a named getter cannot supply one.
+  const hostOf = (n) => {
+    let r = null;
+    try { r = Node.prototype.getRootNode.call(n); } catch (e) { return null; }
+    return r && r.nodeType === 11 && r.host ? r.host : null;
+  };
+  // Tails for a control with no id of its own, smallest first: its tag, the tag qualified by type,
+  // role or class tokens, and finally its position among same-tag siblings. Every tail is ONE
+  // compound selector, never a combinator chain: under the executor a descendant combinator is
+  // shadow-transparent and a child combinator is too, so a chain the page counts as unique in one
+  // tree can denote a second element in a nested root. A compound is matched element by element,
+  // and the union of the host's scopes is exactly the set the executor searches; a nested host's
+  // anchor composes such compounds link by link, each verified under its own host. A positional tail
+  // is a last resort: unlike a tag or class, a sibling inserted before the control retargets it
+  // without changing the match count, which is the one drift the executor-side count cannot see.
+  const structuralTails = (el) => {
+    const tag = String(el.tagName || '').toLowerCase();
+    if (!/^[a-z][a-z0-9-]*$/.test(tag)) return [];
+    const tails = [tag];
+    const type = el.getAttribute('type');
+    if (type && /^[a-z-]+$/i.test(String(type))) tails.push(tag + '[type="' + String(type).toLowerCase() + '"]');
+    const role = el.getAttribute('role');
+    if (role && /^[a-z]+$/i.test(String(role))) tails.push(tag + '[role="' + String(role).toLowerCase() + '"]');
+    // A design system's class tokens are as stable as its tags; each is screened to a plain
+    // identifier and the whole is verified, so a token the page chose cannot forge a payload line
+    // or denote a second element.
+    let classes = [];
+    try { classes = Array.from(el.classList || []).filter((c) => /^[A-Za-z_][\w-]*$/.test(c)).slice(0, 3); } catch (e) { classes = []; }
+    const leaf = classes.length ? tag + '.' + classes.join('.') : tag;
+    if (classes.length) tails.push(leaf);
+    let k = 1;
+    try { for (let sib = el.previousElementSibling; sib; sib = sib.previousElementSibling) { if (sib.tagName === el.tagName) k++; } } catch (e) { return tails; }
+    tails.push(leaf + ':nth-of-type(' + k + ')');
+    return tails;
+  };
+  // Shadow encapsulation scopes ids to their own root, so a design system reuses one internal id in
+  // every instance and no unscoped selector can single one out; a component's native control often
+  // carries no id at all. The host itself is outside the root it owns, so it can be named the
+  // ordinary way -- by its own identity, by a marker written on it in the light DOM, or through ITS
+  // host in turn -- and anchoring on it scopes the control without writing anything into the component.
+  // Naming a host is paid once per walk: the same anchor serves every control under it, and a
+  // marker written for the first is reused, not re-minted, for the rest.
+  const anchorByHost = new Map();
+  // Anchoring is bounded per walk. A control that cannot be named does not spend the element
+  // budget, so without this a page of thousands of unnameable component controls would spend the
+  // evaluate's whole time bound on tails that all fail.
+  let anchorAttempts = 0;
+  const _ANCHOR_ATTEMPTS = 3000;
+  const _ANCHORED_MAX_LEN = 400;
+  // Set when the LAST refusal was ours (a budget) rather than the page's, so the omission is
+  // reported as such and not as a claim about the control.
+  let anchorRefusedByBudget = false;
+  // The host and tail of the last selector hostAnchored composed, kept so the record can be
+  // re-resolved under its host later (a composed selector straddles a root; only scoped counting sees it).
+  let lastAnchor = null;
+  const hostAnchored = (el, host, depth) => {
+    depth = depth || 0;
+    if (depth === 0) anchorRefusedByBudget = false;
+    if (!host) return null;
+    if (depth > 8) { anchorRefusedByBudget = true; return null; }
+    // A host already named this walk costs a lookup, not an attempt; the budget is charged for
+    // naming a host, which is the part that walks the page.
+    if (!anchorByHost.has(host) && ++anchorAttempts > _ANCHOR_ATTEMPTS) { anchorRefusedByBudget = true; return null; }
+    let tails = [];
+    if (el.id) {
+      const raw = String(el.id);
+      if (!_FORGEABLE.test(raw)) {
+        const esc = window.CSS && CSS.escape ? CSS.escape(raw) : null;
+        tails.push(esc === raw && raw === raw.trimEnd() ? '#' + esc : attr('id', raw));
+      }
+    }
+    tails = tails.concat(structuralTails(el));
+    let ctrl = null;
+    for (const t of tails) { if (scopedResolvesTo(host, t, el)) { ctrl = t; break; } }
+    if (!ctrl) return null;
+    let hostSel = null;
+    let hostTrail = [];
+    if (anchorByHost.has(host)) {
+      const cached = anchorByHost.get(host);
+      hostSel = cached.sel;
+      hostTrail = cached.trail;
+      if (!hostSel && cached.budget) anchorRefusedByBudget = true;
+    } else {
+      const budgetBefore = anchorRefusedByBudget;
+      // naturalSelector reports its cause through shared state; the control's own cause is already
+      // settled by the time we get here and must survive naming the host.
+      const why = naturalWhy;
+      const inconclusive = checkInconclusive;
+      hostSel = naturalSelector(host);
+      // A host with an identity of its own is named by it or not at all: marking one whose identity
+      // could not be verified would hand out a handle on the one page where uniqueness cannot be
+      // checked. A host with no identity is marked in the light DOM like any other control there --
+      // mintOn refuses to write inside a root by construction, so a host that is itself
+      // component-hosted is anchored through its own host instead.
+      if (!hostSel && naturalWhy === 'anonymous') {
+        // A host that is itself a listed control already carries this walk's marker; reuse it
+        // rather than re-entering mintOn, which would count the same marker twice.
+        const prior = mintedOn.find((r) => r.el === host);
+        if (prior) {
+          hostSel = attr('data-tv3', prior.m);
+          // The controls anchored on it are bound to a record of their own so losing the marker
+          // drops them too; the marker itself is counted by the host's record, not again here.
+          anchorsMinted.push({ rec: null, el: host, m: prior.m, fresh: false, shared: true });
+        }
+      }
+      if (!hostSel && naturalWhy === 'anonymous') {
+        const writtenBefore = markersWritten;
+        hostSel = mintOn(host);
+        if (hostSel) {
+          let m = null;
+          try { m = host.getAttribute('data-tv3'); } catch (e) { m = null; }
+          anchorsMinted.push({ rec: null, el: host, m: m, fresh: markersWritten > writtenBefore });
+        }
+      }
+      // A host that could not be marked (it lives in a root) or whose own id is reused by a sibling
+      // instance is anchored through ITS host in turn, which can scope either.
+      if (hostSel) hostTrail = [{ sel: hostSel, target: host }];
+      if (!hostSel && (naturalWhy === 'anonymous' || naturalWhy === 'duplicated')) {
+        const outer = hostOf(host);
+        if (outer && outer !== host) {
+          hostSel = hostAnchored(host, outer, depth + 1);
+          if (hostSel) hostTrail = lastAnchor ? lastAnchor.trail : [];
+        }
+      }
+      naturalWhy = why;
+      checkInconclusive = inconclusive;
+      // A refusal reached through the recursion may be the depth bound, which a control whose own
+      // host this is would not hit; only a top-level or successful answer is worth remembering. A
+      // refusal that was a budget stays a budget on every later hit.
+      if (hostSel || depth === 0) anchorByHost.set(host, { sel: hostSel, trail: hostTrail, budget: !hostSel && anchorRefusedByBudget && !budgetBefore });
+    }
     if (!hostSel) return null;
-    return hostSel + ' ' + ctrl;
+    // Naming the host may have written to it, and a component can re-render its root on any
+    // attribute change: the tail was verified before that write, so it is verified again after,
+    // or a replacement control would inherit this one's label and state.
+    if (!scopedResolvesTo(host, ctrl, el)) return null;
+    const sel = hostSel + ' ' + ctrl;
+    if (sel.length > _ANCHORED_MAX_LEN) { anchorRefusedByBudget = true; return null; }
+    // The whole chain that produced the selector, each link verified where it was taken, so the
+    // record can be re-validated link by link: the tail under its host, and the host by its own name.
+    lastAnchor = { sel: sel, trail: [{ scope: host, ctrl: ctrl, target: el }].concat(hostTrail) };
+    return sel;
+  };
+  // The caption of a component's control is usually slotted from the host's light DOM, so the
+  // control's own innerText is empty. Read the slot's assigned content first; when the control is
+  // the only one in its root, the host's composed text is that control's caption.
+  const slottedText = (el, host) => {
+    let t = '';
+    let slots;
+    try { slots = el.querySelectorAll('slot'); } catch (e) { slots = []; }
+    for (const sl of slots) {
+      let nodes;
+      try { nodes = sl.assignedNodes({ flatten: true }); } catch (e) { continue; }
+      for (const n of nodes) t += ' ' + (n.nodeType === 1 ? (n.innerText || '') : (n.textContent || ''));
+    }
+    t = t.replace(/\s+/g, ' ').trim();
+    if (t) return t;
+    let root = null;
+    try { root = Node.prototype.getRootNode.call(el); } catch (e) { return ''; }
+    if (!root || root.nodeType !== 11) return '';
+    let peers;
+    try { peers = root.querySelectorAll(q); } catch (e) { return ''; }
+    if (peers.length !== 1 || peers[0] !== el) return '';
+    // Only a host whose light DOM is bare text is a caption; a card slotting headings and a body
+    // beside its one icon button would otherwise hand that button the whole card as its name.
+    let textOnly = true;
+    try { for (const n of host.childNodes) { if (n.nodeType !== 3) { textOnly = false; break; } } } catch (e) { return ''; }
+    if (!textOnly) return '';
+    return String(host.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 140);
   };
   // Controls inside a component that we could not name, split by CAUSE: these need different
   // fixes, and one merged tally would send the follow-up after the wrong one.
@@ -1501,7 +2097,29 @@ _OBSERVE_JS = (
   // earlier one, and an element's own attributeChangedCallback can move our marker onto a peer.
   // Registered before the record is built, so a throw between the two still reaches that check.
   const mintedOn = [];
+  const elOfRec = new Map();
+  // What a record reported that would change its MEANING: properties, which no MutationObserver
+  // records, the ARIA state attributes, and the naming attributes. Text is not fingerprinted -- it
+  // is witnessed and answered by re-resolving the record, so a countdown that rewrites its own
+  // caption keeps its listing while an aria-label rewritten to another action does not.
+  const stampOfRec = new Map();
+  const fingerprint = (el) => {
+    try {
+      return [
+        el.checked === true, el.type === 'password' ? '' : String(el.value || '').slice(0, 140), el.disabled === true,
+        el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'), el.getAttribute('aria-expanded'),
+        el.getAttribute('aria-label'), el.getAttribute('aria-labelledby'), el.getAttribute('title'), el.getAttribute('placeholder'),
+        el.getAttribute('aria-disabled'), el.readOnly === true, el.required === true, el.hidden === true, el.getAttribute('aria-hidden'),
+      ].join('\u0001');
+    } catch (e) { return null; }
+  };
+  // Hosts marked to anchor component controls. `anchorsMinted` collects the hosts one hostAnchored
+  // call marked; `anchorRecords` keeps every such record with the controls it anchors, so losing
+  // the host's marker after the walk drops each of those controls, not the host.
+  const anchorsMinted = [];
+  const anchorRecords = [];
   let unnamedAnonymous = 0;
+  let unnamedBudget = 0;
   let unnamedDuplicated = 0;
   let unnamedUnverifiable = 0;
   let unnamedUnsafe = 0;
@@ -1512,20 +2130,125 @@ _OBSERVE_JS = (
   // diverge whenever a retained control is dropped later for having no selector that names it.
   let hiddenKept = 0;
   let hiddenListed = 0;
+  let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
   let lastGroup = '';
   let groupTotal = 0;
+  const _PHANTOM_TEXT_TYPES = /^(?:text|search|email|tel|url|number|password|date|datetime-local|month|week|time)$/;
+  // Our own witness for the walk: every marker write can run page code, synchronously or through
+  // the page's own MutationObservers after we yield. Anything it changed is re-validated below;
+  // an unchanged page pays nothing beyond the connection check.
+  let _witness = null;
+  const _witnessed = [];
+  try {
+    // Delivered records are consumed by the callback, so they are kept here and joined with
+    // whatever is still queued when the walk asks.
+    _witness = new MutationObserver((recs) => { for (const m of recs) _witnessed.push(m); });
+    const opts = { subtree: true, childList: true, attributes: true, characterData: true };
+    for (const root of allRoots) { try { _witness.observe(root, opts); } catch (e) {} }
+  } catch (e) { _witness = null; }
+  // v1's hasHorizontallyScrolledAncestor (domUtils.js): a scrolled overflow-x container keeps its
+  // off-window columns on the page, so an off-canvas center inside one must not drop the control.
+  const _hScrolledAncestor = (node) => {
+    // Climb via the prototype getter, not node.parentElement: a <form> exposes named controls as own
+    // properties, so <input name="parentElement"> makes form.parentElement that input -- a
+    // form<->input 2-cycle that would loop this walk forever and hang the whole page.evaluate.
+    for (let p = _parentOf.call(node); p; p = _parentOf.call(p)) {
+      // scrollLeft via the prototype getter too: a <form> with <input name="scrollLeft"> would
+      // otherwise shadow it with an always-truthy element and fake a scrolled ancestor.
+      if (_scrollLeftOf.call(p)) {
+        const ox = window.getComputedStyle(p).overflowX;
+        if (ox === 'auto' || ox === 'scroll') return true;
+      }
+    }
+    return false;
+  };
+  // v1 isElementVisible (domUtils.js) force-marks a native form control inside an open shadow root
+  // as visible even when CSS hides it: web-component libraries hide the native input via
+  // visibility:hidden / off-canvas positioning behind a styled overlay the user actually clicks.
+  // Mirror that carve-out so the two gates above do not drop such a control. A closed dropdown host
+  // (aria-expanded="false") and a closed combobox-filter sibling are the exceptions v1 still hides.
+  const _shadowForcedVisible = (node) => {
+    let root = null;
+    try { root = Node.prototype.getRootNode.call(node); } catch (e) { return false; }
+    if (!(root instanceof ShadowRoot)) return false;
+    const tag = String(node.tagName || '').toLowerCase();
+    if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return false;
+    if (node.disabled) return false;
+    if (tag === 'input' && String(node.type || '').toLowerCase() === 'hidden') return false;
+    const host = root.host;
+    if (host && host.getAttribute('aria-expanded') === 'false') return false;
+    if (node.getAttribute('role') === 'combobox') {
+      const prev = node.previousElementSibling;
+      if (prev && prev.getAttribute('aria-expanded') === 'false') return false;
+    }
+    return true;
+  };
+  // Does a display:contents host actually render visible content? Mirrors v1 isElementVisible's
+  // display:contents recursion (domUtils.js): a rendered child is a non-empty visible text node, a
+  // visible on-canvas element, or a nested display:contents wrapper that itself renders. Depth-bounded.
+  const _contentsRenders = (node, depth) => {
+    if (depth > 4) return false;
+    for (let c = _firstChildOf.call(node); c; c = _nextOf.call(c)) {
+      const k = _nodeTypeOf.call(c);
+      if (k === 3) {
+        // v1 isVisibleTextNode: a text node renders iff its range has a positive, on-canvas box --
+        // so font-size:0 / clipped text (non-empty but zero-area) does not count.
+        if (_normText(_contentOf.call(c)).length === 0) continue;
+        let tr = null;
+        try { const rng = document.createRange(); rng.selectNode(c); tr = rng.getBoundingClientRect(); } catch (e) { tr = null; }
+        if (tr && tr.width > 0 && tr.height > 0 && (tr.left + tr.width) / 2 + window.scrollX >= 0) return true;
+        continue;
+      }
+      if (k !== 1) continue;
+      const cs = window.getComputedStyle(c);
+      if (cs.display === 'contents') { if (_contentsRenders(c, depth + 1)) return true; continue; }
+      // visibility !== 'visible' catches collapse too, matching v1's isElementStyleVisibilityVisible.
+      if (cs.visibility !== 'visible' || _unseen(c)) continue;
+      const cr = _bcr.call(c);
+      if ((cr.left + cr.width) / 2 + window.scrollX < 0 && !_hScrolledAncestor(c)) continue;
+      return true;
+    }
+    return false;
+  };
   for (let idx = 0; idx < els.length; idx++) {
    const el = els[idx].el;
    const host = els[idx].host;
    let mintedValue = null;
    let minted = null;
+   const anchorRecs = [];
+   lastAnchor = null;
    // A form exposes its named controls as its own properties, so <input name="tagName"> makes
    // el.tagName that input. Every read below can therefore be a clobbered non-function, and the
    // loop is inside page.evaluate: one throw costs the whole element list, not one element.
    try {
     const r = el.getBoundingClientRect();
+    // A native form control inside an open shadow root is force-kept by v1 regardless of CSS/position
+    // (web-component overlay pattern), so it skips the two new own-element gates. And v1 judges a
+    // native checkbox/radio by its PARENT rather than the control itself (domUtils.js) -- the
+    // visually-hidden consent/option pattern -- so for those the gates below are applied to the parent.
+    const _elTag = String(el.tagName || '').toLowerCase();
+    const _elType = String(el.type || '').toLowerCase();
+    const ownGated = !_shadowForcedVisible(el);
+    let gateEl = el, gr = r;
+    if (_elTag === 'input' && (_elType === 'checkbox' || _elType === 'radio')) {
+      const gp = _parentOf.call(el);
+      if (gp) { gateEl = gp; gr = _bcr.call(gp); }
+    }
+    // Off-canvas gate, mirroring v1 isElementVisible (domUtils.js): an element whose horizontal
+    // center sits left of the page is off-screen and not interactable, unless a horizontally
+    // scrolled ancestor explains it. X only, never Y -- an overflow ancestor makes Y unreliable, so
+    // a below-the-fold control (positive center-x) stays listed. Scoped to non-zero-rect elements
+    // like v1 (whose center_x check is only reached for a non-zero rect), so the zero-size
+    // skinned-proxy carve-out below still runs for an off-screen-positioned skinned control.
+    const centerX = (gr.left + gr.width) / 2 + window.scrollX;
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { continue; }
+    // v1's isElementStyleVisibilityVisible (domUtils.js) drops a control whose own computed
+    // visibility is not 'visible'. Scoped to non-zero-rect elements so the zero-size skinned-proxy
+    // carve-out below still runs; visibility is read per-element, so a visibility:visible child of a
+    // hidden ancestor is kept. A native checkbox/radio judges the parent here instead of itself.
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { continue; }
     let hidden = false;
     if (r.width === 0 || r.height === 0) {
       // Design systems skin a native SELECT/checkbox/radio/file input at zero size behind a styled
@@ -1538,37 +2261,15 @@ _OBSERVE_JS = (
         if (hiddenKept >= 40) { dropped++; continue; }
         hidden = true;
         hiddenKept++;
+      } else if (!_unseen(el) && _contentsRenders(el, 0)) {
+        // A display:contents host has a zero rect of its own but is not hidden -- its rendered
+        // children carry it, matching v1's isElementVisible. _unseen's only non-rect-gated false
+        // path is display:contents, so this reaches exactly that case; genuinely hidden zero-rect
+        // controls (display:none/visibility:hidden/opacity:0/aria-hidden) still drop below. Keep it
+        // only when it actually renders visible content, as v1's recursion does -- an empty,
+        // all-hidden, or all-off-canvas host is a phantom.
       } else {
         continue;
-      }
-    }
-    let selector = naturalSelector(el);
-    if (!selector) {
-      // We do not write inside a shadow root. Setting a marker there is a mutation of the
-      // component's own subtree, and every mechanism that wrote one and then tried to manage the
-      // consequences failed: the mark provokes the re-render that destroys it, and because the mark
-      // IS the handle we hand out it cannot move off-DOM. Verifying it needed a wait, every clock
-      // belongs to the page, and a fixed wait was accurate under 50 ms and silently wrong past it.
-      // Worse, a marker that churns every observe makes the payload differ every turn, which
-      // defeats the loop's perception-stall terminator -- so the page burned the whole budget where
-      // the base engine terminated cleanly. Not writing restores that behavior exactly. A control
-      // with an id, name or data-testid of its own is unaffected, which is the ordinary case.
-      if (host) {
-        if (naturalWhy === 'duplicated') selector = hostAnchored(el, host);
-        if (!selector) {
-          if (naturalWhy === 'duplicated') unnamedDuplicated++;
-          else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
-          else if (naturalWhy === 'unsafe') unnamedUnsafe++;
-          else unnamedAnonymous++;
-          continue;
-        }
-      } else {
-        const writtenBefore = markersWritten;
-        selector = mintOn(el);
-        if (!selector) { dropped++; continue; }
-        mintedValue = el.getAttribute('data-tv3');
-        minted = { rec: null, el: el, m: mintedValue, fresh: markersWritten > writtenBefore };
-        mintedOn.push(minted);
       }
     }
     // Tree-scoped for the same reason as _VISIBLE_PROXY_JS: the shadow walk feeds this loop
@@ -1583,11 +2284,61 @@ _OBSERVE_JS = (
     // The name the page gives the control, placeholder excluded: a placeholder is a hint shared by
     // every field of a template, not a name, so it does not count as one below.
     let strongLabel = (el.getAttribute('aria-label') || '').trim();
-    if (!strongLabel && el.labels && el.labels[0]) strongLabel = (el.labels[0].innerText || '').trim();
+    if (!strongLabel && el.labels) {
+      for (const l of el.labels) { strongLabel = (l.innerText || '').trim(); if (strongLabel) break; }
+    }
     if (!strongLabel) strongLabel = byId('aria-labelledby');
     if (!strongLabel) strongLabel = (el.innerText || '').trim();
+    if (!strongLabel && host) strongLabel = slottedText(el, host);
+    // A text control the page itself hides from assistive tech, takes out of the tab order and
+    // leaves unnamed is one no person can reach; a non-zero box does not make it a field.
+    const isTextLike = el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && _PHANTOM_TEXT_TYPES.test(String(el.type || '').toLowerCase()));
+    const unnamed = !strongLabel && !['placeholder', 'aria-labelledby', 'title'].some((a) => (el.getAttribute(a) || '').trim());
+    if (isTextLike && el.getAttribute('aria-hidden') === 'true' && el.getAttribute('tabindex') === '-1' && unnamed) {
+      phantomDropped++;
+      continue;
+    }
+    let selector = naturalSelector(el);
+    if (!selector) {
+      // We do not write inside a shadow root. Setting a marker there is a mutation of the
+      // component's own subtree, and every mechanism that wrote one and then tried to manage the
+      // consequences failed: the mark provokes the re-render that destroys it, and because the mark
+      // IS the handle we hand out it cannot move off-DOM. Verifying it needed a wait, every clock
+      // belongs to the page, and a fixed wait was accurate under 50 ms and silently wrong past it.
+      // Worse, a marker that churns every observe makes the payload differ every turn, which
+      // defeats the loop's perception-stall terminator -- so the page burned the whole budget where
+      // the base engine terminated cleanly. Not writing restores that behavior exactly. A control
+      // with an id, name or data-testid of its own is unaffected, which is the ordinary case.
+      if (host) {
+        anchorsMinted.length = 0;
+        anchorRefusedByBudget = false;
+        lastAnchor = null;
+        if (naturalWhy === 'duplicated' || naturalWhy === 'anonymous') selector = hostAnchored(el, host);
+        // A host marked during this attempt is accounted for whether or not the attempt produced a
+        // selector: a marker nobody is bound to still has to be counted, and re-checked, after the walk.
+        for (const a of anchorsMinted) { a.ctrls = []; mintedOn.push(a); anchorRecords.push(a); }
+        if (selector) {
+          for (const a of anchorRecords) { if (selector.indexOf(attr('data-tv3', a.m)) === 0) { a.ctrls.push({ el: el, rec: null }); anchorRecs.push(a); } }
+        } else {
+          if (anchorRefusedByBudget) unnamedBudget++;
+          else if (naturalWhy === 'duplicated') unnamedDuplicated++;
+          else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
+          else if (naturalWhy === 'unsafe') unnamedUnsafe++;
+          else unnamedAnonymous++;
+          continue;
+        }
+      } else {
+        const writtenBefore = markersWritten;
+        selector = mintOn(el);
+        if (!selector) { dropped++; continue; }
+        mintedValue = el.getAttribute('data-tv3');
+        minted = { rec: null, el: el, m: mintedValue, fresh: markersWritten > writtenBefore };
+        mintedOn.push(minted);
+      }
+    }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim() || strongLabel;
     if (!label) label = (el.type === 'password' ? '' : el.value || '').trim();
+    if (!label) label = (el.getAttribute('title') || '').trim();
     const role = el.getAttribute('role');
     // el.type is only trustworthy where the UA normalises it to a known keyword. On INPUT, BUTTON
     // and SELECT it is a reflected enum; on <a>, <link>, <embed>, <object> and <source> it hands
@@ -1652,12 +2403,15 @@ _OBSERVE_JS = (
     const pressed = el.getAttribute('aria-pressed');
     if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     if (minted !== null) minted.rec = rec;
+    for (const a of anchorRecs) { for (const c of a.ctrls) { if (c.el === el) c.rec = rec; } }
     if (hidden) hiddenListed++;
     // A submit or button input is named by its caption, and a caption is what a refusal beside it
     // repeats; a field's own control is the only thing a wrapper holds.
     const captioned = rec.tag === 'input' && /^(?:submit|button|reset|image)$/.test(rec.type || '');
     if ((rec.tag === 'input' && !captioned) || rec.tag === 'select' || rec.tag === 'textarea') labelOfControl.set(el, rec.label.replace(/\s+/g, ' ').trim());
     out.push(rec);
+    elOfRec.set(rec, el);
+    stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
     if (++i > 250) {
       // Count what the budget actually cost, not what is left in the array: a zero-size match would
       // have been skipped anyway, and counting it overstates the loss on any page carrying a hidden
@@ -1675,6 +2429,16 @@ _OBSERVE_JS = (
     }
    } catch (e) { dropped++; continue; }
   }
+  // Let the page's own MutationObservers deliver (they are queued, not synchronous), then check
+  // marker ownership -- a callback can move a marker onto a peer -- and ask the witness what changed. Our marker writes are our own; anything else means a record may describe
+  // an element that was replaced, mutated in place, or re-identified, so every record is re-resolved
+  // to the element it was built for and dropped if it no longer denotes exactly that element.
+  // `await null` yields through the intrinsic promise machinery: the page cannot replace it the way
+  // it can replace setTimeout, and every observer notification queued during the walk is ahead of
+  // this continuation in the microtask queue.
+  // Bounded: a callback may defer its own work another turn, and each turn is answered by one
+  // more yield; a page that keeps queueing forever is left to the witness, which records what it did.
+  for (let turn = 0; turn < 16; turn++) await null;
   // A marker we wrote can be gone by the end of the walk: a component that mirrors attributes moves
   // it onto a peer, and the element we named is then addressed by a selector matching nothing. One
   // attribute read per named element, no re-query -- a natural selector cannot be invalidated this
@@ -1683,11 +2447,74 @@ _OBSERVE_JS = (
     let still = null;
     try { still = rem.el.getAttribute('data-tv3'); } catch (e) { still = null; }
     // A record never built (the element threw mid-walk) was never handed out either.
+    if (rem.ctrls) {
+      const lost = still !== rem.m;
+      for (const c of rem.ctrls) {
+        // A later host's marking can re-render an earlier component, detaching a control that
+        // passed its own check; its record would then describe a replacement the tail resolves to.
+        let connected = false;
+        try { connected = _isConnected.call(c.el); } catch (e) { connected = false; }
+        if (!lost && connected) continue;
+        const at = c.rec === null ? -1 : out.indexOf(c.rec);
+        if (at !== -1) { out.splice(at, 1); labelOfControl.delete(c.el); dropped++; }
+      }
+      if (lost && !rem.shared) { if (rem.fresh) markersWritten--; else markersReused--; }
+      continue;
+    }
     if (rem.rec === null || still !== rem.m) {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
       if (at !== -1) { out.splice(at, 1); labelOfControl.delete(rem.el); dropped++; }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
+  }
+  // Any marker write during the walk can have run page code that re-rendered an EARLIER record's
+  // element, whatever named it: a record whose element is no longer connected describes a control
+  // that no longer exists, while its selector may resolve to a replacement in a different state.
+  let mutated = false;
+  if (_witness) {
+    try {
+      for (const m of _witness.takeRecords()) _witnessed.push(m);
+      _witness.disconnect();
+      mutated = _witnessed.some((m) => !(m.type === 'attributes' && m.attributeName === 'data-tv3'));
+      // A root attached during the walk was never observed, so a change inside it is invisible to
+      // the witness; a root count that moved is treated as a change.
+      if (!mutated) {
+        let rootsNow = 0;
+        const stack = [document];
+        while (stack.length) {
+          const r = stack.pop();
+          rootsNow++;
+          let kids;
+          try { kids = r.querySelectorAll('*'); } catch (e) { mutated = true; break; }
+          for (const k of kids) {
+            let sr = null;
+            try { sr = k.shadowRoot; } catch (e) { continue; }
+            if (sr && sr.nodeType === 11) stack.push(sr);
+          }
+        }
+        if (rootsNow !== allRoots.length) mutated = true;
+      }
+    } catch (e) { mutated = true; }
+  }
+  for (let k = out.length - 1; k >= 0; k--) {
+    const rec = out[k];
+    const el = elOfRec.get(rec);
+    let connected = true;
+    if (el) { try { connected = _isConnected.call(el); } catch (e) { connected = false; } }
+    let ok = connected;
+    const stamp = ok && el ? stampOfRec.get(rec) : null;
+    // A property write (checked, value) leaves no mutation record, so the fingerprint is always
+    // compared; re-resolving the selector is paid only when the witness saw the tree change.
+    if (ok && stamp && stamp.fp !== fingerprint(el)) ok = false;
+    if (ok && stamp && mutated) {
+      if (stamp.anchor) {
+        for (const link of stamp.anchor.trail) {
+          if (link.ctrl) { if (!scopedResolvesTo(link.scope, link.ctrl, link.target)) { ok = false; break; } }
+          else { checkInconclusive = false; if (!resolvesTo(link.sel, link.target) && !checkInconclusive) { ok = false; break; } }
+        }
+      } else { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
+    }
+    if (!ok) { labelOfControl.delete(el); out.splice(k, 1); dropped++; }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
   // summaries) live in non-interactive nodes the element list can never carry. Three sources in
@@ -1936,7 +2763,7 @@ _OBSERVE_JS = (
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
 
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, markersMinted: markersWritten, markersReused: markersReused, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
 }
 """
 )
@@ -1970,6 +2797,38 @@ def _spec(
 
 def _obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {"type": "object", "properties": properties, "required": required or []}
+
+
+# Mirror v1's default inter_action_delay (get_wait_time default 0.5 → random.uniform(base, 2*base)).
+# v3's tool factory has no task/workflow context to thread the org-tunable wait_config, so the
+# default constant is used; widen the factory only if per-org tuning is later shown to matter.
+_UPLOAD_SUBMIT_DELAY_BASE_S = 0.5
+
+
+async def _settle_after_upload(page: Any) -> None:
+    """Let the page finish processing a just-uploaded file before the next action runs.
+
+    v1 already settles after every upload; v3's tool loop can otherwise dispatch the upload and
+    the next action back-to-back in one turn, before upload UI (spinner/progress/XHR) has mounted.
+    Reuses v1's settle (`_wait_for_upload_processing`), but best-effort: v1 lets an unclassified
+    settle error propagate, whereas here the upload has already succeeded, so a settle failure is
+    logged and swallowed rather than turned into a tool error.
+    """
+    from skyvern.webeye.actions.handler import _wait_for_upload_processing
+
+    try:
+        # engine_selection is intentionally omitted (v3's tool factory has no engine context); its
+        # only effect is error classification inside the settle, and the catch-all below tolerates
+        # any settle error regardless.
+        await _wait_for_upload_processing(page)
+    except Exception:
+        LOG.info("post-upload settle failed, continuing", exc_info=True)
+
+
+async def _upload_submit_delay() -> None:
+    """Small randomized delay after an upload, mirroring v1's per-action inter_action_delay default,
+    so the upload and the following action are not dispatched in the same instant."""
+    await asyncio.sleep(random.uniform(_UPLOAD_SUBMIT_DELAY_BASE_S, _UPLOAD_SUBMIT_DELAY_BASE_S * 2))
 
 
 def build_browser_tools(
@@ -2031,7 +2890,10 @@ def build_browser_tools(
         omitted_duplicated = data.get("unnamedDuplicated") or 0
         omitted_unverifiable = data.get("unnamedUnverifiable") or 0
         omitted_unsafe = data.get("unnamedUnsafe") or 0
-        omitted_in_components = omitted_anonymous + omitted_duplicated + omitted_unverifiable + omitted_unsafe
+        omitted_budget = data.get("unnamedBudget") or 0
+        omitted_in_components = (
+            omitted_anonymous + omitted_duplicated + omitted_unverifiable + omitted_unsafe + omitted_budget
+        )
         if omitted_in_components:
             # Sizes the capability this deliberately gives up, split by cause because the causes have
             # different fixes: `duplicated` is answered by host-anchored selectors with executor-side
@@ -2045,6 +2907,7 @@ def build_browser_tools(
                 omitted_duplicated=omitted_duplicated,
                 omitted_unverifiable=omitted_unverifiable,
                 omitted_unsafe=omitted_unsafe,
+                omitted_budget=omitted_budget,
                 listed=len(elements),
             )
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
@@ -2063,6 +2926,11 @@ def build_browser_tools(
         if hidden_kept:
             lines.append(
                 f"note: {hidden_kept} native control(s) hidden behind styled proxies are listed with [hidden-native]"
+            )
+        phantom_dropped = data.get("phantomDropped") or 0
+        if phantom_dropped:
+            lines.append(
+                f"note: {phantom_dropped} unreachable input(s) omitted (aria-hidden, out of the tab order, unlabeled)"
             )
         for t in data.get("text") or []:
             lines.append(f"text: {t!r}")
@@ -2164,6 +3032,8 @@ def build_browser_tools(
                 why.append(f"{omitted_unverifiable} could not be verified because a component root was unreadable")
             if omitted_unsafe:
                 why.append(f"{omitted_unsafe} carry an identifier we cannot render safely")
+            if omitted_budget:
+                why.append(f"{omitted_budget} exceeded the naming budget for this page")
             lines.append(
                 f"note: {omitted_in_components} control(s) inside components are not listed because we "
                 f"have no selector that identifies them: {'; '.join(why)}"
@@ -2213,6 +3083,7 @@ def build_browser_tools(
         summary = {
             "text_dropped": text_dropped,
             "hidden_listed": hidden_kept,
+            "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
             "omitted_unnameable": omitted_in_components,
@@ -2266,11 +3137,63 @@ def build_browser_tools(
             )
         return ToolResult.error(f"{exc.selector} is disabled — it cannot be typed into until the page enables it")
 
-    def _covered_error(selector: str) -> ToolResult:
+    def _covered_error(
+        selector: str, occluder: dict[str, Any] | None = None, *, verb: str = "typed into"
+    ) -> ToolResult:
+        also = "" if verb == "clicked" else " — a person could not click it either"
+        name = str((occluder or {}).get("name") or "").strip()
+        layer_selector = (occluder or {}).get("selector")
+        if occluder and occluder.get("invisible"):
+            # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
+            # Telling the model to dismiss an overlay it can see is then a false instruction that makes
+            # it flail; name the layer as invisible and point at recovery routes that do not depend on
+            # seeing it. Controls are omitted on purpose: a ghost backdrop has none, and a still-present
+            # named layer's controls did not dismiss it (that is why it is still here).
+            if name and layer_selector:
+                layer_desc = f'"{name}" ({layer_selector})'
+            elif name:
+                layer_desc = f'"{name}"'
+            elif layer_selector:
+                layer_desc = f"a layer ({layer_selector})"
+            else:
+                layer_desc = "a layer"
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc} that is INVISIBLE — it intercepts clicks but paints "
+                f"nothing on screen, so you will not see it in a screenshot{also}. It is most likely a "
+                "leftover backdrop from a dialog or cookie banner that was already dismissed. Do not keep "
+                "trying to dismiss a visible overlay; press Escape, re-observe, or reach the field another way."
+            )
+        if not occluder:
+            return ToolResult.error(
+                f"{selector} is rendered but something else is on top of it, so it cannot be {verb}{also}. "
+                "Dismiss whatever covers it (a dialog, an overlay, a cookie banner), then re-observe."
+            )
+        layer_desc = f'"{name}"' if name else "a layer"
+        if layer_selector:
+            layer_desc = f"{layer_desc} ({layer_selector})"
+        parts = []
+        for control in occluder.get("controls") or []:
+            control_selector = control.get("selector") if isinstance(control, dict) else None
+            label = str((control.get("label") if isinstance(control, dict) else "") or "").strip()
+            if control_selector and label:
+                parts.append(f'{control_selector} "{label}"')
+            elif control_selector:
+                parts.append(control_selector)
+            elif label:
+                parts.append(f'"{label}" (no selector — re-observe to address it)')
+        if parts:
+            controls_desc = "; ".join(parts)
+        else:
+            controls_desc = "re-observe — no controls were found on it"
+        if occluder.get("truncated"):
+            controls_desc += "; more controls exist (re-observe to see the rest)"
         return ToolResult.error(
-            f"{selector} is rendered but something else is on top of it, so it cannot be typed into — a "
-            "person could not click it either. Dismiss whatever covers it (a dialog, an overlay, a cookie "
-            "banner), then re-observe."
+            f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. "
+            # The layer may be a general modal, not just a consent wall -- these are every control
+            # found on it, not confirmed dismissers, since a destructive or navigational action
+            # (e.g. "Delete account") is not distinguishable here from a close/cancel button.
+            f"Its controls: {controls_desc}. Pick whichever one actually closes or dismisses the "
+            f"layer, then retry {selector}."
         )
 
     async def _probe_arg(page: Any, selector: str) -> dict[str, Any]:
@@ -2286,6 +3209,31 @@ def build_browser_tools(
         except Exception:
             element = None
         return {"sel": selector, "el": element}
+
+    async def _ambiguous_selector_error(page: Any, selector: str) -> ToolResult | None:
+        # A host-anchored selector straddles a shadow boundary, which the per-root marker count
+        # cannot see through; the executor's own engine can, so it supplies the count. Playwright's
+        # actions are non-strict and would otherwise land on whichever match comes first.
+        if not (_is_host_anchored_selector(selector) or _TV3_MARKER_SELECTOR_RE.match(selector.strip())):
+            return None
+        try:
+            matches = await page.locator(selector).count()
+        except Exception:
+            # Left open, as the marker count is: refusing here would block every action on a page
+            # whose engine hiccups, and the action's own actionability wait still applies.
+            LOG.warning("taskv3 selector count unavailable; acting unverified", selector=selector)
+            return None
+        if matches == 1:
+            return None
+        if matches == 0:
+            return ToolResult.error(
+                f"{selector} no longer matches anything on the page — the page re-rendered since it was "
+                "observed. Re-observe and act on fresh selectors from the new observation."
+            )
+        return ToolResult.error(
+            f"{selector} matches {matches} elements, so it does not identify one control. Re-observe and "
+            "act on a selector from the new observation, or narrow this one until it matches exactly one."
+        )
 
     async def _marker_matches(page: Any, selector: str) -> int:
         try:
@@ -2515,6 +3463,10 @@ def build_browser_tools(
                     "marked element, so the marker no longer identifies one control. Re-observe and act "
                     "on fresh selectors from the new observation."
                 )
+        else:
+            ambiguous = await _ambiguous_selector_error(page, selector)
+            if ambiguous is not None:
+                return ambiguous
         pre: dict[str, Any] | None = None
         try:
             pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
@@ -2635,6 +3587,18 @@ def build_browser_tools(
                         "likely removed by a re-render (e.g. a menu closed and destroyed its options). "
                         f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})"
                     )
+                # Diagnosed only now, after the full actionability wait: a transient overlay (a toast,
+                # a closing menu) deserves the whole 15s to clear on its own, not a probe-shortened one.
+                try:
+                    reach_raw = await page.evaluate(_TYPE_TARGET_PROBE_JS, await _probe_arg(page, selector))
+                except Exception:
+                    reach_raw = None
+                reach_probe = reach_raw if isinstance(reach_raw, dict) else None
+                # `skinned` is the typing path's force-past signal; a click has no force fallback, so a
+                # click that timed out on an occluded field is genuinely blocked -- even by the field's
+                # own open listbox. Name the occluder rather than re-raise a bare Page.click Timeout.
+                if reach_probe and reach_probe.get("occluded"):
+                    return _covered_error(selector, reach_probe.get("occluder"), verb="clicked")
                 raise
             base = f"clicked {selector} — now at {await _url(page)}"
 
@@ -2671,13 +3635,16 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
+        ambiguous = await _ambiguous_selector_error(page, selector)
+        if ambiguous is not None:
+            return ambiguous
         await page.hover(selector, timeout=15000)
         return ToolResult.ok(f"hovered {selector}")
 
-    async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool]:
-        """(reachable, occluded). Raises when the field cannot accept typed text at all. Shared by both
-        typing paths: fill() does no hit-testing, so without this a covered password or email field is
-        filled silently -- no timeout to notice, and a person could not have reached it."""
+    async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool, dict[str, Any] | None]:
+        """(reachable, occluded, occluder). Raises when the field cannot accept typed text at all. Shared
+        by both typing paths: fill() does no hit-testing, so without this a covered password or email
+        field is filled silently -- no timeout to notice, and a person could not have reached it."""
         try:
             probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, await _probe_arg(page, selector))
         except Exception:
@@ -2688,16 +3655,22 @@ def build_browser_tools(
             if probe.get("disabled") or probe.get("readOnly"):
                 raise _FieldNotEditable(selector, bool(probe.get("readOnly")))
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
+        occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and not probe.get("skinned"):
-            return False, occluded
-        return True, occluded
+            return False, occluded, occluder
+        # Reachable: a skinned own-popup is force-typed past, so there is no blocking occluder to
+        # report. The probe still names it (the click path, which reads the probe directly, needs the
+        # name), but surfacing it here would let a force-click that then navigates or remounts the
+        # field raise a false "covered by <the field's own list>" message on a field that was reachable.
+        return True, occluded, None
 
-    async def _focus_for_typing(page: Any, selector: str) -> bool:
-        """Put the caret in `selector`. False means the field is genuinely covered and must not be typed
-        into. A click is how a widget learns to open its suggestion list, so it stays the first move."""
-        reachable, occluded = await _reachable_for_typing(page, selector)
+    async def _focus_for_typing(page: Any, selector: str) -> tuple[bool, dict[str, Any] | None]:
+        """Put the caret in `selector`. A False first element means the field is genuinely covered and
+        must not be typed into. A click is how a widget learns to open its suggestion list, so it stays
+        the first move."""
+        reachable, occluded, occluder = await _reachable_for_typing(page, selector)
         if not reachable:
-            return False
+            return False, occluder
         if occluded:
             # Forcing skips the hit-target check but still dispatches at coordinates, so the wrapper
             # can take the event; the focus check below is what makes the outcome deterministic.
@@ -2721,14 +3694,14 @@ def build_browser_tools(
                 # The wrapper was a link and the click followed it. The selector may well match
                 # something on the destination, so typing now would put the text somewhere nobody
                 # asked for.
-                return False
+                return False, occluder
             try:
                 # The click may have remounted or hidden the field -- a wrapper that swaps its input
                 # on click is an ordinary SPA shape. fill() would wait its own full timeout for a
                 # node that is gone or invisible, which is the cost this whole path exists to avoid.
                 await page.wait_for_selector(selector, state="visible", timeout=1200)
             except Exception:
-                return False
+                return False, occluder
         else:
             await page.click(selector, timeout=15000)
         try:
@@ -2741,7 +3714,7 @@ def build_browser_tools(
             # focus() needs no hit target, so it repairs a skin that swallowed the click without
             # forwarding it. Typing then goes to the field rather than wherever the caret was.
             await page.focus(selector, timeout=15000)
-        return True
+        return True, None
 
     async def _commit_typeahead(
         page: Any, selector: str, value: str, rounds: int
@@ -2816,8 +3789,9 @@ def build_browser_tools(
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM just before typing so the finder treats only NEW/reacting nodes as suggestions —
         # static page text that merely shares a word with the value can't be mistaken for one.
-        if not await _focus_for_typing(page, selector):
-            raise _FieldCovered(selector)
+        focused, occluder = await _focus_for_typing(page, selector)
+        if not focused:
+            raise _FieldCovered(selector, occluder)
         await page.fill(selector, "", timeout=15000)
         presnapshot_ok = True
         try:
@@ -2885,6 +3859,9 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
+        ambiguous = await _ambiguous_selector_error(page, selector)
+        if ambiguous is not None:
+            return ambiguous
         text = _resolve_text(args.get("text", ""))
         press_enter = args.get("press_enter")
         clear = args.get("clear", True)
@@ -2898,8 +3875,8 @@ def build_browser_tools(
             # not just on a single `input` from fill — still surfaces them, then commit the best match.
             try:
                 committed, opt_txt, readable = await _type_and_commit(page, selector, text, rounds=3)
-            except _FieldCovered:
-                return _covered_error(selector)
+            except _FieldCovered as exc:
+                return _covered_error(exc.selector, exc.occluder)
             except _FieldNotEditable as exc:
                 return _not_editable_error(exc)
             if opt_txt and committed:
@@ -2940,11 +3917,11 @@ def build_browser_tools(
         # They reach fill()/type(), which do no hit-testing, so nothing here would fail on its own --
         # the text simply lands in a field the person could not have reached.
         try:
-            reachable, _ = await _reachable_for_typing(page, selector)
+            reachable, _, occluder = await _reachable_for_typing(page, selector)
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
         if not reachable:
-            return _covered_error(selector)
+            return _covered_error(selector, occluder)
         if clear:
             await page.fill(selector, text, timeout=15000)
         else:
@@ -2960,6 +3937,9 @@ def build_browser_tools(
         selector = args["selector"]
         label = args.get("label")
         value = args.get("value")
+        ambiguous = await _ambiguous_selector_error(page, selector)
+        if ambiguous is not None:
+            return ambiguous
         try:
             probe = await page.evaluate(_SELECT_VISIBILITY_JS, await _probe_arg(page, selector))
         except Exception:
@@ -3005,6 +3985,9 @@ def build_browser_tools(
         key = args["key"]
         selector = args.get("selector")
         if selector:
+            ambiguous = await _ambiguous_selector_error(page, selector)
+            if ambiguous is not None:
+                return ambiguous
             await page.press(selector, key)
         else:
             await page.keyboard.press(key)
@@ -3016,6 +3999,9 @@ def build_browser_tools(
             return error
         selector = args.get("selector")
         if selector:
+            ambiguous = await _ambiguous_selector_error(page, selector)
+            if ambiguous is not None:
+                return ambiguous
             el = await page.query_selector(selector)
             if el:
                 await el.scroll_into_view_if_needed()
@@ -3046,7 +4032,7 @@ def build_browser_tools(
         page, error = await _resolve_page()
         if error is not None:
             return error
-        url = await asyncio.to_thread(validate_fetch_url, args["url"])
+        url = await asyncio.to_thread(validate_fetch_url, _resolve_text(args["url"]))
         response = await page.goto(url, timeout=60000, wait_until="load")
         # Surface the HTTP status: an error page otherwise reads as a successful navigation, hiding
         # dead URLs and blank shells from the model.
@@ -3063,6 +4049,9 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
+        ambiguous = await _ambiguous_selector_error(page, selector)
+        if ambiguous is not None:
+            return ambiguous
         source = _resolve_text(args["file"])
         local_path = await download_file(source, output_dir=downloads_dir, organization_id=organization_id)
         # For http(s) sources download_file stages into downloads_dir; naming the file lets the
@@ -3074,6 +4063,10 @@ def build_browser_tools(
         if el is None:
             return ToolResult("error", f"no file input for selector {selector!r}", staged)
         await el.set_input_files(paths)
+        # Settle + a small randomized delay so the upload and a following submit are not dispatched
+        # in the same instant, matching v1's upload cadence (the engine that clears this step reliably).
+        await _settle_after_upload(page)
+        await _upload_submit_delay()
         return ToolResult.ok(f"uploaded 1 file to {selector}", staged)
 
     async def select_combobox(args: dict[str, Any]) -> ToolResult:
@@ -3085,11 +4078,14 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
+        ambiguous = await _ambiguous_selector_error(page, selector)
+        if ambiguous is not None:
+            return ambiguous
         value = _resolve_text(args["value"])
         try:
             committed, opt_txt, readable = await _type_and_commit(page, selector, value, rounds=8)
-        except _FieldCovered:
-            return _covered_error(selector)
+        except _FieldCovered as exc:
+            return _covered_error(exc.selector, exc.occluder)
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
         if opt_txt is None:

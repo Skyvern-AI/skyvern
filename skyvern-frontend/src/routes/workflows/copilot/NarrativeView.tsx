@@ -1,13 +1,25 @@
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
-import { buildRevealOffsets, revealedCountAt } from "./actionReveal";
+import {
+  buildRevealOffsets,
+  revealedCharsAt,
+  revealedCountAt,
+} from "./actionReveal";
 import { humanizeBlockLabel } from "./blockLabel";
 import {
-  CopilotPhaseId,
-  PhaseStatus,
-  derivePhases,
-  showPhaseChecklist,
-} from "./copilotPhases";
+  ACTIVITY_KIND_GLYPH,
+  ACTIVITY_KIND_WORD,
+  ActivityRow as ActivityRowModel,
+  deriveActivityLog,
+} from "./copilotActivityLog";
+import { showPhaseChecklist } from "./copilotPhases";
+import { CodeWriteDiff } from "./workflowCopilotTypes";
 import {
   ActivityEntry,
   BlockState,
@@ -15,7 +27,6 @@ import {
   TurnNarrativeState,
   TurnSummary,
   computeTurnSummary,
-  condenseActivityEntries,
   formatElapsed,
   humanizeJudgeText,
   isBlockOk,
@@ -219,7 +230,119 @@ function AttemptsBadge({ attempts }: { attempts?: number }) {
   );
 }
 
-function ActivityRow({ entry }: { entry: ActivityEntry }) {
+// The activity log's row, one grid for every kind of work: a single gutter
+// glyph, the sentence, and the elapsed column. Status rides inline at the end
+// of the sentence rather than as a second glyph column, so a block row and a
+// step row sit on the same rails.
+function FLogLine({
+  glyph,
+  kindWord,
+  children,
+  trailing,
+  onClick,
+  expanded,
+  title,
+}: {
+  glyph: React.ReactNode;
+  kindWord?: string;
+  children: React.ReactNode;
+  trailing?: React.ReactNode;
+  onClick?: () => void;
+  expanded?: boolean;
+  title?: string;
+}) {
+  const body = (
+    <>
+      <span
+        // Baseline-aligned, per the design canvas — but these glyphs do not fill
+        // their box the way letters fill theirs, so sharing a baseline leaves
+        // their ink centre ~1.5px below the sentence's and they read as sloppy.
+        // Centring the box does not move ink; only a transform does. The offset
+        // is measured, not eyeballed: render the row and compare the ink bands
+        // of the two columns, and re-derive it if the type changes.
+        className="inline-block -translate-y-[1.5px] text-center font-mono text-[11px] text-muted-foreground dark:text-slate-500"
+        aria-hidden="true"
+      >
+        {glyph}
+      </span>
+      <span className="min-w-0 text-left text-[12.5px] leading-[1.5] text-muted-foreground dark:text-slate-400">
+        {kindWord === undefined ? null : (
+          <span className="sr-only">{kindWord} · </span>
+        )}
+        {children}
+      </span>
+      <span className="whitespace-nowrap font-mono text-[10.5px] tabular-nums text-muted-foreground dark:text-slate-500">
+        {trailing}
+      </span>
+    </>
+  );
+  const shape =
+    "grid w-full grid-cols-[18px_1fr_auto] items-baseline gap-x-2.5 py-[3px]";
+  return onClick === undefined ? (
+    <div className={shape}>{body}</div>
+  ) : (
+    <button
+      type="button"
+      className={`${shape} cursor-pointer text-left`}
+      aria-expanded={expanded}
+      onClick={onClick}
+      title={title}
+    >
+      {body}
+    </button>
+  );
+}
+
+// The sentence an entry contributes, without the glyph column. The log's row
+// renders it inline so status can ride at the end; a nested sub-row wraps the
+// same content in its own glyph gutter.
+function entryLine(
+  entry: ActivityEntry,
+  title?: string | null,
+): { content: React.ReactNode } {
+  if (entry.kind === "narration") {
+    return { content: <span className="italic">{entry.text}</span> };
+  }
+  if (entry.kind === "tool_call") {
+    return {
+      content: (
+        <>
+          <span>
+            {title ??
+              entry.displayLabel ??
+              toolActivityDisplayLabel(entry.toolName)}
+          </span>
+          <span className="text-muted-foreground dark:text-slate-500">
+            {" "}
+            · calling…
+          </span>
+          <AttemptsBadge attempts={entry.attempts} />
+        </>
+      ),
+    };
+  }
+  const ok = entry.success !== false;
+  return {
+    content: (
+      <>
+        <span className={ok ? undefined : "text-rose-700 dark:text-rose-200"}>
+          {ok ? (title ?? entry.text) : entry.text}
+        </span>
+        <AttemptsBadge attempts={entry.attempts} />
+      </>
+    ),
+  };
+}
+
+function ActivityRow({
+  entry,
+  title,
+}: {
+  entry: ActivityEntry;
+  // Narrator-authored title for the row this entry heads. Falls through to the
+  // tool-derived label when the narrator never spoke for the step.
+  title?: string | null;
+}) {
   if (entry.kind === "narration") {
     return (
       <FSubRow
@@ -234,7 +357,7 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
   }
   if (entry.kind === "tool_call") {
     const label =
-      entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
+      title ?? entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
     return (
       <FSubRow glyph="▸" glyphClass="text-muted-foreground">
         <span className="text-foreground dark:text-slate-200">{label}</span>
@@ -263,7 +386,7 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
             : "text-rose-700 dark:text-rose-200"
         }
       >
-        {entry.text}
+        {ok ? (title ?? entry.text) : entry.text}
       </span>
       <AttemptsBadge attempts={entry.attempts} />
     </FSubRow>
@@ -277,6 +400,21 @@ function useTick(active: boolean, intervalMs = 1000): void {
     const id = setInterval(() => setTick((t) => t + 1), intervalMs);
     return () => clearInterval(id);
   }, [active, intervalMs]);
+}
+
+// Both reveals advance faster than an interval coarse enough for status text:
+// narration moves a character every 14ms, and buildRevealOffsets scales a long
+// block's steps under 150ms, so a timer samples them in visible jumps.
+function useFrameTick(active: boolean): void {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    let raf = requestAnimationFrame(function loop() {
+      setTick((t) => t + 1);
+      raf = requestAnimationFrame(loop);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [active]);
 }
 
 function FRecordedActionRow({
@@ -342,6 +480,21 @@ interface FBlockRunProps {
   onSelect?: (label: string) => void;
   uxV1?: boolean;
   outcomeReasonFallback?: string | null;
+  // Narrator title for the row this card heads. The card's own status text and
+  // the rollup's block lists still name the block, so the title replaces only
+  // the label here.
+  rowTitle?: string | null;
+  // Inside the activity log the card sheds its puck for the shared row grid,
+  // so a block does not read as a different species from the steps around it.
+  flat?: boolean;
+  // Supplied when the log's row already names the kind of work. The block's
+  // own state then rides inline as a mark instead of taking the gutter.
+  rowGlyph?: React.ReactNode;
+  rowKindWord?: string;
+  rowTrailing?: React.ReactNode;
+  // When the activity log owns this card's row, open/closed comes from there
+  // so the row and the card never disagree about a single click.
+  expansion?: { open: boolean; onToggle: () => void };
 }
 
 function FBlockRun({
@@ -350,8 +503,15 @@ function FBlockRun({
   onSelect,
   uxV1,
   outcomeReasonFallback,
+  rowTitle,
+  flat,
+  rowGlyph,
+  rowKindWord,
+  rowTrailing,
+  expansion,
 }: FBlockRunProps) {
-  const displayLabel = uxV1 ? humanizeBlockLabel(block.label) : block.label;
+  const displayLabel =
+    rowTitle ?? (uxV1 ? humanizeBlockLabel(block.label) : block.label);
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
@@ -434,13 +594,24 @@ function FBlockRun({
 
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
-  const open = userOpen === null ? defaultOpen : userOpen;
+  const open = expansion
+    ? expansion.open
+    : userOpen === null
+      ? defaultOpen
+      : userOpen;
   // A stop stays inspectable but not self-opening: the user knows why it
-  // stopped, so it should not demand attention the way a failure does.
+  // stopped, so it should not demand attention the way a failure does. Under
+  // the activity log `expansion` supplies the open state and none of this
+  // applies — there, every finished row folds, a failure included.
   const toggleable =
-    isOk || isOutcomeNotShown || isVerifying || isRanNeutral || isStopped;
+    expansion !== undefined ||
+    isOk ||
+    isOutcomeNotShown ||
+    isVerifying ||
+    isRanNeutral ||
+    isStopped;
   useTick(isRunning);
-  useTick(hasActions && (replayingAction || elapsedReveal < totalMs), 150);
+  useFrameTick(hasActions && (replayingAction || elapsedReveal < totalMs));
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
   const statusText = isOk
@@ -458,9 +629,159 @@ function FBlockRun({
               : isDraft
                 ? "drafted"
                 : "queued";
+  // The visible mark carries the state for sighted readers; this is the same
+  // state as a word, without the duration statusText folds in — the row
+  // already has an elapsed column.
+  const stateWord = isOk
+    ? "done"
+    : isRunning
+      ? "working"
+      : isVerifying
+        ? "verifying outcome"
+        : isRanNeutral || isOutcomeNotShown
+          ? "ran"
+          : isFail
+            ? "halted"
+            : isStopped
+              ? "stopped"
+              : isDraft
+                ? "drafted"
+                : "queued";
+  const stateGlyph = isOk ? (
+    "✓"
+  ) : isOutcomeNotShown ? (
+    "!"
+  ) : isVerifying ? (
+    "…"
+  ) : isFail ? (
+    "✕"
+  ) : isStopped ? (
+    "■"
+  ) : isRunning ? (
+    <Spinner />
+  ) : (
+    palette.glyph
+  );
   const collapsedOutcomeReason = isOutcomeNotShown
     ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
     : null;
+
+  const onHeaderClick = () => {
+    onSelect?.(block.label);
+    if (expansion) {
+      expansion.onToggle();
+    } else if (toggleable) {
+      setUserOpen((v) => !(v === null ? defaultOpen : v));
+    }
+  };
+  const collapsedExtras = (
+    <>
+      {!open && !expansion && isOk && block.activity.length > 0 ? (
+        <div className="mt-0.5 text-[12px] leading-[1.5] text-muted-foreground">
+          {block.activity[block.activity.length - 1]!.text}
+        </div>
+      ) : null}
+      {!open && !expansion && isOutcomeNotShown ? (
+        <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
+          Outcome not confirmed — the run finished without showing the goal was
+          met
+          {collapsedOutcomeReason
+            ? `: ${truncateOutcomeReason(collapsedOutcomeReason)}`
+            : "."}
+        </div>
+      ) : null}
+    </>
+  );
+
+  const blockDetail = (
+    <div className="flex flex-col gap-1.5 border-l border-border/60 py-1.5 pl-3">
+      {isRunning ? (
+        <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-blue-400/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-blue-300">
+          <span className="h-[5px] w-[5px] animate-pulse rounded-full bg-blue-400" />
+          Active in Live Browser
+        </span>
+      ) : null}
+      {block.activity.length === 0 && isRunning ? (
+        <FSubRow
+          glyph={<Spinner small />}
+          glyphClass="text-blue-700 dark:text-blue-300"
+        >
+          <span className="text-muted-foreground">Working…</span>
+        </FSubRow>
+      ) : null}
+      {block.activity.map((entry) => (
+        <ActivityRow key={entry.id} entry={entry} />
+      ))}
+      {hasActions
+        ? recordedActions!
+            .slice(0, visibleActionCount)
+            .map((action, i) => (
+              <FRecordedActionRow
+                key={action.actionId}
+                action={action}
+                revealing={replayingAction && i === revealedCount}
+                flash={
+                  i < revealedCount &&
+                  elapsedReveal - offsets[i]! < FLASH_WINDOW_MS
+                }
+              />
+            ))
+        : null}
+      {isFail ? (
+        <div className="mt-1 flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
+          <span className="text-[11px] font-bold text-rose-700 dark:text-rose-300">
+            ✕
+          </span>
+          <div className="text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200/90">
+            {block.activity.find((e) => e.kind === "tool_result")?.text ??
+              "Halted — see run details."}
+          </div>
+        </div>
+      ) : null}
+      {isOutcomeNotShown ? (
+        <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
+          <span className="text-[11px] font-bold text-amber-700 dark:text-amber-300">
+            !
+          </span>
+          <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
+            {normalizeOutcomeReason(block.outcomeReason) ??
+              "The step ran, but the run did not demonstrate the goal was met."}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+
+  if (flat) {
+    return (
+      <div className="flex flex-col">
+        <FLogLine
+          glyph={rowGlyph ?? <span className={accentText}>{stateGlyph}</span>}
+          kindWord={rowKindWord}
+          trailing={
+            <>
+              {elapsed ?? rowTrailing}
+              {toggleable ? (open ? " ⌄" : " ›") : null}
+            </>
+          }
+          onClick={onHeaderClick}
+          expanded={expansion ? open : undefined}
+          title={`Highlight ${block.label} on canvas`}
+        >
+          {displayLabel}
+          {rowGlyph === undefined ? null : (
+            <span className={accentText} aria-hidden="true">
+              {" "}
+              {stateGlyph}
+            </span>
+          )}
+          <span className="sr-only">{` · ${stateWord}`}</span>
+        </FLogLine>
+        <div className="pl-[28px]">{collapsedExtras}</div>
+        {open ? <div className="pl-[28px]">{blockDetail}</div> : null}
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col">
@@ -469,33 +790,15 @@ function FBlockRun({
         className={`flex w-full items-start gap-3 px-1 py-1 text-left ${
           toggleable ? "cursor-pointer" : "cursor-default"
         }`}
-        onClick={() => {
-          onSelect?.(block.label);
-          if (toggleable) {
-            setUserOpen((v) => !(v === null ? defaultOpen : v));
-          }
-        }}
+        aria-expanded={expansion ? expansion.open : undefined}
+        onClick={onHeaderClick}
         title={`Highlight ${block.label} on canvas`}
       >
         <span
           className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-bold ${accentBorder} ${accentText} ${puckBg}`}
           aria-hidden="true"
         >
-          {isOk ? (
-            "✓"
-          ) : isOutcomeNotShown ? (
-            "!"
-          ) : isVerifying ? (
-            "…"
-          ) : isFail ? (
-            "✕"
-          ) : isStopped ? (
-            "■"
-          ) : isRunning ? (
-            <Spinner />
-          ) : (
-            palette.glyph
-          )}
+          {stateGlyph}
         </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
@@ -519,20 +822,7 @@ function FBlockRun({
               · {block.blockType}
             </span>
           </div>
-          {!open && isOk && block.activity.length > 0 ? (
-            <div className="mt-0.5 text-[12px] leading-[1.5] text-muted-foreground">
-              {block.activity[block.activity.length - 1]!.text}
-            </div>
-          ) : null}
-          {!open && isOutcomeNotShown ? (
-            <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
-              Outcome not confirmed — the run finished without showing the goal
-              was met
-              {collapsedOutcomeReason
-                ? `: ${truncateOutcomeReason(collapsedOutcomeReason)}`
-                : "."}
-            </div>
-          ) : null}
+          {collapsedExtras}
         </div>
         {toggleable ? (
           <span
@@ -546,64 +836,7 @@ function FBlockRun({
         ) : null}
       </button>
 
-      {open ? (
-        <div className="ml-9 flex flex-col gap-1.5 border-l border-border/60 py-1.5 pl-3">
-          {isRunning ? (
-            <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-blue-400/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-blue-300">
-              <span className="h-[5px] w-[5px] animate-pulse rounded-full bg-blue-400" />
-              Active in Live Browser
-            </span>
-          ) : null}
-          {block.activity.length === 0 && isRunning ? (
-            <FSubRow
-              glyph={<Spinner small />}
-              glyphClass="text-blue-700 dark:text-blue-300"
-            >
-              <span className="text-muted-foreground">Working…</span>
-            </FSubRow>
-          ) : null}
-          {block.activity.map((entry) => (
-            <ActivityRow key={entry.id} entry={entry} />
-          ))}
-          {hasActions
-            ? recordedActions!
-                .slice(0, visibleActionCount)
-                .map((action, i) => (
-                  <FRecordedActionRow
-                    key={action.actionId}
-                    action={action}
-                    revealing={replayingAction && i === revealedCount}
-                    flash={
-                      i < revealedCount &&
-                      elapsedReveal - offsets[i]! < FLASH_WINDOW_MS
-                    }
-                  />
-                ))
-            : null}
-          {isFail ? (
-            <div className="mt-1 flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
-              <span className="text-[11px] font-bold text-rose-700 dark:text-rose-300">
-                ✕
-              </span>
-              <div className="text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200/90">
-                {block.activity.find((e) => e.kind === "tool_result")?.text ??
-                  "Halted — see run details."}
-              </div>
-            </div>
-          ) : null}
-          {isOutcomeNotShown ? (
-            <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
-              <span className="text-[11px] font-bold text-amber-700 dark:text-amber-300">
-                !
-              </span>
-              <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
-                {normalizeOutcomeReason(block.outcomeReason) ??
-                  "The step ran, but the run did not demonstrate the goal was met."}
-              </div>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+      {open ? <div className="ml-9">{blockDetail}</div> : null}
     </div>
   );
 }
@@ -710,87 +943,6 @@ function FWorkingHeader() {
   );
 }
 
-function phaseGlyph(status: PhaseStatus): ReactNode {
-  switch (status) {
-    case "done":
-      return "✓";
-    case "fail":
-      return "✕";
-    case "stopped":
-      return "■";
-    case "active":
-      return <Spinner />;
-    default:
-      return "○";
-  }
-}
-
-function phasePuckClasses(status: PhaseStatus): string {
-  switch (status) {
-    case "done":
-      return "border-emerald-400/60 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
-    case "fail":
-      return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
-    case "active":
-      return "border-blue-400/60 bg-blue-500/15 text-blue-700 dark:text-blue-300";
-    case "stopped":
-      return "border-slate-400/60 bg-slate-elevation4 text-muted-foreground";
-    default:
-      return "border-slate-500/60 bg-slate-elevation3 text-slate-600";
-  }
-}
-
-function phaseLabelClasses(status: PhaseStatus): string {
-  switch (status) {
-    case "active":
-      return "font-semibold text-foreground";
-    case "fail":
-      return "text-rose-700 dark:text-rose-300";
-    case "pending":
-    case "notrun":
-      return "text-muted-foreground dark:text-slate-500";
-    default:
-      return "text-muted-foreground";
-  }
-}
-
-// Status is otherwise conveyed only via an aria-hidden glyph/color — this
-// gives screen-reader users the same information as sighted users.
-function phaseStatusWord(status: PhaseStatus): string {
-  switch (status) {
-    case "active":
-      return "Active";
-    case "done":
-      return "Done";
-    case "fail":
-      return "Failed";
-    case "stopped":
-      return "Stopped";
-    case "notrun":
-      return "Not run";
-    default:
-      return "Pending";
-  }
-}
-
-// While Draft is active its stream is necessarily empty (the LLM is writing
-// code, no frames arrive), so one shimmered placeholder row fills that gap.
-function DraftPlaceholderNote() {
-  const shimmerRef = useShimmerText<HTMLSpanElement>(true);
-  const text = "Writing the workflow code…";
-  return (
-    <FSubRow glyph="▸" glyphClass="text-muted-foreground">
-      <span
-        ref={shimmerRef}
-        title={text}
-        className="block truncate text-muted-foreground"
-      >
-        {text}
-      </span>
-    </FSubRow>
-  );
-}
-
 export const COPILOT_ACK_LINES = [
   "Reading your request…",
   "Getting oriented…",
@@ -842,168 +994,361 @@ export function InstantAckPlaceholder() {
   );
 }
 
-interface FPhaseChecklistProps {
+interface FActivityLogProps {
   turn: TurnNarrativeState;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
   uxV1?: boolean;
 }
 
-function FPhaseChecklist({
-  turn,
+// The kind gutter sits to the left of ActivityRow's own status column, so a
+// row reads <kind> <status> <text> and neither signal displaces the other.
+// The counts line sits outside the row's own expand button, so its `view diff`
+// control is never a button nested inside another button.
+function FCodeWriteDiff({
+  diff,
+  open,
+  onToggle,
+  uxV1,
+}: {
+  diff: CodeWriteDiff;
+  open: boolean;
+  onToggle: () => void;
+  uxV1?: boolean;
+}) {
+  return (
+    <div className="flex flex-col">
+      <FSubRow glyph="±" glyphClass="text-sky-700 dark:text-sky-300">
+        <span
+          className={uxV1 ? "text-foreground" : "font-mono text-foreground"}
+          title={diff.label}
+        >
+          {uxV1 ? humanizeBlockLabel(diff.label) : diff.label}
+        </span>
+        <span className="pl-1.5 font-mono text-emerald-700 dark:text-emerald-300">
+          {`+${diff.added}`}
+        </span>
+        <span className="pl-1 font-mono text-rose-700 dark:text-rose-300">
+          {`−${diff.removed}`}
+        </span>
+        {/* A disabled control receives no pointer events, so the reason why it is
+            dead has to hang on something that does. */}
+        <span
+          title={
+            diff.patchDropped
+              ? "The diff was too large to keep, so only its line counts were saved."
+              : undefined
+          }
+        >
+          <button
+            type="button"
+            className="pl-2 text-muted-foreground underline-offset-2 hover:underline disabled:no-underline disabled:opacity-50"
+            disabled={diff.patch === undefined}
+            aria-expanded={open}
+            onClick={onToggle}
+          >
+            {open ? "hide diff" : "view diff"}
+          </button>
+        </span>
+      </FSubRow>
+      {open && diff.patch !== undefined ? (
+        <pre className="ml-5 overflow-x-auto whitespace-pre rounded border border-border/60 bg-muted/40 p-2 text-[11px] leading-[1.5]">
+          {diff.patch.split("\n").map((line, i) => (
+            <div
+              key={`${i}-${line}`}
+              className={
+                line.startsWith("+")
+                  ? "text-emerald-700 dark:text-emerald-300"
+                  : line.startsWith("-")
+                    ? "text-rose-700 dark:text-rose-300"
+                    : "text-muted-foreground"
+              }
+            >
+              {line}
+            </div>
+          ))}
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
+function FActivityLogRow({
+  row,
+  open,
+  onToggle,
+  diffOpen,
+  onDiffToggle,
   turnEnded,
   onBlockSelect,
   uxV1,
-}: FPhaseChecklistProps) {
-  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
-  const rows = useMemo(() => derivePhases(turn), [turn]);
-  const condensedBlocks = useMemo(
-    () =>
-      turn.blocks.map((b) => ({
-        ...b,
-        activity: condenseActivityEntries(b.activity),
-      })),
-    [turn.blocks],
-  );
-  const [openPhases, setOpenPhases] = useState<Set<CopilotPhaseId>>(
-    () => new Set(),
+  outcomeReasonFallback,
+}: {
+  row: ActivityRowModel;
+  open: boolean;
+  onToggle: () => void;
+  diffOpen: (label: string) => boolean;
+  onDiffToggle: (label: string) => void;
+  turnEnded: boolean;
+  onBlockSelect?: (label: string) => void;
+  uxV1?: boolean;
+  outcomeReasonFallback?: string | null;
+}) {
+  const last = row.entries[row.entries.length - 1];
+  // A lone run card becomes the row itself, so the collapsed line keeps the
+  // block's own verdict rather than the run tool's flag, which can disagree.
+  // Unless the row is still calling and that block already finished: it is an
+  // earlier run's card, and its verdict would read as this row's status.
+  const only = row.blocks.length === 1 ? row.blocks[0] : undefined;
+  const soloBlock =
+    row.pending && only !== undefined && only.state !== "running"
+      ? undefined
+      : only;
+  const hasDetail =
+    row.blocks.length > 0 ||
+    row.entries.length > 1 ||
+    row.codeDiffs.length > 0 ||
+    row.reason !== null;
+  // Body content is whatever the line does not already show: a solo block's
+  // line is the card, so every entry is still unrendered; otherwise the line
+  // is the last entry and the body carries the ones before it.
+  const bodyEntries = soloBlock ? row.entries : row.entries.slice(0, -1);
+  // The reason is a body child too: a row whose only detail is its reason
+  // would otherwise render an empty container and hide the prose entirely.
+  const bodyChildren =
+    bodyEntries.length +
+    (soloBlock ? 0 : row.blocks.length) +
+    row.codeDiffs.length +
+    (row.reason === null ? 0 : 1);
+  // The collapsed row carries the whole write's delta; per-block identity and
+  // the patch itself live in the detail. A row folding two writes sums them,
+  // since one line cannot name both blocks without becoming two.
+  const rowAdded = row.codeDiffs.reduce((n, d) => n + d.added, 0);
+  const rowRemoved = row.codeDiffs.reduce((n, d) => n + d.removed, 0);
+  // Time-derived like the recorded-action reveal, so a hydrated row (no
+  // arrival stamp) falls straight through to the full string on first render.
+  const reasonShown =
+    row.reason === null
+      ? 0
+      : revealedCharsAt(row.reason.length, Date.now() - (row.reasonAt ?? 0));
+  const reasonRevealing =
+    row.reason !== null && reasonShown < row.reason.length;
+  useFrameTick(open && reasonRevealing);
+
+  // Only a browse row accumulates entries, and only a run row carries blocks,
+  // so these two counts can never both apply to one row.
+  const foldedSummary =
+    row.entries.length > 1
+      ? `\u00b7 ${row.entries.length} steps`
+      : row.blocks.length > 0
+        ? `\u00b7 ${row.blocks.length} ${row.blocks.length === 1 ? "block" : "blocks"}`
+        : null;
+
+  // While the work is still happening the trailing column is wall time since it
+  // began; the row's own entry stamps only span what has been recorded, so a
+  // row with one entry would read 0:00 for as long as the step took. Once the
+  // row settles it reports the recorded span, and the tick stops with it.
+  useTick(row.live);
+  const rowElapsed = row.live
+    ? liveElapsed(row.startedAt)
+    : formatElapsed(row.startedAt, row.endedAt);
+
+  const kindGlyph = row.kind === null ? null : ACTIVITY_KIND_GLYPH[row.kind];
+  const kindWord = row.kind === null ? undefined : ACTIVITY_KIND_WORD[row.kind];
+
+  const lineContent =
+    soloBlock || last === undefined ? null : entryLine(last, row.label);
+  // A mark reports an outcome, so only a step that returned can carry one — a
+  // call still in flight has no outcome yet. Beyond that, a browse or write
+  // step that worked says so in its own sentence, so only a run's result and
+  // any failure earn a mark of their own.
+  const settled = last !== undefined && last.kind === "tool_result";
+  const mark =
+    soloBlock || !settled
+      ? null
+      : last.success === false
+        ? "✕"
+        : row.kind === "run"
+          ? "✓"
+          : null;
+
+  const lineNode = soloBlock ? (
+    <FBlockRun
+      block={soloBlock}
+      turnEnded={turnEnded}
+      onSelect={onBlockSelect}
+      uxV1={uxV1}
+      outcomeReasonFallback={outcomeReasonFallback}
+      rowTitle={row.label}
+      flat
+      rowGlyph={kindGlyph}
+      rowKindWord={kindWord}
+      rowTrailing={rowElapsed}
+      expansion={{ open, onToggle }}
+    />
+  ) : (
+    <FLogLine
+      glyph={kindGlyph}
+      kindWord={kindWord}
+      trailing={
+        <>
+          {rowElapsed}
+          {hasDetail ? (open ? " ⌄" : " ›") : null}
+        </>
+      }
+      onClick={hasDetail ? onToggle : undefined}
+      expanded={hasDetail ? open : undefined}
+    >
+      {lineContent?.content}
+      {mark === null ? null : (
+        <span
+          className={
+            mark === "✓"
+              ? "text-emerald-700 dark:text-emerald-300"
+              : "text-rose-700 dark:text-rose-300"
+          }
+          aria-hidden="true"
+        >
+          {" "}
+          {mark}
+        </span>
+      )}
+      {!open && foldedSummary !== null ? (
+        <span className="text-muted-foreground dark:text-slate-500">
+          {" "}
+          {foldedSummary}
+        </span>
+      ) : null}
+      {row.codeDiffs.length === 0 ? null : (
+        <span className="font-mono tabular-nums">
+          <span className="text-muted-foreground dark:text-slate-500">
+            {" \u00b7 "}
+          </span>
+          <span className="text-emerald-700 dark:text-emerald-300">{`+${rowAdded}`}</span>
+          <span className="pl-1 text-rose-700 dark:text-rose-300">{`\u2212${rowRemoved}`}</span>
+        </span>
+      )}
+    </FLogLine>
   );
 
   return (
     <div className="flex flex-col">
-      {rows.map((row) => {
-        const isActive = row.status === "active";
-        const hasNest =
-          row.id === "draft"
-            ? row.entries.length > 0 ||
-              (turn.draft?.blockLabels.length ?? 0) > 0 ||
-              isActive
-            : row.id === "test"
-              ? row.entries.length > 0 || turn.blocks.length > 0
-              : row.entries.length > 0;
-        const open = isActive || openPhases.has(row.id);
-        const toggleable = hasNest && !isActive;
-        const rowContent = (
-          <>
-            <span
-              className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-bold ${phasePuckClasses(
-                row.status,
-              )}`}
-              aria-hidden="true"
+      {lineNode}
+      {open && bodyChildren > 0 ? (
+        <div className="ml-[28px] flex flex-col gap-1 border-l border-border/60 py-1 pl-3">
+          {row.codeDiffs.map((diff) => (
+            <FCodeWriteDiff
+              key={diff.label}
+              diff={diff}
+              open={diffOpen(diff.label)}
+              onToggle={() => onDiffToggle(diff.label)}
+              uxV1={uxV1}
+            />
+          ))}
+          {row.reason === null ? null : (
+            <FSubRow
+              glyph="✦"
+              glyphClass="text-sky-700 dark:text-sky-300"
+              italic
+              muted
             >
-              {phaseGlyph(row.status)}
-            </span>
-            <span
-              className={`flex-1 text-[12.5px] ${phaseLabelClasses(row.status)}`}
-            >
-              {row.label}
-              <span className="sr-only"> · {phaseStatusWord(row.status)}</span>
-            </span>
-            {row.stub ? (
               <span
-                className={`text-[11px] tabular-nums ${
-                  row.status === "fail"
-                    ? "text-rose-700 dark:text-rose-400"
-                    : "text-muted-foreground dark:text-slate-500"
-                }`}
+                data-testid="copilot-reason"
+                className={[
+                  "break-words [overflow-wrap:anywhere]",
+                  // The tail keeps the full string in flow so the row never
+                  // grows, but that also makes the clamp paint its ellipsis on
+                  // line four from the first frame — stranded in the
+                  // transparent region while the reveal is still on line one.
+                  reasonRevealing
+                    ? "overflow-hidden [max-height:calc(4*1.55em)]"
+                    : "line-clamp-4",
+                ].join(" ")}
               >
-                {row.stub}
+                {row.reason.slice(0, reasonShown)}
+                <span
+                  aria-hidden="true"
+                  className={reasonRevealing ? "animate-pulse" : "opacity-0"}
+                >
+                  {"\u258c"}
+                </span>
+                <span className="text-transparent">
+                  {row.reason.slice(reasonShown)}
+                </span>
               </span>
-            ) : null}
-            {hasNest ? (
-              <span
-                className={`shrink-0 text-[12px] text-muted-foreground transition-transform dark:text-slate-500 ${
-                  open ? "rotate-90" : ""
-                }`}
-                aria-hidden="true"
-              >
-                ›
-              </span>
-            ) : null}
-          </>
-        );
-        const toggle = () =>
-          setOpenPhases((prev) => {
-            const next = new Set(prev);
-            if (next.has(row.id)) {
-              next.delete(row.id);
-            } else {
-              next.add(row.id);
-            }
-            return next;
-          });
+            </FSubRow>
+          )}
+          {bodyEntries.map((entry) => (
+            <ActivityRow key={entry.id} entry={entry} />
+          ))}
+          {(soloBlock ? [] : row.blocks).map((b) => (
+            <FBlockRun
+              key={b.workflowRunBlockId || b.label}
+              block={b}
+              turnEnded={turnEnded}
+              onSelect={onBlockSelect}
+              uxV1={uxV1}
+              outcomeReasonFallback={outcomeReasonFallback}
+              flat
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
+interface FActivityLogProps {
+  turn: TurnNarrativeState;
+  turnEnded: boolean;
+  onBlockSelect?: (label: string) => void;
+  uxV1?: boolean;
+}
+
+function FActivityLog({
+  turn,
+  turnEnded,
+  onBlockSelect,
+  uxV1,
+}: FActivityLogProps) {
+  const outcomeReasonFallback = notConfirmedDisplayReason(turn);
+  const { rows, focusIndex } = useMemo(() => deriveActivityLog(turn), [turn]);
+  // Signed, not a bare id set: a click on the live row has to be able to mean
+  // "closed", or folding the active row would silently pin it open instead.
+  const [override, setOverride] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
+  const toggle = useCallback((id: string, open: boolean) => {
+    setOverride((prev) => new Map(prev).set(id, !open));
+  }, []);
+  // Every write's patch stays open for the rest of the turn rather than closing when a
+  // newer write lands: a patch that vanishes mid-read is worse than a longer log. At Done
+  // they all collapse to their counts, with the body behind `view diff`.
+  const writeDiffsOpen = !turnEnded;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {rows.map((row, i) => {
+        const showsWriteDiff = writeDiffsOpen && row.codeDiffs.length > 0;
+        const open =
+          override.get(row.id) ?? (i === focusIndex || showsWriteDiff);
+        const diffOpen = (label: string) =>
+          override.get(`diff:${row.id}:${label}`) ?? showsWriteDiff;
         return (
-          <div key={row.id} className="flex flex-col">
-            {toggleable ? (
-              <button
-                type="button"
-                aria-expanded={open}
-                onClick={toggle}
-                className="flex w-full cursor-pointer items-center gap-3 px-1 py-1 text-left"
-              >
-                {rowContent}
-              </button>
-            ) : (
-              // Active rows render inert (a button whose click is a no-op
-              // would be a keyboard/screen-reader trap) — status is
-              // conveyed via the sr-only word in rowContent instead.
-              <div className="flex w-full items-center gap-3 px-1 py-1 text-left">
-                {rowContent}
-              </div>
-            )}
-            {open ? (
-              <div className="ml-[25px] flex flex-col gap-1.5 rounded-lg border border-border/60 bg-slate-elevation1 px-3 py-2">
-                {row.id === "draft" ? (
-                  <>
-                    {row.entries.map((entry) => (
-                      <ActivityRow key={entry.id} entry={entry} />
-                    ))}
-                    {(turn.draft?.blockLabels ?? []).map((label) => (
-                      <FSubRow
-                        key={label}
-                        glyph="✦"
-                        glyphClass="text-emerald-700 dark:text-emerald-300"
-                      >
-                        <span className="text-muted-foreground">Drafted </span>
-                        <span
-                          className={
-                            uxV1
-                              ? "text-foreground"
-                              : "font-mono text-foreground"
-                          }
-                          title={uxV1 ? label : undefined}
-                        >
-                          {uxV1 ? humanizeBlockLabel(label) : label}
-                        </span>
-                      </FSubRow>
-                    ))}
-                    {isActive ? <DraftPlaceholderNote /> : null}
-                  </>
-                ) : row.id === "test" ? (
-                  <>
-                    {row.entries.map((entry) => (
-                      <ActivityRow key={entry.id} entry={entry} />
-                    ))}
-                    {condensedBlocks.map((b) => (
-                      <FBlockRun
-                        key={b.workflowRunBlockId || b.label}
-                        block={b}
-                        turnEnded={turnEnded}
-                        onSelect={onBlockSelect}
-                        uxV1={uxV1}
-                        outcomeReasonFallback={collapsedOutcomeReason}
-                      />
-                    ))}
-                  </>
-                ) : (
-                  row.entries.map((entry) => (
-                    <ActivityRow key={entry.id} entry={entry} />
-                  ))
-                )}
-              </div>
-            ) : null}
-          </div>
+          <FActivityLogRow
+            key={row.id}
+            row={row}
+            open={open}
+            onToggle={() => toggle(row.id, open)}
+            diffOpen={diffOpen}
+            onDiffToggle={(label) =>
+              toggle(`diff:${row.id}:${label}`, diffOpen(label))
+            }
+            turnEnded={turnEnded}
+            onBlockSelect={onBlockSelect}
+            uxV1={uxV1}
+            outcomeReasonFallback={outcomeReasonFallback}
+          />
         );
       })}
     </div>
@@ -1127,8 +1472,13 @@ function RollupCard({
   const completed = rollupBlocks.filter((b) => isBlockOk(b));
   const failed = rollupBlocks.filter((b) => b.state === "failed");
   const stopped = rollupBlocks.filter((b) => b.state === "stopped");
-  const showCommit = !summary.isQA && completed.length > 0;
   const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
+  // The log holds every block, but a non-solo run row renders its cards in the
+  // body, which is collapsed once the turn ends — so the log names a block on
+  // screen only in the one-block case. These lists stay until a run row carries
+  // its blocks' outcomes in the collapsed line.
+  const showCommit = !summary.isQA && completed.length > 0;
+  const showHalted = failed.length > 0;
   // Expand only earns a chevron when DetailView adds content beyond the head's
   // message — a pure ask (no scouting) re-renders the same text, so no chevron.
   const hasExpandableDetail =
@@ -1160,7 +1510,8 @@ function RollupCard({
 
       {showChecklist ? (
         <div className="border-t border-white/5 px-3.5 py-2">
-          <FPhaseChecklist
+          <FActivityLog
+            key={turn.turnId ?? ""}
             turn={turn}
             turnEnded
             onBlockSelect={onBlockSelect}
@@ -1209,7 +1560,7 @@ function RollupCard({
         </div>
       ) : null}
 
-      {failed.length > 0 ? (
+      {showHalted ? (
         <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
           <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-rose-700 dark:text-rose-400">
             Halted
@@ -1327,7 +1678,8 @@ function DetailView({
       {showChecklist ? (
         <>
           {turn.terminal === null ? <FWorkingHeader /> : null}
-          <FPhaseChecklist
+          <FActivityLog
+            key={turn.turnId ?? ""}
             turn={turn}
             turnEnded={turn.terminal !== null}
             onBlockSelect={onBlockSelect}

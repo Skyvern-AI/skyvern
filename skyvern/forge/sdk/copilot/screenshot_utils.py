@@ -19,6 +19,7 @@ from PIL import Image
 COPILOT_SCREENSHOT_MAX_WIDTH = 1024
 COPILOT_SCREENSHOT_MAX_HEIGHT = 768
 COPILOT_JPEG_QUALITY = 60
+_BROWSER_ABLATION_MAX_SCREENSHOT_FRAMES = 24
 
 LOG = structlog.get_logger()
 
@@ -210,6 +211,24 @@ def enqueue_screenshot(
         return False
     pending.clear()
     pending.append(entry)
+    if getattr(ctx, "eval_mode", None) == "browser_ablation":
+        frames = getattr(ctx, "eval_screenshot_frames", None)
+        if isinstance(frames, list) and not any(frame.get("capture_id") == entry.capture_id for frame in frames):
+            frame = {
+                "capture_id": entry.capture_id,
+                "mime": entry.mime,
+                "image_b64": entry.b64,
+                "captured_url": entry.provenance.captured_url,
+                "browser_session_id": entry.provenance.browser_session_id,
+                "source_tool": entry.provenance.source_tool,
+            }
+            if len(frames) < _BROWSER_ABLATION_MAX_SCREENSHOT_FRAMES:
+                frames.append(frame)
+            else:
+                # Keep starting-state evidence and roll the latter half so terminal evidence stays
+                # current without allowing a single response frame to grow without bound.
+                frames.pop(_BROWSER_ABLATION_MAX_SCREENSHOT_FRAMES // 2)
+                frames.append(frame)
     return True
 
 

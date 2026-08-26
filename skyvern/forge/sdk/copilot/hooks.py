@@ -13,6 +13,7 @@ from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
 
+from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
 from skyvern.forge.sdk.copilot.enforcement import (
     gate_decision_trace_fields,
     outcome_fully_verified,
@@ -85,6 +86,8 @@ class CopilotRunHooks(RunHooksBase):
     ) -> None:
         try:
             self._ctx.model_calls_this_turn += 1
+            if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
+                self._ctx.eval_prompt_sha256 = prompt_sha256(system_prompt)
         except Exception:
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",

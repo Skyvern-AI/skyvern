@@ -692,6 +692,28 @@ class TestSummarizeToolResult:
         )
         assert "20" in summary
 
+    def test_type_text_uses_executed_selector_after_post_hook_projection(self) -> None:
+        summary = self._summarize(
+            "type_text",
+            {
+                "ok": True,
+                "data": {"executed_selector": "#email", "typed_length": 10},
+            },
+        )
+
+        assert summary == "Typed 10 chars into '#email'"
+
+    def test_click_uses_executed_selector_after_post_hook_projection(self) -> None:
+        summary = self._summarize(
+            "click",
+            {
+                "ok": True,
+                "data": {"executed_selector": "#submit"},
+            },
+        )
+
+        assert summary == "Clicked '#submit'"
+
     def test_unknown_tool_returns_ok(self) -> None:
         summary = self._summarize("unknown_tool", {"ok": True})
         assert summary == "OK"

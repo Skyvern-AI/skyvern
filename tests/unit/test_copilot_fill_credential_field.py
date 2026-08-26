@@ -456,8 +456,6 @@ def _wire_impl(
 
     monkeypatch.setattr(credential_fill_module, "_register_scout_interaction_observation", fake_register)
 
-
-class TestFillCredentialFieldImpl:
     @pytest.mark.asyncio
     async def test_target_identity_is_captured_before_fill_and_effect_afterward(
         self, monkeypatch: pytest.MonkeyPatch
@@ -496,8 +494,8 @@ class TestFillCredentialFieldImpl:
         assert ctx.scout_trajectory[-1]["selector_match_count"] == 1
         assert ctx.scout_trajectory[-1]["observed_effects"]["value_landed"] is True
         assert ctx.scout_trajectory[-1]["selector_candidates"] == [
-            {"selector": "#passwordInput", "source": "requested"},
-            {"selector": 'input[name="password"]', "source": "name"},
+            {"selector": "#passwordInput", "source": "requested", "match_count": None},
+            {"selector": 'input[name="password"]', "source": "name", "match_count": None},
         ]
 
     def test_tool_layer_readback_cannot_verify_a_short_secret(self) -> None:

@@ -37,6 +37,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/useCloseBrowserSessionMutation";
 import { SaveSessionAsBrowserProfileDialog } from "@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog";
 import { useBackgroundBrowserProfileCreate } from "@/routes/browserProfiles/hooks/useBackgroundBrowserProfileCreate";
+import { useBrowserProfileCreateStore } from "@/store/useBrowserProfileCreateStore";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
 import {
@@ -55,7 +56,10 @@ import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
 import { BrowserSessionTimeline } from "./BrowserSessionTimeline";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
-import { getBrowserSessionTabFromPathname } from "./BrowserSession.utils";
+import {
+  getBrowserSessionTabFromPathname,
+  getSessionControlsState,
+} from "./BrowserSession.utils";
 
 // PersistentBrowserSessionStatus values (skyvern/forge/sdk/schemas/persistent_browser_sessions.py)
 const BROWSER_SESSION_STATUS_BADGE_VARIANT: Record<
@@ -132,6 +136,9 @@ function BrowserSession() {
 
   const credentialGetter = useCredentialGetter();
   const { startBackgroundCreate } = useBackgroundBrowserProfileCreate();
+  const activeProfileCreate = useBrowserProfileCreateStore(
+    (state) => state.active,
+  );
 
   const query = useQuery({
     queryKey: ["browserSession", browserSessionId],
@@ -147,6 +154,12 @@ function BrowserSession() {
   });
 
   const browserSession = query.data;
+  const { showControls, isSavingProfile, showCloseSession } =
+    getSessionControlsState({
+      browserSessionId,
+      status: browserSession?.status,
+      savingProfileSessionId: activeProfileCreate?.browserSessionId,
+    });
   const isCdpMode =
     resolveStreamTransport(
       browserStreamingMode,
@@ -252,62 +265,86 @@ function BrowserSession() {
         <div className="flex w-full flex-shrink-0 items-center gap-2 rounded-t-lg border border-b-0 bg-slate-900 px-2 pt-1">
           <BrowserTabStrip options={TAB_OPTIONS} />
 
-          {browserSessionId && browserSession?.status === "running" && (
+          {showControls && (
             <div className="ml-auto flex flex-shrink-0 items-center gap-1 pb-1">
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 px-2 text-xs text-slate-300 hover:text-foreground"
-                onClick={() => setIsSaveProfileDialogOpen(true)}
+                className={cn(
+                  "h-7 px-2 text-xs text-slate-300",
+                  isSavingProfile
+                    ? "cursor-not-allowed"
+                    : "hover:text-foreground",
+                )}
+                onClick={() => {
+                  if (isSavingProfile) {
+                    return;
+                  }
+                  setIsSaveProfileDialogOpen(true);
+                }}
+                // `disabled` would pull in the button base's
+                // disabled:pointer-events-none (killing the title tooltip) and
+                // disabled:opacity-50 (dimming the only in-progress feedback to
+                // 3.9:1, under the 4.5:1 AA floor).
+                aria-disabled={isSavingProfile}
+                title={
+                  isSavingProfile ? "Saving profile — please wait" : undefined
+                }
               >
-                <BrowserIcon className="mr-1.5 h-3.5 w-3.5" />
-                Save Profile
+                {isSavingProfile ? (
+                  <ReloadIcon className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <BrowserIcon className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                {isSavingProfile ? "Saving…" : "Save Profile"}
               </Button>
-              <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <DialogTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label="Close browser session"
-                          className="h-7 w-7 text-slate-300 hover:bg-red-500/15 hover:text-red-300"
-                        >
-                          <Cross2Icon className="h-3.5 w-3.5" />
-                        </Button>
-                      </DialogTrigger>
-                    </TooltipTrigger>
-                    <TooltipContent>Close</TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                <DialogContent>
-                  <DialogHeader>
-                    <DialogTitle>Are you sure?</DialogTitle>
-                    <DialogDescription>
-                      Are you sure you want to stop (shut down) this browser
-                      session?
-                    </DialogDescription>
-                  </DialogHeader>
-                  <DialogFooter>
-                    <DialogClose asChild>
-                      <Button variant="secondary">Back</Button>
-                    </DialogClose>
-                    <Button
-                      variant="destructive"
-                      onClick={() => {
-                        closeBrowserSessionMutation.mutate();
-                      }}
-                      disabled={closeBrowserSessionMutation.isPending}
-                    >
-                      {closeBrowserSessionMutation.isPending && (
-                        <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                      )}
-                      Stop Browser Session
-                    </Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+              {showCloseSession && (
+                <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <DialogTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label="Close browser session"
+                            className="h-7 w-7 text-slate-300 hover:bg-red-500/15 hover:text-red-300"
+                          >
+                            <Cross2Icon className="h-3.5 w-3.5" />
+                          </Button>
+                        </DialogTrigger>
+                      </TooltipTrigger>
+                      <TooltipContent>Close</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>Are you sure?</DialogTitle>
+                      <DialogDescription>
+                        Are you sure you want to stop (shut down) this browser
+                        session?
+                      </DialogDescription>
+                    </DialogHeader>
+                    <DialogFooter>
+                      <DialogClose asChild>
+                        <Button variant="secondary">Back</Button>
+                      </DialogClose>
+                      <Button
+                        variant="destructive"
+                        onClick={() => {
+                          closeBrowserSessionMutation.mutate();
+                        }}
+                        disabled={closeBrowserSessionMutation.isPending}
+                      >
+                        {closeBrowserSessionMutation.isPending && (
+                          <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                        )}
+                        Stop Browser Session
+                      </Button>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+              )}
             </div>
           )}
         </div>

@@ -45,6 +45,7 @@ function FileUploadEditorBody({
     awsAccessKeyId,
     awsSecretAccessKey,
     regionName,
+    endpointUrl,
     azureStorageAccountName,
     azureStorageAccountKey,
     azureBlobContainerName,
@@ -169,6 +170,23 @@ function FileUploadEditorBody({
               nodeId={blockId}
               onChange={(value) => update({ regionName: value })}
               value={regionName as string}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-muted-foreground">
+                (Optional) Endpoint URL
+              </Label>
+              <HelpTooltip
+                content={helpTooltips["fileUpload"]["endpoint_url"]}
+              />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ endpointUrl: value })}
+              value={endpointUrl as string}
+              placeholder="https://storage.example.com"
               className="nopan text-xs"
             />
           </div>

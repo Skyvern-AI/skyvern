@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 
 import pytest
 
-from skyvern.exceptions import AzureConfigurationError, DownloadSaveIncompleteError
+from skyvern.config import settings
+from skyvern.exceptions import AzureConfigurationError, BlockedHost, DownloadSaveIncompleteError, UnresolvableHost
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
@@ -90,6 +91,9 @@ async def _execute_file_download(
     drive_download_side_effect: Callable[..., object] | BaseException | None = None,
     downloaded_file_infos: list[FileInfo] | None = None,
     storage_save_side_effect: BaseException | None = None,
+    blocked_endpoint_hosts: tuple[str, ...] = (),
+    unresolvable_endpoint_hosts: tuple[str, ...] = (),
+    endpoint_host_ips: tuple[str, ...] = ("203.0.113.10",),
 ) -> SimpleNamespace:
     workflow_run_context = MagicMock()
     workflow_run_context.organization_id = "organization-id"
@@ -129,6 +133,14 @@ async def _execute_file_download(
 
     record_output = AsyncMock(side_effect=record_output_parameter_value)
 
+    def fake_resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
+        # Keeps endpoint validation off real DNS; the guard is what's under test, not resolution.
+        if host in blocked_endpoint_hosts:
+            raise BlockedHost(host=host)
+        if host in unresolvable_endpoint_hosts:
+            raise UnresolvableHost(host=host)
+        return endpoint_host_ips
+
     async def execute_browser(*args: object, **kwargs: object) -> BlockResult:
         if during_execute is None:
             _write_downloads(download_dir, *downloads_during_execute)
@@ -152,6 +164,10 @@ async def _execute_file_download(
             return_value=download_dir,
         ),
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.resolve_fetch_host_ips",
+            side_effect=fake_resolve_fetch_host_ips,
+        ) as resolve_endpoint_host,
         patch.object(google_drive_service, "download_file", drive_download),
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
     ):
@@ -177,6 +193,7 @@ async def _execute_file_download(
         record_output=record_output,
         recorded_output=recorded_output,
         drive_download=drive_download,
+        resolve_endpoint_host=resolve_endpoint_host,
         storage_save=mock_app.STORAGE.save_downloaded_files,
         get_google_workspace_credentials=mock_app.AGENT_FUNCTION.get_google_workspace_credentials,
     )
@@ -1202,6 +1219,215 @@ async def test_s3_destination_unwraps_secret_values(tmp_path: Path) -> None:
     assert destination.storage_type == FileStorageType.S3
     assert destination.aws_access_key_id == "actual-key"
     assert destination.aws_secret_access_key == "actual-secret"
+
+
+@pytest.mark.asyncio
+async def test_s3_destination_carries_endpoint_url(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url="https://storage.example.com",
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.storage_type == FileStorageType.S3
+    assert destination.endpoint_url == "https://storage.example.com"
+
+
+@pytest.mark.asyncio
+async def test_s3_destination_without_endpoint_url_defaults_to_none(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.endpoint_url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_url", ["", "   "], ids=["empty", "whitespace"])
+async def test_s3_blank_endpoint_url_behaves_exactly_like_unset(tmp_path: Path, endpoint_url: str) -> None:
+    """A block persisted with endpoint_url="" must still upload to real AWS S3.
+
+    The editor used to serialize an unset endpoint as "", and botocore raises
+    ``ValueError: Invalid endpoint:`` on an empty endpoint rather than defaulting to AWS.
+    """
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url=endpoint_url,
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.endpoint_url is None
+    assert destination.endpoint_resolved_ips is None
+    execution.resolve_endpoint_host.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint_url",
+    ["storage.example.com", "http://storage.example.com", "ftp://storage.example.com"],
+    ids=["no-scheme", "http", "ftp"],
+)
+async def test_s3_dispatch_rejects_non_https_endpoint_before_upload(tmp_path: Path, endpoint_url: str) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url=endpoint_url,
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    assert execution.result.success is False
+    assert "endpoint_url" in execution.result.failure_reason
+    execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint_url", "blocked_host"),
+    [
+        ("https://169.254.169.254/", "169.254.169.254"),
+        ("https://localhost:9000/", "localhost"),
+        ("https://storage.example.com/", "storage.example.com"),
+    ],
+    ids=["metadata-ip", "localhost", "public-name-resolving-private"],
+)
+async def test_s3_dispatch_rejects_internal_endpoint_host_before_upload(
+    tmp_path: Path, endpoint_url: str, blocked_host: str
+) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url=endpoint_url,
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+        blocked_endpoint_hosts=(blocked_host,),
+    )
+
+    assert execution.result.success is False
+    assert "private or internal address" in execution.result.failure_reason
+    execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_s3_endpoint_resolution_is_pinned_against_rebinding(tmp_path: Path) -> None:
+    """The validated addresses travel to the S3 client, so it never re-resolves the name."""
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url="https://storage.example.com/",
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+        endpoint_host_ips=("198.51.100.7", "203.0.113.10"),
+    )
+
+    assert execution.result.success is True
+    execution.resolve_endpoint_host.assert_called_once_with("storage.example.com")
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.endpoint_url == "https://storage.example.com/"
+    assert destination.endpoint_resolved_ips == ("198.51.100.7", "203.0.113.10")
+
+
+@pytest.mark.asyncio
+async def test_s3_dispatch_rejects_unresolvable_endpoint_host_before_upload(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url="https://nowhere.example.com/",
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        downloads_during_execute=("statement.pdf",),
+        unresolvable_endpoint_hosts=("nowhere.example.com",),
+    )
+
+    assert execution.result.success is False
+    assert "could not be resolved" in execution.result.failure_reason
+    execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_s3_internal_endpoint_allowed_without_pinning_when_setting_enabled(tmp_path: Path) -> None:
+    """Self-hosted deployments opt into an internal object store, plaintext included."""
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.S3,
+        s3_bucket="bucket",
+        aws_access_key_id="access-key",
+        aws_secret_access_key="secret-key",
+        endpoint_url="http://minio.internal:9000/",
+    )
+    with patch.object(settings, "ALLOW_S3_ENDPOINT_INTERNAL_HOSTS", True):
+        execution = await _execute_file_download(
+            block,
+            _browser_result(block, downloaded_filenames=("statement.pdf",)),
+            download_dir,
+            downloads_during_execute=("statement.pdf",),
+            blocked_endpoint_hosts=("minio.internal",),
+        )
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.endpoint_url == "http://minio.internal:9000/"
+    assert destination.endpoint_resolved_ips is None
+    execution.resolve_endpoint_host.assert_not_called()
 
 
 @pytest.mark.asyncio

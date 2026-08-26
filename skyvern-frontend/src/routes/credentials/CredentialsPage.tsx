@@ -52,7 +52,7 @@ type TabValue = (typeof TAB_VALUES)[number];
 const DEFAULT_TAB: TabValue = "passwords";
 
 function CredentialsPage() {
-  const { setIsOpen, setType } = useCredentialModalState();
+  const { openModal } = useCredentialModalState();
   const { startBackgroundTest } = useBackgroundCredentialTest();
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 250);
@@ -247,8 +247,7 @@ function CredentialsPage() {
           <DropdownMenuContent className="w-48">
             <DropdownMenuItem
               onSelect={() => {
-                setIsOpen(true);
-                setType(CredentialModalTypes.PASSWORD);
+                openModal(CredentialModalTypes.PASSWORD);
               }}
               className="cursor-pointer"
             >
@@ -257,8 +256,7 @@ function CredentialsPage() {
             </DropdownMenuItem>
             <DropdownMenuItem
               onSelect={() => {
-                setIsOpen(true);
-                setType(CredentialModalTypes.CREDIT_CARD);
+                openModal(CredentialModalTypes.CREDIT_CARD);
               }}
               className="cursor-pointer"
             >
@@ -267,8 +265,7 @@ function CredentialsPage() {
             </DropdownMenuItem>
             <DropdownMenuItem
               onSelect={() => {
-                setIsOpen(true);
-                setType(CredentialModalTypes.SECRET);
+                openModal(CredentialModalTypes.SECRET);
               }}
               className="cursor-pointer"
             >

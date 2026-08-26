@@ -127,10 +127,10 @@ _BOUNDED_HTML = "<form><input name='q'><button type='submit'>Go</button></form>"
 
 
 @pytest.mark.asyncio
-async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On a heavy page the raw get_html is dropped over the MCP size cap; the settle retry
-    must re-read via the stripped path only, not re-serialize the full DOM."""
+async def test_recapture_reuses_rendered_style_snapshot_without_raw_get_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Composition recapture must preserve rendered-style facts without serializing the raw DOM."""
     raw_calls = {"n": 0}
+    stripped_calls = {"n": 0}
     stripped_payloads = iter([_HOLLOW_HTML, _BOUNDED_HTML])
 
     async def fake_raw(ctx: object) -> dict:
@@ -138,6 +138,7 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
         return {"ok": True, "data": {}}  # cap-dropped: no html payload -> forces stripped fallback
 
     async def fake_stripped(ctx: object) -> tuple[str, bool]:
+        stripped_calls["n"] += 1
         return next(stripped_payloads), False
 
     async def unavailable_structured(ctx: object, **_kwargs: object) -> tuple[None, None]:
@@ -166,8 +167,10 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
     assert html_error is None
     assert evidence is not None
     assert tools.has_bounded_page_schema(evidence)
-    # First iteration's raw read is cap-dropped; the settle retry skips it entirely.
-    assert raw_calls["n"] == 1
+    # Both observations use the bounded rendered snapshot needed for computed-style
+    # obstruction facts; neither serializes a raw DOM that may exceed the MCP cap.
+    assert stripped_calls["n"] == 2
+    assert raw_calls["n"] == 0
     settle_sleep.assert_awaited_once_with(tools.composition_capture._COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
 
 

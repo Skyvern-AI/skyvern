@@ -10,6 +10,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useMemo } from "react";
 import { useOnePasswordItemsQuery } from "../hooks/useOnePasswordItemsQuery";
+import { isOnePasswordItemOfType } from "@/routes/credentials/onePasswordItems";
 
 type Props = {
   vaultId: string;
@@ -32,21 +33,9 @@ function OnePasswordItemSelector({
 
   const filteredItems = useMemo(() => {
     const items = data?.items ?? [];
-    const filtered = items.filter((item) => {
-      const category = item.category.toLowerCase();
-
-      if (credentialDataType === "password") {
-        return category.includes("login") || category.includes("password");
-      }
-
-      if (credentialDataType === "creditCard") {
-        return category.includes("card");
-      }
-
-      return true;
-    });
-
-    return filtered;
+    return items.filter((item) =>
+      isOnePasswordItemOfType(item, credentialDataType),
+    );
   }, [credentialDataType, data?.items]);
 
   // Always include the currently-selected item so a saved selection renders even when the

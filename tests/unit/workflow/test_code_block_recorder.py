@@ -230,7 +230,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     pending: list[PendingAction] = []
     emitted = asyncio.Event()
 
-    async def capture_pending(fact: PendingAction) -> None:
+    def capture_pending(fact: PendingAction) -> None:
         pending.append(fact)
         emitted.set()
 
@@ -254,10 +254,9 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     assert await call == "response"
     assert len(pending) == 1
     assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
 
     fast_pending: list[PendingAction] = []
-    fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)  # type: ignore[arg-type]
+    fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)
     await fast_page.goto("https://example.com/fast")
     await asyncio.sleep(0.02)
     assert fast_pending == []
@@ -265,7 +264,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     failed_pending: list[PendingAction] = []
     failed_inner = ControlledGotoPage(outcome=RuntimeError("navigation failed"))
     failed_inner.release.set()
-    failed_page = RecordingPage(failed_inner, on_pending_action=failed_pending.append)  # type: ignore[arg-type]
+    failed_page = RecordingPage(failed_inner, on_pending_action=failed_pending.append)
     with pytest.raises(RuntimeError, match="navigation failed"):
         await failed_page.goto("https://example.com/fail")
     await asyncio.sleep(0.02)
@@ -273,7 +272,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
 
     cancelled_pending: list[PendingAction] = []
     cancelled_inner = ControlledGotoPage()
-    cancelled_page = RecordingPage(cancelled_inner, on_pending_action=cancelled_pending.append)  # type: ignore[arg-type]
+    cancelled_page = RecordingPage(cancelled_inner, on_pending_action=cancelled_pending.append)
     cancelled_call = asyncio.create_task(cancelled_page.goto("https://example.com/cancel"))
     await cancelled_inner.started.wait()
     cancelled_call.cancel()
@@ -284,7 +283,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
 
     callback_started = asyncio.Event()
 
-    async def failing_callback(fact: PendingAction) -> None:
+    def failing_callback(fact: PendingAction) -> None:
         callback_started.set()
         raise RuntimeError("pending callback failed")
 
@@ -295,7 +294,6 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     callback_failure_inner.release.set()
     assert await callback_failure_call == "unchanged"
     assert [action.status for action in callback_failure_page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
 
 
 @pytest.mark.asyncio
@@ -305,7 +303,7 @@ async def test_keyboard_calls_arm_the_pending_fact(monkeypatch: pytest.MonkeyPat
     emitted = asyncio.Event()
     pending: list[PendingAction] = []
 
-    async def capture(fact: PendingAction) -> None:
+    def capture(fact: PendingAction) -> None:
         pending.append(fact)
         emitted.set()
 
@@ -339,62 +337,6 @@ async def test_keyboard_calls_arm_the_pending_fact(monkeypatch: pytest.MonkeyPat
         credential_release_guard=stalled_guard,
     )
     assert (await pending_for(lambda: guarded_page.keyboard.type("value"))).call_name == "keyboard.type"
-
-
-@pytest.mark.asyncio
-async def test_cancellation_while_draining_pending_navigation_is_preserved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pending_started = asyncio.Event()
-    pending_cancelled = asyncio.Event()
-    release_pending = asyncio.Event()
-
-    async def slow_pending_action(self: _Recorder, fact: PendingAction) -> None:
-        pending_started.set()
-        try:
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            pending_cancelled.set()
-            await release_pending.wait()
-            raise
-
-    class YieldingGotoPage(FakePage):
-        async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
-            await asyncio.sleep(0)
-            return "response"
-
-    monkeypatch.setattr(_Recorder, "_emit_pending_action", slow_pending_action)
-    page = RecordingPage(YieldingGotoPage(), on_pending_action=lambda fact: None)  # type: ignore[arg-type]
-    call = asyncio.create_task(page.goto("https://example.com/cancel-during-cleanup"))
-
-    await asyncio.wait_for(pending_started.wait(), timeout=0.5)
-    await asyncio.wait_for(pending_cancelled.wait(), timeout=0.5)
-    call.cancel()
-    release_pending.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await call
-    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
-
-
-@pytest.mark.asyncio
-async def test_prior_cancellation_does_not_cancel_pending_navigation_cleanup() -> None:
-    page = RecordingPage(FakePage(), on_pending_action=lambda fact: None)  # type: ignore[arg-type]
-
-    async def navigate_after_caught_cancellation() -> object:
-        current_task = asyncio.current_task()
-        assert current_task is not None
-        current_task.cancel()
-        try:
-            await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            pass
-        assert current_task.cancelling() == 1
-        return await page.goto("https://example.com/after-caught-cancellation")
-
-    assert await asyncio.create_task(navigate_after_caught_cancellation()) is None
-    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
 
 
 @pytest.mark.asyncio

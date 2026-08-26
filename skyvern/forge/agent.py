@@ -1318,7 +1318,7 @@ class ForgeAgent:
             extraction_shape_matches,
             validate_and_fill_extraction_result,
         )
-        from skyvern.forge.taskv3.auth_tools import build_auth_tools
+        from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
@@ -1328,6 +1328,7 @@ class ForgeAgent:
             taskv3_runaway_backstops,
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
+        from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import pending_marker
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
@@ -1403,7 +1404,9 @@ class ForgeAgent:
                     step=step,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                     terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-                    navigation_payload_str=json.dumps(parameters) if parameters else "{}",
+                    # A separate masking pass from engine.py's; only the boolean route decision survives it,
+                    # so nothing needs these opaque_url_ tokens to match the ones the engine later mints.
+                    navigation_payload_str=json.dumps(mask_opaque_urls(parameters).masked) if parameters else "{}",
                     error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
                     local_datetime=datetime.now(context.tz_info if context else None).isoformat(),
                 )
@@ -1790,7 +1793,10 @@ class ForgeAgent:
             # must see the pinned key, or a multi-credential context hides get_verification_code.
             # No page provider in page-free mode: the sign-in-link tool navigates, and a run that
             # structurally never touches the live DOM must not be offered it.
-            auth_tools, auth_guidance = build_auth_tools(task, None if page_free_validation else _page_provider)
+            verification_state = VerificationState()
+            auth_tools, auth_guidance = build_auth_tools(
+                task, None if page_free_validation else _page_provider, state=verification_state
+            )
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
             # Withheld in page-free mode: like browser_tools, a page-operating tool must not be offered
@@ -1836,6 +1842,7 @@ class ForgeAgent:
                 completion_blocker=completion_blocker,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
+                verification_blocker=verification_state.block_completion,
             )
         finally:
             if context and credential_parameter_key is not None:
@@ -3199,6 +3206,9 @@ class ForgeAgent:
                 page=current_page,
                 action=action,
                 file_download_false_click_eligible=file_download_false_click_eligible,
+                # Only actions after the first can be stale: an earlier action in this same batch
+                # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
+                allow_stale_refresh=action_idx > 0,
             )
             await app.AGENT_FUNCTION.post_action_execution(action)
             detailed_agent_step_output.actions_and_results[action_idx] = (

@@ -17,6 +17,7 @@ import {
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
+  CodeWriteDiff,
   WorkflowCopilotToolResultUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
@@ -227,8 +228,15 @@ export interface ActivityEntry {
   toolName?: string;
   // Product-safe label for rendering tool activity to users.
   displayLabel?: string;
+  // activeLabel reads while the step runs; outcomeLabel replaces it once
+  // finished. Absent when the narrator did not speak for this step.
+  activeLabel?: string;
+  outcomeLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
+  // Server-computed line delta per code block this write changed. Absent on
+  // every other row and on payloads from a backend that predates it.
+  codeDiffs?: CodeWriteDiff[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -237,6 +245,9 @@ export interface ActivityEntry {
   // Server clock read for this event, persisted so a hydrated turn reports the
   // same elapsed as the live one. Undefined against a backend that does not stamp.
   timestamp?: string;
+  // Epoch ms this entry arrived on the live stream. Absent on hydrate, which
+  // is what makes a reloaded narration render complete instead of replaying.
+  receivedAtMs?: number;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -410,6 +421,30 @@ export function parseCredentialPause(
   };
 }
 
+export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const diffs: CodeWriteDiff[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (
+      typeof row.label !== "string" ||
+      typeof row.added !== "number" ||
+      typeof row.removed !== "number"
+    ) {
+      continue;
+    }
+    diffs.push({
+      label: row.label,
+      added: row.added,
+      removed: row.removed,
+      patch: typeof row.patch === "string" ? row.patch : undefined,
+      patchDropped: row.patchDropped === true,
+    });
+  }
+  return diffs.length > 0 ? diffs : undefined;
+}
+
 export function parseConnectedAccountChoices(
   value: unknown,
 ): ConnectedAccountChoice[] {
@@ -580,6 +615,7 @@ function buildActivityFromToolResult(
     toolName: event.tool_name,
     displayLabel,
     success: event.success,
+    codeDiffs: parseCodeDiffs(event.code_diffs),
     id: `tr-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
   };
@@ -587,22 +623,40 @@ function buildActivityFromToolResult(
 
 function buildActivityFromNarration(
   event: WorkflowCopilotNarrationUpdate,
+  receivedAtMs: number,
 ): ActivityEntry {
   return {
     kind: "narration",
     text: event.narration,
     iteration: event.iteration,
+    activeLabel: event.active_label ?? undefined,
+    outcomeLabel: event.outcome_label ?? undefined,
     id: `n-${event.iteration}-${event.timestamp}`,
     timestamp: event.timestamp,
+    receivedAtMs,
   };
 }
 
-// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention —
-// also used by copilotPhases.ts's hasPendingToolCall.
+// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention.
 export function toolCallIdOf(entry: ActivityEntry): string | undefined {
   return entry.kind === "tool_call" || entry.kind === "tool_result"
     ? entry.id.slice(3)
     : undefined;
+}
+
+// A tool_call still has no matching tool_result — the narrator can emit a
+// TOOL_STARTED progress narration mid-flight (streaming_adapter.py), so
+// checking only the LAST entry's kind isn't enough; match ids instead.
+export function hasPendingToolCall(designActivity: ActivityEntry[]): boolean {
+  const pending = new Set<string>();
+  for (const entry of designActivity) {
+    if (entry.kind === "tool_call") {
+      pending.add(toolCallIdOf(entry) ?? "");
+    } else if (entry.kind === "tool_result") {
+      pending.delete(toolCallIdOf(entry) ?? "");
+    }
+  }
+  return pending.size > 0;
 }
 
 // Folds each tool_call/tool_result pair into one row (pending while
@@ -734,6 +788,18 @@ function appendActivity(
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  // Mirrors NarratorState._activity_bucket_label: narration renders inside the
+  // design step it explains, so it stays in design activity even mid-run.
+  if (entry.kind === "narration") {
+    return {
+      blocks,
+      designActivity: appendCapped(
+        designActivity,
+        entry,
+        MAX_DESIGN_ACTIVITY_ENTRIES,
+      ),
+    };
+  }
   // A run tool's result must rejoin its call's bucket. The run flips the active
   // block between the call and the result, so routing the result to the live
   // active block would split the call/result pair across buckets and it could
@@ -883,6 +949,21 @@ export function applyNarrativeEvent(
       // Preserve any prior block whose label was dropped from the draft (rare
       // — happens if the agent renames a block mid-turn). Drop those that no
       // longer exist; they no longer participate in the proposal.
+      // The write's patch arrives here rather than on the tool_result, because a write and its
+      // test share one tool call and that result lands only after the run. Attach it to the
+      // call's own entry so the row shows the code as soon as it is written.
+      const draftDiffs = parseCodeDiffs(event.code_diffs);
+      const diffTarget =
+        event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
+      const withDiffs =
+        draftDiffs === undefined || diffTarget === null
+          ? prev.designActivity
+          : prev.designActivity.map((entry) =>
+              entry.id === diffTarget
+                ? { ...entry, codeDiffs: draftDiffs }
+                : entry,
+            );
+
       return {
         ...prev,
         draft: {
@@ -891,6 +972,7 @@ export function applyNarrativeEvent(
           summary: event.summary,
         },
         blocks: nextBlocks,
+        designActivity: withDiffs,
       };
     }
 
@@ -1062,7 +1144,7 @@ export function applyNarrativeEvent(
     }
 
     case "narration": {
-      const entry = buildActivityFromNarration(event);
+      const entry = buildActivityFromNarration(event, nowMs);
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1235,7 +1317,12 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       toolName: typeof o.toolName === "string" ? o.toolName : undefined,
       displayLabel:
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
+      activeLabel:
+        typeof o.activeLabel === "string" ? o.activeLabel : undefined,
+      outcomeLabel:
+        typeof o.outcomeLabel === "string" ? o.outcomeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
+      codeDiffs: parseCodeDiffs(o.codeDiffs),
       id: o.id,
       timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
     });

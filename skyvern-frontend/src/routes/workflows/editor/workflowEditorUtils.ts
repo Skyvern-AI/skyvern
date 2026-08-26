@@ -929,6 +929,7 @@ function convertToNode(
           awsAccessKeyId: block.aws_access_key_id ?? "",
           awsSecretAccessKey: block.aws_secret_access_key ?? "",
           regionName: block.region_name ?? "",
+          endpointUrl: block.endpoint_url ?? "",
           azureStorageAccountName: block.azure_storage_account_name ?? "",
           azureStorageAccountKey: block.azure_storage_account_key ?? "",
           azureBlobContainerName: block.azure_blob_container_name ?? "",
@@ -1124,6 +1125,7 @@ function convertToNode(
           awsAccessKeyId: block.aws_access_key_id ?? "",
           awsSecretAccessKey: block.aws_secret_access_key ?? "",
           regionName: block.region_name ?? "",
+          endpointUrl: block.endpoint_url ?? "",
           azureStorageAccountName: block.azure_storage_account_name ?? "",
           azureStorageAccountKey: block.azure_storage_account_key ?? "",
           azureBlobContainerName: block.azure_blob_container_name ?? "",
@@ -3204,6 +3206,9 @@ function getWorkflowBlock(
               aws_access_key_id: node.data.awsAccessKeyId ?? "",
               aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
               region_name: node.data.regionName ?? "",
+              // An unset endpoint must serialize as null, not "": botocore rejects an empty
+              // endpoint_url outright instead of defaulting to AWS the way region_name does.
+              endpoint_url: node.data.endpointUrl || null,
             }),
             ...(node.data.downloadTarget === "azure" && {
               azure_storage_account_name:
@@ -3298,6 +3303,9 @@ function getWorkflowBlock(
         aws_access_key_id: node.data.awsAccessKeyId ?? "",
         aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
         region_name: node.data.regionName ?? "",
+        // An unset endpoint must serialize as null, not "": botocore rejects an empty
+        // endpoint_url outright instead of defaulting to AWS the way region_name does.
+        endpoint_url: node.data.endpointUrl || null,
         azure_storage_account_name: node.data.azureStorageAccountName ?? "",
         azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",

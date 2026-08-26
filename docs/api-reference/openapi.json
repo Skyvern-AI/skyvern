@@ -13869,6 +13869,17 @@
             ],
             "title": "Region Name"
           },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
+          },
           "azure_storage_account_name": {
             "anyOf": [
               {
@@ -14397,6 +14408,17 @@
               }
             ],
             "title": "Region Name"
+          },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
           },
           "azure_storage_account_name": {
             "anyOf": [
@@ -15158,6 +15180,17 @@
             ],
             "title": "Region Name"
           },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
+          },
           "azure_storage_account_name": {
             "anyOf": [
               {
@@ -15441,6 +15474,17 @@
               }
             ],
             "title": "Region Name"
+          },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
           },
           "azure_storage_account_name": {
             "anyOf": [

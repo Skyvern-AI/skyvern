@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import gc
 import json
 import re
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.browser_action_preflight import policy_observation_enable
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
@@ -294,6 +296,250 @@ def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Cannot find context with specified id" in error_msg:
         return True
     return "ReferenceError" in error_msg and "is not defined" in error_msg
+
+
+# Order-locked labels for the selectors in LOADING_INDICATOR_PROBE_JS. The JS ships back a fixed
+# integer index (never a page-derived string), which is mapped to one of these labels Python-side;
+# an out-of-range index collapses to "unknown". Keep this tuple in the same order as the JS array.
+_LOADING_INDICATOR_SELECTOR_LABELS: tuple[str, ...] = (
+    "class_spinner",
+    "class_loading",
+    "class_loader",
+    "class_skeleton",
+    "class_progress",
+    "class_shimmer",
+    "role_progressbar",
+    "role_status_busy",
+    "aria_busy",
+    "aria_live_busy",
+    "overlay_loading",
+    "overlay_page_loading",
+    "overlay_content_loading",
+    "svg_spin",
+    "svg_loading",
+)
+
+# Standard HTML tag allowlist. A descriptor's tag is emitted only if it is one of these low-cardinality
+# names; anything else (e.g. a brand-named custom element) buckets to "custom" so no page-derived token
+# crosses the boundary.
+_STANDARD_HTML_TAGS: frozenset[str] = frozenset(
+    {
+        "div", "span", "svg", "section", "article", "aside", "main", "header", "footer", "nav",
+        "ul", "ol", "li", "p", "a", "button", "img", "i", "b", "em", "strong", "small",
+        "progress", "meter", "output", "form", "input", "label", "table", "tr", "td", "th",
+        "tbody", "thead", "canvas", "figure", "figcaption", "path", "circle", "rect", "g", "use",
+        "h1", "h2", "h3", "h4", "h5", "h6", "dl", "dt", "dd",
+    }
+)  # fmt: skip
+
+_LOADING_POLL_COUNT_CAP = 1000
+_LOADING_DESCRIPTOR_CHANGE_CAP = 10
+_LOADING_MATCH_COUNT_CAP = 25
+
+# Detects visible loading indicators and ships back a bounded, sanitized descriptor built inside the
+# page (never raw class/id/text/attribute strings), or null when nothing visible matches. Truthiness
+# preserves the original bare-bool loading semantics exactly: null -> not loading, descriptor -> loading.
+LOADING_INDICATOR_PROBE_JS = f"""
+() => {{
+    const selectors = [
+        '[class*="spinner"]',
+        '[class*="loading"]',
+        '[class*="loader"]',
+        '[class*="skeleton"]',
+        '[class*="progress"]',
+        '[class*="shimmer"]',
+        '[role="progressbar"]',
+        '[role="status"][aria-busy="true"]',
+        '[aria-busy="true"]',
+        '[aria-live="polite"][aria-busy="true"]',
+        '.loading-overlay',
+        '.page-loading',
+        '.content-loading',
+        'svg[class*="spin"]',
+        'svg[class*="loading"]',
+    ];
+
+    const isVisible = (el) => {{
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            style.opacity !== '0' &&
+            rect.width > 0 &&
+            rect.height > 0
+        );
+    }};
+
+    const isAnimated = (el) => {{
+        try {{
+            if (typeof el.getAnimations === 'function') {{
+                if (el.getAnimations({{ subtree: true }}).some(a => a.playState === 'running')) {{
+                    return true;
+                }}
+            }}
+        }} catch (e) {{
+            // getAnimations can be unavailable or throw in some engines; fall through safely.
+        }}
+        try {{
+            const name = window.getComputedStyle(el).animationName;
+            return name !== 'none' && name !== '';
+        }} catch (e) {{
+            return false;
+        }}
+    }};
+
+    const quantize = (rect) => {{
+        const q = (v) => Math.max(0, Math.min(19, Math.floor(v / 100)));
+        return [q(rect.left), q(rect.top), q(rect.width), q(rect.height)];
+    }};
+
+    let first = null;
+    let count = 0;
+    for (let sel = 0; sel < selectors.length; sel++) {{
+        try {{
+            const elements = document.querySelectorAll(selectors[sel]);
+            for (const el of elements) {{
+                if (!isVisible(el)) continue;
+                count++;
+                if (first === null) {{
+                    try {{
+                        const rect = el.getBoundingClientRect();
+                        let determinate = null;
+                        let progress = null;
+                        const valuenow = el.getAttribute('aria-valuenow');
+                        if (valuenow !== null && valuenow !== '' && !isNaN(Number(valuenow))) {{
+                            determinate = true;
+                            const valuemax = Number(el.getAttribute('aria-valuemax')) || 100;
+                            const denom = valuemax || 100;
+                            progress = Math.max(0, Math.min(10, Math.round((Number(valuenow) / denom) * 10)));
+                        }} else if (el.getAttribute('role') === 'progressbar') {{
+                            determinate = false;
+                        }}
+                        first = {{
+                            sel: sel,
+                            tag: (el.tagName || '').toLowerCase(),
+                            animated: isAnimated(el),
+                            determinate: determinate,
+                            progress: progress,
+                            ident: quantize(rect),
+                        }};
+                    }} catch (e) {{
+                        first = {{ sel: sel, tag: null, animated: null, determinate: null, progress: null, ident: null }};
+                    }}
+                }}
+                if (count >= {_LOADING_MATCH_COUNT_CAP}) break;
+            }}
+        }} catch (e) {{
+            continue;
+        }}
+        if (count >= {_LOADING_MATCH_COUNT_CAP}) break;
+    }}
+
+    if (first === null) {{
+        return null;
+    }}
+    first.n = Math.min(count, {_LOADING_MATCH_COUNT_CAP});
+    return first;
+}}
+"""
+
+
+@dataclasses.dataclass
+class LoadingIndicatorObservation:
+    """Caller-owned, O(1) state accumulated across the polls of a single loading-indicator wait.
+
+    Only the first and last sanitized descriptors are retained; there is no per-poll list and no state
+    that outlives the wait, so nothing bleeds across waits or runs.
+    """
+
+    detected: bool = False
+    poll_count: int = 0
+    first: Any | None = None
+    last: Any | None = None
+    descriptor_changes: int = 0
+    stable_across_polls: bool = True
+
+
+def _descriptor_identity(descriptor: Any) -> tuple:
+    if not isinstance(descriptor, dict):
+        return ("__non_dict__",)
+    ident = descriptor.get("ident")
+    ident_key = tuple(ident) if isinstance(ident, list) else None
+    return (descriptor.get("sel"), descriptor.get("tag"), ident_key, descriptor.get("progress"))
+
+
+def _record_loading_observation(observation: LoadingIndicatorObservation, descriptor: Any) -> None:
+    observation.detected = True
+    if observation.first is None:
+        observation.first = descriptor
+    elif _descriptor_identity(descriptor) != _descriptor_identity(observation.last):
+        observation.stable_across_polls = False
+        if observation.descriptor_changes < _LOADING_DESCRIPTOR_CHANGE_CAP:
+            observation.descriptor_changes += 1
+    observation.last = descriptor
+
+
+def _bounded_int(value: Any, low: int, high: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return max(low, min(high, value))
+
+
+def _match_count_bucket(value: Any) -> str:
+    count = value if isinstance(value, int) and not isinstance(value, bool) else 1
+    if count <= 1:
+        return "1"
+    if count <= 5:
+        return "2-5"
+    return "6+"
+
+
+def _loading_indicator_span_fields(observation: LoadingIndicatorObservation) -> dict[str, Any]:
+    """Pure sanitizer: allowlists both keys and values so a descriptor with hostile/extra fields
+    contributes nothing beyond the fixed, bounded, low-cardinality attribute set."""
+    fields: dict[str, Any] = {
+        "loading_indicator.detected": bool(observation.detected),
+        "loading_indicator.poll_count": min(max(observation.poll_count, 0), _LOADING_POLL_COUNT_CAP),
+    }
+    if not observation.detected:
+        return fields
+
+    last = observation.last if isinstance(observation.last, dict) else {}
+    first = observation.first if isinstance(observation.first, dict) else {}
+
+    sel = last.get("sel")
+    if isinstance(sel, bool) or not isinstance(sel, int) or not (0 <= sel < len(_LOADING_INDICATOR_SELECTOR_LABELS)):
+        fields["loading_indicator.selector"] = "unknown"
+    else:
+        fields["loading_indicator.selector"] = _LOADING_INDICATOR_SELECTOR_LABELS[sel]
+
+    tag = last.get("tag")
+    fields["loading_indicator.tag"] = tag if isinstance(tag, str) and tag in _STANDARD_HTML_TAGS else "custom"
+
+    fields["loading_indicator.match_count_bucket"] = _match_count_bucket(last.get("n"))
+    fields["loading_indicator.animated"] = bool(last.get("animated"))
+
+    determinate = last.get("determinate")
+    if determinate is True:
+        fields["loading_indicator.determinate"] = "true"
+    elif determinate is False:
+        fields["loading_indicator.determinate"] = "false"
+    else:
+        fields["loading_indicator.determinate"] = "n/a"
+
+    progress_first = _bounded_int(first.get("progress"), 0, 10)
+    if progress_first is not None:
+        fields["loading_indicator.progress_first"] = progress_first
+    progress_last = _bounded_int(last.get("progress"), 0, 10)
+    if progress_last is not None:
+        fields["loading_indicator.progress_last"] = progress_last
+
+    fields["loading_indicator.stable_across_polls"] = bool(observation.stable_across_polls)
+    fields["loading_indicator.descriptor_changes"] = min(
+        max(observation.descriptor_changes, 0), _LOADING_DESCRIPTOR_CHANGE_CAP
+    )
+    return fields
 
 
 def _is_json_inlinable(arg: Any) -> bool:
@@ -2142,22 +2388,30 @@ class SkyvernFrame:
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
         loading_indicator_result = "success"
+        loading_observation = LoadingIndicatorObservation()
         with traced_span(_tracer, "skyvern.browser.page_ready.loading_indicators") as _li_span:
             apply_context_attrs(_li_span)
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
-                await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
+                await self._wait_for_loading_indicators_gone(
+                    timeout_ms=loading_indicator_timeout_ms, observation=loading_observation
+                )
             except Exception as exc:
                 if _is_readiness_timeout(exc, self.engine_selection):
                     loading_indicator_result = "timeout"
                     LOG.info(
-                        "Loading indicator timeout - some indicators may still be present, proceeding", sampling=True
+                        "Loading indicator timeout - some indicators may still be present, proceeding",
+                        sampling=True,
+                        **_loading_indicator_span_fields(loading_observation),
                     )
                 else:
                     loading_indicator_result = "error"
                     LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
             finally:
                 _li_span.set_attribute("result", loading_indicator_result)
+                with contained_effect("emit loading indicator telemetry"):
+                    for _attr_key, _attr_value in _loading_indicator_span_fields(loading_observation).items():
+                        _li_span.set_attribute(_attr_key, _attr_value)
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
         network_idle_result = "success"
@@ -2194,75 +2448,32 @@ class SkyvernFrame:
             finally:
                 _ds_span.set_attribute("result", dom_stability_result)
 
-    async def _wait_for_loading_indicators_gone(self, timeout_ms: float = 5000) -> None:
+    async def _wait_for_loading_indicators_gone(
+        self, timeout_ms: float = 5000, observation: LoadingIndicatorObservation | None = None
+    ) -> None:
         """
         Wait for common loading indicators to disappear from the page.
         Checks for spinners, skeletons, progress bars, and loading overlays.
-        """
-        # JavaScript to detect loading indicators
-        loading_indicator_js = """
-        () => {
-            // Common loading indicator selectors
-            const selectors = [
-                // Class-based spinners and loaders
-                '[class*="spinner"]',
-                '[class*="loading"]',
-                '[class*="loader"]',
-                '[class*="skeleton"]',
-                '[class*="progress"]',
-                '[class*="shimmer"]',
-                // Role-based
-                '[role="progressbar"]',
-                '[role="status"][aria-busy="true"]',
-                // Aria attributes
-                '[aria-busy="true"]',
-                '[aria-live="polite"][aria-busy="true"]',
-                // Common loading overlay patterns
-                '.loading-overlay',
-                '.page-loading',
-                '.content-loading',
-                // SVG spinners
-                'svg[class*="spin"]',
-                'svg[class*="loading"]',
-            ];
 
-            for (const selector of selectors) {
-                try {
-                    const elements = document.querySelectorAll(selector);
-                    for (const el of elements) {
-                        // Check if element is visible
-                        const style = window.getComputedStyle(el);
-                        const rect = el.getBoundingClientRect();
-                        const isVisible = (
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden' &&
-                            style.opacity !== '0' &&
-                            rect.width > 0 &&
-                            rect.height > 0
-                        );
-                        if (isVisible) {
-                            return true;  // Loading indicator found
-                        }
-                    }
-                } catch (e) {
-                    // Ignore selector errors
-                }
-            }
-            return false;  // No loading indicators found
-        }
+        Raise semantics are unchanged: ``asyncio.TimeoutError`` on expiry, evaluate errors propagate.
+        When ``observation`` is supplied it is mutated in place each poll for telemetry; readiness
+        behavior (cadence, visibility test, truthiness) is identical whether or not it is passed.
         """
-
         async with asyncio.timeout(timeout_ms / 1000):
             while True:
-                has_loading_indicator = await self.evaluate(
+                loading_indicator = await self.evaluate(
                     frame=self.frame,
                     engine_selection=self.engine_selection,
-                    expression=loading_indicator_js,
+                    expression=LOADING_INDICATOR_PROBE_JS,
                     timeout_ms=timeout_ms,
                 )
-                if not has_loading_indicator:
+                if observation is not None:
+                    observation.poll_count += 1
+                if not loading_indicator:
                     LOG.debug("No loading indicators detected")
                     return
+                if observation is not None:
+                    _record_loading_observation(observation, loading_indicator)
                 await asyncio.sleep(0.1)
 
     async def _wait_for_dom_stable(self, stable_ms: float = 300, timeout_ms: float = 3000) -> None:

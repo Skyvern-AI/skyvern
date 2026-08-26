@@ -20,6 +20,13 @@ export function AnimatedWave({ text, className = "" }: AnimatedWaveProps) {
         .animate-wave {
           animation-name: wave;
         }
+        @media (prefers-reduced-motion: reduce) {
+          /* animation-name is the only animation property not set inline, so
+             clearing it here is what actually stops the wave. */
+          .animate-wave {
+            animation-name: none;
+          }
+        }
       `}</style>
       <span className={`inline-flex ${className}`}>
         {characters.map((char, index) => (

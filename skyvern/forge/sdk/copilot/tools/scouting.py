@@ -283,8 +283,12 @@ async def _capture_scout_selector_candidates(ctx: AgentContext, selector: str | 
         source = _selector_text(raw.get("source"))
         if not candidate_selector or not source:
             continue
-        candidate: ScoutedSelectorCandidate = {"selector": candidate_selector, "source": source}
-        if candidate not in candidates:
+        candidate: ScoutedSelectorCandidate = {
+            "selector": candidate_selector,
+            "source": source,
+            "match_count": _non_negative_count(raw.get("match_count")),
+        }
+        if not any(existing["selector"] == candidate_selector for existing in candidates):
             candidates.append(candidate)
     if candidates:
         ctx.pending_scout_selector_candidates = candidates
@@ -385,8 +389,12 @@ def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dic
         candidate_source = _selector_text(raw.get("source"))
         if not candidate_selector or not candidate_source:
             continue
-        candidate: ScoutedSelectorCandidate = {"selector": candidate_selector, "source": candidate_source}
-        if candidate not in candidates:
+        candidate: ScoutedSelectorCandidate = {
+            "selector": candidate_selector,
+            "source": candidate_source,
+            "match_count": _non_negative_count(raw.get("match_count")),
+        }
+        if not any(existing["selector"] == candidate_selector for existing in candidates):
             candidates.append(candidate)
     if candidates:
         ctx.pending_scout_selector_candidates = candidates
@@ -579,9 +587,20 @@ async def _capture_post_interaction_screenshot(
     )
 
 
+def _model_visible_selector_candidates(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return [
+        {key: item for key, item in candidate.items() if key != "match_count"}
+        if isinstance(candidate, dict)
+        else candidate
+        for candidate in value
+    ]
+
+
 async def _capture_enclosing_form_submits(
     ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Submit controls of the form holding a just-filled field, so submitting what was filled is not
     a guess among the page's other prominent buttons. Returns an empty list on failure."""
     selector = _selector_text(selector)
@@ -605,11 +624,16 @@ async def _capture_enclosing_form_submits(
     controls = (result.get("data") or {}).get("result")
     if not isinstance(controls, list):
         return []
-    return [
-        {"label": str(entry.get("label") or "")[:80], "selector": str(entry.get("selector") or "")[:160]}
-        for entry in controls
-        if isinstance(entry, dict) and (entry.get("label") or entry.get("selector"))
-    ]
+    facts: list[dict[str, Any]] = []
+    for entry in controls:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "")[:80]
+        candidates = entry.get("selector_candidates")
+        if not label and not candidates:
+            continue
+        facts.append({"label": label, "selector_candidates": _model_visible_selector_candidates(candidates)})
+    return facts
 
 
 def _capped_with_eviction_accounting(
@@ -683,7 +707,19 @@ def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: st
                 continue
             controls = [*(form.get("fields") or []), *(form.get("submit_controls") or [])]
             for control in controls:
-                if not isinstance(control, dict) or _selector_text(control.get("selector")) != selector:
+                if not isinstance(control, dict):
+                    continue
+                candidates = control.get("selector_candidates")
+                candidate_selectors = (
+                    {
+                        _selector_text(candidate.get("selector"))
+                        for candidate in candidates
+                        if isinstance(candidate, dict) and candidate.get("match_count") == 1
+                    }
+                    if isinstance(candidates, list)
+                    else set()
+                )
+                if _selector_text(control.get("selector")) != selector and selector not in candidate_selectors:
                     continue
                 observed_hidden = observed_hidden or control.get("visible") is False
                 observed_disabled = observed_disabled or control.get("disabled") is True
@@ -739,8 +775,24 @@ def _record_scouted_interaction(
     artifact: ScoutedInteraction = {"tool_name": tool_name}
     if selector:
         artifact["selector"] = selector
+        artifact["executed_selector"] = selector
     if selector_candidates:
-        artifact["selector_candidates"] = selector_candidates.copy()
+        normalized_candidates: list[ScoutedSelectorCandidate] = []
+        for candidate in selector_candidates:
+            candidate_selector = _selector_text(candidate.get("selector"))
+            source = _selector_text(candidate.get("source"))
+            if not candidate_selector or not source:
+                continue
+            raw_count = candidate.get("match_count")
+            normalized: ScoutedSelectorCandidate = {
+                "selector": candidate_selector,
+                "source": source,
+                "match_count": _non_negative_count(raw_count),
+            }
+            if not any(existing["selector"] == candidate_selector for existing in normalized_candidates):
+                normalized_candidates.append(normalized)
+        if normalized_candidates:
+            artifact["selector_candidates"] = normalized_candidates
     if selector_match_count is not None:
         artifact["selector_match_count"] = selector_match_count
     if source_url and source_url.strip():
@@ -872,6 +924,9 @@ def _page_evidence_has_selector(value: Any, selector: str) -> bool:
 
 def _fill_carry_to_interaction(carry: Mapping[str, Any], trajectory_index: int) -> ScoutedInteraction:
     interaction = {key: value for key, value in carry.items() if key != "available_fields"}
+    executed_selector = interaction.get("executed_selector")
+    if "selector" not in interaction and isinstance(executed_selector, str) and executed_selector:
+        interaction["selector"] = executed_selector
     interaction["trajectory_index"] = trajectory_index
     interaction["carried"] = True
     return cast(ScoutedInteraction, interaction)
@@ -949,6 +1004,16 @@ _PAGE_EVIDENCE_STATE_KEYS = (
 def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
     """Return DOM-observed structure without visual augmentation or transport metadata."""
     state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
+    page_obstructions = packet.get("page_obstructions")
+    state["page_obstructions"] = (
+        [
+            obstruction
+            for obstruction in page_obstructions
+            if isinstance(obstruction, dict) and obstruction.get("source") in {"dom", "dom_html"}
+        ]
+        if isinstance(page_obstructions, list)
+        else []
+    )
     inspection_warnings = packet.get("inspection_warnings")
     state["reveal_relations_truncated"] = (
         isinstance(inspection_warnings, list) and "reveal_relations_truncated" in inspection_warnings
@@ -1208,7 +1273,6 @@ _PAGE_SUMMARY_MAX_SUBMITS = 4
 _PAGE_SUMMARY_MAX_NAV_TEXTS = 8
 _PAGE_SUMMARY_MAX_DISMISS_TEXTS = 4
 _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS = 4
-_PAGE_SUMMARY_SELECTOR_CAP = 120
 
 
 def _summary_text(value: Any) -> str:
@@ -1223,12 +1287,15 @@ def _summary_field_name(field: dict[str, Any]) -> str:
     return ""
 
 
-def _summary_selector(control: dict[str, Any]) -> str:
-    """Carry a selector whole or not at all, never shortened: a truncated selector can still parse
-    and match a different element, which is worse for authoring than carrying no selector."""
-    raw = control.get("selector")
-    selector = raw.strip() if isinstance(raw, str) else ""
-    return selector if selector and len(selector) <= _PAGE_SUMMARY_SELECTOR_CAP else ""
+def _summary_element_facts(control: dict[str, Any]) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    candidates = control.get("selector_candidates")
+    if isinstance(candidates, list):
+        facts["selector_candidates"] = _model_visible_selector_candidates(candidates)
+    identity = control.get("identity")
+    if isinstance(identity, dict):
+        facts["identity"] = identity
+    return facts
 
 
 def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | None:
@@ -1239,9 +1306,7 @@ def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | Non
         value = _summary_text(control.get(key))
         if value:
             summary[key] = value
-    disclosure_selector = _summary_selector(control)
-    if disclosure_selector:
-        summary["selector"] = disclosure_selector
+    summary.update(_summary_element_facts(control))
     if "controls" in summary and isinstance(control.get("controlled_region_visible"), bool):
         summary["controlled_region_visible"] = control["controlled_region_visible"]
     if control.get("disabled") is True:
@@ -1251,17 +1316,8 @@ def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | Non
     return summary
 
 
-def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, str]:
-    """A summary control carrying the selector the evidence observed for it, when there was one.
-
-    The selector is kept whole or dropped, never shortened: a truncated selector can still parse
-    and match a different element, which is worse for authoring than carrying no selector at all.
-    """
-    entry = {"text": text}
-    selector = _summary_selector(control)
-    if selector:
-        entry["selector"] = selector
-    return entry
+def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, Any]:
+    return {"text": text, **_summary_element_facts(control)}
 
 
 def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1292,7 +1348,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             }
         )
     nav_targets = [target for target in evidence.get("navigation_targets") or [] if isinstance(target, dict)]
-    dismiss_entries: list[dict[str, str]] = []
+    dismiss_entries: list[dict[str, Any]] = []
     for overlay in evidence.get("modal_overlays") or []:
         if not isinstance(overlay, dict):
             continue
@@ -1304,6 +1360,33 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"))
             if text:
                 dismiss_entries.append(_summary_entry(text, control))
+    interaction_blocking_layers: list[dict[str, Any]] = []
+    for obstruction in evidence.get("page_obstructions") or []:
+        if not isinstance(obstruction, dict) or obstruction.get("kind") != "interaction_blocking_layer":
+            continue
+        visible_controls = [
+            _summary_entry(text, control)
+            for control, text in (
+                (
+                    control,
+                    _summary_text(control.get("text") or control.get("aria_label") or control.get("title")),
+                )
+                for control in obstruction.get("visible_controls") or []
+                if isinstance(control, dict)
+            )
+            if text
+        ]
+        if not visible_controls:
+            continue
+        layer: dict[str, Any] = {
+            **_summary_element_facts(obstruction),
+            "intercepts_outside_control": obstruction.get("intercepts_outside_control") is True,
+            "visible_controls": visible_controls,
+        }
+        controls_omitted = obstruction.get("visible_controls_omitted")
+        if isinstance(controls_omitted, int) and not isinstance(controls_omitted, bool) and controls_omitted > 0:
+            layer["visible_controls_omitted"] = controls_omitted
+        interaction_blocking_layers.append(layer)
     challenge_state = evidence.get("challenge_state")
     challenge_detected = bool(evidence.get("challenge_controls")) or (
         isinstance(challenge_state, dict) and challenge_state.get("detected") is True
@@ -1326,7 +1409,8 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         summary = _summary_disclosure_control(control)
         if summary is None:
             continue
-        identity = (str(summary.get("selector") or ""), str(summary.get("controls") or ""))
+        candidate_identity = json.dumps(summary.get("selector_candidates") or [], sort_keys=True)
+        identity = (candidate_identity, str(summary.get("controls") or ""))
         if identity in seen_disclosures:
             continue
         seen_disclosures.add(identity)
@@ -1347,6 +1431,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         "disclosure_controls": disclosure_controls,
         "challenge_detected": challenge_detected,
         "modal_dismiss_controls": dismiss_entries,
+        "interaction_blocking_layers": interaction_blocking_layers,
     }
 
 
@@ -1354,6 +1439,13 @@ def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
     """Collapse every control entry to the bare text it carries, and report whether anything changed."""
     dropped = False
     groups: list[Any] = [summary.get("navigation_targets"), summary.get("modal_dismiss_controls")]
+    for layer in summary.get("interaction_blocking_layers") or []:
+        if isinstance(layer, dict):
+            for key in ("selector_candidates", "identity"):
+                if key in layer:
+                    layer.pop(key)
+                    dropped = True
+            groups.append(layer.get("visible_controls"))
     for form in summary.get("forms") or []:
         if isinstance(form, dict):
             groups.extend([form.get("fields"), form.get("submit_controls")])
@@ -1383,6 +1475,9 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> str | None:
     if summary.get("modal_dismiss_controls"):
         summary["modal_dismiss_controls"] = []
         return "modal_dismiss_controls"
+    if summary.get("interaction_blocking_layers"):
+        summary["interaction_blocking_layers"] = []
+        return "interaction_blocking_layers"
     for form in forms[1:]:
         if form.get("submit_controls"):
             form["submit_controls"] = []

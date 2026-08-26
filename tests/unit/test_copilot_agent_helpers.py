@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _page_obstructions_from_visual_summary,
+    model_visible_composition_evidence,
     parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
@@ -1717,6 +1718,7 @@ workflow_definition:
             payload,
             ctx,
             allow_missing_credentials=False,
+            originating_call_id=None,
         ):
             captured["workflow_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]
@@ -1884,7 +1886,7 @@ workflow_definition:
 """
         captured: dict[str, object] = {}
 
-        async def fake_update_workflow(payload, ctx, *, allow_missing_credentials=False):
+        async def fake_update_workflow(payload, ctx, *, allow_missing_credentials=False, originating_call_id=None):
             captured["persisted_yaml"] = payload["workflow_yaml"]
             captured["allow_missing_credentials"] = allow_missing_credentials
             ctx.last_workflow_yaml = payload["workflow_yaml"]
@@ -2124,10 +2126,16 @@ workflow_definition:
             if obstruction.get("source") != "vision_summary"
         ] == [
             control["selector_candidates"]
-            for obstruction in source_obstructions[:5]
+            for obstruction in [model_visible_composition_evidence(item) for item in source_obstructions[:5]]
             for control in obstruction["visible_controls"]
             if obstruction.get("source") != "vision_summary"
         ]
+        assert all(
+            "selector" not in control
+            and all("match_count" not in candidate for candidate in control["selector_candidates"])
+            for obstruction in carried_obstructions
+            for control in obstruction["visible_controls"]
+        )
         assert [
             control["identity"]
             for obstruction in carried_obstructions

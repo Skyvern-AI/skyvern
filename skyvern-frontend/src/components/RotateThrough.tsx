@@ -44,7 +44,7 @@ function RotateThrough({
 
   return (
     <div
-      className={`transition-all duration-150 ease-in-out ${
+      className={`transition-all duration-150 ease-in-out motion-reduce:scale-100 motion-reduce:opacity-100 motion-reduce:transition-none ${
         isAnimating ? "scale-95 opacity-0" : "scale-100 opacity-100"
       } ${className}`}
     >

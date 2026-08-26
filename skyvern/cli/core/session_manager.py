@@ -69,6 +69,9 @@ class SessionState:
     har_enabled: bool = False
     _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
     # -- Active page tracking (tab management) --
+    # True only when a caller retains this state beyond one tool call (stdio/global session,
+    # organization registry, copilot registry); tab switch/close/wait_for_new refuse otherwise.
+    tab_state_persists: bool = False
     _active_page: Page | None = None
     # -- Page event buffer for tab_wait_for_new --
     _page_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
@@ -376,6 +379,7 @@ def register_copilot_session(session_id: str, state: SessionState, *, organizati
         if redactor is not None:
             state._codeblock_redactor = redactor
     state.organization_id = organization_id
+    state.tab_state_persists = True
     _copilot_sessions[(organization_id, session_id)] = state
 
 
@@ -408,6 +412,7 @@ def get_current_session() -> SessionState:
         if state is None:
             state = SessionState(organization_id=organization_id)
             _organization_sessions[organization_id] = state
+        state.tab_state_persists = True
         _current_session.set(state)
         return state
 
@@ -424,6 +429,7 @@ def get_current_session() -> SessionState:
     if _global_session is None:
         _global_session = SessionState()
     state = _global_session
+    state.tab_state_persists = True
     _current_session.set(state)
     return state
 
@@ -435,8 +441,10 @@ def set_current_session(state: SessionState) -> None:
     if organization_id is not None and not _stateless_http_mode:
         state.organization_id = organization_id
         _organization_sessions[organization_id] = state
+        state.tab_state_persists = True
     elif not _stateless_http_mode:
         _global_session = state
+        state.tab_state_persists = True
     _current_session.set(state)
 
 

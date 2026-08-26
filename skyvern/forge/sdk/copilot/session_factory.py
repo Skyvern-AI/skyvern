@@ -23,6 +23,7 @@ from skyvern.forge.sdk.agents.context import (
     pair_tool_calls_with_outputs,
     replace_agent_message_field,
 )
+from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
@@ -255,6 +256,13 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         target.mkdir(parents=True, exist_ok=True)
         payload = {
             "capture_case_id": getattr(ctx, "eval_capture_case_id", None),
+            "eval_mode": getattr(ctx, "eval_mode", None),
+            "ordered_native_tool_names": list(getattr(ctx, "eval_native_tool_names", ())),
+            "ordered_mcp_tool_names": list(getattr(ctx, "eval_mcp_tool_names", ())),
+            "prompt_sha256": (
+                prompt_sha256(model_data.instructions) if isinstance(model_data.instructions, str) else None
+            ),
+            "tool_surface_sha256": getattr(ctx, "eval_tool_surface_sha256", None),
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,

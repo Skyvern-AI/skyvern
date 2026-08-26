@@ -145,6 +145,7 @@ function setFileUploadNode(
     awsAccessKeyId: string | null;
     awsSecretAccessKey: string | null;
     regionName: string | null;
+    endpointUrl: string | null;
     azureStorageAccountName: string | null;
     azureStorageAccountKey: string | null;
     azureBlobContainerName: string | null;
@@ -164,6 +165,7 @@ function setFileUploadNode(
       awsAccessKeyId: overrides.awsAccessKeyId ?? null,
       awsSecretAccessKey: overrides.awsSecretAccessKey ?? null,
       regionName: overrides.regionName ?? null,
+      endpointUrl: overrides.endpointUrl ?? null,
       azureStorageAccountName: overrides.azureStorageAccountName ?? null,
       azureStorageAccountKey: overrides.azureStorageAccountKey ?? null,
       azureBlobContainerName: overrides.azureBlobContainerName ?? null,
@@ -197,6 +199,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
       awsSecretAccessKey: "secret",
       s3Bucket: "my-bucket",
       regionName: "us-west-2",
+      endpointUrl: "https://storage.example.com",
       path: "uploads",
     });
     render(<FileUploadBlockForm blockId="f1" />);
@@ -206,6 +209,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     expect(screen.getByText("AWS Secret Access Key")).toBeDefined();
     expect(screen.getByText("S3 Bucket")).toBeDefined();
     expect(screen.getByText("Region Name")).toBeDefined();
+    expect(screen.getByText("(Optional) Endpoint URL")).toBeDefined();
     expect(screen.getByText("(Optional) Folder Path")).toBeDefined();
 
     // Azure fields are not visible
@@ -215,9 +219,9 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     expect(screen.queryByText("Google Account")).toBeNull();
     expect(screen.queryByText("Google Drive Folder ID")).toBeNull();
 
-    // 5 textareas (prompt, key id, bucket, region, path) and 1 password input
+    // 6 textareas (prompt, key id, bucket, region, endpoint url, path) and 1 password input
     const textareas = screen.getAllByTestId("wbi-textarea");
-    expect(textareas).toHaveLength(5);
+    expect(textareas).toHaveLength(6);
     const password = screen.getByTestId("wbi-password") as HTMLInputElement;
     expect(password.value).toBe("secret");
   });
@@ -369,14 +373,29 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     setFileUploadNode("f1", { storageType: "s3" });
     render(<FileUploadBlockForm blockId="f1" />);
 
-    // Order: prompt, awsAccessKeyId, s3Bucket, regionName, path
+    // Order: prompt, awsAccessKeyId, s3Bucket, regionName, endpointUrl, path
     const textareas = screen.getAllByTestId("wbi-textarea");
-    fireEvent.change(textareas[4] as HTMLTextAreaElement, {
+    fireEvent.change(textareas[5] as HTMLTextAreaElement, {
       target: { value: "uploads/2026" },
     });
 
     expect(updateNodeData).toHaveBeenCalledWith("f1", {
       path: "uploads/2026",
+    });
+  });
+
+  test("editing endpointUrl (when s3) propagates", () => {
+    setFileUploadNode("f1", { storageType: "s3" });
+    render(<FileUploadBlockForm blockId="f1" />);
+
+    // Order: prompt, awsAccessKeyId, s3Bucket, regionName, endpointUrl, path
+    const textareas = screen.getAllByTestId("wbi-textarea");
+    fireEvent.change(textareas[4] as HTMLTextAreaElement, {
+      target: { value: "https://storage.example.com" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("f1", {
+      endpointUrl: "https://storage.example.com",
     });
   });
 
@@ -427,5 +446,48 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
       ok = usePendingCommitsStore.getState().flush("f1");
     });
     expect(ok).toBe(true);
+  });
+});
+
+describe("file upload serialization", () => {
+  test.each<[string | null]>([[""], [null]])(
+    "serializes an unset s3 endpoint (%j) as null, never an empty string",
+    async (endpointUrl) => {
+      const { getWorkflowBlocks } = await vi.importActual<
+        typeof import("../../workflowEditorUtils")
+      >("../../workflowEditorUtils");
+
+      setFileUploadNode("f1", { storageType: "s3", endpointUrl });
+      const node = mockNodes.get("f1");
+      const [savedBlock] = getWorkflowBlocks(
+        [node] as never,
+        [],
+      ) as unknown as Array<Record<string, unknown>>;
+
+      // botocore raises "Invalid endpoint:" on "", so an unset endpoint must round-trip
+      // as null and let the backend fall back to AWS S3.
+      expect(savedBlock).toHaveProperty("endpoint_url", null);
+    },
+  );
+
+  test("preserves a configured s3 endpoint", async () => {
+    const { getWorkflowBlocks } = await vi.importActual<
+      typeof import("../../workflowEditorUtils")
+    >("../../workflowEditorUtils");
+
+    setFileUploadNode("f1", {
+      storageType: "s3",
+      endpointUrl: "https://storage.example.com",
+    });
+    const node = mockNodes.get("f1");
+    const [savedBlock] = getWorkflowBlocks(
+      [node] as never,
+      [],
+    ) as unknown as Array<Record<string, unknown>>;
+
+    expect(savedBlock).toHaveProperty(
+      "endpoint_url",
+      "https://storage.example.com",
+    );
   });
 });

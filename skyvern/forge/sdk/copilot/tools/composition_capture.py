@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
     merge_visual_composition_evidence,
+    model_visible_composition_evidence,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
     stamp_page_evidence_provenance,
@@ -99,11 +100,13 @@ _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision
 
 
 def _model_facing_inspect_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Detach stored evidence and shed select options until the complete JSON packet fits, retaining
-    each select's selector, total option count, and explicit omission fact for targeted retrieval."""
+    """Detach stored evidence, remove locator recommendations, and fit the complete model packet."""
     if result.get("ok") is not True:
         return result
     shaped = copy.deepcopy(result)
+    data = shaped.get("data")
+    if isinstance(data, dict):
+        shaped["data"] = model_visible_composition_evidence(data)
     if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
         return shaped
     data = shaped.get("data")
@@ -390,7 +393,7 @@ async def _composition_evidence_after_navigation_failure(
         return (evidence, frame) if evidence.get("screenshot_used") else None
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
-    html, html_error, html_truncated, _ = await _composition_get_html(ctx)
+    html, html_error, html_truncated, _ = await _composition_get_html(ctx, rendered_style_snapshot=True)
     if html_error is None:
         evidence = parse_composition_html(
             html,
@@ -603,7 +606,11 @@ async def _capture_composition_evidence(
         # extractor may have blinked on a later attempt while a signalled packet is in hand.
         if used_structured and challenge_evidence_unsettled(evidence):
             break
-        html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
+        html, html_error, html_truncated, used_stripped = await _composition_get_html(
+            copilot_ctx,
+            skip_raw=skip_raw,
+            rendered_style_snapshot=True,
+        )
         if html_error is not None:
             if evidence is not None:
                 break

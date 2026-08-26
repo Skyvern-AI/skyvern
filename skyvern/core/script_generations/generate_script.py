@@ -1720,7 +1720,7 @@ def _build_download_statement(
     args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
     download_target = str(block.get("download_target") or "")
     destination_fields_by_target = {
-        "s3": ["s3_bucket", "aws_access_key_id", "aws_secret_access_key", "region_name"],
+        "s3": ["s3_bucket", "aws_access_key_id", "aws_secret_access_key", "region_name", "endpoint_url"],
         "azure": ["azure_storage_account_name", "azure_storage_account_key", "azure_blob_container_name"],
         "google_drive": ["google_credential_id", "google_drive_folder_id"],
         "sftp": [
@@ -2267,6 +2267,7 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         "aws_access_key_id",
         "aws_secret_access_key",
         "region_name",
+        "endpoint_url",
         "azure_storage_account_name",
         "azure_storage_account_key",
         "azure_blob_container_name",

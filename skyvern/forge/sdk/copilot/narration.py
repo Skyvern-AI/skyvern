@@ -5,8 +5,9 @@ This module watches the agent's tool round-trips, detects meaningful state
 transitions, and emits short human-readable sentences over the existing SSE
 channel so the user can see "what the copilot is doing" in real time.
 
-Narration is ephemeral -- not persisted to chat history. The frontend clears
-it when the final response lands. The narrator LLM runs as a background task
+Narration is persisted into the turn's design activity and paired to the step
+it explains, so a reload shows what was live at the time. The narrator LLM runs
+as a background task
 so it never blocks the primary event pump. At most one narration is in flight
 at a time; if a second transition fires while the first is still in flight,
 it is dropped (cadence is already transition-driven, not spammy).
@@ -27,6 +28,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
@@ -170,11 +172,12 @@ def build_tool_result_activity(
     *,
     timestamp: datetime,
     display_label: str | None = None,
+    code_diffs: list[CodeWriteDiff] | None = None,
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
     display_label = display_label or tool_activity_display_label(tool_name)
-    return {
+    entry: NarrativeActivityEntry = {
         "kind": "tool_result",
         "text": summary or display_label,
         "iteration": iteration,
@@ -184,16 +187,31 @@ def build_tool_result_activity(
         "id": f"tr-{tool_call_id}",
         "timestamp": timestamp.isoformat(),
     }
+    if code_diffs:
+        entry["codeDiffs"] = code_diffs
+    return entry
 
 
-def build_narration_activity(narration: str, iteration: int, timestamp: datetime) -> NarrativeActivityEntry:
-    return {
+def build_narration_activity(
+    narration: str,
+    iteration: int,
+    timestamp: datetime,
+    *,
+    active_label: str | None = None,
+    outcome_label: str | None = None,
+) -> NarrativeActivityEntry:
+    entry: NarrativeActivityEntry = {
         "kind": "narration",
         "text": narration,
         "iteration": iteration,
         "id": f"n-{iteration}-{timestamp.isoformat()}",
         "timestamp": timestamp.isoformat(),
     }
+    if active_label:
+        entry["activeLabel"] = active_label
+    if outcome_label:
+        entry["outcomeLabel"] = outcome_label
+    return entry
 
 
 class TransitionKind(StrEnum):
@@ -239,6 +257,13 @@ class NarratorState:
     # Which iteration recorded pending_transition, so suppressing iteration N cannot
     # discard a transition an earlier typed-row-free iteration is still waiting on.
     pending_transition_iteration: int | None = None
+    # The pending transition was tagged to a step other than the one it
+    # described, so any outcome it names belongs to earlier work.
+    pending_transition_reanchored: bool = False
+    # Highest-priority transition a protected TOOL_STARTED displaced. Promoted
+    # to pending once the intent narration is scheduled.
+    deferred_transition: TransitionKind | None = None
+    deferred_transition_iteration: int | None = None
     user_goal: str = ""
     # Tool whose tool_called arrived but tool_output hasn't yet. Cleared on
     # tool_output so post-tool transitions describe the finished action, not
@@ -260,17 +285,10 @@ class NarratorState:
     run_tool_call_buckets: dict[str, str | None] = field(default_factory=dict)
     # Per-turn (NarratorState lives one turn); collapses repeated code-repair progress to one entry.
     emitted_progress_texts: set[str] = field(default_factory=set)
-    # Iterations already carrying a typed tool row; narrator prose is suppressed for
-    # those. Iteration numbers restart per stream_to_sse pass, so it is cleared on entry.
-    iterations_with_tool_activity: set[int] = field(default_factory=set)
 
     def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
         if entry is None:
             return
-        if entry.get("kind") in ("tool_call", "tool_result"):
-            iteration = entry.get("iteration")
-            if isinstance(iteration, int):
-                self.iterations_with_tool_activity.add(iteration)
         label = self._activity_bucket_label(entry)
         if label is None:
             self.design_activity.append(entry)
@@ -290,6 +308,10 @@ class NarratorState:
         call/result pair across buckets and the FE could never fold it. Pin the
         result to the call's bucket by tool_call_id; everything else routes live.
         """
+        # Narration renders inside the design step it explains, so it stays in
+        # design_activity even mid-run rather than becoming a row on the block card.
+        if entry.get("kind") == "narration":
+            return None
         entry_id = entry.get("id") or ""
         if entry.get("kind") == "tool_call" and entry.get("toolName") in _RUN_ACTIVITY_TOOLS:
             bucket = self.running_block_label
@@ -320,12 +342,35 @@ class NarratorState:
         )
 
     def record_transition(self, kind: TransitionKind) -> None:
+        # Every transition meaning "the work returned" outranks TOOL_STARTED, so
+        # without this a step's own completion always replaces the intent
+        # narration it was about to get and the narrator only speaks in
+        # hindsight. The loser is banked rather than dropped: it becomes pending
+        # as soon as the intent is scheduled, so the step is still narrated
+        # twice. Still-working transitions are not hindsight and pass through.
+        if (
+            self.pending_transition is TransitionKind.TOOL_STARTED
+            and self.pending_transition_iteration == self.current_iteration
+            and kind in _OUTCOME_KNOWN_TRANSITIONS
+        ):
+            if (
+                self.deferred_transition is None
+                or _TRANSITION_PRIORITY[kind] > _TRANSITION_PRIORITY[self.deferred_transition]
+            ):
+                self.deferred_transition = kind
+                self.deferred_transition_iteration = self.current_iteration
+            return
         if (
             self.pending_transition is None
             or _TRANSITION_PRIORITY[kind] > _TRANSITION_PRIORITY[self.pending_transition]
         ):
             self.pending_transition = kind
             self.pending_transition_iteration = self.current_iteration
+            self.pending_transition_reanchored = False
+        elif self.pending_transition_iteration is None:
+            # Banked across a pass reset; re-anchor to this pass's first step.
+            self.pending_transition_iteration = self.current_iteration
+            self.pending_transition_reanchored = True
 
 
 @dataclass(frozen=True)
@@ -373,12 +418,13 @@ class _NarratorPromptContext:
     activity: list[_ToolActivityEntry]
     user_goal: str = ""
     pending_tool_name: str | None = None
+    # The transition was banked across a pass reset and re-anchored, so it
+    # describes work from an earlier step than the one it now points at.
+    reanchored: bool = False
 
 
-def should_emit(state: NarratorState, now: float, iteration: int | None = None) -> bool:
+def should_emit(state: NarratorState, now: float) -> bool:
     if state.pending_transition is None:
-        return False
-    if iteration is not None and iteration in state.iterations_with_tool_activity:
         return False
     if state.in_flight_task is not None and not state.in_flight_task.done():
         return False
@@ -388,31 +434,32 @@ def should_emit(state: NarratorState, now: float, iteration: int | None = None) 
     return True
 
 
-def schedule_narration(
-    state: NarratorState,
-    stream: EventSourceStream,
-    iteration: int,
-) -> None:
+def schedule_narration(state: NarratorState, stream: EventSourceStream) -> None:
     """Kick off a background narration task if the gate allows. Fire-and-drop:
     errors, timeouts, and empty responses are swallowed inside the task."""
+    # A transition banked across an enforcement pass loses its tag when the pass
+    # resets it. Anchor it to the step running now rather than dropping it, so a
+    # poll and a tool event reaching this point cannot disagree about the same
+    # banked transition.
+    if state.pending_transition is not None and state.pending_transition_iteration is None:
+        state.pending_transition_iteration = state.current_iteration
+        state.pending_transition_reanchored = True
+    reanchored = state.pending_transition_reanchored
+
     now = time.monotonic()
-    if not should_emit(state, now, iteration):
-        # A transition on an iteration that carries a typed row is already
-        # described by that row, so consume it here. Banking it would let it
-        # surface as stale prose against an unrelated later iteration.
-        if (
-            state.pending_transition is not None
-            and iteration in state.iterations_with_tool_activity
-            and state.pending_transition_iteration == iteration
-        ):
-            state.pending_transition = None
-            state.pending_transition_iteration = None
+    if not should_emit(state, now):
         return
 
     transition = state.pending_transition
-    assert transition is not None  # guaranteed by should_emit
-    state.pending_transition = None
-    state.pending_transition_iteration = None
+    iteration = state.pending_transition_iteration
+    if transition is None or iteration is None:
+        return
+    # A transition this step's intent displaced takes the slot it just freed.
+    state.pending_transition = state.deferred_transition
+    state.pending_transition_iteration = state.deferred_transition_iteration
+    state.pending_transition_reanchored = False
+    state.deferred_transition = None
+    state.deferred_transition_iteration = None
     # Bound failure-path retries to the same gap window successes use; without
     # this, a flaky narrator re-fires every poll tick.
     state.last_attempted_at = now
@@ -424,6 +471,7 @@ def schedule_narration(
         activity=list(state.pending_activity),
         user_goal=state.user_goal,
         pending_tool_name=state.pending_tool_name,
+        reanchored=reanchored,
     )
     task = asyncio.create_task(
         _narration_task_body(state=state, stream=stream, iteration=iteration, prompt_ctx=prompt_ctx)
@@ -467,9 +515,7 @@ async def _narration_task_body(
             LOG.warning("copilot narrator failed, dropping emission", error=str(exc), transition=transition_value)
             return
 
-        if not narration:
-            return
-        if iteration in state.iterations_with_tool_activity:
+        if narration is None or not narration.reasoning:
             return
 
         narration_ts = datetime.now(timezone.utc)
@@ -477,7 +523,9 @@ async def _narration_task_body(
             await stream.send(
                 WorkflowCopilotNarrationUpdate(
                     type=WorkflowCopilotStreamMessageType.NARRATION,
-                    narration=narration,
+                    narration=narration.reasoning,
+                    active_label=narration.active_label,
+                    outcome_label=narration.outcome_label,
                     iteration=iteration,
                     timestamp=narration_ts,
                 )
@@ -485,7 +533,16 @@ async def _narration_task_body(
         except Exception as exc:
             LOG.warning("copilot narrator send failed", error=str(exc), transition=transition_value)
             return
-        state.record_activity(build_narration_activity(narration, iteration, narration_ts))
+        LOG.info("copilot_narration_emitted", iteration=iteration, transition=transition_value)
+        state.record_activity(
+            build_narration_activity(
+                narration.reasoning,
+                iteration,
+                narration_ts,
+                active_label=narration.active_label,
+                outcome_label=narration.outcome_label,
+            )
+        )
         # Only advance last_emitted_at after a real delivery. A failed /
         # empty / leak-dropped emission leaves the clock where it was so the
         # next valid transition can emit immediately instead of waiting 10s
@@ -499,8 +556,8 @@ async def _narration_task_body(
         state.in_flight_task = None
 
 
-async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -> str | None:
-    """Invoke a small/fast LLM to produce one user-facing sentence.
+async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -> NarrationDraft | None:
+    """Invoke a small/fast LLM for one unit of work's titles and reason.
 
     Returns None on timeout or when no handler is configured. Never raises;
     failures propagate as None so the narration is silently dropped.
@@ -526,10 +583,10 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -
         )
         return None
 
-    narration = _extract_narration_text(response)
-    if not narration:
+    draft = _extract_narration_draft(response)
+    if draft is None:
         return None
-    sanitized = _sanitize_narration(narration)
+    sanitized = _sanitize_narration(draft.reasoning)
     if _narration_leaks_identifier(sanitized):
         # Drop the emission rather than ship an identifier to the user. The
         # next transition will get another chance; cadence is transition-driven
@@ -541,7 +598,16 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -
             preview=sanitized[:120],
         )
         return None
-    return sanitized
+    # A leaking label is dropped on its own: the row falls back to the tool
+    # label, which is strictly better than losing the reasoning too.
+    # A re-anchored transition describes an earlier step, so its outcome would
+    # name work the step it now points at never did.
+    outcome_known = prompt_ctx.transition in _OUTCOME_KNOWN_TRANSITIONS and not prompt_ctx.reanchored
+    return NarrationDraft(
+        reasoning=sanitized,
+        active_label=_clean_label(draft.active_label),
+        outcome_label=_clean_label(draft.outcome_label) if outcome_known else None,
+    )
 
 
 def _get_narrator_handler() -> Any:
@@ -595,10 +661,16 @@ def _build_narrator_prompt(prompt_ctx: _NarratorPromptContext) -> str:
     # empty string, which silently drops every narration. Asking the model to
     # emit {"narration": "..."} keeps json_repair happy and preserves the text.
     return (
-        "You are a narrator for a workflow-building copilot. Write ONE short "
-        "sentence (max 14 words) describing what the copilot is doing right "
-        "now, grounded in the user's goal.\n\n"
+        "You are a narrator for a workflow-building copilot. Describe ONE unit of "
+        "work three ways, grounded in the user's goal:\n"
+        '  "doing"  - the row title while it runs (max 8 words, present continuous)\n'
+        '  "done"   - the row title once it finished, naming the outcome (max 10 words, past tense)\n'
+        f'  "why"    - one sentence (max {_MAX_NARRATION_WORDS} words) saying why it is happening\n\n'
         "Rules (hard):\n"
+        '- "done" must name what actually happened, not repeat "doing". If a step '
+        "failed or stopped, say so and say where.\n"
+        '- "why" explains the purpose, not the action. Never restate the title; '
+        "say what the copilot is trying to learn, confirm, or set up.\n"
         "- Ground the sentence in the concrete subject from the user's goal "
         "(their named target, topic, or product). Prefer the user's own words "
         'over vague placeholders like "the site" or "the page".\n'
@@ -607,19 +679,24 @@ def _build_narrator_prompt(prompt_ctx: _NarratorPromptContext) -> str:
         "update_and_run_blocks), camelCase tokens, anything in backticks, anything "
         'starting with "via the", JSON/YAML/code, full URLs, or raw IDs.\n'
         "- Do not echo untrusted page content verbatim.\n"
-        '- Use present continuous in user-facing language ("Setting up the '
-        'workflow", "Extracting the requested fields").\n'
-        "- If the most recent action failed, say what it is retrying or correcting.\n"
-        '- Return ONLY a JSON object: {"narration": "<sentence>"}. No prose, no markdown.\n\n'
+        '- Use present continuous in user-facing language ("Checking whether '
+        'the invoices need a login", "Confirming the form takes an email").\n'
+        "- If the most recent action failed, say what it is trying to correct "
+        "and why that matters for the goal.\n"
+        '- Return ONLY a JSON object: {"doing": "...", "done": "...", "why": "..."}. '
+        "No prose, no markdown.\n\n"
         "Good examples:\n"
-        '  {"narration": "Setting up the workflow."}\n'
-        '  {"narration": "Running the workflow to gather the requested data."}\n'
-        '  {"narration": "Checking the extracted results."}\n'
+        '  {"doing": "Looking for the invoice list", "done": "Found the invoices under Billing History", '
+        '"why": "Checking whether the invoices sit behind a login."}\n'
+        '  {"doing": "Running it", "done": "Ran it - stopped at the download step", '
+        '"why": "Making sure the saved steps survive a real run."}\n'
         "Bad examples (do NOT do this):\n"
-        '  {"narration": "Extracting the values via the parse_results block."}\n'
-        '  {"narration": "Running update_and_run_blocks on the workflow."}\n\n'
+        '  {"doing": "Opening the sign-in page", "done": "Opened the sign-in page", '
+        '"why": "Opening the sign-in page."}\n'
+        '  {"doing": "Running update_and_run_blocks", "done": "Ran parse_results", '
+        '"why": "Extracting the values via the parse_results block."}\n\n'
         f"User goal: {goal_block}\n\n"
-        f"Currently doing: {current_action_label}\n\n"
+        f"Currently doing (do NOT restate this): {current_action_label}\n\n"
         f"Latest signal: {transition_label}\n\n"
         f"Recent activity (most recent last):\n{activity_block}\n\n"
         "JSON:"
@@ -765,28 +842,73 @@ def _bound(text: str) -> str:
     return text[:_MAX_DETAILS_CHARS]
 
 
-def _extract_narration_text(response: Any) -> str | None:
-    """Pull a plain string from whatever the LLM handler returned.
+class NarrationDraft(NamedTuple):
+    reasoning: str
+    active_label: str | None = None
+    outcome_label: str | None = None
 
-    Handlers may return a str, a dict with ``user_response``/``content``, or
-    some other shape depending on experimentation wiring. Fall back to str()
-    only when nothing structured is recognizable.
-    """
-    if isinstance(response, str):
-        return response.strip() or None
-    if isinstance(response, dict):
-        for key in ("narration", "sentence", "user_response", "content", "text"):
-            value = response.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
+
+def _first_str(response: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = response.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 
+def _extract_narration_draft(response: Any) -> NarrationDraft | None:
+    """Pull the narrator's three fields from whatever the LLM handler returned.
+
+    A bare string, or a dict carrying only the old single-field shape, still
+    yields a reasoning-only draft so a model that ignores the label contract
+    degrades to today's behaviour instead of emitting nothing.
+    """
+    if isinstance(response, str):
+        text = response.strip()
+        return NarrationDraft(reasoning=text) if text else None
+    if isinstance(response, dict):
+        reasoning = _first_str(response, ("why", "narration", "sentence", "user_response", "content", "text"))
+        if not reasoning:
+            return None
+        return NarrationDraft(
+            reasoning=reasoning,
+            active_label=_first_str(response, ("doing",)),
+            outcome_label=_first_str(response, ("done",)),
+        )
+    return None
+
+
+# A finished title is only honest once the step it describes has produced a
+# result. Narration scheduled at tool_started runs before the tool returns, so
+# any outcome the model names there is a guess and is discarded.
+_OUTCOME_KNOWN_TRANSITIONS = frozenset(
+    {
+        TransitionKind.BLOCK_COMPLETED,
+        TransitionKind.BLOCK_FAILED,
+        TransitionKind.NAVIGATION_COMPLETED,
+        TransitionKind.TEST_COMPLETED,
+        TransitionKind.WORKFLOW_UPDATED,
+        # Only detect_transitions raises this, and only from the tool_output
+        # branch, so the work it follows has returned. It also outranks
+        # BLOCK_COMPLETED, so excluding it would strip the outcome from a real
+        # completion it displaced.
+        TransitionKind.NEW_TOOL_CLUSTER,
+    }
+)
+
+
+def _clean_label(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    cleaned = _sanitize_narration(raw)
+    if not cleaned or _narration_leaks_identifier(cleaned):
+        return None
+    return cleaned
+
+
 # Narration sanitization: trim, strip trailing quotes/fences the model might
-# have included, collapse whitespace, and enforce a hard length ceiling.
-# Belt-and-braces layer in addition to the prompt rules.
-_MAX_NARRATION_CHARS = 180
+# have included, collapse whitespace, and bound the length in whole words.
+_MAX_NARRATION_WORDS = 40
 _NARRATION_DELIMITERS = ("```", '"', "'")
 
 
@@ -797,10 +919,10 @@ def _sanitize_narration(text: str) -> str:
             cleaned = cleaned[len(delim) :].lstrip()
         if cleaned.endswith(delim):
             cleaned = cleaned[: -len(delim)].rstrip()
-    cleaned = " ".join(cleaned.split())
-    if len(cleaned) > _MAX_NARRATION_CHARS:
-        cleaned = cleaned[:_MAX_NARRATION_CHARS].rstrip() + "..."
-    return cleaned
+    words = cleaned.split()
+    if len(words) > _MAX_NARRATION_WORDS:
+        return " ".join(words[:_MAX_NARRATION_WORDS]) + "..."
+    return " ".join(words)
 
 
 # Any token that looks like an internal identifier: snake_case, camelCase with
@@ -1023,7 +1145,7 @@ async def narrator_poll_tick(
                 except Exception:
                     LOG.debug("copilot block_progress send failed", exc_info=True)
 
-    schedule_narration(state, stream, state.current_iteration)
+    schedule_narration(state, stream)
 
     return NarratorPollTickResult(
         prior_block_ts=next_prior_block_ts,

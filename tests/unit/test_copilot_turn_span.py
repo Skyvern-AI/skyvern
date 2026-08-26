@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from opentelemetry import trace as otel_trace
@@ -205,3 +207,85 @@ async def test_outer_turn_recovery_records_error_attrs_on_turn_span(
     assert attrs.get("copilot.error_exception_type") == "RuntimeError"
     assert attrs.get("copilot.error_reply_proposal_disposition") == result.proposal_disposition
     assert attrs.get("copilot.error_workflow_modified") is False
+
+
+@pytest.mark.asyncio
+async def test_outer_turn_recovery_preserves_browser_ablation_session_for_cleanup(
+    span_exporter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_after_session(*, ctx_sink: list[Any], stream: Any, **kwargs: Any) -> None:
+        ctx_sink.append(
+            copilot_agent.CopilotContext(
+                organization_id=kwargs["organization_id"],
+                workflow_id=kwargs["chat_request"].workflow_id,
+                workflow_permanent_id=kwargs["chat_request"].workflow_permanent_id,
+                workflow_yaml="",
+                browser_session_id="pbs_cleanup",
+                stream=stream,
+                api_key=kwargs["api_key"],
+                user_message=kwargs["chat_request"].message,
+                workflow_copilot_chat_id=kwargs["chat_request"].workflow_copilot_chat_id,
+                eval_mode=copilot_agent.CopilotEvalMode.BROWSER_ABLATION,
+            )
+        )
+        raise RuntimeError("boom after session creation")
+
+    monkeypatch.setattr(copilot_agent, "_run_copilot_turn_impl", fail_after_session)
+
+    result = await copilot_agent.run_copilot_agent(
+        stream=object(),
+        organization_id="o_test",
+        chat_request=_make_chat_request(),
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=None,
+        api_key="sk-test",
+        eval_mode=copilot_agent.CopilotEvalMode.BROWSER_ABLATION,
+    )
+
+    assert result.browser_ablation_metadata is not None
+    assert result.browser_ablation_metadata["browser_session_id"] == "pbs_cleanup"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_browser_ablation_turn_closes_created_session(
+    span_exporter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def cancel_after_session(*, ctx_sink: list[Any], stream: Any, **kwargs: Any) -> None:
+        ctx_sink.append(
+            copilot_agent.CopilotContext(
+                organization_id=kwargs["organization_id"],
+                workflow_id=kwargs["chat_request"].workflow_id,
+                workflow_permanent_id=kwargs["chat_request"].workflow_permanent_id,
+                workflow_yaml="",
+                browser_session_id="pbs_cancelled",
+                stream=stream,
+                api_key=kwargs["api_key"],
+                user_message=kwargs["chat_request"].message,
+                workflow_copilot_chat_id=kwargs["chat_request"].workflow_copilot_chat_id,
+                eval_mode=copilot_agent.CopilotEvalMode.BROWSER_ABLATION,
+            )
+        )
+        raise asyncio.CancelledError
+
+    close_session = AsyncMock()
+    monkeypatch.setattr(copilot_agent, "_run_copilot_turn_impl", cancel_after_session)
+    monkeypatch.setattr(copilot_agent, "close_browser_session_quietly", close_session)
+
+    with pytest.raises(asyncio.CancelledError):
+        await copilot_agent.run_copilot_agent(
+            stream=object(),
+            organization_id="o_test",
+            chat_request=_make_chat_request(),
+            chat_history=[],
+            global_llm_context=None,
+            debug_run_info_text="",
+            llm_api_handler=None,
+            api_key="sk-test",
+            eval_mode=copilot_agent.CopilotEvalMode.BROWSER_ABLATION,
+        )
+
+    close_session.assert_awaited_once_with("o_test", "pbs_cancelled")

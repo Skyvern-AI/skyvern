@@ -99,6 +99,8 @@ function StreamStatusPanel({
   const isSuccess = diagnostic.tone === "success";
   return (
     <div
+      role="status"
+      aria-live="polite"
       className={cn(
         "flex h-full w-full items-center justify-center rounded-md bg-white p-6 text-neutral-600 dark:bg-slate-900 dark:text-slate-300",
         isSuccess && "border border-success/30",
@@ -125,7 +127,12 @@ function StreamStatusPanel({
           </div>
         )}
         {diagnostic.pending && (
-          <div className="mt-1 flex flex-col gap-1 text-neutral-600 dark:text-slate-400">
+          // Decorative and on a 7s rotation: inside the live region it would
+          // interrupt a screen reader again every time it cycles.
+          <div
+            aria-hidden="true"
+            className="mt-1 flex flex-col gap-1 text-neutral-600 dark:text-slate-400"
+          >
             <RotateThrough interval={7 * 1000}>
               {WHIMSICAL_LOADING_MESSAGES.map((message) => (
                 <span key={message}>{message}</span>

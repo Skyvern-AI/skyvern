@@ -27,6 +27,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
+from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_REASON,
     InterruptedTurnFacts,
@@ -79,9 +81,11 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotFailureKind,
     CopilotPendingTurn,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
+    WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotCancelRequest,
     WorkflowCopilotChat,
     WorkflowCopilotChatHistoryMessage,
@@ -418,6 +422,7 @@ async def _ensure_terminal_frame(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error="The assistant didn't finish this turn. Please try again.",
+                    failure_kind="server",
                     turn_id=turn_id,
                     narrative_summary=None,
                 )
@@ -483,6 +488,12 @@ def _record_recoverable_failure_span_attrs(
         current_span.set_attribute("copilot.error_exception_type", failure.exception_type)
     current_span.set_attribute("copilot.error_workflow_modified", failure.workflow_modified)
     current_span.set_attribute("copilot.error_reply_proposal_disposition", proposal_disposition)
+
+
+def _http_exception_failure_kind(exc: HTTPException) -> CopilotFailureKind | None:
+    """A 5xx is ours (the LLM returned nothing usable, or the route broke); a 4xx is a real refusal
+    the caller should see reflected as the product's own answer."""
+    return "server" if exc.status_code >= 500 else None
 
 
 def _make_error_narrative_payload(turn_id: str | None, turn_index: int | None, message: str) -> TurnNarrativePayload:
@@ -946,6 +957,7 @@ async def _persist_cancel_turn(
         updated_global_llm_context = prior_global_llm_context
         total_tokens = None
         response_type = "REPLY"
+        resolved_model = None
         output_policy_diagnostics = None
         turn_outcome = TurnOutcome(
             response_kind=ResponseKind.RECOVER,
@@ -995,6 +1007,7 @@ async def _persist_cancel_turn(
         updated_global_llm_context = agent_result.global_llm_context
         total_tokens = agent_result.total_tokens
         response_type = agent_result.response_type
+        resolved_model = agent_result.resolved_model
         output_policy_diagnostics = agent_result.output_policy_diagnostics
         turn_outcome = agent_result.turn_outcome
         response_turn_id = turn_id or agent_result.turn_id
@@ -1071,6 +1084,7 @@ async def _persist_cancel_turn(
                     response_time=response_time,
                     total_tokens=total_tokens,
                     response_type=response_type,
+                    resolved_model=resolved_model,
                     proposal_disposition=proposal_disposition,
                     workflow_applied=workflow_applied,
                     cancelled=True,
@@ -1232,24 +1246,35 @@ async def _finalise_normal_turn(
         narrative_payload=narrative_payload,
     )
 
-    await stream.send(
-        WorkflowCopilotStreamResponseUpdate(
-            type=WorkflowCopilotStreamMessageType.RESPONSE,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            message=user_response,
-            updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
-            response_time=assistant_message.created_at if assistant_message else datetime.now(timezone.utc),
-            total_tokens=agent_result.total_tokens,
-            response_type=agent_result.response_type,
-            proposal_disposition=proposal_disposition,
-            workflow_applied=workflow_applied,
-            output_policy_diagnostics=agent_result.output_policy_diagnostics,
-            turn_id=agent_result.turn_id,
-            narrative_summary=narrative_summary,
-            narrative_payload=narrative_payload,
-            terminal_envelope=terminal_envelope,
-        )
+    response_data = {
+        "type": WorkflowCopilotStreamMessageType.RESPONSE,
+        "workflow_copilot_chat_id": chat.workflow_copilot_chat_id,
+        "message": user_response,
+        "updated_workflow": updated_workflow.model_dump(mode="json") if updated_workflow else None,
+        "response_time": assistant_message.created_at if assistant_message else datetime.now(timezone.utc),
+        "total_tokens": agent_result.total_tokens,
+        "response_type": agent_result.response_type,
+        "resolved_model": agent_result.resolved_model,
+        "proposal_disposition": proposal_disposition,
+        "workflow_applied": workflow_applied,
+        "output_policy_diagnostics": agent_result.output_policy_diagnostics,
+        "turn_id": agent_result.turn_id,
+        "narrative_summary": narrative_summary,
+        "narrative_payload": narrative_payload,
+        "terminal_envelope": terminal_envelope,
+    }
+    browser_ablation_metadata = (
+        agent_result.browser_ablation_metadata if isinstance(agent_result, AgentResult) else None
     )
+    if isinstance(browser_ablation_metadata, dict):
+        await stream.send(
+            WorkflowCopilotBrowserAblationResponseUpdate(
+                **response_data,
+                **browser_ablation_metadata,
+            )
+        )
+    else:
+        await stream.send(WorkflowCopilotStreamResponseUpdate(**response_data))
 
 
 async def _commit_staged_workflow(
@@ -1859,6 +1884,8 @@ async def _new_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization,
+    *,
+    eval_mode: CopilotEvalMode | None = None,
 ) -> EventSourceResponse:
     """ENABLE_WORKFLOW_COPILOT_V2 dispatch target.
 
@@ -1926,9 +1953,10 @@ async def _new_copilot_chat_post(
             translated_log_message: str,
             none_chat_log_message: str,
             none_chat_user_message: str,
+            failure_kind: CopilotFailureKind,
         ) -> None:
             """Shared by the LLMProviderError and generic Exception handlers below —
-            only their four log/user-facing strings differ."""
+            only their log/user-facing strings and failure kind differ."""
             nonlocal terminal_frame_emitted
             restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
             restore_failed = False
@@ -2012,6 +2040,7 @@ async def _new_copilot_chat_post(
                     WorkflowCopilotStreamErrorUpdate(
                         type=WorkflowCopilotStreamMessageType.ERROR,
                         error=none_chat_user_message,
+                        failure_kind=failure_kind,
                         turn_id=turn_id,
                         narrative_summary=None,
                     )
@@ -2174,6 +2203,7 @@ async def _new_copilot_chat_post(
                     WorkflowCopilotStreamErrorUpdate(
                         type=WorkflowCopilotStreamMessageType.ERROR,
                         error="Copilot is not configured for this organization. Contact support.",
+                        failure_kind="configuration",
                         turn_id=turn_id,
                         narrative_summary=None,
                     )
@@ -2289,6 +2319,7 @@ async def _new_copilot_chat_post(
                     eval_capture_case_id=(
                         request.headers.get("x-copilot-eval-case") if settings.ENV == "local" else None
                     ),
+                    eval_mode=eval_mode,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
@@ -2358,6 +2389,7 @@ async def _new_copilot_chat_post(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error=exc.detail,
+                    failure_kind=_http_exception_failure_kind(exc),
                     turn_id=turn_id,
                     narrative_summary=None,
                 )
@@ -2369,6 +2401,7 @@ async def _new_copilot_chat_post(
                 translated_log_message="LLM provider error translated to recoverable workflow copilot v2 reply",
                 none_chat_log_message="LLM provider error (copilot v2)",
                 none_chat_user_message="Failed to process your request. Please try again.",
+                failure_kind="provider",
             )
         except asyncio.CancelledError:
             if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
@@ -2442,6 +2475,7 @@ async def _new_copilot_chat_post(
                 translated_log_message="Unexpected workflow copilot v2 error translated to recoverable reply",
                 none_chat_log_message="Unexpected error in workflow copilot v2",
                 none_chat_user_message="An error occurred. Please try again.",
+                failure_kind="server",
             )
         finally:
             if cancel_watcher is not None and not cancel_watcher.done():
@@ -2449,6 +2483,11 @@ async def _new_copilot_chat_post(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await cancel_watcher
             await _ensure_terminal_frame(stream, terminal_frame_emitted, turn_id=turn_id)
+            if eval_mode == CopilotEvalMode.BROWSER_ABLATION and agent_result is not None:
+                metadata = agent_result.browser_ablation_metadata
+                browser_session_id = metadata.get("browser_session_id") if isinstance(metadata, dict) else None
+                if isinstance(browser_session_id, str) and browser_session_id:
+                    await close_browser_session_quietly(organization.organization_id, browser_session_id)
 
     return FastAPIEventSourceStream.create(request, stream_handler)
 
@@ -2602,6 +2641,22 @@ async def workflow_copilot_chat_post(
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
+    raw_eval_mode = request.headers.get("x-copilot-eval-mode")
+    if raw_eval_mode is not None:
+        try:
+            eval_mode = CopilotEvalMode(raw_eval_mode)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported Copilot eval mode",
+            ) from exc
+        if (
+            not settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED
+            or organization.organization_id not in settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS
+        ):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
+        return await _new_copilot_chat_post(request, chat_request, organization, eval_mode=eval_mode)
+
     if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id, mode=chat_request.mode):
         return await _new_copilot_chat_post(request, chat_request, organization)
 
@@ -2762,6 +2817,7 @@ async def workflow_copilot_chat_post(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error=exc.detail,
+                    failure_kind=_http_exception_failure_kind(exc),
                 )
             )
         except LLMProviderError as exc:
@@ -2776,6 +2832,7 @@ async def workflow_copilot_chat_post(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error="Failed to process your request. Please try again.",
+                    failure_kind="provider",
                 )
             )
         except Exception as exc:
@@ -2790,6 +2847,7 @@ async def workflow_copilot_chat_post(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error="An error occurred. Please try again.",
+                    failure_kind="server",
                 )
             )
         finally:
