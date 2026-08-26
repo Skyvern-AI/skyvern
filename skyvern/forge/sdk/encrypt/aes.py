@@ -1,5 +1,6 @@
 import base64
 import hashlib
+from collections.abc import Iterable
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -7,19 +8,18 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
 
-# The public defaults and fallback parameters retain the legacy MD5 normalization so
-# existing ciphertext remains decryptable. New ciphertext configured with an explicit
-# salt and IV uses SHA-256 normalization instead.
+# md5 normalizes a string to 16 bytes here and is not asked to supply a security
+# property. Every input is either a fixed public constant below or a 256-bit
+# HMAC-SHA256 digest from bootstrap.py, so what makes a derived salt/IV unguessable
+# is the secrecy of that input, not md5's collision resistance.
 #
-# The SHA-derived IV remains deterministic, matching the persisted ciphertext format.
-# A future authenticated-encryption migration can introduce random nonces stored with
-# each ciphertext; that requires a versioned payload and is separate from removing MD5
-# from the primary encryption path here.
-#
-# Fallback candidates are decrypt-only. They let deployments read values written before
-# this normalization change and naturally age out as those values are rewritten through
-# the primary path.
-default_iv = hashlib.md5(b"deterministic_iv_0123456789").digest()
+# The IV path does carry a real weakness, and it is not the hash: the IV is
+# deterministic — one per deployment rather than one per message — which costs
+# AES-CBC its semantic security. Fixing that needs random IVs carried in a
+# versioned payload, and it is staged rather than done here because every running
+# instance must be able to *read* the new format before any instance starts
+# *writing* it. This change is that read step.
+default_iv = hashlib.md5(b"deterministic_iv_0123456789", usedforsecurity=False).digest()
 default_salt = hashlib.md5(b"deterministic_salt_0123456789", usedforsecurity=False).digest()
 
 
@@ -30,28 +30,46 @@ class AES(BaseEncryptor):
         secret_key: str,
         salt: str | None = None,
         iv: str | None = None,
-        fallback_decrypt_keys: list[tuple[str | None, str | None]] | None = None,
+        fallback_decrypt_keys: Iterable[tuple[str | None, str | None]] | None = None,
     ) -> None:
         self.secret_key = hashlib.md5(secret_key.encode("utf-8"), usedforsecurity=False).digest()
-        self.salt = hashlib.sha256(salt.encode("utf-8")).digest() if salt else default_salt
-        self.iv = hashlib.sha256(iv.encode("utf-8")).digest()[:16] if iv else default_iv
-        self._fallback_decrypt_params: list[tuple[bytes, bytes]] = [
-            (
-                hashlib.sha256(fb_salt.encode("utf-8")).digest() if fb_salt else default_salt,
-                hashlib.sha256(fb_iv.encode("utf-8")).digest()[:16] if fb_iv else default_iv,
-            )
-            for fb_salt, fb_iv in (fallback_decrypt_keys or [])
-        ]
-        self._fallback_decrypt_params.extend(
-            (
-                hashlib.md5(fb_salt.encode("utf-8"), usedforsecurity=False).digest() if fb_salt else default_salt,
-                hashlib.md5(fb_iv.encode("utf-8")).digest() if fb_iv else default_iv,
-            )
-            for fb_salt, fb_iv in (fallback_decrypt_keys or [])
-        )
+        self.salt, self.iv = self._encryption_params(salt, iv)
+        self._fallback_decrypt_params = self._decrypt_fallbacks((self.salt, self.iv), salt, iv, fallback_decrypt_keys)
 
     def method(self) -> EncryptMethod:
         return EncryptMethod.AES
+
+    @staticmethod
+    def _encryption_params(salt: str | None, iv: str | None) -> tuple[bytes, bytes]:
+        return (
+            hashlib.md5(salt.encode("utf-8"), usedforsecurity=False).digest() if salt else default_salt,
+            hashlib.md5(iv.encode("utf-8"), usedforsecurity=False).digest() if iv else default_iv,
+        )
+
+    @staticmethod
+    def _sha256_params(salt: str | None, iv: str | None) -> tuple[bytes, bytes]:
+        # Decrypt-only. Open-source releases normalized salt/IV with sha256 for a
+        # window, so a deployment upgrading from one of those has stored ciphertext
+        # only these parameters can open.
+        return (
+            hashlib.sha256(salt.encode("utf-8")).digest() if salt else default_salt,
+            hashlib.sha256(iv.encode("utf-8")).digest()[:16] if iv else default_iv,
+        )
+
+    @classmethod
+    def _decrypt_fallbacks(
+        cls,
+        primary: tuple[bytes, bytes],
+        salt: str | None,
+        iv: str | None,
+        fallback_decrypt_keys: Iterable[tuple[str | None, str | None]] | None,
+    ) -> list[tuple[bytes, bytes]]:
+        candidates: list[tuple[bytes, bytes]] = []
+        for pair_salt, pair_iv in [(salt, iv), *(fallback_decrypt_keys or [])]:
+            for params in (cls._encryption_params(pair_salt, pair_iv), cls._sha256_params(pair_salt, pair_iv)):
+                if params != primary and params not in candidates:
+                    candidates.append(params)
+        return candidates
 
     def _derive_key(self, salt: bytes | None = None) -> bytes:
         kdf = PBKDF2HMAC(
