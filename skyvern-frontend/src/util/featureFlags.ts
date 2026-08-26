@@ -1,5 +1,9 @@
 export const ANALYTICS_DASHBOARD_FLAG = "ANALYTICS_DASHBOARD";
 
+// Gates the anomaly alert feed on /analytics; the backend /analytics/anomalies
+// route enforces the same flag server-side.
+export const ANALYTICS_ANOMALY_DETECTION_FLAG = "ANALYTICS_ANOMALY_DETECTION";
+
 /**
  * Gates the workflow editor onboarding tour and A/B experiment.
  * When disabled, users skip the tour and experiment routing entirely.
@@ -40,3 +44,6 @@ export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";
 
 // Opt-in (0% base): recording keeps the CDP stream instead of swapping to VNC.
 export const RECORD_BROWSER_CDP_TRANSPORT_FLAG = "record_browser_cdp_transport";
+
+// Opt-in (0% base): Record Browser v2 — capture from the input path, no scripts injected into the page.
+export const RECORD_BROWSER_V2_FLAG = "record_browser_v2";

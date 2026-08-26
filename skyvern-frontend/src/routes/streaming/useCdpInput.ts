@@ -13,6 +13,7 @@ import {
 // 4411 is emitted mid-session (page resolution or dispatch failed), so unlike a setup-time close it
 // leaves a channel the user still believes is live; without a reconnect, input is dead until reload.
 const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410, 4411]);
+const MOUSE_MOVE_BUFFER_THRESHOLD = 64 * 1024;
 
 interface UseCdpInputOptions {
   inputWsUrl: string | null;
@@ -27,6 +28,7 @@ interface UseCdpInputReturn {
   userIsControlling: boolean;
   setUserIsControlling: (v: boolean) => void;
   inputReady: boolean;
+  inputRttMs: number | null;
   containerRef: React.RefObject<HTMLDivElement>;
   handlers: {
     handleMouseDown: (e: React.MouseEvent<HTMLImageElement>) => void;
@@ -63,18 +65,19 @@ export function useCdpInput({
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
+  const [inputRttMs, setInputRttMs] = useState<number | null>(null);
   const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
   const clientId = useClientIdStore((s) => s.clientId);
 
   const inputSocketRef = useRef<WebSocket | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const lastMouseMoveRef = useRef<number>(0);
   const userIsControllingRef = useRef(false);
   const inputReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
   const inputReconnectAttemptsRef = useRef(0);
+  const inputPingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const inputStoppedRef = useRef(false);
   const inputEventCountRef = useRef(0);
   const wheelAccumulatorRef = useRef<{
@@ -85,6 +88,15 @@ export function useCdpInput({
     modifiers: number;
   } | null>(null);
   const wheelAnimationFrameRef = useRef<number | null>(null);
+  const pendingMouseMoveRef = useRef<Record<string, unknown> | null>(null);
+  const mouseMoveAnimationFrameRef = useRef<number | null>(null);
+  const cancelPendingMouseMove = () => {
+    if (mouseMoveAnimationFrameRef.current !== null) {
+      cancelAnimationFrame(mouseMoveAnimationFrameRef.current);
+      mouseMoveAnimationFrameRef.current = null;
+    }
+    pendingMouseMoveRef.current = null;
+  };
   const interceptedClipboardKeysRef = useRef(new Set<string>());
   const onClipboardPasteRef = useRef(onClipboardPaste);
   const onClipboardCopyRef = useRef(onClipboardCopy);
@@ -97,9 +109,17 @@ export function useCdpInput({
     inputStoppedRef.current = false;
     inputReconnectAttemptsRef.current = 0;
 
+    function clearInputPingTimer() {
+      if (inputPingTimerRef.current) {
+        clearInterval(inputPingTimerRef.current);
+        inputPingTimerRef.current = null;
+      }
+    }
+
     function connectInputWs(credentialParam: string) {
       if (inputStoppedRef.current) return;
       if (inputSocketRef.current) {
+        clearInputPingTimer();
         inputSocketRef.current.close();
       }
       const ws = new WebSocket(
@@ -110,6 +130,14 @@ export function useCdpInput({
       ws.addEventListener("open", () => {
         if (inputSocketRef.current !== ws) return;
         console.log("[cdp-input] WebSocket connected");
+        inputPingTimerRef.current = setInterval(() => {
+          if (
+            inputSocketRef.current === ws &&
+            ws.readyState === WebSocket.OPEN
+          ) {
+            ws.send(JSON.stringify({ type: "ping", t: performance.now() }));
+          }
+        }, 5000);
         if (userIsControllingRef.current) {
           ws.send(JSON.stringify({ kind: "take-control" }));
         }
@@ -132,6 +160,9 @@ export function useCdpInput({
               ws.send(JSON.stringify({ kind: "take-control" }));
             }
           }
+          if (msg.kind === "pong" && typeof msg.t === "number") {
+            setInputRttMs(performance.now() - msg.t);
+          }
           if (msg.kind === "navigate-error") {
             setNavigateError(
               NAVIGATE_ERROR_MESSAGES[msg.reason] ??
@@ -145,7 +176,9 @@ export function useCdpInput({
       ws.addEventListener("close", (event) => {
         console.log("[cdp-input] WebSocket closed", event.code, event.reason);
         if (inputSocketRef.current !== ws) return;
+        clearInputPingTimer();
         setInputReady(false);
+        setInputRttMs(null);
         userIsControllingRef.current = false;
         setUserIsControlling(false);
         inputSocketRef.current = null;
@@ -189,15 +222,20 @@ export function useCdpInput({
         clearTimeout(inputReconnectTimerRef.current);
         inputReconnectTimerRef.current = null;
       }
+      clearInputPingTimer();
       if (inputSocketRef.current) {
         inputSocketRef.current.close();
         inputSocketRef.current = null;
       }
+      cancelPendingMouseMove();
     };
   }, [interactive, inputWsUrl, credentialGetter, clientId]);
 
   useEffect(() => {
     userIsControllingRef.current = userIsControlling;
+    return () => {
+      cancelPendingMouseMove();
+    };
   }, [userIsControlling]);
 
   useEffect(() => {
@@ -316,8 +354,18 @@ export function useCdpInput({
     ws.send(JSON.stringify(payload));
   }, []);
 
+  const flushMouseMove = useCallback(() => {
+    mouseMoveAnimationFrameRef.current = null;
+    const payload = pendingMouseMoveRef.current;
+    pendingMouseMoveRef.current = null;
+    if (payload) {
+      sendInputEvent(payload);
+    }
+  }, [sendInputEvent]);
+
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
+      cancelPendingMouseMove();
       if (!interactive || !userIsControlling) return;
       const coords = mapMouseCoordinates(e, viewportWidth, viewportHeight);
       if (!coords) return;
@@ -342,6 +390,7 @@ export function useCdpInput({
 
   const handleMouseUp = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
+      cancelPendingMouseMove();
       if (!interactive || !userIsControlling) return;
       const coords = mapMouseCoordinates(e, viewportWidth, viewportHeight);
       if (!coords) return;
@@ -367,12 +416,9 @@ export function useCdpInput({
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
       if (!interactive || !userIsControlling) return;
-      const now = Date.now();
-      if (now - lastMouseMoveRef.current < 50) return;
-      lastMouseMoveRef.current = now;
       const coords = mapMouseCoordinates(e, viewportWidth, viewportHeight);
       if (!coords) return;
-      sendInputEvent({
+      const payload = {
         type: "mouseEvent",
         eventType: "mouseMoved",
         x: coords.x,
@@ -380,13 +426,28 @@ export function useCdpInput({
         button: "none",
         clickCount: 0,
         modifiers: getModifiers(e),
-      });
+      };
+      const ws = inputSocketRef.current;
+      if (
+        ws?.readyState === WebSocket.OPEN &&
+        ws.bufferedAmount > MOUSE_MOVE_BUFFER_THRESHOLD
+      ) {
+        pendingMouseMoveRef.current = payload;
+        if (mouseMoveAnimationFrameRef.current === null) {
+          mouseMoveAnimationFrameRef.current =
+            requestAnimationFrame(flushMouseMove);
+        }
+        return;
+      }
+      cancelPendingMouseMove();
+      sendInputEvent(payload);
     },
     [
       interactive,
       userIsControlling,
       viewportWidth,
       viewportHeight,
+      flushMouseMove,
       sendInputEvent,
     ],
   );
@@ -479,6 +540,7 @@ export function useCdpInput({
     userIsControlling,
     setUserIsControlling,
     inputReady,
+    inputRttMs,
     containerRef,
     handlers: {
       handleMouseDown,
