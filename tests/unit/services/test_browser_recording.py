@@ -268,14 +268,20 @@ def make_streaming_console_input(
     input_value: str,
     target_id: str = "email",
     target_text: str = "Email",
+    input_type: str | None = None,
+    autocomplete: str | None = None,
 ) -> list[StreamingExfiltratedEvent]:
-    target = {
+    target: dict[str, t.Any] = {
         "id": target_id,
         "skyId": "sky-email",
         "tagName": "INPUT",
         "text": [target_text],
         "value": input_value,
     }
+    if input_type is not None:
+        target["inputType"] = input_type
+    if autocomplete is not None:
+        target["autocomplete"] = autocomplete
     common = {
         "target": target,
         "timestamp": timestamp_ms,
@@ -884,3 +890,299 @@ def test_decompress_returns_bytes_for_valid_payload() -> None:
     payload = base64.b64encode(gzip.compress(raw)).decode("ascii")
 
     assert processor.decompress(payload) == raw
+
+
+def make_keydown_event(target: dict[str, t.Any], timestamp: float, key: str = "a") -> ExfiltratedConsoleEvent:
+    return make_console_event(
+        params={"type": "keydown", "key": key, "target": target, "timestamp": timestamp},
+        timestamp=timestamp,
+    )
+
+
+def make_blur_event(target: dict[str, t.Any], timestamp: float) -> ExfiltratedConsoleEvent:
+    return make_console_event(
+        params={"type": "blur", "target": target, "timestamp": timestamp},
+        timestamp=timestamp,
+    )
+
+
+def test_is_secret_field_and_credential_kind() -> None:
+    from skyvern.services.browser_recording.redact import credential_kind_for_target, is_secret_field
+
+    assert is_secret_field("password", None) is True
+    assert is_secret_field("text", "one-time-code") is True
+    assert is_secret_field("text", "cc-number") is True
+    assert is_secret_field("text", "username current-password") is True
+    assert is_secret_field("email", None) is False
+    assert is_secret_field("text", "off") is False
+    assert is_secret_field("text", "username") is False
+
+    assert credential_kind_for_target("password", None) == "password"
+    assert credential_kind_for_target("text", "current-password") == "password"
+    assert credential_kind_for_target("text", "one-time-code") == "totp"
+    assert credential_kind_for_target("text", "cc-number") == "credit_card"
+    assert credential_kind_for_target("email", None) is None
+    assert credential_kind_for_target("text", "off") is None
+
+
+def test_reify_strips_secret_values_from_console_events() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    events = processor.reify(
+        [
+            {
+                "kind": "exfiltrated-event",
+                "event_name": "user_interaction",
+                "source": "console",
+                "timestamp": 1.0,
+                "params": {
+                    "type": "keydown",
+                    "key": "h",
+                    "code": "KeyH",
+                    "inputValue": "hunter2",
+                    "url": "https://example.com/login",
+                    "timestamp": 1000.0,
+                    "target": {
+                        "tagName": "INPUT",
+                        "id": "password",
+                        "skyId": "sky-pw",
+                        "inputType": "password",
+                        "value": "hunter2",
+                        "text": ["Password"],
+                    },
+                    "activeElement": {"tagName": "INPUT"},
+                    "window": {"height": 800, "width": 1200, "scrollX": 0, "scrollY": 0},
+                    "mousePosition": {"xp": 0.5, "yp": 0.5},
+                },
+            }
+        ]
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, ExfiltratedConsoleEvent)
+    assert event.params.target.value is None
+    assert event.params.inputValue is None
+    assert event.params.key is None
+    assert event.params.code is None
+    assert event.params.target.inputType == "password"
+
+
+def test_password_fill_still_emits_empty_input_text() -> None:
+    target = {
+        "id": "password",
+        "skyId": "sky-pw",
+        "tagName": "INPUT",
+        "text": ["Password"],
+        "inputType": "password",
+        "value": None,
+    }
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1001.0),
+        make_blur_event(target=target, timestamp=1002.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, ActionInputText)
+    assert action.input_value == ""
+    assert action.target.input_type == "password"
+
+
+def test_password_submitted_with_enter_still_emits_input_text() -> None:
+    """Enter-to-submit never blurs before navigating, so the Enter keydown is the only emit signal.
+
+    Redacting it along with the character keystrokes silently drops the whole password step.
+    """
+    target = {
+        "id": "password",
+        "skyId": "sky-pw",
+        "tagName": "INPUT",
+        "text": ["Password"],
+        "inputType": "password",
+        "value": None,
+    }
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    # Enter through reify(), not events_to_actions(): ingest redaction runs there, so a test
+    # below it would pass even with the Enter keydown stripped.
+    events = processor.reify(
+        [
+            make_focus_event(target=target, timestamp=1000.0).model_dump(),
+            make_keydown_event(target=target, timestamp=1001.0, key="s").model_dump(),
+            make_keydown_event(target=target, timestamp=1002.0, key="Enter").model_dump(),
+        ]
+    )
+    actions = processor.events_to_actions(events)
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, ActionInputText)
+    assert action.input_value == ""
+    assert action.target.input_type == "password"
+
+
+def test_secret_character_keystrokes_still_redacted() -> None:
+    from skyvern.services.browser_recording.redact import redact_console_event
+
+    target = {"id": "password", "tagName": "INPUT", "inputType": "password", "value": "hunter2"}
+
+    typed = redact_console_event(make_keydown_event(target=target, timestamp=1.0, key="s"))
+    assert typed.params.key is None
+    assert typed.params.code is None
+    assert typed.params.target.value is None
+
+    submit = redact_console_event(make_keydown_event(target=target, timestamp=2.0, key="Enter"))
+    assert submit.params.key == "Enter"
+    assert submit.params.target.value is None
+
+
+def test_non_secret_empty_value_still_skipped() -> None:
+    target = {
+        "id": "email",
+        "skyId": "sky-email",
+        "tagName": "INPUT",
+        "text": ["Email"],
+        "inputType": "email",
+        "value": None,
+    }
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1001.0),
+        make_blur_event(target=target, timestamp=1002.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    assert processor.events_to_actions(events) == []
+
+
+@pytest.mark.asyncio
+async def test_password_ingest_emits_redacted_draft_with_credential_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_llm(*args: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:
+        raise RuntimeError("llm unavailable")
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", failing_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    session.ingest_events(
+        make_streaming_console_input(
+            timestamp_ms=1000.0,
+            input_value="hunter2",
+            target_id="password",
+            target_text="Password",
+            input_type="password",
+        )
+    )
+    steps = await session.flush()
+
+    assert len(steps) == 1
+    assert steps[0].credential_kind == "password"
+    assert "hunter2" not in (steps[0].title or "")
+    assert "hunter2" not in (steps[0].navigation_goal or "")
+    stored = session.events
+    for event in stored:
+        if isinstance(event, ExfiltratedConsoleEvent):
+            assert event.params.target.value != "hunter2"
+            assert event.params.inputValue != "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_create_action_block_prompt_omits_secret_keeps_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    captured: dict[str, str] = {}
+
+    async def fake_llm(*, prompt: str, prompt_name: str, organization_id: str) -> dict[str, t.Any]:
+        captured[prompt_name] = prompt
+        return {"block_label": "fill", "title": "Fill", "prompt": "Fill the field."}
+
+    monkeypatch.setattr(svc, "_recording_enrichment_llm_handler", lambda: fake_llm)
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+
+    await processor.create_action_block(
+        ActionInputText(
+            kind=ActionKind.INPUT_TEXT,
+            target=ActionTarget(
+                id="password",
+                sky_id="sky-pw",
+                tag_name="INPUT",
+                texts=["Password"],
+                input_type="password",
+                mouse=Mouse(xp=0.5, yp=0.5),
+            ),
+            timestamp_start=1000.0,
+            timestamp_end=1001.0,
+            url="https://example.com/login",
+            input_value="hunter2",
+        )
+    )
+    assert "hunter2" not in captured["recording-action-block-prompt-input-text"]
+
+    captured.clear()
+    await processor.create_action_block(
+        ActionInputText(
+            kind=ActionKind.INPUT_TEXT,
+            target=ActionTarget(
+                id="email",
+                sky_id="sky-email",
+                tag_name="INPUT",
+                texts=["Email"],
+                input_type="email",
+                mouse=Mouse(xp=0.5, yp=0.5),
+            ),
+            timestamp_start=1000.0,
+            timestamp_end=1001.0,
+            url="https://example.com/login",
+            input_value="user@example.com",
+        )
+    )
+    assert "user@example.com" in captured["recording-action-block-prompt-input-text"]
+
+
+@pytest.mark.asyncio
+async def test_otp_autocomplete_ingest_redacts_and_stamps_totp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_llm(*args: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:
+        raise RuntimeError("llm unavailable")
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", failing_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+    session.ingest_events(
+        make_streaming_console_input(
+            timestamp_ms=1000.0,
+            input_value="654321",
+            target_id="otp",
+            target_text="Code",
+            input_type="text",
+            autocomplete="one-time-code",
+        )
+    )
+    steps = await session.flush()
+
+    assert len(steps) == 1
+    assert steps[0].credential_kind == "totp"
+    assert "654321" not in (steps[0].navigation_goal or "")
