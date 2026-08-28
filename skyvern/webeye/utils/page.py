@@ -11,7 +11,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -1014,17 +1014,28 @@ def _close_screenshot_stitch_resources(
 _SAME_ORIGIN_FETCH_JS = """
 async (args) => {
     try {
-        const { url, maxSizeBytes } = args;
-        const response = await fetch(url);
+        const { url, maxSizeBytes, headers, redirect } = args;
+        const response = await fetch(url, { headers: headers || {}, redirect: redirect || 'follow' });
         if (!response.ok) {
             return { ok: false, status: response.status };
         }
-        const blob = await response.blob();
-        // Reject oversized blobs before serializing them to a data URL, so a huge
-        // client-side blob can't be read fully into memory / base64-transcoded.
-        if (maxSizeBytes != null && blob.size > maxSizeBytes) {
-            return { ok: false, error: 'too_large', size: blob.size };
+        if (!response.body) return { ok: false, error: 'no_readable_stream' };
+        const reader = response.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+                total += value.byteLength;
+                chunks.push(value);
+                if (maxSizeBytes != null && total > maxSizeBytes) {
+                    await reader.cancel();
+                    return { ok: false, error: 'too_large', size: total };
+                }
+            }
         }
+        const blob = new Blob(chunks);
         return await new Promise((resolve) => {
             const reader = new FileReader();
             reader.onloadend = () => {
@@ -1644,7 +1655,7 @@ class SkyvernFrame:
             return None
 
         # blob.size is checked in-page against this before the payload is serialized.
-        blob_arg = {"url": blob_url, "maxSizeBytes": max_size_bytes}
+        blob_arg: dict[str, Any] = {"url": blob_url, "maxSizeBytes": max_size_bytes}
         main_frame = page.main_frame
         for frame in frames:
             try:
@@ -1707,6 +1718,8 @@ class SkyvernFrame:
         workflow_run_id: str | None = None,
         max_size_bytes: int | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        headers: dict[str, str] | None = None,
+        redirect: Literal["follow", "error"] = "follow",
     ) -> bytes | None:
         """Fetch an http(s) URL's bytes via an in-page fetch() inside a same-origin frame.
 
@@ -1728,7 +1741,9 @@ class SkyvernFrame:
             return None
 
         # _SAME_ORIGIN_FETCH_JS is a plain fetch(); reused here for http(s) recovery.
-        fetch_arg = {"url": url, "maxSizeBytes": max_size_bytes}
+        fetch_arg: dict[str, Any] = {"url": url, "maxSizeBytes": max_size_bytes, "redirect": redirect}
+        if headers:
+            fetch_arg["headers"] = headers
         main_frame = page.main_frame
         for frame in frames:
             # Route the main frame through the Page so SkyvernFrame.evaluate can attach any
