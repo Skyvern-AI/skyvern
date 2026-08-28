@@ -242,6 +242,7 @@ function BrowserSessionStream({
     userIsControlling,
     setUserIsControlling,
     inputReady,
+    inputRttMs,
     containerRef,
     handlers,
     navigate,
@@ -257,6 +258,8 @@ function BrowserSessionStream({
     onClipboardCopy:
       exfiltrate && isMessageConnected ? onClipboardCopy : undefined,
   });
+  const inputRttMsRef = useRef(inputRttMs);
+  inputRttMsRef.current = inputRttMs;
 
   useEffect(() => {
     const recordingStarted =
@@ -327,6 +330,7 @@ function BrowserSessionStream({
             samples.length,
           fps_min: Math.min(...samples),
           sample_count: samples.length,
+          input_rtt_ms: inputRttMsRef.current,
         });
         if (recordingHealthFlushTimerRef.current === flushTimer) {
           recordingHealthFlushTimerRef.current = null;

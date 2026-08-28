@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 from bs4 import BeautifulSoup
-from playwright.async_api import Route, async_playwright
+from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -64,6 +65,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
 from skyvern.forge.sdk.copilot.tools.composition_capture import _model_facing_inspect_result
@@ -3517,7 +3519,12 @@ def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _capture_live_dom(
-    url: str, html: str, wait_selector: str, *, rendered_style_snapshot: bool = False
+    url: str,
+    html: str,
+    wait_selector: str,
+    *,
+    rendered_style_snapshot: bool = False,
+    interact: Callable[[Page], Awaitable[None]] | None = None,
 ) -> tuple[str, str]:
     async def _handle(route: Route) -> None:
         if route.request.url == url:
@@ -3532,6 +3539,8 @@ async def _capture_live_dom(
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_selector(wait_selector)
+        if interact is not None:
+            await interact(page)
         raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
         content = (
             await page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION)
@@ -6690,3 +6699,158 @@ def test_parsed_dismiss_controls_offer_selector_sources_in_the_browser_rung_orde
         "class_type",
         "structural",
     ]
+
+
+_OBSERVED_STATE_URL = "https://test.example.com/booking"
+_OBSERVED_STATE_HTML = """<!DOCTYPE html>
+<html><body>
+  <form id="booking">
+    <label for="depart">Depart date</label>
+    <input type="date" id="depart" name="depart" />
+    <label for="cabin">Cabin</label>
+    <select id="cabin" name="cabin">
+      <option value="economy" selected>Economy</option>
+      <option value="business">Business</option>
+    </select>
+    <label for="insured">Add insurance</label>
+    <input type="checkbox" id="insured" name="insured" />
+    <label for="pw">Password</label>
+    <input type="password" id="pw" name="pw" />
+    <label for="note">Notes</label>
+    <textarea type="date" id="note" name="note"></textarea>
+    <button type="submit">Book</button>
+  </form>
+</body></html>
+"""
+_OBSERVED_STATE_SECRET = "hunter2-not-a-real-secret"
+
+
+async def _fill_booking_form(page: Page) -> None:
+    await page.fill("#depart", "2026-09-14")
+    await page.select_option("#cabin", "business")
+    await page.check("#insured")
+    await page.fill("#pw", _OBSERVED_STATE_SECRET)
+    await page.fill("#note", _OBSERVED_STATE_SECRET)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_field_state_the_agent_produced_survives_capture_while_markup_attributes_do_not() -> None:
+    raw, _ = await _capture_live_dom(_OBSERVED_STATE_URL, _OBSERVED_STATE_HTML, "#depart", interact=_fill_booking_form)
+    captured = {entry["name"]: entry for entry in json.loads(raw)["forms"][0]["fields"]}
+    assert captured["depart"]["observed_value"] == "2026-09-14"
+    assert captured["note"]["type"] == "date"
+    assert "observed_value" not in captured["note"]
+
+    parsed = parse_composition_structured(
+        json.loads(raw), inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL
+    )
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert fields["depart"]["value"] == ""
+    assert fields["depart"]["observed_value"] == "2026-09-14"
+    assert fields["insured"]["checked"] is False
+    assert fields["insured"]["observed_checked"] is True
+    cabin_options = {option["value"]: option for option in fields["cabin"]["options"]}
+    assert cabin_options["economy"]["selected"] is True
+    assert cabin_options["economy"]["observed_selected"] is False
+    assert cabin_options["business"]["selected"] is False
+    assert cabin_options["business"]["observed_selected"] is True
+
+    assert "observed_value" not in fields["pw"]
+    assert "observed_checked" not in fields["pw"]
+    assert fields["note"]["type"] == "date"
+    assert "observed_value" not in fields["note"]
+    assert _OBSERVED_STATE_SECRET not in json.dumps(parsed)
+
+    assert _runtime_form_summaries(parsed["forms"]) == [
+        "Depart date date 2026-09-14",
+        "Cabin select Business",
+        "Add insurance checkbox checked",
+        "Password password",
+        "Notes date",
+    ]
+
+
+def test_a_structured_packet_claiming_an_observed_password_value_is_not_admitted() -> None:
+    payload = {
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "name": "pw",
+                        "type": "password",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "name": "note",
+                        "type": "textarea",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "liar",
+                        "type": "date",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "checkliar",
+                        "type": "checkbox",
+                        "observed_checked": True,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "depart",
+                        "type": "date",
+                        "observed_value": "2026-09-14",
+                        "identity": {"tag": "input"},
+                    },
+                ]
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL)
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert "observed_value" not in fields["pw"]
+    assert "observed_value" not in fields["note"]
+    assert "observed_value" not in fields["liar"]
+    assert "observed_checked" not in fields["checkliar"]
+    assert fields["depart"]["observed_value"] == "2026-09-14"
+    assert _OBSERVED_STATE_SECRET not in json.dumps(parsed)
+
+
+def test_a_structured_packet_claiming_an_observed_option_on_a_non_select_is_not_admitted() -> None:
+    payload = {
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "name": "liar",
+                        "type": "select",
+                        "identity": {"tag": "div"},
+                        "options": [{"text": _OBSERVED_STATE_SECRET, "observed_selected": True}],
+                    },
+                    {
+                        "name": "depart",
+                        "type": "select",
+                        "identity": {"tag": "select"},
+                        "options": [{"text": "2026-09-14", "observed_selected": True}],
+                    },
+                ]
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL)
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert all("observed_selected" not in option for option in fields["liar"]["options"])
+    assert fields["depart"]["options"][0]["observed_selected"] is True
+    assert fields["liar"]["option_count"] == 1

@@ -965,6 +965,10 @@ class AgentFunction:
         """
         return True
 
+    async def is_record_browser_v2_enabled(self, organization_id: str | None) -> bool:
+        """Record Browser v2 (no page scripts). Self-hosted deployments run v1."""
+        return False
+
     async def resolve_stream_transport(
         self, *, browser_session_id: str | None, organization_id: str | None, ip_address: str | None = None
     ) -> str:

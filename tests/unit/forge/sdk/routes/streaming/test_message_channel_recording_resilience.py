@@ -18,6 +18,8 @@ never skips the draft flush or the channel close.
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 import typing as t
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
@@ -28,7 +30,15 @@ from playwright._impl._errors import Error as PlaywrightError
 from starlette.websockets import WebSocketState
 
 from skyvern.forge.sdk.routes.streaming.channels import message as message_module
-from skyvern.forge.sdk.routes.streaming.channels.message import MessageKind, MessageOutError, loop_stream_messages
+from skyvern.forge.sdk.routes.streaming.channels.message import (
+    MessageKind,
+    MessageOutError,
+    MessageOutRecordingCommitted,
+    loop_stream_messages,
+)
+from skyvern.services.browser_recording.types import ActionKind
+from skyvern.services.browser_recording.v2.ledger import Gesture, get_ledger, stop_ledger
+from skyvern.services.browser_recording.v2.session import discard_session_v2, get_session_v2
 
 PBS_ID = "pbs_123"
 WP_ID = "wpid_123"
@@ -43,7 +53,7 @@ END_EXFILTRATION_DATA = {"kind": MessageKind.END_EXFILTRATION.value}
 RECORDING_REARM_CAPTURE_DATA = {"kind": MessageKind.RECORDING_REARM_CAPTURE.value}
 
 
-def _message_channel(receive_sequence: list[object]) -> MagicMock:
+def _message_channel(receive_sequence: t.Iterable[object]) -> MagicMock:
     """A MessageChannel double whose websocket replays ``receive_sequence``."""
     message_channel = MagicMock()
     message_channel.class_name = "MessageChannel"
@@ -375,3 +385,297 @@ async def test_recording_round_trip_still_works_when_target_is_healthy(
     registry.stop_session.assert_awaited_once_with(PBS_ID)
     assert _sent_error_kinds(message_channel) == []
     message_channel.close.assert_awaited_once()
+
+
+class _FakeV2Session:
+    def __init__(self, sealed: bool = False) -> None:
+        self.browser_session_id = PBS_ID
+        self.sealed = sealed
+        self.paused = 0
+        self.resumed = 0
+        self.seals = 0
+
+    async def seal(self) -> list[object]:
+        self.sealed = True
+        self.seals += 1
+        return []
+
+    def pause(self) -> None:
+        self.paused += 1
+
+    def resume(self) -> None:
+        self.resumed += 1
+
+    async def stop_ticker(self) -> None:
+        return None
+
+
+def _set_record_browser_v2(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    agent_function = MagicMock()
+    agent_function.is_record_browser_v2_enabled = AsyncMock(return_value=enabled)
+    monkeypatch.setattr(message_module.app, "AGENT_FUNCTION", agent_function)
+
+
+@pytest.mark.asyncio
+async def test_begin_exfiltration_under_v2_starts_a_session_and_injects_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v2 owns the recording end to end: no ExfiltrationChannel, so no page scripts."""
+    exfiltration_channel_class = MagicMock()
+    message_channel = _message_channel([BEGIN_EXFILTRATION_DATA, END_EXFILTRATION_DATA, WebSocketDisconnect()])
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: MagicMock())
+    monkeypatch.setattr(message_module, "ExfiltrationChannel", exfiltration_channel_class)
+    registry = MagicMock()
+    monkeypatch.setattr(message_module, "interpretation_registry", registry)
+    _set_record_browser_v2(monkeypatch, True)
+
+    started: list[str] = []
+    session = _FakeV2Session()
+    monkeypatch.setattr(
+        message_module,
+        "get_session_v2",
+        lambda pbs_id: session if started else None,
+    )
+    monkeypatch.setattr(
+        message_module,
+        "start_session_v2",
+        lambda **kwargs: started.append(kwargs["browser_session_id"]),
+    )
+
+    await loop_stream_messages(message_channel)
+
+    assert started == [PBS_ID]
+    exfiltration_channel_class.assert_not_called()
+    registry.start_session.assert_not_called()
+    # end-exfiltration seals but keeps the session: its ledger is the commit's only input.
+    assert session.seals == 1
+    assert _sent_error_kinds(message_channel) == []
+
+
+RECORDING_COMMIT_DATA = {"kind": MessageKind.RECORDING_COMMIT.value, "mode": "blocks", "draft_steps": None}
+
+
+def _seed_click_gestures() -> None:
+    ledger = get_ledger(PBS_ID)
+    assert ledger is not None
+    for kind in ("mouse_pressed", "mouse_released"):
+        ledger.append(
+            Gesture(
+                seq=0,
+                t_received=1.0,
+                kind=kind,
+                page_key="page-1",
+                url="https://example.test/form",
+                x=1,
+                y=2,
+                button="left",
+                click_count=1,
+                selector="#search",
+                role="button",
+                accessible_name="Search",
+            )
+        )
+
+
+def _commit_script(commits: int) -> t.Iterator[object]:
+    """begin -> record a click -> end -> commit, as the panel drives it."""
+    yield BEGIN_EXFILTRATION_DATA
+    _seed_click_gestures()
+    yield END_EXFILTRATION_DATA
+    for _ in range(commits):
+        yield RECORDING_COMMIT_DATA
+    yield WebSocketDisconnect()
+
+
+def _committed_messages(message_channel: MagicMock) -> list[MessageOutRecordingCommitted]:
+    return [
+        sent
+        for call in message_channel.send_nowait.call_args_list
+        for sent in call.kwargs.get("messages", [])
+        if isinstance(sent, MessageOutRecordingCommitted)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recording_commit_renders_the_sealed_session_then_drops_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The commit rides the messages socket because the ledger is process-local (plan §5 PR-6)."""
+    message_channel = _message_channel(_commit_script(commits=2))
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: MagicMock())
+    monkeypatch.setattr(message_module, "ExfiltrationChannel", MagicMock())
+    monkeypatch.setattr(message_module, "interpretation_registry", MagicMock())
+    _set_record_browser_v2(monkeypatch, True)
+
+    try:
+        await loop_stream_messages(message_channel)
+    finally:
+        discard_session_v2(PBS_ID)
+        stop_ledger(PBS_ID)
+
+    committed = _committed_messages(message_channel)
+    assert len(committed) == 1
+    assert committed[0].mode == "blocks"
+    assert [block["block_type"] for block in committed[0].blocks] == ["action"]
+    # The committed recording is gone: the second commit finds nothing to render.
+    assert get_session_v2(PBS_ID) is None
+    assert get_ledger(PBS_ID) is None
+    assert _sent_error_kinds(message_channel) == [MessageKind.RECORDING_COMMIT.value]
+
+
+@pytest.mark.asyncio
+async def test_v2_teardown_still_finds_the_session_after_browser_session_goes_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """message_channel.browser_session can flip to None mid-recording (loop_verify_browser_session
+    clears it on timeout/finalize without closing the socket). Teardown must still locate and
+    seal the live v2 session instead of leaking it forever."""
+    message_channel = _message_channel([BEGIN_EXFILTRATION_DATA, WebSocketDisconnect()])
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: MagicMock())
+    monkeypatch.setattr(message_module, "ExfiltrationChannel", MagicMock())
+    monkeypatch.setattr(message_module, "interpretation_registry", MagicMock())
+    _set_record_browser_v2(monkeypatch, True)
+
+    session = _FakeV2Session(sealed=True)
+    monkeypatch.setattr(message_module, "get_session_v2", lambda pbs_id: session)
+    monkeypatch.setattr(
+        message_module, "start_session_v2", lambda **kwargs: message_channel.__setattr__("browser_session", None)
+    )
+    discarded: list[str] = []
+    monkeypatch.setattr(message_module, "discard_session_v2", lambda pbs_id: discarded.append(pbs_id))
+
+    await loop_stream_messages(message_channel)
+
+    assert discarded == [PBS_ID]
+
+
+@pytest.mark.asyncio
+async def test_begin_exfiltration_with_v2_disabled_takes_the_v1_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    channel = _started_channel()
+    message_channel = _message_channel([BEGIN_EXFILTRATION_DATA, END_EXFILTRATION_DATA, WebSocketDisconnect()])
+    registry = _install_recording_doubles(monkeypatch, channel=channel)
+    _set_record_browser_v2(monkeypatch, False)
+
+    started: list[str] = []
+    monkeypatch.setattr(message_module, "start_session_v2", lambda **kwargs: started.append("v2"))
+
+    await loop_stream_messages(message_channel)
+
+    assert started == []
+    channel.start.assert_awaited_once()
+    registry.start_session.assert_called_once()
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+
+
+@pytest.mark.asyncio
+async def test_stale_v2_session_does_not_hijack_a_v1_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The socket latches its recorder at begin-exfiltration; the v2 registry is not the switch."""
+    channel = _started_channel()
+    message_channel = _message_channel([BEGIN_EXFILTRATION_DATA, END_EXFILTRATION_DATA, WebSocketDisconnect()])
+    registry = _install_recording_doubles(monkeypatch, channel=channel)
+    _set_record_browser_v2(monkeypatch, False)
+
+    stale = _FakeV2Session()
+    monkeypatch.setattr(message_module, "get_session_v2", lambda pbs_id: stale)
+
+    await loop_stream_messages(message_channel)
+
+    assert stale.seals == 0
+    channel.stop.assert_awaited_once()
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+
+
+@pytest.mark.asyncio
+async def test_a_mid_socket_flag_flip_does_not_start_a_second_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
+    channel = _started_channel()
+    message_channel = _message_channel(
+        [BEGIN_EXFILTRATION_DATA, BEGIN_EXFILTRATION_DATA, END_EXFILTRATION_DATA, WebSocketDisconnect()]
+    )
+    registry = _install_recording_doubles(monkeypatch, channel=channel)
+
+    agent_function = MagicMock()
+    agent_function.is_record_browser_v2_enabled = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(message_module.app, "AGENT_FUNCTION", agent_function)
+    started: list[str] = []
+    monkeypatch.setattr(message_module, "start_session_v2", lambda **kwargs: started.append("v2"))
+
+    await loop_stream_messages(message_channel)
+
+    assert started == []
+    assert agent_function.is_record_browser_v2_enabled.await_count == 1
+    message_module.ExfiltrationChannel.assert_called_once()
+    channel.rearm_all_pages.assert_awaited_once()
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+
+
+@pytest.mark.asyncio
+async def test_v2_recording_reaches_the_panel_as_epoch_stamped_draft_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end over the real v2 session: a ledger row becomes a panel-ready draft step."""
+    message_channel = _message_channel([])
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: MagicMock())
+    monkeypatch.setattr(message_module, "ExfiltrationChannel", MagicMock())
+    monkeypatch.setattr(message_module, "interpretation_registry", MagicMock())
+    _set_record_browser_v2(monkeypatch, True)
+    receive_count = 0
+
+    async def receive_json() -> dict[str, str]:
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return BEGIN_EXFILTRATION_DATA
+        if receive_count == 2:
+            ledger = get_ledger(PBS_ID)
+            assert ledger is not None
+            ledger.append(
+                Gesture(
+                    seq=0,
+                    t_received=time.monotonic(),
+                    kind="mouse_pressed",
+                    page_key="page-1",
+                    url="https://example.test/form",
+                    x=1,
+                    y=2,
+                    button="left",
+                    click_count=1,
+                    accessible_name="Search",
+                )
+            )
+            ledger.append(
+                Gesture(
+                    seq=0,
+                    t_received=time.monotonic(),
+                    kind="key",
+                    page_key="page-1",
+                    url="https://example.test/form",
+                    key="s",
+                    text="hunter2",
+                    key_event_type="keyDown",
+                    accessible_name="Search",
+                )
+            )
+            return END_EXFILTRATION_DATA
+        raise WebSocketDisconnect()
+
+    message_channel.websocket.receive_json = receive_json
+
+    try:
+        await loop_stream_messages(message_channel)
+    finally:
+        discard_session_v2(PBS_ID)
+        stop_ledger(PBS_ID)
+
+    updates = [
+        sent
+        for call in message_channel.send_nowait.call_args_list
+        for sent in call.kwargs.get("messages", [])
+        if isinstance(sent, message_module.MessageOutRecordingInterpretationUpdate)
+    ]
+    assert updates[-1].finalized is True
+    steps = updates[-1].steps
+    assert [(step.action_kind, step.label, step.navigation_goal) for step in steps] == [
+        (ActionKind.CLICK, "Click Search", "Click Search"),
+        (ActionKind.INPUT_TEXT, "Type into Search", "Type into Search"),
+    ]
+    now_epoch_ms = time.time() * 1000
+    assert all(abs(now_epoch_ms - (step.timestamp_start or 0)) < 60_000 for step in steps)
+    assert "hunter2" not in json.dumps([step.model_dump() for step in steps])

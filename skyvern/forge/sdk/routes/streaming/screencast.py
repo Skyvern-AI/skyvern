@@ -15,6 +15,7 @@ from opentelemetry import metrics
 from playwright.async_api import CDPSession
 
 from skyvern.forge import app
+from skyvern.forge.sdk.routes.streaming import latency_probe
 from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
 from skyvern.webeye.browser_state import BrowserState
 
@@ -255,6 +256,8 @@ async def start_screencast_loop(
         asyncio.create_task(_ack_frame(session, params.get("sessionId", 0)))
         if session is not cdp_session:
             return
+        if entity_type == "browser_session":
+            latency_probe.note_frame(entity_id, received_at)
         metadata = params.get("metadata", {})
         if metadata:
             _update_viewport_from_metadata(metadata)

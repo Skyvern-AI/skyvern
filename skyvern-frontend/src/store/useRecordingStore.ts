@@ -259,6 +259,11 @@ interface RecordingStore {
    */
   recordingAttemptId: string | null;
   /**
+   * The open message socket, published by useRecordingMessageChannel. The v2
+   * commit rides this socket because the ledger is local to the pod behind it.
+   */
+  messageSocket: WebSocket | null;
+  /**
    * Latest live-interpretation snapshot from the backend. Snapshots are
    * full replacements keyed by monotonically increasing session revision.
    */
@@ -349,6 +354,7 @@ interface RecordingStore {
     },
   ) => void;
   setRecordingTransport: (transport: RecordingTransport) => void;
+  setMessageSocket: (socket: WebSocket | null) => void;
   /**
    * Flush any pending events into a compressed chunk.
    * Call this before consuming the data.
@@ -529,6 +535,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   recordingTransport: "vnc",
   workflowPermanentId: null,
   recordingAttemptId: null,
+  messageSocket: null,
   draftSteps: [],
   interpretationSessionId: null,
   sessionRevision: 0,
@@ -772,6 +779,10 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     if (!get().isRecording) {
       set({ recordingTransport });
     }
+  },
+
+  setMessageSocket: (messageSocket) => {
+    set({ messageSocket });
   },
 
   setIsRecording: (isRecording, meta) => {

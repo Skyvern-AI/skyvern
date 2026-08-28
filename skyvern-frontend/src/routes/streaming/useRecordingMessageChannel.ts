@@ -6,6 +6,7 @@ import {
   useRecordingStore,
   type ExfiltratedEventConsoleParams,
   type MessageInExfiltratedEvent,
+  type RecordingDraftStep,
   type RecordingInterpretationUpdate,
 } from "@/store/useRecordingStore";
 import { copyText } from "@/util/copyText";
@@ -105,6 +106,7 @@ const messageInKinds = [
   "copied-text",
   "error",
   "exfiltrated-event",
+  "recording-committed",
   "recording-interpretation-update",
 ] as const;
 
@@ -129,11 +131,23 @@ interface MessageInRecordingInterpretationUpdate extends RecordingInterpretation
   kind: "recording-interpretation-update";
 }
 
+export interface RecordingCommitResult {
+  blocks: Array<unknown>;
+  parameters: Array<unknown>;
+  mode: string;
+  diagnostics: Record<string, number>;
+}
+
+interface MessageInRecordingCommitted extends RecordingCommitResult {
+  kind: "recording-committed";
+}
+
 type MessageIn =
   | MessageInCopiedText
   | MessageInError
   | MessageInAskForClipboard
   | MessageInExfiltratedEvent
+  | MessageInRecordingCommitted
   | MessageInRecordingInterpretationUpdate;
 
 function getMessage(data: unknown): MessageIn | undefined {
@@ -210,6 +224,9 @@ function getMessage(data: unknown): MessageIn | undefined {
         } as MessageInExfiltratedEvent;
       }
       break;
+    }
+    case "recording-committed": {
+      return data as MessageInRecordingCommitted;
     }
     case "recording-interpretation-update": {
       // steps is optional: a delta update carries changed_steps instead. Only
@@ -408,6 +425,10 @@ function handleMessage(
       store.add(message);
       break;
     }
+    case "recording-committed": {
+      // commitRecordingOverMessageSocket resolves this on its own listener.
+      break;
+    }
     case "recording-interpretation-update": {
       useRecordingStore.getState().applyInterpretationUpdate({
         interpretation_session_id: message.interpretation_session_id,
@@ -425,6 +446,72 @@ function handleMessage(
       return _exhaustive;
     }
   }
+}
+
+const COMMIT_TIMEOUT_MS = 60_000;
+
+// The v2 ledger is process-local to the pod holding this socket, so the commit rides
+// the socket rather than an HTTP POST that could land on another pod.
+export function commitRecordingOverMessageSocket(args: {
+  mode: "blocks" | "auto";
+  draftSteps: Array<RecordingDraftStep> | null;
+}): Promise<RecordingCommitResult> {
+  const socket = useRecordingStore.getState().messageSocket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(
+      new Error("The recording connection is not available; try again."),
+    );
+  }
+
+  return new Promise<RecordingCommitResult>((resolve, reject) => {
+    const settle = (outcome: () => void) => {
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      clearTimeout(timer);
+      outcome();
+    };
+
+    const onClose = () =>
+      settle(() =>
+        reject(
+          new Error("The recording connection closed before it finished."),
+        ),
+      );
+
+    const onMessage = (event: MessageEvent) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      const message = getMessage(parsed);
+      if (message?.kind === "recording-committed") {
+        settle(() => resolve(message));
+      } else if (
+        message?.kind === "error" &&
+        message.failed_kind === "recording-commit"
+      ) {
+        settle(() => reject(new Error(message.message)));
+      }
+    };
+
+    const timer = setTimeout(
+      () =>
+        settle(() => reject(new Error("Timed out processing the recording."))),
+      COMMIT_TIMEOUT_MS,
+    );
+
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose);
+    socket.send(
+      JSON.stringify({
+        kind: "recording-commit",
+        mode: args.mode,
+        draft_steps: args.draftSteps,
+      }),
+    );
+  });
 }
 
 export function useRecordingMessageChannel(
@@ -518,6 +605,10 @@ export function useRecordingMessageChannel(
       event: CloseEvent,
       disconnectedSocket: WebSocket | null,
     ) => {
+      const store = useRecordingStore.getState();
+      if (store.messageSocket === disconnectedSocket) {
+        store.setMessageSocket(null);
+      }
       if (
         disconnectedSocket === null ||
         messageSocketRef.current === disconnectedSocket
@@ -539,6 +630,7 @@ export function useRecordingMessageChannel(
 
       ws.onopen = () => {
         if (cancelled) return;
+        useRecordingStore.getState().setMessageSocket(ws);
         messageSocketRef.current = ws;
         setIsMessageConnected(true);
         setMessageSocket(ws);
@@ -595,6 +687,9 @@ export function useRecordingMessageChannel(
       ) {
         ws.send(JSON.stringify({ kind: "end-exfiltration" }));
         beganRef.current = false;
+      }
+      if (useRecordingStore.getState().messageSocket === ws) {
+        useRecordingStore.getState().setMessageSocket(null);
       }
       messageSocketRef.current = null;
       try {

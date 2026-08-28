@@ -542,3 +542,53 @@ def test_malformed_url_like_prose_does_not_raise() -> None:
     refs = mask_opaque_urls({"task_data": prose, "u": "http://[invalid?token=abcdefghijklmnop"})
     assert refs.masked == {"task_data": prose, "u": "http://[invalid?token=abcdefghijklmnop"}
     assert refs.refs == {}
+
+
+# OpaqueUrlRefs.mask masks free-text emit surfaces by PROVENANCE, not URL shape: only a URL the
+# payload masker minted is rewritten. A benign live-page URL is never touched — even one that is
+# itself signing-shaped (an ?token=<high-entropy> ATS landing page), which is exactly the false
+# positive the shape-only masker produced on the model's navigational anchor.
+FP_SIGNING_SHAPED_BENIGN_URL = "https://jobs.example.test/apply?token=abcdefABCDEF0123456789ghijklMNOPqrstuvwx"
+
+
+def test_mask_rewrites_known_payload_ref_in_prose() -> None:
+    refs = mask_opaque_urls({"file": SIGNED})
+    token = next(iter(refs.refs))
+    masked = refs.mask(f"could not download {SIGNED} — retry?")
+    assert "token=eyJhbGciOiJIUzI1NiJ9" not in masked
+    assert token in masked
+
+
+def test_mask_rewrites_whole_string_ref_to_its_payload_token() -> None:
+    refs = mask_opaque_urls({"file": SIGNED})
+    # Same token the payload masker minted for this URL, so an output surface and the payload agree.
+    assert refs.mask(SIGNED) == refs.masked["file"]
+
+
+def test_mask_leaves_signing_shaped_benign_url_untouched() -> None:
+    # The centerpiece false-positive guard: is_signed_url() flags this benign ATS URL, but it was
+    # never in the payload, so provenance masking must leave the model's live-page anchor intact.
+    assert is_signed_url(FP_SIGNING_SHAPED_BENIGN_URL) is True
+    refs = mask_opaque_urls({"file": SIGNED})
+    prose = f"you are on {FP_SIGNING_SHAPED_BENIGN_URL} now"
+    assert refs.mask(prose) == prose
+
+
+def test_mask_is_identity_without_refs() -> None:
+    empty = mask_opaque_urls(None)
+    assert empty.mask(f"download {SIGNED}") == f"download {SIGNED}"
+
+
+def test_mask_matches_html_entity_escaped_multiparam_ref() -> None:
+    # A multi-parameter presigned URL (the dominant signed-payload shape) is entity-escaped inside
+    # HTML (& -> &amp;), so the raw substring never appears in get_html output. The masker must still
+    # catch it via the escaped form, or the signing artifact leaks through get_html.
+    import html as html_mod
+
+    refs = mask_opaque_urls({"file": S3_STYLE_SIGNED})
+    token = next(iter(refs.refs))
+    page_html = f'<a href="{html_mod.escape(S3_STYLE_SIGNED, quote=False)}">download</a>'
+    assert "&amp;" in page_html
+    masked = refs.mask(page_html)
+    assert "X-Amz-Signature=" not in masked
+    assert token in masked

@@ -41,6 +41,8 @@ def create_forge_stub_app() -> ForgeApp:
     # the real OSS base no-op so unit tests exercise the legacy in-process path.
     fake_app_module.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
+    # Record Browser v2 fails closed to v1, but _LazyNamespace would auto-mock it truthy.
+    fake_app_module.AGENT_FUNCTION.is_record_browser_v2_enabled = AsyncMock(return_value=False)
     base_agent_function = AgentFunction()
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.

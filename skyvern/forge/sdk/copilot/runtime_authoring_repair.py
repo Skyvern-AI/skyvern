@@ -14,7 +14,12 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     is_carrier_backed_category_entry,
     typed_challenge_kind,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, model_visible_composition_evidence
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    OBSERVED_CHECKED_FIELD_TYPES,
+    OBSERVED_VALUE_FIELD_TYPES,
+    has_bounded_page_schema,
+    model_visible_composition_evidence,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
@@ -28,6 +33,7 @@ _RUNTIME_AUTHORING_REASON_CODE = "runtime_block_failure"
 _MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
+_OBSERVED_STATE_MAX_CHARS = 60
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _OBSTRUCTION_KEYS = ("kind", "text", "visual_location")
 _OBSTRUCTION_CONTROL_KEYS = ("text",)
@@ -159,22 +165,63 @@ def _runtime_summary_list(value: Any, keys: tuple[str, ...]) -> list[str]:
     return summaries
 
 
+def _observed_field_state(field: Any) -> tuple[str, bool]:
+    """Returns the rendered state and whether the control actually observed something.
+
+    An empty date or an unticked box still renders, so absence stays distinguishable from
+    no observation at all, but it must not outrank a filled control for a summary slot.
+    """
+    if not isinstance(field, dict):
+        return "", False
+    field_type = _bounded_runtime_text(field.get("type"), 40).lower()
+    identity = field.get("identity")
+    real_tag = _bounded_runtime_text(identity.get("tag"), 40).lower() if isinstance(identity, dict) else ""
+    if real_tag == "input" and field_type in OBSERVED_VALUE_FIELD_TYPES:
+        if "observed_value" not in field:
+            return "", False
+        observed_value = _bounded_runtime_text(field.get("observed_value"), _OBSERVED_STATE_MAX_CHARS)
+        return observed_value or "empty", bool(observed_value)
+    if real_tag == "input" and field_type in OBSERVED_CHECKED_FIELD_TYPES:
+        observed = field.get("observed_checked")
+        if not isinstance(observed, bool):
+            return "", False
+        return ("checked", True) if observed else ("unchecked", False)
+    if real_tag != "select":
+        return "", False
+    for option in field.get("options") or []:
+        if isinstance(option, dict) and option.get("observed_selected") is True:
+            text = _bounded_runtime_text(option.get("text"), _OBSERVED_STATE_MAX_CHARS)
+            selected = text or _bounded_runtime_text(option.get("value"), _OBSERVED_STATE_MAX_CHARS)
+            # A blank leading option is selected by default, so an empty one observed nothing.
+            return selected, bool(selected)
+    return "", False
+
+
 def _runtime_form_summaries(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    summaries: list[str] = []
+    observed: list[str] = []
+    plain: list[str] = []
     for form in value:
         if not isinstance(form, dict):
             continue
         for field in form.get("fields") or []:
             summary = _runtime_summary_entry(field, ("label", "type"))
-            if summary:
-                summaries.append(summary)
+            if not summary:
+                continue
+            state, informative = _observed_field_state(field)
+            entry = (
+                _bounded_runtime_text(f"{summary} {state}", _RUNTIME_SUMMARY_MAX_CHARS + _OBSERVED_STATE_MAX_CHARS + 1)
+                if state
+                else summary
+            )
+            (observed if informative else plain).append(entry)
         for control in form.get("submit_controls") or []:
             summary = _runtime_summary_entry(control, ("text", "disabled"))
             if summary:
-                summaries.append(summary)
-    return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
+                plain.append(summary)
+    # Fields that observed something lead so the item cap cannot drop them for earlier controls.
+    return (observed + plain)[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
 def _runtime_result_summaries(value: Any) -> list[str]:

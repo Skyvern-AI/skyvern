@@ -130,8 +130,73 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
 
     assert isinstance(actual, CacheableSystemInstructions)
     # The envelope adds nothing to the rendered template except the code-owned MCP authority
-    # clause, which no template may drop or displace.
-    assert str(actual) == f"{agent_module._MCP_RESULT_SECURITY_BOUNDARY}\n\n{expected}"
+    # clause and current-time fact, neither of which a template may drop or displace.
+    assert actual.stable_prefix == f"{agent_module._MCP_RESULT_SECURITY_BOUNDARY}\n\n{expected}"
+    assert str(actual) == (
+        f"{agent_module._MCP_RESULT_SECURITY_BOUNDARY}\n\n{expected}"
+        f"\n\n{agent_module._CURRENT_TIME_FACT_PREFIX}{fixed_now.isoformat()}"
+    )
+
+
+def test_default_template_carries_the_current_time_fact_in_the_dynamic_tail() -> None:
+    prompt = agent_module._build_system_prompt(tool_usage_guide="tool guide")
+
+    assert isinstance(prompt, CacheableSystemInstructions)
+    assert agent_module._CURRENT_TIME_FACT_PREFIX not in prompt.stable_prefix
+    assert str(prompt).count(agent_module._CURRENT_TIME_FACT_PREFIX) == 1
+    _, _, carried = prompt.dynamic_suffix.partition(agent_module._CURRENT_TIME_FACT_PREFIX)
+    carried_at = datetime.fromisoformat(carried.strip())
+    assert carried_at.tzinfo is not None
+    assert abs((datetime.now(timezone.utc) - carried_at).total_seconds()) < 300
+
+
+def test_template_without_a_datetime_placeholder_still_carries_the_time_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_load_prompt(**_kwargs: str) -> str:
+        return "custom template body with no datetime placeholder"
+
+    monkeypatch.setattr(agent_module.prompt_engine, "load_prompt", fake_load_prompt)
+
+    prompt = agent_module._build_system_prompt(tool_usage_guide="tool guide")
+
+    assert isinstance(prompt, CacheableSystemInstructions)
+    assert prompt.stable_prefix.endswith("custom template body with no datetime placeholder")
+    assert agent_module._CURRENT_TIME_FACT_PREFIX not in prompt.stable_prefix
+    _, _, carried = prompt.dynamic_suffix.partition(agent_module._CURRENT_TIME_FACT_PREFIX)
+    carried_at = datetime.fromisoformat(carried.strip())
+    assert abs((datetime.now(timezone.utc) - carried_at).total_seconds()) < 300
+
+
+def test_time_fact_survives_the_dynamic_prompt_early_returns() -> None:
+    instructions = agent_module._build_dynamic_system_prompt(
+        tool_usage_guide="tool guide",
+        config=agent_module.CopilotConfig(),
+    )
+
+    for context in (object(), SimpleNamespace(context=object())):
+        prompt = instructions(context, None)
+        assert agent_module._CURRENT_TIME_FACT_PREFIX in str(prompt)
+
+
+def test_stable_prefix_is_byte_identical_across_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _prompt_at(moment: datetime) -> CacheableSystemInstructions:
+        class _FixedDateTime:
+            @classmethod
+            def now(cls, tz: timezone) -> datetime:
+                return moment
+
+        monkeypatch.setattr(agent_module, "datetime", _FixedDateTime)
+        built = agent_module._build_system_prompt(tool_usage_guide="tool guide")
+        assert isinstance(built, CacheableSystemInstructions)
+        return built
+
+    first = _prompt_at(datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+    second = _prompt_at(datetime(2027, 8, 9, 10, 11, 12, tzinfo=timezone.utc))
+
+    assert first.stable_prefix == second.stable_prefix
+    assert first.dynamic_suffix != second.dynamic_suffix
+    assert "2027-08-09T10:11:12" in second.dynamic_suffix
 
 
 def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
