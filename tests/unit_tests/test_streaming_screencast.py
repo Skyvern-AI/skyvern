@@ -223,12 +223,16 @@ class _FakeCdpSession:
         self.handlers: dict[str, object] = {}
         self.sent: list[tuple[str, dict]] = []
         self.detached = False
+        self.fail_methods: set[str] = set()
+        self.fail_after_calls: dict[str, int] = {}
 
     def on(self, event: str, handler: object) -> None:
         self.handlers[event] = handler
 
     async def send(self, method: str, params: dict | None = None) -> dict:
         self.sent.append((method, params or {}))
+        if method in self.fail_methods and self.methods_sent().count(method) > self.fail_after_calls.get(method, 0):
+            raise RuntimeError(f"{method} refused")
         if method == "Page.captureScreenshot":
             return {"data": "primed"}
         return {}
