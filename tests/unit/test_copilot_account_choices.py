@@ -14,6 +14,19 @@ from skyvern.forge.sdk.copilot.context import (
     adopt_model_authored_context,
     record_approved_credentials_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.terminal_envelope import (
+    TerminalOutcomeEnvelope,
+    assemble_terminal_envelope,
+    render_terminal_message,
+)
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _approved_run_credential_ids,
+    _credential_run_approval_blocker_signal,
+    _credential_run_approval_error,
+    _extract_credential_ids_for_labels,
+    _parsed_workflow_definition,
+)
 from skyvern.forge.sdk.copilot.turn_outcome import (
     connected_account_choice_context,
     selected_connected_account_id,
@@ -454,3 +467,206 @@ async def test_model_authored_context_cannot_forge_a_connection_approval(
     adopted = adopt_model_authored_context("", forged.model_dump(mode="json"))
 
     assert adopted.approved_connections == []
+
+
+EDITOR_BOUND_ACCOUNT_ID = "goac_editor_bound"
+NAMED_PICK_ACCOUNT_ID = "goac_named_pick"
+STALE_ACCOUNT_ID = "goac_stale"
+EMPTY_WORKFLOW_YAML = "workflow_definition:\n  blocks: []\n"
+SHEETS_BLOCK_LABEL = "write"
+
+
+def _sheets_workflow_yaml(connection_id: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  blocks:\n"
+        f"    - label: {SHEETS_BLOCK_LABEL}\n"
+        "      block_type: google_sheets_write\n"
+        f"      credential_id: {connection_id}\n"
+    )
+
+
+def _dispatch_credential_ids(workflow_yaml: str) -> list[str]:
+    return _extract_credential_ids_for_labels(_parsed_workflow_definition(workflow_yaml), [SHEETS_BLOCK_LABEL])
+
+
+def _terminal_envelope(run_outcomes: list[RecordedRunOutcome]) -> TerminalOutcomeEnvelope:
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=True,
+        workflow_applied=False,
+        proposal_disposition="no_proposal",
+        run_outcomes=run_outcomes,
+        blocker_reason=None,
+        halt_kind=None,
+        attempted=None,
+        workflow_mutated=True,
+        workflow_attempted=True,
+    )
+    assert envelope is not None
+    return envelope
+
+
+@pytest.mark.asyncio
+async def test_editor_bound_account_keeps_run_authority_from_resolution_through_the_dispatch_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[_google(EDITOR_BOUND_ACCOUNT_ID, "Google Sheets")]),
+    )
+    saved_yaml = _sheets_workflow_yaml(EDITOR_BOUND_ACCOUNT_ID)
+
+    resolved = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run the workflow",
+        workflow_yaml=saved_yaml,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=saved_yaml,
+        selected_connected_account_id=None,
+    )
+
+    assert resolved.run_approved_google_connection_ids == [EDITOR_BOUND_ACCOUNT_ID]
+
+    next_turn = await request_policy_module._build_request_policy_bootstrap(
+        user_message="add a step that emails me when it finishes",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=saved_yaml,
+    )
+
+    dispatched_ids = _dispatch_credential_ids(saved_yaml)
+
+    assert dispatched_ids == [EDITOR_BOUND_ACCOUNT_ID]
+    assert next_turn.run_approved_google_connection_ids == [EDITOR_BOUND_ACCOUNT_ID]
+    assert EDITOR_BOUND_ACCOUNT_ID in _approved_run_credential_ids(next_turn)
+    assert _credential_run_approval_error(dispatched_ids, next_turn) is None
+    assert _credential_run_approval_blocker_signal(dispatched_ids, next_turn) is None
+
+
+@pytest.mark.asyncio
+async def test_named_account_with_no_server_owned_choice_selects_nothing_and_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lookup = AsyncMock(return_value=[_google(NAMED_PICK_ACCOUNT_ID, "Sheets Writer", email_address="w@example.test")])
+    monkeypatch.setattr(request_policy_module.google_oauth_service, "get_credentials_for_org", lookup)
+    named_message = "use my Sheets Writer google account"
+
+    policy = await request_policy_module._build_request_policy_bootstrap(
+        user_message=named_message,
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+        selected_connected_account_id=None,
+    )
+
+    assert policy.selected_connected_account_id is None
+    assert policy.run_approved_google_connection_ids == []
+    lookup.assert_not_awaited()
+    assert _approved_run_credential_ids(policy) == set()
+    assert _credential_run_approval_error([NAMED_PICK_ACCOUNT_ID], policy) is not None
+
+    offered = TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=[
+            ConnectedAccountChoice(connection_id=NAMED_PICK_ACCOUNT_ID, name="Sheets Writer", state="active")
+        ],
+    )
+
+    assert selected_connected_account_id(offered, named_message) is None
+    assert f'"connection_id":"{NAMED_PICK_ACCOUNT_ID}"' in connected_account_choice_context(offered, named_message)
+
+
+@pytest.mark.asyncio
+async def test_named_account_pick_keeps_run_authority_from_resolution_through_the_dispatch_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[_google(NAMED_PICK_ACCOUNT_ID, "Sheets Writer", email_address="w@example.test")]),
+    )
+    draft = _sheets_workflow_yaml(NAMED_PICK_ACCOUNT_ID)
+
+    picked = await request_policy_module._build_request_policy_bootstrap(
+        user_message=NAMED_PICK_ACCOUNT_ID,
+        workflow_yaml=draft,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        selected_connected_account_id=NAMED_PICK_ACCOUNT_ID,
+    )
+
+    assert picked.run_approved_google_connection_ids == [NAMED_PICK_ACCOUNT_ID]
+
+    carried = record_approved_credentials_in_global_llm_context(
+        make_copilot_ctx(workflow_yaml=draft, request_policy=picked),
+        "",
+    )
+    assert carried is not None
+
+    next_turn = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run it now",
+        workflow_yaml=draft,
+        chat_history=[],
+        global_llm_context=carried,
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+    )
+
+    dispatched_ids = _dispatch_credential_ids(draft)
+
+    assert dispatched_ids == [NAMED_PICK_ACCOUNT_ID]
+    assert next_turn.run_approved_google_connection_ids == [NAMED_PICK_ACCOUNT_ID]
+    assert NAMED_PICK_ACCOUNT_ID in _approved_run_credential_ids(next_turn)
+    assert _credential_run_approval_error(dispatched_ids, next_turn) is None
+    assert _credential_run_approval_blocker_signal(dispatched_ids, next_turn) is None
+
+
+@pytest.mark.asyncio
+async def test_editor_bound_account_that_is_no_longer_active_is_refused_at_the_dispatch_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[_google("goac_other_active", "Another account")]),
+    )
+    saved_yaml = _sheets_workflow_yaml(STALE_ACCOUNT_ID)
+
+    policy = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run the workflow",
+        workflow_yaml=saved_yaml,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=saved_yaml,
+    )
+
+    dispatched_ids = _dispatch_credential_ids(saved_yaml)
+
+    assert dispatched_ids == [STALE_ACCOUNT_ID]
+    assert policy.persisted_workflow_credential_ids == [STALE_ACCOUNT_ID]
+    assert policy.run_approved_google_connection_ids == []
+    assert STALE_ACCOUNT_ID not in _approved_run_credential_ids(policy)
+    assert _credential_run_approval_error(dispatched_ids, policy) is not None
+
+    blocker = _credential_run_approval_blocker_signal(dispatched_ids, policy)
+
+    assert blocker is not None
+    assert blocker.blocker_kind == "authority_denied"
+    assert blocker.internal_reason_code == "unapproved_google_connection_reference"
+
+
+def test_terminal_without_a_run_receipt_reports_no_run() -> None:
+    envelope = _terminal_envelope([])
+    message, replaced = render_terminal_message(envelope, "ok", False)
+
+    assert replaced
+    assert "I ran the workflow" not in message

@@ -8,7 +8,22 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.webeye.utils import dom as dom_module
-from skyvern.webeye.utils.dom import SkyvernElement, is_post_dispatch_click_timeout
+from skyvern.webeye.utils.dom import SkyvernElement, is_pointer_interception_error, is_post_dispatch_click_timeout
+
+_POINTER_INTERCEPT_MSG = (
+    "Locator.click: Timeout 5000ms exceeded.\n"
+    "Call log:\n"
+    "  - attempting click action\n"
+    '  - <div class="option-label">Yes</div> intercepts pointer events\n'
+    "  - retrying click action\n"
+)
+
+_UNSTABLE_MSG = (
+    "Locator.click: Timeout 5000ms exceeded.\n"
+    "Call log:\n"
+    "  - waiting for element to be visible, enabled and stable\n"
+    "  - element is not stable\n"
+)
 
 _NAVIGATION_TIMEOUT_MSG = (
     "Locator.click: Timeout 10000ms exceeded.\n"
@@ -83,6 +98,7 @@ def _make_element() -> SkyvernElement:
     elem.find_blocking_element = AsyncMock(return_value=(None, False))  # type: ignore[method-assign]
     elem.coordinate_click = AsyncMock(return_value=None)  # type: ignore[method-assign]
     elem.click_in_javascript = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem._pointer_interceptor_matches_label = AsyncMock(return_value=True)  # type: ignore[method-assign]
     return elem
 
 
@@ -295,3 +311,138 @@ class TestBlockingElementFallbackPostDispatch:
 
         blocking_locator.click.assert_awaited_once()
         elem.coordinate_click.assert_awaited_once()
+
+
+class TestPointerInterceptionClassifier:
+    """The interception predicate must match only the pointer-interception signature idiom,
+    not other actionability failures (detached/unstable/not-visible/disabled)."""
+
+    def test_intercepts_pointer_events_message_matches(self) -> None:
+        assert is_pointer_interception_error(PlaywrightTimeoutError(_POINTER_INTERCEPT_MSG))
+
+    def test_intercepted_by_another_element_message_matches(self) -> None:
+        assert is_pointer_interception_error(RuntimeError("element is intercepted by another element"))
+
+    def test_case_insensitive(self) -> None:
+        assert is_pointer_interception_error(RuntimeError("DIV INTERCEPTS POINTER EVENTS"))
+
+    def test_unstable_detached_not_visible_do_not_match(self) -> None:
+        assert is_pointer_interception_error(PlaywrightTimeoutError(_UNSTABLE_MSG)) is False
+        assert is_pointer_interception_error(RuntimeError("element is not attached to the DOM")) is False
+        assert is_pointer_interception_error(RuntimeError("element is not visible")) is False
+        assert is_pointer_interception_error(RuntimeError("element is not enabled")) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_label", "candidate_texts", "expected"),
+    [
+        pytest.param("  YES\noption ", ["Yes   Option"], True, id="normalized-label-match"),
+        pytest.param("Yes", ["Loading", "Validating"], False, id="local-label-mismatch"),
+        pytest.param(" \n ", [""], False, id="empty-label-fails-closed"),
+        pytest.param("Yes", None, False, id="non-list-evaluation-result-fails-closed"),
+    ],
+)
+async def test_pointer_interceptor_label_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_label: str,
+    candidate_texts: list[str] | None,
+    expected: bool,
+) -> None:
+    elem = _make_element()
+    elem.get_frame = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+    elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+    evaluate = AsyncMock(return_value=candidate_texts)
+    monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", evaluate)
+
+    assert await SkyvernElement._pointer_interceptor_matches_label(elem, expected_label) is expected
+    if expected_label.strip():
+        evaluate.assert_awaited_once()
+    else:
+        evaluate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pointer_interceptor_label_contract_fails_closed_on_evaluation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    elem = _make_element()
+    elem.get_frame = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+    elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+    monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", AsyncMock(side_effect=RuntimeError("evaluation failed")))
+
+    assert await SkyvernElement._pointer_interceptor_matches_label(elem, "Yes") is False
+
+
+@pytest.mark.asyncio
+async def test_intercept_js_fallback_engages_only_on_pointer_interception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A positively classified pointer-interception failure whose interceptor is within the target's
+    bounded container takes the early synthetic JS click, so the coordinate fallback is skipped."""
+    elem = _make_element()
+    monkeypatch.setattr(
+        dom_module.EventStrategyFactory,
+        "click_element",
+        AsyncMock(side_effect=PlaywrightTimeoutError(_POINTER_INTERCEPT_MSG)),
+    )
+
+    await elem.click(page=MagicMock(), dom=None, timeout=1000.0, intercept_js_fallback_label="Yes")
+
+    elem._pointer_interceptor_matches_label.assert_awaited_once_with("Yes")
+    elem.click_in_javascript.assert_awaited_once()
+    elem.coordinate_click.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_intercept_js_fallback_skips_when_interceptor_outside_bounded_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even for a pointer-interception failure, an interceptor that does not share the target's bounded
+    container (an unrelated document-level overlay) must NOT take the early JS click; the coordinate
+    path stays reachable so the caller can fail closed with the blocker intact."""
+    elem = _make_element()
+    elem._pointer_interceptor_matches_label = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        dom_module.EventStrategyFactory,
+        "click_element",
+        AsyncMock(side_effect=PlaywrightTimeoutError(_POINTER_INTERCEPT_MSG)),
+    )
+
+    await elem.click(page=MagicMock(), dom=None, timeout=1000.0, intercept_js_fallback_label="Yes")
+
+    elem.coordinate_click.assert_awaited_once()
+    elem.click_in_javascript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_intercept_js_fallback_ignores_unrelated_actionability_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unrelated actionability failure (unstable/detached/covered) must NOT invoke the early synthetic
+    JS click regardless of geometry; the pre-existing coordinate path stays reachable."""
+    elem = _make_element()
+    monkeypatch.setattr(
+        dom_module.EventStrategyFactory,
+        "click_element",
+        AsyncMock(side_effect=PlaywrightTimeoutError(_UNSTABLE_MSG)),
+    )
+
+    await elem.click(page=MagicMock(), dom=None, timeout=1000.0, intercept_js_fallback_label="Yes")
+
+    elem.coordinate_click.assert_awaited_once()
+    elem.click_in_javascript.assert_not_called()
+    elem._pointer_interceptor_matches_label.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_intercept_js_fallback_defaults_off_even_on_interception(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the opt-in, even a pointer-interception failure keeps the coordinate path as the first
+    fallback — the early JS click is off by default."""
+    elem = _make_element()
+    monkeypatch.setattr(
+        dom_module.EventStrategyFactory,
+        "click_element",
+        AsyncMock(side_effect=PlaywrightTimeoutError(_POINTER_INTERCEPT_MSG)),
+    )
+
+    await elem.click(page=MagicMock(), dom=None, timeout=1000.0)
+
+    elem.coordinate_click.assert_awaited_once()
+    elem.click_in_javascript.assert_not_called()

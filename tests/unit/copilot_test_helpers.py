@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -269,3 +270,30 @@ def make_model_input_data(items: list[Any], *, instructions: str | None = None, 
         model_data=SimpleNamespace(input=list(items), instructions=instructions),
         context=context,
     )
+
+
+class FakeMCPServerManager:
+    def __init__(self, servers: object) -> None:
+        self.active_servers = servers
+
+    async def __aenter__(self) -> FakeMCPServerManager:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+def stub_copilot_agent_loop(
+    monkeypatch: pytest.MonkeyPatch, run_with_enforcement: Callable[..., Awaitable[object]]
+) -> None:
+    def fake_resolve_model_config(
+        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+    ) -> tuple[str, object, str, bool]:
+        return f"model-{llm_key_override or 'PRIMARY'}", object(), llm_key_override or "PRIMARY", True
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)

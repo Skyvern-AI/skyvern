@@ -39,11 +39,15 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
+    _TASK_V3_PURE_BANNED_BLOCK_TYPES,
+    _TASK_V3_PURE_TASK_BLOCK_TYPES,
     CopilotBlockPolicyStatus,
     _code_only_browser_authoring_prompt,
     _code_only_browser_schema_guidance,
+    _task_v3_pure_policy_violations,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
+from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
 
 _CODE_ONLY_UNAVAILABLE = tuple(
@@ -84,6 +88,12 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
 def _code_only_ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx = _ctx(prior_yaml=prior_yaml)
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    return ctx
+
+
+def _task_v3_pure_ctx(prior_yaml: str | None = None) -> MagicMock:
+    ctx = _ctx(prior_yaml=prior_yaml)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.TASK_V3_PURE
     return ctx
 
 
@@ -190,6 +200,10 @@ def test_code_only_policy_table_derives_unavailable_types() -> None:
     assert "native_allowed" not in {status.value for status in CopilotBlockPolicyStatus}
 
 
+def test_task_v3_pure_policy_table_derives_unavailable_types() -> None:
+    assert _TASK_V3_PURE_BANNED_BLOCK_TYPES == frozenset({"code", "task_v2"})
+
+
 @pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE)
 @pytest.mark.asyncio
 async def test_code_only_schema_pre_hook_rejects_table_entries(block_type: str, code_only_ctx: MagicMock) -> None:
@@ -211,6 +225,287 @@ async def test_code_only_schema_pre_hook_normalizes_case_whitespace_and_alias(co
     assert result["ok"] is False
     assert params["block_type"] == "navigation"
     assert "focused `code` blocks" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_task_v3_pure_schema_exposes_real_task_and_catalog() -> None:
+    ctx = _task_v3_pure_ctx()
+
+    task_result = await _get_block_schema_pre_hook({"block_type": "task"}, ctx)
+    assert task_result is not None
+    assert task_result["ok"] is True
+    assert task_result["data"]["block_type"] == "task"
+    assert task_result["data"]["schema"]["properties"]["engine"]["const"] == "skyvern-3.0"
+    assert "default" not in task_result["data"]["schema"]["properties"]["engine"]
+    assert "engine" in task_result["data"]["schema"]["required"]
+
+    listed = await _get_block_schema_post_hook(
+        {"ok": True, "data": {"block_types": {"navigation": "Navigate", "code": "Code"}, "count": 2}},
+        raw={},
+        ctx=ctx,
+    )
+    assert set(_TASK_V3_PURE_TASK_BLOCK_TYPES).issubset(listed["data"]["block_types"])
+    assert "code" not in listed["data"]["block_types"]
+    assert "task_v2" not in listed["data"]["block_types"]
+
+    navigation = await _get_block_schema_post_hook(
+        {
+            "ok": True,
+            "data": {
+                "block_type": "navigation",
+                "schema": {"properties": {"engine": {"$ref": "#/$defs/WorkflowBlockEngine"}}},
+            },
+        },
+        raw={},
+        ctx=ctx,
+    )
+    assert navigation["data"]["schema"]["properties"]["engine"] == {
+        "type": "string",
+        "const": "skyvern-3.0",
+        "description": "Required by the active Task-V3-pure authoring policy.",
+    }
+    assert "engine" in navigation["data"]["schema"]["required"]
+
+
+@pytest.mark.parametrize("block_type", sorted(_TASK_V3_PURE_TASK_BLOCK_TYPES))
+def test_task_v3_pure_accepts_all_supported_task_types_with_exact_engine(block_type: str) -> None:
+    block = {"block_type": block_type, "label": f"{block_type}_block", "engine": "skyvern-3.0"}
+
+    assert _task_v3_pure_policy_violations(_yaml(block)) == []
+
+
+def test_task_v3_pure_contract_matches_runtime_supported_type_set() -> None:
+    assert _TASK_V3_PURE_TASK_BLOCK_TYPES == frozenset(
+        block_type.value for block_type in _TASK_V3_SUPPORTED_BLOCK_TYPES
+    )
+
+
+def test_task_v3_pure_keeps_engine_less_workflow_vocabulary_available() -> None:
+    submitted = _yaml(
+        {"block_type": "goto_url", "label": "open", "url": "https://example.com"},
+        {"block_type": "wait", "label": "wait", "wait_sec": 1},
+        {"block_type": "http_request", "label": "request", "url": "https://example.com/api"},
+        {"block_type": "google_sheets_read", "label": "sheet", "spreadsheet_id": "sheet"},
+        {"block_type": "human_interaction", "label": "review", "recipients": ["reviewer@example.com"]},
+    )
+
+    assert _task_v3_pure_policy_violations(submitted) == []
+
+
+@pytest.mark.parametrize("engine", [None, "skyvern-1.0", "skyvern-2.0", "openai-cua"])
+def test_task_v3_pure_rejects_omitted_or_non_v3_engines(engine: str | None) -> None:
+    block = {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"}
+    if engine is not None:
+        block["engine"] = engine
+
+    violations = _task_v3_pure_policy_violations(_yaml(block))
+
+    assert [violation.code for violation in violations] == ["engine_not_skyvern_v3"]
+
+
+@pytest.mark.parametrize("block_type", ["code", "task_v2"])
+def test_task_v3_pure_rejects_unavailable_executor_blocks(block_type: str) -> None:
+    violations = _task_v3_pure_policy_violations(_yaml({"block_type": block_type, "label": "unsafe"}))
+
+    assert [violation.code for violation in violations] == ["block_type_unavailable"]
+
+
+def test_task_v3_pure_rejects_nested_legacy_task_and_unsupported_validation() -> None:
+    submitted = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "loop",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {"block_type": "task", "label": "nested", "engine": "skyvern-1.0"},
+                {
+                    "block_type": "validation",
+                    "label": "download_validation",
+                    "engine": "skyvern-3.0",
+                    "complete_on_download": True,
+                },
+            ],
+        }
+    )
+
+    violations = _task_v3_pure_policy_violations(submitted)
+
+    assert [(violation.label, violation.code) for violation in violations] == [
+        ("nested", "engine_not_skyvern_v3"),
+        ("download_validation", "unsupported_v3_combination"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_v3_pure_update_requires_full_definition_migration() -> None:
+    legacy = _yaml({"block_type": "task", "label": "legacy", "engine": "skyvern-1.0"})
+    unrelated_edit = _yaml(
+        {"block_type": "task", "label": "legacy", "engine": "skyvern-1.0"},
+        {"block_type": "wait", "label": "new_wait", "wait_sec": 1},
+    )
+    ctx = _task_v3_pure_ctx(prior_yaml=legacy)
+
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml") as process:
+        result = await _update_workflow({"workflow_yaml": unrelated_edit}, ctx)
+
+    assert result["ok"] is False
+    assert result["block_id"] == "banned_blocks"
+    assert result["data"]["violations"] == [
+        {
+            "label": "legacy",
+            "block_type": "task",
+            "code": "engine_not_skyvern_v3",
+            "guidance": "Set the submitted block engine exactly to `skyvern-3.0`.",
+        }
+    ]
+    process.assert_not_called()
+
+
+def test_task_v3_pure_control_flow_allows_parameter_and_jinja_but_rejects_prompt_paths() -> None:
+    submitted = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "parameter_loop",
+            "loop_over_parameter_key": "items",
+            "loop_variable_reference": "{{items}}",
+            "loop_blocks": [{"block_type": "wait", "label": "wait", "wait_sec": 1}],
+        },
+        {
+            "block_type": "for_loop",
+            "label": "prompt_loop",
+            "loop_over_parameter_key": "items",
+            "loop_variable_reference": "the rows currently visible on the page",
+            "loop_blocks": [{"block_type": "wait", "label": "wait_again", "wait_sec": 1}],
+        },
+        {
+            "block_type": "while_loop",
+            "label": "jinja_loop",
+            "condition": {"criteria_type": "jinja2_template", "expression": "{{ has_more }}"},
+            "loop_blocks": [{"block_type": "wait", "label": "wait_more", "wait_sec": 1}],
+        },
+        {
+            "block_type": "conditional",
+            "label": "prompt_branch",
+            "branch_conditions": [
+                {
+                    "criteria": {"criteria_type": "prompt", "expression": "Is the page complete?"},
+                    "next_block_label": "wait",
+                }
+            ],
+        },
+    )
+
+    violations = _task_v3_pure_policy_violations(submitted)
+
+    assert [(violation.label, violation.code) for violation in violations] == [
+        ("prompt_loop", "synthetic_task_control_flow"),
+        ("prompt_branch", "synthetic_task_control_flow"),
+    ]
+
+
+def test_task_v3_pure_control_flow_honors_default_jinja_criteria_type() -> None:
+    submitted = _yaml(
+        {
+            "block_type": "while_loop",
+            "label": "default_jinja_loop",
+            "condition": {"expression": "{{ has_more }}"},
+            "loop_blocks": [{"block_type": "wait", "label": "wait", "wait_sec": 1}],
+        },
+        {
+            "block_type": "conditional",
+            "label": "default_jinja_branch",
+            "branch_conditions": [
+                {
+                    "criteria": {"expression": "{{ should_continue }}"},
+                    "next_block_label": "wait",
+                }
+            ],
+        },
+    )
+
+    assert _task_v3_pure_policy_violations(submitted) == []
+
+
+@pytest.mark.asyncio
+async def test_task_v3_pure_validate_block_uses_the_same_structural_contract() -> None:
+    ctx = _task_v3_pure_ctx()
+
+    rejected = await _validate_block_pre_hook(
+        {"block_json": json.dumps({"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"})},
+        ctx,
+    )
+    accepted = await _validate_block_pre_hook(
+        {
+            "block_json": json.dumps(
+                {
+                    "block_type": "navigation",
+                    "label": "navigate",
+                    "navigation_goal": "Go",
+                    "engine": "skyvern-3.0",
+                }
+            )
+        },
+        ctx,
+    )
+
+    assert rejected is not None
+    assert rejected["data"]["violations"][0]["code"] == "engine_not_skyvern_v3"
+    assert accepted is None
+
+
+@pytest.mark.asyncio
+async def test_task_v3_pure_update_rejects_raw_omitted_engine_before_conversion() -> None:
+    submitted = _yaml({"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"})
+    ctx = _task_v3_pure_ctx()
+
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml") as process:
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+    assert result["ok"] is False
+    assert result["block_id"] == "banned_blocks"
+    assert result["data"]["violations"][0]["code"] == "engine_not_skyvern_v3"
+    process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_task_v3_pure_update_preserves_submitted_v3_engine_bytes() -> None:
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go", "engine": "skyvern-3.0"}
+    )
+    ctx = _task_v3_pure_ctx()
+    fake_workflow = MagicMock()
+    for attr in (
+        "title",
+        "description",
+        "workflow_definition",
+        "proxy_location",
+        "webhook_callback_url",
+        "persist_browser_session",
+        "model",
+        "max_screenshot_scrolls",
+        "extra_http_headers",
+        "run_with",
+        "ai_fallback",
+        "cache_key",
+        "run_sequentially",
+        "sequential_key",
+    ):
+        setattr(fake_workflow, attr, None)
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            return_value=fake_workflow,
+        ) as process,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
+    ):
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
+        mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+    assert result["ok"] is True
+    assert process.await_args.kwargs["workflow_yaml"] == submitted
+    assert ctx.workflow_yaml == submitted
 
 
 @pytest.mark.asyncio

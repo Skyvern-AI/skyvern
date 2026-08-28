@@ -466,7 +466,7 @@ class TestSanitization:
         sanitized = sanitize_tool_result_for_llm("update_workflow", result)
         assert "_workflow" not in sanitized
 
-    def test_large_schema_truncated(self) -> None:
+    def test_large_incidental_schema_truncated(self) -> None:
         from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 
         big_schema = {f"field_{i}": {"type": "string"} for i in range(200)}
@@ -474,8 +474,20 @@ class TestSanitization:
             "ok": True,
             "data": {"schema": big_schema},
         }
-        sanitized = sanitize_tool_result_for_llm("get_block_schema", result)
+        sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
         assert sanitized["data"]["schema"]["_truncated"] is True
+
+    def test_get_block_schema_returns_the_schema_it_was_called_for(self) -> None:
+        """The truncation steer says to call get_block_schema for the block type — so applying it to
+        that call's own answer leaves the model no route to the fields it asked for."""
+        from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+
+        big_schema = {f"field_{i}": {"type": "string"} for i in range(200)}
+        result = {"ok": True, "data": {"block_type": "code", "schema": big_schema}}
+
+        sanitized = sanitize_tool_result_for_llm("get_block_schema", result)
+
+        assert sanitized["data"]["schema"] == big_schema
 
     def test_run_blocks_sanitizer_preserves_compact_packet_fields(self) -> None:
         from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm

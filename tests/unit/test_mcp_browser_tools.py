@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli.core import browser_ops
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager
@@ -1150,6 +1151,58 @@ async def test_click_native_option_sdk_equivalent_quotes_observed_strings(
     result = await mcp_browser.skyvern_click(selector="#region > option")
 
     _assert_sdk_equivalent_parses(result)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_uses_direct_extension_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("extension evaluation must bypass Playwright"))
+    evaluate = AsyncMock(return_value={"answer": 42})
+    runtime = SimpleNamespace(evaluate=evaluate)
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_current_session",
+        lambda: SimpleNamespace(context=BrowserContext(mode="extension")),
+    )
+    monkeypatch.setattr(
+        BrowserExtensionRuntime,
+        "instance",
+        classmethod(lambda _cls: runtime),
+    )
+
+    result = await mcp_browser.skyvern_evaluate(expression="({ answer: 6 * 7 })")
+
+    assert result["ok"] is True
+    assert result["data"]["result"] == {"answer": 42}
+    evaluate.assert_awaited_once_with("({ answer: 6 * 7 })")
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_does_not_reclaim_tab_without_active_extension_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_page = AsyncMock(side_effect=session_manager.BrowserNotAvailableError("No active browser session"))
+    evaluate = AsyncMock(side_effect=AssertionError("closed extension session must not evaluate"))
+    runtime = SimpleNamespace(evaluate=evaluate)
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_current_session",
+        lambda: SimpleNamespace(context=None),
+    )
+    monkeypatch.setattr(
+        BrowserExtensionRuntime,
+        "instance",
+        classmethod(lambda _cls: runtime),
+    )
+
+    result = await mcp_browser.skyvern_evaluate(expression="document.title")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.NO_ACTIVE_BROWSER
+    evaluate.assert_not_awaited()
+    get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
 
 
 @pytest.mark.asyncio

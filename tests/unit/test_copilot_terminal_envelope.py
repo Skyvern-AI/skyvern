@@ -471,6 +471,21 @@ def test_render_terminal_message_stopped_degraded_envelope_uses_minimal_honest_s
     assert rendered == "I stopped without confirming the goal was met."
 
 
+def test_render_terminal_message_stopped_with_a_recorded_run_reports_that_it_ran() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict="not_evaluated",
+        run_display_reason=None,
+        response_kind="stopped",
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+
+    assert replaced is True
+    assert rendered == "I ran the workflow. The latest recorded run completed."
+
+
 def test_render_terminal_message_no_run_blocker_stop_keeps_blocker_evidence() -> None:
     blocker = "The site demands SSO before any page loads."
     envelope = TerminalOutcomeEnvelope(

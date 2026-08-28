@@ -13,6 +13,7 @@ before an item miss is believed.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -728,22 +729,17 @@ async def test_a_burst_across_more_vaults_than_the_cache_holds_drains_back_to_ca
     assert len(bitwarden_module._cli_sessions._sessions) <= capacity
 
 
-def test_the_identity_fingerprint_is_salted_per_process_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_identity_fingerprint_is_not_an_offline_oracle_for_the_master_password() -> None:
     """A log reader who knows the email must not be able to confirm password guesses against it."""
     email, master_password = "user@example.com", "hunter2"
-    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_SALT", b"a" * 32)
-    first_process = bitwarden_module._VaultIdentity.resolve(
+    identity = bitwarden_module._VaultIdentity.resolve(
         client_id=None, client_secret=None, email=email, master_password=master_password
     )
-    fingerprint = first_process.fingerprint
+    unsalted = hashlib.sha256(f"email\x00{email}\x00{master_password}".encode()).hexdigest()
 
-    monkeypatch.setattr(bitwarden_module, "_IDENTITY_FINGERPRINT_SALT", b"b" * 32)
-    second_process = bitwarden_module._VaultIdentity.resolve(
-        client_id=None, client_secret=None, email=email, master_password=master_password
-    )
-
-    assert first_process.fingerprint == fingerprint
-    assert second_process.fingerprint != fingerprint
+    assert identity.fingerprint != unsalted
+    # Still stable within the process, which is all the cache keys on.
+    assert identity.fingerprint == identity.fingerprint
 
 
 def test_an_identity_never_reveals_its_secrets_when_logged() -> None:

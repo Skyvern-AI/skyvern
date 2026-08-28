@@ -2,7 +2,7 @@ import asyncio
 import inspect
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import posthog
 import pytest
@@ -610,3 +610,43 @@ async def test_agent_mode_flag_off_keeps_custom_select_llm_path(monkeypatch: pyt
     assert outcome["script_mode"] is False
     assert outcome["family_gate_enabled"] is False
     assert outcome["outcome"] == "llm_fallback_family_off"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_seam_does_not_request_intercept_js_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deterministic seam keeps the physical fallback chain: its option click must not request the
+    early synthetic JS fallback, whose readback here is not strict enough to prevent a false success."""
+    provider = FakeExperimentationProvider({CUSTOM_FLAG: True, UMBRELLA_FLAG: True})
+    _set_provider(monkeypatch, provider)
+    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(handler, "_read_custom_select_matched_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler, "_resolve_custom_select_readback_scope_element", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler, "_anchor_is_combobox_input", AsyncMock(return_value=False))
+    monkeypatch.setattr(handler, "_custom_select_scope_confirms_committed", AsyncMock(return_value=(False, "none")))
+    monkeypatch.setattr(
+        handler, "_verify_custom_select_option_with_settle", AsyncMock(return_value=(True, "matched_state"))
+    )
+
+    element = MagicMock()
+    element.get_attr = AsyncMock(return_value="option")
+    element.scroll_into_view = AsyncMock(return_value=None)
+    element.click = AsyncMock(return_value=None)
+
+    async def _get_element(element_id: str) -> Any:
+        return element
+
+    result = await handler._select_deterministic_custom_option(
+        target_value="Blocked",
+        get_option_candidates=lambda: [
+            {"label": "Blocked", "value": "Blocked", "element_id": "opt1", "is_choice_input": False}
+        ],
+        field_context={"field": "Status"},
+        page=MagicMock(),
+        get_skyvern_element=_get_element,
+        task=_task(),
+        execute=True,
+    )
+
+    element.click.assert_awaited_once()
+    assert element.click.await_args.kwargs.get("intercept_js_fallback_label") is None
+    assert result is not None and isinstance(result[0], handler.ActionSuccess)

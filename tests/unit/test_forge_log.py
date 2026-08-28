@@ -43,3 +43,14 @@ def test_kwarg_correlation_id_is_searchable_without_context() -> None:
         event_dict = add_log_context(None, "info", {"msg": "Begin browser session", "browser_session_id": "pbs_2"})
 
     assert event_dict["msg"] == "Begin browser session | browser_session_id=pbs_2"
+
+
+def test_codeblock_execution_path_is_a_field_not_a_msg_suffix() -> None:
+    # The arm is a grouping facet for the secure-vs-legacy monitors, not a correlation id,
+    # so it must stay out of the searchable-id suffix (SKY-13848 bounds what goes into msg).
+    context = SkyvernContext(workflow_run_id="wr_1", codeblock_execution_path="secure_runner")
+    with patch.object(skyvern_context, "current", return_value=context):
+        event_dict = add_log_context(None, "warning", {"msg": "Block failed"})
+
+    assert event_dict["codeblock_execution_path"] == "secure_runner"
+    assert event_dict["msg"] == "Block failed | workflow_run_id=wr_1"
