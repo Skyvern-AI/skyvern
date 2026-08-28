@@ -462,6 +462,38 @@ async def test_engine_wires_failure_evidence_gate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_engine_forwards_the_page_probe_and_withholds_it_from_page_free_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Drop this kwarg anywhere on the way in and the loop classifies every unflagged error as
+    # non-poisoning -- the fail-open state -- with every loop-level test still green.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: list[object] = []
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.append(kwargs.get("page_probe"))
+        return LoopOutcome(status="completed", reason="ok")
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", page_probe=probe
+    )
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_probe=probe,
+        page_free=True,
+    )
+    assert captured == [probe, None]
+
+
+@pytest.mark.asyncio
 async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

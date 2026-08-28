@@ -2537,12 +2537,14 @@ async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
         monkeypatch, outcome, task_block=block, data_extraction_goal=None, extracted_information_schema=None
     )
     assert loop_mock.await_args.kwargs["page_fingerprint"] is not None
+    assert loop_mock.await_args.kwargs["page_probe"] is not None  # batch-poisoning probe reaches the engine
     assert loop_mock.await_args.kwargs["max_settle_deferrals"] > 0
 
     _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
     assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is not None
+    assert bare_loop_mock.await_args.kwargs["page_probe"] is not None
     assert bare_loop_mock.await_args.kwargs["max_settle_deferrals"] == 0
 
 

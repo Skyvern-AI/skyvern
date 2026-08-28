@@ -5163,6 +5163,7 @@ async def test_click_on_a_marker_the_page_cloned_never_silently_lands_on_the_clo
             assert clicked == [], f"failed loud yet still dispatched a click on {clicked}"
             assert "e-observe" in r.content, r.content
             assert selector in r.content
+            assert r.data == {"page_state_changed": True}  # a cloning re-render must poison the batch
 
 
 @_skip_no_browser
@@ -5212,6 +5213,7 @@ async def test_click_on_a_marker_the_page_destroyed_still_fails_loud() -> None:
 
         assert r.status == "error"
         assert "no longer exists" in r.content and "e-observe" in r.content
+        assert r.data == {"page_state_changed": True}  # a same-document re-render must poison the batch
         assert await page.evaluate("() => window.__clicked") == []
 
 

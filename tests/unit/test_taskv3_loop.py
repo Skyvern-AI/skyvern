@@ -24,6 +24,7 @@ from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_REASON_PREFIX,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
@@ -31,6 +32,7 @@ from skyvern.forge.taskv3.loop import (
     NAV_DEAD_END_REASON_PREFIX,
     NAVIGATION_DEAD_END_STATUSES,
     NO_TOOL_CALL_NUDGE,
+    PAGE_UNAVAILABLE_ERROR,
     PERCEPTION_STALL_NUDGE_AFTER,
     PERCEPTION_STALL_REASON_PREFIX,
     PERCEPTION_STALL_SHADOW_EVENT,
@@ -107,14 +109,44 @@ class _ScriptedCaller:
         return {"choices": [{"message": message}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
 
 
-def _recording_tool(name: str, sink: list[tuple[str, dict[str, Any]]], *, raises: bool = False) -> ToolSpec:
+def _recording_tool(
+    name: str, sink: list[tuple[str, dict[str, Any]]], *, raises: bool = False, billable: bool = False
+) -> ToolSpec:
     async def handler(args: dict[str, Any]) -> ToolResult:
         sink.append((name, args))
         if raises:
             raise RuntimeError("boom")
         return ToolResult.ok(f"{name} done")
 
-    return ToolSpec(name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler)
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, billable=billable
+    )
+
+
+def _erroring_tool(
+    name: str,
+    sink: list[tuple[str, dict[str, Any]]],
+    *,
+    error_data: dict[str, Any] | None = None,
+    billable: bool = False,
+    recordable: bool = False,
+) -> ToolSpec:
+    """Like ``_recording_tool`` but returns ``ToolResult.error(...)`` directly (optionally carrying a
+    ``data`` payload, e.g. ``page_transitioned``) instead of raising -- ``raises=True`` on
+    ``_recording_tool`` only ever produces a bare ``tool_error: RuntimeError: boom`` with no data."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append((name, args))
+        return ToolResult.error(f"{name} failed", data=error_data)
+
+    return ToolSpec(
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        billable=billable,
+        recordable=recordable,
+    )
 
 
 async def _run(script: list[list[tuple[str, dict[str, Any]]]], tools: list[ToolSpec], **kwargs: Any):
@@ -167,13 +199,18 @@ async def test_perception_is_on_demand_never_injected() -> None:
     assert len(click_calls) == 2
 
 
-def _look_tool(sink: list[tuple[str, dict[str, Any]]], *, image: bytes = b"\x89PNG-fake") -> ToolSpec:
+def _look_tool(
+    sink: list[tuple[str, dict[str, Any]]], *, image: bytes = b"\x89PNG-fake", fail_before_renumbering: bool = False
+) -> ToolSpec:
     """A `look`-shaped tool: returns a text legend AND a transient screenshot the loop must show the
-    model on the next call only (never persisted to the transcript)."""
+    model on the next call only (never persisted to the transcript). Like the real tool it reports
+    `marks_renumbered` once the manifest was rebuilt; a failure before that point reports nothing."""
 
     async def handler(args: dict[str, Any]) -> ToolResult:
         sink.append(("look", args))
-        return ToolResult.ok("[1] button 'Next'", screenshots=[image])
+        if fail_before_renumbering:
+            return ToolResult.error("look budget reached")
+        return ToolResult.ok("[1] button 'Next'", data={"marks_renumbered": True}, screenshots=[image])
 
     return ToolSpec(
         name="look",
@@ -678,14 +715,15 @@ async def test_tool_call_cap_stops_mid_batch() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_error_stops_batch_and_skips_remaining() -> None:
-    # A failed call mid-batch must stop the rest of the batch (so a later write can't run against a
-    # page a failed earlier call left in a bad state) and answer the skipped calls, so the next turn
-    # sees a valid transcript and re-plans from the error.
+    # A failed call whose own result signals a page transition must still stop the rest of the batch
+    # (so a later write can't run against a page the failed call left in a different state) and
+    # answer the skipped calls, so the next turn sees a valid transcript and re-plans from the error.
     click_calls: list[tuple[str, dict[str, Any]]] = []
+    boom_calls: list[tuple[str, dict[str, Any]]] = []
     type_calls: list[tuple[str, dict[str, Any]]] = []
     tools = [
         _recording_tool("click", click_calls),
-        _recording_tool("boom", [], raises=True),
+        _erroring_tool("boom", boom_calls, error_data={"page_transitioned": True}),
         _recording_tool("type", type_calls),
         make_finish_tool(),
     ]
@@ -700,7 +738,634 @@ async def test_tool_error_stops_batch_and_skips_remaining() -> None:
     assert len(type_calls) == 0  # the call after the error was skipped, not executed
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
-    assert any("tool_error: RuntimeError" in m["content"] for m in turn1_tool_msgs)
+    assert any(m.get("name") == "boom" and "boom failed" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_non_mutating_tool_error_lets_independent_batch_calls_run() -> None:
+    # A `type` failure that leaves the page unchanged (no page-transition data, probe reads
+    # unchanged) must not block unrelated select_option calls later in the same batch -- only a
+    # failure that may have left the page in an unplanned-for state should stop the batch. `type`
+    # and `select_option` are marked billable=True to match production (tools.py) so this exercises
+    # the real probe-gated branch, not a fixture shortcut that skips it.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    select_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    tools = [
+        _recording_tool("click", click_calls),
+        _recording_tool("type", type_calls, raises=True, billable=True),
+        _recording_tool("select_option", select_calls, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("click", {"selector": "#ok"}),
+            ("type", {"selector": "#name"}),
+            ("select_option", {"selector": "#a"}),
+            ("select_option", {"selector": "#b"}),
+            ("select_option", {"selector": "#c"}),
+        ],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(select_calls) == 3  # all three ran despite the earlier, non-page-mutating error
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "tool_error" in m["content"] for m in turn1_tool_msgs)
+    assert not any("skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_failed_call_skips_only_same_selector_dependents() -> None:
+    # A failed `type` on "#q" should skip a later call that targets the SAME selector (it depends on
+    # the failed call having succeeded) but must not skip a call against an unrelated selector. All
+    # three tools are billable=True to match production (tools.py), with a constant probe so the
+    # probe-gated branch runs and reads unchanged.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    press_calls: list[tuple[str, dict[str, Any]]] = []
+    select_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    tools = [
+        _recording_tool("type", type_calls, raises=True, billable=True),
+        _recording_tool("press_key", press_calls, billable=True),
+        _recording_tool("select_option", select_calls, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("type", {"selector": "#q"}),
+            ("press_key", {"selector": "#q"}),
+            ("select_option", {"selector": "#z"}),
+        ],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(press_calls) == 0  # depends on the failed #q type, must not run
+    assert len(select_calls) == 1  # unrelated selector, must run
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(
+        m.get("name") == "press_key" and "skipped" in m["content"] and "#q" in m["content"] for m in turn1_tool_msgs
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_call_skips_only_same_mark_dependents() -> None:
+    # A failed `type(mark=3)` should skip a later call on the SAME mark, mirroring the selector case,
+    # since act-by-mark calls carry no top-level "selector" arg for _call_selector to key on. The
+    # dependents are selects, not clicks: a click after any batch failure is deferred as a possible submit.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    select_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _recording_tool("type", type_calls, raises=True, billable=True),
+        _recording_tool("select_option", select_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("type", {"mark": 3}),
+            ("select_option", {"mark": 3}),
+            ("select_option", {"mark": 4}),
+        ],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert len(select_calls) == 1  # only mark=4 dispatched; mark=3 depends on the failed type
+    assert select_calls[0][1]["mark"] == 4
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "select_option" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_mid_batch_look_defers_every_later_mark_call() -> None:
+    # look() renumbers marks on every call, so a mark=3 queued behind a mid-batch look was chosen from
+    # the OLD screenshot and now names an arbitrary element: it is deferred, not dispatched.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    look_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        if len(type_calls) == 1:
+            return ToolResult.error("type failed")
+        return ToolResult.ok("type done")
+
+    tools = [
+        ToolSpec(
+            name="type",
+            description="type",
+            parameters={"type": "object", "properties": {}},
+            handler=type_handler,
+            billable=True,
+        ),
+        _look_tool(look_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("type", {"mark": 3}),
+            ("look", {}),
+            ("type", {"mark": 3}),
+        ],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(look_calls) == 1
+    assert len(type_calls) == 1  # the second mark=3 is deferred: its number predates the renumbering
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
+    assert any("renumbered" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_non_page_action_failure_does_not_mark_its_selector_or_arm_the_batch() -> None:
+    # A timed-out wait on #x mutates nothing: the later click on #x re-resolves the element itself, so
+    # it must dispatch rather than be skipped as a dependent, and no submit deferral is armed.
+    wait_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    async def wait_handler(args: dict[str, Any]) -> ToolResult:
+        wait_calls.append(("wait", args))
+        return ToolResult.error("wait timed out")
+
+    tools = [
+        ToolSpec(
+            name="wait", description="wait", parameters={"type": "object", "properties": {}}, handler=wait_handler
+        ),
+        _recording_tool("click", click_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("wait", {"selector": "#x"}), ("click", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(wait_calls) == 1
+    assert len(click_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_billable_failure_that_moved_the_page_still_stops_the_batch() -> None:
+    # A wait that times out BECAUSE the site navigated is not a field failure, but the page moved: the
+    # probe runs around every known tool, so the rest of the batch (planned for the old page) is skipped.
+    readings = iter(["doc-1", "doc-2"])
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return next(readings, "doc-2")
+
+    async def wait_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("wait timed out")
+
+    tools = [
+        ToolSpec(
+            name="wait", description="wait", parameters={"type": "object", "properties": {}}, handler=wait_handler
+        ),
+        _recording_tool("click", click_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("wait", {"selector": "#x"}), ("click", {"selector": "#next"})],
+        [("finish", {"status": "terminated", "reason": "gave up"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "terminated"
+    assert click_calls == []
+    click_msgs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+    assert any("changed the page" in m["content"] for m in click_msgs)
+
+
+@pytest.mark.asyncio
+async def test_hung_page_probe_is_bounded_and_reads_as_poisoned(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A renderer that never answers the probe must not stall the loop past its deadline: the sample is
+    # bounded, and a missing reading is treated as poisoned (the batch stops), never as unchanged.
+    monkeypatch.setattr(loop_module, "_PAGE_PROBE_TIMEOUT_SECONDS", 0.01)
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def hung_probe() -> str | None:
+        await asyncio.Event().wait()
+        return None
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        if args.get("selector") == "#q":
+            return ToolResult.error("type failed")
+        return ToolResult.ok("type done")
+
+    tools = [
+        ToolSpec(
+            name="type",
+            description="type",
+            parameters={"type": "object", "properties": {}},
+            handler=type_handler,
+            billable=True,
+        ),
+        make_finish_tool(),
+    ]
+    script = [
+        [("type", {"selector": "#q"}), ("type", {"selector": "#zip"})],
+        [("finish", {"status": "terminated", "reason": "gave up"})],
+    ]
+    outcome, _ = await asyncio.wait_for(_run(script, tools, page_probe=hung_probe), timeout=2)
+
+    assert outcome.status == "terminated"
+    assert [call_args.get("selector") for _, call_args in type_calls] == ["#q"]  # batch stopped: reading missing
+
+
+@pytest.mark.asyncio
+async def test_look_that_fails_before_renumbering_keeps_mark_dependents() -> None:
+    # A look() refused on budget (or failing to capture/enumerate) leaves the old manifest live, so a
+    # mark=3 call after it still names the element whose earlier call failed and must stay skipped.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    look_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        return ToolResult.error("type failed")
+
+    tools = [
+        ToolSpec(
+            name="type",
+            description="type",
+            parameters={"type": "object", "properties": {}},
+            handler=type_handler,
+            billable=True,
+        ),
+        _look_tool(look_calls, fail_before_renumbering=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("type", {"mark": 3}),
+            ("look", {}),
+            ("type", {"mark": 3}),
+        ],
+        [("finish", {"status": "terminated", "reason": "gave up"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "terminated"
+    assert len(look_calls) == 1
+    assert len(type_calls) == 1  # the second mark=3 call is still a dependent of the failed one
+    type_msgs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
+    assert any("skipped" in m["content"] for m in type_msgs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finish_status", "expected_turns", "expected_status"),
+    [
+        ("completed", 2, "completed"),
+        ("terminated", 2, "terminated"),
+        ("failed", 2, "failed"),
+    ],
+)
+async def test_any_finish_deferred_after_batch_failure(
+    finish_status: str, expected_turns: int, expected_status: str
+) -> None:
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        return ToolResult.error("type failed")
+
+    tools = [
+        ToolSpec(
+            name="type",
+            description="type",
+            parameters={"type": "object", "properties": {}},
+            handler=type_handler,
+            billable=True,
+        ),
+        make_finish_tool(),
+    ]
+    script = [
+        [("type", {"selector": "#q"}), ("finish", {"status": finish_status, "reason": "done"})],
+        [("finish", {"status": finish_status, "reason": "done after re-checking"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    # Every verdict was written before the model saw the failure, so each is deferred one turn: a
+    # completed one may be false, and a failed/terminated one carries a reason that predates the error.
+    assert outcome.status == expected_status
+    assert outcome.turns == expected_turns
+    finish_msgs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert any("skipped" in m["content"] for m in finish_msgs)
+
+
+@pytest.mark.asyncio
+async def test_cross_selector_dependent_call_still_dispatches_and_fails_on_its_own() -> None:
+    # A call against a DIFFERENT selector than the failed one is not skipped by the same-selector
+    # rule -- it dispatches and, if it truly depends on the failed call's DOM effect, fails on its
+    # own terms rather than being wrong-committed as "skipped".
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls.append(("select_option", args))
+        return ToolResult.error(f"no element for selector {args['selector']!r}")
+
+    tools = [
+        ToolSpec(
+            name="select_option", description="s", parameters={"type": "object", "properties": {}}, handler=handler
+        ),
+        make_finish_tool(),
+    ]
+    script = [
+        [("select_option", {"selector": "#a"}), ("select_option", {"selector": "#b"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert len(calls) == 2  # #b was dispatched -- its selector differs from #a's, so it is not skipped
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "select_option"]
+    assert all("skipped" not in m["content"] for m in turn1_tool_msgs)
+    assert any("no element for selector '#b'" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submit_call",
+    [
+        ("press_key", {"key": "Enter"}),
+        ("press_key", {"key": "Control+Enter"}),
+        ("press_key", {"selector": "#submit", "key": "Space"}),
+        ("press_key", {"selector": "#submit", "key": " "}),
+        ("type", {"selector": "#other", "press_enter": True}),
+    ],
+    ids=[
+        "press_key_enter",
+        "press_key_control_enter",
+        "press_key_space",
+        "press_key_literal_space",
+        "type_press_enter",
+    ],
+)
+async def test_click_and_enter_submit_skipped_after_batch_failure_but_other_fields_run(
+    submit_call: tuple[str, dict[str, Any]],
+) -> None:
+    # After a page-action failure in the batch, the loop cannot classify a click -- it may be the
+    # form's Submit -- so ANY later click is skipped alongside the Enter-shaped submit shapes. Other
+    # field-filling tools (select_combobox, type, file_upload) on OTHER selectors are not submit-shaped
+    # and still run.
+    submit_name, submit_args = submit_call
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    press_calls: list[tuple[str, dict[str, Any]]] = []
+    combobox_calls: list[tuple[str, dict[str, Any]]] = []
+    upload_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        if args.get("selector") == "#q":
+            return ToolResult.error("type failed")
+        return ToolResult.ok("type done")
+
+    tools = [
+        ToolSpec(
+            name="type",
+            description="type",
+            parameters={"type": "object", "properties": {}},
+            handler=type_handler,
+            billable=True,
+        ),
+        _recording_tool("click", click_calls),
+        _recording_tool("press_key", press_calls),
+        _recording_tool("select_combobox", combobox_calls),
+        _recording_tool("file_upload", upload_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("type", {"selector": "#q"}),
+            ("click", {"selector": "#agree"}),
+            (submit_name, submit_args),
+            ("select_combobox", {"selector": "#city"}),
+            ("type", {"selector": "#zip"}),
+            ("file_upload", {"selector": "#resume"}),
+        ],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(click_calls) == 0  # a click cannot be classified as safe, so it's skipped too
+    if submit_name == "press_key":
+        assert len(press_calls) == 0  # Enter-shaped submit skipped after the batch failure
+    else:
+        # The submit-shaped `type` call is skipped before dispatch -- only the earlier, failed "#q"
+        # call and the later "#zip" call reach the handler and land in the sink.
+        assert not any(call_args.get("selector") == "#other" for _, call_args in type_calls)
+    assert len(combobox_calls) == 1  # unrelated field, not submit-shaped, still runs
+    assert any(call_args.get("selector") == "#zip" for _, call_args in type_calls)  # unrelated type still runs
+    assert len(upload_calls) == 1  # unrelated field, not submit-shaped, still runs
+    assert outcome.tool_calls == 5  # four dispatched calls plus finish: the two skipped calls cost no budget
+
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "click" and "skipped" in m["content"] for m in turn1_tool_msgs)
+    assert any(m.get("name") == submit_name and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("data_flag", "error_value", "expected_status"),
+    [
+        ("page_transitioned", True, "completed"),
+        ("page_state_changed", True, "completed"),
+        # navigation_dead_end additionally classifies the run as terminated once the batch settles --
+        # that's a separate mechanism from the batch-stop this test targets, so it gets its own expected
+        # final status rather than "completed".
+        ("navigation_dead_end", 404, "terminated"),
+    ],
+)
+async def test_page_changing_tool_error_still_stops_batch(
+    data_flag: str, error_value: Any, expected_status: str
+) -> None:
+    # An error result that itself signals the page moved (page_transitioned, page_state_changed, or
+    # navigation_dead_end in .data) must still stop the rest of the batch even though the call
+    # "failed" -- the page moved out from under any planned follow-up regardless of the reported status.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    nav_click_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _recording_tool("click", click_calls),
+        _erroring_tool("nav_click", nav_click_calls, error_data={data_flag: error_value}),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [
+            ("click", {"selector": "#ok"}),
+            ("nav_click", {"selector": "#nav"}),
+            ("type", {"selector": "#x"}),
+        ],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == expected_status
+    assert len(type_calls) == 0  # the batch stopped: the page moved under the failed call
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_navigate_tool_error_still_stops_batch() -> None:
+    # A failed `navigate` carries no explicit page_transitioned/page_state_changed data, but
+    # navigation is inherently page-mutating -- an errored navigate must still stop the batch.
+    navigate_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _recording_tool("navigate", navigate_calls, raises=True),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": "https://example.com"}), ("type", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert len(type_calls) == 0
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_page_unavailable_tool_error_still_stops_batch() -> None:
+    # The page itself is gone: inherently poisoning regardless of tool name or data.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error(PAGE_UNAVAILABLE_ERROR)
+
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        ToolSpec(name="click", description="c", parameters={"type": "object", "properties": {}}, handler=handler),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "#ok"}), ("type", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert len(type_calls) == 0
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_page_probe_change_across_failed_call_stops_batch() -> None:
+    # A billable tool's error carries no data flag, but the page_probe sampled before and after the
+    # dispatch shows the page changed underneath it -- still poisoning.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    probe_calls = {"n": 0}
+
+    async def probe() -> str | None:
+        probe_calls["n"] += 1
+        return "A" if probe_calls["n"] == 1 else "B"
+
+    tools = [
+        _erroring_tool("click", click_calls, billable=True),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "#ok"}), ("type", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(type_calls) == 0  # the probe changed across the failed call -- batch stopped
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_page_probe_unchanged_across_failed_call_continues_batch() -> None:
+    # Same shape as above, but the probe reads the same value before and after the failed call --
+    # nothing in this error signals a page change, so the batch continues.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe() -> str | None:
+        return "same"
+
+    tools = [
+        _erroring_tool("click", click_calls, billable=True),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("click", {"selector": "#ok"}), ("type", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(type_calls) == 1  # the probe read unchanged across the failed call -- batch continues
+
+
+@pytest.mark.asyncio
+async def test_recordable_non_billable_tool_error_with_probe_change_stops_batch() -> None:
+    # solve_captcha is recordable but not billable -- the probe must still be sampled around it, or a
+    # failed solve that moved the page can never poison the batch.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    probe_calls = {"n": 0}
+
+    async def probe() -> str | None:
+        probe_calls["n"] += 1
+        return "doc-1" if probe_calls["n"] == 1 else "doc-2"
+
+    tools = [
+        _erroring_tool("solve_captcha", click_calls, recordable=True),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("solve_captcha", {}), ("type", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools, page_probe=probe)
+
+    assert outcome.status == "completed"
+    assert len(type_calls) == 0  # the probe changed across the failed recordable call -- batch stopped
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
 
 
 @pytest.mark.asyncio
@@ -1231,7 +1896,9 @@ async def test_every_executed_tool_call_emits_one_timing_record() -> None:
         # A null selector is the case that matters: the tools fall back to scanning the whole page,
         # so it must read as absent even though the key is present.
         [("observe", {"selector": "sel"}), ("click", {"selector": None})],
-        [("boom", {}), ("click", {})],  # boom fails, so the trailing click is skipped, not executed
+        # boom fails on "#s"; the trailing click on the SAME selector depends on it and is skipped
+        # before dispatch (SKY-15143: a non-page-mutating error no longer halts the whole batch).
+        [("boom", {"selector": "#s"}), ("click", {"selector": "#s"})],
         [("nope", {})],  # unknown tool
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
@@ -1248,7 +1915,7 @@ async def test_every_executed_tool_call_emits_one_timing_record() -> None:
     assert [entry["tool_status"] for entry in records] == ["ok", "ok", "error", "error", "ok"]
     assert [entry["batch_size"] for entry in records] == [2, 2, 2, 1, 1]
     assert [entry["batch_index"] for entry in records] == [0, 1, 0, 0, 0]
-    assert [entry["selector_present"] for entry in records] == [True, False, False, False, False]
+    assert [entry["selector_present"] for entry in records] == [True, False, True, False, False]
     assert [entry["billable"] for entry in records] == [False, False, True, False, False]
     assert [entry["turn"] for entry in records] == [1, 1, 2, 3, 4]
 
