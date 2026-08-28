@@ -1155,3 +1155,92 @@ class TestMcpProvenanceSurvivesPruning:
         summary = json.loads(_summarize_tool_output(json.dumps(payload)))
 
         assert MCP_RESULT_PROVENANCE_KEY not in summary
+
+
+class TestPageEvidenceCompaction:
+    """Collapsing an older inspect_page_for_composition result to {"ok": true, "_summarized": ...}
+    tells the model it has page evidence while leaving it none."""
+
+    FILLER = "x" * 9000
+
+    def _packet(self, *, session: str, forms: list[dict], nav: list[dict]) -> str:
+        return json.dumps(
+            {
+                "ok": True,
+                "data": {
+                    "source_tool": "inspect_page_for_composition",
+                    "source_browser_session_id": session,
+                    "current_url": "https://example.test/app/",
+                    "inspected_url": "https://example.test/app/",
+                    "page_title": "Analytics",
+                    "forms": forms,
+                    "navigation_targets": nav,
+                    "visible_text_excerpt": self.FILLER,
+                    "key_value_relations": [{"key": "Visitors", "value": "9.42K", "noise": self.FILLER}],
+                },
+            }
+        )
+
+    def _signed_out(self) -> str:
+        return self._packet(
+            session="pbs_cold",
+            forms=[{"fields": [{"id": "email", "label": "Email"}, {"id": "password", "label": "Password"}]}],
+            nav=[],
+        )
+
+    def _signed_in(self) -> str:
+        return self._packet(session="pbs_warm", forms=[], nav=[{"id": "navWebAnalytics", "text": "Web analytics"}])
+
+    def test_page_evidence_is_not_collapsed_to_a_hollow_success(self) -> None:
+        compacted = json.loads(_summarize_tool_output(self._signed_out()))
+
+        assert compacted.keys() != {"ok", "_summarized"}, "an observation became a success placeholder"
+        assert "page_evidence" in compacted
+
+    def test_two_browser_states_keep_their_own_facts_and_provenance(self) -> None:
+        cold = json.loads(_summarize_tool_output(self._signed_out()))["page_evidence"]
+        warm = json.loads(_summarize_tool_output(self._signed_in()))["page_evidence"]
+
+        assert cold["source_browser_session_id"] == "pbs_cold"
+        assert warm["source_browser_session_id"] == "pbs_warm"
+        assert cold["current_url"] == warm["current_url"], "same URL — only the browser state differs"
+        assert "email" in json.dumps(cold["forms"]), "the sign-in fields are what the cold state carries"
+        assert not warm.get("forms")
+        assert "navWebAnalytics" in json.dumps(warm["navigation_targets"])
+
+    def test_raw_excerpts_are_dropped_before_facts(self) -> None:
+        compacted = _summarize_tool_output(self._signed_out())
+
+        assert self.FILLER not in compacted, "raw excerpts and derived relations go first"
+        assert len(compacted) < len(self._signed_out()) / 4
+
+    def test_a_crowded_page_cannot_defeat_compaction(self) -> None:
+        """Per-list bounds alone would let a page with many forms and links compact to roughly the
+        size it arrived at, which is the opposite of what this pass is for."""
+        lists = {
+            key: [{"id": f"{key}-{index}", "text": "y" * 380} for index in range(12)]
+            for key in (
+                "forms",
+                "navigation_targets",
+                "result_containers",
+                "clickable_controls",
+                "challenge_controls",
+                "modal_overlays",
+                "page_obstructions",
+            )
+        }
+        crowded = json.dumps(
+            {
+                "ok": True,
+                "data": {
+                    "source_tool": "inspect_page_for_composition",
+                    "inspected_url": "https://example.test/app/",
+                    **lists,
+                },
+            }
+        )
+
+        compacted = _summarize_tool_output(crowded)
+
+        assert len(compacted) < 5000, f"compacted output was {len(compacted)} chars"
+        assert json.loads(compacted)["page_evidence"]["forms"], "the first facts still survive"

@@ -92,7 +92,9 @@ CONTROL_INBOUND_TIMEOUT_SECONDS = 45.0
 EXTENSION_RESET_TIMEOUT_SECONDS = 5.0
 MAX_PENDING_TAB_EVENT_TABS = 64
 MAX_PENDING_TAB_EVENTS_PER_TAB = 16
-_LEASED_OPS = frozenset({"debugger.attach", "debugger.send", "debugger.detach", "tabs.activate", "tabs.remove"})
+_LEASED_OPS = frozenset(
+    {"debugger.attach", "debugger.send", "debugger.detach", "dom.evaluate", "tabs.activate", "tabs.remove"}
+)
 _WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
 _APPROVAL_SOURCE_INTERACTIVE = "interactive"
 _APPROVAL_SOURCE_GRANT = "grant"
@@ -892,7 +894,7 @@ class BrowserExtensionBrokerServer:
                 "Approve this agent's browser session in the Skyvern Agent confirmation tab",
             )
         if (
-            op in {"extension.request", "lease.acquire_default"}
+            op in {"extension.request", "lease.acquire_default", "lease.list"}
             and relay.connected
             and relay.extension_protocol_version != PROTOCOL_VERSION
         ):
@@ -900,6 +902,31 @@ class BrowserExtensionBrokerServer:
                 "EXTENSION_UPGRADE_REQUIRED",
                 "Reload the current Skyvern Agent extension before using this agent",
             )
+        if op == "lease.list":
+            if args:
+                raise BrowserExtensionBrokerError("INVALID_REQUEST", "Lease list does not accept arguments")
+            if self._extension_reset_quarantined:
+                raise BrowserExtensionBrokerError(
+                    self._extension_reset_error or "EXTENSION_RESET_IN_PROGRESS",
+                    "Extension state reset has not completed",
+                    retry_after=0.1 if self._extension_reset_error in {None, "EXTENSION_RESET_IN_PROGRESS"} else None,
+                )
+            listed = await relay.request("tabs.list", {}, timeout=5.0)
+            tabs = listed.get("tabs")
+            if not isinstance(tabs, list):
+                raise BrowserExtensionBrokerError("INVALID_FRAME", "Extension tab list is invalid")
+            owned_tab_ids = {
+                tab_id
+                for tab_id, lease in self._leases.items()
+                if not lease.draining and lease.client_id == connection.client_id
+            }
+            return {
+                "tabs": [
+                    dict(tab)
+                    for tab in tabs
+                    if isinstance(tab, dict) and type(tab.get("tabId")) is int and tab["tabId"] in owned_tab_ids
+                ]
+            }
         if op == "lease.release":
             if set(args) != {"tabId"}:
                 raise BrowserExtensionBrokerError("INVALID_REQUEST", "Lease release requires only a tabId")

@@ -31,7 +31,6 @@ const {
   historyResponse,
   routeParams,
   workflowRunQueryMock,
-  mockFeatureFlagEnabled,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const post = vi.fn().mockResolvedValue({});
@@ -66,13 +65,8 @@ const {
     historyResponse: history,
     routeParams: params,
     workflowRunQueryMock: vi.fn(),
-    mockFeatureFlagEnabled: vi.fn().mockReturnValue(true),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: mockFeatureFlagEnabled,
-}));
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -243,7 +237,6 @@ beforeEach(() => {
   };
   workflowRunQueryMock.mockReset();
   workflowRunQueryMock.mockReturnValue({ data: undefined });
-  mockFeatureFlagEnabled.mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -276,14 +269,6 @@ describe("WorkflowCopilotChat — instant acknowledgement", () => {
 
     await waitFor(() => expectNoAckLines());
     expect(screen.getAllByRole("status")).toHaveLength(1);
-  });
-
-  it("REGRESSION: never renders when copilot_ux_v1 is off", async () => {
-    mockFeatureFlagEnabled.mockReturnValue(false);
-    await renderChat();
-    await submit("build a workflow");
-
-    expectNoAckLines();
   });
 
   it("REGRESSION: an Ask reply clears the placeholder when the turn completes", async () => {

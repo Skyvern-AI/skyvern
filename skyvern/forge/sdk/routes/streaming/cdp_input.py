@@ -3,7 +3,6 @@ CDP input channel for interactive browser control via Chrome DevTools Protocol.
 """
 
 import asyncio
-import contextlib
 import dataclasses
 import json
 import time
@@ -11,13 +10,13 @@ import typing as t
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
+from opentelemetry import metrics
 from playwright.async_api import CDPSession
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming import latency_probe
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
 from skyvern.forge.sdk.routes.streaming.screencast import (
     _resolve_working_page,
@@ -32,9 +31,6 @@ from skyvern.forge.sdk.streaming.registries import (
     try_stream_ref_inc,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.services.browser_recording.v2.resolver import get_resolver
-from skyvern.services.browser_recording.v2.session import get_session_v2
-from skyvern.services.browser_recording.v2.tap import tap_navigation, tap_pipelined
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_errors import is_target_closed_message
 from skyvern.webeye.browser_state import BrowserState
@@ -45,17 +41,19 @@ LOG = structlog.get_logger()
 _INPUT_KIND_LABELS = frozenset(
     {"mouseEvent", "keyEvent", "wheelEvent", "navigateEvent", "goBackEvent", "goForwardEvent", "reloadEvent"}
 )
-_input_wait_seconds = latency_probe._meter.create_histogram(
+_LATENCY_BUCKETS_SECONDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.045, 0.06, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+_meter = metrics.get_meter("skyvern.live_view")
+_input_wait_seconds = _meter.create_histogram(
     "skyvern.live_view.input_wait_seconds",
     unit="s",
     description="Input event: receive_text returned -> dispatch started, including active-page resolution",
-    explicit_bucket_boundaries_advisory=latency_probe._LATENCY_BUCKETS_SECONDS,
+    explicit_bucket_boundaries_advisory=_LATENCY_BUCKETS_SECONDS,
 )
-_input_dispatch_seconds = latency_probe._meter.create_histogram(
+_input_dispatch_seconds = _meter.create_histogram(
     "skyvern.live_view.input_dispatch_seconds",
     unit="s",
     description="Input event: dispatch handling after an active CDP session is acquired",
-    explicit_bucket_boundaries_advisory=latency_probe._LATENCY_BUCKETS_SECONDS,
+    explicit_bucket_boundaries_advisory=_LATENCY_BUCKETS_SECONDS,
 )
 
 _VALID_MOUSE_TYPES = {"mousePressed", "mouseReleased", "mouseMoved"}
@@ -73,16 +71,11 @@ ACTIVE_PAGE_INPUT_REFRESH_INTERVAL = 0.5
 _NAVIGATION_RESET_TIMEOUT_MS = 5_000
 _TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedError"})
 _PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent"})
-_LATENCY_PROBED_MOUSE_TYPES = frozenset({"mousePressed", "mouseReleased"})
 _MAX_IN_FLIGHT_INPUT_DISPATCHES = 32
 
 
 def _input_kind_label(kind: object) -> str:
     return kind if isinstance(kind, str) and kind in _INPUT_KIND_LABELS else "other"
-
-
-def _is_discrete_input(kind: str, msg: dict) -> bool:
-    return kind in {"keyEvent", "wheelEvent"} or msg.get("eventType") in _LATENCY_PROBED_MOUSE_TYPES
 
 
 @dataclasses.dataclass
@@ -122,21 +115,6 @@ class ActivePageCdpInputSession:
         self.next_refresh_at = 0.0
         self.page_resolution_failed = False
 
-    async def _attach_observer(self, page: object, session: CDPSession) -> None:
-        if self.entity_type != "browser_session":
-            return
-        recording_session = get_session_v2(self.entity_id)
-        if recording_session is None:
-            return
-        try:
-            await recording_session.attach_page(str(id(page)), session)
-        except Exception:
-            LOG.warning(
-                "v2 observer attach failed",
-                **{self.log_id_key: self.log_id_value},
-                exc_info=True,
-            )
-
     async def get_session(self, *, force_refresh: bool = False) -> CDPSession | None:
         now = time.monotonic()
         if not force_refresh and now < self.next_refresh_at:
@@ -162,14 +140,12 @@ class ActivePageCdpInputSession:
         self.page_resolution_failed = False
         self.next_refresh_at = now + self.refresh_interval
         if self.cdp_session is not None and page is self.page:
-            await self._attach_observer(page, self.cdp_session)
             return self.cdp_session
 
         await self.close()
         session = await page.context.new_cdp_session(page)  # type: ignore[attr-defined]
         self.cdp_session = session
         self.page = page
-        await self._attach_observer(page, session)
         LOG.info(
             "CDP input rebound to active page",
             **{self.log_id_key: self.log_id_value},
@@ -321,11 +297,6 @@ async def _close_ws_safely(websocket: WebSocket, code: int, reason: str = "") ->
         await websocket.close(code=code, reason=reason)
     except Exception:
         pass
-
-
-async def _send_pong(websocket: WebSocket, t: object) -> None:
-    with contextlib.suppress(Exception):
-        await websocket.send_json({"kind": "pong", "t": t})
 
 
 _EVENT_DISPATCH_MAP: dict[str, tuple[t.Callable[[dict], dict | None], str]] = {
@@ -509,14 +480,12 @@ async def _run_input_loop(
     input_session: ActivePageCdpInputSession,
     log_id_key: str,
     log_id_value: str,
-    browser_session_id: str | None,
 ) -> None:
     dropped_log_count = 0
     no_active_page_log_count = 0
     dispatch_semaphore = asyncio.Semaphore(_MAX_IN_FLIGHT_INPUT_DISPATCHES)
     dispatch_tasks: set[asyncio.Task[None]] = set()
     dispatch_failure_close_started = False
-    bound_cdp_session: CDPSession | None = None
 
     async def dispatch_pipelined_event(
         cdp_session: CDPSession,
@@ -571,12 +540,6 @@ async def _run_input_loop(
 
             kind = msg.get("kind") or msg.get("type")
 
-            if kind == "ping":
-                task = asyncio.create_task(_send_pong(websocket, msg.get("t")))
-                dispatch_tasks.add(task)
-                task.add_done_callback(dispatch_tasks.discard)
-                continue
-
             if kind == "take-control":
                 channel.interactor = "user"
                 LOG.info("CDP input: take-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
@@ -615,20 +578,11 @@ async def _run_input_loop(
                     no_active_page_log_count += 1
                 continue
 
-            if cdp_session is not bound_cdp_session:
-                resolver = get_resolver(browser_session_id) if browser_session_id else None
-                if resolver is not None and bound_cdp_session is not None:
-                    resolver.forget_session(bound_cdp_session)
-                bound_cdp_session = cdp_session
-
             if kind in _PIPELINED_INPUT_KINDS:
                 dispatch = _validate_cdp_dispatch(kind, msg, log_id_key, log_id_value)
                 if dispatch is None:
                     continue
                 cdp_method, validated = dispatch
-                tap_pipelined(browser_session_id, kind, validated, received_at, input_session.page, cdp_session)
-                if browser_session_id and _is_discrete_input(kind, msg):
-                    latency_probe.note_input(browser_session_id, received_at)
                 await dispatch_semaphore.acquire()
                 if dispatch_failure_close_started:
                     dispatch_semaphore.release()
@@ -648,7 +602,6 @@ async def _run_input_loop(
             dispatch_started = time.monotonic()
             _input_wait_seconds.record(dispatch_started - received_at, attributes)
             try:
-                tap_navigation(browser_session_id, kind, msg, received_at, input_session.page)
                 await _dispatch_event(cdp_session, input_session.page, kind, msg, log_id_key, log_id_value, websocket)
             except Exception:
                 LOG.warning(
@@ -743,7 +696,7 @@ async def cdp_input_stream(
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, input_session, "workflow_run_id", workflow_run_id, None)
+        await _run_input_loop(websocket, channel, input_session, "workflow_run_id", workflow_run_id)
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", workflow_run_id=workflow_run_id)
@@ -825,9 +778,7 @@ async def cdp_input_browser_session_stream(
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(
-            websocket, channel, input_session, "browser_session_id", browser_session_id, browser_session_id
-        )
+        await _run_input_loop(websocket, channel, input_session, "browser_session_id", browser_session_id)
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", browser_session_id=browser_session_id)
@@ -838,7 +789,6 @@ async def cdp_input_browser_session_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", browser_session_id=browser_session_id, exc_info=True)
     finally:
-        latency_probe.forget(browser_session_id)
         await _close_input_session_and_release_browser_state(
             input_session, browser_state, "browser_session", browser_session_id
         )

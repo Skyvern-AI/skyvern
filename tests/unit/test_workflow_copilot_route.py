@@ -31,6 +31,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.context import AgentResult, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
@@ -112,6 +113,7 @@ def _make_chat_request(
     code_block: bool | None = None,
     keep_pending_proposal: bool = False,
     idempotency_key: str | None = None,
+    eval_entrypoint_url: str | None = None,
 ) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
@@ -124,6 +126,7 @@ def _make_chat_request(
         code_block=code_block,
         keep_pending_proposal=keep_pending_proposal,
         idempotency_key=idempotency_key,
+        eval_entrypoint_url=eval_entrypoint_url,
     )
 
 
@@ -1452,7 +1455,11 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
-    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request,
+        _make_chat_request(mode="build", code_block=False),
+        organization,
+    )
     assert response is captured["sentinel"]
 
     stream = MagicMock()
@@ -1464,6 +1471,12 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
     handler = captured["handler"]
     assert callable(handler)
     await handler(stream)
+
+    app.AGENT_FUNCTION.get_copilot_config_for_request.assert_awaited_once_with(
+        "org-1",
+        code_block_mode=False,
+        composer_mode="build",
+    )
 
     if expect_restore:
         restore_mock.assert_awaited_once()
@@ -4102,3 +4115,187 @@ def test_a_client_side_http_error_stays_the_products_own_answer() -> None:
     assert (
         workflow_copilot_route._http_exception_failure_kind(HTTPException(status_code=403, detail="forbidden")) is None
     )
+
+
+def _eval_header_request() -> MagicMock:
+    request = MagicMock()
+    request.headers = {"x-copilot-eval": "odysseys"}
+    return request
+
+
+def _install_v2_dispatch(
+    monkeypatch: pytest.MonkeyPatch, *, eval_inputs_enabled: bool, eval_organization_ids: list[str] | None = None
+) -> AsyncMock:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED", eval_inputs_enabled)
+    monkeypatch.setattr(
+        settings,
+        "WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS",
+        ["org-1"] if eval_organization_ids is None else eval_organization_ids,
+    )
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    new_copilot_mock = AsyncMock(return_value=object())
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+    return new_copilot_mock
+
+
+@pytest.mark.asyncio
+async def test_eval_entrypoint_url_is_rejected_when_the_eval_setting_is_off(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_eval_entrypoint_url_is_rejected_when_the_caller_org_is_not_allowlisted(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(
+        monkeypatch, eval_inputs_enabled=True, eval_organization_ids=["some-other-eval-org"]
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_eval_entrypoint_url_is_rejected_when_the_eval_header_is_absent(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            anon_request,
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "eval_entrypoint_url",
+    [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "https://",
+        "not a url",
+        "https://exa mple.com",
+        "https://example.com:bad/path",
+        "https://:443",
+        "https://example.com/a b",
+        "https://user:secret@example.com",
+        "  https://seed.example  ",
+        # A caller past all three gates still cannot aim the browser at cloud metadata or a
+        # private range; the navigation guard refuses these too, this is the earlier 400.
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/internal",
+        "http://metadata.google.internal/computeMetadata/v1/",
+    ],
+)
+async def test_a_non_http_eval_entrypoint_url_is_rejected_with_both_gates_open(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace, eval_entrypoint_url: str
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(eval_entrypoint_url=eval_entrypoint_url),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eval_mode", [None, CopilotEvalMode.BROWSER_ABLATION])
+async def test_an_admitted_eval_entrypoint_url_reaches_the_agent_path_byte_exact(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace, eval_mode: CopilotEvalMode | None
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
+    request = _eval_header_request()
+    if eval_mode is not None:
+        request.headers["x-copilot-eval-mode"] = eval_mode.value
+
+    await workflow_copilot_chat_post(
+        request,
+        _make_chat_request(eval_entrypoint_url="https://seed.example"),
+        organization,
+    )
+
+    assert new_copilot_mock.await_args.kwargs["eval_entrypoint_url"] == "https://seed.example"
+    assert new_copilot_mock.await_args.kwargs.get("eval_mode") == eval_mode
+
+
+@pytest.mark.asyncio
+async def test_the_entrypoint_gate_answers_before_the_eval_mode_gate(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+    request = _eval_header_request()
+    request.headers["x-copilot-eval-mode"] = CopilotEvalMode.BROWSER_ABLATION.value
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            request,
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_eval_entrypoint_url_is_rejected_on_the_legacy_copilot_path(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(mode="ask", eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_request_without_an_eval_entrypoint_url_reaches_the_agent_path_unchanged(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
+
+    await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
+
+    assert new_copilot_mock.await_args.kwargs["eval_entrypoint_url"] is None

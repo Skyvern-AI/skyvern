@@ -76,6 +76,7 @@ import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowR
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
+import { usePageSlots } from "@/store/PageSlots";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
@@ -91,7 +92,7 @@ import {
   type RecoveryGuidanceTelemetryContext,
 } from "@/util/onboarding/recoveryGuidanceTelemetry";
 import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
-import { shouldPollForGeneratedCode } from "./utils";
+import { getRerunNavigationState, shouldPollForGeneratedCode } from "./utils";
 
 const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
   "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
@@ -175,10 +176,12 @@ function WorkflowRun() {
   const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const onboarding = useOnboardingStateOptional();
+  const { workflowRunMilestoneCard: WorkflowRunMilestoneCard } = usePageSlots();
 
   const {
     data: workflowRun,
     isLoading: workflowRunIsLoading,
+    isPlaceholderData: workflowRunIsPlaceholder,
     isFetched,
     error,
   } = useWorkflowRunWithWorkflowQuery();
@@ -817,6 +820,26 @@ function WorkflowRun() {
           </div>
         </header>
       )}
+      {WorkflowRunMilestoneCard &&
+      workflowRun &&
+      !workflowRunIsPlaceholder &&
+      workflowRun.workflow_run_id === workflowRunId &&
+      workflowRun.status === Status.Completed ? (
+        <WorkflowRunMilestoneCard
+          workflowRunId={workflowRun.workflow_run_id}
+          rerun={
+            !isEmbedded &&
+            !isTaskv2Run &&
+            !isWorkflowDeleted &&
+            workflowPermanentId
+              ? {
+                  to: `/agents/${workflowPermanentId}/run`,
+                  state: getRerunNavigationState(workflowRun),
+                }
+              : undefined
+          }
+        />
+      ) : null}
       {/* 2FA Verification Code Form - shown when workflow is waiting for a code */}
       <WorkflowRunVerificationCodeForm />
       {showOutputSection && (

@@ -29,9 +29,8 @@ export const WORKFLOWS_DIRECTORY_TREE_FLAG = "WORKFLOWS_DIRECTORY_TREE";
 // Not enrolled reads as disabled, so the default stays the legacy editor.
 export const WORKFLOW_STUDIO_FLAG = "workflow_studio_v2";
 
-// Gates progressive recorded-action reveal in copilot verify cards.
-// Not enrolled reads as disabled, so the default stays the pre-reveal card.
-export const COPILOT_UX_V1_FLAG = "copilot_ux_v1";
+// Gates the optional, server-confirmed onboarding details step.
+export const ONBOARDING_QUESTIONNAIRE_FLAG = "onboarding_questionnaire_v1";
 
 // Gates the login-block fallback-credential editor. Off ⇒ the fallback config is hidden, because
 // automatic retries only run for orgs in the CREDENTIAL_FALLBACK_RETRY rollout (backend gate), so
@@ -42,8 +41,4 @@ export const CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY";
 // Opt-in preview (0% base): recordings synthesize code blocks instead of agent blocks.
 export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";
 
-// Opt-in (0% base): recording keeps the CDP stream instead of swapping to VNC.
-export const RECORD_BROWSER_CDP_TRANSPORT_FLAG = "record_browser_cdp_transport";
-
-// Opt-in (0% base): Record Browser v2 — capture from the input path, no scripts injected into the page.
-export const RECORD_BROWSER_V2_FLAG = "record_browser_v2";
+export const ONBOARDING_PROGRESS_FLAG = "onboarding_progress_v1";

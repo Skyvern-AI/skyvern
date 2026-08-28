@@ -10,6 +10,7 @@ const exploringTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
+  designStarted: true,
 });
 
 afterEach(() => {
@@ -17,13 +18,13 @@ afterEach(() => {
 });
 
 describe("NarrativeView — transcript working line", () => {
-  it("keeps the line when the composer's verb row is not showing", () => {
-    render(<NarrativeView turn={exploringTurn()} uxV1 />);
-    expect(screen.getByText("Working…")).toBeTruthy();
-  });
+  it("replaces the active-turn working header with the acknowledgement", () => {
+    render(<NarrativeView turn={exploringTurn()} />);
 
-  it("drops the line once the composer's verb row carries the state", () => {
-    render(<NarrativeView turn={exploringTurn()} uxV1 workingRowActive />);
     expect(screen.queryByText("Working…")).toBeNull();
+    expect(screen.queryByText("· building your workflow")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain(
+      "Copilot is working on your request…",
+    );
   });
 });

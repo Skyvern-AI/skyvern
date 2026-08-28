@@ -7,6 +7,7 @@ import {
   TurnNarrativeState,
   condenseActivityEntries,
   hasPendingToolCall,
+  isBlockOk,
   parseUtcIsoMs,
   toolCallIdOf,
 } from "./narrativeState";
@@ -109,11 +110,17 @@ function runStartLookup(
     }
   }
   return (row) => {
-    const first = row.entries[0];
+    // A code write and its immediate test share one display row, but block
+    // evidence still belongs to the run invocation. Using the author entry's
+    // earlier timestamp here can make a parallel block look like part of the
+    // new test.
+    const firstRun = row.entries.find((entry) => kindOf(entry) === "run");
+    const first = firstRun ?? row.entries[0];
     if (first === undefined) return null;
     const callId = toolCallIdOf(first);
     const startedAt =
       (callId === undefined ? undefined : callStartedAt.get(callId)) ??
+      first.activityStartedAt ??
       first.timestamp;
     return parseUtcIsoMs(startedAt);
   };
@@ -130,25 +137,153 @@ function anchorRunRow(
   if (block.state === "drafted" || runRows.length === 0) {
     return undefined;
   }
-  const lastRow = runRows[runRows.length - 1];
+  const timedRows = runRows.map((row) => ({ row, started: runStartedMs(row) }));
   const blockStartedMs = parseUtcIsoMs(block.startedAt);
   if (blockStartedMs === null) {
-    return lastRow;
+    return (
+      timedRows.reduce<ActivityRow | undefined>((latest, candidate) => {
+        if (candidate.started === null) return latest;
+        if (latest === undefined) return candidate.row;
+        const latestStarted = runStartedMs(latest);
+        return latestStarted === null || candidate.started > latestStarted
+          ? candidate.row
+          : latest;
+      }, undefined) ?? runRows[runRows.length - 1]
+    );
   }
   let anchor: ActivityRow | undefined;
-  for (const row of runRows) {
-    const startedMs = runStartedMs(row);
-    if (startedMs !== null && startedMs <= blockStartedMs) {
+  let anchorStarted = -Infinity;
+  for (const { row, started } of timedRows) {
+    if (
+      started !== null &&
+      started <= blockStartedMs &&
+      started > anchorStarted
+    ) {
       anchor = row;
+      anchorStarted = started;
     }
   }
   // Nothing started early enough means the block's own row aged out past the
   // activity cap, so the nearest surviving row is the earliest one left.
-  return anchor ?? runRows[0];
+  if (anchor !== undefined) return anchor;
+  return (
+    timedRows.reduce<ActivityRow | undefined>((earliest, candidate) => {
+      if (candidate.started === null) return earliest;
+      if (earliest === undefined) return candidate.row;
+      const earliestStarted = runStartedMs(earliest);
+      return earliestStarted === null || candidate.started < earliestStarted
+        ? candidate.row
+        : earliest;
+    }, undefined) ?? runRows[0]
+  );
+}
+
+function retryEntries(entry: ActivityEntry): ActivityEntry[] {
+  return [...(entry.priorFailures ?? []), entry];
 }
 
 function condensedBlock(block: BlockState): BlockState {
-  return { ...block, activity: condenseActivityEntries(block.activity) };
+  return {
+    ...block,
+    activity: condenseActivityEntries(block.activity).flatMap(retryEntries),
+  };
+}
+
+function stableRowId(entry: ActivityEntry): string {
+  const root = entry.retryRootId;
+  if (root !== undefined) {
+    return root.startsWith("tc-") || root.startsWith("tr-")
+      ? root.slice(3)
+      : root;
+  }
+  return toolCallIdOf(entry) || entry.id;
+}
+
+function coalesceNarratedBrowseRetries(
+  rows: ActivityRow[],
+  intentByRow: ReadonlyMap<ActivityRow, string>,
+): void {
+  const coalesced: ActivityRow[] = [];
+  const coalescedIntents: (string | undefined)[] = [];
+  for (const row of rows) {
+    const previous = coalesced[coalesced.length - 1];
+    const intent = intentByRow.get(row);
+    const previousIntent = coalescedIntents[coalescedIntents.length - 1];
+    const previousTail = previous?.entries[previous.entries.length - 1];
+    const previousFailed =
+      previousTail?.kind === "tool_result" && previousTail.success === false;
+    const previousEndedMs = parseUtcIsoMs(previous?.endedAt);
+    const rowStartedMs = parseUtcIsoMs(row.startedAt);
+    // Parallel siblings can carry the same narrated intent. They are a retry
+    // only when the new attempt starts after the failed one ended; missing
+    // timestamps retain the legacy fallback for old hydrated payloads.
+    const followsFailure =
+      previousEndedMs === null ||
+      rowStartedMs === null ||
+      rowStartedMs >= previousEndedMs;
+    if (
+      previous?.kind !== "browse" ||
+      row.kind !== "browse" ||
+      !previousFailed ||
+      !followsFailure ||
+      intent === undefined ||
+      intent !== previousIntent
+    ) {
+      coalesced.push(row);
+      coalescedIntents.push(intent);
+      continue;
+    }
+
+    const latest = row.entries[row.entries.length - 1];
+    if (latest === undefined) {
+      coalesced.push(row);
+      coalescedIntents.push(intent);
+      continue;
+    }
+    const attempts =
+      (previous.entries[previous.entries.length - 1]?.attempts ?? 1) +
+      (latest.attempts ?? 1);
+    const earlierEntries = previous.entries.map((entry) => ({
+      ...entry,
+      attempts: undefined,
+    }));
+    const currentEntries = row.entries.slice();
+    currentEntries[currentEntries.length - 1] = {
+      ...latest,
+      attempts,
+      activityStartedAt:
+        previous.startedAt ?? latest.activityStartedAt ?? latest.timestamp,
+    };
+    coalesced[coalesced.length - 1] = {
+      ...row,
+      id: previous.id,
+      entries: [...earlierEntries, ...currentEntries],
+      startedAt: previous.startedAt ?? row.startedAt,
+      reason: row.reason ?? previous.reason,
+      reasonAt: row.reasonAt ?? previous.reasonAt,
+    };
+  }
+  rows.splice(0, rows.length, ...coalesced);
+}
+
+function rowContainsNarrationTime(
+  row: ActivityRow,
+  narrationTimestamp: string | undefined,
+): boolean {
+  const narrationMs = parseUtcIsoMs(narrationTimestamp);
+  if (narrationMs === null || row.entries.length === 0) return false;
+
+  const starts = row.entries
+    .flatMap((entry) => [entry.activityStartedAt, entry.timestamp])
+    .map(parseUtcIsoMs)
+    .filter((value): value is number => value !== null);
+  if (starts.length === 0) return false;
+
+  const startedMs = Math.min(...starts);
+  const endedMs = hasPendingToolCall(row.entries)
+    ? Infinity
+    : Math.max(...starts);
+  return narrationMs >= startedMs && narrationMs <= endedMs;
 }
 
 export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
@@ -164,14 +299,47 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     }
     const kind = kindOf(entry);
     const prev = rows[rows.length - 1];
-    if (kind === "browse" && prev?.kind === "browse") {
-      prev.entries.push(entry);
+    const previousEntry = prev?.entries[prev.entries.length - 1];
+    const previousEndedMs = parseUtcIsoMs(previousEntry?.timestamp);
+    const runStartedMs = parseUtcIsoMs(
+      entry.activityStartedAt ?? entry.timestamp,
+    );
+    const followsPreviousEntry =
+      previousEndedMs === null ||
+      runStartedMs === null ||
+      runStartedMs >= previousEndedMs;
+    // Successful and in-flight browse tools form one compact discovery row.
+    // A failed browse tool is its own recoverable attempt: folding it into the
+    // surrounding successes made an earlier successful action appear to fail,
+    // while folding multiple failures reused the wrong action title. Same-tool
+    // retries have already been condensed above and retain their attempt count.
+    if (
+      kind === "browse" &&
+      prev?.kind === "browse" &&
+      entry.success !== false &&
+      previousEntry?.success !== false
+    ) {
+      prev.entries.push(...retryEntries(entry));
+      continue;
+    }
+    // A block-scoped write and the run immediately following it are one user-
+    // facing build/test action. Keeping them on one frontier preserves the
+    // freshly written diff while the test is active instead of flashing the
+    // write row for a moment and collapsing it as soon as the run starts.
+    if (
+      kind === "run" &&
+      prev?.kind === "author" &&
+      followsPreviousEntry &&
+      prev.entries.some((candidate) => (candidate.codeDiffs?.length ?? 0) > 0)
+    ) {
+      prev.kind = "run";
+      prev.entries.push(...retryEntries(entry));
       continue;
     }
     rows.push({
-      id: toolCallIdOf(entry) || entry.id,
+      id: stableRowId(entry),
       kind,
-      entries: [entry],
+      entries: retryEntries(entry),
       blocks: [],
       codeDiffs: [],
       pending: false,
@@ -183,35 +351,66 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     });
   }
 
-  // Pair by iteration when the tag survived, else attach to the step the
-  // narration followed: iteration is neither unique nor durable.
+  // Pair a narration to a result that chronology moved below it, then by the
+  // closest matching iteration, else to the step it followed. A pending row's
+  // open-ended time span is not an ownership claim: parallel calls commonly
+  // overlap, and an older unresolved call must not steal a sibling's prose.
   for (const { entry, precedingRow } of narrations) {
     // The owning row can sit either side of where the narration landed: a
     // narration emitted mid-step precedes its own tool_result, while one
     // emitted after a step follows it. Iteration also restarts each
     // enforcement pass, so nearest-wins disambiguates a repeated number.
+    // Pairing a call/result whose narration arrived mid-flight moves its result
+    // after the narration. Only a later row can be that displaced owner. This
+    // narrow timestamp rule keeps "Reviewing…" with the inspection it describes
+    // without letting any older open-ended call capture unrelated narration.
     let ownerIdx = -1;
-    let bestDistance = Infinity;
-    rows.forEach((row, i) => {
-      if (!row.entries.some((e) => e.iteration === entry.iteration)) return;
-      const distance = Math.abs(i - precedingRow);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        ownerIdx = i;
+    const futureTimeOwners: number[] = [];
+    for (let i = precedingRow + 1; i < rows.length; i += 1) {
+      if (rowContainsNarrationTime(rows[i]!, entry.timestamp)) {
+        futureTimeOwners.push(i);
       }
-    });
+    }
+    if (futureTimeOwners.length === 1) {
+      ownerIdx = futureTimeOwners[0]!;
+    } else if (futureTimeOwners.length > 1) {
+      const matchingIteration = futureTimeOwners.filter((i) =>
+        rows[i]!.entries.some(
+          (candidate) => candidate.iteration === entry.iteration,
+        ),
+      );
+      if (matchingIteration.length === 1) {
+        ownerIdx = matchingIteration[0]!;
+      }
+    }
+    let bestDistance = Infinity;
+    if (ownerIdx === -1) {
+      rows.forEach((row, i) => {
+        if (!row.entries.some((e) => e.iteration === entry.iteration)) return;
+        const distance = Math.abs(i - precedingRow);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          ownerIdx = i;
+        }
+      });
+    }
     const targetIdx = ownerIdx === -1 ? precedingRow : ownerIdx;
     const target = rows[targetIdx];
     if (target) {
       target.reason = entry.text;
-      // The reason tracks the latest narration, but the live title does not:
-      // the first narration to reach a row names the work, and a later one
-      // would rewrite a line the user is already reading. The outcome title
-      // still comes from the latest narration, which is the one that knows how
-      // the row ended.
+      // The reason tracks the latest narration, but the live title normally
+      // does not: the first narration to reach a row names the work, and a
+      // later one would rewrite a line the user is already reading. A combined
+      // write/test row is the exception because its current action genuinely
+      // advances from writing to testing while preserving one frontier.
       const held = labelsByRow.get(targetIdx);
+      const combinedWriteAndRun =
+        target.kind === "run" &&
+        target.entries.some((candidate) => kindOf(candidate) === "author");
       labelsByRow.set(targetIdx, {
-        active: held?.active ?? entry.activeLabel,
+        active: combinedWriteAndRun
+          ? (entry.activeLabel ?? held?.active)
+          : (held?.active ?? entry.activeLabel),
         outcome: entry.outcomeLabel ?? held?.outcome,
       });
       target.reasonAt = entry.receivedAtMs;
@@ -250,7 +449,7 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
   let liveIndex = -1;
   rows.forEach((row) => {
     const stamps = row.entries
-      .map((e) => e.timestamp)
+      .flatMap((e) => [e.activityStartedAt, e.timestamp])
       .filter((t): t is string => typeof t === "string")
       .sort();
     row.startedAt = stamps[0] ?? null;
@@ -261,6 +460,14 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     const byLabel = new Map<string, CodeWriteDiff>();
     for (const entry of row.entries) {
       for (const diff of entry.codeDiffs ?? []) byLabel.set(diff.label, diff);
+    }
+    // A repair tool_call is bucketed under the block that is already running,
+    // not in designActivity. Its write-time diff still belongs to the block's
+    // frontier row and must be promoted before the later tool_result repeats it.
+    for (const block of row.blocks) {
+      for (const entry of block.activity) {
+        for (const diff of entry.codeDiffs ?? []) byLabel.set(diff.label, diff);
+      }
     }
     row.codeDiffs = [...byLabel.values()];
     row.pending = hasPendingToolCall(row.entries);
@@ -278,17 +485,84 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     // liveIndex says: it is -1 on a terminated turn, and last-wins when two
     // calls run in parallel. A step that never returned cannot show an outcome.
     const working = row.pending || i === liveIndex;
+    // Outcome labels are predictions authored before the step resolves. When
+    // the attempt fails, keep the narrator's stable intent as the row title;
+    // the exact failure remains in the row detail instead of letting a stale
+    // success-shaped outcome replace what Copilot was trying to accomplish.
+    const terminalEntry = row.entries[row.entries.length - 1];
+    const cannotUsePredictedOutcome =
+      (terminalEntry?.kind === "tool_result" &&
+        terminalEntry.success === false) ||
+      row.blocks.some((block) => !isBlockOk(block));
     row.label =
-      (working ? tenses.active : (tenses.outcome ?? tenses.active)) ?? null;
+      (working || cannotUsePredictedOutcome
+        ? tenses.active
+        : (tenses.outcome ?? tenses.active)) ?? null;
+  });
+
+  // Narration names the user-facing activity; raw browser operations are its
+  // technical substeps. Until the narrator declares a new intent, keep those
+  // substeps under the current active label instead of flashing peer titles
+  // such as "Inspecting page" and "Opening page" between semantic labels.
+  let browseIntent: string | null = null;
+  const browseIntentByRow = new Map<ActivityRow, string>();
+  rows.forEach((row, i) => {
+    if (row.kind !== "browse") {
+      browseIntent = null;
+      return;
+    }
+    const active = labelsByRow.get(i)?.active;
+    if (active !== undefined) {
+      browseIntent = active;
+    } else if (browseIntent !== null) {
+      row.label = browseIntent;
+    }
+    if (browseIntent !== null) {
+      browseIntentByRow.set(row, browseIntent);
+    }
+  });
+
+  // Retries may switch browser tools while pursuing the same narrated intent.
+  // Tool-level condensation cannot recognize that as one activity, but the
+  // narrator's explicit active label can: adjacent failed attempts with the
+  // same label become one row. The first attempt keeps the stable row id so a
+  // user's expansion choice survives while later attempts update its status.
+  coalesceNarratedBrowseRetries(rows, browseIntentByRow);
+  liveIndex = -1;
+  rows.forEach((row, i) => {
+    row.pending = hasPendingToolCall(row.entries);
+    row.live =
+      !ended &&
+      (row.pending || row.blocks.some((block) => block.state === "running"));
+    if (row.live) liveIndex = i;
   });
 
   // While the model is generating, no row has an unmatched call and no block is
   // running, so liveIndex is -1 and nothing would be open — the stretch that
-  // reads as "one collapsed row and nothing going on". Rows only ever append,
-  // so following the newest one keeps the freshest work open and moves forward
-  // only, instead of hopping back to an earlier row when a parallel call
-  // finishes and collapsing the row being read.
-  const focusIndex = ended || rows.length === 0 ? -1 : rows.length - 1;
+  // reads as "one collapsed row and nothing going on". Follow the newest row in
+  // that gap. The one exception is a contentless draft placeholder appended
+  // after real live work: it describes what now exists, not what is happening,
+  // so it cannot hide the row carrying the active call or running block.
+  const newestIndex = rows.length - 1;
+  const newest = rows[newestIndex];
+  const newestIsEmptyDraft =
+    newest !== undefined &&
+    newest.entries.length === 0 &&
+    newest.codeDiffs.length === 0 &&
+    newest.reason === null &&
+    newest.blocks.length > 0 &&
+    newest.blocks.every(
+      (block) =>
+        block.state === "drafted" &&
+        block.activity.length === 0 &&
+        (block.recordedActions?.length ?? 0) === 0,
+    );
+  const focusIndex =
+    ended || rows.length === 0
+      ? -1
+      : liveIndex !== -1 && newestIsEmptyDraft
+        ? liveIndex
+        : newestIndex;
 
   return { rows, liveIndex, focusIndex };
 }

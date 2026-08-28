@@ -601,6 +601,84 @@ def _truncated_output_fallback(output: str) -> str:
     return output[:_TOOL_OUTPUT_SUMMARIZE_THRESHOLD] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
 
 
+# Compacting page evidence to {"ok":true} tells the model it has evidence while leaving it none, so
+# raw excerpts and derived relations go first and the bounded facts describing what is on the page,
+# and which browser saw it, stay. An allowlist rather than a drop-list: an evidence field nobody has
+# classified yet is likelier to be raw page text than a fact worth keeping.
+_PAGE_EVIDENCE_IDENTITY = (
+    "source_tool",
+    "current_url",
+    "inspected_url",
+    "page_title",
+    "observation_step",
+    "source_browser_session_id",
+    "workflow_run_id",
+    "observed_after_workflow_run",
+)
+_PAGE_EVIDENCE_FACT_LISTS = (
+    "forms",
+    "navigation_targets",
+    "result_containers",
+    "clickable_controls",
+    "challenge_controls",
+    "modal_overlays",
+    "page_obstructions",
+)
+_PAGE_EVIDENCE_MAX_ENTRIES = 12
+_PAGE_EVIDENCE_ENTRY_CHARS = 400
+# Per-list bounds alone would let a page with many forms and links produce a compacted output as
+# large as an uncompacted one, defeating the pass whose job is keeping the turn inside the window.
+_PAGE_EVIDENCE_SUMMARY_CHARS = 4000
+
+
+def _is_page_evidence(data: dict[str, Any]) -> bool:
+    if data.get("source_tool") == "inspect_page_for_composition":
+        return True
+    return any(key in data for key in _PAGE_EVIDENCE_FACT_LISTS) and "inspected_url" in data
+
+
+def _compact_length(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":")))
+
+
+def _bounded_evidence_entries(value: list[Any], budget: int) -> list[Any]:
+    entries: list[Any] = []
+    for entry in value[:_PAGE_EVIDENCE_MAX_ENTRIES]:
+        blob = json.dumps(entry, separators=(",", ":"))
+        bounded = entry if len(blob) <= _PAGE_EVIDENCE_ENTRY_CHARS else blob[:_PAGE_EVIDENCE_ENTRY_CHARS]
+        budget -= _compact_length(bounded)
+        if budget < 0:
+            break
+        entries.append(bounded)
+    return entries
+
+
+def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    kept: dict[str, Any] = {}
+    for key in _PAGE_EVIDENCE_IDENTITY:
+        value = data.get(key, parsed.get(key))
+        if value not in (None, ""):
+            kept[key] = value
+    budget = _PAGE_EVIDENCE_SUMMARY_CHARS - _compact_length(kept)
+    for key in _PAGE_EVIDENCE_FACT_LISTS:
+        value = data.get(key)
+        if budget <= 0 or not isinstance(value, list) or not value:
+            continue
+        entries = _bounded_evidence_entries(value, budget)
+        if entries:
+            kept[key] = entries
+            budget -= _compact_length(entries)
+    challenge_state = data.get("challenge_state")
+    if isinstance(challenge_state, dict) and challenge_state.get("detected"):
+        kept["challenge_state"] = {
+            key: challenge_state.get(key) for key in ("detected", "kind", "source") if challenge_state.get(key)
+        }
+    indicators = data.get("anti_bot_indicators")
+    if isinstance(indicators, list) and indicators:
+        kept["anti_bot_indicators"] = indicators[:8]
+    return kept
+
+
 def _summarize_tool_output(output: str) -> str:
     """Compress an old function_call_output to a compact JSON synopsis that
     preserves only signal fields (ok/error/status/failure_reason/block labels).
@@ -627,6 +705,14 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
 
     data = parsed.get("data")
+    if isinstance(data, dict) and _is_page_evidence(data):
+        synopsis["page_evidence"] = _summarize_page_evidence(parsed, data)
+        synopsis["_summarized"] = "older page evidence — bounded facts retained, raw excerpts dropped"
+        try:
+            return json.dumps(synopsis, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return _truncated_output_fallback(output)
+
     if isinstance(data, dict):
         code = data.get("code")
         if isinstance(code, str) and code:

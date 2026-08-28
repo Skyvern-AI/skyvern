@@ -25,14 +25,6 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-const { mockCopilotUxV1Enabled } = vi.hoisted(() => ({
-  mockCopilotUxV1Enabled: vi.fn(() => true),
-}));
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => mockCopilotUxV1Enabled(),
-}));
-
 const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
   () => {
     const calls: StreamCall[] = [];
@@ -200,8 +192,6 @@ function diagnoseNarrativePayload(message: string) {
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
-  mockCopilotUxV1Enabled.mockReset();
-  mockCopilotUxV1Enabled.mockReturnValue(true);
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
@@ -278,14 +268,6 @@ describe("WorkflowCopilotChat — Confirm chip (SKY-12137)", () => {
       });
       streamCalls[0]!.resolve();
     });
-
-    expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
-  });
-
-  it("does not render when the flag is off", async () => {
-    mockCopilotUxV1Enabled.mockReturnValue(false);
-    await renderChat();
-    await sendConfirmNote();
 
     expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
   });

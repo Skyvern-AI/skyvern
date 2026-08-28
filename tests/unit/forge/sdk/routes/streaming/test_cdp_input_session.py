@@ -6,7 +6,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -19,68 +19,7 @@ from playwright.async_api import CDPSession
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.forge.sdk.routes.streaming import cdp_input, latency_probe
-from skyvern.services.browser_recording.v2.ledger import start_ledger, stop_ledger
-from skyvern.services.browser_recording.v2.tap import tap_pipelined
-
-
-def test_latency_probe_records_the_next_frame_and_clears_pending_input(monkeypatch: pytest.MonkeyPatch) -> None:
-    histogram = Mock()
-    monkeypatch.setattr(latency_probe, "input_to_frame_seconds", histogram)
-    latency_probe.forget("pbs_latency")
-
-    latency_probe.note_frame("pbs_latency", 1.0)
-    latency_probe.set_recording("pbs_latency", True)
-    latency_probe.note_input("pbs_latency", 2.0)
-    latency_probe.note_frame("pbs_latency", 2.125)
-    latency_probe.note_frame("pbs_latency", 2.25)
-    latency_probe.set_recording("pbs_latency", False)
-    latency_probe.note_input("pbs_latency", 3.0)
-    latency_probe.note_frame("pbs_latency", 3.5)
-
-    assert histogram.record.call_args_list == [
-        call(0.125, {"recording": "on"}),
-        call(0.5, {"recording": "off"}),
-    ]
-
-
-def test_forget_clears_the_recording_gauge_so_a_dropped_session_is_not_latched_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An abrupt disconnect never sends END_EXFILTRATION, so teardown's forget() is the only
-    thing that can stop the next frame for that id being labelled recording=on."""
-    histogram = Mock()
-    monkeypatch.setattr(latency_probe, "input_to_frame_seconds", histogram)
-
-    latency_probe.set_recording("pbs_dropped", True)
-    latency_probe.forget("pbs_dropped")
-    latency_probe.note_input("pbs_dropped", 1.0)
-    latency_probe.note_frame("pbs_dropped", 1.25)
-
-    assert histogram.record.call_args_list == [call(0.25, {"recording": "off"})]
-    latency_probe.forget("pbs_dropped")
-
-
-def test_the_recording_cap_evicts_the_oldest_session_not_an_arbitrary_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    histogram = Mock()
-    monkeypatch.setattr(latency_probe, "input_to_frame_seconds", histogram)
-    ids = [f"pbs_cap_{index}" for index in range(latency_probe.MAX_SESSIONS + 1)]
-    for browser_session_id in ids:
-        latency_probe.set_recording(browser_session_id, True)
-
-    for browser_session_id in (ids[0], ids[1], ids[-1]):
-        latency_probe.note_input(browser_session_id, 0.0)
-        latency_probe.note_frame(browser_session_id, 1.0)
-
-    assert histogram.record.call_args_list == [
-        call(1.0, {"recording": "off"}),
-        call(1.0, {"recording": "on"}),
-        call(1.0, {"recording": "on"}),
-    ]
-    for browser_session_id in ids:
-        latency_probe.forget(browser_session_id)
+from skyvern.forge.sdk.routes.streaming import cdp_input
 
 
 class _RecordingPlaywrightTransport(Transport):
@@ -203,72 +142,6 @@ async def test_rebinds_when_the_working_page_changes(monkeypatch: pytest.MonkeyP
     assert first.detached is True
 
 
-@pytest.mark.asyncio
-async def test_observer_attach_failure_does_not_kill_input_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    session = _FakeSession("first")
-    page = _FakePage(session)
-    attach_attempted = False
-
-    async def _resolve(*args: Any, **kwargs: Any) -> _FakePage:
-        return page
-
-    class _RecordingSession:
-        async def attach_page(self, page_key: str, cdp_session: _FakeSession) -> None:
-            nonlocal attach_attempted
-            attach_attempted = True
-            raise RuntimeError("attach failed")
-
-    monkeypatch.setattr(cdp_input, "_resolve_working_page", _resolve)
-    monkeypatch.setattr(cdp_input, "get_session_v2", lambda browser_session_id: _RecordingSession())
-    input_session = cdp_input.ActivePageCdpInputSession(
-        browser_state=object(),  # type: ignore[arg-type]
-        entity_id="pbs-test",
-        entity_type="browser_session",
-    )
-
-    assert await input_session.get_session() is session
-    assert attach_attempted is True
-
-
-@pytest.mark.asyncio
-async def test_a_second_recording_attaches_its_own_observer_to_the_same_page(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The input session outlives a recording, so the next recording must still get attached."""
-    session = _FakeSession("first")
-    page = _FakePage(session)
-    recording_session: Any = None
-    attached: list[tuple[str, _FakeSession]] = []
-
-    async def _resolve(*args: Any, **kwargs: Any) -> _FakePage:
-        return page
-
-    class _RecordingSession:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        async def attach_page(self, page_key: str, cdp_session: _FakeSession) -> None:
-            attached.append((self.name, cdp_session))
-
-    monkeypatch.setattr(cdp_input, "_resolve_working_page", _resolve)
-    monkeypatch.setattr(cdp_input, "get_session_v2", lambda browser_session_id: recording_session)
-    input_session = cdp_input.ActivePageCdpInputSession(
-        browser_state=object(),  # type: ignore[arg-type]
-        entity_id="pbs-test",
-        entity_type="browser_session",
-    )
-
-    assert await input_session.get_session() is session
-    recording_session = _RecordingSession("first-recording")
-    assert await input_session.get_session(force_refresh=True) is session
-    recording_session = None
-    assert await input_session.get_session(force_refresh=True) is session
-    recording_session = _RecordingSession("second-recording")
-    assert await input_session.get_session(force_refresh=True) is session
-
-    assert attached == [("first-recording", session), ("second-recording", session)]
-
-
 class _FakeNavigablePage:
     """Stands in for the Playwright page `_dispatch_navigate_event` calls `goto()` on."""
 
@@ -377,7 +250,7 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="agent", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "navigateEvent", "url": "https://example.com"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == []
         assert websocket.sent_json == []
@@ -394,7 +267,7 @@ class TestNavigateEvent:
             ]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://example.com/path"]
         assert websocket.sent_json == []
@@ -416,7 +289,7 @@ class TestNavigateEvent:
             ]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://unresolvable.invalid", "about:blank"]
         assert page.goto_timeouts == [None, 5000]
@@ -454,7 +327,7 @@ class TestNavigateEvent:
             ]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert websocket.sent_json == []
         assert websocket.closed == (4411, "dispatch_failed")
@@ -491,7 +364,7 @@ class TestNavigateEvent:
             ]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://public.invalid", "about:blank"]
         assert input_dispatch_urls == ["about:blank"]
@@ -522,7 +395,7 @@ class TestNavigateEvent:
             ]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://public.invalid", "about:blank"]
         assert input_dispatch_urls == ["about:blank"]
@@ -541,7 +414,7 @@ class TestNavigateEvent:
             [json.dumps({"type": "navigateEvent", "url": "http://169.254.169.254/latest/meta-data/"})]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == []
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
@@ -554,7 +427,7 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "navigateEvent", "url": "   "})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == []
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "invalid_url"}]
@@ -566,7 +439,7 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "navigateEvent", "url": "https://example.org/"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://example.org/"]
         assert websocket.sent_json == []
@@ -582,7 +455,7 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "navigateEvent", "url": "example.org"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://example.org"]
         assert websocket.sent_json == []
@@ -604,7 +477,7 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "navigateEvent", "url": "https://example.org/redirect"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://example.org/redirect", "about:blank"]
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
@@ -629,7 +502,7 @@ class TestNavigateEvent:
             ]
         )
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert page.goto_calls == ["https://example.org/redirect", "about:blank"]
         assert page.goto_timeouts == [None, 5000]
@@ -661,7 +534,7 @@ class TestHistoryNavigation:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert _dispatched(session) == [("Page.navigateToHistoryEntry", {"entryId": 0})]
         assert websocket.sent_json == []
@@ -673,7 +546,7 @@ class TestHistoryNavigation:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "goForwardEvent"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert _dispatched(session) == [("Page.navigateToHistoryEntry", {"entryId": 1})]
 
@@ -684,7 +557,7 @@ class TestHistoryNavigation:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "reloadEvent"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert _dispatched(session) == [("Page.reload", {})]
 
@@ -697,7 +570,7 @@ class TestHistoryNavigation:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert _dispatched(session) == []
         assert websocket.sent_json == []
@@ -716,7 +589,7 @@ class TestHistoryNavigation:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert _dispatched(session) == []
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
@@ -728,7 +601,7 @@ class TestHistoryNavigation:
         channel = SimpleNamespace(interactor="agent", client_id="c1")
         websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
 
-        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
         assert session.sent == []
 
@@ -758,7 +631,7 @@ async def test_pointer_burst_is_received_before_dispatches_complete() -> None:
         ]
     )
     loop_task = asyncio.create_task(
-        cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
     )
 
     try:
@@ -777,57 +650,6 @@ async def test_pointer_burst_is_received_before_dispatches_complete() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipelined_tap_is_ordered_before_semaphore_acquire(monkeypatch: pytest.MonkeyPatch) -> None:
-    browser_session_id = "pbs_ledger_order"
-    ledger = start_ledger(browser_session_id)
-    order: list[str] = []
-
-    class _OrderingSemaphore:
-        def __init__(self, value: int) -> None:
-            assert value > 0
-
-        async def acquire(self) -> None:
-            order.append("acquire")
-
-        def release(self) -> None:
-            pass
-
-    def _recording_tap(*args: Any, **kwargs: Any) -> None:
-        tap_pipelined(*args, **kwargs)
-        order.append("tap")
-
-    monkeypatch.setattr(cdp_input.asyncio, "Semaphore", _OrderingSemaphore)
-    monkeypatch.setattr(cdp_input, "tap_pipelined", _recording_tap)
-    input_session = _FakeInputSession(_FakeSession("s"))
-    channel = SimpleNamespace(interactor="user", client_id="c1")
-    websocket = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "type": "mouseEvent",
-                    "eventType": "mousePressed",
-                    "x": 10,
-                    "y": 20,
-                    "button": "left",
-                    "clickCount": 1,
-                    "modifiers": 0,
-                }
-            )
-        ]
-    )
-
-    try:
-        await cdp_input._run_input_loop(
-            websocket, channel, input_session, "browser_session_id", browser_session_id, browser_session_id
-        )
-
-        assert order[:2] == ["tap", "acquire"]
-        assert [(row.seq, row.kind) for row in ledger.rows()] == [(1, "mouse_pressed")]
-    finally:
-        stop_ledger(browser_session_id)
-
-
-@pytest.mark.asyncio
 async def test_target_closed_background_dispatch_is_dropped_without_closing_input_channel() -> None:
     dispatch_attempted = asyncio.Event()
 
@@ -840,7 +662,7 @@ async def test_target_closed_background_dispatch_is_dropped_without_closing_inpu
     channel = SimpleNamespace(interactor="user", client_id="c1")
     websocket = _BlockingWebSocket([json.dumps({"type": "wheelEvent", "x": 10, "y": 20, "deltaX": 0, "deltaY": 1})])
     loop_task = asyncio.create_task(
-        cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+        cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
     )
 
     try:
@@ -862,7 +684,7 @@ async def test_background_dispatch_failure_closes_input_channel_once() -> None:
     channel = SimpleNamespace(interactor="user", client_id="c1")
     websocket = _BlockingWebSocket([json.dumps({"type": "wheelEvent", "x": 10, "y": 20, "deltaX": 0, "deltaY": 1})])
 
-    await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test", None)
+    await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
     assert websocket.close_calls == [(4411, "dispatch_failed")]
 
@@ -901,7 +723,7 @@ async def test_dispatched_input_event_records_wait_and_dispatch_latency(monkeypa
     input_session = SimpleNamespace(get_session=_get_session, page=object())
 
     loop_task = asyncio.create_task(
-        cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_1", None)
+        cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_1")
     )
     async with asyncio.timeout(0.5):
         while not fake_session.sent:

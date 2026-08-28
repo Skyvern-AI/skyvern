@@ -94,13 +94,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-// This suite exercises the legacy (copilot_ux_v1 off) default-mode logic; no
-// test here touches copilot_ux_v1-gated behavior, so pin it off rather than
-// the stray `true` this file previously carried over from SKY-11973's mock.
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => false,
-}));
-
 const saveData = {
   title: "Test WF",
   workflow: {
@@ -167,9 +160,7 @@ async function renderChat(flags: FlagConfig) {
       </FeatureFlagValueContext.Provider>
     </FeatureFlagContext.Provider>,
   );
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -184,7 +175,7 @@ async function submit(value: string) {
   });
 }
 
-async function selectMode(label: "Ask" | "Build" | "Build workflow as code") {
+async function selectMode(label: "Ask" | "Build" | "Build with code") {
   await act(async () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
       button: 0,
@@ -215,75 +206,22 @@ afterEach(() => {
   cleanup();
 });
 
-describe("WorkflowCopilotChat — composer default mode variant", () => {
-  it("leaves code_block unset for backend fallback when the default variant is unset", async () => {
+describe("WorkflowCopilotChat — unflagged composer default", () => {
+  it("defaults to Build with code when code-first is accessible", async () => {
     await renderChat({ copilotV2: true, codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
-
-  it("sends code_block=true for the build_code override variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "build_code",
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
     expect(streamCalls[0]?.body.code_block).toBe(true);
   });
 
-  it("sends code_block=false for the build_no_code variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "build_no_code",
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
-  });
-
-  it("defaults to Ask for the ask variant and sends code_block=null", async () => {
+  it("ignores the retired default-mode variant", async () => {
     await renderChat({
       copilotV2: true,
       codeBlockMode: true,
       defaultMode: "ask",
     });
-    await submit("answer a question");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("ask");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
-
-  it("defaults to Ask for the ask_code variant and sends code_block=null while in Ask", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask_code",
-    });
-    await submit("answer a question");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("ask");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
-
-  it("lands on code ON when selecting Build workflow as code", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask_code",
-    });
-    await selectMode("Build workflow as code");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -291,12 +229,29 @@ describe("WorkflowCopilotChat — composer default mode variant", () => {
     expect(streamCalls[0]?.body.code_block).toBe(true);
   });
 
-  it("turns code OFF when selecting plain Build from a code default", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "build_code",
-    });
+  it("sends code_block=null when Ask is selected", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await selectMode("Ask");
+    await submit("answer a question");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.mode).toBe("ask");
+    expect(streamCalls[0]?.body.code_block).toBe(null);
+  });
+
+  it("lands on code ON when selecting Build with code", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await selectMode("Ask");
+    await selectMode("Build with code");
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.mode).toBe("build");
+    expect(streamCalls[0]?.body.code_block).toBe(true);
+  });
+
+  it("turns code OFF when selecting plain Build", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
     await selectMode("Build");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -305,7 +260,7 @@ describe("WorkflowCopilotChat — composer default mode variant", () => {
     expect(streamCalls[0]?.body.code_block).toBe(false);
   });
 
-  it("sends code_block=null when the code-block flag is off, ignoring the variant", async () => {
+  it("sends code_block=null when code-first is inaccessible", async () => {
     await renderChat({
       copilotV2: true,
       codeBlockMode: false,

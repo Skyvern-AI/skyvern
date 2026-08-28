@@ -22,13 +22,13 @@ interface UseCdpInputOptions {
   viewportHeight: number;
   onClipboardPaste?: (text: string) => void;
   onClipboardCopy?: () => void;
+  onInput?: () => void;
 }
 
 interface UseCdpInputReturn {
   userIsControlling: boolean;
   setUserIsControlling: (v: boolean) => void;
   inputReady: boolean;
-  inputRttMs: number | null;
   containerRef: React.RefObject<HTMLDivElement>;
   handlers: {
     handleMouseDown: (e: React.MouseEvent<HTMLImageElement>) => void;
@@ -62,10 +62,10 @@ export function useCdpInput({
   viewportHeight,
   onClipboardPaste,
   onClipboardCopy,
+  onInput,
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
-  const [inputRttMs, setInputRttMs] = useState<number | null>(null);
   const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
   const clientId = useClientIdStore((s) => s.clientId);
@@ -77,7 +77,6 @@ export function useCdpInput({
     null,
   );
   const inputReconnectAttemptsRef = useRef(0);
-  const inputPingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const inputStoppedRef = useRef(false);
   const inputEventCountRef = useRef(0);
   const wheelAccumulatorRef = useRef<{
@@ -100,8 +99,10 @@ export function useCdpInput({
   const interceptedClipboardKeysRef = useRef(new Set<string>());
   const onClipboardPasteRef = useRef(onClipboardPaste);
   const onClipboardCopyRef = useRef(onClipboardCopy);
+  const onInputRef = useRef(onInput);
   onClipboardPasteRef.current = onClipboardPaste;
   onClipboardCopyRef.current = onClipboardCopy;
+  onInputRef.current = onInput;
 
   useEffect(() => {
     if (!interactive || !inputWsUrl) return;
@@ -109,17 +110,9 @@ export function useCdpInput({
     inputStoppedRef.current = false;
     inputReconnectAttemptsRef.current = 0;
 
-    function clearInputPingTimer() {
-      if (inputPingTimerRef.current) {
-        clearInterval(inputPingTimerRef.current);
-        inputPingTimerRef.current = null;
-      }
-    }
-
     function connectInputWs(credentialParam: string) {
       if (inputStoppedRef.current) return;
       if (inputSocketRef.current) {
-        clearInputPingTimer();
         inputSocketRef.current.close();
       }
       const ws = new WebSocket(
@@ -130,14 +123,6 @@ export function useCdpInput({
       ws.addEventListener("open", () => {
         if (inputSocketRef.current !== ws) return;
         console.log("[cdp-input] WebSocket connected");
-        inputPingTimerRef.current = setInterval(() => {
-          if (
-            inputSocketRef.current === ws &&
-            ws.readyState === WebSocket.OPEN
-          ) {
-            ws.send(JSON.stringify({ type: "ping", t: performance.now() }));
-          }
-        }, 5000);
         if (userIsControllingRef.current) {
           ws.send(JSON.stringify({ kind: "take-control" }));
         }
@@ -160,9 +145,6 @@ export function useCdpInput({
               ws.send(JSON.stringify({ kind: "take-control" }));
             }
           }
-          if (msg.kind === "pong" && typeof msg.t === "number") {
-            setInputRttMs(performance.now() - msg.t);
-          }
           if (msg.kind === "navigate-error") {
             setNavigateError(
               NAVIGATE_ERROR_MESSAGES[msg.reason] ??
@@ -176,9 +158,7 @@ export function useCdpInput({
       ws.addEventListener("close", (event) => {
         console.log("[cdp-input] WebSocket closed", event.code, event.reason);
         if (inputSocketRef.current !== ws) return;
-        clearInputPingTimer();
         setInputReady(false);
-        setInputRttMs(null);
         userIsControllingRef.current = false;
         setUserIsControlling(false);
         inputSocketRef.current = null;
@@ -222,7 +202,6 @@ export function useCdpInput({
         clearTimeout(inputReconnectTimerRef.current);
         inputReconnectTimerRef.current = null;
       }
-      clearInputPingTimer();
       if (inputSocketRef.current) {
         inputSocketRef.current.close();
         inputSocketRef.current = null;
@@ -351,6 +330,7 @@ export function useCdpInput({
       console.log("[cdp-input] Sending:", payload.type, payload.eventType);
       inputEventCountRef.current++;
     }
+    onInputRef.current?.();
     ws.send(JSON.stringify(payload));
   }, []);
 
@@ -540,7 +520,6 @@ export function useCdpInput({
     userIsControlling,
     setUserIsControlling,
     inputReady,
-    inputRttMs,
     containerRef,
     handlers: {
       handleMouseDown,

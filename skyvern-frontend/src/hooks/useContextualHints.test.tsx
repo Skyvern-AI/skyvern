@@ -48,6 +48,7 @@ function makeCtx(
     state: COMPLETED_STATE,
     isLoading: false,
     updateState: vi.fn(),
+    updateStateConfirmed: vi.fn(),
     isNewUser: false,
     abVariant: "template-first",
     recoveryGuidanceAssignment: null,
@@ -110,6 +111,8 @@ describe("useContextualHints", () => {
       surface: "editor",
       hint_id: "add-another-block",
       layer: 2,
+      organization_id: undefined,
+      step_id: "onboarding.hint_shown:v1",
     });
   });
 
@@ -167,6 +170,8 @@ describe("useContextualHints", () => {
       surface: "editor",
       hint_id: "add-another-block",
       layer: 2,
+      organization_id: undefined,
+      step_id: "onboarding.hint_dismissed:v1",
     });
   });
 });

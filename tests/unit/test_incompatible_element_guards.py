@@ -6,6 +6,7 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 
 from skyvern.exceptions import InvalidElementForTextInput
+from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.handler import (
     _is_selected_engine_error,
     _is_selected_engine_timeout,
@@ -158,3 +159,68 @@ async def test_input_clear_classifies_incompatible_element(monkeypatch: pytest.M
     monkeypatch.setattr("skyvern.webeye.utils.dom.EventStrategyFactory.clear_field", _raise)
     with pytest.raises(InvalidElementForTextInput):
         await element.input_clear()
+
+
+# --------------------------------------------------------------------------- #
+# _strict_date_mask_order / _canonical_iso_date — deterministic date canonicalization.
+# A live <input type=date> takes only YYYY-MM-DD; a locale value is canonicalized only when the
+# day/month order is unambiguous, and prose / first-letter lookalikes never define an order.
+# --------------------------------------------------------------------------- #
+def test_strict_date_mask_order_accepts_real_masks() -> None:
+    assert handler._strict_date_mask_order("mm/dd/yyyy") == ("m", "d", "y")
+    assert handler._strict_date_mask_order("dd-mm-yyyy") == ("d", "m", "y")
+    assert handler._strict_date_mask_order("yyyy.mm.dd") == ("y", "m", "d")
+    assert handler._strict_date_mask_order("d/m/yyyy") == ("d", "m", "y")
+
+
+def test_strict_date_mask_order_rejects_prose_and_lookalikes() -> None:
+    for prose in (
+        "Date Must Yield",
+        "Day Month Year",
+        "Start date",
+        "mm/dd/yy",
+        "mm/mm/yyyy",
+        "mm/yyyy",
+        "day mm/dd/yyyy",
+    ):
+        assert handler._strict_date_mask_order(prose) is None
+    assert handler._strict_date_mask_order(None) is None
+    assert handler._strict_date_mask_order("") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "placeholder", "expected"),
+    [
+        # already ISO stays ISO
+        ("2026-08-23", None, "2026-08-23"),
+        # a strict mask decides the order, so the same digits canonicalize both ways
+        ("03/04/2026", "mm/dd/yyyy", "2026-03-04"),
+        ("03/04/2026", "dd/mm/yyyy", "2026-04-03"),
+        ("2026.08.23", "yyyy.mm.dd", "2026-08-23"),
+        ("08/23/2026", "mm/dd/yyyy", "2026-08-23"),
+        # no mask: only an unambiguous reading is accepted (a part > 12 pins the day)
+        ("23/08/2026", None, "2026-08-23"),
+        ("08/23/2026", None, "2026-08-23"),
+        # no mask and both parts <= 12 -- ambiguous, refuse rather than guess a date
+        ("03/04/2026", None, None),
+        # prose / first-letter lookalikes must not define an order (the mask blocker)
+        ("03/04/2026", "Date Must Yield", None),
+        ("03/04/2026", "Day Month Year", None),
+        ("03/04/2026", "Start date", None),
+        # partial year, duplicate, missing, extra tokens are rejected
+        ("03/04/26", "mm/dd/yy", None),
+        ("03/04/2026", "mm/mm/yyyy", None),
+        ("03/2026", "mm/yyyy", None),
+        ("03/04/2026", "day mm/dd/yyyy", None),
+        # calendar correctness: invalid month/day, non-leap Feb 29, valid leap Feb 29
+        ("13/04/2026", "mm/dd/yyyy", None),
+        ("02/30/2026", "mm/dd/yyyy", None),
+        ("02/29/2027", "mm/dd/yyyy", None),
+        ("02/29/2028", "mm/dd/yyyy", "2028-02-29"),
+        # not a date, or a non-four-digit year value
+        ("hello", "mm/dd/yyyy", None),
+        ("08/23/26", "mm/dd/yyyy", None),
+    ],
+)
+def test_canonical_iso_date(text: str, placeholder: str | None, expected: str | None) -> None:
+    assert handler._canonical_iso_date(text, placeholder) == expected

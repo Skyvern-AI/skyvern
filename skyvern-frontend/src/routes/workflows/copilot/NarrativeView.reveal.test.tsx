@@ -229,7 +229,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, NOW - 500)])}
-        uxV1
       />,
     );
 
@@ -250,7 +249,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, undefined)])}
-        uxV1
       />,
     );
 
@@ -263,7 +261,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, undefined)])}
-        uxV1
       />,
     );
 
@@ -275,7 +272,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, NOW - 500)])}
-        uxV1
       />,
     );
 
@@ -297,7 +293,6 @@ describe("NarrativeView — narration reveal", () => {
           narration(1, NOW),
           toolCall("2", 2, "edit_block"),
         ])}
-        uxV1
       />,
     );
 

@@ -14,6 +14,7 @@ import hashlib
 import json
 import random
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,6 +28,8 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_REASON_PREFIX,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
+    NAV_DEAD_END_REASON_PREFIX,
+    NAVIGATION_DEAD_END_STATUSES,
     NO_TOOL_CALL_NUDGE,
     PERCEPTION_STALL_NUDGE_AFTER,
     PERCEPTION_STALL_REASON_PREFIX,
@@ -48,6 +51,7 @@ from skyvern.forge.taskv3.loop import (
     make_finish_tool,
     run_agent_tool_loop,
 )
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 
 
 class _ScriptedCaller:
@@ -58,6 +62,12 @@ class _ScriptedCaller:
         self.calls = 0
         self.message_history: list[dict[str, Any]] = []
         self.sent_tools: list[dict[str, Any]] | None = None
+        # Model the real LLMCaller.llm_config the engine dereferences to gate the vision `look` tool.
+        self.llm_config = SimpleNamespace(supports_vision=True)
+        # Per-call record of the transient screenshots= arg the loop passed, and the image-block
+        # count the built request would carry (message_history images + this turn's screenshots).
+        self.screenshots_per_call: list[list[bytes] | None] = []
+        self.image_blocks_per_call: list[int] = []
 
     def supports_tool_choice(self) -> bool:
         return True
@@ -72,8 +82,20 @@ class _ScriptedCaller:
         use_message_history: bool = False,
         raw_response: bool = False,
         tool_choice: str | None = None,
+        screenshots: list[bytes] | None = None,
     ) -> dict[str, Any]:
         self.sent_tools = tools
+        self.screenshots_per_call.append(list(screenshots) if screenshots else None)
+        # The built request = the re-seeded transcript plus this turn's transient screenshots. Mirror
+        # llm_messages_builder_with_history: history images (there should be none) + one block per
+        # screenshot appended to a trailing user message.
+        history_images = sum(
+            1
+            for msg in self.message_history
+            for part in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+            if isinstance(part, dict) and part.get("type") in ("image_url", "image")
+        )
+        self.image_blocks_per_call.append(history_images + (len(screenshots) if screenshots else 0))
         turn = self._script[self.calls] if self.calls < len(self._script) else []
         self.calls += 1
         message: dict[str, Any] = {"content": "reasoning..."}
@@ -143,6 +165,72 @@ async def test_perception_is_on_demand_never_injected() -> None:
     # The loop never perceives on its own — observe fires only when the model asks.
     assert observe_calls == []
     assert len(click_calls) == 2
+
+
+def _look_tool(sink: list[tuple[str, dict[str, Any]]], *, image: bytes = b"\x89PNG-fake") -> ToolSpec:
+    """A `look`-shaped tool: returns a text legend AND a transient screenshot the loop must show the
+    model on the next call only (never persisted to the transcript)."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(("look", args))
+        return ToolResult.ok("[1] button 'Next'", screenshots=[image])
+
+    return ToolSpec(
+        name="look",
+        description="look",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_look_image_is_ephemeral_gone_the_turn_after() -> None:
+    # Operator constraint: the annotated screenshot rides exactly ONE request (the turn after look)
+    # and the request the turn AFTER that carries zero image blocks — the accumulation regression.
+    look_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_look_tool(look_calls), _recording_tool("click", click_calls), make_finish_tool()]
+    script = [
+        [("look", {})],  # turn 1: model looks
+        [("click", {"mark": 1})],  # turn 2: model acts on what it saw
+        [("finish", {"status": "completed", "reason": "ok"})],  # turn 3
+    ]
+    outcome, caller = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    # turn 1 request: no image yet; turn 2 request: the look image; turn 3 request: gone.
+    assert caller.image_blocks_per_call[0] == 0
+    assert caller.image_blocks_per_call[1] == 1
+    assert caller.image_blocks_per_call[2] == 0
+    # The transcript the loop re-seeds each turn never holds an image block.
+    for msg in caller.message_history:
+        content = msg.get("content")
+        if isinstance(content, list):
+            assert all(not (isinstance(p, dict) and p.get("type") in ("image_url", "image")) for p in content)
+
+
+@pytest.mark.asyncio
+async def test_n_looks_add_exactly_n_images_total() -> None:
+    # Cost law: N looks add exactly N images across the whole run, not N x remaining turns.
+    look_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_look_tool(look_calls), _recording_tool("click", click_calls), make_finish_tool()]
+    script = [
+        [("look", {})],
+        [("click", {"mark": 1})],
+        [("look", {})],
+        [("click", {"mark": 2})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert len(look_calls) == 2
+    total_images = sum(len(s) for s in caller.screenshots_per_call if s)
+    assert total_images == 2
+    # And no single request ever carries more than the one image just produced.
+    assert max(caller.image_blocks_per_call) == 1
 
 
 @pytest.mark.asyncio
@@ -230,6 +318,127 @@ async def test_terminal_finish_with_failed_status() -> None:
 
     assert outcome.status == "failed"
     assert outcome.reason == "blocked by captcha"
+
+
+def _navigate_tool(dead_end_status: int | None = None) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        data: dict[str, Any] = {"page_state_changed": True}
+        if dead_end_status is not None:
+            data["navigation_dead_end"] = dead_end_status
+        return ToolResult.ok("navigated", data=data)
+
+    return ToolSpec(
+        name="navigate",
+        description="navigate",
+        parameters={"type": "object", "properties": {"url": {"type": "string"}}},
+        handler=handler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_navigate_dead_end_terminates_run() -> None:
+    # A navigate that landed on a dead/removed posting (HTTP 404/410) must end the run as `terminated`,
+    # matching v1 — NOT left to the model's finish choice (which defaults to failed at agent.py).
+    tools = [_navigate_tool(dead_end_status=404), make_finish_tool()]
+    script = [
+        [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
+        [("finish", {"status": "completed", "reason": "should never run"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_navigate_without_dead_end_does_not_terminate() -> None:
+    # Anti-over-route: an ordinary navigation (no dead-end signal) must NOT be reclassified — the run
+    # proceeds and finishes on the model's own verdict.
+    tools = [_navigate_tool(dead_end_status=None), make_finish_tool()]
+    script = [
+        [("navigate", {"url": "https://jobs.example.test/acme/123"})],
+        [("finish", {"status": "completed", "reason": "applied"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "applied"
+
+
+@pytest.mark.asyncio
+async def test_batched_dead_end_then_live_navigate_recovers() -> None:
+    # The system prompt tells the model to batch aggressively. A turn that batches a speculative
+    # navigate that 404s WITH a fallback navigate to a live page must NOT be terminated on the first
+    # of the batch — the fallback runs and the run proceeds to the model's own verdict.
+    live = _navigate_tool(dead_end_status=None)
+    dead = _navigate_tool(dead_end_status=404)
+    tools = [
+        ToolSpec(name="navigate_dead", description="d", parameters=dead.parameters, handler=dead.handler),
+        ToolSpec(name="navigate_live", description="l", parameters=live.parameters, handler=live.handler),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate_dead", {"url": "https://jobs.example.test/acme/closed"}), ("navigate_live", {"url": "x"})],
+        [("finish", {"status": "completed", "reason": "applied to the live one"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "applied to the live one"
+
+
+@pytest.mark.parametrize("status", sorted(NAVIGATION_DEAD_END_STATUSES))
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_terminates_before_loop(status: int) -> None:
+    # The dominant dead-posting case: the task's STARTING url is dead. It is navigated during browser
+    # setup (before this loop), so the model never calls the `navigate` tool — it just observes the dead
+    # page and finishes (defaulting to failed). The loop must classify the pre-loop status and end
+    # `terminated` WITHOUT ever calling the model.
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "should never run"})]],
+        [make_finish_tool()],
+        initial_navigation_status=status,
+    )
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert caller.calls == 0  # short-circuited before the first LLM call — deterministic, not model-driven
+    assert outcome.turns == 0
+
+
+@pytest.mark.parametrize("status", [None, 200, 302, 401, 403, 429, 500, 503])
+@pytest.mark.asyncio
+async def test_initial_navigation_non_dead_end_runs_normally(status: int | None) -> None:
+    # Anti-over-route: a reachable/soft/recoverable starting status must NOT short-circuit — the run
+    # proceeds and finishes on the model's own verdict.
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "applied"})]],
+        [make_finish_tool()],
+        initial_navigation_status=status,
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "applied"
+    assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_yields_canceled_when_cancelling() -> None:
+    # A run canceled during setup must persist as `canceled` (and stay unbilled), not be pre-empted
+    # into `terminated` by the pre-loop dead-end fast path — cancellation is checked first, exactly as
+    # the first loop turn would.
+    async def _cancel() -> bool:
+        return True
+
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "x"})]],
+        [make_finish_tool()],
+        initial_navigation_status=404,
+        should_cancel=_cancel,
+    )
+
+    assert outcome.status == "canceled"
+    assert caller.calls == 0
 
 
 @pytest.mark.asyncio
@@ -3135,6 +3344,95 @@ async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the
 
     assert ctx.runtime_secret_values == {hidden_url, hidden_token, visible_code}
     assert ctx.model_hidden_values == {hidden_url, hidden_token}
+
+
+@pytest.mark.asyncio
+async def test_payload_signed_urls_are_masked_to_their_token_across_every_tool_result_surface() -> None:
+    """The single model-facing masking boundary: a resolved payload signed URL echoed by ANY tool
+    result — a navigate/select/type success echo AND a handler-raised tool_error — is rewritten to
+    the SAME opaque token the prompt masker minted (masking by PROVENANCE/membership, not shape),
+    while a benign signing-shaped live-page URL that was never in the payload passes through
+    untouched. This subsumes the per-surface masks and covers the surfaces they forgot."""
+    signed = (
+        "https://files.example.test/uploads/a1b2c3d4e5f6/resume.pdf"
+        "?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.Q29ycmVjdEhvcnNlQmF0dGVyeVN0YXBsZTAxMjM0NTY3ODk"
+    )
+    signature_slice = "eyJhbGciOiJIUzI1NiJ9.c2lnbmVk"
+    # A live-page URL that is_signed_url() flags by shape but was never in the payload.
+    benign = "https://jobs.example.test/apply?token=abcdefABCDEF0123456789ghijklMNOPqrstuvwx"
+    # The browser reports a payload URL back canonicalized ("/" path inserted, default port dropped),
+    # which is how the real navigate tool echoes page.url — the boundary must still recognize it.
+    pathless = "https://files.example.test:443?token=eyJhbGciOiJIUzI1NiJ9.cGF0aGxlc3M.Q29ycmVjdEhvcnNl"
+    pathless_browser_form = "https://files.example.test/?token=eyJhbGciOiJIUzI1NiJ9.cGF0aGxlc3M.Q29ycmVjdEhvcnNl"
+
+    refs = mask_opaque_urls({"file": signed, "link": pathless})
+    token = refs.masked["file"]
+    pathless_token = refs.masked["link"]
+
+    async def navigate_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"navigated to {signed}, then {pathless_browser_form}.")
+
+    async def select_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error(f"no option matched {signed!r}")
+
+    async def type_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"typed, committed {signed}")
+
+    async def boom_handler(_args: dict[str, Any]) -> ToolResult:
+        raise ValueError(f"download failed for {signed}")
+
+    async def benign_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"you are on {benign} now")
+
+    # A redirect landing URL derived mid-task (navigate) is masked from that moment on.
+    landing = "https://cdn.example.test/blob/resume.pdf?X-Amz-Signature=deadbeefdeadbeefdeadbeefdeadbeef"
+
+    async def redirect_handler(_args: dict[str, Any]) -> ToolResult:
+        refs.derive(landing)
+        return ToolResult.ok(f"navigated to {landing}")
+
+    empty = {"type": "object", "properties": {}}
+    tools = [
+        ToolSpec(name="redirect", description="r", parameters=empty, handler=redirect_handler),
+        ToolSpec(name="navigate", description="n", parameters=empty, handler=navigate_handler),
+        ToolSpec(name="select", description="s", parameters=empty, handler=select_handler),
+        ToolSpec(name="type", description="t", parameters=empty, handler=type_handler),
+        ToolSpec(name="boom", description="b", parameters=empty, handler=boom_handler),
+        ToolSpec(name="benign", description="g", parameters=empty, handler=benign_handler),
+        make_finish_tool(),
+    ]
+    # The loop skips the rest of a batch after a tool errors, so the error/raise surfaces each get
+    # their own turn; the boundary must mask every one regardless of batching.
+    script = [
+        [("navigate", {}), ("type", {}), ("benign", {}), ("redirect", {})],
+        [("select", {})],
+        [("boom", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+
+    ctx = SkyvernContext(task_id="tsk_opaque")
+    ctx.opaque_url_refs = refs.refs
+    skyvern_context.set(ctx)
+    try:
+        outcome, caller = await _run(script, tools)
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    tool_messages = {m["name"]: m["content"] for m in caller.message_history if m.get("role") == "tool"}
+    # The raw signed bytes appear NOWHERE in the model-facing transcript.
+    assert all(signature_slice not in m["content"] for m in caller.message_history if m.get("role") == "tool")
+    assert all("cGF0aGxlc3M" not in m["content"] for m in caller.message_history if m.get("role") == "tool")
+    # Every echoing surface — success and error — shows the SAME token the prompt masker minted.
+    assert tool_messages["navigate"] == f"navigated to {token}, then {pathless_token}."
+    assert token in tool_messages["select"]
+    assert token in tool_messages["type"]
+    assert token in tool_messages["boom"]
+    # A benign signing-shaped live-page URL never in the payload is left intact (membership, not shape).
+    assert tool_messages["benign"] == f"you are on {benign} now"
+    assert "deadbeef" not in tool_messages["redirect"] and tool_messages["redirect"].startswith(
+        "navigated to opaque_url_"
+    )
 
 
 @pytest.mark.asyncio

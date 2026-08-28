@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
 
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
@@ -78,6 +81,7 @@ How to work:
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
 - Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys yourself. If `select_combobox` returns an error, the field is genuinely unfilled — try a fuller value or report it; never treat it as done.
 - `observe` already gives you everything you need to fill a field (selector, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` is a rare last resort for ONE specific element `observe` failed to describe: NEVER call it on a whole page/form/section, NEVER call it twice for the same element, and NEVER inspect more than once before acting.
+- `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
 - Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its selectors before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
 
@@ -194,6 +198,7 @@ async def run_task_v3_agent_loop(
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
+    initial_navigation_status: int | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -209,9 +214,34 @@ async def run_task_v3_agent_loop(
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
     # tools to resolve a token with, so the payload stays verbatim for the model to judge directly.
     refs = mask_opaque_urls(parameters) if not page_free else OpaqueUrlRefs(masked=parameters, refs={})
+    # The single model-facing masking boundary reads these off the task context (the chokepoint
+    # hide_from_model already runs on every tool result), so a resolved ref echoed by any tool —
+    # success or error — is rewritten to its token by membership, without each tool opting in. Set
+    # unconditionally (empty when this task minted none): the context is shared across every task block
+    # in a workflow run and blocks run sequentially, so this is the boundary's sole writer and a prior
+    # block's refs must not linger and mask this block's output to a token only that block's resolver —
+    # not this one's — can reverse. A production run always has a context (execute_step establishes it
+    # before _execute_task_v3); the None-guard only spares context-free test calls, which carry no real
+    # payload to leak. The same dict object, not a copy: a ref derived mid-task (a navigate redirect)
+    # must reach the boundary.
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        ctx.opaque_url_refs = refs.refs
     if refs.refs:
         resolve_typed_text = refs.chain(resolve_typed_text)
 
+    # Offer `look` only when this run's model AND this run's screenshot policy will actually deliver
+    # the image — `_llm_screenshots_for_call` drops it both for a non-vision model and, for the
+    # non-vision-fallback `taskv3-agent-loop` prompt, whenever the run is in the enriched_tree_no_images
+    # cohort (an org is pinned there at 100% today). Otherwise `look` would advertise an image the model
+    # never sees.
+    _ctx = skyvern_context.current()
+    vision_enabled = llm_caller.llm_config.supports_vision and (
+        _ctx is None
+        or _ctx.llm_screenshots_enabled_for_prompt(
+            is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES
+        )
+    )
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
     browser_tools = (
@@ -223,6 +253,7 @@ async def run_task_v3_agent_loop(
             organization_id=organization_id,
             resolve_typed_text=resolve_typed_text,
             opaque_refs=refs,
+            vision_enabled=vision_enabled,
         )
     )
 
@@ -260,6 +291,9 @@ async def run_task_v3_agent_loop(
     elif completion_blocker is not None and completion_probe is None:
         extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
     system_prompt = base_system_prompt + extra_system_guidance
+    system_prompt += datetime.now(ctx.tz_info if ctx and ctx.tz_info else UTC).strftime(
+        "\n\nToday's date is %Y-%m-%d (%A), %Z."
+    )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
     outcome = await run_agent_tool_loop(
@@ -284,6 +318,7 @@ async def run_task_v3_agent_loop(
         submit_watch=None if page_free else submit_watch,
         completion_probe=completion_probe,
         staged_downloads=staged_downloads,
+        initial_navigation_status=initial_navigation_status,
     )
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)

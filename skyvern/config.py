@@ -266,6 +266,12 @@ class Settings(BaseSettings):
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
+    # Admits the Odysseys benchmark's typed entry-point input on the copilot chat route, and only
+    # together with the X-Copilot-Eval header. Never enabled outside the dedicated eval lane.
+    WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED: bool = False
+    # The caller-supplied header is not an authorization: on a shared deployment only API
+    # credentials belonging to these explicitly configured eval organizations may seed an entry point.
+    WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
     # Local-development escape hatch: run a copilot block test run in the API process when sandbox
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.

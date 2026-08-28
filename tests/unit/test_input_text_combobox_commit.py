@@ -1519,3 +1519,51 @@ async def test_search_bar_no_settle_when_enabled_nested_span_target_present() ->
     assert inc.get_incremental_element_tree.await_count == 1  # initial read only, no settle re-read
     select_mock.assert_awaited_once()
     assert select_mock.await_args.kwargs["target_value"] == _TARGET
+
+
+# --------------------------------------------------------------------------- #
+# _custom_select_committed_readback_confirms — the pre-ownership-recovery gate.
+# A strict scope read can miss a commit the chosen option itself reflects; the gate honors a visibly
+# committed pick before ownership-dependent recovery, but only on an exact-label + committed signal.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_committed_readback_confirms_selected_option_with_exact_label() -> None:
+    element = MagicMock()
+    state = {"label": "Yes", "role": "option", "selectedAttr": True}
+    with patch.object(handler, "_read_custom_select_matched_state", AsyncMock(return_value=state)):
+        assert await handler._custom_select_committed_readback_confirms(element, "Yes") is True
+
+
+@pytest.mark.asyncio
+async def test_committed_readback_rejects_label_mismatch() -> None:
+    element = MagicMock()
+    state = {"label": "No", "role": "option", "selectedAttr": True}
+    with patch.object(handler, "_read_custom_select_matched_state", AsyncMock(return_value=state)):
+        assert await handler._custom_select_committed_readback_confirms(element, "Yes") is False
+
+
+@pytest.mark.asyncio
+async def test_committed_readback_rejects_unreadable_state() -> None:
+    # A None read-back (unreadable / errored seam) is never success — no fail-open.
+    element = MagicMock()
+    with patch.object(handler, "_read_custom_select_matched_state", AsyncMock(return_value=None)):
+        assert await handler._custom_select_committed_readback_confirms(element, "Yes") is False
+
+
+@pytest.mark.asyncio
+async def test_committed_readback_rejects_single_select_highlight() -> None:
+    # aria-selected on a single-select option is a keyboard highlight, not a commit; not success.
+    element = MagicMock()
+    state = {"label": "Yes", "role": "option", "ariaSelected": True, "inMultiselectable": False}
+    with patch.object(handler, "_read_custom_select_matched_state", AsyncMock(return_value=state)):
+        assert await handler._custom_select_committed_readback_confirms(element, "Yes") is False
+
+
+@pytest.mark.asyncio
+async def test_committed_readback_rejects_blank_requested_value() -> None:
+    # An empty expected label cannot be exact-matched; short-circuit before reading, never success.
+    element = MagicMock()
+    read = AsyncMock(return_value={"label": "Yes", "selectedAttr": True})
+    with patch.object(handler, "_read_custom_select_matched_state", read):
+        assert await handler._custom_select_committed_readback_confirms(element, "   ") is False
+    read.assert_not_awaited()

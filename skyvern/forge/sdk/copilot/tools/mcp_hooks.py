@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import uuid
@@ -9,6 +10,7 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
+from pydantic import JsonValue
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
@@ -40,6 +42,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction, 
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.schemas.workflows import TaskBlockYAML
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -50,6 +53,9 @@ from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
     _COPILOT_BANNED_BLOCK_TYPES,
     _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
+    _TASK_V3_ENGINE,
+    _TASK_V3_PURE_BANNED_BLOCK_TYPES,
+    _TASK_V3_PURE_TASK_BLOCK_TYPES,
     _code_only_browser_schema_guidance,
     _code_only_browser_unavailable_summary,
     _copilot_banned_block_alternatives,
@@ -58,6 +64,8 @@ from .banned_blocks import (
     _copilot_block_policy,
     _record_code_native_pending_capability,
     _render_block_policy_detail,
+    _task_v3_pure_block_violations,
+    _task_v3_pure_reject_message,
 )
 from .page_observation import (
     _record_composition_page_observation,
@@ -162,6 +170,16 @@ async def _get_block_schema_pre_hook(
     normalized = normalize_copilot_block_type_alias(block_type)
     if normalized != block_type.strip().lower():
         params["block_type"] = normalized
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE and normalized == "task":
+        return {
+            "ok": True,
+            "data": {
+                "block_type": "task",
+                "summary": "Run a general browser task with the Task V3 engine.",
+                "schema": _task_v3_pure_schema(TaskBlockYAML.model_json_schema()),
+                "task_v3_pure_guidance": _task_v3_pure_schema_guidance(),
+            },
+        }
     policy_entry = _copilot_block_policy(normalized, ctx)
     if policy_entry is None:
         return None
@@ -208,7 +226,8 @@ async def _validate_block_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     _normalize_block_json_alias(params)
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    authoring_policy = _copilot_block_authoring_policy(ctx)
+    if authoring_policy not in {BlockAuthoringPolicy.CODE_ONLY_BROWSER, BlockAuthoringPolicy.TASK_V3_PURE}:
         return None
     block_json = params.get("block_json")
     if not isinstance(block_json, str):
@@ -218,6 +237,15 @@ async def _validate_block_pre_hook(
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(raw, dict):
+        return None
+    if authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE:
+        violations = _task_v3_pure_block_violations(raw)
+        if violations:
+            return {
+                "ok": False,
+                "error": _task_v3_pure_reject_message(violations),
+                "data": {"violations": [violation.as_dict() for violation in violations]},
+            }
         return None
     block_type = raw.get("block_type")
     if not isinstance(block_type, str):
@@ -250,10 +278,39 @@ async def _get_block_schema_post_hook(
         if isinstance(block_types, dict):
             for banned in _copilot_banned_block_types(ctx):
                 block_types.pop(banned, None)
+            if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
+                for task_block_type in sorted(_TASK_V3_PURE_TASK_BLOCK_TYPES):
+                    block_types.setdefault(
+                        task_block_type,
+                        f"Task V3 {task_block_type.replace('_', ' ')} block",
+                    )
             data["count"] = len(block_types)
         block_type = data.get("block_type")
+        if (
+            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE
+            and isinstance(block_type, str)
+            and block_type in _TASK_V3_PURE_TASK_BLOCK_TYPES
+            and isinstance(data.get("schema"), dict)
+        ):
+            data["schema"] = _task_v3_pure_schema(data["schema"])
+            data["task_v3_pure_guidance"] = _task_v3_pure_schema_guidance()
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
             ctx.code_only_code_schema_seen = True
+            schema = data.get("schema")
+            if isinstance(schema, dict):
+                properties = schema.get("properties")
+                if isinstance(properties, dict) and isinstance(properties.get("prompt"), dict):
+                    properties["prompt"] = {
+                        "type": "string",
+                        "description": (
+                            "Every new or wholly rewritten code block must include this non-null string: "
+                            "the model-authored plain-language Goal shown in the editor."
+                        ),
+                    }
+                    required = schema.get("required")
+                    required_fields = required if isinstance(required, list) else []
+                    if "prompt" not in required_fields:
+                        schema["required"] = [*required_fields, "prompt"]
             data["code_only_note"] = _code_only_browser_unavailable_summary()
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
@@ -264,6 +321,32 @@ async def _get_block_schema_post_hook(
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
     return result
+
+
+def _task_v3_pure_schema(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    policy_schema = copy.deepcopy(schema)
+    properties = policy_schema.get("properties")
+    if isinstance(properties, dict):
+        properties["engine"] = {
+            "type": "string",
+            "const": _TASK_V3_ENGINE,
+            "description": "Required by the active Task-V3-pure authoring policy.",
+        }
+        required = policy_schema.get("required")
+        if isinstance(required, list) and "engine" not in required:
+            required.append("engine")
+        elif not isinstance(required, list):
+            policy_schema["required"] = ["engine"]
+    return policy_schema
+
+
+def _task_v3_pure_schema_guidance() -> list[str]:
+    return [
+        "Set every task-shaped block engine exactly to `skyvern-3.0`.",
+        "Use engine-less blocks for orchestration, integrations, direct navigation, waits, files, and human interaction.",
+        "Use `loop_over_parameter_key` for for_loop input and explicit `jinja2_template` criteria for conditional or while_loop control flow.",
+        "Code, task_v2, free-form for_loop inputs, prompt control-flow criteria, and download-gated validation are unavailable.",
+    ]
 
 
 async def _get_workflow_knowledge_post_hook(
@@ -1519,7 +1602,11 @@ def _block_schema_banned_types_note(
     banned = (
         _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
         if normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-        else _COPILOT_BANNED_BLOCK_TYPES
+        else (
+            _TASK_V3_PURE_BANNED_BLOCK_TYPES
+            if normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.TASK_V3_PURE
+            else _COPILOT_BANNED_BLOCK_TYPES
+        )
     )
     return f"Unavailable under the active policy and rejected on request: {', '.join(sorted(banned))}."
 

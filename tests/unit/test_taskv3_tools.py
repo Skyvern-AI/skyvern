@@ -13,18 +13,156 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator
+from html import escape as html_escape
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 import pytest
-from structlog.testing import capture_logs
 
 # Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
 # delay-specific test can exercise the real function while other upload tests skip the sleep.
-from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, _is_host_anchored_selector
+from playwright.async_api import Error as _PlaywrightError
+from structlog.testing import capture_logs
+
+from skyvern.forge.taskv3.tools import (
+    NAVIGATION_DEAD_END_STATUSES,
+    PAGE_UNAVAILABLE_ERROR,
+    _annotate_screenshot,
+    _invalid_selector_result,
+    _is_host_anchored_selector,
+    _normalize_selector,
+)
 from skyvern.forge.taskv3.tools import _upload_submit_delay as _REAL_UPLOAD_SUBMIT_DELAY
-from skyvern.forge.taskv3.tools import build_browser_tools
+from skyvern.forge.taskv3.tools import (
+    build_browser_tools,
+)
 from tests.unit.test_taskv3_loop import _ScriptedCaller
+
+
+def test_classify_commit_matrix() -> None:
+    from skyvern.forge.taskv3.tools import CommitStatus, _classify_commit
+
+    S = {"checked": True}  # a readable committable post-state
+
+    # INV-2 right to answer: no readable committable post-state -> unverified.
+    assert _classify_commit({"checked": False}, 1, None) == CommitStatus.UNVERIFIED
+    assert _classify_commit({"checked": False}, 1, {"value": None}) == CommitStatus.UNVERIFIED
+    # ...and an unreadable pre-state (with no value-specific truth) is unverified, not a false verdict.
+    assert _classify_commit(None, 1, S) == CommitStatus.UNVERIFIED
+
+    # Widget-agnostic committing direction: any committable field moving is a commit.
+    assert _classify_commit({"checked": False}, 1, {"checked": True}) == CommitStatus.OK
+    assert _classify_commit({"value": "a"}, 1, {"value": "ab"}) == CommitStatus.OK
+    assert _classify_commit({"selected": False}, 1, {"selected": True}) == CommitStatus.OK
+    # No field moved -> did-not-commit.
+    assert _classify_commit({"checked": True}, 1, {"checked": True}) == CommitStatus.DID_NOT_COMMIT
+
+    # INV-1 identity guards the CONFIDENT answer only: a commit read off n != 1 is unverified...
+    assert _classify_commit({"checked": False}, 0, S) == CommitStatus.UNVERIFIED
+    assert _classify_commit({"checked": False}, 2, S) == CommitStatus.UNVERIFIED
+    # ...but a readable did-not-commit is reported whatever n is — only an error halts a batched turn,
+    # and a queued submit must not run on a field the readback says is unfilled.
+    assert _classify_commit({"checked": True}, 2, {"checked": True}) == CommitStatus.DID_NOT_COMMIT
+    assert _classify_commit({"checked": True}, 0, {"checked": True}) == CommitStatus.DID_NOT_COMMIT
+
+    # committed_value overrides the generic rule with a caller's value-specific truth (the typeahead
+    # site, whose token-overlap tolerance lives in JS) under the same ranking.
+    assert _classify_commit(None, 1, S, committed_value=True) == CommitStatus.OK
+    assert _classify_commit(None, 1, S, committed_value=False) == CommitStatus.DID_NOT_COMMIT
+    assert _classify_commit(None, 0, S, committed_value=True) == CommitStatus.UNVERIFIED
+    assert _classify_commit(None, 2, S, committed_value=False) == CommitStatus.DID_NOT_COMMIT
+
+
+def test_match_menu_option_matrix() -> None:
+    from skyvern.forge.taskv3.tools import _match_menu_option
+
+    opts = [
+        {"n": 1, "text": "Analytics"},
+        {"n": 2, "text": "Engineering"},
+        {"n": 3, "text": "People Operations"},
+    ]
+    # Exact normalized match (case/whitespace-insensitive) wins.
+    assert _match_menu_option("Analytics", opts) == 1
+    assert _match_menu_option("  analytics ", opts) == 1
+    assert _match_menu_option("PEOPLE   OPERATIONS", opts) == 3
+    # FORWARD token-prefix only: a short observed value matches the fuller option label.
+    assert _match_menu_option("People", opts) == 3
+    eeo = [{"n": 1, "text": "Yes"}, {"n": 2, "text": "No"}, {"n": 3, "text": "Decline to self-identify"}]
+    assert _match_menu_option("Decline", eeo) == 3
+    # REVERSE is refused: a longer value must NOT commit a shorter, more-general option — the fuller row
+    # may simply be unrendered (virtualised list), so committing "People Operations" for a "…Team" value
+    # or "New" for "New York" would be a silent wrong success.
+    assert _match_menu_option("People Operations Team", opts) is None
+    assert _match_menu_option("New York", [{"n": 1, "text": "New"}, {"n": 2, "text": "Newark"}]) is None
+    # CRITICAL: a value that is only an incidental SUBSTRING of an option is NOT matched — "No" is inside
+    # "prefer not to answer" but must never commit the "No" row on a sensitive question.
+    assert _match_menu_option("Prefer not to answer", eeo) is None
+    # ...and an abbreviation that is not a whole-token prefix is not guessed at either.
+    assert _match_menu_option("Eng", opts) is None
+    # Apostrophe/quote folding comes from the shared exact/stem matcher.
+    assert _match_menu_option("Masters Degree", [{"n": 1, "text": "Master's Degree"}, {"n": 2, "text": "PhD"}]) == 1
+    # No match -> None (hand the options back to the model, don't guess).
+    assert _match_menu_option("Legal", opts) is None
+    assert _match_menu_option("", opts) is None
+    # Exact wins even when a token-prefix is otherwise ambiguous: "Yes" is an exact row despite
+    # "Yes, I consent" sharing its first token.
+    yn = [{"n": 1, "text": "Yes"}, {"n": 2, "text": "Yes, I consent"}, {"n": 3, "text": "No"}]
+    assert _match_menu_option("Yes", yn) == 1
+    # Ambiguous forward-prefix with no exact match -> None, never an arbitrary pick.
+    ambiguous = [{"n": 1, "text": "United States Minor"}, {"n": 2, "text": "United States Major"}]
+    assert _match_menu_option("United States", ambiguous) is None
+    # A row missing a usable index is ignored rather than crashing.
+    assert _match_menu_option("Analytics", [{"n": None, "text": "Analytics"}, {"n": 5, "text": "Analytics"}]) == 5
+    # A leading comma token is folded away, so a short value forward-prefix-matches a punctuated label
+    # ("Yes" -> "Yes, I consent") instead of silently missing on the attached comma.
+    punct = [{"n": 1, "text": "Yes, I consent"}, {"n": 2, "text": "No"}]
+    assert _match_menu_option("Yes", punct) == 1
+    # A slash is left intact so a combined single option is NOT prefix-matched by one of its halves.
+    assert _match_menu_option("Yes", [{"n": 1, "text": "Yes/No"}, {"n": 2, "text": "Maybe"}]) is None
+
+
+def test_annotate_screenshot_downscales_and_draws_marks() -> None:
+    import io as _io
+
+    from PIL import Image
+
+    buf = _io.BytesIO()
+    Image.new("RGB", (1600, 900), (0, 0, 0)).save(buf, format="PNG")
+    out = _annotate_screenshot(buf.getvalue(), [{"n": 1, "x": 100, "y": 100, "w": 200, "h": 80}], vw=800)
+    img = Image.open(_io.BytesIO(out)).convert("RGB")
+    # Operator constraint: downscale to ~1024w so the ephemeral image stays cheap.
+    assert img.width == 1024
+    # A red box was drawn on the all-black frame — proves marks are rendered server-side.
+    colors = {c for _, c in img.getcolors(maxcolors=100000) or []}
+    assert any(r > 200 and g < 80 and b < 80 for (r, g, b) in colors)
+
+
+def test_look_tool_gated_on_vision_capability() -> None:
+    async def provider() -> Any:
+        return None
+
+    names_default = {t.name for t in build_browser_tools(provider)}
+    assert "look" in names_default  # default: offered
+    names_vision = {t.name for t in build_browser_tools(provider, vision_enabled=True)}
+    assert "look" in names_vision
+    names_blind = {t.name for t in build_browser_tools(provider, vision_enabled=False)}
+    # A non-vision model would drop the screenshot before the request, so look is not advertised.
+    assert "look" not in names_blind
+    # The rest of the toolset is unchanged whether or not look is present.
+    assert names_blind == names_vision - {"look"}
+
+
+def test_annotate_screenshot_no_downscale_when_already_small() -> None:
+    import io as _io
+
+    from PIL import Image
+
+    buf = _io.BytesIO()
+    Image.new("RGB", (640, 480), (0, 0, 0)).save(buf, format="PNG")
+    out = _annotate_screenshot(buf.getvalue(), [{"n": 2, "x": 10, "y": 10, "w": 50, "h": 20}], vw=640)
+    img = Image.open(_io.BytesIO(out)).convert("RGB")
+    assert img.width == 640
 
 
 def _has_playwright_browser() -> bool:
@@ -43,9 +181,27 @@ _skip_no_browser = pytest.mark.skipif(
 )
 
 
+class _FakeRequest:
+    """Minimal stand-in for a Playwright request, exposing the attributes the upload-activity probe
+    reads. Defaults describe an upload-like dispatch (POST xhr)."""
+
+    def __init__(
+        self, method: str = "POST", resource_type: str = "xhr", url: str = "https://api.example.test/upload"
+    ) -> None:
+        self.method = method
+        self.resource_type = resource_type
+        self.url = url
+        self.post_data: str | None = None
+
+
 class _FakeElement:
-    def __init__(self) -> None:
+    def __init__(self, page: Any = None) -> None:
         self.calls: list[tuple[str, Any]] = []
+        self._page = page
+        self._files: list[Any] = []
+        # Default: model an immediate-upload form — attaching a file makes the site dispatch an upload
+        # request, so upload-activity is observed. Tests that need a silent no-op set this False.
+        self.emit_upload_on_set = True
 
     async def inner_html(self) -> str:
         return "<div>inner</div>"
@@ -55,13 +211,33 @@ class _FakeElement:
 
     async def set_input_files(self, paths: Any) -> None:
         self.calls.append(("set_input_files", paths))
+        self._files = list(paths) if isinstance(paths, (list, tuple)) else [paths]
+        if self._page is not None and self.emit_upload_on_set:
+            self._page._emit_request(_FakeRequest())
+
+    async def evaluate(self, _js: str, _arg: Any = None) -> Any:
+        # The file-input readback the populate check runs after set_input_files.
+        return len(self._files)
 
 
 class _FakePage:
     def __init__(self) -> None:
         self.url = "https://example.test/apply"
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.element = _FakeElement()
+        self.element = _FakeElement(self)
+        self._request_listeners: list[Any] = []
+
+    def on(self, event: str, callback: Any) -> None:
+        if event == "request":
+            self._request_listeners.append(callback)
+
+    def remove_listener(self, event: str, callback: Any) -> None:
+        if event == "request" and callback in self._request_listeners:
+            self._request_listeners.remove(callback)
+
+    def _emit_request(self, request: Any) -> None:
+        for cb in list(self._request_listeners):
+            cb(request)
 
     async def eval_on_selector(self, selector: str, js: str) -> str:
         # Field-type probe: report a non-typeahead type so legacy tests exercise the plain fill path.
@@ -311,6 +487,161 @@ async def test_navigate_and_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     r2 = await _tool(tools, "wait").handler({"selector": "#next", "state": "visible"})
     assert r2.status == "ok"
     assert any(c[0] == "wait_for_selector" for c in page.calls)
+
+
+async def _navigate_status(monkeypatch: pytest.MonkeyPatch, status: int | None) -> Any:
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        page.url = url
+        page.calls.append(("goto", {"url": url}))
+        return None if status is None else SimpleNamespace(status=status)
+
+    page.goto = _goto  # type: ignore[assignment]
+    tools = build_browser_tools(_fixed_page_provider(page))
+    return await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
+
+
+@pytest.mark.parametrize("status", sorted(NAVIGATION_DEAD_END_STATUSES))
+@pytest.mark.asyncio
+async def test_navigate_flags_dead_end_on_hard_404_or_410(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    # A genuinely dead/removed posting (HTTP 404/410) is a non-capability dead-end: v1 routes it to
+    # terminated; v3 must surface a deterministic signal the loop maps to terminated rather than
+    # leaving failed/terminated to the model's finish-tool discretion.
+    r = await _navigate_status(monkeypatch, status)
+    assert r.status == "ok"
+    assert (r.data or {}).get("navigation_dead_end") == status
+
+
+@pytest.mark.parametrize("status", [None, 200, 302, 401, 403, 429, 500, 503])
+@pytest.mark.asyncio
+async def test_navigate_does_not_flag_dead_end_for_non_dead_statuses(
+    monkeypatch: pytest.MonkeyPatch, status: int | None
+) -> None:
+    # NARROW: only hard "resource does not exist / gone". Auth (401/403), rate-limit (429), transient
+    # server errors (5xx), redirects (3xx) and OK are NOT dead-ends — a real capability failure or a
+    # recoverable condition must stay unflagged so it is never over-routed to terminated.
+    r = await _navigate_status(monkeypatch, status)
+    assert r.status == "ok"
+    assert "navigation_dead_end" not in (r.data or {})
+
+
+def _reload_guard_tools(monkeypatch: pytest.MonkeyPatch, filled: int) -> tuple[Any, list[Any]]:
+    import skyvern.forge.taskv3.tools as tools_module
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+
+    async def _filled(_page: Any) -> int:
+        return filled
+
+    monkeypatch.setattr(tools_module, "_count_filled_fields", _filled)
+    page = _FakePage()  # page.url == https://example.test/apply
+    return page, build_browser_tools(_fixed_page_provider(page))
+
+
+@pytest.mark.asyncio
+async def test_navigate_refuses_destructive_same_url_reload_with_filled_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-15092(A): navigating to the URL we are already on is a full reload that discards in-progress
+    # form state (filled fields, an attached file). It must be refused, not silently reload and wipe
+    # verified-good progress. RED against pre-guard code, which reloaded unconditionally.
+    page, tools = _reload_guard_tools(monkeypatch, filled=2)
+    r = await _tool(tools, "navigate").handler({"url": page.url})
+    assert r.status == "error", r.content
+    assert "discard" in r.content
+    assert not any(c[0] == "goto" for c in page.calls)  # never reloaded
+
+
+@pytest.mark.asyncio
+async def test_navigate_same_url_reload_allowed_on_confirming_repeat(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The guard is recoverable: an intentional reset is honored — a second navigate to the same URL
+    # confirms intent and proceeds.
+    page, tools = _reload_guard_tools(monkeypatch, filled=2)
+    r1 = await _tool(tools, "navigate").handler({"url": page.url})
+    assert r1.status == "error"
+    r2 = await _tool(tools, "navigate").handler({"url": page.url})
+    assert r2.status == "ok", r2.content
+    assert any(c[0] == "goto" for c in page.calls)
+
+
+@pytest.mark.asyncio
+async def test_navigate_to_a_different_url_is_never_guarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # NEGATIVE: the guard must not touch normal multi-page navigation — a DIFFERENT url proceeds even
+    # with filled fields on the current page.
+    page, tools = _reload_guard_tools(monkeypatch, filled=5)
+    r = await _tool(tools, "navigate").handler({"url": "https://example.test/apply/step-2"})
+    assert r.status == "ok", r.content
+    assert any(c[0] == "goto" for c in page.calls)
+
+
+@pytest.mark.asyncio
+async def test_navigate_same_url_reload_with_no_filled_state_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Nothing to protect: a same-URL reload of a page with no filled fields proceeds normally.
+    page, tools = _reload_guard_tools(monkeypatch, filled=0)
+    r = await _tool(tools, "navigate").handler({"url": page.url})
+    assert r.status == "ok", r.content
+    assert any(c[0] == "goto" for c in page.calls)
+
+
+@pytest.mark.asyncio
+async def test_navigate_intervening_navigation_resets_the_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Leaving the page and returning clears the pending confirm, so a fresh same-URL reload is refused
+    # again rather than silently auto-confirmed by a stale pending from an earlier refusal.
+    page, tools = _reload_guard_tools(monkeypatch, filled=3)
+    same = page.url
+
+    async def nav(url: str) -> Any:
+        return await _tool(tools, "navigate").handler({"url": url})
+
+    assert (await nav(same)).status == "error"  # refuse; pending set
+    assert (await nav("https://example.test/other")).status == "ok"  # leave; pending cleared
+    assert (await nav(same)).status == "ok"  # return (fresh load, different from /other)
+    assert (await nav(same)).status == "error"  # reload again → refused fresh, not auto-confirmed
+
+
+@pytest.mark.asyncio
+async def test_navigate_rerefuses_when_at_risk_state_grew_after_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A stale confirm must NOT wipe state that GREW after the refusal (e.g. a file attached in between):
+    # the repeat is re-refused because more is now at risk than when the model was first warned.
+    import skyvern.forge.taskv3.tools as tools_module
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    seq = [2, 3]  # refusal sees 2 filled fields; the repeat sees 3 (a file was attached in between)
+
+    async def _filled(_page: Any) -> int:
+        return seq.pop(0) if seq else 3
+
+    monkeypatch.setattr(tools_module, "_count_filled_fields", _filled)
+    page = _FakePage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    assert (await _tool(tools, "navigate").handler({"url": page.url})).status == "error"  # filled=2, refuse
+    r2 = await _tool(tools, "navigate").handler({"url": page.url})  # filled=3 > 2 → re-refuse
+    assert r2.status == "error", r2.content
+    assert not any(c[0] == "goto" for c in page.calls)  # never reloaded — the grown state is protected
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_filled_state_probe_counts_an_attached_file_input(tmp_path: Any) -> None:
+    # The guard's filled-state oracle MUST count a file input holding a file — the pre-submit form
+    # serializer deliberately does not, and an attached resume is exactly the progress the guard
+    # protects. Real Chromium so files.length reflects a genuine attach.
+    from skyvern.forge.taskv3.tools import _count_filled_fields  # noqa: PLC0415
+
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 cv")
+    async with _content_page('<form><input type="file" id="cv"><input type="text" id="name"></form>') as page:
+        assert await _count_filled_fields(page) == 0
+        await page.set_input_files("#cv", str(cv))
+        assert await _count_filled_fields(page) >= 1
+        await page.fill("#name", "John Doe")
+        assert await _count_filled_fields(page) >= 2
 
 
 @pytest.mark.asyncio
@@ -610,34 +941,87 @@ async def test_navigate_resolves_secret_placeholder_before_goto(monkeypatch: pyt
 class _TypeaheadFakePage:
     """Fake page for the BEHAVIORAL typeahead path. `evaluate` stands in for the JS suggestion-finder
     (_FIND_SUGGESTION_JS, identified by the data-tv3-sugg tag it sets) and the commit-verifier
-    (_VERIFY_COMMIT_JS, identified by its `closest` call), so type()/select_combobox control flow can be
+    (_VERIFY_COMMIT_JS, identified by its `noSuggestionList` flag), so type()/select_combobox control flow can be
     driven without a real DOM. `field_type` feeds the pre-probe input-type check; `suggestion` is what the
     finder returns (None => the page rendered nothing that overlaps the value); `committed` is the value
     the verifier reads back after the suggestion is clicked."""
 
     def __init__(
-        self, *, field_type: str = "text", suggestion: dict[str, Any] | None = None, committed: str = ""
+        self,
+        *,
+        field_type: str = "text",
+        suggestion: dict[str, Any] | None = None,
+        committed: str | None = "",
+        match_count: int | None = None,
+        reach: str = "",
+        node_name: str = "input",
+        disabled: bool = False,
     ) -> None:
         self._field_type = field_type
         self._suggestion = suggestion
         self._committed = committed
+        self._match_count = match_count
+        self._reach = reach
+        self._node_name = node_name
+        self._disabled = disabled
         self.calls: list[tuple[str, Any]] = []
         self.clicked_suggestion = False
+
+    def locator(self, selector: str) -> Any:
+        # Only modelled when a test sets match_count; otherwise raise so the tool fail-opens to n==1,
+        # exactly as it does when a real page cannot count the selector.
+        if self._match_count is None:
+            raise RuntimeError("locator not modelled")
+
+        class _FakeLocator:
+            def __init__(self, n: int) -> None:
+                self._n = n
+
+            async def count(self) -> int:
+                return self._n
+
+        return _FakeLocator(self._match_count)
 
     async def eval_on_selector(self, selector: str, js: str) -> str:
         return self._field_type
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), so match
-        # the verifier (identified by its `closest` call) first, then the finder.
-        if "closest" in js:
+        # the verifier (identified by its `noSuggestionList` flag) first, then the finder.
+        # The native-vs-custom probe (_SELECT_VISIBILITY_JS, identified by its `proxied` field): reports
+        # the element's nodeName + disabled so select_option can gate native (<select>) vs custom.
+        if "proxied" in js:
+            return {
+                "exists": True,
+                "nodeName": self._node_name,
+                "visible": True,
+                "disabled": self._disabled,
+                "proxied": False,
+            }
+        if "noSuggestionList" in js:
             return self._committed
         if "data-tv3-sugg" in js:
             return self._suggestion
-        # The probe-reach question. This fake models a plain light-DOM field, so every check we run
-        # against it is genuinely runnable and no claim should be withheld.
+        # The typeable-vs-open-list gate the shared commit path runs before typing. This fake models a
+        # real typeahead <input>, so it is typeable unless its field type is one an <input> cannot type
+        # into — mirroring _ANCHOR_TYPEABLE_JS's NONTEXT set.
+        if "isContentEditable" in js:
+            return self._field_type not in {
+                "checkbox",
+                "radio",
+                "button",
+                "submit",
+                "reset",
+                "file",
+                "image",
+                "range",
+                "color",
+                "hidden",
+            }
+        # The probe-reach question. Defaults to "" (a plain light-DOM field, every check runnable, no
+        # claim withheld); a test sets reach="component"/"unprobeable" to model a field the check cannot reach.
         if "'unprobeable'" in js:
-            return ""
+            return self._reach
         return None
 
     async def click(self, selector: str, timeout: int | None = None) -> None:
@@ -653,6 +1037,16 @@ class _TypeaheadFakePage:
 
     async def press(self, selector: str, key: str) -> None:
         self.calls.append(("press", (selector, key)))
+
+    async def select_option(
+        self,
+        selector: str,
+        label: str | None = None,
+        value: str | None = None,
+        timeout: int | None = None,
+        force: bool = False,
+    ) -> None:
+        self.calls.append(("select_option", {"selector": selector, "label": label, "value": value}))
 
 
 async def _instant_sleep(*_a: Any, **_k: Any) -> None:
@@ -729,6 +1123,156 @@ async def test_select_combobox_fails_loud_when_no_suggestion_reacts(monkeypatch:
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
     assert r.status == "error" and "NOT filled" in r.content
+
+
+@pytest.mark.asyncio
+async def test_type_typeahead_that_remounts_after_commit_is_unverified_not_a_false_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # INV-1: after the suggestion is clicked the field re-resolves to n!=1 (the widget remounted or
+    # removed its input), so there is no stable element to read the commit off. That is ok-unverified —
+    # a false "did not commit — NOT filled" would halt the batch on a field that may well have committed.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed=None, match_count=0
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#city", "text": "Lisbon"})
+    assert page.clicked_suggestion
+    assert r.status == "ok", r.content
+    assert "re-resolved to 0 elements" in r.content, r.content
+    assert "NOT filled" not in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_select_combobox_that_remounts_after_commit_is_unverified_not_a_false_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # INV-1 for the explicit-combobox consumer: same remount, same soft verdict — not a false hard error.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed=None, match_count=0
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Lisbon"})
+    assert page.clicked_suggestion
+    assert r.status == "ok", r.content
+    assert "re-resolved to 0 elements" in r.content, r.content
+    assert "did not commit" not in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_type_readable_empty_field_is_a_hard_error_even_inside_a_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Readability (INV-2) and commit are separate dimensions: a field that reads back EMPTY was readable,
+    # so it did-not-commit (hard error), even when the reach probe would soften an UNREADABLE field in the
+    # same component. Guards the split — collapsing "read empty" into "unreadable" would soften a rejected
+    # required field to ok-unverified and let a batch proceed on an empty field.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed="", match_count=1, reach="component"
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#city", "text": "Lisbon"})
+    assert page.clicked_suggestion
+    assert r.status == "error", r.content
+    assert "NOT filled" in r.content, r.content
+    assert "could not be verified" not in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_type_readable_empty_field_that_re_resolves_ambiguously_is_still_a_hard_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A readback that positively reads the field EMPTY outranks INV-1: the field is known unfilled, and
+    # only an error halts the rest of a batched turn (a queued submit must not run on it). n != 1 may
+    # soften a confident commit to "re-observe", never a did-not-commit to ok.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed="", match_count=2)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#city", "text": "Lisbon"})
+    assert page.clicked_suggestion
+    assert r.status == "error", r.content
+    assert "NOT filled" in r.content, r.content
+    assert "could not be verified" not in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_select_combobox_readable_empty_field_that_re_resolves_ambiguously_is_still_a_hard_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same fail-closed ranking at the explicit-combobox site branch, which `type` does not exercise.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed="", match_count=2)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Lisbon"})
+    assert page.clicked_suggestion
+    assert r.status == "error", r.content
+    assert "did not commit" in r.content, r.content
+    assert "could not be verified" not in r.content, r.content
+
+
+@pytest.mark.asyncio
+async def test_select_option_diverts_custom_combobox_to_shared_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A non-<select> target (nodeName != 'select') must route into the shared commit path — type +
+    # click the suggestion — and NOT call page.select_option (which would throw on a custom combobox).
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text",
+        node_name="input",
+        suggestion={"text": "Analytics", "score": 2},
+        committed="Analytics",
+        match_count=1,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_option").handler({"selector": "#dept", "label": "Analytics"})
+    assert r.status == "ok", r.content
+    assert page.clicked_suggestion  # committed via the typeahead path
+    assert not any(c[0] == "select_option" for c in page.calls)  # never hit the native <select> API
+
+
+@pytest.mark.asyncio
+async def test_select_option_native_select_uses_native_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A real <select> (nodeName == 'select') keeps the native path — dispatch page.select_option, no typing.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(node_name="select", suggestion={"text": "United States", "score": 2})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
+    assert r.status == "ok", r.content
+    assert ("select_option", {"selector": "#country", "label": "United States", "value": None}) in page.calls
+    assert not page.clicked_suggestion
+
+
+@pytest.mark.asyncio
+async def test_select_option_disabled_custom_combobox_reports_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A disabled control is refused with the accurate "is disabled" message BEFORE the custom divert —
+    # not the typeable-gate refusal, and nothing is typed.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text", node_name="input", disabled=True, suggestion={"text": "Analytics", "score": 2}
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_option").handler({"selector": "#dept", "label": "Analytics"})
+    assert r.status == "error", r.content
+    assert "disabled" in r.content, r.content
+    assert not page.clicked_suggestion
 
 
 # --- DOM-level tests: exercise the REAL finder/pre-snapshot JS against a live page, so the safeguards
@@ -3282,6 +3826,40 @@ async def test_download_signal_survives_compaction_end_to_end_through_loop(tmp_p
     assert any("Downloaded: report.pdf" in m["content"] for m in observe_msgs)  # notice survives on a live message
 
 
+@pytest.mark.asyncio
+async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    # End-to-end through the REAL navigate handler and the REAL loop (not a fake tool): a model-issued
+    # navigate that lands on a hard 404 must end the run `terminated`, even though the model then tries
+    # to finish `completed`. Reverting the tools.py dead-end flag makes this go `completed` (RED).
+    import skyvern.utils.url_validators as urlv
+    from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        page.url = url
+        page.calls.append(("goto", {"url": url}))
+        return SimpleNamespace(status=404)
+
+    page.goto = _goto  # type: ignore[assignment]
+    all_tools = build_browser_tools(_fixed_page_provider(page)) + [make_finish_tool()]
+    script = [
+        [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
+        [("finish", {"status": "completed", "reason": "should not win"})],
+    ]
+    outcome = await run_agent_tool_loop(
+        llm_caller=_ScriptedCaller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=all_tools,
+        max_turns=10,
+        max_tool_calls=20,
+    )
+
+    assert outcome.status == "terminated"
+
+
 # --- Commit-verified click-open dropdown selection. The staging specimen: a click-open
 # filter popover that toggles open/closed on trigger clicks and REMOUNTS its option nodes each open,
 # so ids from a prior observe go stale and every toggle click returns an uninformative ok. The click
@@ -4138,6 +4716,272 @@ async def test_dom_a_radiogroup_category_reports_its_children_and_the_leaf_commi
         assert await page.evaluate("() => window.__commits") == 1
 
 
+_REVEAL_HIDDEN_MENU_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div id="trigger" tabindex="0"
+       style="position:absolute;top:40px;left:40px;width:320px;height:28px;border:1px solid #888">Choose one</div>
+  <script>
+    window.__commits = 0;
+    var CATS = {'Referral': ['Current employee', 'Former employee'], 'Event': ['Career fair', 'Conference']};
+    var ROW = 'min-height:26px;padding:2px 6px;';
+    document.getElementById('trigger').addEventListener('click', function () {
+      var ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      var list = document.createElement('div');
+      list.id = 'list';
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:320px;background:#fff;border:1px solid #ccc');
+      Object.keys(CATS).forEach(function (name) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-haspopup', 'true');
+        row.setAttribute('style', ROW);
+        row.appendChild(document.createTextNode(name));
+        var kids = [];
+        CATS[name].forEach(function (k) {
+          var kid = document.createElement('div');
+          kid.setAttribute('role', 'option');
+          kid.setAttribute('aria-checked', 'false');
+          // Pre-exists as a DOM DESCENDANT of the category row, hidden until the row is clicked.
+          kid.setAttribute('style', ROW + 'padding-left:18px;display:none');
+          kid.textContent = k;
+          kid.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            kid.setAttribute('aria-checked', 'true');
+            window.__commits++;
+          });
+          row.appendChild(kid);
+          kids.push(kid);
+        });
+        row.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          if (kids[0].style.display !== 'none') return;   // already expanded
+          // Reveal the pre-existing hidden descendants; the category itself commits nothing.
+          kids.forEach(function (x) { x.setAttribute('style', ROW + 'padding-left:18px;display:block'); });
+        });
+        list.appendChild(row);
+      });
+      document.body.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_category_revealing_pre_existing_hidden_children_reports_them_not_a_false_commit() -> None:
+    # SKY-14741 click-channel fix: a category whose leaf rows PRE-EXIST as hidden DESCENDANTS and are
+    # revealed (display:none->block) on click commits nothing, so the click must report the revealed
+    # children rather than a false "Selected option 'Referral'". RED today: _grew keys on child-count,
+    # which is unchanged by a display-only reveal, so the state change reads as a commit.
+    async with _live_page(_REVEAL_HIDDEN_MENU_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 2 options" in (await click.handler({"selector": "#trigger"})).content
+        r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert await page.evaluate("() => window.__commits") == 0, r2.content
+        assert "opened a menu of 2 options" in r2.content, r2.content
+        assert "Current employee" in r2.content and "Former employee" in r2.content, r2.content
+        r3 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r3.status == "ok", r3.content
+        assert await page.evaluate("() => window.__commits") == 1, r3.content
+
+
+_REVEAL_HIDDEN_ABSOLUTE_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div id="trigger" tabindex="0"
+       style="position:absolute;top:40px;left:40px;width:320px;height:28px;border:1px solid #888">Choose one</div>
+  <script>
+    window.__commits = 0;
+    var CATS = {'Referral': ['Current employee', 'Former employee'], 'Event': ['Career fair', 'Conference']};
+    document.getElementById('trigger').addEventListener('click', function () {
+      var ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      var list = document.createElement('div');
+      list.id = 'list';
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:320px;background:#fff;border:1px solid #ccc');
+      var top = 120;
+      Object.keys(CATS).forEach(function (name) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-haspopup', 'true');
+        row.setAttribute('style', 'position:relative;height:26px;padding:2px 6px;');
+        row.appendChild(document.createTextNode(name));
+        var kids = [];
+        CATS[name].forEach(function (k, i) {
+          var kid = document.createElement('div');
+          kid.setAttribute('role', 'option');
+          kid.setAttribute('aria-checked', 'false');
+          // Descendant of the row, but rendered OUT OF FLOW (absolute) — revealing it does not change
+          // the row's own height or child count, so only the visible-descendant-row signal moves.
+          kid.setAttribute('style', 'position:absolute;left:400px;top:' + (i * 24) + 'px;width:200px;height:22px;display:none');
+          kid.textContent = k;
+          kid.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            kid.setAttribute('aria-checked', 'true');
+            window.__commits++;
+          });
+          row.appendChild(kid);
+          kids.push(kid);
+        });
+        row.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          if (kids[0].style.display !== 'none') return;
+          kids.forEach(function (x, i) {
+            x.setAttribute('style', 'position:absolute;left:400px;top:' + (i * 24) + 'px;width:200px;height:22px;display:block');
+          });
+        });
+        list.appendChild(row);
+        top += 30;
+      });
+      document.body.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_category_revealing_out_of_flow_hidden_children_reports_them_not_a_false_commit() -> None:
+    # Pins the visible-descendant-row (optVis) signal specifically: the leaves are DESCENDANTS of the
+    # clicked row but rendered position:absolute, so revealing them leaves the row's own height and
+    # child count unchanged — only the count of visible descendant rows rises. Deleting optVis reds this
+    # (height/child-count alone cannot see the expansion) while the in-flow test above stays green.
+    async with _live_page(_REVEAL_HIDDEN_ABSOLUTE_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 2 options" in (await click.handler({"selector": "#trigger"})).content
+        r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert await page.evaluate("() => window.__commits") == 0, r2.content
+        assert "opened a menu of 2 options" in r2.content, r2.content
+        assert "Current employee" in r2.content and "Former employee" in r2.content, r2.content
+
+
+_HOVER_REVEAL_COMMIT_FIXTURE_HTML = """
+<!doctype html><html><head><style>
+  .kids { display: none; }
+  .cat:hover .kids { display: block; }
+</style></head><body style="margin:0">
+  <div id="trigger" tabindex="0"
+       style="position:absolute;top:40px;left:40px;width:320px;height:28px;border:1px solid #888">Choose one</div>
+  <script>
+    window.__commits = 0;
+    document.getElementById('trigger').addEventListener('click', function () {
+      var ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      var list = document.createElement('div');
+      list.id = 'list';
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:320px;background:#fff;border:1px solid #ccc');
+      ['Benefits', 'Payroll'].forEach(function (name) {
+        var row = document.createElement('div');
+        row.className = 'cat';
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-checked', 'false');
+        row.setAttribute('style', 'min-height:26px;padding:2px 6px;');
+        row.appendChild(document.createTextNode(name));
+        var kids = document.createElement('div');
+        kids.className = 'kids';
+        ['Preview A', 'Preview B'].forEach(function (k) {
+          var kid = document.createElement('div');
+          kid.setAttribute('role', 'option');
+          kid.setAttribute('style', 'min-height:22px');
+          kid.textContent = k;
+          kids.appendChild(kid);
+        });
+        row.appendChild(kids);
+        // Commits on click; the descendants only appear on :hover, which Playwright does before the click.
+        row.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          row.setAttribute('aria-checked', 'true');
+          window.__commits++;
+        });
+        list.appendChild(row);
+      });
+      document.body.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_commit_whose_hover_reveals_a_preview_is_still_a_commit_not_a_menu() -> None:
+    # A row that COMMITS on click but reveals descendant rows on CSS :hover (Playwright hovers before it
+    # clicks) must report the commit, not a fabricated "opened a menu": the hover-revealed rows are the
+    # hover's doing and are re-baselined out. RED if optVis is missing from the hover re-baseline tuple,
+    # where the pre-hover optVis=0 baseline would make the still-hovered reveal read as a click expansion.
+    async with _live_page(_HOVER_REVEAL_COMMIT_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 2 options" in (await click.handler({"selector": "#trigger"})).content
+        r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert await page.evaluate("() => window.__commits") == 1, r2.content
+        assert "opened a menu" not in r2.content, r2.content
+
+
+_REVEAL_HIDDEN_CHECKBOX_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div id="trigger" tabindex="0"
+       style="position:absolute;top:40px;left:40px;width:320px;height:28px;border:1px solid #888">Choose one</div>
+  <script>
+    window.__commits = 0;
+    var CATS = {'Referral': ['Current employee', 'Former employee'], 'Event': ['Career fair', 'Conference']};
+    document.getElementById('trigger').addEventListener('click', function () {
+      var ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      var list = document.createElement('div');
+      list.id = 'list';
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:320px;background:#fff;border:1px solid #ccc');
+      Object.keys(CATS).forEach(function (name) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-haspopup', 'true');
+        row.setAttribute('style', 'position:relative;height:26px;padding:2px 6px;');
+        row.appendChild(document.createTextNode(name));
+        var kids = [];
+        CATS[name].forEach(function (k, i) {
+          var kid = document.createElement('div');
+          kid.setAttribute('role', 'checkbox');   // multi-select leaf; not in the pre-fix optVis role set
+          kid.setAttribute('aria-checked', 'false');
+          kid.setAttribute('style', 'position:absolute;left:400px;top:' + (i * 24) + 'px;width:200px;height:22px;display:none');
+          kid.textContent = k;
+          row.appendChild(kid);
+          kids.push(kid);
+        });
+        row.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          if (kids[0].style.display !== 'none') return;
+          kids.forEach(function (x, i) {
+            x.setAttribute('style', 'position:absolute;left:400px;top:' + (i * 24) + 'px;width:200px;height:22px;display:block');
+          });
+        });
+        list.appendChild(row);
+      });
+      document.body.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_category_revealing_out_of_flow_checkbox_children_reports_them() -> None:
+    # The reveal signal must use the same row roles the menu finder reports on: a multi-select category
+    # whose leaves are role=checkbox, revealed out of flow, must still be reported (not a false commit).
+    # RED before _visRows was widened from {option,menuitem,treeitem,row} to the full menu-row role set.
+    async with _live_page(_REVEAL_HIDDEN_CHECKBOX_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 2 options" in (await click.handler({"selector": "#trigger"})).content
+        r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert await page.evaluate("() => window.__commits") == 0, r2.content
+        assert "opened a menu of 2 options" in r2.content, r2.content
+        assert "Current employee" in r2.content and "Former employee" in r2.content, r2.content
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_dom_a_real_commit_survives_the_click_also_revealing_more_rows() -> None:
@@ -4792,6 +5636,53 @@ _HIDDEN_CHECKBOX_REVERTS_HTML = """
   <input id="agree" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
   <script>
     document.getElementById('agree').addEventListener('change', e => { e.target.checked = false; });
+  </script>
+</body></html>
+"""
+
+
+# A change listener that also clones the control makes the selector re-resolve to two elements after
+# the action, so the readback's did-not-commit (or commit) is read off an n != 1 target.
+_HIDDEN_SELECT_REVERTS_AND_CLONES_HTML = """
+<!doctype html><html><body>
+  <label for="country">Country</label>
+  <select id="country" style="display:none">
+    <option value="">Pick</option>
+    <option value="us">United States</option>
+  </select>
+  <script>
+    document.getElementById('country').addEventListener('change', e => {
+      e.target.value = '';
+      e.target.insertAdjacentHTML('afterend', '<select id="country" style="display:none"><option value="">Pick</option></select>');
+    });
+  </script>
+</body></html>
+"""
+
+_HIDDEN_SELECT_COMMITS_AND_CLONES_HTML = """
+<!doctype html><html><body>
+  <label for="country">Country</label>
+  <select id="country" style="display:none">
+    <option value="">Pick</option>
+    <option value="us">United States</option>
+  </select>
+  <script>
+    document.getElementById('country').addEventListener('change', e => {
+      e.target.insertAdjacentHTML('afterend', '<select id="country" style="display:none"><option value="">Pick</option></select>');
+    });
+  </script>
+</body></html>
+"""
+
+_HIDDEN_CHECKBOX_REVERTS_AND_CLONES_HTML = """
+<!doctype html><html><body>
+  <label for="agree" style="display:inline-block;width:200px;height:24px">I agree</label>
+  <input id="agree" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+  <script>
+    document.getElementById('agree').addEventListener('change', e => {
+      e.target.checked = false;
+      e.target.insertAdjacentHTML('afterend', '<input id="agree" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">');
+    });
   </script>
 </body></html>
 """
@@ -6142,6 +7033,32 @@ async def test_select_option_on_hidden_native_select_fails_loud_when_change_does
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_select_option_that_reverts_and_re_resolves_ambiguously_still_fails_loud() -> None:
+    # The native select positively reads back unselected, so the did-not-commit error (which halts the
+    # rest of a batched turn) must survive the selector now matching two elements.
+    async with _content_page(_HIDDEN_SELECT_REVERTS_AND_CLONES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
+        assert await page.locator("#country").count() == 2, "fixture is not armed"
+        assert r.status == "error", r.content
+        assert "did NOT commit" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_that_commits_but_re_resolves_ambiguously_is_unverified() -> None:
+    # INV-1 downgrades only the confident answer: the value committed, but it was read off one of two
+    # matches, so the result is ok-unverified with a re-observe cue rather than a confident "selected".
+    async with _content_page(_HIDDEN_SELECT_COMMITS_AND_CLONES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
+        assert await page.locator("#country").count() == 2, "fixture is not armed"
+        assert r.status == "ok", r.content
+        assert "re-resolved to 2 elements" in r.content and "re-observe" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_typing_into_a_component_control_does_not_claim_a_check_we_could_not_run() -> None:
     # The typeahead reaction probes are document-only, so on a control inside a component they see
     # no suggestion list — which is not evidence there was none. Reporting a bare "typed into X"
@@ -6288,6 +7205,17 @@ async def test_click_on_skinned_checkbox_fails_loud_when_toggle_does_not_commit(
         assert "did NOT commit" in r.content
 
 
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_skinned_checkbox_that_reverts_and_re_resolves_ambiguously_still_fails_loud() -> None:
+    async with _content_page(_HIDDEN_CHECKBOX_REVERTS_AND_CLONES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#agree"})
+        assert await page.locator("#agree").count() == 2, "fixture is not armed"
+        assert r.status == "error", r.content
+        assert "did NOT commit" in r.content, r.content
+
+
 _HIDDEN_NATIVE_EDGES_HTML = """
 <!doctype html><html><body>
   <label for="state">State</label>
@@ -6387,6 +7315,428 @@ async def test_a_widget_that_unmounts_its_own_input_is_not_called_a_component() 
         assert await page.evaluate("() => !document.getElementById('city')"), "fixture did not unmount"
         assert "inside a component" not in r.content, r.content
         assert r.status == "error" and "NOT filled" in r.content, r
+
+
+# --- SKY-14741: no-match error enrichment for drilldown/category typeaheads (RED-first). The rows a
+# leaf is nested under (aria-haspopup + hidden nested children, like a real drilldown menu) are
+# structurally present but never visible-match by text, so the finder correctly returns nothing --
+# today that dead end reports the bare "no autocomplete suggestion matched" string with no hint the
+# visible rows are expandable categories. ---
+
+_TYPEAHEAD_DRILLDOWN_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="reason" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('reason');
+    var CATEGORIES = [
+      { label: 'Employment', kids: ['Current employee', 'Former employee'] },
+      { label: 'Referral', kids: ['Friend', 'Colleague'] }
+    ];
+    inp.addEventListener('input', function () {
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      CATEGORIES.forEach(function (cat) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-haspopup', 'true');
+        row.setAttribute('style', 'height:26px;display:block');
+        row.textContent = cat.label;
+        cat.kids.forEach(function (k) {
+          var kid = document.createElement('div');
+          kid.setAttribute('role', 'option');
+          kid.textContent = k;
+          // Hidden until the category row is expanded by clicking it, like a real drilldown menu --
+          // present in the DOM for a classifier to see, invisible to the finder's own geometry scan.
+          kid.setAttribute('style', 'display:none');
+          row.appendChild(kid);
+        });
+        dd.appendChild(row);
+      });
+      document.body.appendChild(dd);
+    });
+  </script>
+</body></html>
+"""
+
+
+def _reacting_leaf_list_html(field_id: str, options: list[str]) -> str:
+    # Shared by the no-regression / classifier-precision guards below: a plain typeahead whose
+    # reacting dropdown holds only ordinary leaf rows (role=option, no aria-haspopup, no nested
+    # children) -- never expandable, so the no-match error must stay in its current bare form.
+    opts_js = ", ".join(json.dumps(o) for o in options)
+    return f"""
+<!doctype html><html><body style="margin:0">
+  <input id="{field_id}" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('{field_id}');
+    var OPTIONS = [{opts_js}];
+    inp.addEventListener('input', function () {{
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      OPTIONS.forEach(function (t) {{
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('style', 'height:26px;display:block');
+        row.textContent = t;
+        dd.appendChild(row);
+      }});
+      document.body.appendChild(dd);
+    }});
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_no_match_enumerates_expandable_categories() -> None:
+    # RED (SKY-14741): "Current employee" exists only inside the hidden, expandable "Employment"
+    # category (aria-haspopup=true + >=2 nested child rows) -- the finder correctly never matches it
+    # by text, so today's bare "no autocomplete suggestion matched" error gives the model no hint the
+    # visible rows are expandable and it blind-clicks until the run dies at budget. This must
+    # eventually enumerate the category rows as clickable [data-tv3-menu="N"] targets.
+    async with _live_page(_TYPEAHEAD_DRILLDOWN_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#reason", "value": "Current employee"})
+        assert r.status == "error", r.content
+        assert "Employment" in r.content, r.content
+        assert "Referral" in r.content, r.content
+        assert "data-tv3-menu" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_flat_no_match_error_is_byte_identical_no_regression_guard() -> None:
+    # NO-REGRESSION GUARD, not a RED test -- passes today and must keep passing once the drilldown
+    # enrichment lands: a flat list with zero expandable rows must keep the CURRENT bare no-match
+    # string byte-for-byte (no category enumeration, no data-tv3-menu).
+    async with _live_page(_reacting_leaf_list_html("city", ["Lisbon", "Porto"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield"})
+        assert r.status == "error", r.content
+        assert r.content == (
+            "no autocomplete suggestion matched 'Springfield' for #city; the field is NOT filled "
+            "— do not assume success or move on as if it were"
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_no_match_never_reports_genuine_leaves_as_categories() -> None:
+    # Classifier-precision guard (CP hardening point 1): rows with no aria-haspopup and no nested
+    # children are genuine leaves. A no-match error must never mistag one as an expandable category.
+    async with _live_page(_reacting_leaf_list_html("dept", ["Engineering", "Marketing", "Sales"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#dept", "value": "Legal"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+        assert r.content == (
+            "no autocomplete suggestion matched 'Legal' for #dept; the field is NOT filled "
+            "— do not assume success or move on as if it were"
+        )
+
+
+_GROUPED_LISTBOX_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="fruit" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('fruit');
+    inp.addEventListener('input', function () {
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('role', 'listbox');
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      // A canonical ARIA grouped listbox: role=group is a static section label wrapping already-visible
+      // option leaves, NOT an expandable drilldown. It carries no aria-haspopup/aria-expanded.
+      var grp = document.createElement('div');
+      grp.setAttribute('role', 'group');
+      grp.setAttribute('aria-label', 'Citrus');
+      grp.setAttribute('style', 'display:block');
+      ['Orange', 'Lemon'].forEach(function (t) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('style', 'height:22px;display:block');
+        row.textContent = t;
+        grp.appendChild(row);
+      });
+      dd.appendChild(grp);
+      document.body.appendChild(dd);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_grouped_listbox_is_not_reported_as_a_drilldown_category() -> None:
+    # Classifier-precision guard (CP hardening point 1, false-expandable direction): a role=group
+    # wrapping already-visible option leaves is a section label, not an expandable category. Tagging it
+    # would tell the model to "click to expand" a wrapper that commits nothing -- a dead click on a
+    # confident wrong instruction. RED against the classifier's first cut, which qualified any row with
+    # >=2 nested option descendants regardless of role.
+    async with _live_page(_GROUPED_LISTBOX_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#fruit", "value": "Cherry"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+        assert r.content == (
+            "no autocomplete suggestion matched 'Cherry' for #fruit; the field is NOT filled "
+            "— do not assume success or move on as if it were"
+        )
+
+
+_FILTER_TO_ZERO_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="city" role="combobox" aria-autocomplete="list" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('city');
+    var OPTIONS = ['Lisbon', 'Porto', 'Braga'];
+    // A genuinely FILTERING typeahead: an absent value narrows the list to zero option rows (renders a
+    // bare "No options" line, no role=option). Nothing new for _FIND_MENU_JS to count -- the only signal
+    // that this is searchable is aria-autocomplete=list.
+    inp.addEventListener('input', function () {
+      var old = document.getElementById('dd'); if (old) old.remove();
+      if (!inp.value) return;
+      var m = OPTIONS.filter(function (o) { return o.toLowerCase().indexOf(inp.value.toLowerCase()) >= 0; });
+      var dd = document.createElement('div'); dd.id = 'dd'; dd.setAttribute('role', 'listbox');
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      if (m.length === 0) {
+        var e = document.createElement('div'); e.textContent = 'No options';
+        e.setAttribute('style', 'height:26px'); dd.appendChild(e);
+      } else {
+        m.forEach(function (t) {
+          var row = document.createElement('div'); row.setAttribute('role', 'option');
+          row.setAttribute('style', 'height:26px'); row.textContent = t; dd.appendChild(row);
+        });
+      }
+      document.body.appendChild(dd);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_searchable_filter_to_zero_reads_plain_no_match() -> None:
+    # A searchable combobox (aria-autocomplete=list) that filters to ZERO rows on an absent value leaves
+    # no new rows for the reaction probe to count -- but it is still a genuine no-match, NOT a
+    # non-searchable click-to-open to reopen. The ARIA contract is the fallback signal: report the plain
+    # no-match rather than falling through to open->observe->pick.
+    async with _live_page(_FILTER_TO_ZERO_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+        assert r.content == (
+            "no autocomplete suggestion matched 'Springfield' for #city; the field is NOT filled "
+            "— do not assume success or move on as if it were"
+        )
+
+
+def _reacting_special_row_html(field_id: str, row_attrs: str, label: str) -> str:
+    # A reacting dropdown with a single row carrying arbitrary attributes and no nested option
+    # children -- for probing whether a lone aria signal (expanded/disabled) should qualify it.
+    return f"""
+<!doctype html><html><body style="margin:0">
+  <input id="{field_id}" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('{field_id}');
+    inp.addEventListener('input', function () {{
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('role', 'listbox');
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      var row = document.createElement('div');
+      row.setAttribute('role', 'option');
+      {row_attrs}
+      row.setAttribute('style', 'height:26px;display:block');
+      row.textContent = {label!r};
+      dd.appendChild(row);
+      document.body.appendChild(dd);
+    }});
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_already_expanded_row_is_not_reported_as_a_category() -> None:
+    # Precision guard: aria-expanded="true" is already open -- clicking it would toggle it CLOSED, not
+    # reveal options. Only a collapsed row (aria-expanded="false") is a category worth clicking. RED
+    # against the classifier's first cut, which treated mere presence of aria-expanded as a signal.
+    html = _reacting_special_row_html("sec", "row.setAttribute('aria-expanded', 'true');", "Open section")
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#sec", "value": "Nonexistent"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_disabled_category_is_not_reported() -> None:
+    # Precision guard: a disabled row is a dead click even if it carries an expand affordance, so it
+    # must never be offered as a clickable category.
+    html = _reacting_special_row_html(
+        "svc", "row.setAttribute('aria-haspopup', 'true'); row.setAttribute('aria-disabled', 'true');", "Locked"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#svc", "value": "Nonexistent"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+
+
+_NAV_ROW_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <a role="menuitem" href="/products" aria-haspopup="true"
+     style="position:absolute;top:8px;left:40px;width:120px;height:20px">Products</a>
+  <input id="reason" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('reason');
+    inp.addEventListener('input', function () {
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('role', 'listbox');
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      ['Alpha', 'Beta'].forEach(function (t) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('style', 'height:22px;display:block');
+        row.textContent = t;
+        dd.appendChild(row);
+      });
+      document.body.appendChild(dd);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_navigational_row_is_not_reported_as_a_category() -> None:
+    # P0 precision guard: an <a href>/<button> row navigates away when clicked, destroying the
+    # partially filled form. It must never be offered as a category even with aria-haspopup, mirroring
+    # _FIND_SUGGESTION_JS's own nav exclusion.
+    async with _live_page(_NAV_ROW_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#reason", "value": "Gamma"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+        assert "Products" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_haspopup_but_already_expanded_row_is_not_reported() -> None:
+    # Precision guard: aria-haspopup + aria-expanded="true" is an already-open popup; a click collapses
+    # it. The haspopup arm must not override the already-open exclusion.
+    html = _reacting_special_row_html(
+        "svc", "row.setAttribute('aria-haspopup', 'true'); row.setAttribute('aria-expanded', 'true');", "Open"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#svc", "value": "Nonexistent"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_a_haspopup_only_category() -> None:
+    # Positive mutation-power for the aria-haspopup arm: a row qualifying on aria-haspopup ALONE (no
+    # nested children, no aria-expanded) must be reported. Deleting the hasPopup arm reds this.
+    html = _reacting_special_row_html("svc", "row.setAttribute('aria-haspopup', 'true');", "Benefits")
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#svc", "value": "Nonexistent"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" in r.content and "Benefits" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_a_collapsed_only_category() -> None:
+    # Positive mutation-power for the aria-expanded arm: a row qualifying on aria-expanded="false" ALONE
+    # (collapsed, no haspopup, no children) must be reported. Deleting the hasExpanded arm reds this.
+    html = _reacting_special_row_html("svc", "row.setAttribute('aria-expanded', 'false');", "Benefits")
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#svc", "value": "Nonexistent"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" in r.content and "Benefits" in r.content, r.content
+
+
+_NESTED_ONLY_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="reason" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('reason');
+    inp.addEventListener('input', function () {
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('role', 'listbox');
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      var row = document.createElement('div');
+      row.setAttribute('role', 'option');   // no aria-haspopup, no aria-expanded
+      row.setAttribute('style', 'height:26px;display:block');
+      row.appendChild(document.createTextNode('Benefits'));
+      ['Dental', 'Vision'].forEach(function (t) {
+        var kid = document.createElement('div');
+        kid.setAttribute('role', 'option');
+        kid.textContent = t;
+        kid.setAttribute('style', 'height:22px;display:none');
+        row.appendChild(kid);
+      });
+      dd.appendChild(row);
+      document.body.appendChild(dd);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_a_nested_children_only_category() -> None:
+    # Positive mutation-power for the nested-children arm: a role=option row with >=2 nested option
+    # children and NO aria signal must be reported. Deleting the childCount arm reds this.
+    async with _live_page(_NESTED_ONLY_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#reason", "value": "Nonexistent"})
+        assert r.status == "error", r.content
+        assert "data-tv3-menu" in r.content and "Benefits" in r.content, r.content
 
 
 @_skip_no_browser
@@ -7570,6 +8920,8 @@ async def test_observe_line_count_matches_its_header_across_hostile_attribute_va
             f'<div id="a7" role="button" aria-label="x{payload}" style="width:40px;height:20px">x</div>',
             f'<select id="a8"><option value="x{payload}">x{payload}</option></select>',
             f'<fieldset><legend>x{payload}</legend><input id="a9" type="checkbox"></fieldset>',
+            # A placeholder demoted to a hint by an associated label still reaches the rendered line.
+            f'<label for="a10">Named</label><input id="a10" placeholder="x{payload}">',
         ]
         async with _live_page("".join(hostile) + '<button id="real">Real</button>') as page:
             tools = build_browser_tools(_fixed_page_provider(page))
@@ -7873,12 +9225,16 @@ _SHARED_ID_DROPZONES_HTML = """
   <ds-drop id="dz-b"></ds-drop>
   <ds-drop class="anon"></ds-drop>
   <script>
+    // An immediate-upload form: attaching a file dispatches an upload request. Absolute URL so the
+    // request is dispatched (and observed) even though it fails against no server.
+    function upl() { fetch('https://api.example.test/upload', {method: 'POST', body: new FormData()}).catch(function () {}); }
     function mk(hostId, inputId, labelText) {
       var r = document.getElementById(hostId).attachShadow({mode: 'open'});
       r.innerHTML =
         '<label for="' + inputId + '" style="display:inline-block;width:240px;height:40px">' +
         labelText + '</label>' +
         '<input type="file" id="' + inputId + '" style="position:absolute;width:0;height:0;opacity:0">';
+      r.getElementById(inputId).addEventListener('change', upl);
     }
     mk('dz-single', 'resume-unique', 'Upload resume (only one)');
     mk('dz-a', 'resume', 'Upload resume');
@@ -10017,6 +11373,8 @@ async def test_file_upload_settles_and_delays_after_set_input_files(monkeypatch:
 
     async def rec_set_input_files(paths: Any) -> None:
         order.append("upload")
+        page.element._files = list(paths)
+        page._emit_request(_FakeRequest())  # immediate-upload form acknowledges the attach
 
     monkeypatch.setattr(page.element, "set_input_files", rec_set_input_files)
 
@@ -10039,6 +11397,400 @@ async def test_file_upload_settles_and_delays_after_set_input_files(monkeypatch:
 
     assert "uploaded 1 file" in r.content
     assert order == ["upload", "settle", "delay"]
+
+
+def _patch_upload_dwell(monkeypatch: pytest.MonkeyPatch, tools_module: Any) -> None:
+    async def _noop_settle(_page: Any) -> None:
+        return None
+
+    async def _noop_delay() -> None:
+        return None
+
+    monkeypatch.setattr(tools_module, "_settle_after_upload", _noop_settle)
+    monkeypatch.setattr(tools_module, "_upload_submit_delay", _noop_delay)
+
+
+def _patch_upload_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.forge.sdk.api.files as files_module
+
+    async def _fake(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return "/tmp/cv.pdf"
+
+    monkeypatch.setattr(files_module, "download_file", _fake)
+
+
+@pytest.mark.asyncio
+async def test_file_upload_no_upload_activity_returns_actionable_error_not_false_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The core fix: set_input_files can populate the control at the Playwright layer yet the site
+    # register nothing (post-navigation the change handler is not wired) — zero upload requests
+    # dispatched. file_upload must return a recoverable non-OK there, not a confident OK that makes the
+    # agent submit with no file. A submit-time-upload form lands here too as an accepted false-negative.
+    # RED against pre-fix code, which returned "uploaded 1 file" regardless of activity.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakePage()
+    page.element.emit_upload_on_set = False  # file lands in the input, but the site never reacts
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "no upload activity" in r.content
+    assert "uploaded 1 file" not in r.content
+    # The file was still attached at the Playwright layer, so the staged-download key must persist so
+    # the download-signal wrapper still suppresses the staged file.
+    assert (r.data or {}).get("staged_download") == "cv.pdf"
+    # The request listener must be removed after the call — no leaked/accumulating listeners.
+    assert page._request_listeners == []
+
+
+@pytest.mark.asyncio
+async def test_file_upload_confirms_when_upload_activity_observed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An immediate-upload form dispatches an upload request when the file is attached; file_upload then
+    # reports the confident OK and cleans up its listener.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakePage()  # default emit_upload_on_set=True → an upload request is dispatched
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "ok", r.content
+    assert "uploaded 1 file" in r.content
+    assert page._request_listeners == []
+
+
+@pytest.mark.asyncio
+async def test_file_upload_not_populated_returns_did_not_attach_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Layer 1 populate check: if set_input_files leaves the control holding no file (wrong element, a
+    # reset, or a detach mid-call), file_upload reports "did not attach" rather than a false OK.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakePage()
+    page.element.emit_upload_on_set = False
+
+    async def _empty_files(_js: str, _arg: Any = None) -> Any:
+        return 0
+
+    monkeypatch.setattr(page.element, "evaluate", _empty_files)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "did not attach" in r.content
+    assert page._request_listeners == []
+
+
+class _FakeDropzonePage(_FakePage):
+    """A page whose rendered text the test controls, so the filename-shown readback around
+    set_input_files sees a before/after difference (or not)."""
+
+    def __init__(self, text: str = "Upload your resume") -> None:
+        super().__init__()
+        self.text = text
+        self.text_reads = 0
+
+    async def evaluate(self, js: str, *args: Any) -> Any:
+        if "innerText" in js:
+            self.text_reads += 1
+            return self.text
+        return await super().evaluate(js)
+
+
+def _consume_and_clear(page: _FakeDropzonePage, *, upload: bool, show: bool) -> Any:
+    """Site JS for a consume-and-clear dropzone: read the file off the input, optionally dispatch the
+    upload, optionally render the filename, then reset the input so files.length reads 0."""
+
+    async def _set(paths: Any) -> None:
+        page.element._files = list(paths)
+        if upload:
+            page._emit_request(_FakeRequest(method="POST", resource_type="xhr"))
+        if show:
+            page.text = page.text + "\nAttached: cv.pdf  [remove]"
+        page.element._files = []
+
+    return _set
+
+
+@pytest.mark.asyncio
+async def test_file_upload_consume_and_clear_dropzone_with_upload_activity_is_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A consume-and-clear dropzone reads input.files on change, uploads the file, shows it, then resets
+    # the input so the same control can accept another drop. Layer 1 then reads files.length == 0 AFTER
+    # a genuine upload; the file's own name newly on the page proves the site took it — a success, not
+    # "did not attach". RED against pre-fix code, which errored on files.length == 0 unconditionally.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+    monkeypatch.setattr(page.element, "set_input_files", _consume_and_clear(page, upload=True, show=True))
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "ok", r.content
+    assert "uploaded 1 file" in r.content
+    assert "Attached: cv.pdf" in r.content  # the site's own words travel with the confirmation
+    assert (r.data or {}).get("staged_download") == "cv.pdf"
+    assert page._request_listeners == []
+
+
+@pytest.mark.asyncio
+async def test_file_upload_consume_and_clear_without_network_activity_is_recoverable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The input was cleared and the page names the file, but nothing was dispatched: a client-side
+    # rejection looks exactly like this (it names the file it refused and sends nothing), so this is
+    # not a confirmation. It is a recoverable error that carries the page's own words, never an OK.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+    monkeypatch.setattr(page.element, "set_input_files", _consume_and_clear(page, upload=False, show=True))
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "re-observe" in r.content
+    assert "Attached: cv.pdf" in r.content
+    assert "uploaded 1 file" not in r.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_rejection_banner_naming_the_file_is_not_a_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Server-side rejection: the file was dispatched, the site refused it and cleared the input, and the
+    # banner names the file. Upload activity plus the name newly shown would otherwise read as success;
+    # the rejection wording around the name vetoes that, in the safe direction only.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+
+    async def _upload_then_reject(paths: Any) -> None:
+        page.element._files = list(paths)
+        page._emit_request(_FakeRequest(method="POST", resource_type="xhr"))
+        page.text = page.text + "\nError: cv.pdf exceeds the 2MB size limit and was not uploaded."
+        page.element._files = []
+
+    monkeypatch.setattr(page.element, "set_input_files", _upload_then_reject)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "uploaded 1 file" not in r.content
+    assert "exceeds the 2MB size limit" in r.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_empty_input_with_ambient_post_only_still_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The hole the consume-and-clear branch must not open: a genuine no-op (the site never took the
+    # file) on a busy page whose ambient POST xhr traffic makes the activity probe read true. Nothing
+    # shows the file, so this stays a recoverable error — never a submit-without-file.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+
+    async def _no_op_with_ambient_post(paths: Any) -> None:
+        page._emit_request(_FakeRequest(method="POST", resource_type="xhr", url="https://api.example.test/beat"))
+
+    monkeypatch.setattr(page.element, "set_input_files", _no_op_with_ambient_post)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "did not attach" in r.content
+    assert page._request_listeners == []
+
+
+@pytest.mark.asyncio
+async def test_file_upload_empty_input_with_unrelated_text_containing_the_stem_still_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only the file's FULL name counts, as a whole token: a banner that lazy-loads during the settle
+    # window and happens to contain the stem ("test" in "test environment"), or a different file whose
+    # name contains this one ("oldtest.pdf", "old-test.pdf", "test.pdf.bak"), must not read as the site
+    # showing this file.
+    import skyvern.forge.sdk.api.files as files_module
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+
+    async def _no_op_then_unrelated_text(paths: Any) -> None:
+        page.text = page.text + (
+            "\nThis is a test environment banner. Previously attached: oldtest.pdf, old-test.pdf, test.pdf.bak"
+        )
+
+    async def _stage_test_pdf(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return "/tmp/test.pdf"
+
+    monkeypatch.setattr(page.element, "set_input_files", _no_op_then_unrelated_text)
+    monkeypatch.setattr(files_module, "download_file", _stage_test_pdf)
+    _patch_upload_dwell(monkeypatch, tools_module)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "test.pdf"})
+
+    assert r.status == "error", r.content
+    assert "did not attach" in r.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_empty_input_with_preexisting_filename_mention_still_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Diff guard: the page already said "cv.pdf" before the attach (a prior attempt, or instructions
+    # naming the expected file). Present-after alone is not evidence; only absent-before AND present-after is.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage(text="Please upload cv.pdf")
+    monkeypatch.setattr(page.element, "set_input_files", _consume_and_clear(page, upload=True, show=False))
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "did not attach" in r.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_empty_input_with_unreadable_page_text_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A DOM read failure on this branch must fall to the recoverable error, never to a new OK: the OK
+    # here is what lets the model submit, so it needs positive evidence.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+
+    async def _raise(js: str, *args: Any) -> Any:
+        if "innerText" in js:
+            raise RuntimeError("execution context destroyed")
+        return await _FakePage.evaluate(page, js)
+
+    monkeypatch.setattr(page, "evaluate", _raise)
+    monkeypatch.setattr(page.element, "set_input_files", _consume_and_clear(page, upload=True, show=True))
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "did not attach" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_page_shows_filename_reads_rendered_text_only_across_shadow_roots() -> None:
+    # The readback must see the filename a dropzone renders inside a shadow root, and must NOT see it in
+    # hidden nodes, <script> or <style> text (document level or inside a shadow root): a config blob that
+    # mentions the name is not the site showing the file. Real Chromium, since innerText semantics are
+    # exactly what is under test.
+    from skyvern.forge.taskv3.tools import _mentions_filename, _page_rendered_text  # noqa: PLC0415
+
+    html = (
+        "<div id=host></div><div style='display:none'>hidden-cv.pdf</div>"
+        '<script type=\'application/json\'>{"f":"cv.pdf"}</script>'
+        "<script>const h = document.getElementById('host').attachShadow({mode:'open'});"
+        "h.innerHTML = \"<style>.a{content:'cv.pdf'}</style><span id=chip hidden>cv.pdf</span>\";</script>"
+    )
+    async with _content_page(html) as page:
+        assert not _mentions_filename(await _page_rendered_text(page) or "", "/tmp/cv.pdf")
+        await page.evaluate(
+            "() => { document.getElementById('host').shadowRoot.getElementById('chip').hidden = false; }"
+        )
+        assert _mentions_filename(await _page_rendered_text(page) or "", "/tmp/cv.pdf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rendered",
+    [
+        # A benign chip first, the rejection naming the file again elsewhere: every mention counts.
+        "Selected file: cv.pdf\n" + "x" * 300 + "\nError: cv.pdf could not be uploaded due to size limits.",
+        # The rejection sits well past any fixed window around the name.
+        "cv.pdf " + "please keep files under the size limit shown in the sidebar. " * 3 + "error uploading, retry",
+        # Hedged phrasing with words between "not" and the verb.
+        "cv.pdf will not be uploaded, please try again later",
+        # Contractions and plain refusal verbs.
+        "Sorry, we can't accept cv.pdf right now.",
+        "cv.pdf was denied by the virus scanner",
+        "Upload of cv.pdf unsuccessful — please try uploading again",
+        "cv.pdf: we don't support this file type",
+        "Something went wrong with cv.pdf",
+        "cv.pdf is too\n large for this form",
+    ],
+)
+async def test_file_upload_rejection_anywhere_in_newly_rendered_text_vetoes(
+    monkeypatch: pytest.MonkeyPatch, rendered: str
+) -> None:
+    # The veto reads everything the site newly rendered, not a window around the first mention.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakeDropzonePage()
+
+    async def _upload_then_reject(paths: Any) -> None:
+        page.element._files = list(paths)
+        page._emit_request(_FakeRequest(method="POST", resource_type="xhr"))
+        page.text = page.text + "\n" + rendered
+        page.element._files = []
+
+    monkeypatch.setattr(page.element, "set_input_files", _upload_then_reject)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "uploaded 1 file" not in r.content
+    assert "cv.pdf" in r.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_ignores_non_upload_network_noise(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The activity probe must DISCRIMINATE: unrelated background traffic (a GET, an analytics image
+    # beacon) is not an upload. A page firing only such noise during the upload window is still a
+    # no-activity case, so the check does not false-confirm on ambient traffic.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    page = _FakePage()
+
+    async def _set_with_noise(paths: Any) -> None:
+        page.element._files = list(paths)
+        page._emit_request(_FakeRequest(method="GET", resource_type="image", url="https://cdn.test/ping.gif"))
+        page._emit_request(_FakeRequest(method="POST", resource_type="ping", url="https://cdn.test/beacon"))
+
+    monkeypatch.setattr(page.element, "set_input_files", _set_with_noise)
+    _patch_upload_dwell(monkeypatch, tools_module)
+    _patch_upload_download(monkeypatch)
+
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "resume.pdf"})
+
+    assert r.status == "error", r.content
+    assert "no upload activity" in r.content
+    assert page._request_listeners == []
 
 
 @pytest.mark.asyncio
@@ -10149,6 +11901,87 @@ def _refs_for(*urls: str) -> Any:
 
 
 @pytest.mark.asyncio
+async def test_navigate_derives_a_ref_only_for_a_redirect_reached_through_a_payload_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    landing = "https://cdn.example.test/blob/resume.pdf?X-Amz-Signature=0123456789abcdef0123456789abcdef"
+
+    class _RedirectingPage(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+            await super().goto(url, timeout, wait_until)
+            self.url = landing
+
+    refs = _refs_for(_SIGNED_REF_URL)
+    token = next(iter(refs.refs))
+    tools = build_browser_tools(
+        _fixed_page_provider(_RedirectingPage()), resolve_typed_text=refs.chain(None), opaque_refs=refs
+    )
+    r = await _tool(tools, "navigate").handler({"url": token})
+    assert landing in refs.refs.values() and refs.mask(r.content).startswith("navigated to opaque_url_")
+
+    # A failed navigation reports its cause, but every URL Playwright names in it came from following the
+    # ref, so they are shown as the token; and a non-http landing (an error page) derives nothing.
+    class _FailingPage(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+            raise RuntimeError(f"page.goto: net::ERR_NAME_NOT_RESOLVED at {landing}")
+
+    refs = _refs_for(_SIGNED_REF_URL)
+    tools = build_browser_tools(
+        _fixed_page_provider(_FailingPage()), resolve_typed_text=refs.chain(None), opaque_refs=refs
+    )
+    r = await _tool(tools, "navigate").handler({"url": token})
+    assert (
+        r.status == "error" and "X-Amz" not in r.content and token in r.content and "ERR_NAME_NOT_RESOLVED" in r.content
+    )
+    assert landing not in refs.refs.values()
+    # The request text is model-supplied: it must never act as a replacement pattern.
+    r = await _tool(tools, "navigate").handler({"url": token + "\\g<0>"})
+    assert r.status == "error" and "X-Amz" not in r.content
+
+    class _ErrorPage(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+            self.url = "chrome-error://chromewebdata/"
+
+    refs = _refs_for(_SIGNED_REF_URL)
+    tools = build_browser_tools(
+        _fixed_page_provider(_ErrorPage()), resolve_typed_text=refs.chain(None), opaque_refs=refs
+    )
+    r = await _tool(tools, "navigate").handler({"url": token})
+    assert r.content == "navigated to chrome-error://chromewebdata/" and len(refs.refs) == 1
+    # A credential placeholder is substituted too, but it is not payload provenance: a redirect reached
+    # through one derives nothing, and its navigation failure is reported as raised.
+    refs = _refs_for(_SIGNED_REF_URL)
+    tools = build_browser_tools(
+        _fixed_page_provider(_RedirectingPage()),
+        resolve_typed_text=refs.chain(
+            lambda t: "https://portal.example.test/login?sso=1" if t == "placeholder_sso" else t
+        ),
+        opaque_refs=refs,
+    )
+    r = await _tool(tools, "navigate").handler({"url": "placeholder_sso"})
+    assert landing not in refs.refs.values() and r.content == f"navigated to {landing}"
+    with pytest.raises(RuntimeError):
+        tools = build_browser_tools(
+            _fixed_page_provider(_FailingPage()),
+            resolve_typed_text=refs.chain(
+                lambda t: "https://portal.example.test/login?sso=1" if t == "placeholder_sso" else t
+            ),
+            opaque_refs=refs,
+        )
+        await _tool(tools, "navigate").handler({"url": "placeholder_sso"})
+    # A model-chosen live URL that happens to redirect to a signed page has no payload provenance.
+    refs = _refs_for(_SIGNED_REF_URL)
+    tools = build_browser_tools(
+        _fixed_page_provider(_RedirectingPage()), resolve_typed_text=refs.chain(None), opaque_refs=refs
+    )
+    r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/apply"})
+    assert landing not in refs.refs.values() and refs.mask(r.content) == f"navigated to {landing}"
+
+
+@pytest.mark.asyncio
 async def test_observe_masks_payload_ref_page_url() -> None:
     page = _FakePage()
     page.url = _SIGNED_REF_URL
@@ -10197,40 +12030,11 @@ async def test_get_html_leaves_inline_signing_shaped_benign_url_unmasked() -> No
     assert "opaque_url_" not in result.content
 
 
-async def _run_file_upload_with_failing_download(source: str, opaque_refs: Any, error_url: str) -> Any:
-    page = _FakePage()
-    tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=opaque_refs)
-    import skyvern.forge.sdk.api.files as files_module
-
-    async def failing_download_file(
-        source: str, output_dir: str | None = None, organization_id: str | None = None
-    ) -> str:
-        raise Exception(f"Failed to download managed storage file: {error_url}")
-
-    original = files_module.download_file
-    files_module.download_file = failing_download_file  # type: ignore[assignment]
-    try:
-        return await _tool(tools, "file_upload").handler({"selector": "#cv", "file": source})
-    finally:
-        files_module.download_file = original
-
-
-@pytest.mark.asyncio
-async def test_file_upload_masks_payload_ref_in_download_error() -> None:
-    result = await _run_file_upload_with_failing_download(_SIGNED_REF_URL, _refs_for(_SIGNED_REF_URL), _SIGNED_REF_URL)
-    assert result.status == "error"
-    assert _SIGNED_REF_ARTIFACT not in result.content
-    assert "opaque_url_" in result.content
-
-
-@pytest.mark.asyncio
-async def test_file_upload_leaves_signing_shaped_benign_url_in_download_error_unmasked() -> None:
-    result = await _run_file_upload_with_failing_download(
-        _FP_SIGNED_SHAPED_URL, _refs_for(_SIGNED_REF_URL), _FP_SIGNED_SHAPED_URL
-    )
-    assert result.status == "error"
-    assert _FP_SIGNED_SHAPED_URL in result.content
-    assert "opaque_url_" not in result.content
+# file_upload no longer masks its own download-error: it propagates the exception to the loop's
+# generic tool_error, which the single model-facing boundary (hide_from_model) masks by membership.
+# That path — a raising handler's tool_error masked to its token, and a benign signing-shaped URL
+# left intact — is covered at the loop entry point by
+# test_taskv3_loop.test_payload_signed_urls_are_masked_to_their_token_across_every_tool_result_surface.
 
 
 @pytest.mark.asyncio
@@ -10293,3 +12097,350 @@ async def test_observe_leaves_benign_page_text_unmasked() -> None:
     result = await _tool(tools, "observe").handler({})
     assert _FP_SIGNED_SHAPED_URL in result.content
     assert "opaque_url_" not in result.content
+
+
+# Selector-robustness guard (SKY-14600): a model-emitted invalid bare `#<id>` (digit/UUID-leading) is
+# normalized to the equivalent, always-valid `[id="..."]` form; any residual unparseable selector becomes
+# an actionable single-tool error instead of a naked patchright crash that aborts the whole batched turn.
+# Real patchright/playwright messages, captured verbatim from a headless-chromium probe. These are
+# LIBRARY-INTERNAL strings and are version-coupled: the classifier matches on them by design (the
+# exception class differs between patchright and playwright, the wording does not). RED-proofed here so
+# a library upgrade that rewords them breaks THIS test loudly instead of silently disarming the guard.
+_PW_INVALID_ID_MSG = (
+    "Page.query_selector: SyntaxError: Failed to execute 'querySelectorAll' on 'Document': "
+    "'#3c421ef6-1234-5678-9abc-def012345678' is not a valid selector."
+)
+_PW_PARSE_MSG = 'Page.click: Unexpected token "" while parsing selector "div["'
+
+
+@pytest.mark.parametrize(
+    "selector,expected",
+    [
+        # Invalid-as-bare ids (leading digit / hyphen-digit / lone hyphen) -> rewritten to [id="..."].
+        ("#3c421ef6-1234-5678-9abc-def012345678", '[id="3c421ef6-1234-5678-9abc-def012345678"]'),
+        ("#9", '[id="9"]'),
+        ("#-9x", '[id="-9x"]'),
+        ("#-", '[id="-"]'),
+        # Valid selectors -> returned byte-identical.
+        ("#normalid", "#normalid"),
+        ("#--9x", "#--9x"),  # double-hyphen leading is VALID CSS (probe: resolves, no raise)
+        ("#a3c", "#a3c"),  # digit present but not leading
+        ("#_x", "#_x"),
+        ("#foo .bar", "#foo .bar"),
+        ("#foo.bar", "#foo.bar"),
+        ("#foo:hover", "#foo:hover"),
+        (".cls", ".cls"),
+        ("input", "input"),
+        ('[id="x"]', '[id="x"]'),
+        ('[data-tv3-act="3"]', '[data-tv3-act="3"]'),
+    ],
+)
+def test_normalize_selector_table(selector: str, expected: str) -> None:
+    assert _normalize_selector(selector) == expected
+
+
+def test_normalize_selector_never_alters_valid_selectors() -> None:
+    # The passthrough property IS the safety case: a selector that already parses must come out
+    # byte-identical, so normalization can never change WHICH element an action targets.
+    valid = [
+        "#normalid",
+        "#--9x",
+        "#a3c",
+        "#_x",
+        "#x-9",
+        "#café",  # non-ASCII identifier-start is valid
+        "#foo .bar",
+        "#foo.bar",
+        "#foo:hover",
+        "#foo[disabled]",
+        "#a\\31 b",  # a correctly digit-escaped id is already valid
+        ".cls",
+        ".a.b.c",
+        "div",
+        "*",
+        "input[type=file]",
+        '[id="9lead"]',
+        '[name="first name"]',
+        '[data-tv3="k1"]',
+        '[data-tv3-menu="2"]',
+        "#form #field",
+        "button.primary",
+        "ul > li:first-child",
+        "a[href^='https']",
+    ]
+    for s in valid:
+        assert _normalize_selector(s) == s, f"normalization altered a valid selector: {s!r}"
+
+
+def test_normalize_selector_leaves_unsafe_or_unquotable_ids_untouched() -> None:
+    # An id carrying a quote, backslash, whitespace, or a combinator/pseudo char must NEVER be wrapped
+    # into [id="..."] (it would malform or change the selector). The regex excludes them, so each of
+    # these passes through unchanged rather than being rewritten.
+    for s in ['#a"b', "#a'b", "#a\\5c", "#a\\ b", "#a b", "#a[b", "#a>b", "#a:b", "#a.b", "#a,b"]:
+        out = _normalize_selector(s)
+        assert out == s, f"unsafe id was rewritten: {s!r} -> {out!r}"
+        assert not (out.startswith('[id="') and out != s)
+
+
+def test_invalid_selector_result_matches_real_playwright_messages() -> None:
+    for msg in (_PW_INVALID_ID_MSG, _PW_PARSE_MSG):
+        r = _invalid_selector_result("#3c", _PlaywrightError(msg))
+        assert r is not None
+        assert r.status == "error"
+        assert "valid CSS selector" in r.content
+
+
+def test_invalid_selector_result_ignores_non_selector_errors() -> None:
+    # Narrow match: timeouts, teardown, and other failures must be RE-RAISED (return None), not
+    # swallowed as an actionable selector error.
+    for msg in (
+        "Page.click: Timeout 30000ms exceeded.",
+        "Target page, context or browser has been closed",
+        "net::ERR_CONNECTION_REFUSED",
+    ):
+        assert _invalid_selector_result("#3c", _PlaywrightError(msg)) is None
+
+
+class _RaisingQueryPage(_FakePage):
+    """Mirrors production: query_selector raises the real invalid-selector Error for any selector that
+    isn't a valid attribute form; a `[id=...]`/`[name=...]` selector resolves normally."""
+
+    async def query_selector(self, selector: str) -> Any:
+        self.calls.append(("query_selector", {"selector": selector}))
+        if not selector.startswith("["):
+            raise _PlaywrightError(_PW_INVALID_ID_MSG)
+        return self.element
+
+
+def _patch_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.forge.sdk.api.files as files_module
+
+    async def _fake(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        return "/tmp/downloaded.pdf"
+
+    monkeypatch.setattr(files_module, "download_file", _fake)
+
+
+@pytest.mark.asyncio
+async def test_file_upload_unparseable_selector_returns_actionable_error_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A malformed, NON-normalizable selector must become an actionable single-tool error, not a naked
+    # patchright raise that aborts the batch. RED when the guard's except is reverted (handler raises).
+    _patch_download(monkeypatch)
+    page = _RaisingQueryPage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    result = await _tool(tools, "file_upload").handler({"selector": "div[", "file": "/tmp/cv.pdf"})
+    assert result.status == "error"
+    assert "valid CSS selector" in result.content
+
+
+@pytest.mark.asyncio
+async def test_file_upload_invalid_selector_does_not_stage_phantom_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # With downloads_dir active, an invalid selector must fail BEFORE the source is fetched, so nothing
+    # is staged for the download-signal wrapper to misread as a browser download (which sets
+    # download_notice and can wrongly complete a complete-on-download run). RED if the download precedes
+    # selector resolution: the staged upload lands in downloads_dir and the guard's error omits it.
+    import skyvern.forge.sdk.api.files as files_module
+
+    called = {"n": 0}
+
+    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        called["n"] += 1
+        staged = Path(output_dir or str(tmp_path)) / "staged_resume.pdf"
+        staged.write_bytes(b"resume bytes")
+        return str(staged)
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+    page = _RaisingQueryPage()
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path))
+    result = await _tool(tools, "file_upload").handler({"selector": "div[", "file": "https://example.test/cv.pdf"})
+
+    assert result.status == "error"
+    assert "valid CSS selector" in result.content
+    assert called["n"] == 0
+    assert not (result.data or {}).get("download_notice")
+
+
+@pytest.mark.asyncio
+async def test_file_upload_normalizes_digit_leading_id_into_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The dominant crash shape (digit/UUID-leading `#id`) is normalized to `[id="..."]` BEFORE the
+    # naked query_selector, turning a batch-aborting crash into a successful upload. RED without
+    # normalization (the bare `#3c...` would raise, yielding an error instead of ok).
+    _patch_download(monkeypatch)
+    page = _RaisingQueryPage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    result = await _tool(tools, "file_upload").handler(
+        {"selector": "#3c421ef6-1234-5678-9abc-def012345678", "file": "/tmp/cv.pdf"}
+    )
+    assert result.status == "ok"
+    assert ("set_input_files", ["/tmp/downloaded.pdf"]) in page.element.calls
+    assert ("query_selector", {"selector": '[id="3c421ef6-1234-5678-9abc-def012345678"]'}) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_click_normalizes_model_supplied_invalid_bare_id() -> None:
+    # Nesting: for an act_by_mark tool with a MODEL-SUPPLIED selector (no mark), the guard normalizes
+    # the selector the handler actually acts on — page.click receives the [id="..."] form, not `#3c...`.
+    page = _FakePage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    await _tool(tools, "click").handler({"selector": "#3c421ef6-1234-5678-9abc-def012345678"})
+    assert ("click", {"selector": '[id="3c421ef6-1234-5678-9abc-def012345678"]'}) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_click_leaves_valid_selector_untouched_through_the_stack() -> None:
+    # Guard must not interfere with a valid selector anywhere in the act_by_mark/preflight stack.
+    page = _FakePage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    await _tool(tools, "click").handler({"selector": "#normalid"})
+    assert ("click", {"selector": "#normalid"}) in page.calls
+
+
+_LABELED_INPUT_WITH_FORMAT_PLACEHOLDER_HTML = """
+<!doctype html><html><body><form>
+  <label for="start">Date Available *</label>
+  <input id="start" type="text" placeholder="dd/mm/yyyy">
+  <label for="first">First Name *</label>
+  <input id="first" type="text">
+</form></body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_names_a_field_by_its_label_not_its_placeholder() -> None:
+    # A design system that marks required-ness only with a `*` inside the <label> gave the model
+    # 'dd/mm/yyyy' for a required date field: the placeholder outranked the associated label, so
+    # the one field the label named as required was the one field with no visible required signal.
+    async with _content_page(_LABELED_INPUT_WITH_FORMAT_PLACEHOLDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+    line = next(ln for ln in r.content.splitlines() if ln.startswith("[#start]"))
+    assert "Date Available *" in line
+    assert "dd/mm/yyyy" in line  # the format hint is what makes the value typeable
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_look_legend_names_a_field_by_its_label_not_its_placeholder() -> None:
+    # Same weakness as observe's, on the act-by-mark path: the legend took the placeholder over the
+    # associated <label>, so the required marker the label carried never reached the model.
+    async with _content_page(_LABELED_INPUT_WITH_FORMAT_PLACEHOLDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "look").handler({})
+    line = next(ln for ln in r.content.splitlines() if ln.startswith("[1] "))
+    assert "Date Available *" in line
+    assert "dd/mm/yyyy" in line  # the format hint is what makes the value typeable
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_look_legend_masks_a_minted_url_carried_by_a_placeholder() -> None:
+    # The hint is capped for display like the label; masking is by provenance over the WHOLE URL, so
+    # the cap must come after it or the legend prints a signed fragment the masker can no longer see.
+    html = f'<form><label for="doc">Résumé link</label><input id="doc" placeholder="{_SIGNED_REF_URL}"></form>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_SIGNED_REF_URL))
+        r = await _tool(tools, "look").handler({})
+    assert _SIGNED_REF_ARTIFACT not in r.content
+    assert "opaque_url_" in r.content
+
+
+# A payload URL long enough to hit observe's per-field display caps (label 140, value 100,
+# placeholder 60). Masking is by provenance over the WHOLE URL, so a cap applied before the masker
+# runs leaves a truncated URL the masker cannot recognise -- and the signing tail with it.
+_LONG_SIGNED_REF_URL = (
+    "https://files.example.test/uploads/a1b2c3d4/resume.pdf"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260827%2Fus-east-1%2Fs3%2Faws4_request"
+    "&X-Amz-Date=20260827T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host"
+    "&X-Amz-Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+_LONG_SIGNED_REF_ARTIFACT = "X-Amz-Credential=AKIAEXAMPLE"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "carrier",
+    [
+        "value",
+        "placeholder",
+        "label",
+        "group",
+        "invalid",
+        "spinbutton",
+        "slotted",
+        "prefixed",
+        "huge",
+        "alert",
+        "alert_prefixed_huge",
+        "canonical",
+        "escaped",
+    ],
+)
+async def test_observe_masks_a_minted_url_longer_than_its_display_caps(carrier: str) -> None:
+    assert len(_LONG_SIGNED_REF_URL) > 200
+    url = _LONG_SIGNED_REF_URL
+    if carrier == "group":
+        # Group text is the description of a field named by nothing; capped at 200 for display.
+        html = f'<form><p id="hint">Upload at {_LONG_SIGNED_REF_URL}</p><input id="doc" aria-describedby="hint"></form>'
+    elif carrier == "invalid":
+        # A custom validity message echoes whatever the page put in it, at a 140 display cap.
+        html = (
+            '<form><input id="doc" value="x">'
+            f"<script>document.getElementById('doc').setCustomValidity('Not {_LONG_SIGNED_REF_URL}')</script></form>"
+        )
+    elif carrier == "spinbutton":
+        # A widget spinbutton reports its value through aria-valuenow, not .value.
+        html = f'<div role="spinbutton" tabindex="0" aria-valuenow="{_LONG_SIGNED_REF_URL}">42</div>'
+    elif carrier == "slotted":
+        # A single-control component is captioned by its host's light-DOM text.
+        html = (
+            f"<x-field>{_LONG_SIGNED_REF_URL}</x-field><script>customElements.define('x-field', class extends "
+            "HTMLElement { connectedCallback() { const r = this.attachShadow({mode: 'open'}); "
+            "r.innerHTML = '<slot></slot><input id=\"doc\">'; } })</script>"
+        )
+    elif carrier == "prefixed":
+        # A URL just under the retained width, behind a short visible prefix: the carrier as a whole
+        # exceeds a fixed retain cap even though the URL alone does not.
+        url = _LONG_SIGNED_REF_URL + "&X-Amz-Policy=" + "p" * (1990 - len(_LONG_SIGNED_REF_URL))
+        html = f'<form><input id="doc" value="Download: {url}"></form>'
+    elif carrier == "huge":
+        # A URL longer than any fixed retain cap.
+        url = _LONG_SIGNED_REF_URL + "&X-Amz-Policy=" + "p" * 2400
+        html = f'<form><input id="doc" value="{url}"></form>'
+    elif carrier == "alert":
+        # The page-text digest: a status message that echoes the URL, longer than its 300 display cap.
+        html = f'<div role="alert">Saved your document to {_LONG_SIGNED_REF_URL} for review</div><input id="doc">'
+    elif carrier == "canonical":
+        # The browser echoes a payload URL in canonical form: each non-ASCII char becomes a 12-char
+        # percent-escape, so the echoed text is far longer than the URL the width was sized from.
+        from skyvern.forge.sdk.core.skyvern_context import canonical_url  # noqa: PLC0415
+
+        url = _LONG_SIGNED_REF_URL + "#" + "\U0001f4c4" * 300
+        html = f'<form><input id="doc" value="{canonical_url(url)}"></form>'
+    elif carrier == "escaped":
+        # The page authored the URL entity-escaped once too often, so the DOM-decoded value still holds
+        # `&amp;` for every query separator and is longer than the raw or canonical URL.
+        url = _LONG_SIGNED_REF_URL + "&p=1" * 500
+        html = f'<form><input id="doc" value="{html_escape(html_escape(url))}"></form>'
+    elif carrier == "alert_prefixed_huge":
+        # The widest display window (page text, 300) with a prefix wider than any other window, then
+        # a URL just under the retain floor: the retain margin must be sized for THIS window.
+        url = _LONG_SIGNED_REF_URL + "&X-Amz-Policy=" + "p" * (1990 - len(_LONG_SIGNED_REF_URL))
+        html = f'<div role="alert">{"Please wait. " * 20}{url}</div><input id="doc">'
+    elif carrier == "value":
+        html = f'<form><input id="doc" value="{_LONG_SIGNED_REF_URL}"></form>'
+    elif carrier == "placeholder":
+        html = f'<form><label for="doc">Résumé link</label><input id="doc" placeholder="{_LONG_SIGNED_REF_URL}"></form>'
+    else:
+        html = f'<form><input id="doc" aria-label="{_LONG_SIGNED_REF_URL}"></form>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(url))
+        r = await _tool(tools, "observe").handler({})
+    line = next(ln for ln in r.content.splitlines() if ln.startswith("[#doc]") or "spinbutton" in ln)
+    assert _LONG_SIGNED_REF_ARTIFACT not in r.content
+    assert "opaque_url_" in (r.content if carrier.startswith("alert") else line)

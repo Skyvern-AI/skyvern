@@ -67,6 +67,73 @@ async def test_engine_accepts_first_finish() -> None:
 
 
 @pytest.mark.asyncio
+async def test_navigate_through_a_payload_ref_redirect_masks_the_landing_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A payload ref that redirects hands its provenance to the landing URL: the real navigate tool
+    derives a ref for it, the engine's context holds the same dict, and the boundary masks it."""
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)  # no DNS in unit tests
+    signed = "https://files.example.test/uploads/deadbeef/resume.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    landing = "https://cdn.example.test/blob/resume.pdf?X-Amz-Signature=0123456789abcdef0123456789abcdef"
+
+    class _RedirectingPage(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+            await super().goto(url, timeout, wait_until)
+            self.url = landing
+
+    token = mask_opaque_urls({"file": signed}).masked["file"]
+    caller = _ScriptedCaller([[("navigate", {"url": token})], [("finish", {"status": "completed", "reason": "done"})]])
+    ctx = SkyvernContext(task_id="tsk_redirect")
+    skyvern_context.set(ctx)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_RedirectingPage()),
+            llm_caller=caller,
+            goal="g",
+            parameters={"file": signed},
+        )
+    finally:
+        skyvern_context.reset()
+    navigate_message = next(m["content"] for m in caller.message_history if m.get("role") == "tool")
+    assert "0123456789abcdef" not in navigate_message and navigate_message.startswith("navigated to opaque_url_")
+    assert landing in ctx.opaque_url_refs.values()
+
+
+@pytest.mark.asyncio
+async def test_engine_overwrites_opaque_url_refs_so_a_prior_blocks_refs_never_bleed() -> None:
+    """The masking boundary reads ctx.opaque_url_refs, and one SkyvernContext is shared across every
+    task block in a workflow run. The engine must OVERWRITE that field with the current task's refs —
+    the minted set, or empty when the task mints none — never merge or leave a prior block's stale
+    entry. Otherwise a later block masks a URL to a token only the earlier block's resolver can
+    reverse, which the model then cannot round-trip back through a tool call."""
+    signed = "https://files.example.test/uploads/deadbeef/resume.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    ctx = SkyvernContext(task_id="tsk_prior")
+    ctx.opaque_url_refs = {"opaque_url_stale00": "https://old.example.test/x?token=STALE"}
+    skyvern_context.set(ctx)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+            goal="g",
+            parameters={"file": signed},
+        )
+        # Overwritten with exactly this task's refs; the prior block's stale entry is gone.
+        assert ctx.opaque_url_refs == mask_opaque_urls({"file": signed}).refs
+        assert "opaque_url_stale00" not in ctx.opaque_url_refs
+
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+            goal="g",
+            parameters={"first_name": "John"},
+        )
+        # A task that mints no refs resets the field to empty, not the previous task's refs.
+        assert ctx.opaque_url_refs == {}
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
 async def test_engine_terminate_accepted_immediately() -> None:
     script = [[("finish", {"status": "terminated", "reason": "CAPTCHA blocks the form"})]]
     caller = _ScriptedCaller(script)
@@ -752,3 +819,73 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     assert finish_kwargs["verification_blocker"] is None
     assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
     assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_free", [False, True])
+async def test_engine_system_prompt_carries_the_current_date(monkeypatch: pytest.MonkeyPatch, page_free: bool) -> None:
+    # A relative-date goal ("two weeks from today") is unanswerable without a reference date; the
+    # model was observed typing past dates. The date is computed at assembly, never hardcoded.
+    from datetime import UTC, datetime
+
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    before = datetime.now(UTC)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="fill in the date available: two weeks from today",
+        page_free=page_free,
+    )
+    after = datetime.now(UTC)
+    system_prompt = loop_kwargs["system_prompt"]
+    assert any(
+        f"Today's date is {d.strftime('%Y-%m-%d')} ({d.strftime('%A')})" in system_prompt for d in (before, after)
+    ), system_prompt[-300:]
+
+
+@pytest.mark.asyncio
+async def test_engine_system_prompt_dates_in_the_runs_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The browser runs in the proxy's timezone (browser_factory sets ctx.tz_info); the stated date
+    # must be that zone's today, or UTC drifts a day ahead of/behind the page every evening.
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    # One of the two extreme zones is always on a different calendar day than UTC.
+    tz = next(
+        z
+        for z in (ZoneInfo("Pacific/Kiritimati"), ZoneInfo("Etc/GMT+12"))
+        if datetime.now(z).date() != datetime.now(UTC).date()
+    )
+    ctx = SkyvernContext(task_id="tsk_tz")
+    ctx.tz_info = tz
+    skyvern_context.set(ctx)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([]),
+            goal="fill in the date available: two weeks from today",
+        )
+    finally:
+        skyvern_context.reset()
+    system_prompt = loop_kwargs["system_prompt"]
+    assert f"Today's date is {datetime.now(tz).strftime('%Y-%m-%d')}" in system_prompt, system_prompt[-200:]
+    assert f"Today's date is {datetime.now(UTC).strftime('%Y-%m-%d')}" not in system_prompt

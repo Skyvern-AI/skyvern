@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 import structlog
 import yaml
@@ -115,6 +116,7 @@ from skyvern.schemas.workflows import (
 from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.strings import escape_code_fences
+from skyvern.utils.url_validators import is_blocked_host
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
@@ -1886,6 +1888,7 @@ async def _new_copilot_chat_post(
     organization: Organization,
     *,
     eval_mode: CopilotEvalMode | None = None,
+    eval_entrypoint_url: str | None = None,
 ) -> EventSourceResponse:
     """ENABLE_WORKFLOW_COPILOT_V2 dispatch target.
 
@@ -2212,7 +2215,9 @@ async def _new_copilot_chat_post(
 
             copilot_config = (
                 await app.AGENT_FUNCTION.get_copilot_config_for_request(
-                    organization.organization_id, code_block_mode=chat_request.code_block
+                    organization.organization_id,
+                    code_block_mode=chat_request.code_block,
+                    composer_mode=chat_request.mode,
                 )
             ) or CopilotConfig()
 
@@ -2320,6 +2325,7 @@ async def _new_copilot_chat_post(
                         request.headers.get("x-copilot-eval-case") if settings.ENV == "local" else None
                     ),
                     eval_mode=eval_mode,
+                    eval_entrypoint_url=eval_entrypoint_url,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
@@ -2635,12 +2641,53 @@ async def workflow_copilot_chat_audio(
     )
 
 
+def _validated_eval_entrypoint_url(
+    request: Request, chat_request: WorkflowCopilotChatRequest, organization: Organization
+) -> str | None:
+    """A silently dropped seed produces a benchmark run that looks seeded and never was, so every
+    rejected condition raises instead of falling back to the default resolution path."""
+    if chat_request.eval_entrypoint_url is None:
+        return None
+    eval_entrypoint_url = chat_request.eval_entrypoint_url
+    if (
+        not settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED
+        or organization.organization_id not in settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS
+        or request.headers.get("x-copilot-eval") != "odysseys"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="eval_entrypoint_url is not accepted on this deployment",
+        )
+    try:
+        parsed = urlparse(eval_entrypoint_url)
+        accepted = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and not any(char.isspace() for char in eval_entrypoint_url)
+            and (parsed.port is None or 0 < parsed.port < 65536)
+            # Same host policy every other URL-accepting entry point applies, so a metadata or
+            # RFC1918 host is refused here rather than only at the navigation guard. A local
+            # fixture lane passes by listing its own host in ALLOWED_HOSTS, as it already must.
+            and not is_blocked_host(parsed.hostname or "")
+        )
+    except ValueError:
+        accepted = False
+    if not accepted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="eval_entrypoint_url must be an http(s) URL",
+        )
+    return eval_entrypoint_url
+
+
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
+    eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
     raw_eval_mode = request.headers.get("x-copilot-eval-mode")
     if raw_eval_mode is not None:
         try:
@@ -2655,10 +2702,26 @@ async def workflow_copilot_chat_post(
             or organization.organization_id not in settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
-        return await _new_copilot_chat_post(request, chat_request, organization, eval_mode=eval_mode)
+        return await _new_copilot_chat_post(
+            request,
+            chat_request,
+            organization,
+            eval_mode=eval_mode,
+            eval_entrypoint_url=eval_entrypoint_url,
+        )
 
     if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id, mode=chat_request.mode):
-        return await _new_copilot_chat_post(request, chat_request, organization)
+        return await _new_copilot_chat_post(
+            request,
+            chat_request,
+            organization,
+            eval_entrypoint_url=eval_entrypoint_url,
+        )
+    if eval_entrypoint_url is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="eval_entrypoint_url requires the copilot v2 agent path",
+        )
 
     async def stream_handler(stream: EventSourceStream) -> None:
         turn_id = uuid.uuid4().hex

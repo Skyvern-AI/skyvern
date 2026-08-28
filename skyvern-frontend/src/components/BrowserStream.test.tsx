@@ -99,7 +99,6 @@ const mocks = vi.hoisted(() => {
     pendingEvents: [],
     reset: vi.fn(),
     setIsRecording: vi.fn(),
-    setMessageSocket: vi.fn(),
   };
 
   return {

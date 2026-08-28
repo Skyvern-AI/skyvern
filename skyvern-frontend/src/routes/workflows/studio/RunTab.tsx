@@ -29,18 +29,20 @@ export function RunTab() {
   // ?bl= marks a block-scoped run; "Retry" would rerun the whole workflow,
   // so suppress that CTA for block runs (the block is rerun from the editor).
   const isBlockRun = searchParams.has("bl");
+  const retryPath = `/agents/${workflowPermanentId}/run`;
+  const retryState =
+    workflowRun &&
+    workflowRun.workflow_run_id === runId &&
+    statusIsFinalized(workflowRun) &&
+    workflowRun.task_v2 === null
+      ? getRerunNavigationState(workflowRun)
+      : undefined;
   const retryRun = () => {
-    const path = `/agents/${workflowPermanentId}/run`;
-    if (
-      workflowRun &&
-      workflowRun.workflow_run_id === runId &&
-      statusIsFinalized(workflowRun) &&
-      workflowRun.task_v2 === null
-    ) {
-      navigate(path, { state: getRerunNavigationState(workflowRun) });
+    if (retryState) {
+      navigate(retryPath, { state: retryState });
       return;
     }
-    navigate(path);
+    navigate(retryPath);
   };
 
   return (
@@ -62,6 +64,11 @@ export function RunTab() {
             }
       }
       onRetry={isBlockRun || workflowDeleted ? undefined : retryRun}
+      milestoneRerun={
+        isBlockRun || workflowDeleted
+          ? undefined
+          : { to: retryPath, state: retryState }
+      }
     />
   );
 }

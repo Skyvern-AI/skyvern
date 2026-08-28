@@ -75,6 +75,7 @@ def test_protocol_allowlists_match_contract() -> None:
             "debugger.attach",
             "debugger.detach",
             "debugger.send",
+            "dom.evaluate",
             "tabs.create",
             "tabs.remove",
             "tabs.activate",
@@ -117,6 +118,11 @@ def test_manifest_key_derives_extension_id() -> None:
     derived_extension_id = "".join(chr(ord("a") + int(nibble, 16)) for nibble in digest_prefix)
 
     assert derived_extension_id == EXTENSION_ID
+    assert "userScripts" in manifest["permissions"]
+    assert "activeTab" not in manifest["permissions"]
+    assert "scripting" not in manifest["permissions"]
+    assert manifest["minimum_chrome_version"] == "138"
+    assert manifest["host_permissions"] == ["http://*/*", "https://*/*"]
 
 
 def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:
@@ -128,6 +134,7 @@ def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:
 
     assert "key" not in packaged_manifest
     assert "service_worker.js" in names
+    assert "dom_router.js" in names
     assert "README.md" not in names
 
     second_path = package_extension(tmp_path / "skyvern-agent-second.zip")

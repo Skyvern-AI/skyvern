@@ -23,9 +23,11 @@ type StreamPresenterProps = {
 
 /**
  * Transport-agnostic live browser stream: picks VNC vs CDP from runtime config.
- * Recording stays on the session's own transport — a CDP-transport session has
- * no reachable VNC endpoint, so swapping to VNC for recording kills the view;
- * exfiltration only needs the messages channel, which both transports carry.
+ * Recording stays on whichever transport the session already serves. Vendor
+ * sessions reach cdp precisely because they expose no relayable RFB endpoint, so
+ * swapping them to VNC to record killed the only stream they had; deployments
+ * that set BROWSER_STREAMING_MODE=cdp land here too and record over CDP the same
+ * way, whether or not their pods also run a VNC server.
  */
 export function StreamPresenter({
   browserSessionId,
@@ -92,7 +94,7 @@ export function StreamPresenter({
       showControlButtons={showControlButtons}
       exfiltrate={isRecording}
       hideRecordingIndicator={hideRecordingIndicator}
-      // StrictMode remounts this component; the recording must survive those.
+      // StrictMode remounts this component; the recording must survive that.
       // StudioBrowserStream owns the session-level reset instead.
       resetRecordingOnUnmount={false}
       onActivity={onActivity}

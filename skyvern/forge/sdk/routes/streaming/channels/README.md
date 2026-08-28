@@ -4,7 +4,7 @@ A "channel", as used within the streaming mechanism of our remote browsers,
 is a WebSocket fit to some particular purpose.
 
 There is/are:
-  - a "VNC" channel that transmits NoVNC's RFB protocol data (legacy viewers)
+  - a "VNC" channel that transmits NoVNC's RFB protocol data
   - a "Message" channel that transmits JSON between the frontend app and
     the api server
   - "CDP" channels that send messages to a remote browser using CDP protocol
@@ -15,10 +15,10 @@ There is/are:
 In all cases, these are just WebSockets. They have been bucketed into "named channels"
 to aid understanding.
 
-Record Browser captures actions over CDP: the frontend renders screencast frames
-from the browser-session stream, user events arrive via the Exfiltration channel,
-and the Message channel carries recording commands and interpretation updates.
-The VNC channel and its Message pairing below apply to legacy VNC viewers.
+First-party browser sessions render over VNC. Record Browser captures user events
+over the Exfiltration channel, and the Message channel carries recording commands
+and interpretation updates. Vendor-held sessions without a relayable RFB endpoint
+render from CDP screencast instead.
 
 These channels are described at the top of their respective files.
 

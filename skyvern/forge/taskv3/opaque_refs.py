@@ -6,7 +6,6 @@ Never import this from tools.py, loop.py, or auth_tools.py: it imports auth_tool
 from __future__ import annotations
 
 import hashlib
-import html
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -14,6 +13,7 @@ from urllib.parse import unquote, unquote_plus, urlsplit
 
 import structlog
 
+from skyvern.forge.sdk.core.skyvern_context import mask_opaque_urls_in_text
 from skyvern.forge.taskv3.auth_tools import _MIN_REDACTED_QUERY_VALUE_CHARS, _OPAQUE_QUERY_VALUE_RE
 
 LOG = structlog.get_logger()
@@ -205,23 +205,24 @@ class OpaqueUrlRefs:
                 resolved = resolved.replace(token, url)
         return resolved
 
+    def derive(self, url: str) -> str:
+        """Give ``url`` the provenance of a payload ref — a redirect target reached through one — so the
+        boundary masks it and a later tool call can resolve it. Returns its token."""
+        token = _token_for(url)
+        self.refs[token] = url
+        return token
+
     def mask(self, text: str) -> str:
         """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token —
         the inverse of resolve(). Masking is by PROVENANCE, not URL shape: only a URL we minted from
         the payload is rewritten, so a live-page URL the model must reason about is never touched, even
         when it is itself signing-shaped (a ``?gclid=``/``?token=`` landing page). Output-only surfaces
-        never resolve the token back; the token is the same one the payload masker minted for that URL."""
-        masked = text
-        # Longest URL first so a payload URL that is a prefix of another is not partially rewritten.
-        for token, url in sorted(self.refs.items(), key=lambda item: len(item[1]), reverse=True):
-            # A URL rendered inside HTML (get_html) has its query separators entity-encoded (& -> &amp;),
-            # so a multi-parameter presigned URL — the dominant signed-payload shape — never matches its
-            # raw form there; match the escaped form too. Plain-text surfaces only carry the raw form,
-            # where html.escape is a no-op, so the extra variant is harmless (dedup collapses it).
-            for variant in dict.fromkeys((url, html.escape(url, quote=False))):
-                if variant in masked:
-                    masked = masked.replace(variant, token)
-        return masked
+        never resolve the token back; the token is the same one the payload masker minted for that URL.
+
+        Shares one implementation with the model-facing boundary (SkyvernContext.hide_from_model), so
+        the pre-truncation surfaces (observe/get_html) and the universal tool-result boundary can never
+        diverge."""
+        return mask_opaque_urls_in_text(text, self.refs)
 
     def resolve_deep(self, value: Any) -> Any:
         if isinstance(value, str):

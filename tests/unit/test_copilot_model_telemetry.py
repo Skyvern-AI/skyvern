@@ -184,6 +184,49 @@ async def _stream_response(model: LitellmModel) -> tuple[list[Any], list[tuple[i
 
 
 @pytest.mark.asyncio
+async def test_model_adapter_attaches_exact_tools_for_nonstream_and_stream_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attached: list[list[Any]] = []
+
+    async def fake_get_response(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(output=[])
+
+    async def fake_stream_response(*_args: Any, **_kwargs: Any) -> AsyncIterator[str]:
+        yield "done"
+
+    monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
+    monkeypatch.setattr(LitellmModel, "get_response", fake_get_response)
+    monkeypatch.setattr(LitellmModel, "stream_response", fake_stream_response)
+    model = CopilotLitellmModel(model="openai/gpt-5.6", next_model_call_index=lambda: 1)
+
+    await model.get_response(
+        system_instructions="system",
+        input=[{"role": "user", "content": "hello"}],
+        model_settings=ModelSettings(),
+        tools=[_lookup_number],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+    streamed = [
+        event
+        async for event in model.stream_response(
+            system_instructions="system",
+            input=[{"role": "user", "content": "hello"}],
+            model_settings=ModelSettings(),
+            tools=[_lookup_number],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+    ]
+
+    assert attached == [[_lookup_number], [_lookup_number]]
+    assert streamed == ["done"]
+
+
+@pytest.mark.asyncio
 async def test_nonstream_capture_preserves_request_and_result(monkeypatch: pytest.MonkeyPatch) -> None:
     requests: list[bytes] = []
 

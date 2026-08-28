@@ -28,7 +28,7 @@ import {
   getSetupTime,
 } from "./templateUtils";
 
-const SURFACE = "dashboard" as const;
+const SURFACE = "discover" as const;
 
 const INTENT_PLACEHOLDERS: Record<string, string> = {
   fill_forms: "Describe the form you want to fill out...",

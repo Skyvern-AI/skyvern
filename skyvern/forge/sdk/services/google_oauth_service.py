@@ -27,7 +27,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import AsyncLock, NoopLock
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.db.id import generate_google_oauth_credential_id
+from skyvern.forge.sdk.db.id import GOOGLE_OAUTH_CREDENTIAL_PREFIX, generate_google_oauth_credential_id
 
 # Lifecycle constants and InvalidConsentNonceError live on the repository (the DB owns
 # them); re-export from this module so the cloud shim and existing call sites keep
@@ -895,6 +895,71 @@ async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCrede
 
 async def get_visible_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
     return await app.DATABASE.google_oauth.list_visible_for_org(organization_id=organization_id)
+
+
+def _matches_reference(credential: GoogleOAuthCredentialBase, normalized_reference: str) -> bool:
+    if not normalized_reference:
+        return False
+    return (
+        credential.credential_name.strip().casefold() == normalized_reference
+        or (credential.email_address or "").strip().casefold() == normalized_reference
+    )
+
+
+async def resolve_credential_reference(organization_id: str, reference: str) -> str:
+    """Map a caller-supplied Google connection reference onto a stored credential id.
+
+    The stored id appears nowhere outside the block editor's account dropdown, so a hand-written
+    or agent-written block reaches here carrying the connection name or the account email instead.
+    Accept all three. Unresolvable references come back unchanged; the caller reports not-found.
+    """
+    reference = reference.strip()
+    if not reference or reference.startswith(f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_"):
+        return reference
+
+    credentials = await get_visible_credentials_for_org(organization_id)
+    normalized = reference.casefold()
+    matches = [credential for credential in credentials if _matches_reference(credential, normalized)]
+    active = [credential for credential in matches if credential.state == STATE_ACTIVE]
+    candidates = active or matches
+    if len({credential.id for credential in candidates}) != 1:
+        return reference
+    return candidates[0].id
+
+
+async def describe_credential_failure(organization_id: str, reference: str) -> str:
+    """Explain why ``reference`` produced no access token, in terms the workflow author can act on."""
+    reconnect = "Reconnect the Google account: no valid access token"
+    try:
+        credentials = await get_visible_credentials_for_org(organization_id)
+    except Exception:
+        LOG.warning("Failed to list Google connections while describing a credential failure", exc_info=True)
+        return reconnect
+
+    reference = reference.strip()
+    if any(credential.id == reference for credential in credentials):
+        return reconnect
+
+    normalized = reference.casefold()
+    matches = [credential for credential in credentials if _matches_reference(credential, normalized)]
+    if len(matches) == 1:
+        return reconnect
+    if len(matches) > 1:
+        return (
+            f"credential_id '{reference}' matches {len(matches)} connected Google accounts. "
+            "Rename them on the Integrations page, or pick the account in the block editor."
+        )
+    if not credentials:
+        return (
+            f"credential_id '{reference}' cannot be resolved: no Google account is connected to this "
+            "organization. Connect one on the Integrations page."
+        )
+    names = ", ".join(f"'{credential.credential_name}'" for credential in credentials)
+    return (
+        f"credential_id '{reference}' does not match any connected Google account. "
+        f"Connected accounts: {names}. Use one of those names, the account email, or pick the "
+        "account in the block editor."
+    )
 
 
 async def update_email_address(
