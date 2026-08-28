@@ -5145,6 +5145,7 @@ async def test_recover_passes_recovery_timeout_to_read_http_url_bytes(tmp_path: 
 
     assert result is not None
     assert read_mock.await_args.kwargs["timeout_ms"] == _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS * 1000
+    assert "redirect" not in read_mock.await_args.kwargs
 
 
 @pytest.mark.asyncio
