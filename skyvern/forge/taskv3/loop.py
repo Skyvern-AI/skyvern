@@ -199,6 +199,10 @@ ACTION_LOOP_REASON_PREFIX = "action_loop:"
 # capability failures, not dead-ends, and are left to the model / stay `failed`.
 NAVIGATION_DEAD_END_STATUSES = frozenset({404, 410})
 
+# Defined here (not tools.py) so the batch-dispatch poisoning check below can compare against it
+# without an import cycle -- tools.py already imports ToolResult/ToolSpec from this module.
+PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
+
 # A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
 # removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
 # verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
@@ -467,23 +471,58 @@ FAILURE_EVIDENCE_MIN_TOOL_CALLS = 3
 FAILURE_EVIDENCE_MIN_TURNS = 3
 
 
+def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
+    """An Enter keypress or a type that pressed Enter: the submit shapes with no selector to key on."""
+    if tool_name == "press_key":
+        raw = str(args.get("key", ""))
+        # Space on a focused button activates it exactly like a click; a literal " " would strip to "".
+        if raw == " ":
+            return True
+        # Playwright accepts Modifier+Key chords, and Control/Meta+Enter is a real submit.
+        key = raw.strip().lower().rsplit("+", 1)[-1]
+        return key in ("enter", "return", "numpadenter", "space")
+    if tool_name == "type":
+        return bool(args.get("press_enter"))
+    return False
+
+
+def _call_selector(args: dict[str, Any]) -> str | None:
+    selector = args.get("selector")
+    if isinstance(selector, str) and selector:
+        return selector
+    mark = args.get("mark")
+    return f"mark={mark}" if isinstance(mark, (int, str)) else None
+
+
+_PAGE_PROBE_TIMEOUT_SECONDS = 10.0
+
+
+async def _sample_page_probe(page_probe: Callable[[], Awaitable[str | None]]) -> str | None:
+    """A raising or hung probe is as uninformative as a None one: all mean "no reading," not "unchanged."""
+    try:
+        return await asyncio.wait_for(page_probe(), timeout=_PAGE_PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        return None
+
+
+def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
+    """A click, an Enter press, or a type that pressed Enter: the loop cannot tell a submit from any of them."""
+    return tool_name == "click" or _is_enter_submit(tool_name, args)
+
+
+def _is_finish(tool_name: str) -> bool:
+    return tool_name == "finish"
+
+
 def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bool:
     """solve_captcha arms on ANY dispatch — its "not solved" error is exactly the verdict the async
     protocol can contradict. Other actions arm only when they reached the page AND in their
-    submit-shaped form: any click, an Enter press, or a type that pressed Enter."""
+    submit-shaped form."""
     if tool_name == "solve_captcha":
         return True
     if not ok:
         return False
-    if tool_name == "click":
-        # Deliberately broad: the loop has no submit-classification for click targets, and
-        # narrowing by label/selector text is the marker-parsing this design avoids.
-        return True
-    if tool_name == "press_key":
-        return str(args.get("key", "")).strip().lower() in ("enter", "return", "numpadenter")
-    if tool_name == "type":
-        return bool(args.get("press_enter"))
-    return False
+    return _may_submit(tool_name, args)
 
 
 @dataclass
@@ -952,6 +991,7 @@ async def run_agent_tool_loop(
     completion_probe: CompletionProbe | None = None,
     staged_downloads: set[str] | None = None,
     initial_navigation_status: int | None = None,
+    page_probe: Callable[[], Awaitable[str | None]] | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     # Per run, never logged: the hashes it keys are stable within this run (the only scope any guard
@@ -1146,6 +1186,12 @@ async def run_agent_tool_loop(
         # navigate can clear it — the model is told to batch aggressively, and terminating on the first
         # of a batched [navigate(dead), navigate(live)] would discard the recovery it planned.
         pending_nav_dead_end: int | None = None
+        # A same-selector dependent of a failed page-action call is skipped; any later click, Enter-shaped
+        # submit, or finish in the batch is skipped too -- the loop cannot tell a submit from the first two,
+        # and a verdict written before the failure was seen may be wrong or mis-reasoned.
+        failed_selectors: set[str] = set()
+        batch_had_failure = False
+        marks_stale = False
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -1159,6 +1205,58 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(messages, tool_calls[idx:], "run canceled")
                 break
             spec = tool_by_name.get(tool_name)
+            call_selector = _call_selector(args)
+            if marks_stale and call_selector is not None and call_selector.startswith("mark="):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "skipped: an earlier look in this batch renumbered the marks, so this mark was chosen "
+                            "from an old screenshot; pick it again from the new one"
+                        ),
+                    }
+                )
+                continue
+            if call_selector is not None and call_selector in failed_selectors:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": f"skipped: depends on an earlier call in this batch on {call_selector} that failed",
+                    }
+                )
+                continue
+            if batch_had_failure and _is_finish(tool_name):
+                # Any verdict queued behind the failure was written before the model saw it: a completed
+                # one may be false, and a failed/terminated one carries a reason that predates the error.
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "skipped: a field in this batch failed before this verdict was reached; "
+                            "re-observe, then finish with a status that reflects the failure"
+                        ),
+                    }
+                )
+                continue
+            if batch_had_failure and _may_submit(tool_name, args):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": (
+                            "skipped: a field in this batch failed and this call may submit the form; "
+                            "fix the field, then re-queue it"
+                        ),
+                    }
+                )
+                continue
             # Once the action-step budget is spent, refuse a further page action — terminate, mirroring
             # the step engine's max-steps stop — but let perception/finish through, since the cap bounds
             # new action rounds, not the separate re-observe/finish turn the system prompt asks for.
@@ -1184,6 +1282,11 @@ async def run_agent_tool_loop(
                     await on_pre_action(tool_name, args)
                 except Exception:
                     LOG.warning("taskv3 on_pre_action callback failed", tool=tool_name, exc_info=True)
+            # Sampled before dispatch so an error below can be checked for having moved the page even
+            # when the tool set no flag (a raised exception carries none). Not billed to the tool's timing.
+            probe_before: str | None = None
+            if spec is not None and page_probe is not None:
+                probe_before = await _sample_page_probe(page_probe)
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -1250,6 +1353,11 @@ async def run_agent_tool_loop(
             if result.screenshots:
                 pending_screenshots = list(result.screenshots)
             result_data = result.data or {}
+            if tool_name == "look" and result_data.get("marks_renumbered"):
+                # Every mark=N still queued in this batch was chosen before this look renumbered the
+                # marks, so it now names an arbitrary element; a look refused before rebuilding its
+                # manifest leaves the old marks (and their failed keys) live.
+                marks_stale = True
             if progress is not None and observe_summary:
                 invalid_fields = observe_summary.get("invalid_fields")
                 if invalid_fields is not None and progress.observe(invalid_fields):
@@ -1438,11 +1546,34 @@ async def run_agent_tool_loop(
                 break
 
             if result.status == "error":
-                # A failed call can leave the page in a state the rest of this batch was not planned
-                # against (e.g. a write after a failed navigate). Stop and skip the remaining calls so
-                # the model re-plans next turn from the error rather than acting on a stale assumption.
-                _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "earlier tool call in this batch failed")
-                break
+                # The rest of the batch is skipped only when the failed call moved the page: the tool's
+                # own signal, or the probe sampled before dispatch (a missing reading counts as moved).
+                poisoned = (
+                    tool_name == "navigate"
+                    or result.content == PAGE_UNAVAILABLE_ERROR
+                    or bool(
+                        result_data.get("page_transitioned")
+                        or result_data.get("page_state_changed")
+                        or result_data.get("navigation_dead_end")
+                    )
+                )
+                # Whether the page moved is independent of the tool's kind: a wait that timed out because
+                # the site navigated poisons the batch just as a failed click would.
+                if not poisoned and spec is not None and page_probe is not None:
+                    probe_after = await _sample_page_probe(page_probe)
+                    poisoned = probe_before is None or probe_after is None or probe_after != probe_before
+                if poisoned:
+                    _append_skipped_tool_results(
+                        messages,
+                        tool_calls[idx + 1 :],
+                        "earlier tool call in this batch failed and changed the page — re-observe before "
+                        "re-queuing these",
+                    )
+                    break
+                if spec is not None and (spec.billable or spec.recordable):
+                    batch_had_failure = True
+                    if call_selector is not None:
+                        failed_selectors.add(call_selector)
 
         # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the

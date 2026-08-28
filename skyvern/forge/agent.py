@@ -1777,16 +1777,31 @@ class ForgeAgent:
         # the gate, not here. Built for both populations — the failure-evidence gate needs a sampler
         # to run at all — over the same page accessor each population's tools use, so the evidence
         # is sampled from the page the model actually acted on.
+        _PAGE_FINGERPRINT_PROBE_JS = (
+            "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
+            " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
+            " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
+        )
+
+        _DOCUMENT_NONCE_JS = (
+            "() => { if (!window.__skyvern_doc_nonce) window.__skyvern_doc_nonce = String(Math.random());"
+            " return window.__skyvern_doc_nonce; }"
+        )
+
         async def _page_fingerprint() -> str | None:
             peek = await _fingerprint_page()
             if peek is None:
                 return None
-            probe_js = (
-                "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
-                " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
-                " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
-            )
-            return await peek.evaluate(probe_js)
+            return await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+
+        # Document identity, not content: a failed call's leftover text or open menu changes the DOM
+        # without re-mapping other selectors, while a navigation or reload (which does) wipes the nonce.
+        async def _page_probe() -> str | None:
+            peek = await _fingerprint_page()
+            if peek is None:
+                return None
+            nonce = await peek.evaluate(_DOCUMENT_NONCE_JS)
+            return f"{peek.url}|{nonce}"
 
         # Whether the control the run CLICKED is still in flight. Scoped to that one control on
         # purpose: "is anything on this page busy?" strands a finished run on an unrelated upload
@@ -1834,6 +1849,7 @@ class ForgeAgent:
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                page_probe=_page_probe,
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence

@@ -27,7 +27,13 @@ from PIL import Image, ImageDraw
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
-from skyvern.forge.taskv3.loop import NAVIGATION_DEAD_END_STATUSES, ToolHandler, ToolResult, ToolSpec
+from skyvern.forge.taskv3.loop import (
+    NAVIGATION_DEAD_END_STATUSES,
+    PAGE_UNAVAILABLE_ERROR,
+    ToolHandler,
+    ToolResult,
+    ToolSpec,
+)
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 
 if TYPE_CHECKING:
@@ -40,8 +46,6 @@ LOG = structlog.get_logger()
 # Resolved fresh per tool call rather than a page bound once, so a click that opens a new
 # tab/popup is followed on the next call instead of leaving the loop stuck on a stale page.
 PageProvider = Callable[[], Awaitable[Any]]
-
-PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
 # Cap on the page URL observe() echoes. Callers that register a secret URL for exact-match redaction
 # must register this prefix too, or the truncated echo survives the scrub.
@@ -178,7 +182,9 @@ def _classify_commit(
     """Classify a value-must-change action from a before/after observable-state readback.
 
     Ranked fail-closed: a readable did-not-commit is reported whatever the target re-resolved to, because
-    only an error halts a batched turn (INV-1 guards the confident ok, not the refusal). A commit read off
+    an error halts the rest of a batched turn only when it moved the page -- otherwise the field is
+    reported unfilled and only its same-selector dependents and any later click or Enter are skipped
+    (INV-1 guards the confident ok, not the refusal). A commit read off
     a target that re-resolved to n != 1 is `unverified` (INV-1); no readable committable state is
     `unverified` (INV-2). `committed_value` hands in a caller's own value-dimension truth in place of the
     generic any-field-changed rule.
@@ -4447,7 +4453,8 @@ def build_browser_tools(
         if matches == 0:
             return ToolResult.error(
                 f"{selector} no longer matches anything on the page — the page re-rendered since it was "
-                "observed. Re-observe and act on fresh selectors from the new observation."
+                "observed. Re-observe and act on fresh selectors from the new observation.",
+                data={"page_state_changed": True},
             )
         return ToolResult.error(
             f"{selector} matches {matches} elements, so it does not identify one control. Re-observe and "
@@ -4679,7 +4686,8 @@ def build_browser_tools(
                     return ToolResult.error(
                         f"{selector} no longer exists on the page — element markers vanish when the "
                         "page re-renders (a closed menu destroys its options). Re-observe and act on "
-                        "fresh selectors from the new observation."
+                        "fresh selectors from the new observation.",
+                        data={"page_state_changed": True},
                     )
                 # The re-attach may have been a re-render that cloned the row, so the count is re-read.
                 matches = await _marker_matches(page, selector)
@@ -4689,7 +4697,8 @@ def build_browser_tools(
                 return ToolResult.error(
                     f"{selector} now matches {matches} elements — the page re-rendered and cloned the "
                     "marked element, so the marker no longer identifies one control. Re-observe and act "
-                    "on fresh selectors from the new observation."
+                    "on fresh selectors from the new observation.",
+                    data={"page_state_changed": True},
                 )
         else:
             ambiguous = await _ambiguous_selector_error(page, selector)
@@ -4808,7 +4817,8 @@ def build_browser_tools(
                 await _clear_proxy_tags(page)
                 return ToolResult.error(
                     f"{selector} left the page before the click could land — it was replaced by a "
-                    "re-render; re-observe and act on fresh selectors"
+                    "re-render; re-observe and act on fresh selectors",
+                    data={"page_state_changed": True},
                 )
             base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
         else:
@@ -4830,10 +4840,13 @@ def build_browser_tools(
                 except Exception:
                     gone = False
                 if gone:
+                    # A same-document re-render: the URL and document nonce read unchanged, so only this
+                    # flag tells the loop the rest of the batch was planned against a stale page.
                     return ToolResult.error(
                         f"click on {selector} failed: the element no longer exists on the page — it was "
                         "likely removed by a re-render (e.g. a menu closed and destroyed its options). "
-                        f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})"
+                        f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})",
+                        data={"page_state_changed": True},
                     )
                 # Diagnosed only now, after the full actionability wait: a transient overlay (a toast,
                 # a closing menu) deserves the whole 15s to clear on its own, not a probe-shortened one.
@@ -5262,9 +5275,9 @@ def build_browser_tools(
                         f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is "
                         "NOT filled; re-observe and retry, do not proceed"
                     )
-                # DID_NOT_COMMIT: a suggestion surfaced but the field did not accept it — the field is NOT
-                # filled. Return an error so a batched turn halts here (the loop stops the rest of the batch
-                # on error) instead of proceeding — e.g. to a queued submit — on an uncommitted field.
+                # DID_NOT_COMMIT: the field is NOT filled. The loop then skips any later click or Enter
+                # in the same batch -- it may be an unvalidated submit, and no production submit guard
+                # exists yet.
                 return ToolResult.error(
                     f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is NOT "
                     "filled; re-observe and retry, do not proceed"
@@ -5827,7 +5840,9 @@ def build_browser_tools(
         # bind the element fresh immediately before uploading (missing now means it vanished mid-download).
         el = await page.query_selector(selector)
         if el is None:
-            return ToolResult("error", f"no file input for selector {selector!r}", staged)
+            return ToolResult(
+                "error", f"no file input for selector {selector!r}", {**staged, "page_state_changed": True}
+            )
         # Verify the upload took EFFECT, not just that set_input_files did not raise. Watch upload-like
         # network dispatches across the set_input_files + settle window (the window we already dwell in,
         # so this adds no latency); a genuine upload dispatches at least one, a silent no-op none.
@@ -5961,6 +5976,8 @@ def build_browser_tools(
             except Exception:
                 pass
         _look_manifest.clear()
+        # From here on the old marks are gone, whatever happens next -- the loop keys on this.
+        renumbered = {"marks_renumbered": True}
         for e in elements:
             n = int(e["n"])
             try:
@@ -5983,10 +6000,11 @@ def build_browser_tools(
             annotated = await asyncio.get_running_loop().run_in_executor(None, _annotate_screenshot, png, kept, vw)
         except Exception as exc:
             LOG.warning("taskv3 look annotation failed", exc_info=True)
-            return ToolResult.error(f"look failed to render marks: {type(exc).__name__}: {exc}")
+            return ToolResult.error(f"look failed to render marks: {type(exc).__name__}: {exc}", data=renumbered)
         if not kept:
             return ToolResult.ok(
                 "look: no interactive controls are visible in the viewport. Scroll or re-observe.",
+                data=renumbered,
                 screenshots=[annotated],
             )
 
@@ -6009,7 +6027,7 @@ def build_browser_tools(
         if isinstance(data, dict) and data.get("truncated"):
             header += f" (only the first {_LOOK_MAX_MARKS} are marked; scroll for more.)"
         legend = header + "\n" + "\n".join(lines)
-        return ToolResult.ok(legend, screenshots=[annotated])
+        return ToolResult.ok(legend, data=renumbered, screenshots=[annotated])
 
     async def _resolve_mark(page: Any, mark: int) -> tuple[str | None, ToolResult | None]:
         # Turn mark=N into a selector the existing click/type handlers act through. Resolution is the
@@ -6034,7 +6052,8 @@ def build_browser_tools(
         if not connected:
             return None, ToolResult.error(
                 f"mark {mark} no longer points to an element on the page — it moved or the page "
-                "re-rendered since look(). Call look() again and act on a fresh number."
+                "re-rendered since look(). Call look() again and act on a fresh number.",
+                data={"page_state_changed": True},
             )
         return f'[data-tv3-act="{mark}"]', None
 
