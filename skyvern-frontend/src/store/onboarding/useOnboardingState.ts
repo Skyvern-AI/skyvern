@@ -1,14 +1,21 @@
 import { createContext, useContext } from "react";
 import type {
+  ConfirmedPatch,
+  ConfirmedWriteResult,
+  LegacyOnboardingStatePatch,
   OnboardingState,
-  OnboardingStatePatch,
   RecoveryGuidanceAssignment,
 } from "./types";
+
+type ConfirmedOnboardingStateWriter = (
+  patch: ConfirmedPatch,
+) => Promise<ConfirmedWriteResult>;
 
 type OnboardingContextValue = {
   state: OnboardingState | null;
   isLoading: boolean;
-  updateState: (patch: OnboardingStatePatch) => void;
+  updateState: (patch: LegacyOnboardingStatePatch) => void;
+  updateStateConfirmed: ConfirmedOnboardingStateWriter;
   isNewUser: boolean;
   abVariant: string | null;
   recoveryGuidanceAssignment: RecoveryGuidanceAssignment | null;
@@ -31,4 +38,4 @@ function useOnboardingStateOptional(): OnboardingContextValue | null {
 }
 
 export { OnboardingContext, useOnboardingState, useOnboardingStateOptional };
-export type { OnboardingContextValue };
+export type { ConfirmedOnboardingStateWriter, OnboardingContextValue };

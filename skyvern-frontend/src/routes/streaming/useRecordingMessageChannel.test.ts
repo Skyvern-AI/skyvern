@@ -7,10 +7,7 @@ import {
   type RecordingDraftStep,
 } from "@/store/useRecordingStore";
 
-import {
-  commitRecordingOverMessageSocket,
-  useRecordingMessageChannel,
-} from "./useRecordingMessageChannel";
+import { useRecordingMessageChannel } from "./useRecordingMessageChannel";
 
 const mocks = vi.hoisted(() => ({
   getWebSocketParams: vi.fn(async () => "client_id=client-test"),
@@ -34,30 +31,9 @@ class MockWebSocket {
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
-  readonly listeners = new Map<string, Set<(event: Event) => void>>();
 
   constructor(readonly url: string) {
     MockWebSocket.instances.push(this);
-  }
-
-  addEventListener(type: string, listener: (event: never) => void) {
-    const listeners = this.listeners.get(type) ?? new Set();
-    listeners.add(listener as (event: Event) => void);
-    this.listeners.set(type, listeners);
-  }
-
-  removeEventListener(type: string, listener: (event: never) => void) {
-    this.listeners.get(type)?.delete(listener as (event: Event) => void);
-  }
-
-  listenerCount(type: string) {
-    return this.listeners.get(type)?.size ?? 0;
-  }
-
-  private dispatch(type: string, event: Event) {
-    for (const listener of [...(this.listeners.get(type) ?? [])]) {
-      listener(event);
-    }
   }
 
   emitOpen() {
@@ -65,17 +41,13 @@ class MockWebSocket {
   }
 
   emitMessage(message: unknown) {
-    const event = new MessageEvent("message", {
-      data: JSON.stringify(message),
-    });
-    this.onmessage?.(event);
-    this.dispatch("message", event);
+    this.onmessage?.(
+      new MessageEvent("message", { data: JSON.stringify(message) }),
+    );
   }
 
   emitClose(code = 1006) {
-    const event = new CloseEvent("close", { code });
-    this.onclose?.(event);
-    this.dispatch("close", event);
+    this.onclose?.(new CloseEvent("close", { code }));
   }
 }
 
@@ -473,118 +445,5 @@ describe("useRecordingMessageChannel", () => {
       interpretationPending: false,
       interpretationFinalized: false,
     });
-  });
-});
-
-describe("commitRecordingOverMessageSocket", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    MockWebSocket.instances = [];
-    vi.stubGlobal("WebSocket", MockWebSocket);
-    useRecordingStore.setState(initialRecordingState, true);
-    useRecordingStore.getState().reset();
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    useRecordingStore.setState(initialRecordingState, true);
-  });
-
-  async function connectedSocket() {
-    renderHook(() =>
-      useRecordingMessageChannel({
-        browserSessionId: "pbs-1",
-        enabled: true,
-        exfiltrate: false,
-        workflowPermanentId: null,
-        clipboard: "none",
-      }),
-    );
-    return openSocket();
-  }
-
-  const draftStep: RecordingDraftStep = {
-    step_id: "step-1",
-    action_kind: "click",
-    block_type: "action",
-    label: "Click submit",
-    status: "ready",
-    editable_fields: [],
-    parameters: [],
-    parameter_keys: [],
-  };
-
-  it("sends the commit and resolves on recording-committed", async () => {
-    const socket = await connectedSocket();
-
-    const committed = commitRecordingOverMessageSocket({
-      mode: "auto",
-      draftSteps: [draftStep],
-    });
-
-    expect(
-      socket.send.mock.calls.map((call) => JSON.parse(String(call[0]))),
-    ).toContainEqual({
-      kind: "recording-commit",
-      mode: "auto",
-      draft_steps: [draftStep],
-    });
-
-    act(() =>
-      socket.emitMessage({
-        kind: "recording-committed",
-        blocks: [{ block_type: "action" }],
-        parameters: [],
-        mode: "blocks",
-        diagnostics: { rows: 2, facts: 1, dropped: 0, unlocatable: 0 },
-      }),
-    );
-
-    await expect(committed).resolves.toMatchObject({
-      mode: "blocks",
-      blocks: [{ block_type: "action" }],
-    });
-    expect(socket.listenerCount("message")).toBe(0);
-    expect(socket.listenerCount("close")).toBe(0);
-  });
-
-  it("rejects when the backend reports the commit failed", async () => {
-    const socket = await connectedSocket();
-
-    const committed = commitRecordingOverMessageSocket({
-      mode: "auto",
-      draftSteps: null,
-    });
-
-    act(() =>
-      socket.emitMessage({
-        kind: "error",
-        failed_kind: "recording-commit",
-        message: "Failed to render the recording.",
-      }),
-    );
-
-    await expect(committed).rejects.toThrow("Failed to render the recording.");
-    expect(socket.listenerCount("message")).toBe(0);
-  });
-
-  it("rejects when the socket closes before the commit comes back", async () => {
-    const socket = await connectedSocket();
-
-    const committed = commitRecordingOverMessageSocket({
-      mode: "auto",
-      draftSteps: null,
-    });
-
-    act(() => socket.emitClose());
-
-    await expect(committed).rejects.toThrow(/closed/);
-    expect(socket.listenerCount("close")).toBe(0);
-  });
-
-  it("rejects without a connected socket", async () => {
-    await expect(
-      commitRecordingOverMessageSocket({ mode: "auto", draftSteps: null }),
-    ).rejects.toThrow(/not available/);
   });
 });

@@ -242,6 +242,16 @@ export interface ActivityEntry {
   // Consecutive same-tool retries folded into this row by
   // condenseActivityEntries. Unset outside that transform.
   attempts?: number;
+  // First-attempt identity for the reader-visible retry row. The current
+  // entry keeps its real event id for correlation.
+  retryRootId?: string;
+  // Exact failed attempts hidden by retry condensation, retained for the
+  // expanded evidence view.
+  priorFailures?: ActivityEntry[];
+  // Server timestamp of the first call represented by this condensed entry.
+  // A settled tool_result otherwise retains only its completion timestamp,
+  // which makes real multi-second work render as 0:00.
+  activityStartedAt?: string;
   // Server clock read for this event, persisted so a hydrated turn reports the
   // same elapsed as the live one. Undefined against a backend that does not stamp.
   timestamp?: string;
@@ -730,11 +740,19 @@ export function condenseActivityEntries(
       const idx = id !== undefined ? callIndexById.get(id) : undefined;
       if (idx !== undefined) {
         callIndexById.delete(id!);
+        const call = paired[idx];
+        const settled =
+          call?.timestamp === undefined
+            ? entry
+            : {
+                ...entry,
+                activityStartedAt: call.activityStartedAt ?? call.timestamp,
+              };
         if (idx === paired.length - 1) {
-          paired[idx] = entry;
+          paired[idx] = settled;
         } else {
           paired[idx] = null;
-          paired.push(entry);
+          paired.push(settled);
         }
       } else {
         // Its tool_call was evicted past the activity cap — keep the
@@ -751,6 +769,14 @@ export function condenseActivityEntries(
   let lastToolIdx = -1;
   for (const entry of ordered) {
     const prevTool = lastToolIdx >= 0 ? condensed[lastToolIdx] : undefined;
+    const previousEndedMs = parseUtcIsoMs(prevTool?.timestamp);
+    const currentStartedMs = parseUtcIsoMs(
+      entry.activityStartedAt ?? entry.timestamp,
+    );
+    const followsPreviousAttempt =
+      previousEndedMs === null ||
+      currentStartedMs === null ||
+      currentStartedMs >= previousEndedMs;
     if (
       prevTool &&
       entry.toolName !== undefined &&
@@ -758,13 +784,24 @@ export function condenseActivityEntries(
       (prevTool.displayLabel === undefined ||
         entry.displayLabel === undefined ||
         prevTool.displayLabel === entry.displayLabel) &&
-      prevTool.success === false
+      prevTool.success === false &&
+      followsPreviousAttempt
     ) {
+      const { priorFailures: earlierFailures, ...previousAttempt } = prevTool;
       condensed[lastToolIdx] = null;
       lastToolIdx =
         condensed.push({
           ...entry,
+          retryRootId: prevTool.retryRootId ?? prevTool.id,
+          priorFailures: [
+            ...(earlierFailures ?? []),
+            previousAttempt as ActivityEntry,
+          ],
           attempts: (prevTool.attempts ?? 1) + 1,
+          activityStartedAt:
+            prevTool.activityStartedAt ??
+            prevTool.timestamp ??
+            entry.activityStartedAt,
         }) - 1;
       continue;
     }
@@ -781,6 +818,12 @@ export function condenseActivityEntries(
 function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   const next = [...arr, entry];
   return next.length > cap ? next.slice(next.length - cap) : next;
+}
+
+function findActivityBlockIndex(blocks: BlockState[], entryId: string): number {
+  return blocks.findIndex((block) =>
+    block.activity.some((entry) => entry.id === entryId),
+  );
 }
 
 function appendActivity(
@@ -820,9 +863,7 @@ function appendActivity(
         ),
       };
     }
-    const callBlockIdx = blocks.findIndex((b) =>
-      b.activity.some((e) => e.id === callId),
-    );
+    const callBlockIdx = findActivityBlockIndex(blocks, callId);
     if (callBlockIdx !== -1) {
       const nextBlocks = blocks.slice();
       const callBlock = nextBlocks[callBlockIdx]!;
@@ -850,6 +891,38 @@ function appendActivity(
     ...active,
     activity: appendCapped(active.activity, entry, MAX_ACTIVITY_ENTRIES),
   };
+  return { blocks: nextBlocks, designActivity };
+}
+
+function attachCodeDiffsToActivity(
+  blocks: BlockState[],
+  designActivity: ActivityEntry[],
+  targetId: string,
+  codeDiffs: CodeWriteDiff[],
+): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  const designIndex = designActivity.findIndex(
+    (entry) => entry.id === targetId,
+  );
+  if (designIndex !== -1) {
+    const nextDesignActivity = designActivity.slice();
+    nextDesignActivity[designIndex] = {
+      ...nextDesignActivity[designIndex]!,
+      codeDiffs,
+    };
+    return { blocks, designActivity: nextDesignActivity };
+  }
+
+  const blockIndex = findActivityBlockIndex(blocks, targetId);
+  if (blockIndex === -1) return { blocks, designActivity };
+
+  const nextBlocks = blocks.slice();
+  const block = nextBlocks[blockIndex]!;
+  const activityIndex = block.activity.findIndex(
+    (entry) => entry.id === targetId,
+  );
+  const activity = block.activity.slice();
+  activity[activityIndex] = { ...activity[activityIndex]!, codeDiffs };
+  nextBlocks[blockIndex] = { ...block, activity };
   return { blocks: nextBlocks, designActivity };
 }
 
@@ -957,11 +1030,12 @@ export function applyNarrativeEvent(
         event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
       const withDiffs =
         draftDiffs === undefined || diffTarget === null
-          ? prev.designActivity
-          : prev.designActivity.map((entry) =>
-              entry.id === diffTarget
-                ? { ...entry, codeDiffs: draftDiffs }
-                : entry,
+          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          : attachCodeDiffsToActivity(
+              nextBlocks,
+              prev.designActivity,
+              diffTarget,
+              draftDiffs,
             );
 
       return {
@@ -971,8 +1045,8 @@ export function applyNarrativeEvent(
           blockLabels: event.block_labels,
           summary: event.summary,
         },
-        blocks: nextBlocks,
-        designActivity: withDiffs,
+        blocks: withDiffs.blocks,
+        designActivity: withDiffs.designActivity,
       };
     }
 
@@ -1737,15 +1811,14 @@ function adjudicatedSummaryParts(
     hasDrafts: boolean;
     hasCleanCompletedBuild: boolean;
   },
-  uxV1 = false,
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
   // Disposition-first (rule A): a pending draft review outranks why the turn
   // ended, regardless of responseKind (including non-build/clarify turns).
-  if (uxV1 && flags.needsUntestedProposalReview) {
+  if (flags.needsUntestedProposalReview) {
     return { headline: "Draft needs review", accent: "qa", glyph: "!" };
   }
-  if (uxV1 && flags.needsTestedProposalReview) {
+  if (flags.needsTestedProposalReview) {
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (turn.responseKind !== "build") {
@@ -1762,7 +1835,7 @@ function adjudicatedSummaryParts(
       return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
     }
     return {
-      headline: uxV1 ? "Needs your input" : "Question",
+      headline: "Needs your input",
       accent: "qa",
       glyph: "✦",
     };
@@ -1775,7 +1848,7 @@ function adjudicatedSummaryParts(
   }
   if (turn.responseType === "ASK_QUESTION") {
     return {
-      headline: uxV1 ? "Needs your input" : "Question",
+      headline: "Needs your input",
       accent: "qa",
       glyph: "✦",
     };
@@ -1783,11 +1856,7 @@ function adjudicatedSummaryParts(
   return null;
 }
 
-export function computeTurnSummary(
-  turn: TurnNarrativeState,
-  opts: { uxV1?: boolean } = {},
-): TurnSummary {
-  const uxV1 = opts.uxV1 ?? false;
+export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   // A cancelled turn's terminal is "error" purely because the user stopped it,
   // so that arm must not brand their own stop a failure.
@@ -1830,17 +1899,13 @@ export function computeTurnSummary(
   const adjudicated =
     isStoppedWithDraft || isFail || isStopped
       ? null
-      : adjudicatedSummaryParts(
-          turn,
-          {
-            needsUntestedProposalReview,
-            needsTestedProposalReview,
-            hasEdited,
-            hasDrafts,
-            hasCleanCompletedBuild,
-          },
-          uxV1,
-        );
+      : adjudicatedSummaryParts(turn, {
+          needsUntestedProposalReview,
+          needsTestedProposalReview,
+          hasEdited,
+          hasDrafts,
+          hasCleanCompletedBuild,
+        });
 
   const headline = adjudicated
     ? adjudicated.headline
@@ -1850,41 +1915,23 @@ export function computeTurnSummary(
         ? "Run halted"
         : isStopped
           ? "Stopped"
-          : uxV1
-            ? needsUntestedProposalReview
-              ? "Draft needs review"
-              : needsTestedProposalReview
-                ? "Workflow ready for review"
-                : needsInput
-                  ? "Needs your input"
-                  : isQA
-                    ? mode === "refuse"
-                      ? "Declined"
-                      : mode === "clarify"
-                        ? "Needs your input"
-                        : "Answered"
-                    : hasEdited
-                      ? "Applied edits and re-tested"
-                      : hasDrafts
-                        ? "Built and tested the workflow"
-                        : "Completed the run"
-            : needsInput
-              ? "Question"
-              : needsUntestedProposalReview
-                ? "Draft needs review"
-                : needsTestedProposalReview
-                  ? "Workflow ready for review"
-                  : isQA
-                    ? mode === "refuse"
-                      ? "Declined"
-                      : mode === "clarify"
-                        ? "Question"
-                        : "Answered"
-                    : hasEdited
-                      ? "Applied edits and re-tested"
-                      : hasDrafts
-                        ? "Built and tested the workflow"
-                        : "Completed the run";
+          : needsUntestedProposalReview
+            ? "Draft needs review"
+            : needsTestedProposalReview
+              ? "Workflow ready for review"
+              : needsInput
+                ? "Needs your input"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Needs your input"
+                      : "Answered"
+                  : hasEdited
+                    ? "Applied edits and re-tested"
+                    : hasDrafts
+                      ? "Built and tested the workflow"
+                      : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);

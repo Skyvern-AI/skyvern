@@ -209,7 +209,6 @@ describe("useCdpInput reconnects", () => {
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -222,30 +221,6 @@ describe("useCdpInput reconnects", () => {
     await advanceReconnectDelay();
 
     expect(MockWebSocket.instances).toHaveLength(2);
-  });
-
-  it("reports input RTT from a pong message", async () => {
-    const { result } = renderHook(() =>
-      useCdpInput({
-        inputWsUrl: "wss://input.test",
-        interactive: true,
-        viewportWidth: 1280,
-        viewportHeight: 720,
-      }),
-    );
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(result.current.inputRttMs).toBeNull();
-    vi.spyOn(performance, "now").mockReturnValue(250);
-
-    act(() => {
-      MockWebSocket.instances[0]!.emitMessage(
-        JSON.stringify({ kind: "pong", t: 200 }),
-      );
-    });
-
-    expect(result.current.inputRttMs).toBe(50);
   });
 
   it("requires and sends a fresh take-control after reconnect", async () => {

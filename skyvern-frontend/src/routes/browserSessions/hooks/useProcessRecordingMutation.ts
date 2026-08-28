@@ -5,12 +5,8 @@ import { useFeatureFlagEnabled } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { commitRecordingOverMessageSocket } from "@/routes/streaming/useRecordingMessageChannel";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import {
-  RECORD_BROWSER_CODE_FIRST_FLAG,
-  RECORD_BROWSER_V2_FLAG,
-} from "@/util/featureFlags";
+import { RECORD_BROWSER_CODE_FIRST_FLAG } from "@/util/featureFlags";
 import {
   useRecordingStore,
   type RecordingDraftStep,
@@ -49,8 +45,6 @@ const useProcessRecordingMutation = ({
   // Per-user opt-in preview; not enrolled reads as false (agent blocks).
   const codeFirst =
     useFeatureFlagEnabled(RECORD_BROWSER_CODE_FIRST_FLAG) ?? false;
-  const recordBrowserV2 =
-    useFeatureFlagEnabled(RECORD_BROWSER_V2_FLAG) ?? false;
 
   const processRecordingMutation = useMutation({
     mutationFn: async (
@@ -96,8 +90,6 @@ const useProcessRecordingMutation = ({
         throw new Error(FAIL_QUIET_NO_EVENTS);
       }
 
-      // v2 captures nothing in the page, so there is no event stream to upload: with no
-      // events this flushes nothing and returns [], and the draft steps are the recording.
       const compressedChunks = await recordingStore.getCompressedChunks();
 
       captureRecordBrowser("record_browser.process_attempted", {
@@ -105,20 +97,6 @@ const useProcessRecordingMutation = ({
         compressed_chunk_count: compressedChunks.length,
         draft_step_count: draftSteps?.length,
       });
-
-      if (recordBrowserV2) {
-        // The v2 ledger lives on the pod holding the message socket, so the commit
-        // rides that socket; "auto" renders code whenever every row is located, so
-        // record_browser_code_first no longer changes what v2 produces.
-        const committed = await commitRecordingOverMessageSocket({
-          mode: "auto",
-          draftSteps,
-        });
-        return {
-          blocks: committed.blocks as Array<WorkflowBlock>,
-          parameters: committed.parameters as Array<WorkflowParameter>,
-        };
-      }
 
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client

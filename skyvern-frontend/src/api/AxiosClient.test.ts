@@ -555,6 +555,70 @@ describe("UI session refresh", () => {
   });
 });
 
+describe("request-scoped authentication", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    window.sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it("keeps the credential snapshot after shared client defaults change", async () => {
+    const { getClient, getClientWithRequestHeaders, setApiKeyHeader } =
+      await import("./AxiosClient");
+    setApiKeyHeader("api-key-a");
+    const requestA = await getClientWithRequestHeaders(async () => "token-a");
+    setApiKeyHeader("api-key-b");
+    await getClient(async () => "token-b");
+    const adapter = vi.fn<AxiosAdapter>(async (config) => ({
+      data: { ok: true },
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+    }));
+    requestA.client.defaults.adapter = adapter;
+
+    await requestA.client.get("/scoped", { headers: requestA.headers });
+
+    const headers = adapter.mock.calls[0]?.[0].headers;
+    expect(headers?.get("Authorization")).toBe("Bearer token-a");
+    expect(headers?.get("X-API-Key")).toBe("api-key-a");
+  });
+  it("waits for the runtime API key before snapshotting request headers", async () => {
+    const token = "scoped-boot-race-session-canary";
+    let releaseMint: (response: Response) => void = () => {};
+    const mint = new Promise<Response>((resolve) => {
+      releaseMint = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => mint),
+    );
+
+    const { getClientWithRequestHeaders, initializeUiSession } =
+      await import("./AxiosClient");
+    void initializeUiSession();
+
+    const requestPromise = getClientWithRequestHeaders(async () => null);
+
+    releaseMint(
+      new Response(
+        JSON.stringify({
+          token,
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const request = await requestPromise;
+
+    expect(request.headers.get("X-API-Key")).toBe(token);
+  });
+});
+
 describe("open-source application entrypoint", () => {
   beforeEach(() => {
     vi.resetModules();

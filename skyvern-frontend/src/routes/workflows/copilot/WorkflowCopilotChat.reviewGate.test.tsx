@@ -8,8 +8,6 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
-
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
 
 type StreamBody = {
@@ -23,44 +21,37 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-const {
-  streamCalls,
-  postStreaming,
-  cancelPost,
-  historyGet,
-  historyResponse,
-  flagMap,
-} = vi.hoisted(() => {
-  const calls: StreamCall[] = [];
-  const post = vi.fn().mockResolvedValue({});
-  const streaming = vi.fn(
-    (
-      _path: string,
-      body: StreamBody,
-      onMessage: (payload: unknown) => boolean,
-    ) =>
-      new Promise<void>((resolve, reject) => {
-        calls.push({ body, onMessage, resolve, reject });
-      }),
-  );
-  const history = {
-    data: {
-      workflow_copilot_chat_id: "chat-1" as string | null,
-      chat_history: [] as unknown[],
-      proposed_workflow: null as Record<string, unknown> | null,
-      auto_accept: false,
-    },
-  };
-  const get = vi.fn().mockImplementation(() => Promise.resolve(history));
-  return {
-    streamCalls: calls,
-    postStreaming: streaming,
-    cancelPost: post,
-    historyGet: get,
-    historyResponse: history,
-    flagMap: { current: {} as Record<string, boolean> },
-  };
-});
+const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
+  vi.hoisted(() => {
+    const calls: StreamCall[] = [];
+    const post = vi.fn().mockResolvedValue({});
+    const streaming = vi.fn(
+      (
+        _path: string,
+        body: StreamBody,
+        onMessage: (payload: unknown) => boolean,
+      ) =>
+        new Promise<void>((resolve, reject) => {
+          calls.push({ body, onMessage, resolve, reject });
+        }),
+    );
+    const history = {
+      data: {
+        workflow_copilot_chat_id: "chat-1" as string | null,
+        chat_history: [] as unknown[],
+        proposed_workflow: null as Record<string, unknown> | null,
+        auto_accept: false,
+      },
+    };
+    const get = vi.fn().mockImplementation(() => Promise.resolve(history));
+    return {
+      streamCalls: calls,
+      postStreaming: streaming,
+      cancelPost: post,
+      historyGet: get,
+      historyResponse: history,
+    };
+  });
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -98,10 +89,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
     }),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: (flag: string) => flagMap.current[flag] ?? false,
-}));
 
 const saveData = {
   title: "Test WF",
@@ -300,7 +287,6 @@ beforeEach(() => {
   cancelPost.mockClear();
   cancelPost.mockResolvedValue({});
   historyGet.mockClear();
-  flagMap.current = {};
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
@@ -313,9 +299,8 @@ afterEach(() => {
   cleanup();
 });
 
-describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
+describe("WorkflowCopilotChat — g2 review gate", () => {
   it("does not send keep_pending_proposal on a chat's first message (nothing pending yet)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
     await submit("build me a workflow");
@@ -325,7 +310,6 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
   });
 
   it("restores an actionable gate via the chip after a bypassed proposal (old code: buttons vanish forever)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
     await submit("build me a workflow");
@@ -383,7 +367,6 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
   });
 
   it("shows the Untested pill on hydration of an old payload lacking proposalDisposition", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     historyResponse.data.proposed_workflow = proposedWorkflowPayload({
       _copilot_unvalidated: true,
     });
@@ -403,7 +386,6 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
   });
 
   it("renders a legacy (no-narrative) pending turn as pill + footer, no changes body", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     historyResponse.data.proposed_workflow = proposedWorkflowPayload({
       _copilot_unvalidated: true,
     });
@@ -430,7 +412,6 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
   });
 
   it("clears a stale pending gate when a later turn is auto-applied (stale Accept can't reapply over the newer canvas)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
     await submit("build me a workflow");
@@ -471,7 +452,6 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
   });
 
   it("shows the gate live on a narrative-less turn, not only after a reload (SKY-14099)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
     await submit("rename the blocks.");
@@ -490,7 +470,6 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
   });
 
   it("clears the proposal and shows a discarded receipt on a late Reject", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
     await submit("build me a workflow");
@@ -517,47 +496,5 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
       screen.getByText("Discarded — canvas reverted to the previous version"),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
-  });
-});
-
-describe("WorkflowCopilotChat — flag-off parity (SKY-12136)", () => {
-  it("renders today's two green pills + Review + solid Reject with no chip, and never sends keep_pending_proposal", async () => {
-    await renderChat({ docked: true });
-
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Always accept" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-    expect(screen.queryByText(/proposal pending/)).toBeNull();
-    expect(screen.queryByText("Untested")).toBeNull();
-    expect(streamCalls[0]!.body.keep_pending_proposal).toBe(false);
-
-    // docked -> today's DiffCard also renders alongside the raw button row.
-    expect(screen.getByText("Proposed changes")).toBeTruthy();
-  });
-
-  it("nulls the proposal on the next send, matching today's orphaning behavior", async () => {
-    await renderChat();
-
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-
-    await submit("also grab the story scores");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-
-    expect(streamCalls[1]!.body.keep_pending_proposal).toBe(false);
-    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
   });
 });

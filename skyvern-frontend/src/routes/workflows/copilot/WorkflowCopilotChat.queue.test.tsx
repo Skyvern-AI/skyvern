@@ -26,57 +26,50 @@ type StreamCall = {
   resolve: () => void;
   reject: (error: unknown) => void;
 };
-const {
-  streamCalls,
-  postStreaming,
-  cancelPost,
-  historyResponse,
-  speechState,
-  copilotUxV1Enabled,
-} = vi.hoisted(() => {
-  const calls: StreamCall[] = [];
-  const post = vi.fn().mockResolvedValue({});
-  const streaming = vi.fn(
-    (
-      _path: string,
-      body: { message: string },
-      onMessage: (payload: unknown) => boolean,
-    ) =>
-      new Promise<void>((resolve, reject) => {
-        calls.push({ body, onMessage, resolve, reject });
-      }),
-  );
-  const history = {
-    data: {
-      workflow_copilot_chat_id: null as string | null,
-      chat_history: [] as {
-        sender: "user" | "ai";
-        content: string;
-        created_at: string;
-        narrative_payload?: Record<string, unknown> | null;
-      }[],
-      proposed_workflow: null as Record<string, unknown> | null,
-      auto_accept: false,
-    },
-  };
-  const speech = {
-    isSupported: false,
-    isListening: false,
-    isHearingSpeech: false,
-    start: vi.fn(),
-    stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
-    toggle: vi.fn(),
-    takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
-  };
-  return {
-    streamCalls: calls,
-    postStreaming: streaming,
-    cancelPost: post,
-    historyResponse: history,
-    speechState: speech,
-    copilotUxV1Enabled: { value: false },
-  };
-});
+const { streamCalls, postStreaming, cancelPost, historyResponse, speechState } =
+  vi.hoisted(() => {
+    const calls: StreamCall[] = [];
+    const post = vi.fn().mockResolvedValue({});
+    const streaming = vi.fn(
+      (
+        _path: string,
+        body: { message: string },
+        onMessage: (payload: unknown) => boolean,
+      ) =>
+        new Promise<void>((resolve, reject) => {
+          calls.push({ body, onMessage, resolve, reject });
+        }),
+    );
+    const history = {
+      data: {
+        workflow_copilot_chat_id: null as string | null,
+        chat_history: [] as {
+          sender: "user" | "ai";
+          content: string;
+          created_at: string;
+          narrative_payload?: Record<string, unknown> | null;
+        }[],
+        proposed_workflow: null as Record<string, unknown> | null,
+        auto_accept: false,
+      },
+    };
+    const speech = {
+      isSupported: false,
+      isListening: false,
+      isHearingSpeech: false,
+      start: vi.fn(),
+      stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
+      toggle: vi.fn(),
+      takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
+    };
+    return {
+      streamCalls: calls,
+      postStreaming: streaming,
+      cancelPost: post,
+      historyResponse: history,
+      speechState: speech,
+    };
+  });
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -118,15 +111,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
     }),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  // "copilot_ux_v1" stays off by default — this file's fixtures pin today's
-  // headline strings, not the disposition-first reorder behind that flag. The
-  // mode pill it introduces is the only ask/build control a user can reach
-  // mid-turn, so the test that needs one opts in.
-  useFeatureFlagEnabled: (flag: string) =>
-    flag !== "copilot_ux_v1" || copilotUxV1Enabled.value,
-}));
 
 const saveData = {
   title: "Test WF",
@@ -246,7 +230,6 @@ function renderChatWithCodeMode() {
 // The mode pill is the one ask/build control that stays mounted through an
 // in-flight turn. Code-block mode is off so switching mode moves only the mode.
 function renderChatWithModePill() {
-  copilotUxV1Enabled.value = true;
   return renderChatWithFlags(
     {
       ENABLE_WORKFLOW_COPILOT_V2: true,
@@ -305,7 +288,6 @@ beforeEach(() => {
     generatingBlockLabel: null,
     cancelNonce: 0,
   });
-  copilotUxV1Enabled.value = false;
 });
 
 afterEach(() => {
@@ -960,7 +942,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Question")).toBeTruthy();
+    expect(screen.getByText("Needs your input")).toBeTruthy();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -997,7 +979,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Question")).toBeTruthy();
+    expect(screen.getByText("Needs your input")).toBeTruthy();
     expect(screen.getByText(longInputRequest)).toBeTruthy();
     expect(screen.queryByText("Answered")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
@@ -1216,6 +1198,13 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
 
   it("drains an identical queued prompt when the composer left the code mode the turn opened in", async () => {
     await renderChatWithCodeMode();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Build"));
+    });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(

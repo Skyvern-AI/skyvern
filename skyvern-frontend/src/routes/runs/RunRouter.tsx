@@ -30,8 +30,22 @@ import { WorkflowsPageLayout } from "@/routes/workflows/WorkflowsPageLayout";
 import { WorkflowEditor } from "@/routes/workflows/editor/WorkflowEditor";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery";
-import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useWorkflowStudioFlagState } from "@/hooks/useWorkflowStudioEnabled";
 import { useTaskV2Query } from "@/routes/runs/useTaskV2Query";
+import {
+  SYSTEM_RUN_FOCUS_PARAM,
+  toReadableSearch,
+} from "@/routes/workflows/studio/panes";
+
+// Sub-paths the ?wr= redirect below may forward; anything else (including the
+// self-redirecting blocks route and crafted splats) lands on overview.
+const REDIRECTABLE_RUN_SUBPATHS = new Set([
+  "overview",
+  "output",
+  "parameters",
+  "recording",
+  "code",
+]);
 
 const loadingIndicator = (
   <div
@@ -46,8 +60,9 @@ const loadingIndicator = (
 );
 
 function RunRouter() {
-  const { runId } = useParams();
-  const studioEnabled = useWorkflowStudioEnabled();
+  const { runId, "*": subPath } = useParams();
+  const studioFlagState = useWorkflowStudioFlagState();
+  const studioEnabled = studioFlagState ?? false;
 
   const { data: task_v2, isLoading } = useTaskV2Query({
     id: runId?.startsWith("tsk_v2") ? runId : undefined,
@@ -169,6 +184,34 @@ function RunRouter() {
       <WorkflowPermanentIdContext.Provider value={workflowPermanentId}>
         <WorkflowEditor />
       </WorkflowPermanentIdContext.Provider>
+    );
+  }
+
+  // A studio URL carries the viewed run in ?wr= and a possibly stale one in the
+  // path, so honor ?wr= here — but only once the flag is known off (or under
+  // ?embed=true, which never renders the studio), since rewriting while flags
+  // resolve would strip a studio user's URL state. Land on the sub-path
+  // directly because the index and /blocks redirects drop the search (?active=
+  // must survive), and scrub ?wrs=/?bl=, studio-internal companions of ?wr=.
+  const sharedStudioRunId = searchParams.get("wr");
+  if (
+    runType === "workflow" &&
+    (studioFlagState === false || isEmbedded) &&
+    sharedStudioRunId !== null &&
+    /^wr_\w+$/.test(sharedStudioRunId) &&
+    sharedStudioRunId !== runId
+  ) {
+    const params = new URLSearchParams(searchParams);
+    params.delete("wr");
+    params.delete(SYSTEM_RUN_FOCUS_PARAM);
+    params.delete("bl");
+    const targetSubPath =
+      subPath && REDIRECTABLE_RUN_SUBPATHS.has(subPath) ? subPath : "overview";
+    return (
+      <Navigate
+        to={`/runs/${sharedStudioRunId}/${targetSubPath}${toReadableSearch(params)}`}
+        replace
+      />
     );
   }
 

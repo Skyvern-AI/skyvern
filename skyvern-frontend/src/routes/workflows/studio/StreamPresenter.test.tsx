@@ -95,51 +95,58 @@ describe("StreamPresenter transport-swap recording", () => {
     expect(screen.queryByTestId("vnc-stream")).toBeNull();
   });
 
-  it("keeps the recording message channel closed on the non-recording CDP live view", () => {
-    // BrowserSessionStream opens its recording WebSocket whenever exfiltrate is
-    // defined, so the idle live view must pass undefined, not false.
-    render(<StreamPresenter browserSessionId="pbs_test" isRecording={false} />);
-    expect(cdpStreamProps.last?.exfiltrate).toBeUndefined();
+  it("opts the VNC stream out of the unmount reset while recording", () => {
+    runtimeConfigMock.browserStreamingMode = "vnc";
+    render(<StreamPresenter browserSessionId="pbs_test" isRecording />);
+    expect(screen.queryByTestId("vnc-stream")).not.toBeNull();
+    expect(browserStreamProps.last?.resetRecordingOnUnmount).toBe(false);
+  });
+});
+
+describe("StreamPresenter recording on a cdp-transport session", () => {
+  afterEach(() => {
+    cleanup();
+    browserStreamProps.last = null;
+    cdpStreamProps.last = null;
+    runtimeConfigMock.browserStreamingMode = "cdp";
+    runtimeConfigMock.transportPending = false;
+    useRecordingStore.getState().reset();
   });
 
-  it("keeps the CDP stream and drives exfiltration through it when recording starts on cdp transport", () => {
-    // A CDP-transport session has no reachable VNC endpoint: swapping to VNC on
-    // record killed the live view and hammered the API with reconnects.
+  it("keeps the CDP stream and drives exfiltration through it when recording starts", () => {
+    // A cdp-transport session is one with no relayable RFB endpoint (a vendor
+    // browser). Swapping it to VNC on record tore down the only working stream
+    // and left the viewer dead while the API took a reconnect storm.
     useRecordingStore
       .getState()
       .setIsRecording(true, { workflowPermanentId: "wpid_test" });
-    const { rerender } = render(
-      <StreamPresenter browserSessionId="pbs_test" isRecording={false} />,
-    );
-    expect(screen.queryByTestId("recording-pill")).toBeNull();
 
-    rerender(<StreamPresenter browserSessionId="pbs_test" isRecording />);
+    render(<StreamPresenter browserSessionId="pbs_test" isRecording />);
+
     expect(screen.queryByTestId("cdp-stream")).not.toBeNull();
     expect(screen.queryByTestId("vnc-stream")).toBeNull();
     expect(cdpStreamProps.last?.exfiltrate).toBe(true);
     expect(cdpStreamProps.last?.workflowPermanentId).toBe("wpid_test");
-    expect(screen.queryByTestId("recording-pill")).not.toBeNull();
   });
 
-  it("hides the CDP recording pill when the caller shows its own indicator", () => {
-    useRecordingStore
-      .getState()
-      .setIsRecording(true, { workflowPermanentId: "wpid_test" });
-    render(
-      <StreamPresenter
-        browserSessionId="pbs_test"
-        isRecording
-        hideRecordingIndicator
-      />,
-    );
-    expect(screen.queryByTestId("recording-pill")).toBeNull();
+  it("keeps the recording message channel closed on the idle live view", () => {
+    // BrowserSessionStream opens its recording WebSocket whenever exfiltrate is
+    // defined, so the non-recording view must pass undefined, not false.
+    render(<StreamPresenter browserSessionId="pbs_test" isRecording={false} />);
+    expect(cdpStreamProps.last?.exfiltrate).toBeUndefined();
   });
 
-  it("records over the VNC stream, opted out of the unmount reset, on vnc transport", () => {
+  it("labels the recording with the transport it actually rode", () => {
+    // useProcessRecordingMutation reports store.recordingTransport to the backend;
+    // with nothing setting it, every CDP recording was mislabelled as vnc.
+    render(<StreamPresenter browserSessionId="pbs_test" />);
+    expect(useRecordingStore.getState().recordingTransport).toBe("cdp");
+  });
+
+  it("still records over VNC on a vnc-transport session", () => {
     runtimeConfigMock.browserStreamingMode = "vnc";
     render(<StreamPresenter browserSessionId="pbs_test" isRecording />);
     expect(screen.queryByTestId("vnc-stream")).not.toBeNull();
     expect(screen.queryByTestId("cdp-stream")).toBeNull();
-    expect(browserStreamProps.last?.resetRecordingOnUnmount).toBe(false);
   });
 });

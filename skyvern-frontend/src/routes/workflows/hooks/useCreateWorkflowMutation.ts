@@ -65,7 +65,7 @@ function useCreateWorkflowMutation() {
       // this navigation unmounts the onboarding modal, and React Query skips
       // mutate-level callbacks once their observer unmounts.
       if (via === "onboarding_template") {
-        OnboardingTelemetry.flowCompleted("dashboard");
+        OnboardingTelemetry.flowCompleted("discover");
       }
       const search = via ? `?via=${encodeURIComponent(via)}` : "";
       navigate(

@@ -81,7 +81,7 @@ import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
-import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
+import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
 import {
@@ -105,8 +105,7 @@ import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useTurnActivityChange } from "./useTurnActivityChange";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
-import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
-import { useFeatureFlagEnabled } from "posthog-js/react";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -114,7 +113,6 @@ import {
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
 import { cn, formatElapsedSeconds } from "@/util/utils";
-import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import {
   useReleaseStudioRun,
@@ -186,44 +184,6 @@ function collectTimelineBlockActions(
     }
   }
   return out;
-}
-
-type ComposerDefaultVariant =
-  | "build"
-  | "build_code"
-  | "build_no_code"
-  | "ask"
-  | "ask_code";
-
-function normalizeComposerDefaultVariant(
-  variant: string | undefined,
-): ComposerDefaultVariant {
-  if (
-    variant === "ask" ||
-    variant === "ask_code" ||
-    variant === "build_code" ||
-    variant === "build_no_code"
-  ) {
-    return variant;
-  }
-  return "build";
-}
-
-function defaultVariantUsesCode(variant: ComposerDefaultVariant): boolean {
-  return variant === "build_code" || variant === "ask_code";
-}
-
-function defaultCodeBlockRequestOverride(
-  variant: string | undefined,
-): boolean | null {
-  if (variant === "build_code") {
-    return true;
-  }
-  if (variant === "build" || variant === "build_no_code") {
-    return false;
-  }
-  // Ask-only variants, including ask_code, do not send a build request override.
-  return null;
 }
 
 // Ask's mark is a text dingbat; Build's is a color emoji that ModeGlyph flattens
@@ -723,42 +683,15 @@ export function WorkflowCopilotChat({
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
   const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
-  // Client-side PostHog eval (not the backend-served flags above).
-  const copilotUxV1Enabled = useFeatureFlagEnabled(COPILOT_UX_V1_FLAG) ?? false;
   const copilotV2Enabled = copilotV2Flag === true;
   const codeBlockModeEnabled =
     codeBlockModeFlag === true && codeBlockAccessFlag === true;
-  const defaultModeVariant = useFeatureFlagValue(
-    "WORKFLOW_COPILOT_DEFAULT_MODE",
-  );
-  // S4: under the campaign flag, default straight to code-first (skipping the
-  // WORKFLOW_COPILOT_DEFAULT_MODE A/B variant) whenever code-first is accessible.
   const codeFirstAccessible = copilotV2Enabled && codeBlockModeEnabled;
-  const s4DefaultVariant: ComposerDefaultVariant = codeFirstAccessible
-    ? "build_code"
-    : "build";
-  // The variant configures the initial default only when both gating flags are on.
-  const effectiveDefaultVariant: ComposerDefaultVariant = copilotUxV1Enabled
-    ? s4DefaultVariant
-    : copilotV2Enabled && codeBlockModeEnabled
-      ? normalizeComposerDefaultVariant(defaultModeVariant)
-      : "build";
-  // codeBlockRequestOverride keys off the same source effectiveDefaultVariant
-  // used, not the raw flag value, so the S4 default stays internally consistent.
-  const codeOverrideVariantSource = copilotUxV1Enabled
-    ? s4DefaultVariant
-    : defaultModeVariant;
-  const [composerMode, setComposerMode] = useState<"ask" | "build">(() =>
-    effectiveDefaultVariant === "ask" || effectiveDefaultVariant === "ask_code"
-      ? "ask"
-      : "build",
-  );
-  const [codeWorkflow, setCodeWorkflow] = useState(() =>
-    defaultVariantUsesCode(effectiveDefaultVariant),
-  );
+  const [composerMode, setComposerMode] = useState<"ask" | "build">("build");
+  const [codeWorkflow, setCodeWorkflow] = useState(codeFirstAccessible);
   const [codeBlockRequestOverride, setCodeBlockRequestOverride] = useState<
     boolean | null
-  >(() => defaultCodeBlockRequestOverride(codeOverrideVariantSource));
+  >(codeFirstAccessible);
   // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
   const composerSeededRef = useRef(false);
   const flagsResolved =
@@ -770,30 +703,15 @@ export function WorkflowCopilotChat({
       return;
     }
     composerSeededRef.current = true;
-    setComposerMode(
-      effectiveDefaultVariant === "ask" ||
-        effectiveDefaultVariant === "ask_code"
-        ? "ask"
-        : "build",
-    );
-    setCodeWorkflow(defaultVariantUsesCode(effectiveDefaultVariant));
-    setCodeBlockRequestOverride(
-      defaultCodeBlockRequestOverride(codeOverrideVariantSource),
-    );
-  }, [
-    flagsResolved,
-    effectiveDefaultVariant,
-    defaultModeVariant,
-    copilotUxV1Enabled,
-    codeOverrideVariantSource,
-  ]);
+    setComposerMode("build");
+    setCodeWorkflow(codeFirstAccessible);
+    setCodeBlockRequestOverride(codeFirstAccessible);
+  }, [codeFirstAccessible, flagsResolved]);
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
-  const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
   // "Build with code" is offered as a third mode in the dropdown rather than a
   // separate toggle; the code state only renders on the button while in Build.
-  const codeOptionAvailable =
-    copilotV2Enabled && codeBlockModeEnabled && codeToggleAllowed;
+  const codeOptionAvailable = copilotV2Enabled && codeBlockModeEnabled;
   const codeStateActive = isBuild && codeWorkflow && codeOptionAvailable;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
@@ -1014,7 +932,7 @@ export function WorkflowCopilotChat({
     );
   }, []);
   useRunLifecycleAnnouncements({
-    workflowRunId: docked && copilotUxV1Enabled ? workflowRunId : undefined,
+    workflowRunId: docked ? workflowRunId : undefined,
     // isLoading here, not inFlightRef: this hook needs a value React re-runs
     // its effect on when the turn ends, which a ref can't do. The one-render
     // lag that matters for the double-submit guard above doesn't matter here.
@@ -1030,7 +948,7 @@ export function WorkflowCopilotChat({
   // growing set never duplicates rows and the terminal fetch just converges.
   const fetchRecordedActions = useCallback(
     async (runId: string) => {
-      if (!copilotUxV1Enabled || !workflowPermanentId) return;
+      if (!workflowPermanentId) return;
       try {
         const client = await getClient(credentialGetter);
         const response = await client.get<WorkflowRunTimelineItem[]>(
@@ -1068,12 +986,7 @@ export function WorkflowCopilotChat({
         console.error("Failed to fetch recorded actions:", error);
       }
     },
-    [
-      applyStoredNarrativeEvent,
-      copilotUxV1Enabled,
-      credentialGetter,
-      workflowPermanentId,
-    ],
+    [applyStoredNarrativeEvent, credentialGetter, workflowPermanentId],
   );
   const finalizeRecordedActionsPoll = useCallback((runId: string) => {
     const timer = actionPollRef.current.get(runId);
@@ -1091,7 +1004,7 @@ export function WorkflowCopilotChat({
   }, []);
   const startRecordedActionsPoll = useCallback(
     (runId: string | null | undefined) => {
-      if (!copilotUxV1Enabled || !runId || !workflowPermanentId) return;
+      if (!runId || !workflowPermanentId) return;
       if (
         actionPollRef.current.has(runId) ||
         finalizedActionRunIds.current.has(runId)
@@ -1114,7 +1027,7 @@ export function WorkflowCopilotChat({
         ),
       );
     },
-    [copilotUxV1Enabled, fetchRecordedActions, workflowPermanentId],
+    [fetchRecordedActions, workflowPermanentId],
   );
   const stopAllRecordedActionsPolls = useCallback(() => {
     actionPollRef.current.forEach((timer) => clearInterval(timer));
@@ -1122,12 +1035,12 @@ export function WorkflowCopilotChat({
   }, []);
   const focusTurnRun = useCallback(
     (runId: string | null | undefined) => {
-      if (!docked || !copilotUxV1Enabled || !runId) return;
+      if (!docked || !runId) return;
       if (focusedTurnRunId.current === runId) return;
       focusedTurnRunId.current = runId;
       switchStudioRun(runId);
     },
-    [copilotUxV1Enabled, docked, switchStudioRun],
+    [docked, switchStudioRun],
   );
   const releaseTurnRun = useCallback(
     (runId?: string) => {
@@ -1376,7 +1289,6 @@ export function WorkflowCopilotChat({
   // guard makes a stale or double-fired timer a no-op.
   const DRAFTING_GAP_MS = 8000;
   useEffect(() => {
-    if (!copilotUxV1Enabled) return;
     if (!shouldArmDraftingGapTimer(narrative)) return;
     const wait = Math.max(
       0,
@@ -1391,7 +1303,7 @@ export function WorkflowCopilotChat({
       wait,
     );
     return () => clearTimeout(t);
-  }, [narrative, applyStoredNarrativeEvent, copilotUxV1Enabled]);
+  }, [narrative, applyStoredNarrativeEvent]);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -1826,7 +1738,7 @@ export function WorkflowCopilotChat({
   );
 
   // A follow-up turn that ends without a new draft no longer nulls a bypassed
-  // proposal client-side (flag-on); re-fetch the chat row instead, since the
+  // proposal client-side; re-fetch the chat row instead, since the
   // backend (keep_pending_proposal) may have kept it alive server-side.
   // useCallback-stable: handleSend depends on it and is itself a dependency
   // of other effects, so a churning identity here would cascade into them.
@@ -2187,10 +2099,6 @@ export function WorkflowCopilotChat({
             { id: queuedId, sender: "user", content: candidate },
           ]);
         }
-        if (!copilotUxV1Enabled) {
-          setProposedWorkflow(null);
-          setPendingProposalTurnId(null);
-        }
         if (messageOverride === undefined) {
           setInputValue("");
         }
@@ -2228,10 +2136,6 @@ export function WorkflowCopilotChat({
       if (!options.queuedMessageId) {
         setMessages((prev) => [...prev, userMessage]);
       }
-      if (!copilotUxV1Enabled) {
-        setProposedWorkflow(null);
-        setPendingProposalTurnId(null);
-      }
       const messageContent = candidate;
       if (messageOverride === undefined && !options.queuedMessageId) {
         setInputValue("");
@@ -2251,14 +2155,12 @@ export function WorkflowCopilotChat({
           isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
         completedNormally: false,
       };
-      if (copilotUxV1Enabled) {
-        // Clear the prior turn's lingering narrative so the instant-ack placeholder's
-        // turnId===null gate holds on every send, and the first frame hands off cleanly.
-        // Reset the ref too (it lags setNarrative by a passive effect) so a late
-        // prior-turn recorded-actions fetch can't rebase onto the stale narrative.
-        narrativeRef.current = EMPTY_NARRATIVE;
-        setNarrative(EMPTY_NARRATIVE);
-      }
+      // Clear the prior turn's lingering narrative so the instant-ack placeholder's
+      // turnId===null gate holds on every send, and the first frame hands off cleanly.
+      // Reset the ref too (it lags setNarrative by a passive effect) so a late
+      // prior-turn recorded-actions fetch can't rebase onto the stale narrative.
+      narrativeRef.current = EMPTY_NARRATIVE;
+      setNarrative(EMPTY_NARRATIVE);
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -2497,7 +2399,7 @@ export function WorkflowCopilotChat({
             applyWorkflowUpdate(responseEntry.snapshot);
             setProposedWorkflow(null);
             setPendingProposalTurnId(null);
-          } else if (copilotUxV1Enabled && pendingProposalTurnId) {
+          } else if (pendingProposalTurnId) {
             // No new draft this turn, but a bypassed proposal is still
             // pending: re-fetch instead of nulling, since the backend (given
             // keep_pending_proposal) may have kept it alive for a late Accept.
@@ -2578,11 +2480,8 @@ export function WorkflowCopilotChat({
             target_block_label: targetBlockLabel,
             product_action: endToEndAction ? "test_end_to_end" : null,
             selected_block_label: readSelectedBlockLabel(),
-            keep_pending_proposal:
-              copilotUxV1Enabled && Boolean(pendingProposalTurnId),
-            // Only opt in behind the flag; flag-off omits the field entirely so
-            // the request stays byte-identical to legacy.
-            ...(copilotUxV1Enabled && { supports_credential_pause: true }),
+            keep_pending_proposal: Boolean(pendingProposalTurnId),
+            supports_credential_pause: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -2770,7 +2669,6 @@ export function WorkflowCopilotChat({
       codeBlockModeEnabled,
       codeBlockRequestOverride,
       composerMode,
-      copilotUxV1Enabled,
       copilotV2Enabled,
       credentialGetter,
       fetchRecordedActions,
@@ -3240,11 +3138,11 @@ export function WorkflowCopilotChat({
   // (working reason) or the queued bubble's footer (live_browser reason);
   // don't duplicate it as a second status line above the composer.
   const browserStatusText = queuedPrompt
-    ? copilotUxV1Enabled && copilotV2Enabled
+    ? copilotV2Enabled
       ? null
       : queuedPromptWaitingStatus
     : isLoading
-      ? copilotUxV1Enabled && copilotV2Enabled
+      ? copilotV2Enabled
         ? null
         : "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
@@ -3270,9 +3168,7 @@ export function WorkflowCopilotChat({
   const hasComposerText = inputValue.trim().length > 0;
   // The cycling verb row plus the stop button's orbiting ring carry the
   // working state, so the prose status line and the queued chip stand down.
-  const showWorkingRow = Boolean(
-    copilotUxV1Enabled && copilotV2Enabled && isLoading,
-  );
+  const showWorkingRow = Boolean(copilotV2Enabled && isLoading);
   // A live_browser-reason queued prompt parks with no active turn to stop, so
   // an empty composer's morph button would render as a guaranteed no-op "Send".
   // With text typed it does act — it rewrites the parked prompt.
@@ -3347,9 +3243,7 @@ export function WorkflowCopilotChat({
       </DropdownMenuItem>
       {codeOptionAvailable ? (
         <DropdownMenuItem
-          aria-label={
-            copilotUxV1Enabled ? "Build with code" : "Build workflow as code"
-          }
+          aria-label="Build with code"
           onSelect={() => {
             setComposerMode("build");
             setCodeWorkflow(true);
@@ -3362,11 +3256,7 @@ export function WorkflowCopilotChat({
         >
           <ModeGlyph mode="build" glow />
           <span className="flex flex-1 flex-col">
-            <span className="text-sm font-medium">
-              {copilotUxV1Enabled
-                ? "Build with code"
-                : "Build workflow as code"}
-            </span>
+            <span className="text-sm font-medium">Build with code</span>
             <span className="text-xs leading-snug text-muted-foreground">
               Build the workflow as code. Faster and more flexible, but may need
               extra detail to handle every edge case.
@@ -3524,12 +3414,9 @@ export function WorkflowCopilotChat({
                 const hasUnconsumedAdjacentMessage =
                   adjacentMessage !== undefined &&
                   selectedConnectionId === null;
-                const showProposalActions =
-                  isLastMessage && Boolean(proposedWorkflow);
                 const showReviewGate =
-                  copilotUxV1Enabled &&
-                  (shouldShowDiffCard(message.narrative) ||
-                    (turnId !== null && turnId === pendingProposalTurnId));
+                  shouldShowDiffCard(message.narrative) ||
+                  (turnId !== null && turnId === pendingProposalTurnId);
                 return (
                   <div
                     key={message.id}
@@ -3540,7 +3427,6 @@ export function WorkflowCopilotChat({
                     <NarrativeView
                       turn={message.narrative}
                       onBlockSelect={onBlockSelect}
-                      uxV1={copilotUxV1Enabled}
                       workingRowActive={showWorkingRow}
                     />
                     {turnId !== null && choices.length > 0 ? (
@@ -3600,60 +3486,8 @@ export function WorkflowCopilotChat({
                         gateId={turnId ? `copilot-gate-${turnId}` : undefined}
                         flash={turnId !== null && turnId === gateFlashTurnId}
                       />
-                    ) : !copilotUxV1Enabled ? (
-                      <>
-                        {showProposalActions && proposedWorkflow ? (
-                          <div className="flex flex-wrap gap-2 pl-1">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleReviewWorkflow(proposedWorkflow)
-                              }
-                              className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
-                            >
-                              Review
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleAcceptWorkflow(proposedWorkflow)
-                              }
-                              className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
-                            >
-                              Accept
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleAcceptWorkflow(proposedWorkflow, true)
-                              }
-                              className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
-                            >
-                              Always accept
-                            </button>
-                            <button
-                              type="button"
-                              onClick={handleRejectWorkflow}
-                              className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
-                            >
-                              Reject
-                            </button>
-                          </div>
-                        ) : null}
-                        {docked && shouldShowDiffCard(message.narrative) ? (
-                          <DiffCard
-                            pendingProposal={showProposalActions}
-                            rejected={
-                              message.narrative.turnId !== null &&
-                              rejectedTurnIds.has(message.narrative.turnId)
-                            }
-                            turn={message.narrative}
-                          />
-                        ) : null}
-                      </>
                     ) : null}
-                    {copilotUxV1Enabled &&
-                    !isLoadingHistory &&
+                    {!isLoadingHistory &&
                     isLastMessage &&
                     shouldShowConfirmCard(message.narrative) ? (
                       <ConfirmCard
@@ -3665,12 +3499,7 @@ export function WorkflowCopilotChat({
                       />
                     ) : null}
                     {(() => {
-                      if (
-                        isLoadingHistory ||
-                        !copilotUxV1Enabled ||
-                        turnId === null
-                      )
-                        return null;
+                      if (isLoadingHistory || turnId === null) return null;
                       const credFrame = credentialCardFrameFor(
                         message.narrative,
                       );
@@ -3719,12 +3548,7 @@ export function WorkflowCopilotChat({
                       );
                     })()}
                     {(() => {
-                      if (
-                        isLoadingHistory ||
-                        !copilotUxV1Enabled ||
-                        turnId === null
-                      )
-                        return null;
+                      if (isLoadingHistory || turnId === null) return null;
                       const autoBound = autoBoundReceiptFor(message);
                       if (!autoBound || !autoBoundReceiptIndexes.has(index))
                         return null;
@@ -3769,7 +3593,6 @@ export function WorkflowCopilotChat({
                   </div>
                 );
               }
-              const showProposedPanel = isLastMessage && proposedWorkflow;
               const isGateOwnerOrLast =
                 index === gateIndex && Boolean(proposedWorkflow);
               const selectionReceipt = connectedAccountSelectionReceipt(
@@ -3785,7 +3608,6 @@ export function WorkflowCopilotChat({
                       : message
                   }
                   queuedStatus={
-                    copilotUxV1Enabled &&
                     copilotV2Enabled &&
                     queuedPrompt?.reason === "live_browser" &&
                     queuedPrompt.id === message.id
@@ -3796,7 +3618,7 @@ export function WorkflowCopilotChat({
                       : null
                   }
                   footer={
-                    copilotUxV1Enabled && isGateOwnerOrLast ? (
+                    isGateOwnerOrLast ? (
                       <ReviewGateCard
                         pending
                         verdict={getReviewGateVerdict(
@@ -3820,39 +3642,6 @@ export function WorkflowCopilotChat({
                         }
                         onTestEndToEnd={handleTestEndToEnd}
                       />
-                    ) : !copilotUxV1Enabled && showProposedPanel ? (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
-                        >
-                          Review
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
-                        >
-                          Accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleAcceptWorkflow(proposedWorkflow, true)
-                          }
-                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
-                        >
-                          Always accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleRejectWorkflow}
-                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
-                        >
-                          Reject
-                        </button>
-                      </>
                     ) : null
                   }
                 />
@@ -3865,10 +3654,7 @@ export function WorkflowCopilotChat({
             render. The send-time reset (see handleSend) keeps turnId null on
             every send, including queued-then-drained follow-ups.
           */}
-            {copilotUxV1Enabled &&
-            isLoading &&
-            !isLoadingHistory &&
-            narrative.turnId === null ? (
+            {isLoading && !isLoadingHistory && narrative.turnId === null ? (
               <InstantAckPlaceholder />
             ) : null}
             {/*
@@ -3885,11 +3671,9 @@ export function WorkflowCopilotChat({
                 <NarrativeView
                   turn={narrative}
                   onBlockSelect={onBlockSelect}
-                  uxV1={copilotUxV1Enabled}
                   workingRowActive={showWorkingRow}
                 />
-                {copilotUxV1Enabled &&
-                !isLoadingHistory &&
+                {!isLoadingHistory &&
                 livePauseFrame &&
                 livePauseFrame.turn_id === narrative.turnId ? (
                   <CredentialCard
@@ -3937,7 +3721,7 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-border p-3">
-        {copilotUxV1Enabled && copilotV2Enabled ? (
+        {copilotV2Enabled ? (
           <div className="mb-2">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -3973,8 +3757,7 @@ export function WorkflowCopilotChat({
             </DropdownMenu>
           </div>
         ) : null}
-        {copilotUxV1Enabled &&
-        proposedWorkflow &&
+        {proposedWorkflow &&
         pendingProposalTurnId &&
         (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
           <button
@@ -4006,7 +3789,6 @@ export function WorkflowCopilotChat({
           />
         ) : null}
         {!showWorkingRow &&
-        copilotUxV1Enabled &&
         copilotV2Enabled &&
         queuedPrompt &&
         (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
@@ -4039,12 +3821,12 @@ export function WorkflowCopilotChat({
         <SelectedBlockChip />
         <div
           className={
-            copilotUxV1Enabled && copilotV2Enabled
+            copilotV2Enabled
               ? "flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring"
               : "flex items-end gap-2"
           }
         >
-          {copilotUxV1Enabled && copilotV2Enabled ? null : (
+          {copilotV2Enabled ? null : (
             <SpeechInputButton
               isSupported={isSpeechSupported}
               isListening={isSpeechListening}
@@ -4062,7 +3844,7 @@ export function WorkflowCopilotChat({
                   ? "Type to queue a message…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
-                    : copilotUxV1Enabled && copilotV2Enabled
+                    : copilotV2Enabled
                       ? "Ask Copilot to build or change your workflow…"
                       : "Message Skyvern Copilot, or paste recorded steps…"
             }
@@ -4071,7 +3853,7 @@ export function WorkflowCopilotChat({
             onKeyDown={handleKeyPress}
             rows={1}
             className={
-              copilotUxV1Enabled && copilotV2Enabled
+              copilotV2Enabled
                 ? "min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 : "min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             }
@@ -4081,7 +3863,7 @@ export function WorkflowCopilotChat({
               overflowY: "hidden",
             }}
           />
-          {copilotUxV1Enabled && copilotV2Enabled ? (
+          {copilotV2Enabled ? (
             <SpeechInputButton
               isSupported={isSpeechSupported}
               isListening={isSpeechListening}
@@ -4091,7 +3873,7 @@ export function WorkflowCopilotChat({
               iconClassName="h-3.5 w-3.5"
             />
           ) : null}
-          {copilotUxV1Enabled && copilotV2Enabled ? (
+          {copilotV2Enabled ? (
             <TooltipProvider>
               <ControlTooltip
                 content={morphButtonLabel}
@@ -4299,7 +4081,7 @@ export function WorkflowCopilotChat({
       )}
       {/* Mounted only while open: CredentialsModal pulls react-query at mount,
           so keeping it mounted-but-closed would tax every render for nothing. */}
-      {copilotUxV1Enabled && credentialModalOpen ? (
+      {credentialModalOpen ? (
         <CredentialsModal
           isOpen
           // A sign-in pause always needs a password credential; force the form

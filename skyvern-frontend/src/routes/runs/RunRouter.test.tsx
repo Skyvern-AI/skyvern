@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
@@ -22,7 +22,7 @@ const resolvedRun = {
 };
 
 const mocks = vi.hoisted(() => ({
-  studioEnabled: vi.fn(() => true),
+  studioFlagState: vi.fn<() => boolean | undefined>(() => true),
   taskV2: vi.fn(() => ({ data: undefined, isLoading: false })),
   runQuery: vi.fn<
     (options?: { workflowRunId?: string; enabled?: boolean }) => RunQueryResult
@@ -36,7 +36,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
-  useWorkflowStudioEnabled: () => mocks.studioEnabled(),
+  useWorkflowStudioFlagState: () => mocks.studioFlagState(),
+  useWorkflowStudioEnabled: () => mocks.studioFlagState() ?? false,
 }));
 vi.mock("@/routes/runs/useTaskV2Query", () => ({
   useTaskV2Query: () => mocks.taskV2(),
@@ -58,6 +59,13 @@ vi.mock("@/routes/workflows/WorkflowRun", () => ({
   WorkflowRun: () => <div data-testid="legacy">legacy</div>,
 }));
 
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">{location.pathname + location.search}</div>
+  );
+}
+
 function renderAt(entry: string) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
@@ -65,6 +73,7 @@ function renderAt(entry: string) {
         <Route path="/runs/:runId/*" element={<RunRouter />} />
         <Route path="/agents/*" element={<div data-testid="redirected" />} />
       </Routes>
+      <LocationProbe />
     </MemoryRouter>,
   );
 }
@@ -85,7 +94,7 @@ function expectCenteredLoadingIndicator() {
 
 describe("RunRouter", () => {
   beforeEach(() => {
-    mocks.studioEnabled.mockReturnValue(true);
+    mocks.studioFlagState.mockReturnValue(true);
     mocks.taskV2.mockReturnValue({ data: undefined, isLoading: false });
     mocks.runQuery.mockReturnValue({ data: resolvedRun, isLoading: false });
   });
@@ -127,7 +136,7 @@ describe("RunRouter", () => {
   });
 
   test("studio off: keeps the legacy run view", () => {
-    mocks.studioEnabled.mockReturnValue(false);
+    mocks.studioFlagState.mockReturnValue(false);
     renderAt("/runs/wr_1");
     expect(screen.getByTestId("legacy")).toBeTruthy();
     expect(screen.queryByTestId("studio")).toBeNull();
@@ -141,7 +150,7 @@ describe("RunRouter", () => {
   });
 
   test("studio off: disables the run-resolver query so non-studio routes don't fetch a workflow run", () => {
-    mocks.studioEnabled.mockReturnValue(false);
+    mocks.studioFlagState.mockReturnValue(false);
     renderAt("/runs/wr_1");
     expect(mocks.runQuery).toHaveBeenCalledWith(
       expect.objectContaining({ enabled: false }),
@@ -154,6 +163,17 @@ describe("RunRouter", () => {
     expect(screen.queryByTestId("studio")).toBeNull();
   });
 
+  test("embed=true honors ?wr= even while the studio flag is unresolved", () => {
+    // Embed never renders the studio shell, so there is no URL state to protect
+    // and the redirect need not wait for the flag.
+    mocks.studioFlagState.mockReturnValue(undefined);
+    renderAt("/runs/wr_1?embed=true&wr=wr_2&active=act_9");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_2/overview?embed=true&active=act_9",
+    );
+    expect(screen.getByTestId("legacy")).toBeTruthy();
+  });
+
   test("a permanently failed run fetch lands on 404, not an endless spinner", () => {
     mocks.runQuery.mockReturnValue({
       data: undefined,
@@ -164,6 +184,81 @@ describe("RunRouter", () => {
     expect(screen.queryByTestId("studio")).toBeNull();
     expect(screen.queryByAltText("Minimized Logo")).toBeNull();
     expect(screen.queryByTestId("legacy")).toBeNull();
+  });
+
+  test("studio off: a studio-shared link resolves to the ?wr= run, selection intact", () => {
+    // The studio switches runs by rewriting ?wr= and leaving the path alone, so
+    // its URLs can carry a stale run id in the path. Flag-off must land on the
+    // ?wr= run — straight onto the sub-path so the index redirect can't drop
+    // ?active= (the shared selection).
+    mocks.studioFlagState.mockReturnValue(false);
+    renderAt(
+      "/runs/wr_1?wr=wr_2&panes=editor,overview&active=act_9&selected-block=Payment",
+    );
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_2/overview?panes=editor,overview&active=act_9&selected-block=Payment",
+    );
+    expect(screen.getByTestId("legacy")).toBeTruthy();
+    expect(screen.queryByTestId("studio")).toBeNull();
+  });
+
+  test("studio off: ?wr= naming the path run is not a redirect", () => {
+    mocks.studioFlagState.mockReturnValue(false);
+    renderAt("/runs/wr_1?wr=wr_1&active=act_9");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_1?wr=wr_1&active=act_9",
+    );
+    expect(screen.getByTestId("legacy")).toBeTruthy();
+  });
+
+  test("flag unresolved: no rewrite — a studio user's URL state must survive cold load", () => {
+    mocks.studioFlagState.mockReturnValue(undefined);
+    renderAt("/runs/wr_1?wr=wr_2&panes=editor,overview&active=act_9");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_1?wr=wr_2&panes=editor,overview&active=act_9",
+    );
+    expect(screen.getByTestId("legacy")).toBeTruthy();
+  });
+
+  test("studio off: /blocks maps to /overview and the studio-internal ?wrs=/?bl= are scrubbed", () => {
+    // /blocks immediately re-navigates to /overview without the search, and
+    // ?wrs=/?bl= are companions of the ?wr= being promoted into the path.
+    mocks.studioFlagState.mockReturnValue(false);
+    renderAt("/runs/wr_1/blocks?wr=wr_2&wrs=copilot&bl=Login&active=act_9");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_2/overview?active=act_9",
+    );
+  });
+
+  test("studio off: the splat is whitelisted — known sub-paths forward, anything else lands on overview", () => {
+    mocks.studioFlagState.mockReturnValue(false);
+    const first = renderAt("/runs/wr_1/recording?wr=wr_2");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_2/recording",
+    );
+    first.unmount();
+    renderAt("/runs/wr_1/%2E%2E%2Fagents?wr=wr_2&active=act_9");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_2/overview?active=act_9",
+    );
+  });
+
+  test("studio off: a malformed ?wr= is ignored, not spliced into the path", () => {
+    mocks.studioFlagState.mockReturnValue(false);
+    const wr = encodeURIComponent("wr_2/../../agents/wpid_x/studio");
+    renderAt(`/runs/wr_1?wr=${wr}`);
+    expect(screen.getByTestId("location").textContent).toBe(
+      `/runs/wr_1?wr=${wr}`,
+    );
+    expect(screen.getByTestId("legacy")).toBeTruthy();
+  });
+
+  test("studio on: the studio owns ?wr= — the path is never rewritten under it", () => {
+    renderAt("/runs/wr_1?wr=wr_2&panes=editor,overview");
+    expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_1?wr=wr_2&panes=editor,overview",
+    );
   });
 
   test("a failed background poll keeps the studio view while the live run stays retained", () => {

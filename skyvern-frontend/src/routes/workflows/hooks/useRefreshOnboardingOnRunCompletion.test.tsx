@@ -13,8 +13,12 @@ import type {
   RecoveryGuidanceAssignment,
 } from "@/store/onboarding/types";
 import { useRefreshOnboardingOnRunCompletion } from "./useRefreshOnboardingOnRunCompletion";
+vi.mock("@clerk/clerk-react", () => ({
+  useAuth: () => ({ userId: "user-a" }),
+}));
 
-const ONBOARDING_KEY = { queryKey: ["userOnboarding"] };
+const ONBOARDING_KEY = { queryKey: ["userOnboarding", "user-a"] };
+const ONBOARDING_PREFIX = { queryKey: ["userOnboarding"] };
 const RUN_ID = "wr_1";
 
 function run(status: Status, workflowRunId = RUN_ID) {
@@ -84,7 +88,7 @@ function makeRaceWrapper(firstAssignment: RecoveryGuidanceAssignment | null) {
 function onboardingInvalidations(spy: ReturnType<typeof vi.spyOn>): number {
   return spy.mock.calls.filter(
     (call: unknown[]) =>
-      JSON.stringify(call[0]) === JSON.stringify(ONBOARDING_KEY),
+      JSON.stringify(call[0]) === JSON.stringify(ONBOARDING_PREFIX),
   ).length;
 }
 
