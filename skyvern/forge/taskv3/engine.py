@@ -199,6 +199,7 @@ async def run_task_v3_agent_loop(
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
+    page_probe: Callable[[], Awaitable[str | None]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -208,7 +209,9 @@ async def run_task_v3_agent_loop(
     `page_fingerprint` sampler is provided, a finish(completed) on an unsettled page IS forced back
     for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
     only. `max_settle_deferrals=0` disables that completed-side re-verification while leaving the
-    failure-evidence gate, which shares the sampler, intact."""
+    failure-evidence gate, which shares the sampler, intact. `page_probe` is a separate sampler (URL
+    plus fingerprint) the loop uses to detect whether a failed batched call moved the page; a
+    page-free run has no page to probe."""
     # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
@@ -319,6 +322,7 @@ async def run_task_v3_agent_loop(
         completion_probe=completion_probe,
         staged_downloads=staged_downloads,
         initial_navigation_status=initial_navigation_status,
+        page_probe=None if page_free else page_probe,
     )
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
