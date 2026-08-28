@@ -103,6 +103,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.entrypoint import (
     anchor_recovers_entrypoint,
     extract_in_turn_entry_url,
+    resolve_turn_entrypoint_url,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -4082,6 +4083,7 @@ async def run_copilot_agent(
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
+    eval_entrypoint_url: str | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4127,6 +4129,7 @@ async def run_copilot_agent(
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=eval_capture_case_id,
                     eval_mode=eval_mode,
+                    eval_entrypoint_url=eval_entrypoint_url,
                 )
                 return result
             except Exception as exc:
@@ -4227,6 +4230,7 @@ async def _run_copilot_turn_impl(
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
+    eval_entrypoint_url: str | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     copilot_config = config_for_eval_mode(copilot_config, eval_mode)
@@ -4438,10 +4442,33 @@ async def _run_copilot_turn_impl(
         chat_request.workflow_yaml or "",
         transcript_anchor,
     )
-    if in_turn_entrypoint is not None:
-        ctx.resolved_discovery_entrypoint_url = in_turn_entrypoint
-    elif ctx.resolved_discovery_entrypoint_url is None:
-        ctx.resolved_discovery_entrypoint_url = anchor_entrypoint or persisted_entrypoint_url
+    ctx.resolved_discovery_entrypoint_url = resolve_turn_entrypoint_url(
+        eval_entrypoint_url=eval_entrypoint_url,
+        in_turn_entrypoint=in_turn_entrypoint,
+        anchor_entrypoint=anchor_entrypoint,
+        persisted_entrypoint_url=persisted_entrypoint_url,
+        current_entrypoint_url=ctx.resolved_discovery_entrypoint_url,
+    )
+    if eval_entrypoint_url:
+        # finalize_observation_context stamps entrypoint_url only on the way out, so the seed
+        # would otherwise first reach the model on turn N+1 and a benchmark case is one turn.
+        raw_context = (safe_global_llm_context or "").strip()
+        seeded_context = StructuredContext.from_json_str(safe_global_llm_context)
+        context_parse_failed = raw_context.startswith("{") and seeded_context.user_goal == raw_context
+        if context_parse_failed:
+            # A seed the model never sees must not still win the ladder, or the turn resolves
+            # seeded while reasoning unseeded. Re-resolve as if no seed had been supplied.
+            LOG.warning("copilot_eval_entrypoint_seed_skipped", reason="unparsed_structured_context")
+            ctx.resolved_discovery_entrypoint_url = resolve_turn_entrypoint_url(
+                eval_entrypoint_url=None,
+                in_turn_entrypoint=in_turn_entrypoint,
+                anchor_entrypoint=anchor_entrypoint,
+                persisted_entrypoint_url=persisted_entrypoint_url,
+                current_entrypoint_url=None,
+            )
+        else:
+            seeded_context.entrypoint_url = eval_entrypoint_url
+            safe_global_llm_context = seeded_context.to_json_str()
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,

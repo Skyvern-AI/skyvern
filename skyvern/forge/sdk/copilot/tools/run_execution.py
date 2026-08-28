@@ -138,6 +138,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RECORDED_FAILURE_RESPONSE_MAX_CHARS
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
@@ -452,7 +453,9 @@ async def _attach_action_traces(
                     if action.response:
                         # Persistence masks registered secrets and parameters; a token the block
                         # obtained at runtime is in neither registry, so screen it here too.
-                        entry["response"] = redact_raw_secrets_for_prompt(action.response)[:300]
+                        entry["response"] = redact_raw_secrets_for_prompt(action.response)[
+                            :RECORDED_FAILURE_RESPONSE_MAX_CHARS
+                        ]
             action_trace.append(entry)
         block_result["action_trace"] = action_trace
 
@@ -2302,7 +2305,11 @@ async def _run_blocks_and_collect_debug(
                     browser_session_id=run_session_id,
                     block_labels=labels_to_execute,
                     block_outputs=block_outputs_to_seed or None,
-                    workflow_override=runtime_workflow,
+                    # The run was created against the dispatch version, so execute that same
+                    # definition: its blocks carry the persisted output-parameter rows. Executing
+                    # the in-memory runtime copy instead registers block outputs against ids that
+                    # were never persisted, and every consumer keyed on the definition drops them.
+                    workflow_override=dispatch_workflow or runtime_workflow,
                     requested_completion_contract=requested_completion_contract,
                 )
             )

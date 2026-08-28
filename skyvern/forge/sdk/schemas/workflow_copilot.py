@@ -181,6 +181,13 @@ class WorkflowCopilotChatRequest(BaseModel):
             "for that run."
         ),
     )
+    eval_entrypoint_url: str | None = Field(
+        None,
+        description=(
+            "Benchmark-only starting URL. Rejected unless the eval setting and the X-Copilot-Eval header "
+            "are both present; never sent by the product."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):

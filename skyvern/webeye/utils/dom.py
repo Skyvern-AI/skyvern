@@ -108,6 +108,53 @@ def is_post_dispatch_click_timeout(
     return "scheduled navigation" in str(exc).lower()
 
 
+def is_pointer_interception_error(exc: BaseException) -> bool:
+    """A Playwright actionability failure whose message names another element receiving the pointer
+    (``intercepts pointer events`` / ``intercepted by another element``). This is the repo's existing
+    interception signature idiom. It deliberately does NOT match detached / not-stable / not-visible /
+    disabled failures, which must retain the normal coordinate/JS fallback chain."""
+    message = str(exc).lower()
+    return "intercepts pointer events" in message or "intercepted by another element" in message
+
+
+# Return candidate text from the actual hit path only when the hit's boundary-child branch is the
+# adjacent preceding element sibling of the option's branch (the captured visible-label / option layout).
+# The boundary text is excluded so a broad container or a same-text following blocker cannot qualify.
+_POINTER_INTERCEPTOR_LOCAL_TEXT_JS = """(element) => {
+  const rect = element.getBoundingClientRect();
+  if (!rect || !Number.isFinite(rect.left) || !Number.isFinite(rect.top)
+      || rect.width <= 0 || rect.height <= 0) return [];
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  if (!hit || hit === element || element.contains(hit)) return [];
+  let boundary = null;
+  let node = element.parentElement;
+  for (let depth = 0; depth < 2 && node; depth++) {
+    if (node === document.documentElement || node === document.body) break;
+    const tag = (node.tagName || "").toLowerCase();
+    if (tag === "html" || tag === "body") break;
+    if (node.contains(hit)) {
+      boundary = node;
+      break;
+    }
+    node = node.parentElement;
+  }
+  if (!boundary) return [];
+  let hitBranch = hit;
+  while (hitBranch && hitBranch.parentElement !== boundary) hitBranch = hitBranch.parentElement;
+  let targetBranch = element;
+  while (targetBranch && targetBranch.parentElement !== boundary) targetBranch = targetBranch.parentElement;
+  if (!hitBranch || !targetBranch || hitBranch === targetBranch
+      || hitBranch.nextElementSibling !== targetBranch) return [];
+  const texts = [];
+  node = hit;
+  for (let depth = 0; node && node !== boundary && depth < 8; depth++) {
+    texts.push(typeof node.innerText === "string" ? node.innerText : node.textContent || "");
+    node = node.parentElement;
+  }
+  return node === boundary ? texts : [];
+}"""
+
+
 async def resolve_locator(
     scrape_page: ScrapedPage,
     page: Page,
@@ -1299,10 +1346,12 @@ class SkyvernElement:
         incremental_page: IncrementalScrapePage | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         engine_selection: BrowserEngineSelection | None = None,
+        intercept_js_fallback_label: str | None = None,
     ) -> None:
         if not await self.wait_until_enabled(timeout=timeout):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
+        pointer_intercepted = False
         try:
             # Route through the active cursor strategy so alternate profiles can
             # dispatch their own click sequence (explicit mouse.down/up).
@@ -1319,6 +1368,7 @@ class SkyvernElement:
                     element_id=self.get_id(),
                 )
                 return
+            pointer_intercepted = is_pointer_interception_error(exc)
 
         if dom is not None:
             # try to click on the blocking element
@@ -1338,6 +1388,25 @@ class SkyvernElement:
                     return
                 LOG.info("Failed to click on the blocking element", exc_info=True, element_id=self.get_id())
 
+        if intercept_js_fallback_label is not None and pointer_intercepted:
+            interceptor_matches_label = False
+            try:
+                await self.scroll_into_view(timeout=timeout)
+                interceptor_matches_label = await self._pointer_interceptor_matches_label(intercept_js_fallback_label)
+            except Exception:
+                interceptor_matches_label = False
+            if interceptor_matches_label:
+                try:
+                    await self.click_in_javascript()
+                    return
+                except Exception:
+                    LOG.info("Failed intercept JS-click fallback", exc_info=True, element_id=self.get_id())
+            else:
+                LOG.info(
+                    "Intercept JS-click fallback skipped: hit target lacks the expected local option label",
+                    element_id=self.get_id(),
+                )
+
         try:
             await self.scroll_into_view(timeout=timeout)
             await self.coordinate_click(page=page, timeout=timeout)
@@ -1352,6 +1421,25 @@ class SkyvernElement:
     async def click_in_javascript(self) -> None:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         await skyvern_frame.click_element_in_javascript(await self.get_element_handler())
+
+    async def _pointer_interceptor_matches_label(self, expected_label: str) -> bool:
+        normalized_expected = " ".join(expected_label.split()).casefold()
+        if not normalized_expected:
+            return False
+        try:
+            result = await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression=_POINTER_INTERCEPTOR_LOCAL_TEXT_JS,
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            return False
+        if not isinstance(result, list):
+            return False
+        return any(
+            isinstance(candidate, str) and " ".join(candidate.split()).casefold() == normalized_expected
+            for candidate in result
+        )
 
     async def coordinate_click(
         self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS, click_count: int = 1

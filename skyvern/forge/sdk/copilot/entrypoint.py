@@ -91,3 +91,22 @@ def anchor_recovers_entrypoint(
     ):
         return None
     return extract_anchor_entry_url(transcript_earliest_user_turn)
+
+
+def resolve_turn_entrypoint_url(
+    *,
+    eval_entrypoint_url: str | None,
+    in_turn_entrypoint: str | None,
+    anchor_entrypoint: str | None,
+    persisted_entrypoint_url: str | None,
+    current_entrypoint_url: str | None,
+) -> str | None:
+    """The benchmark seed outranks in-turn extraction because an instruction that happens to name a
+    domain would otherwise silently beat the dataset URL the run is supposed to start from."""
+    if eval_entrypoint_url:
+        return eval_entrypoint_url
+    if in_turn_entrypoint is not None:
+        return in_turn_entrypoint
+    if current_entrypoint_url is None:
+        return anchor_entrypoint or persisted_entrypoint_url
+    return current_entrypoint_url

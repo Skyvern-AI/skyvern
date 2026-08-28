@@ -856,7 +856,10 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             # 2000 chars ~= 500 LLM tokens — enough for the model to see the
             # overall shape without consuming a meaningful slice of the prompt
             # budget. Over this, point the model at get_block_schema instead.
-            if len(schema_str) > 2000:
+            # get_block_schema is exempt: the schema is what it was called for, and the steering
+            # message names the call that produced it, so truncating here leaves the model no route
+            # to the fields it asked for.
+            if len(schema_str) > 2000 and tool_name != "get_block_schema":
                 data["schema"] = {
                     "_truncated": True,
                     "message": (

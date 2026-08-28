@@ -394,6 +394,24 @@ LOADING_INDICATOR_PROBE_JS = f"""
         return [q(rect.left), q(rect.top), q(rect.width), q(rect.height)];
     }};
 
+    // The broad `[class*="spinner"]` selector (index 0) also matches static <a> links whose class merely
+    // contains "spinner"; treat such an anchor as a non-match unless it is animating or explicitly busy/
+    // status/progressbar/determinate, so it neither blocks readiness nor enters the telemetry count.
+    const isInertAnchorSpinner = (el) => {{
+        try {{
+            if ((el.tagName || '').toLowerCase() !== 'a') return false;
+            if (isAnimated(el)) return false;
+            if (el.getAttribute('aria-busy') === 'true') return false;
+            const role = el.getAttribute('role');
+            if (role === 'status' || role === 'progressbar') return false;
+            const valuenow = el.getAttribute('aria-valuenow');
+            if (valuenow !== null && valuenow !== '' && !isNaN(Number(valuenow))) return false;
+            return true;
+        }} catch (e) {{
+            return false;
+        }}
+    }};
+
     let first = null;
     let count = 0;
     for (let sel = 0; sel < selectors.length; sel++) {{
@@ -401,6 +419,7 @@ LOADING_INDICATOR_PROBE_JS = f"""
             const elements = document.querySelectorAll(selectors[sel]);
             for (const el of elements) {{
                 if (!isVisible(el)) continue;
+                if (sel === 0 && isInertAnchorSpinner(el)) continue;
                 count++;
                 if (first === null) {{
                     try {{

@@ -1005,10 +1005,11 @@ def _transform_args(
 
 def _copilot_to_call_tool_result(
     copilot_result: dict[str, Any],
+    tool_name: str = "",
 ) -> CallToolResult:
     if not copilot_result:
         return CallToolResult(content=[], isError=True)
-    sanitized = sanitize_tool_result_for_llm("", copilot_result)
+    sanitized = sanitize_tool_result_for_llm(tool_name, copilot_result)
     marked = mark_mcp_result_untrusted_for_llm(sanitized)
     content: list[TextContent] = [TextContent(type="text", text=json.dumps(marked))]
     is_error = copilot_result.get("ok", True) is not True
@@ -1307,7 +1308,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 result = _scrub_tool_result(copilot_ctx, result)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
-            return _copilot_to_call_tool_result(result)
+            return _copilot_to_call_tool_result(result, tool_name)
 
         if overlay.pre_hook:
             try:
@@ -1338,7 +1339,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     hook_result = _scrub_tool_result(copilot_ctx, hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
-                return _copilot_to_call_tool_result(hook_result)
+                return _copilot_to_call_tool_result(hook_result, tool_name)
 
         mcp_args = _transform_args(arguments, overlay)
 
@@ -1391,7 +1392,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     err = _scrub_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-                return _copilot_to_call_tool_result(err)
+                return _copilot_to_call_tool_result(err, tool_name)
             if continuity_result is not None:
                 _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
                 if uses_shared_browser_outcome:
@@ -1409,7 +1410,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     continuity_result = _scrub_tool_result(copilot_ctx, continuity_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
-                return _copilot_to_call_tool_result(continuity_result)
+                return _copilot_to_call_tool_result(continuity_result, tool_name)
             mcp_args["session_id"] = copilot_ctx.browser_session_id
         call_browser_session_id = copilot_ctx.browser_session_id if overlay.requires_browser else None
         call_browser_session_generation = copilot_ctx.browser_session_continuity_generation
@@ -1473,7 +1474,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 err = _scrub_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-            return _copilot_to_call_tool_result(err)
+            return _copilot_to_call_tool_result(err, tool_name)
         except CopilotBrowserSessionUnavailable as exc:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
             try:
@@ -1523,7 +1524,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _browser_session_loss_result({}, disposition=disposition),
                 )
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-            return _copilot_to_call_tool_result(err)
+            return _copilot_to_call_tool_result(err, tool_name)
         except asyncio.CancelledError:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
             if uses_shared_browser_outcome:
@@ -1560,7 +1561,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-            return _copilot_to_call_tool_result(err)
+            return _copilot_to_call_tool_result(err, tool_name)
 
         browser_outcome: _BrowserCallOutcome | None = None
         if uses_shared_browser_outcome:
@@ -1676,7 +1677,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 action_relation=ScreenshotActionRelation.TOOL_RESULT,
             ),
         )
-        return _copilot_to_call_tool_result(copilot_result)
+        return _copilot_to_call_tool_result(copilot_result, tool_name)
 
     async def call_internal_tool(
         self,

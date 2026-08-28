@@ -2450,6 +2450,43 @@ async def skyvern_evaluate(
 
     js = _wrap_async_iife(expression)
 
+    current = get_current_session()
+    current_context = getattr(current, "context", None)
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    extension_runtime = BrowserExtensionRuntime.instance()
+    direct_extension_evaluation = (
+        extension_runtime is not None
+        and current_context is not None
+        and current_context.mode == "extension"
+        and cdp_url is None
+        and (session_id is None or session_id == current_context.session_id)
+    )
+    if direct_extension_evaluation and extension_runtime is not None and current_context is not None:
+        browser_context = current_context
+        with Timer() as timer:
+            try:
+                result = await extension_runtime.evaluate(js)
+                timer.mark("extension")
+            except Exception as exc:
+                return make_result(
+                    "skyvern_evaluate",
+                    ok=False,
+                    browser_context=browser_context,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.ACTION_FAILED,
+                        str(exc),
+                        "Select one HTTP(S) tab in Skyvern Controlled and enable Allow User Scripts",
+                    ),
+                )
+        return make_result(
+            "skyvern_evaluate",
+            browser_context=browser_context,
+            data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
+            timing_ms=timer.timing_ms,
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:

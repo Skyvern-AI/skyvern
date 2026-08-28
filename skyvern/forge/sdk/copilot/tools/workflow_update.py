@@ -131,6 +131,8 @@ from .banned_blocks import (
     _copilot_block_authoring_policy,
     _detect_new_banned_blocks,
     _record_banned_block_reject_span,
+    _task_v3_pure_policy_violations,
+    _task_v3_pure_reject_message,
 )
 from .credentials import _credential_id_misbinding_findings, _credential_reference_validation_error
 from .frontier import (
@@ -3977,6 +3979,19 @@ async def _update_workflow(
     # LLM actually saw, not the turn-start persisted state.
     last_yaml = ctx.last_workflow_yaml
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
+        task_v3_pure_violations = _task_v3_pure_policy_violations(workflow_yaml)
+        if task_v3_pure_violations:
+            violation_items = [(violation.label, violation.block_type) for violation in task_v3_pure_violations]
+            _record_banned_block_reject_span("_update_workflow", violation_items)
+            return _blocked(
+                AuthorTimeBlock(
+                    block_id=BANNED_BLOCKS_BLOCK_ID,
+                    error=_task_v3_pure_reject_message(task_v3_pure_violations),
+                    data={"violations": [violation.as_dict() for violation in task_v3_pure_violations]},
+                )
+            )
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the

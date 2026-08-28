@@ -40,10 +40,14 @@ class ToolResult:
     status: ToolStatus
     content: str
     data: dict[str, Any] | None = None
+    # Transient images the loop must show the model on the NEXT call only (the on-demand `look`
+    # tool's annotated screenshot). Threaded into one .call()'s ephemeral screenshots= arg and never
+    # appended to the transcript, so it costs one image on one turn and is gone the turn after.
+    screenshots: list[bytes] | None = None
 
     @classmethod
-    def ok(cls, content: str, data: dict[str, Any] | None = None) -> ToolResult:
-        return cls("ok", content, data)
+    def ok(cls, content: str, data: dict[str, Any] | None = None, screenshots: list[bytes] | None = None) -> ToolResult:
+        return cls("ok", content, data, screenshots)
 
     @classmethod
     def error(cls, content: str, data: dict[str, Any] | None = None) -> ToolResult:
@@ -187,6 +191,19 @@ ACTION_LOOP_TERMINATE_AFTER = 6
 
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
+
+# Hard "the resource does not exist / is gone" HTTP statuses. A navigation landing on one of these is
+# a genuine non-capability dead-end (a dead or removed posting), which v1 routes to `terminated`. Both
+# the in-loop `navigate` tool and the pre-loop initial-URL navigation classify against this set. NARROW
+# on purpose: auth (401/403), rate-limit (429) and transient server errors (5xx) are recoverable or
+# capability failures, not dead-ends, and are left to the model / stay `failed`.
+NAVIGATION_DEAD_END_STATUSES = frozenset({404, 410})
+
+# A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
+# removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
+# verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
+# navigation. Facetable sibling of the prefixes above.
+NAV_DEAD_END_REASON_PREFIX = "navigation_dead_end:"
 
 # Emitted, never acted on, when the oscillation rule WOULD have terminated. The step engine's
 # tripwires (skyvern/forge/sdk/fail_fast/shadow.py) earn the right to act by publishing this event
@@ -558,6 +575,8 @@ def _unblocker_options(available_tools: set[str]) -> list[str]:
         options.append("if the page may be waiting on a verification widget, call solve_captcha")
     if "get_html" in available_tools:
         options.append("take ONE targeted get_html look at the region that should be changing")
+    if "look" in available_tools:
+        options.append("if you can't tell what's on the page or why an action isn't taking, call look to see it")
     options.append("if the goal is already met, call finish(status=completed)")
     options.append("if genuinely blocked, call finish(status=terminated) naming the blocker as the reason")
     return options
@@ -932,6 +951,7 @@ async def run_agent_tool_loop(
     telemetry_salt: str | None = None,
     completion_probe: CompletionProbe | None = None,
     staged_downloads: set[str] | None = None,
+    initial_navigation_status: int | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     # Per run, never logged: the hashes it keys are stable within this run (the only scope any guard
@@ -991,7 +1011,29 @@ async def run_agent_tool_loop(
     total_tokens = 0
     billable_actions: list[str] = []
     action_steps = 0
+    # Images produced by an on-demand `look` this turn, to show the model on the NEXT call only. Passed
+    # as the transient screenshots= arg once, then cleared, so a look costs one image on one turn and
+    # never enters `messages` (the transcript re-seeds message_history each turn, so it's structurally
+    # gone the turn after).
+    pending_screenshots: list[bytes] = []
     started_at = time.monotonic()
+
+    # The task's starting URL is navigated during browser setup, before this loop runs, so a dead/removed
+    # starting posting never routes through the in-loop `navigate` tool — the model just observes the dead
+    # page and finishes (defaulting to failed). Classify that pre-loop navigation here so the dominant
+    # dead-posting case ends `terminated`, matching v1, without waiting on the model's finish discretion.
+    # Cancellation is checked first, exactly as the first loop turn would: a run canceled during setup must
+    # persist as `canceled` (and stay unbilled), not be pre-empted into `terminated` by this fast path.
+    if outcome is None and initial_navigation_status in NAVIGATION_DEAD_END_STATUSES:
+        if should_cancel is not None and await should_cancel():
+            outcome = LoopOutcome("canceled", "run canceled")
+        else:
+            LOG.info("taskv3 loop initial navigation dead end", http_status=initial_navigation_status)
+            outcome = LoopOutcome(
+                "terminated",
+                f"{NAV_DEAD_END_REASON_PREFIX} the task's starting URL returned HTTP {initial_navigation_status} "
+                "— the target no longer exists or has been removed, so the goal cannot be completed there",
+            )
 
     while outcome is None:
         if should_cancel is not None and await should_cancel():
@@ -1019,6 +1061,10 @@ async def run_agent_tool_loop(
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
         _compact_transcript(messages, snapshot_indices)
         llm_caller.message_history = list(messages)
+        # Consume any pending look image into THIS call only, then clear: the image rides one request
+        # and is never appended to `messages`, so the turn after carries zero image blocks.
+        screenshots_for_call = pending_screenshots or None
+        pending_screenshots = []
         # Retry only the LLM call on transient provider errors. No browser tool has run this
         # turn, so re-issuing the same call is side-effect-free — unlike a whole-task retry,
         # which would re-execute prior clicks/types. This restores the step engine's transient
@@ -1034,6 +1080,7 @@ async def run_agent_tool_loop(
                     tools=openai_tools,
                     use_message_history=True,
                     raw_response=True,
+                    screenshots=screenshots_for_call,
                     **active_call_kwargs,
                 )
                 break
@@ -1095,6 +1142,10 @@ async def run_agent_tool_loop(
         stall_nudges_due: list[tuple[str, int]] = []
         action_nudges_due: list[tuple[str, dict[str, Any], int]] = []
         round_actions: list[tuple[str, dict[str, Any], bool]] = []
+        # A hard 404/410 from an in-loop navigate, applied only AFTER the batch so a same-turn fallback
+        # navigate can clear it — the model is told to batch aggressively, and terminating on the first
+        # of a batched [navigate(dead), navigate(live)] would discard the recovery it planned.
+        pending_nav_dead_end: int | None = None
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -1192,6 +1243,12 @@ async def run_agent_tool_loop(
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
+            # A look's annotated screenshot is shown to the model on the next call only, never stored in
+            # the transcript. Consumed and cleared at the top of the next turn. Only the LATEST snapshot
+            # survives: a second look in the same turn supersedes the first (its marks replace the prior
+            # ones), so re-sending the stale image would just hand the model a dead numbering.
+            if result.screenshots:
+                pending_screenshots = list(result.screenshots)
             result_data = result.data or {}
             if progress is not None and observe_summary:
                 invalid_fields = observe_summary.get("invalid_fields")
@@ -1361,6 +1418,16 @@ async def run_agent_tool_loop(
                     _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "completion probe fired")
                     break
 
+            dead_end_status = result_data.get("navigation_dead_end")
+            if dead_end_status is not None:
+                # A hard 404/410 landing is a non-capability dead-end (a dead/removed posting). Remember
+                # it but do NOT break the batch: a later navigate in the same turn can land the run on a
+                # live page and clear it below. Applied once the batch settles (after this for-loop).
+                pending_nav_dead_end = dead_end_status
+            elif result_data.get("page_state_changed"):
+                # A successful navigate moved the run off any dead page seen earlier this batch.
+                pending_nav_dead_end = None
+
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
                 outcome = LoopOutcome(
@@ -1376,6 +1443,17 @@ async def run_agent_tool_loop(
                 # the model re-plans next turn from the error rather than acting on a stale assumption.
                 _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "earlier tool call in this batch failed")
                 break
+
+        # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
+        # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
+        # failed/terminated choice to the model's finish tool (which does not converge on this class).
+        if outcome is None and pending_nav_dead_end is not None:
+            LOG.info("taskv3 loop navigation dead end", http_status=pending_nav_dead_end, turn=turns)
+            outcome = LoopOutcome(
+                "terminated",
+                f"{NAV_DEAD_END_REASON_PREFIX} navigate landed on a dead page (HTTP {pending_nav_dead_end}) — "
+                "the target no longer exists or has been removed, so the goal cannot be completed there",
+            )
 
         # Warn only after the batch completes: a user message may not sit between an assistant
         # turn's tool results, and the model reads it with the snapshot that tripped it.
