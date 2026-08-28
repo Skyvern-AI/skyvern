@@ -575,6 +575,18 @@ class FileDownloadTarget(StrEnum):
     SFTP = "sftp"
 
 
+def _normalize_optional_endpoint_url(value: str | None) -> str | None:
+    """Treat a blank S3 ``endpoint_url`` as absent.
+
+    The editor serializes an unset destination field as ``""`` and a Jinja value can render
+    empty, and botocore raises ``ValueError: Invalid endpoint:`` on an empty endpoint_url
+    instead of falling back to AWS the way an empty ``region_name`` does.
+    """
+    if value is None:
+        return None
+    return value.strip() or None
+
+
 class FileUploadDestination(BaseModel):
     """Customer-storage destination for a single file upload.
 
@@ -592,6 +604,10 @@ class FileUploadDestination(BaseModel):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     aws_region_name: str | None = None
+    endpoint_url: str | None = None
+    # Addresses ``endpoint_url``'s host already resolved to and was cleared against, passed to the
+    # S3 client so a rebinding name cannot be re-answered with an internal address at connect time.
+    endpoint_resolved_ips: tuple[str, ...] | None = None
 
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
@@ -1078,6 +1094,7 @@ class FileUploadBlockYAML(BlockYAML):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    endpoint_url: str | None = None
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
@@ -1097,6 +1114,8 @@ class FileUploadBlockYAML(BlockYAML):
         description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
     )
     path: str | None = None
+
+    _normalize_endpoint_url = field_validator("endpoint_url")(_normalize_optional_endpoint_url)
 
 
 class SendEmailBlockYAML(BlockYAML):
@@ -1261,6 +1280,7 @@ class FileDownloadBlockYAML(BlockYAML):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    endpoint_url: str | None = None
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
@@ -1292,6 +1312,8 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_identifier: str | None = None
     disable_cache: bool = False
     download_timeout: float | None = None
+
+    _normalize_endpoint_url = field_validator("endpoint_url")(_normalize_optional_endpoint_url)
 
 
 class UrlBlockYAML(BlockYAML):

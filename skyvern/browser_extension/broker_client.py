@@ -198,6 +198,17 @@ class BrokerClient:
         self.scoped_tabs.append(snapshot)
         return dict(snapshot)
 
+    async def list_scoped_tabs(self) -> list[dict[str, Any]]:
+        """Return fresh snapshots for tabs leased to this client."""
+        await self.start()
+        result = await self._control_request("lease.list", {}, 5.0)
+        raw_tabs = result.get("tabs")
+        if not isinstance(raw_tabs, list):
+            raise BrowserExtensionBrokerError("INVALID_FRAME", "Broker tab list is invalid")
+        tabs = _tab_snapshots(raw_tabs)
+        self.scoped_tabs = tabs
+        return [dict(tab) for tab in tabs]
+
     async def release_tab(self, tab_id: int) -> None:
         """Release one leased tab according to the broker's authoritative origin."""
         await self.start()
@@ -931,11 +942,14 @@ def _tab_snapshots(tabs: list[object]) -> list[dict[str, Any]]:
 def _tab_snapshot(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict) or type(value.get("tabId")) is not int:
         return None
-    return {
+    snapshot: dict[str, Any] = {
         "tabId": value["tabId"],
         "url": value.get("url") if isinstance(value.get("url"), str) else "",
         "title": value.get("title") if isinstance(value.get("title"), str) else "",
     }
+    if type(value.get("active")) is bool:
+        snapshot["active"] = value["active"]
+    return snapshot
 
 
 def _startup_error_message(code: str) -> str:

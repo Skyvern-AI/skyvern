@@ -33,6 +33,10 @@ import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import {
+  type WorkflowRunMilestoneCardProps,
+  usePageSlots,
+} from "@/store/PageSlots";
 import { cn, isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
@@ -89,6 +93,7 @@ type RunViewProps = {
   runIdPending?: boolean;
   onFix?: (seedMessage?: string, failingLabel?: string | null) => void;
   onRetry?: () => void;
+  milestoneRerun?: WorkflowRunMilestoneCardProps["rerun"];
 };
 
 function isRunOutputError(value: unknown): value is RunOutputError {
@@ -199,7 +204,9 @@ export function RunView({
   runIdPending = false,
   onFix,
   onRetry,
+  milestoneRerun,
 }: RunViewProps) {
+  const { workflowRunMilestoneCard: WorkflowRunMilestoneCard } = usePageSlots();
   const { runId: pathRunId } = useParams();
   const queryOptions = workflowRunId ? { workflowRunId } : undefined;
   // isLoading here, not isPending like RunTab: this query is enabled only once a run
@@ -717,6 +724,16 @@ export function RunView({
             </button>
           </div>
         </Alert>
+      ) : null}
+      {WorkflowRunMilestoneCard &&
+      runPaneOpen &&
+      !runIsPlaceholder &&
+      workflowRun.workflow_run_id === workflowRunId &&
+      workflowRun.status === Status.Completed ? (
+        <WorkflowRunMilestoneCard
+          workflowRunId={workflowRun.workflow_run_id}
+          rerun={milestoneRerun}
+        />
       ) : null}
 
       {view === "timeline" ? (

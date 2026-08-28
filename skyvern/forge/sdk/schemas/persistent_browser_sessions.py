@@ -97,6 +97,7 @@ class PersistentBrowserSession(BaseModel):
     completed_at: datetime | None = None
     last_activity_at: datetime | None = None
     close_requested_at: datetime | None = None
+    cdp_unreachable_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

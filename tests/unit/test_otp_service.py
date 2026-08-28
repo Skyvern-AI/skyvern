@@ -14,7 +14,7 @@ from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificati
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.workflow.context_manager import _CREDENTIAL_PARAMETER_TYPES
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
     WorkflowParameter,
@@ -1735,11 +1735,9 @@ def _ordinary_workflow_parameter(key: str) -> WorkflowParameter:
 class _FakeWorkflowRunContext:
     """Stub mirroring WorkflowRunContext shape (values/secrets/parameters) for TOTP lookup.
 
-    ``parameters`` maps each key to a real Parameter model so
-    ``is_registered_credential_parameter_key`` exercises the same
-    ``_CREDENTIAL_PARAMETER_TYPES`` isinstance check as production. When omitted,
-    every values key is registered as a real credential parameter (the shape the
-    original credential-selection tests assume).
+    ``parameters`` maps each key to a real Parameter model. When omitted, every values key is
+    registered as a real credential parameter (the shape the original credential-selection
+    tests assume).
     """
 
     def __init__(
@@ -1754,8 +1752,8 @@ class _FakeWorkflowRunContext:
             parameters = {key: _credential_parameter(key) for key in values}
         self.parameters = parameters
 
-    def is_registered_credential_parameter_key(self, key: str) -> bool:
-        return isinstance(self.parameters.get(key), _CREDENTIAL_PARAMETER_TYPES)
+    # Borrow the real implementation so this stub cannot drift from production.
+    is_registered_credential_parameter_key = WorkflowRunContext.is_registered_credential_parameter_key
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"

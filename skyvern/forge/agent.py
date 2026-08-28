@@ -80,6 +80,7 @@ from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
+    calculate_sha256_for_file,
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
     list_files_in_directory,
@@ -917,6 +918,23 @@ class ForgeAgent:
         ]
         if not files_to_rename:
             return []
+        # A persistent-session download lands in the session dir and, for blob: URLs, is also written to
+        # the run dir by the eager carve-out; dedupe the session copy by content so FileUploadBlock uploads
+        # one file, not two (SKY-14276). Seed the snapshot only from local paths newly discovered for this
+        # task (the eager carve-out copies) — never from baseline files already present before the task, or
+        # a new session download that happens to share bytes with a baseline would be wrongly dropped. With
+        # no s3://, gs:// candidate nothing consults the snapshot, so no local file is hashed either.
+        run_dir_checksums: set[str] = set()
+        if any(file.startswith(("s3://", "gs://")) for file in files_to_rename):
+            for local_file in files_to_rename:
+                if local_file.startswith(("s3://", "gs://")):
+                    continue
+                try:
+                    run_dir_checksums.add(calculate_sha256_for_file(local_file))
+                except OSError:
+                    # A listed file that can't be read (vanished mid-finalization, permissions) just
+                    # doesn't participate in dedupe — fail open toward materializing, never toward dropping.
+                    continue
         for file in files_to_rename:
             local_file_name = file
             if file.startswith(("s3://", "gs://")):
@@ -926,6 +944,10 @@ class ForgeAgent:
                     file_data = await get_gcs_client().download_file(file, log_exception=False)
                 if not file_data:
                     continue
+                candidate_checksum = hashlib.sha256(file_data).hexdigest()
+                if candidate_checksum in run_dir_checksums:
+                    continue
+                run_dir_checksums.add(candidate_checksum)
                 local_file_name = file.split("/")[-1]
                 with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
                     f.write(file_data)
@@ -1318,7 +1340,7 @@ class ForgeAgent:
             extraction_shape_matches,
             validate_and_fill_extraction_result,
         )
-        from skyvern.forge.taskv3.auth_tools import build_auth_tools
+        from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
@@ -1328,6 +1350,7 @@ class ForgeAgent:
             taskv3_runaway_backstops,
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
+        from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import pending_marker
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
@@ -1403,7 +1426,9 @@ class ForgeAgent:
                     step=step,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                     terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-                    navigation_payload_str=json.dumps(parameters) if parameters else "{}",
+                    # A separate masking pass from engine.py's; only the boolean route decision survives it,
+                    # so nothing needs these opaque_url_ tokens to match the ones the engine later mints.
+                    navigation_payload_str=json.dumps(mask_opaque_urls(parameters).masked) if parameters else "{}",
                     error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
                     local_datetime=datetime.now(context.tz_info if context else None).isoformat(),
                 )
@@ -1790,7 +1815,10 @@ class ForgeAgent:
             # must see the pinned key, or a multi-credential context hides get_verification_code.
             # No page provider in page-free mode: the sign-in-link tool navigates, and a run that
             # structurally never touches the live DOM must not be offered it.
-            auth_tools, auth_guidance = build_auth_tools(task, None if page_free_validation else _page_provider)
+            verification_state = VerificationState()
+            auth_tools, auth_guidance = build_auth_tools(
+                task, None if page_free_validation else _page_provider, state=verification_state
+            )
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
             # Withheld in page-free mode: like browser_tools, a page-operating tool must not be offered
@@ -1836,6 +1864,12 @@ class ForgeAgent:
                 completion_blocker=completion_blocker,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
+                verification_blocker=verification_state.block_completion,
+                # Only for a bare task, where setup navigated this browser_state to task.url and the
+                # status unambiguously belongs to the starting posting. A workflow block reuses the
+                # browser_state across blocks, so its last status may be a prior block's — skip it there
+                # and let the in-loop `navigate` classifier cover block-driven dead-ends.
+                initial_navigation_status=(browser_state.last_navigation_status if task_block is None else None),
             )
         finally:
             if context and credential_parameter_key is not None:
@@ -3199,6 +3233,9 @@ class ForgeAgent:
                 page=current_page,
                 action=action,
                 file_download_false_click_eligible=file_download_false_click_eligible,
+                # Only actions after the first can be stale: an earlier action in this same batch
+                # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
+                allow_stale_refresh=action_idx > 0,
             )
             await app.AGENT_FUNCTION.post_action_execution(action)
             detailed_agent_step_output.actions_and_results[action_idx] = (
@@ -4901,6 +4938,10 @@ class ForgeAgent:
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
         if pre_resolved_browser_state is not None:
             browser_state = pre_resolved_browser_state
+            # An inherited browser_state was NOT navigated to this task's url here, so its
+            # last_navigation_status belongs to an earlier navigation, not this task's starting URL.
+            # Clear it so the Task V3 loop never reads a stale status as this run's starting-URL dead-end.
+            browser_state.last_navigation_status = None
         elif workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,

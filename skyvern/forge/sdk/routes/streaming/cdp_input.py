@@ -38,10 +38,10 @@ from skyvern.webeye.navigation import revalidate_redirect_chain, validate_naviga
 
 LOG = structlog.get_logger()
 
-_LATENCY_BUCKETS_SECONDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.045, 0.06, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
 _INPUT_KIND_LABELS = frozenset(
     {"mouseEvent", "keyEvent", "wheelEvent", "navigateEvent", "goBackEvent", "goForwardEvent", "reloadEvent"}
 )
+_LATENCY_BUCKETS_SECONDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.045, 0.06, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
 _meter = metrics.get_meter("skyvern.live_view")
 _input_wait_seconds = _meter.create_histogram(
     "skyvern.live_view.input_wait_seconds",

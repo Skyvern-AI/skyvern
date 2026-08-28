@@ -87,6 +87,7 @@ function makeContext(
     state: DEFAULT_STATE,
     isLoading: false,
     updateState: vi.fn(),
+    updateStateConfirmed: vi.fn(),
     isNewUser: false,
     abVariant: null,
     recoveryGuidanceAssignment: null,

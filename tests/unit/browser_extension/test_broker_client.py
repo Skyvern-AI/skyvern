@@ -107,6 +107,33 @@ class EventRelay:
         return None
 
 
+class TabListRelay(EventRelay):
+    async def request(
+        self,
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "tabs.list":
+            if on_registered is not None:
+                on_registered()
+            if on_terminal is not None:
+                on_terminal()
+            return {"tabs": [dict(tab) for tab in self.scoped_tabs]}
+        return await super().request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+
 class ErrorRelay(EventRelay):
     async def request(
         self,
@@ -222,6 +249,40 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
             old_generation,
         )
         assert client.connected
+    finally:
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_client_lists_fresh_tabs_owned_by_its_lease() -> None:
+    server = BrowserExtensionBrokerServer(19778)
+    relay = TabListRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
+    try:
+        await _eventually(lambda: client.connected)
+        relay.scoped_tabs = [
+            {"tabId": 11, "url": "https://one.test", "active": True},
+            {"tabId": 12, "url": "https://two.test", "active": False},
+        ]
+        assert (await client.ensure_root_lease())["tabId"] == relay.scoped_tabs[0]["tabId"]
+        await client.request("tabs.activate", {"tabId": 12})
+
+        relay.scoped_tabs = [
+            {"tabId": 11, "url": "https://one.test", "active": False},
+            {"tabId": 12, "url": "https://two.test", "active": True},
+            {"tabId": 13, "url": "https://other-client.test", "active": False},
+        ]
+
+        expected_tabs = [
+            {"tabId": 11, "url": "https://one.test", "title": "", "active": False},
+            {"tabId": 12, "url": "https://two.test", "title": "", "active": True},
+        ]
+        assert await client.list_scoped_tabs() == expected_tabs
+        assert client.scoped_tabs == expected_tabs
     finally:
         await client.stop()
         await asyncio.wait_for(server_task, 1.0)

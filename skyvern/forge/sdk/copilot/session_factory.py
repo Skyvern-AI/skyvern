@@ -23,6 +23,7 @@ from skyvern.forge.sdk.agents.context import (
     pair_tool_calls_with_outputs,
     replace_agent_message_field,
 )
+from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
@@ -38,6 +39,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
     is_synthetic_user_message,
     log_recent_tool_output_truncation,
     pending_screenshot_message,
+)
+from skyvern.forge.sdk.copilot.model_input_capture import (
+    clear_pending_model_input_capture,
+    register_pending_model_input_capture,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     PendingFrameLease,
@@ -240,6 +245,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
     includes page text and tool results, so writing takes both an explicit path and a local
     environment rather than the path alone.
     """
+    clear_pending_model_input_capture()
     dump_dir = os.getenv("COPILOT_DUMP_MODEL_INPUTS")
     if not dump_dir or settings.ENV != "local":
         return
@@ -255,6 +261,12 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         target.mkdir(parents=True, exist_ok=True)
         payload = {
             "capture_case_id": getattr(ctx, "eval_capture_case_id", None),
+            "eval_mode": getattr(ctx, "eval_mode", None),
+            "ordered_native_tool_names": list(getattr(ctx, "eval_native_tool_names", ())),
+            "ordered_mcp_tool_names": list(getattr(ctx, "eval_mcp_tool_names", ())),
+            "prompt_sha256": (
+                prompt_sha256(model_data.instructions) if isinstance(model_data.instructions, str) else None
+            ),
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,
@@ -269,6 +281,11 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         if parameters:
             serialized = app.AGENT_FUNCTION.redact_codeblock_parameter_values(serialized, parameters)
         path.write_text(serialized if isinstance(serialized, str) else "")
+        register_pending_model_input_capture(
+            path=path,
+            payload=payload,
+            redaction_parameters=parameters,
+        )
     except Exception:
         LOG.warning("Failed to dump copilot model input")
 

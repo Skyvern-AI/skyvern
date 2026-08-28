@@ -1,5 +1,6 @@
 import { BridgeConnection } from "./bridge_connection.js";
 import { DebuggerRouter } from "./debugger_router.js";
+import { evaluateDom } from "./dom_router.js";
 import {
   ERROR_CODES,
   EVENTS,
@@ -49,6 +50,7 @@ const handlers = new Map([
   [OPS.DEBUGGER_ATTACH, (args) => debuggerRouter.attach(args)],
   [OPS.DEBUGGER_DETACH, (args) => debuggerRouter.detach(args)],
   [OPS.DEBUGGER_SEND, (args) => debuggerRouter.send(args)],
+  [OPS.DOM_EVALUATE, (args) => evaluateDom(tabScope, args)],
   [OPS.TABS_CREATE, (args) => tabScope.create(args)],
   [OPS.TABS_REMOVE, (args) => tabScope.remove(args)],
   [OPS.TABS_ACTIVATE, (args) => tabScope.activate(args)],

@@ -115,6 +115,29 @@ async def test_navigation_accepts_public_caller_destination(
     assert all(thread_id != event_loop_thread for thread_id in resolver_threads)
 
 
+@pytest.mark.parametrize("http_status", [200, 404, 410])
+@pytest.mark.asyncio
+async def test_navigate_to_url_records_last_navigation_status(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+    http_status: int,
+) -> None:
+    # The Task V3 loop reads last_navigation_status to classify a dead/removed starting URL, so a
+    # navigation must record the final response's HTTP status on the state (not leave it unset).
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+    url = "https://public.example.test/path"
+    response = SimpleNamespace(status=http_status, request=SimpleNamespace(url=url, redirected_from=None))
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=response)
+
+    await browser_state.navigate_to_url(page=page, url=url)
+
+    assert browser_state.last_navigation_status == http_status
+
+
 @pytest.mark.asyncio
 async def test_navigate_to_url_accepts_allowed_loopback_destination(
     browser_state: RealBrowserState,

@@ -315,6 +315,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   prompt?: string | null;
   s3_bucket?: string | null;
   region_name?: string | null;
+  endpoint_url?: string | null;
   aws_access_key_id?: string | null;
   aws_secret_access_key?: string | null;
   azure_storage_account_name?: string | null;
@@ -380,6 +381,7 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   storage_type: string;
   s3_bucket: string;
   region_name: string;
+  endpoint_url?: string | null;
   aws_access_key_id: string;
   aws_secret_access_key: string;
   azure_storage_account_name?: string | null;

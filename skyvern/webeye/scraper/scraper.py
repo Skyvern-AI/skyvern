@@ -235,6 +235,29 @@ def hash_element(element: dict) -> str:
     return calculate_sha256(element_string)
 
 
+def structural_identity(element: dict) -> str:
+    """Position-independent structural signature of an element: what it IS (tag, attributes, text,
+    descendant shape), not WHERE it is. Unlike ``hash_element`` it also drops ``xpath`` and ``frame``
+    recursively, so a control that a preceding action remounted at a new DOM position -- losing its
+    injected ``unique_id`` and shifting its tag-name xpath -- still matches its pre-remount identity
+    when its semantic content is unchanged. Genuinely volatile identity (e.g. an auto-generated
+    ``rc_select_<n>`` id) is deliberately NOT normalized away: a control whose only distinguishing
+    signal is volatile has no stable identity and must fail closed rather than be guessed at.
+    """
+
+    def strip(node: dict) -> dict:
+        cleaned = {
+            key: value for key, value in node.items() if key not in {"id", "rect", "frame_index", "xpath", "frame"}
+        }
+        if "attributes" in node:
+            cleaned["attributes"] = {key: value for key, value in node["attributes"].items() if key != SKYVERN_ID_ATTR}
+        if "children" in node:
+            cleaned["children"] = [strip(child) for child in node["children"] if isinstance(child, dict)]
+        return cleaned
+
+    return calculate_sha256(json.dumps(strip(element), sort_keys=True))
+
+
 def build_element_dict(
     elements: list[dict],
 ) -> tuple[dict[str, str], dict[str, dict], dict[str, str], dict[str, str], dict[str, list[str]]]:

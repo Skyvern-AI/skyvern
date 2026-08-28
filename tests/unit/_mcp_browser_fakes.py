@@ -22,7 +22,7 @@ def make_real_wait_for_timeout() -> AsyncMock:
 
 
 def make_session_state(**overrides: Any) -> SessionState:
-    state = SessionState()
+    state = SessionState(tab_state_persists=True)
     for key, value in overrides.items():
         setattr(state, key, value)
     return state

@@ -113,6 +113,7 @@ function FileDownloadEditorBody({
     awsAccessKeyId,
     awsSecretAccessKey,
     regionName,
+    endpointUrl,
     azureStorageAccountName,
     azureStorageAccountKey,
     azureBlobContainerName,
@@ -268,6 +269,18 @@ function FileDownloadEditorBody({
                 nodeId={blockId}
                 onChange={(value) => update({ regionName: value })}
                 value={regionName as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="(Optional) Endpoint URL"
+              help={helpTooltips["fileDownload"]["endpoint_url"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ endpointUrl: value })}
+                value={endpointUrl as string}
+                placeholder="https://storage.example.com"
                 className="nopan text-xs"
               />
             </DestinationField>

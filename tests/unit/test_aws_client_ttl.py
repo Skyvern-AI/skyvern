@@ -1,12 +1,20 @@
 import asyncio
 import contextlib
+import datetime
+import ssl
 import time
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
+from aiohttp import web
 from botocore.exceptions import ClientError, ProfileNotFound
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from skyvern.forge.sdk.api import aws
 
@@ -343,6 +351,161 @@ async def test_get_object_info_retries_on_expired_token():
             mock_refresh.assert_called_once()
             assert mock_head.call_count == 2
             assert result == {"ContentLength": 42}
+
+
+@pytest.mark.parametrize("endpoint_url", ["", "   "], ids=["empty", "whitespace"])
+@pytest.mark.asyncio
+async def test_blank_endpoint_url_falls_back_to_aws(endpoint_url: str) -> None:
+    """A blank endpoint must behave like an unset one.
+
+    Workflow blocks can carry endpoint_url="" from the editor or from a template that renders
+    empty, and botocore raises "Invalid endpoint:" rather than defaulting to AWS the way an
+    empty region_name does.
+    """
+    client = aws.AsyncAWSClient(
+        aws_access_key_id="AKIA-test",
+        aws_secret_access_key="secret-test",
+        region_name="us-east-1",
+        endpoint_url=endpoint_url,
+    )
+
+    assert client._endpoint_url is None
+    async with client._s3_client() as s3_client:
+        assert s3_client.meta.endpoint_url == "https://s3.amazonaws.com"
+
+
+@pytest.mark.asyncio
+async def test_pinned_resolver_refuses_hosts_other_than_the_endpoint() -> None:
+    """A connector shares one resolver, so anything but the pinned host must fail closed."""
+    resolver = aws._PinnedIPResolver("storage.example.com", ("198.51.100.7",))
+
+    resolved = await resolver.resolve("storage.example.com", 443)
+    assert [entry["host"] for entry in resolved] == ["198.51.100.7"]
+    # Echoing the requested name back is the resolver contract. It is not what makes TLS verify
+    # against the hostname — aiohttp takes that from the request URL.
+    assert resolved[0]["hostname"] == "storage.example.com"
+
+    with pytest.raises(OSError):
+        await resolver.resolve("attacker.example.com", 443)
+
+
+def test_no_connector_config_without_pinned_ips() -> None:
+    """The default AWS path must not have its connector altered."""
+    assert aws.AsyncAWSClient()._config is None
+    assert aws.AsyncAWSClient(endpoint_url="https://storage.example.com")._config is None
+
+
+@pytest.mark.asyncio
+async def test_resolved_ips_pin_the_connection_and_preserve_the_host_header() -> None:
+    """The S3 client dials the validated address instead of re-resolving the name.
+
+    ``pinned.invalid`` never resolves, so reaching the local server at all proves the
+    connection went to the pinned IP rather than through DNS.
+    """
+    seen: list[str | None] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        seen.append(request.headers.get("Host"))
+        return web.Response(status=200)
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    try:
+        port = site._server.sockets[0].getsockname()[1]
+        client = aws.AsyncAWSClient(
+            aws_access_key_id="AKIA-test",
+            aws_secret_access_key="secret-test",
+            region_name="us-east-1",
+            endpoint_url=f"http://pinned.invalid:{port}",
+            endpoint_resolved_ips=("127.0.0.1",),
+        )
+        async with client._s3_client() as s3_client:
+            await s3_client.put_object(Bucket="bucket", Key="k.txt", Body=b"hello")
+    finally:
+        await runner.cleanup()
+
+    assert seen == [f"pinned.invalid:{port}"]
+
+
+def _self_signed_cert(directory: Path, hostname: str) -> tuple[Path, Path]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        # The SAN deliberately omits 127.0.0.1, so verification can only succeed if the
+        # hostname (not the pinned IP) was used as the TLS identity.
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = directory / "cert.pem"
+    key_path = directory / "key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path
+
+
+@pytest.mark.asyncio
+async def test_pinned_connection_verifies_tls_against_the_hostname(tmp_path: Path) -> None:
+    """Certificate verification must bind to the hostname, not the pinned IP.
+
+    Cloud requires https, so this is the production path. The hostname binding is aiohttp's
+    behaviour, taken from the request URL, so this guards a dependency contract: an upgrade
+    that changed SNI handling to follow the connected address would fail verification for
+    every real customer endpoint, and nothing else in the suite would notice.
+    """
+    hostname = "pinned.invalid"
+    cert_path, key_path = _self_signed_cert(tmp_path, hostname)
+    seen: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        seen.append(request.headers.get("Host", ""))
+        return web.Response(text="ok")
+
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert_path, key_path)
+    app = web.Application()
+    app.router.add_get("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0, ssl_context=server_ctx)
+    await site.start()
+    try:
+        port = site._server.sockets[0].getsockname()[1]
+        # Trust only this cert; verification stays fully on.
+        client_ctx = ssl.create_default_context(cafile=str(cert_path))
+        connector = aiohttp.TCPConnector(
+            resolver=aws._PinnedIPResolver(hostname, ("127.0.0.1",)),
+            ssl=client_ctx,
+        )
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(f"https://{hostname}:{port}/") as response:
+                assert response.status == 200
+                assert await response.text() == "ok"
+
+            # A different host must fail closed rather than fall back to real DNS.
+            with pytest.raises(aiohttp.ClientError):
+                await session.get(f"https://example.com:{port}/")
+    finally:
+        await runner.cleanup()
+
+    assert seen == [f"{hostname}:{port}"]
 
 
 @pytest.mark.asyncio

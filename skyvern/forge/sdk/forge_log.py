@@ -428,6 +428,8 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
             event_dict["browser_session_id"] = context.browser_session_id
         if getattr(context, "copilot_session_id", None):
             event_dict["copilot_session_id"] = context.copilot_session_id
+        if getattr(context, "codeblock_execution_path", None):
+            event_dict["codeblock_execution_path"] = context.codeblock_execution_path
         if getattr(context, "browser_container_ip", None):
             event_dict["browser_container_ip"] = context.browser_container_ip
         if getattr(context, "browser_container_task_arn", None):

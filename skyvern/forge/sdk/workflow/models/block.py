@@ -49,7 +49,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
@@ -99,10 +99,13 @@ from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
+    classify_download_visibility,
+    download_dir_path_for_run,
     download_file,
     get_download_dir,
     get_path_for_workflow_download_directory,
     is_remote_url,
+    observe_download_dir,
     parse_uri_to_path,
     resolve_local_or_download_file,
     resolve_run_download_id,
@@ -194,6 +197,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
+    RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     RecordingPage,
     json_safe_recorder_output,
     user_code_line_from_exception,
@@ -236,12 +240,14 @@ from skyvern.schemas.workflows import (
     FileType,
     FileUploadDestination,
     _direct_code_block_error_code_raises,
+    _normalize_optional_endpoint_url,
     _validate_code_block_error_code_calls,
     _validate_code_block_error_code_mapping,
 )
 from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
@@ -4026,7 +4032,7 @@ def _code_block_failure_action(*, failing_line: int | None, action_order: int, r
         status=ActionStatus.failed,
         action_order=action_order,
         description=f"code error at line {failing_line}" if failing_line else "code error",
-        response=response[:500],
+        response=response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS],
         output={"code_line": failing_line},
     )
 
@@ -4424,7 +4430,11 @@ def _code_block_build_class(func: Any, name: str, /, *bases: Any, metaclass: Any
 _DOWNLOAD_CLAIM_TIMEOUT_SECONDS = 60
 _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS = 10
 _DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS = 15
+_DOWNLOAD_CLAIM_EVIDENCE_TIMEOUT_SECONDS = 10
 _DOWNLOAD_CLAIM_FALLBACK_STEM = "downloaded_file"
+
+DownloadEvidenceProbe = Callable[[], Awaitable[tuple[list[FileInfo] | None, set[str]]]]
+_DownloadIdentity = tuple[str | None, str | None]
 
 
 def _download_monitor_owns_binding(page: Page | RecordingPage) -> bool:
@@ -4438,6 +4448,46 @@ def _download_monitor_owns_binding(page: Page | RecordingPage) -> bool:
     return interceptor.is_monitoring_browser_downloads()
 
 
+async def _registered_download_identities(
+    download_evidence: DownloadEvidenceProbe | None,
+) -> dict[_DownloadIdentity, str] | None:
+    """Registered downloads keyed by an identity two reads agree on, or ``None`` when registration
+    could not be read — never proof that nothing arrived. The probe re-runs registration, so it is
+    bounded here rather than left to spend its own minutes-long budget on a failing claim."""
+    if download_evidence is None:
+        return None
+    try:
+        async with asyncio.timeout(_DOWNLOAD_CLAIM_EVIDENCE_TIMEOUT_SECONDS):
+            registered, _ = await download_evidence()
+    except Exception:
+        LOG.warning("Code block download claim could not read registration evidence", exc_info=True)
+        return None
+    if registered is None:
+        return None
+    return {(file_info.filename, file_info.checksum): file_info.filename or "" for file_info in registered}
+
+
+async def _newly_registered_download_name(
+    download_evidence: DownloadEvidenceProbe | None,
+    registered_before_click: dict[_DownloadIdentity, str] | None,
+) -> str | None:
+    """The name of a file this click registered, or ``None`` when no new registration can be proven.
+
+    A block that downloaded earlier already has registered files, so only a delta is evidence that
+    the click delivered anything."""
+    if registered_before_click is None:
+        return None
+    registered_after_click = await _registered_download_identities(download_evidence)
+    if registered_after_click is None:
+        return None
+    new_names = sorted(
+        name for identity, name in registered_after_click.items() if identity not in registered_before_click and name
+    )
+    if not new_names:
+        return None
+    return normalize_download_filename(new_names[0]) or _DOWNLOAD_CLAIM_FALLBACK_STEM
+
+
 async def _code_block_click_and_claim_download_builtin(
     page: Page | RecordingPage,
     selector: str,
@@ -4445,6 +4495,7 @@ async def _code_block_click_and_claim_download_builtin(
     organization_id: str | None = None,
     workflow_run_id: str | None = None,
     download_binding: DownloadBinding | None = None,
+    download_evidence: DownloadEvidenceProbe | None = None,
 ) -> str:
     """Click ``selector`` once and confirm the browser download it fires, returning the sanitized
     suggested filename as a summary.
@@ -4462,6 +4513,13 @@ async def _code_block_click_and_claim_download_builtin(
     if not resolved_selector:
         raise CodeBlockDownloadClaimError("click_and_claim_download requires the selector of the affordance to click.")
     click_error: BaseException | None = None
+    # Only a binding whose delivery this page cannot observe can reach the grace branch below, so
+    # the extra registration read is taken for those claims alone.
+    registered_before_click = (
+        await _registered_download_identities(download_evidence)
+        if download_binding is DownloadBinding.SESSION_DIR or _download_monitor_owns_binding(page)
+        else None
+    )
     # A provider-owned session delivers the bytes on its own connection, so this page may never see
     # the event at all (SKY-11371). Wait briefly for one rather than spending the full window on an
     # event that is not this binding's proof of delivery.
@@ -4489,21 +4547,30 @@ async def _code_block_click_and_claim_download_builtin(
             engaged=False,
             binding=download_binding.value,
             monitor_owns_binding=claim_monitor_owns_binding,
-            clicked=click_error is None,
+            click_completed_without_error=click_error is None,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
+        delivered_name = (
+            await _newly_registered_download_name(download_evidence, registered_before_click)
+            if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding
+            else None
+        )
         if click_error is not None:
-            # A selector that no longer matches is a page failure, not a download that failed to
-            # fire. Re-raise Playwright's own error so the healing path still recognises its type.
-            raise click_error
+            if delivered_name is None:
+                # A selector that no longer matches is a page failure, not a download that failed to
+                # fire. Re-raise Playwright's own error so the healing path still recognises its type.
+                raise click_error
+            # The click did not return, but this binding's writer registered a file it started, so
+            # failing here would fail a download that arrived.
+            return delivered_name
         if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding:
             # The click landed, and this binding's delivery belongs to the session watcher or to the
             # monitor -- which denies browser-native downloads and fetches the bytes itself, so no
             # Download event need ever reach this page. Failing here would fail a download that
             # succeeded; the execution layer still reports an unregistered intent when nothing
             # arrives.
-            return _DOWNLOAD_CLAIM_FALLBACK_STEM
+            return delivered_name or _DOWNLOAD_CLAIM_FALLBACK_STEM
         raise CodeBlockDownloadClaimError("Clicking the affordance did not fire a browser download.") from exc
 
     monitor_owns_binding = _download_monitor_owns_binding(page)
@@ -4543,6 +4610,7 @@ def _bind_code_block_download_claim(
     organization_id: str | None,
     workflow_run_id: str | None,
     download_binding: DownloadBinding | None,
+    download_evidence: DownloadEvidenceProbe | None = None,
 ) -> Callable[[Page | RecordingPage, str], Awaitable[str]]:
     """Two-argument closure rather than a `partial`: keyword
     defaults on a `partial` would let block code override the run identity it is bound to."""
@@ -4554,6 +4622,7 @@ def _bind_code_block_download_claim(
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             download_binding=download_binding,
+            download_evidence=download_evidence,
         )
 
     return click_and_claim_download
@@ -4702,6 +4771,7 @@ class CodeBlock(Block):
         workflow_run_block_id: str | None = None,
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
+        download_evidence: DownloadEvidenceProbe | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -4745,6 +4815,7 @@ class CodeBlock(Block):
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             download_binding=download_binding,
+            download_evidence=download_evidence,
         )
         parameter_defaults: dict[str, Any] = {}
         if parameters:
@@ -4997,7 +5068,87 @@ async def wrapper({default_args}):
                 exc_info=True,
             )
 
+    def _bind_download_evidence_probe(
+        self,
+        *,
+        engine: str,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        session_bound: bool,
+        resolved_download_id: str | None,
+    ) -> DownloadEvidenceProbe:
+        """The claim's read of what this run has registered, on the same authority the binding
+        verdict consults — the claim never scans a directory of its own."""
+
+        async def probe() -> tuple[list[FileInfo] | None, set[str]]:
+            return await self._register_downloaded_files(
+                engine=engine,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                session_bound=session_bound,
+                download_run_id=resolved_download_id,
+            )
+
+        return probe
+
     async def _register_downloaded_files(
+        self,
+        *,
+        engine: str,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        session_bound: bool = False,
+        download_run_id: str | None = None,
+        download_binding_kind: str | None = None,
+    ) -> tuple[list[FileInfo] | None, set[str]]:
+        """Register downloads, recording what the registered directory held on either side.
+
+        Bracketed here rather than in one engine's dispatch so the record is not engine-biased,
+        for the same reason the unregistered-intent signal is emitted from every engine.
+        """
+        listed_run_id = download_run_id or workflow_run_id
+        listed_dir = download_dir_path_for_run(listed_run_id)
+        alt_dir = download_dir_path_for_run(workflow_run_id) if listed_run_id != workflow_run_id else None
+        pre = observe_download_dir(listed_dir)
+        alt_pre = observe_download_dir(alt_dir) if alt_dir is not None else None
+        try:
+            return await self._register_downloaded_files_inner(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                session_bound=session_bound,
+                download_run_id=download_run_id,
+            )
+        finally:
+            with contained_effect(
+                "download registration visibility",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            ):
+                LOG.info(
+                    "codeblock.download_registration_visibility",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    engine=engine,
+                    boundary="register",
+                    session_bound=session_bound,
+                    **classify_download_visibility(
+                        pre=pre,
+                        settled=None,
+                        post=observe_download_dir(listed_dir),
+                        alt_pre=alt_pre,
+                        alt_post=observe_download_dir(alt_dir) if alt_dir is not None else None,
+                        listed_run_id=listed_run_id,
+                        workflow_run_id=workflow_run_id,
+                        download_binding_kind=download_binding_kind,
+                    ),
+                )
+
+    async def _register_downloaded_files_inner(
         self,
         *,
         organization_id: str | None,
@@ -6060,6 +6211,7 @@ async def wrapper({default_args}):
         resolved_download_id: str | None,
         download_dir_before: set[tuple[str, int, int]] | None,
         session_bound: bool,
+        download_binding_kind: str | None = None,
         result: dict[str, Any] | list | str | None = None,
     ) -> dict[str, Any] | None:
         """Registration evidence for a block that failed after a download already landed.
@@ -6096,6 +6248,8 @@ async def wrapper({default_args}):
             needs_registration = bool(new_names & before_names) or not new_names.issubset(registered_names)
         if needs_registration:
             downloaded_files, skipped_file_names = await self._register_downloaded_files(
+                engine=engine,
+                download_binding_kind=download_binding_kind,
                 organization_id=organization_id or workflow_run_context.organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
@@ -6161,6 +6315,7 @@ async def wrapper({default_args}):
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
                     session_bound=session_download_lane_active(browser_state),
+                    download_binding_kind=download_binding_of(browser_state).value,
                     result=output_parameter_value,
                 )
                 or output_parameter_value
@@ -6243,6 +6398,8 @@ async def wrapper({default_args}):
                     # directory (SKY-13694's completed-with-null arm).
                     try:
                         downloaded_files, skipped_file_names = await self._register_downloaded_files(
+                            engine="inline",
+                            download_binding_kind=download_binding_of(browser_state).value,
                             organization_id=organization_id or workflow_run_context.organization_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
@@ -6303,6 +6460,7 @@ async def wrapper({default_args}):
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
                         session_bound=session_download_lane_active(browser_state),
+                        download_binding_kind=download_binding_of(browser_state).value,
                         result=result.output_parameter_value,
                     )
                     if failure_output is not None:
@@ -6879,6 +7037,14 @@ async def wrapper({default_args}):
 
         try:
             await recorder.link_block()
+            download_evidence = self._bind_download_evidence_probe(
+                engine="secure_runner" if use_codeblock_runner else "inline",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                session_bound=session_download_lane_active(browser_state),
+                resolved_download_id=resolved_download_id,
+            )
             if use_codeblock_runner:
                 secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
                     block=self,
@@ -6892,6 +7058,7 @@ async def wrapper({default_args}):
                     recording_page=recording_page,
                     download_run_id=resolved_download_id,
                     download_binding=download_binding_of(browser_state),
+                    download_evidence=download_evidence,
                 )
                 LOG.info(
                     "Secure CodeBlock override returned",
@@ -7045,6 +7212,8 @@ async def wrapper({default_args}):
                             or not secure_new_names.issubset(secure_registered_names)
                         ):
                             host_files, secure_skipped_file_names = await self._register_downloaded_files(
+                                engine="secure_runner",
+                                download_binding_kind=download_binding_of(browser_state).value,
                                 organization_id=organization_id or workflow_run_context.organization_id,
                                 workflow_run_id=workflow_run_id,
                                 workflow_run_block_id=workflow_run_block_id,
@@ -7104,6 +7273,16 @@ async def wrapper({default_args}):
                     workflow_run_block_id=workflow_run_block_id,
                     block_label=self.label,
                 )
+                # The downgraded block now runs inline, so a probe still labelled secure_runner
+                # would file this run's registrations under the engine that declined it.
+                download_evidence = self._bind_download_evidence_probe(
+                    engine="inline",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    session_bound=session_download_lane_active(browser_state),
+                    resolved_download_id=resolved_download_id,
+                )
             user_function = self.generate_async_user_function(
                 self.code,
                 recording_page,
@@ -7113,6 +7292,7 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 download_run_id=resolved_download_id,
                 download_binding=download_binding_of(browser_state),
+                download_evidence=download_evidence,
             )
             try:
                 result = await self.execute_user_function_with_timeout(
@@ -7218,6 +7398,7 @@ async def wrapper({default_args}):
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
                         session_bound=session_download_lane_active(browser_state),
+                        download_binding_kind=download_binding_of(browser_state).value,
                         result=failure_output,
                     )
                     if download_aware_failure_output is None:
@@ -7291,7 +7472,7 @@ async def wrapper({default_args}):
                 recorded.append(
                     _code_block_failure_action(
                         action_order=len(recorded),
-                        response=(failure_reason or "")[:500],
+                        response=failure_reason or "",
                         failing_line=failing_line,
                     )
                 )
@@ -7332,6 +7513,7 @@ async def wrapper({default_args}):
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
                         session_bound=session_download_lane_active(browser_state),
+                        download_binding_kind=download_binding_of(browser_state).value,
                     ),
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
@@ -7372,6 +7554,8 @@ async def wrapper({default_args}):
 
             try:
                 downloaded_files, skipped_file_names = await self._register_downloaded_files(
+                    engine="inline",
+                    download_binding_kind=download_binding_of(browser_state).value,
                     organization_id=organization_id or workflow_run_context.organization_id,
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
@@ -8194,6 +8378,7 @@ class FileDestinationBlock(Block):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    endpoint_url: str | None = None
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
@@ -8221,6 +8406,8 @@ class FileDestinationBlock(Block):
         ),
     )
 
+    _normalize_endpoint_url = field_validator("endpoint_url")(_normalize_optional_endpoint_url)
+
     def _get_destination_parameters(self, workflow_run_context: WorkflowRunContext) -> list[PARAMETER_TYPE]:
         parameters = []
 
@@ -8238,6 +8425,9 @@ class FileDestinationBlock(Block):
 
         if self.aws_secret_access_key and workflow_run_context.has_parameter(self.aws_secret_access_key):
             parameters.append(workflow_run_context.get_parameter(self.aws_secret_access_key))
+
+        if self.endpoint_url and workflow_run_context.has_parameter(self.endpoint_url):
+            parameters.append(workflow_run_context.get_parameter(self.endpoint_url))
 
         if self.azure_storage_account_name and workflow_run_context.has_parameter(self.azure_storage_account_name):
             parameters.append(workflow_run_context.get_parameter(self.azure_storage_account_name))
@@ -8297,6 +8487,10 @@ class FileDestinationBlock(Block):
         if self.aws_secret_access_key:
             self.aws_secret_access_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.aws_secret_access_key, workflow_run_context
+            )
+        if self.endpoint_url:
+            self.endpoint_url = self.format_block_parameter_template_from_workflow_run_context(
+                self.endpoint_url, workflow_run_context
             )
         if self.azure_storage_account_name:
             self.azure_storage_account_name = self.format_block_parameter_template_from_workflow_run_context(
@@ -8412,12 +8606,57 @@ class FileDestinationBlock(Block):
             f"https://{azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
         )
 
+    async def _resolve_validated_s3_endpoint(self) -> tuple[str | None, tuple[str, ...] | None]:
+        """Normalize and SSRF-check a customer-supplied S3-compatible endpoint.
+
+        Mirrors the SFTP/SMTP siblings: resolve the customer-supplied host, refuse private,
+        loopback, link-local, and metadata targets, and return the validated addresses so the
+        S3 client dials those instead of re-resolving a name that could rebind. The hostname
+        stays the TLS and ``Host`` identity, so SigV4 signing is unaffected.
+
+        Returns ``(None, None)`` when unset, which routes to AWS S3.
+        """
+        endpoint_url = _normalize_optional_endpoint_url(self.endpoint_url)
+        if endpoint_url is None:
+            return None, None
+
+        parsed = urlparse(endpoint_url)
+        host = parsed.hostname
+        if settings.ALLOW_S3_ENDPOINT_INTERNAL_HOSTS:
+            # Self-hosted deployments point at an object store on their own network, which is
+            # commonly plaintext; the operator has accepted both risks by enabling this.
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError("S3 endpoint_url must be an http:// or https:// URL")
+            if not host:
+                raise ValueError("S3 endpoint_url must include a hostname")
+            return endpoint_url, None
+
+        if parsed.scheme != "https":
+            raise ValueError(
+                "S3 endpoint_url must be an https:// URL: plaintext http would put the request "
+                "signature on the wire in cleartext and is rejected by the upload proxy"
+            )
+        if not host:
+            raise ValueError("S3 endpoint_url must include a hostname")
+
+        try:
+            resolved_ips = await asyncio.to_thread(resolve_fetch_host_ips, host)
+        except UnresolvableHost:
+            raise ValueError(f"S3 endpoint_url host could not be resolved: {host}") from None
+        except BlockedHost:
+            raise ValueError(
+                f"S3 endpoint_url host resolves to a private or internal address, which is not allowed: {host}"
+            ) from None
+        return endpoint_url, resolved_ips
+
     def _build_s3_destination(
         self,
         workflow_run_id: str,
         file_path: str,
         aws_access_key_id: str | None,
         aws_secret_access_key: str | None,
+        endpoint_url: str | None,
+        endpoint_resolved_ips: tuple[str, ...] | None,
     ) -> FileUploadDestination:
         s3_uri = self._get_s3_uri(workflow_run_id, file_path)
         # ``_get_s3_uri`` returns ``s3://{bucket}/{key}`` — split it back out for
@@ -8433,6 +8672,8 @@ class FileDestinationBlock(Block):
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             aws_region_name=self.region_name,
+            endpoint_url=endpoint_url,
+            endpoint_resolved_ips=endpoint_resolved_ips,
         )
 
     def _build_azure_destination(
@@ -8534,12 +8775,15 @@ class FileDestinationBlock(Block):
                 or not actual_aws_secret_access_key.strip()
             ):
                 raise ValueError("S3 is not configured: resolved AWS credentials are empty")
+            endpoint_url, endpoint_resolved_ips = await self._resolve_validated_s3_endpoint()
             for file_path in files_to_upload:
                 destination = self._build_s3_destination(
                     workflow_run_id=workflow_run_id,
                     file_path=file_path,
                     aws_access_key_id=actual_aws_access_key_id,
                     aws_secret_access_key=actual_aws_secret_access_key,
+                    endpoint_url=endpoint_url,
+                    endpoint_resolved_ips=endpoint_resolved_ips,
                 )
                 customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
                     file_path=file_path,

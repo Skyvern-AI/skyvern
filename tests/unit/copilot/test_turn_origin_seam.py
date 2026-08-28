@@ -214,16 +214,10 @@ async def test_self_heal_mcp_session_preserves_adopted_working_page_when_not_las
 
 
 @pytest.mark.asyncio
-async def test_ensure_browser_session_prefix_guard_never_looks_up_selfheal_in_persistent_store(
+async def test_ensure_browser_session_prefix_guard_never_resolves_a_selfheal_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
-
-    monkeypatch.setattr(
-        runtime,
-        "_get_persistent_browser_session",
-        AsyncMock(side_effect=AssertionError("selfheal ids must not reach persistent lookup")),
-    )
 
     created = SimpleNamespace(persistent_browser_session_id="pbs_created")
     ready_state = SimpleNamespace(browser_context=_FakeBrowserContext())
@@ -240,6 +234,7 @@ async def test_ensure_browser_session_prefix_guard_never_looks_up_selfheal_in_pe
     assert result is None
     assert ctx.browser_session_id == "pbs_created"
     manager.create_session.assert_awaited_once()
+    assert all(call.kwargs.get("session_id") != "selfheal:wr_old" for call in manager.get_browser_state.await_args_list)
 
 
 @pytest.mark.asyncio

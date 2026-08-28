@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import socket
 import time
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
@@ -12,6 +13,8 @@ from urllib.parse import urlparse
 
 import aioboto3
 import structlog
+from aiobotocore.config import AioConfig
+from aiohttp.abc import AbstractResolver, ResolveResult
 from botocore.exceptions import ClientError, ProfileNotFound
 
 from skyvern.config import settings
@@ -62,6 +65,47 @@ class AWSSessionConfigurationError(RuntimeError):
     pass
 
 
+class _PinnedIPResolver(AbstractResolver):
+    """Resolve ``pinned_host`` only to already-validated IPs, and refuse every other name.
+
+    A connector shares one resolver across every host it dials, so answering unconditionally
+    would misroute any other name (a redirect, say) to the pinned addresses. Anything but
+    ``pinned_host`` therefore fails closed rather than falling back to real DNS, which would
+    reopen the rebinding window this exists to close.
+
+    aiohttp takes TLS SNI, certificate verification, and the ``Host`` header from the request
+    URL rather than from anything returned here, so redirecting the connection to an IP leaves
+    SigV4 signing and virtual-host bucket addressing untouched. The ``hostname`` field below is
+    the resolver contract's echo of the name asked for, not the TLS identity.
+    """
+
+    def __init__(self, pinned_host: str, resolved_ips: tuple[str, ...]) -> None:
+        self._pinned_host = pinned_host.strip().lower().rstrip(".")
+        self._resolved_ips = resolved_ips
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        if host.strip().lower().rstrip(".") != self._pinned_host:
+            raise OSError(f"{host} is not the validated S3 endpoint host")
+        return [
+            ResolveResult(
+                hostname=host,
+                host=ip,
+                port=port,
+                family=socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                proto=0,
+                flags=socket.AI_NUMERICHOST | socket.AI_NUMERICSERV,
+            )
+            for ip in self._resolved_ips
+        ]
+
+    async def close(self) -> None:
+        # One instance is shared by every client this AsyncAWSClient builds; a connector
+        # closing its resolver must not disarm the pin for the next client.
+        return None
+
+
 class AsyncAWSClient:
     def __init__(
         self,
@@ -70,12 +114,22 @@ class AsyncAWSClient:
         region_name: str | None = None,
         endpoint_url: str | None = None,
         profile_name: str | None = None,
+        endpoint_resolved_ips: tuple[str, ...] | None = None,
     ) -> None:
         self.region_name = region_name or settings.AWS_REGION
-        self._endpoint_url = endpoint_url
+        # An empty endpoint_url must behave like an unset one: botocore raises
+        # "ValueError: Invalid endpoint:" on "", and callers can reach here with a field that
+        # was serialized empty or rendered empty from a template.
+        self._endpoint_url = (endpoint_url or "").strip() or None
         self._aws_access_key_id = aws_access_key_id
         self._aws_secret_access_key = aws_secret_access_key
         self._profile_name = profile_name
+        pinned_host = urlparse(self._endpoint_url).hostname if self._endpoint_url else None
+        self._config = (
+            AioConfig(connector_args={"resolver": _PinnedIPResolver(pinned_host, endpoint_resolved_ips)})
+            if endpoint_resolved_ips and pinned_host
+            else None
+        )
         self._session: aioboto3.Session | None = None
         self._session_created_at: float = 0.0
 
@@ -191,27 +245,30 @@ class AsyncAWSClient:
 
     def _ecs_client(self) -> ECSClient:
         return self._get_session(AWSClientType.ECS).client(
-            AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url
+            AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url, config=self._config
         )
 
     def _secrets_manager_client(self) -> SecretsManagerClient:
         return self._get_session(AWSClientType.SECRETS_MANAGER).client(
-            AWSClientType.SECRETS_MANAGER, region_name=self.region_name, endpoint_url=self._endpoint_url
+            AWSClientType.SECRETS_MANAGER,
+            region_name=self.region_name,
+            endpoint_url=self._endpoint_url,
+            config=self._config,
         )
 
     def _s3_client(self) -> S3Client:
         return self._get_session(AWSClientType.S3).client(
-            AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url
+            AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url, config=self._config
         )
 
     def _ec2_client(self) -> EC2Client:
         return self._get_session(AWSClientType.EC2).client(
-            AWSClientType.EC2, region_name=self.region_name, endpoint_url=self._endpoint_url
+            AWSClientType.EC2, region_name=self.region_name, endpoint_url=self._endpoint_url, config=self._config
         )
 
     def _batch_client(self) -> BatchClient:
         return self._get_session(AWSClientType.BATCH).client(
-            AWSClientType.BATCH, region_name=self.region_name, endpoint_url=self._endpoint_url
+            AWSClientType.BATCH, region_name=self.region_name, endpoint_url=self._endpoint_url, config=self._config
         )
 
     def _create_tag_string(self, tags: dict[str, str]) -> str:

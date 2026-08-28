@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     NO_PERSISTED_END_URL,
+    RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     _attach_action_traces,
     _attach_failed_block_screenshots,
     _dispatched_end_url,
@@ -728,7 +729,55 @@ class TestAttachActionTraces:
 
         await _attach_action_traces([block], [result], "org-1")
 
-        assert len(result["action_trace"][0]["response"]) == 300
+        assert len(result["action_trace"][0]["response"]) == RECORDED_FAILURE_RESPONSE_MAX_CHARS
+
+    @pytest.mark.asyncio
+    async def test_a_call_log_keeps_the_lines_naming_what_blocked_the_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verbatim output from a real Playwright click blocked by an overlay, where the cause
+        is in the trailing lines. Cut those and what survives reads like a bad locator, so the
+        model repairs the selector instead of dismissing the overlay."""
+        call_log = (
+            "TimeoutError: Locator.click: Timeout 3000ms exceeded.\n"
+            "Call log:\n"
+            '  - waiting for locator("#grid label.size--will-restock").first\n'
+            '    - locator resolved to <label data-i="0" class="size size--will-restock">s0</label>\n'
+            "  - attempting click action\n"
+            "    2 × waiting for element to be visible, enabled and stable\n"
+            "      - element is visible, enabled and stable\n"
+            "      - scrolling into view if needed\n"
+            "      - done scrolling\n"
+            "      - <div></div> intercepts pointer events\n"
+            "    - retrying click action\n"
+            "    - waiting 20ms\n"
+            "    2 × waiting for element to be visible, enabled and stable\n"
+            "      - element is visible, enabled and stable\n"
+            "      - scrolling into view if needed\n"
+            "      - done scrolling\n"
+            "      - <div></div> intercepts pointer events\n"
+            "    - retrying click action\n"
+            "      - waiting 100ms\n"
+        )
+        assert len(call_log) > 500
+
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "add_to_cart", "status": "failed"}
+        actions = [
+            self._make_action("task-1", "click", "failed", None, None, response=call_log, output={"code_line": 18})
+        ]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        projected = result["action_trace"][0]["response"]
+        assert "locator resolved to" in projected
+        assert "element is visible, enabled and stable" in projected
+        assert "intercepts pointer events" in projected
 
     @pytest.mark.asyncio
     async def test_a_non_recorder_failed_action_keeps_its_response_out_of_the_trace(

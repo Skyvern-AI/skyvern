@@ -532,6 +532,36 @@ def _snapshot_from_ctx(ctx: SimpleNamespace, run_id: str) -> RunEvidenceSnapshot
     )
 
 
+def test_independent_post_run_snapshot_removes_singular_selector_recommendation() -> None:
+    ctx = _producer_ctx()
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_current",
+        "source_tool": "inspect_page_for_composition",
+        "clickable_controls": [
+            {
+                "text": "Star",
+                "selector": "button.auth-state",
+                "selector_match_count": 1,
+                "selector_candidates": [
+                    {"selector": "button.auth-state", "source": "class", "match_count": 1},
+                    {"selector": 'button[data-action="star"]', "source": "data_action", "match_count": 1},
+                ],
+            }
+        ],
+    }
+
+    snapshot = _snapshot_from_ctx(ctx, "wr_current")
+    control = snapshot.block_outputs["post_run_page_observation"]["clickable_controls"][0]
+
+    assert "selector" not in control
+    assert "selector_match_count" not in control
+    assert control["selector_candidates"] == [
+        {"selector": "button.auth-state", "source": "class"},
+        {"selector": 'button[data-action="star"]', "source": "data_action"},
+    ]
+
+
 def test_pre_run_baseline_provenance_valid_for_scout_evidence() -> None:
     assert run_execution_module._pre_run_baseline_is_provenance_valid({"visible_text_excerpt": "a form"}) is True
 
@@ -803,7 +833,7 @@ async def test_dispatched_packet_carries_forms_and_result_containers(monkeypatch
     assert any(control.get("type") == "submit" for control in forms[0]["submit_controls"])
     containers = packet["result_containers"]
     assert containers
-    assert any(container.get("selector") for container in containers)
+    assert any(container.get("selector_candidates") for container in containers)
 
 
 @pytest.mark.asyncio

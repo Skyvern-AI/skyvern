@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
@@ -37,9 +38,10 @@ def _make_mock_browser(*pages: MagicMock) -> MagicMock:
 
 
 def _make_session_state(browser: MagicMock | None = None) -> SessionState:
-    """Create a SessionState with tab management fields."""
+    """Create a SessionState retained by a caller, as the stdio/global and copilot paths do."""
     state = SessionState()
     state.browser = browser
+    state.tab_state_persists = True
     return state
 
 
@@ -85,6 +87,28 @@ async def test_tab_list_returns_all_tabs(monkeypatch: pytest.MonkeyPatch) -> Non
     assert tabs[1]["url"] == "https://b.com"
     assert tabs[1]["is_active"] is False
     assert result["data"]["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_tab_list_answers_within_its_bound_when_a_page_title_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _never_returns() -> str:
+        await asyncio.sleep(3600)
+        return "Slow"
+
+    hanging = _make_mock_page("https://slow.com", "Slow")
+    hanging.title = _never_returns
+    browser = _make_mock_browser(hanging)
+
+    ctx = BrowserContext(mode="local")
+    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=hanging), ctx)))
+    _patch_session(monkeypatch, _make_session_state(browser))
+    monkeypatch.setattr(mcp_tabs, "TAB_TITLE_TIMEOUT_SECONDS", 0.05)
+
+    result = await asyncio.wait_for(mcp_tabs.skyvern_tab_list(), timeout=5)
+
+    assert result["ok"] is True
+    assert result["data"]["tabs"][0]["title"] == ""
+    assert result["data"]["tabs"][0]["url"] == "https://slow.com"
 
 
 @pytest.mark.asyncio
@@ -297,10 +321,12 @@ async def test_tab_switch_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _make_session_state(browser)
     _patch_session(monkeypatch, state)
 
+    active_before = state._active_page
     result = await mcp_tabs.skyvern_tab_switch(tab_id="nonexistent")
 
     assert result["ok"] is False
     assert result["error"]["code"] == "INVALID_INPUT"
+    assert state._active_page is active_before
 
 
 # ═══════════════════════════════════════════════════
@@ -582,33 +608,59 @@ class TestResolveTab:
 
 
 # ═══════════════════════════════════════════════════
-# Stateless HTTP mode guards
+# Session-ownership guards
 # ═══════════════════════════════════════════════════
 
 
-class TestStatelessModeGuards:
-    """Tab tools that rely on session state must reject stateless HTTP mode."""
+class TestTabStatePersistenceGuards:
+    """Tab tools that mutate session state refuse a caller whose state dies with the call."""
 
     @pytest.mark.asyncio
-    async def test_tab_switch_rejects_stateless(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
+    async def test_tab_switch_rejects_per_request_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session_manager.set_stateless_http_mode(True)
+        _patch_get_page(monkeypatch, _make_mock_page(), BrowserContext(mode="cloud_session", session_id="pbs_req"))
         result = await mcp_tabs.skyvern_tab_switch(tab_id="123")
         assert result["ok"] is False
         assert result["error"]["code"] == "ACTION_FAILED"
 
     @pytest.mark.asyncio
-    async def test_tab_close_rejects_stateless(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
+    async def test_tab_close_rejects_per_request_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session_manager.set_stateless_http_mode(True)
+        _patch_get_page(monkeypatch, _make_mock_page(), BrowserContext(mode="cloud_session", session_id="pbs_req"))
         result = await mcp_tabs.skyvern_tab_close()
         assert result["ok"] is False
         assert result["error"]["code"] == "ACTION_FAILED"
 
     @pytest.mark.asyncio
-    async def test_tab_wait_for_new_rejects_stateless(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
+    async def test_tab_wait_for_new_rejects_per_request_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session_manager.set_stateless_http_mode(True)
+        _patch_get_page(monkeypatch, _make_mock_page(), BrowserContext(mode="cloud_session", session_id="pbs_req"))
         result = await mcp_tabs.skyvern_tab_wait_for_new()
         assert result["ok"] is False
         assert result["error"]["code"] == "ACTION_FAILED"
+
+    @pytest.mark.asyncio
+    async def test_tab_switch_allows_registered_copilot_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page_a = _make_mock_page("https://a.com", "A")
+        page_b = _make_mock_page("https://b.com", "B")
+        owned = SessionState(browser=_make_mock_browser(page_a, page_b), organization_id="org_tabs")
+        session_manager.set_stateless_http_mode(True)
+        session_manager.register_copilot_session("pbs_tabs", owned, organization_id="org_tabs")
+        ctx = BrowserContext(mode="cloud_session", session_id="pbs_tabs")
+
+        async def _get_page_installing_registered(**_kwargs: object) -> tuple[SimpleNamespace, BrowserContext]:
+            session_manager.set_current_session(owned)
+            return SimpleNamespace(page=page_a), ctx
+
+        monkeypatch.setattr(mcp_tabs, "get_page", _get_page_installing_registered)
+        try:
+            result = await mcp_tabs.skyvern_tab_switch(tab_id=str(id(page_b)))
+        finally:
+            session_manager.unregister_copilot_session("pbs_tabs", organization_id="org_tabs")
+
+        assert result["ok"] is True
+        assert owned.tab_state_persists is True
+        assert owned._active_page is page_b
 
 
 # ═══════════════════════════════════════════════════

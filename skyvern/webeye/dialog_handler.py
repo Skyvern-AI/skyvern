@@ -14,8 +14,24 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.browser_action_preflight import preflight_dialog_response
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.webeye.browser_errors import is_target_closed_message
 
 LOG = structlog.get_logger()
+
+_DIALOG_GONE_MESSAGE_MARKER = "no dialog is showing"
+
+
+def _is_dialog_gone_error(exc: BaseException) -> bool:
+    """Whether the dialog was already gone by the time we answered it — the page navigated, closed,
+    or something else dismissed it first.
+
+    Matched on message text rather than exception class: the deployed driver is patchright, whose
+    error type is not the ``playwright.async_api`` one this module imports, so a class-based
+    ``except`` would silently miss every one of these.
+    """
+    message = str(exc)
+    return _DIALOG_GONE_MESSAGE_MARKER in message.lower() or is_target_closed_message(message)
+
 
 # Track contexts that already have a dialog handler to avoid duplicate registration
 # when the same BrowserContext is returned by CDP reconnect paths.
@@ -32,7 +48,8 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     For alert and beforeunload dialogs, always accepts without calling the LLM.
     For confirm/prompt dialogs with no task context, auto-accepts (no LLM round-trip needed).
     For confirm/prompt dialogs with task context, calls the secondary LLM handler to decide.
-    Falls back to accept on any error (safer than dismiss for form submissions).
+    Falls back to accept on any decision error (safer than dismiss for form submissions), except
+    when the dialog itself is already gone — nothing is answerable then.
 
     ``page`` is the page this handler was registered on — the dialog's originating page. Every
     response this handler gives except an alert's (which has no alternative) routes through
@@ -85,69 +102,82 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
         else:
             await dialog.accept(prompt_text)
 
-    # Alert (no choice to preflight) auto-accepts directly; beforeunload accept commits a pending
-    # navigation, so its acceptance goes through the choke point.
-    if dialog_type == "alert":
-        log.info("Dialog auto-accepted", dialog_type=dialog_type)
-        await dialog.accept()
-        return
-    if dialog_type == "beforeunload":
-        log.info("Dialog auto-accepted", dialog_type=dialog_type)
-        await _respond("accept")
-        return
-
-    if not navigation_goal and not navigation_payload:
-        log.info("Dialog auto-accepted (no task context)", dialog_type=dialog_type)
-        await _respond("accept", default_value or "")
-        return
-
-    # For confirm/prompt with task context, call LLM to decide
+    # Answering races the page, and every response path below can lose it. This runs as a pyee
+    # listener, so an escaping error lands in asyncio's default exception handler at error level
+    # with none of the context bound above; the race is an expected outcome, everything else is not.
     try:
-        prompt = prompt_engine.load_prompt(
-            "handle-dialog",
-            dialog_type=dialog_type,
-            dialog_message=dialog_message,
-            default_value=default_value,
-            navigation_goal=navigation_goal,
-            navigation_payload=json.dumps(navigation_payload) if navigation_payload else None,
-        )
+        # Alert (no choice to preflight) auto-accepts directly; beforeunload accept commits a
+        # pending navigation, so its acceptance goes through the choke point.
+        if dialog_type == "alert":
+            log.info("Dialog auto-accepted", dialog_type=dialog_type)
+            await dialog.accept()
+            return
+        if dialog_type == "beforeunload":
+            log.info("Dialog auto-accepted", dialog_type=dialog_type)
+            await _respond("accept")
+            return
 
-        # JS dialogs block the page's JS thread while open. We need a hard timeout
-        # to ensure the page doesn't stay frozen indefinitely if the LLM call is slow.
-        response = await asyncio.wait_for(
-            get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
-                prompt=prompt,
-                prompt_name="handle-dialog",
-                organization_id=organization_id,
-            ),
-            timeout=DIALOG_LLM_TIMEOUT,
-        )
+        if not navigation_goal and not navigation_payload:
+            log.info("Dialog auto-accepted (no task context)", dialog_type=dialog_type)
+            await _respond("accept", default_value or "")
+            return
 
-        action = str(response.get("action", "accept")).lower()
-        prompt_text = response.get("prompt_text")
+        # For confirm/prompt with task context, call LLM to decide
+        try:
+            prompt = prompt_engine.load_prompt(
+                "handle-dialog",
+                dialog_type=dialog_type,
+                dialog_message=dialog_message,
+                default_value=default_value,
+                navigation_goal=navigation_goal,
+                navigation_payload=json.dumps(navigation_payload) if navigation_payload else None,
+            )
 
-        if action not in ("accept", "dismiss"):
-            log.warning("Dialog LLM returned unexpected action, defaulting to accept", llm_action=action)
-            action = "accept"
+            # JS dialogs block the page's JS thread while open. We need a hard timeout
+            # to ensure the page doesn't stay frozen indefinitely if the LLM call is slow.
+            response = await asyncio.wait_for(
+                get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+                    prompt=prompt,
+                    prompt_name="handle-dialog",
+                    organization_id=organization_id,
+                ),
+                timeout=DIALOG_LLM_TIMEOUT,
+            )
 
-        log.info(
-            "Dialog handled via LLM",
-            action=action,
-            has_prompt_text=prompt_text is not None,
-        )
+            action = str(response.get("action", "accept")).lower()
+            prompt_text = response.get("prompt_text")
 
-        if action == "dismiss":
-            await _respond("dismiss")
-        else:
-            await _respond("accept", prompt_text if prompt_text is not None else (default_value or ""))
+            if action not in ("accept", "dismiss"):
+                log.warning("Dialog LLM returned unexpected action, defaulting to accept", llm_action=action)
+                action = "accept"
 
-    except asyncio.TimeoutError:
-        log.warning("Dialog LLM call timed out, falling back to accept")
-        await _respond("accept", default_value or "")
+            log.info(
+                "Dialog handled via LLM",
+                action=action,
+                has_prompt_text=prompt_text is not None,
+            )
 
-    except Exception:
-        log.exception("Dialog handler error, falling back to accept")
-        await _respond("accept", default_value or "")
+            if action == "dismiss":
+                await _respond("dismiss")
+            else:
+                await _respond("accept", prompt_text if prompt_text is not None else (default_value or ""))
+
+        except asyncio.TimeoutError:
+            log.warning("Dialog LLM call timed out, falling back to accept")
+            await _respond("accept", default_value or "")
+
+        except Exception as exc:
+            # A dialog that is already gone cannot be answered, so the fallback accept would both
+            # overrule a deliberate dismissal and raise a second time. Let the guard below name it.
+            if _is_dialog_gone_error(exc):
+                raise
+            log.exception("Dialog handler error, falling back to accept")
+            await _respond("accept", default_value or "")
+
+    except Exception as exc:
+        if not _is_dialog_gone_error(exc):
+            raise
+        log.warning("Dialog was gone before it could be answered", error=str(exc))
 
 
 def set_dialog_handler(browser_context: BrowserContext) -> None:

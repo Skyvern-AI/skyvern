@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -28,9 +28,14 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    PendingAction,
     RecordingPage,
 )
-from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
+from skyvern.forge.sdk.workflow.models.code_block_recording import (
+    CONTROL_ENDPOINT_PROBE_INTERVAL_SECONDS,
+    MAX_CONTROL_ENDPOINT_PROBES,
+    CodeBlockActionRecording,
+)
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -43,6 +48,7 @@ from skyvern.webeye.actions.actions import (
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 _RECORDING_PATH = "skyvern.forge.sdk.workflow.models.code_block_recording.app"
+_RECORDING_MODULE = "skyvern.forge.sdk.workflow.models.code_block_recording"
 
 
 def _has_playwright_chromium() -> bool:
@@ -501,3 +507,121 @@ async def test_real_playwright_stalled_calls_emit_pending_facts(monkeypatch: pyt
     pending = [log for log in logs if log["event"] == "codeblock.page_call_still_pending"]
     assert [log["call_name"] for log in pending] == ["page.goto", "page.wait_for_url", "locator.click"]
     assert {log["workflow_run_block_id"] for log in pending} == {"wrb_1"}
+
+
+@pytest.mark.asyncio
+async def test_repeated_failures_do_not_pile_probes_onto_a_suspect_browser() -> None:
+    # During the wedge every subsequent capture also fails; unbounded probing would pile
+    # fresh CDP attaches onto the browser already suspected of being unresponsive. The
+    # interval, not the cap, is what stops a burst.
+    page = SimpleNamespace(
+        url="https://example.com/",
+        screenshot=AsyncMock(side_effect=TimeoutError("Page.screenshot: Timeout exceeded")),
+        is_closed=lambda: False,
+    )
+    scheduled = MagicMock()
+    recording = _recording(page)
+
+    with (
+        patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", AsyncMock()),
+        patch(f"{_RECORDING_MODULE}.schedule_control_endpoint_diagnostics", scheduled),
+    ):
+        for _ in range(4):
+            await recording._recorded_action_sink(Action(action_type=ActionType.CLICK))
+
+    assert scheduled.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_database_error_does_not_probe_the_browser() -> None:
+    # Only a failed capture says anything about the browser; probe fields under this message
+    # are read as browser evidence, so a database blip must not manufacture them.
+    page = SimpleNamespace(url="https://example.com/", screenshot=AsyncMock(), is_closed=lambda: False)
+    scheduled = MagicMock()
+    recording = _recording(page)
+    recording._workflow_run_block = None
+
+    with (
+        patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", AsyncMock()),
+        patch(
+            f"{_RECORDING_PATH}.DATABASE.observer.get_workflow_run_block",
+            AsyncMock(side_effect=RuntimeError("database unavailable")),
+        ),
+        patch(f"{_RECORDING_MODULE}.schedule_control_endpoint_diagnostics", scheduled),
+    ):
+        await recording._recorded_action_sink(Action(action_type=ActionType.CLICK))
+
+    scheduled.assert_not_called()
+    page.screenshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_page_call_that_never_returns_still_probes() -> None:
+    # The recorded-action sink runs in the caller's finally, so a page call that never
+    # returns never reaches it. The pending-call signal is the only hook on that path,
+    # and it is the outcome that emits no browser_operation_failed precursor at all.
+    page = SimpleNamespace(url="https://example.com/", screenshot=AsyncMock(), is_closed=lambda: False)
+    scheduled = MagicMock()
+    recording = _recording(page)
+
+    with patch(f"{_RECORDING_MODULE}.schedule_control_endpoint_diagnostics", scheduled):
+        recording._page_call_still_pending(PendingAction(call_name="goto", threshold_seconds=20.0))
+
+    assert scheduled.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_both_failure_paths_share_one_probe_budget() -> None:
+    # Either path may fire first; back-to-back they must still spend only one probe.
+    page = SimpleNamespace(
+        url="https://example.com/",
+        screenshot=AsyncMock(side_effect=TimeoutError("Page.screenshot: Timeout exceeded")),
+        is_closed=lambda: False,
+    )
+    scheduled = MagicMock()
+    recording = _recording(page)
+
+    with (
+        patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", AsyncMock()),
+        patch(f"{_RECORDING_MODULE}.schedule_control_endpoint_diagnostics", scheduled),
+    ):
+        recording._page_call_still_pending(PendingAction(call_name="goto", threshold_seconds=20.0))
+        await recording._recorded_action_sink(Action(action_type=ActionType.CLICK))
+        recording._page_call_still_pending(PendingAction(call_name="click", threshold_seconds=20.0))
+
+    assert scheduled.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_slow_call_early_does_not_leave_a_later_wedge_unprobed() -> None:
+    # A hard one-shot would be spent by any call outstanding at PENDING_CALL_DELAY_SECONDS,
+    # so one benign slow navigation would record the healthy row and leave a real wedge
+    # later in the same block with no probe at all.
+    page = SimpleNamespace(url="https://example.com/", screenshot=AsyncMock(), is_closed=lambda: False)
+    scheduled = MagicMock()
+    recording = _recording(page)
+    pending = PendingAction(call_name="goto", threshold_seconds=20.0)
+
+    with patch(f"{_RECORDING_MODULE}.schedule_control_endpoint_diagnostics", scheduled):
+        recording._page_call_still_pending(pending)
+        # Far enough past the interval that a later failure is a new event, not a burst.
+        recording._last_control_endpoint_probe -= CONTROL_ENDPOINT_PROBE_INTERVAL_SECONDS + 1
+        recording._page_call_still_pending(pending)
+
+    assert scheduled.call_count == 2
+    assert [c.kwargs["probe_sequence"] for c in scheduled.call_args_list] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_probing_stops_at_the_cap() -> None:
+    page = SimpleNamespace(url="https://example.com/", screenshot=AsyncMock(), is_closed=lambda: False)
+    scheduled = MagicMock()
+    recording = _recording(page)
+    pending = PendingAction(call_name="goto", threshold_seconds=20.0)
+
+    with patch(f"{_RECORDING_MODULE}.schedule_control_endpoint_diagnostics", scheduled):
+        for _ in range(MAX_CONTROL_ENDPOINT_PROBES + 3):
+            recording._last_control_endpoint_probe = None
+            recording._page_call_still_pending(pending)
+
+    assert scheduled.call_count == MAX_CONTROL_ENDPOINT_PROBES

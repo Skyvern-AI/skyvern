@@ -1,11 +1,21 @@
 import asyncio
+import atexit
+import contextlib
+import hashlib
 import json
 import os
 import random
 import re
+import secrets
+import shutil
+import tempfile
 import time
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
-from typing import Any, Tuple
+from functools import cached_property
+from typing import Any, Tuple, TypeVar
 
 import structlog
 import tldextract
@@ -47,6 +57,246 @@ _RETRY_BACKOFF_CAP_SECONDS = 60.0
 def _retry_backoff_seconds(attempt: int) -> float:
     # Full jitter: a batch of runs that failed together retries spread out instead of re-aligned.
     return random.uniform(0, min(_RETRY_BACKOFF_CAP_SECONDS, _RETRY_BACKOFF_BASE_SECONDS * (2**attempt)))
+
+
+# The CLI keeps its login state, tokens and encrypted vault copy in one data directory. Pointing each
+# vault identity at its own directory lets sessions for different organizations coexist, so a run
+# never has to log another organization out to make room for its own login.
+_BITWARDEN_APPDATA_ENV_VAR = "BITWARDENCLI_APPDATA_DIR"
+
+# Each `bw` invocation is a Node process. Bound how many run at once so a burst of runs cannot starve
+# the browsers sharing the pod, and so one slow command no longer blocks every other run's fetch.
+_cli_command_semaphore = asyncio.Semaphore(max(1, settings.BITWARDEN_MAX_CONCURRENT_CLI_COMMANDS))
+
+_EXPIRED_SESSION_MARKERS = (
+    "you are not logged in",
+    "vault is locked",
+    "session key is invalid",
+    "invalid session",
+    "mac failed",
+)
+# A vault copy that predates the item looks exactly like an item that does not exist, so both are
+# worth one forced sync before believing the miss.
+_STALE_VAULT_MARKERS = ("not found", "no items found", "no item found")
+
+# The fingerprint is only ever compared against others made in this process. A random per-process
+# salt prevents cross-process correlation, while a password KDF prevents a log line carrying the
+# fingerprint from becoming a cheap offline oracle for guessing the master password.
+_IDENTITY_FINGERPRINT_SALT = secrets.token_bytes(32)
+_IDENTITY_FINGERPRINT_ITERATIONS = 120_000
+
+
+class _SessionRepair(StrEnum):
+    """What to do to a cached session that just failed a read."""
+
+    NONE = "none"
+    RESYNC = "resync"
+    RELOGIN = "relogin"
+
+
+def _repair_for_failure(message: str) -> _SessionRepair:
+    lowered = message.lower()
+    if any(marker in lowered for marker in _EXPIRED_SESSION_MARKERS):
+        return _SessionRepair.RELOGIN
+    if any(marker in lowered for marker in _STALE_VAULT_MARKERS):
+        return _SessionRepair.RESYNC
+    return _SessionRepair.NONE
+
+
+@dataclass(frozen=True, repr=False)
+class _VaultIdentity:
+    """The credentials one cached CLI session is logged in as."""
+
+    client_id: str | None
+    client_secret: str | None
+    email: str | None
+    master_password: str
+
+    @staticmethod
+    def resolve(
+        client_id: str | None,
+        client_secret: str | None,
+        email: str | None,
+        master_password: str | None,
+    ) -> "_VaultIdentity":
+        # Mirror the fallbacks `login` applies, so the fingerprint names the login that will happen.
+        return _VaultIdentity(
+            client_id=client_id,
+            client_secret=client_secret,
+            email=email or settings.BITWARDEN_EMAIL,
+            master_password=master_password or settings.BITWARDEN_MASTER_PASSWORD or "",
+        )
+
+    @property
+    def uses_email_auth(self) -> bool:
+        return bool(self.email and self.master_password)
+
+    @cached_property
+    def fingerprint(self) -> str:
+        """A stable, non-reversible name for this identity, safe to log and to use as a directory."""
+        material = (
+            ["email", self.email or "", self.master_password]
+            if self.uses_email_auth
+            else ["apikey", self.client_id or "", self.client_secret or "", self.master_password]
+        )
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            "\x00".join(material).encode(),
+            _IDENTITY_FINGERPRINT_SALT,
+            _IDENTITY_FINGERPRINT_ITERATIONS,
+        ).hex()
+
+    def __repr__(self) -> str:
+        return f"_VaultIdentity(fingerprint={self.fingerprint[:12]})"
+
+
+class _CliSession:
+    """A logged-in, unlocked CLI session and the data directory holding its copy of the vault."""
+
+    def __init__(self, identity: _VaultIdentity, appdata_dir: str) -> None:
+        self.identity = identity
+        self.appdata_dir = appdata_dir
+        # Serializes the steps that write to the data directory (login, unlock, sync). Reads against
+        # an established session run concurrently.
+        self.lock = asyncio.Lock()
+        self.session_key: str | None = None
+        self.synced_at: float = 0.0
+        self.in_flight = 0
+        self.retired = False
+        self.last_used_at = time.monotonic()
+
+    @property
+    def env(self) -> dict[str, str]:
+        return {_BITWARDEN_APPDATA_ENV_VAR: self.appdata_dir}
+
+    @contextlib.asynccontextmanager
+    async def in_use(self) -> AsyncIterator["_CliSession"]:
+        """Keep this session's data directory alive while a command is running against it."""
+        self.in_flight += 1
+        self.last_used_at = time.monotonic()
+        try:
+            yield self
+        finally:
+            self.in_flight -= 1
+            self.last_used_at = time.monotonic()
+            if self.retired and self.in_flight == 0:
+                self._remove_data_dir()
+
+    def retire(self) -> None:
+        """Log this identity out for good.
+
+        Removing the directory is what logs it out: the directory holds the tokens and the vault
+        copy. A retired session is never handed out again, so it is safe to wait for the readers
+        still inside `in_use` rather than deleting the directory out from under them.
+        """
+        self.retired = True
+        self.session_key = None
+        if self.in_flight == 0:
+            self._remove_data_dir()
+
+    def _remove_data_dir(self) -> None:
+        shutil.rmtree(self.appdata_dir, ignore_errors=True)
+
+
+class _CliSessionCache:
+    """Per-process store of live CLI sessions, keyed by vault identity and bounded by an LRU."""
+
+    def __init__(self) -> None:
+        self._sessions: OrderedDict[str, _CliSession] = OrderedDict()
+        self._lock = asyncio.Lock()
+        self._root: str | None = None
+        self._generation = 0
+
+    def _root_dir(self) -> str:
+        if self._root is None:
+            self._root = tempfile.mkdtemp(prefix="skyvern-bitwarden-")
+            atexit.register(shutil.rmtree, self._root, True)
+        return self._root
+
+    async def checkout(self, identity: _VaultIdentity) -> _CliSession:
+        async with self._lock:
+            session = self._sessions.get(identity.fingerprint)
+            if session is None:
+                # A directory per session object, not per identity: a session retired while another
+                # request still held it must never be able to delete its own replacement's data.
+                self._generation += 1
+                appdata_dir = os.path.join(self._root_dir(), f"{identity.fingerprint[:16]}-{self._generation}")
+                session = _CliSession(identity, appdata_dir)
+                self._sessions[identity.fingerprint] = session
+            os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
+            self._sessions.move_to_end(identity.fingerprint)
+            reclaimed = self._reclaim(keep=identity.fingerprint)
+
+        await self._retire_all(reclaimed)
+        return session
+
+    async def release(self) -> None:
+        """Sweep once a request is done with its session.
+
+        Checkout alone is not enough: during a burst across more vaults than the cache holds, every
+        entry is either in flight or the one being handed out, so nothing is reclaimable at that
+        moment. Sweeping again as requests finish is what brings the cache back to capacity, and
+        what lets an idle session expire while the pod is still doing other Bitwarden work.
+        """
+        async with self._lock:
+            reclaimed = self._reclaim(keep=None)
+        await self._retire_all(reclaimed)
+
+    async def _retire_all(self, reclaimed: list[tuple[_CliSession, str]]) -> None:
+        for stale, reason in reclaimed:
+            LOG.info(
+                "Retiring a cached Bitwarden CLI session",
+                reason=reason,
+                fingerprint=stale.identity.fingerprint[:12],
+            )
+            async with stale.lock:
+                stale.retire()
+
+    def _reclaim(self, keep: str | None) -> list[tuple[_CliSession, str]]:
+        """Retire sessions that have gone idle or pushed the cache past capacity.
+
+        The caller holds the cache lock. `keep` names the session this checkout is about to hand
+        out: it has no reader yet, so it looks idle, and retiring it would send the caller to a
+        directory that no longer exists and make every request for that vault log in again.
+        """
+        reclaimed: list[tuple[_CliSession, str]] = []
+        capacity = max(1, settings.BITWARDEN_SESSION_CACHE_SIZE)
+        max_idle = settings.BITWARDEN_SESSION_MAX_IDLE_SECONDS
+        now = time.monotonic()
+        for fingerprint, session in list(self._sessions.items()):
+            # A session with a command in flight still owns its data directory; leave it alone and
+            # let a later checkout reclaim it.
+            if fingerprint == keep or session.in_flight:
+                continue
+            if max_idle > 0 and now - session.last_used_at >= max_idle:
+                reason = "idle"
+            elif len(self._sessions) > capacity:
+                reason = "capacity"
+            else:
+                continue
+            del self._sessions[fingerprint]
+            reclaimed.append((session, reason))
+        return reclaimed
+
+    async def discard(self, session: _CliSession) -> None:
+        async with self._lock:
+            if self._sessions.get(session.identity.fingerprint) is session:
+                del self._sessions[session.identity.fingerprint]
+        async with session.lock:
+            session.retire()
+
+    async def clear(self) -> None:
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            async with session.lock:
+                session.retire()
+
+
+_cli_sessions = _CliSessionCache()
+
+T = TypeVar("T")
 
 
 class BitwardenItemType(IntEnum):
@@ -333,8 +583,6 @@ class RunCommandResult(BaseModel):
 
 
 class BitwardenService:
-    _cli_session_lock: asyncio.Lock = asyncio.Lock()
-
     @staticmethod
     def _is_ignorable_login_stderr(stderr: str) -> bool:
         lines = [line.strip() for line in stderr.splitlines() if line.strip()]
@@ -378,26 +626,32 @@ class BitwardenService:
             env.update(additional_env)  # Update with any additional environment variables
 
         shell_subprocess = None
-        started = time.monotonic()
+        queued_at = time.monotonic()
+        started = queued_at
         try:
-            async with asyncio.timeout(timeout):
-                shell_subprocess = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                stdout, stderr = await shell_subprocess.communicate()
-                return RunCommandResult(
-                    stdout=stdout.decode(),
-                    stderr=stderr.decode(),
-                    returncode=shell_subprocess.returncode,
-                )
+            # Wait for a slot outside the command's own budget: `timeout` measures the command, and
+            # the caller's attempt-level deadline is what bounds the queueing.
+            async with _cli_command_semaphore:
+                started = time.monotonic()
+                async with asyncio.timeout(timeout):
+                    shell_subprocess = await asyncio.create_subprocess_exec(
+                        *command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                    )
+                    stdout, stderr = await shell_subprocess.communicate()
+                    return RunCommandResult(
+                        stdout=stdout.decode(),
+                        stderr=stderr.decode(),
+                        returncode=shell_subprocess.returncode,
+                    )
         except asyncio.TimeoutError:
             LOG.error(
                 "Bitwarden command timed out",
                 timeout_seconds=timeout,
                 elapsed_seconds=round(time.monotonic() - started, 2),
+                queued_seconds=round(started - queued_at, 2),
                 command=command[0:2],
                 exc_info=True,
             )
@@ -408,6 +662,7 @@ class BitwardenService:
             LOG.warning(
                 "Bitwarden command cancelled by an enclosing deadline",
                 elapsed_seconds=round(time.monotonic() - started, 2),
+                queued_seconds=round(started - queued_at, 2),
                 command=command[0:2],
             )
             raise
@@ -436,11 +691,103 @@ class BitwardenService:
         return None
 
     @staticmethod
+    async def _establish_cli_session(session: _CliSession, timeout: int) -> None:
+        """Log this identity in and unlock it. The caller holds `session.lock`."""
+        identity = session.identity
+        await BitwardenService.login(
+            identity.client_id,
+            identity.client_secret,
+            email=identity.email,
+            master_password=identity.master_password,
+            timeout=timeout,
+            appdata_dir=session.appdata_dir,
+        )
+        session.session_key = await BitwardenService.unlock(
+            identity.master_password, timeout=timeout, appdata_dir=session.appdata_dir
+        )
+        # Sync after unlocking rather than before, so the one call works for both auth modes: an
+        # API-key login leaves the vault locked, and `bw sync` needs it open.
+        await BitwardenService.sync(timeout=timeout, session_key=session.session_key, appdata_dir=session.appdata_dir)
+        session.synced_at = time.monotonic()
+
+    @staticmethod
+    async def _prepare_cli_session(
+        session: _CliSession,
+        timeout: int,
+        force_sync: bool = False,
+    ) -> None:
+        """Make `session` usable, logging in only if this process does not already hold a session."""
+        async with session.lock:
+            if session.session_key is None:
+                await BitwardenService._establish_cli_session(session, timeout=timeout)
+                return
+
+            if (
+                not force_sync
+                and time.monotonic() - session.synced_at < settings.BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS
+            ):
+                return
+            try:
+                await BitwardenService.sync(
+                    timeout=timeout, session_key=session.session_key, appdata_dir=session.appdata_dir
+                )
+                session.synced_at = time.monotonic()
+            except Exception:
+                if force_sync:
+                    # A caller that asked for a guaranteed-fresh vault has no way to tell a stale
+                    # answer from a correct one — a listing that is missing an item someone just
+                    # added looks exactly like a listing that is right. Say the refresh failed.
+                    raise
+                # An opportunistic refresh is different: the read that follows can still detect a
+                # miss and force another sync, so a failure here is not worth failing the run over.
+                LOG.warning("Could not refresh the cached Bitwarden vault; reading the cached copy", exc_info=True)
+
+    @staticmethod
+    async def _with_cli_session(
+        identity: _VaultIdentity,
+        timeout: int,
+        run: Callable[[_CliSession], Awaitable[T]],
+        force_sync: bool = False,
+    ) -> T:
+        """Run `run` against a live CLI session, repairing a stale session once before giving up."""
+        for attempt in range(2):
+            session = await _cli_sessions.checkout(identity)
+            try:
+                # Claim the session before the first await after checkout, so eviction cannot pull
+                # the data directory out from under a command that is about to run against it.
+                async with session.in_use():
+                    await BitwardenService._prepare_cli_session(session, timeout=timeout, force_sync=force_sync)
+                    return await run(session)
+            except BitwardenAccessDeniedError:
+                raise
+            except BaseException as error:
+                repair = _repair_for_failure(str(error)) if attempt == 0 else _SessionRepair.NONE
+                # A session that never finished logging in is not a session; drop it rather than
+                # hand the next run a half-built data directory.
+                if session.session_key is None or repair is _SessionRepair.RELOGIN:
+                    await _cli_sessions.discard(session)
+                if repair is _SessionRepair.NONE or not isinstance(error, Exception):
+                    raise
+                LOG.info(
+                    "Refreshing a cached Bitwarden CLI session before one retry",
+                    repair=str(repair),
+                    fingerprint=identity.fingerprint[:12],
+                    error=str(error),
+                )
+                force_sync = True
+            finally:
+                # This request is done holding its session, which may be what makes another one
+                # reclaimable. Runs on the way out of a return, a raise and a retry alike.
+                await _cli_sessions.release()
+        raise BitwardenListItemsError("Bitwarden CLI session could not be refreshed")
+
+    @staticmethod
     async def _list_items_using_cli(
         session_key: str,
         bw_organization_id: str | None = None,
         collection_id: str | None = None,
         timeout: int = 60,
+        appdata_dir: str | None = None,
     ) -> list[dict]:
         list_command = ["bw", "list", "items", "--session", session_key]
         if bw_organization_id:
@@ -448,17 +795,48 @@ class BitwardenService:
         if collection_id:
             list_command.extend(["--collectionid", collection_id])
 
-        items_result = await BitwardenService.run_command(list_command, timeout=timeout)
+        env = {_BITWARDEN_APPDATA_ENV_VAR: appdata_dir} if appdata_dir else None
+        items_result = await BitwardenService.run_command(list_command, additional_env=env, timeout=timeout)
+        return BitwardenService._parse_listed_items(items_result)
+
+    @staticmethod
+    def _parse_listed_items(items_result: RunCommandResult) -> list[dict]:
+        """Read `bw list items` output, naming the CLI's own complaint before blaming the JSON.
+
+        A CLI whose session has expired exits non-zero with an empty stdout, so parsing first would
+        report a JSON error and swallow the one detail — the stderr — that says to log in again.
+        """
         if items_result.returncode != 0:
             raise BitwardenListItemsError(f"Failed to list Bitwarden items. Error: {items_result.stderr}")
 
         try:
             items = json.loads(items_result.stdout)
-            if isinstance(items, list):
-                return items
         except json.JSONDecodeError:
-            pass
-        raise BitwardenListItemsError("Failed to parse items JSON")
+            raise BitwardenListItemsError(
+                f"Failed to parse items JSON. Error: {items_result.stderr} Output: {items_result.stdout}"
+            )
+        if not isinstance(items, list):
+            raise BitwardenListItemsError(f"Failed to parse items JSON. Output: {items_result.stdout}")
+        return items
+
+    @staticmethod
+    def _parse_fetched_item(item_result: RunCommandResult, item_id: str) -> dict:
+        """Read `bw get item` output, naming the CLI's own complaint before blaming the JSON.
+
+        Same reasoning as `_parse_listed_items`: a dead session and an item the cached vault has
+        never seen both report themselves on stderr, and both are recoverable — but only if the
+        message survives to the caller.
+        """
+        if item_result.returncode != 0 or item_result.stderr:
+            raise BitwardenGetItemError(f"Failed to get the bitwarden item {item_id}. Error: {item_result.stderr}")
+
+        try:
+            item = json.loads(item_result.stdout)
+        except json.JSONDecodeError:
+            raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
+        if not item:
+            raise BitwardenGetItemError(f"No item found in Bitwarden for item ID: {item_id}")
+        return item
 
     @staticmethod
     async def list_item_overviews(
@@ -473,59 +851,64 @@ class BitwardenService:
         if not email or not master_password:
             raise BitwardenLoginError("Bitwarden item listing requires org-scoped email and master password")
 
+        async def list_overviews(session: _CliSession) -> list[BitwardenItemOverview]:
+            session_key = session.session_key or ""
+            raw_items_with_preferred_collection: list[tuple[dict, str | None]] = []
+
+            if bw_organization_id:
+                raw_items = await BitwardenService._list_items_using_cli(
+                    session_key=session_key,
+                    bw_organization_id=bw_organization_id,
+                    timeout=timeout,
+                    appdata_dir=session.appdata_dir,
+                )
+                allowed_collection_ids = set(bw_collection_ids or [])
+                if allowed_collection_ids:
+                    raw_items = [
+                        item
+                        for item in raw_items
+                        if any(cid in allowed_collection_ids for cid in item.get("collectionIds") or [])
+                    ]
+                raw_items_with_preferred_collection = [(item, None) for item in raw_items]
+            elif bw_collection_ids:
+                for collection_id in bw_collection_ids:
+                    raw_items = await BitwardenService._list_items_using_cli(
+                        session_key=session_key,
+                        collection_id=collection_id,
+                        timeout=timeout,
+                        appdata_dir=session.appdata_dir,
+                    )
+                    raw_items_with_preferred_collection.extend((item, collection_id) for item in raw_items)
+            else:
+                raw_items = await BitwardenService._list_items_using_cli(
+                    session_key=session_key, timeout=timeout, appdata_dir=session.appdata_dir
+                )
+                raw_items_with_preferred_collection = [(item, None) for item in raw_items]
+
+            overviews: list[BitwardenItemOverview] = []
+            seen_item_ids: set[str] = set()
+            for item, preferred_collection_id in raw_items_with_preferred_collection:
+                overview = get_bitwarden_item_overview_from_bitwarden_item(
+                    item,
+                    allowed_collection_ids=bw_collection_ids,
+                    preferred_collection_id=preferred_collection_id,
+                )
+                if overview is not None and overview.item_id not in seen_item_ids:
+                    seen_item_ids.add(overview.item_id)
+                    overviews.append(overview)
+            return overviews
+
         await BitwardenService._apply_jitter()
+        identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
         async with asyncio.timeout(timeout):
-            async with BitwardenService._cli_session_lock:
-                try:
-                    # The Bitwarden CLI stores active login state globally, so the whole session workflow is locked.
-                    await BitwardenService.logout()
-                    await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
-                    await BitwardenService.sync()
-                    session_key = await BitwardenService.unlock(master_password)
-                    raw_items_with_preferred_collection: list[tuple[dict, str | None]] = []
-
-                    if bw_organization_id:
-                        raw_items = await BitwardenService._list_items_using_cli(
-                            session_key=session_key,
-                            bw_organization_id=bw_organization_id,
-                            timeout=timeout,
-                        )
-                        allowed_collection_ids = set(bw_collection_ids or [])
-                        if allowed_collection_ids:
-                            raw_items = [
-                                item
-                                for item in raw_items
-                                if any(cid in allowed_collection_ids for cid in item.get("collectionIds") or [])
-                            ]
-                        raw_items_with_preferred_collection = [(item, None) for item in raw_items]
-                    elif bw_collection_ids:
-                        for collection_id in bw_collection_ids:
-                            raw_items = await BitwardenService._list_items_using_cli(
-                                session_key=session_key,
-                                collection_id=collection_id,
-                                timeout=timeout,
-                            )
-                            raw_items_with_preferred_collection.extend((item, collection_id) for item in raw_items)
-                    else:
-                        raw_items = await BitwardenService._list_items_using_cli(
-                            session_key=session_key, timeout=timeout
-                        )
-                        raw_items_with_preferred_collection = [(item, None) for item in raw_items]
-
-                    overviews: list[BitwardenItemOverview] = []
-                    seen_item_ids: set[str] = set()
-                    for item, preferred_collection_id in raw_items_with_preferred_collection:
-                        overview = get_bitwarden_item_overview_from_bitwarden_item(
-                            item,
-                            allowed_collection_ids=bw_collection_ids,
-                            preferred_collection_id=preferred_collection_id,
-                        )
-                        if overview is not None and overview.item_id not in seen_item_ids:
-                            seen_item_ids.add(overview.item_id)
-                            overviews.append(overview)
-                    return overviews
-                finally:
-                    await BitwardenService.logout()
+            # Someone browsing their own vault expects to see an item they just added, so this path
+            # always syncs first. It still reuses the login, which is what a run's fetch pays for.
+            return await BitwardenService._with_cli_session(
+                identity,
+                timeout=timeout,
+                run=list_overviews,
+                force_sync=True,
+            )
 
     @staticmethod
     async def get_secret_value_from_url(
@@ -557,19 +940,18 @@ class BitwardenService:
                 # Every CLI command gets `timeout`; the attempt as a whole gets twice that, so one slow step
                 # cannot consume the others' budget and a dead vault still fails in bounded time.
                 async with asyncio.timeout(2 * timeout):
-                    async with BitwardenService._cli_session_lock:
-                        return await BitwardenService._get_secret_value_from_url(
-                            client_id=client_id,
-                            client_secret=client_secret,
-                            master_password=master_password,
-                            bw_organization_id=bw_organization_id,
-                            bw_collection_ids=bw_collection_ids,
-                            url=url,
-                            collection_id=collection_id,
-                            item_id=item_id,
-                            timeout=timeout,
-                            email=email,
-                        )
+                    return await BitwardenService._get_secret_value_from_url(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        master_password=master_password,
+                        bw_organization_id=bw_organization_id,
+                        bw_collection_ids=bw_collection_ids,
+                        url=url,
+                        collection_id=collection_id,
+                        item_id=item_id,
+                        timeout=timeout,
+                        email=email,
+                    )
             except BitwardenAccessDeniedError as e:
                 raise e
             except Exception as e:
@@ -623,24 +1005,16 @@ class BitwardenService:
         """
         Get the secret value from the Bitwarden CLI.
         """
-        try:
-            await BitwardenService.login(
-                client_id, client_secret, email=email, master_password=master_password, timeout=timeout
-            )
-            await BitwardenService.sync(timeout=timeout)
-            session_key = await BitwardenService.unlock(master_password, timeout=timeout)
+
+        async def fetch(session: _CliSession) -> dict[str, str]:
+            session_key = session.session_key or ""
 
             if item_id:  # if item_id provided, get single item by item id
+                # One item decrypted, rather than the whole collection: this is the cheap path, and
+                # the only one that stays cheap as a collection grows.
                 command = ["bw", "get", "item", item_id, "--session", session_key]
-                item_result = await BitwardenService.run_command(command, timeout=timeout)
-                if item_result.stderr:
-                    raise BitwardenGetItemError(
-                        f"Failed to get the bitwarden item {item_id}. Error: {item_result.stderr}"
-                    )
-                try:
-                    item = json.loads(item_result.stdout)
-                except json.JSONDecodeError:
-                    raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
+                item_result = await BitwardenService.run_command(command, additional_env=session.env, timeout=timeout)
+                item = BitwardenService._parse_fetched_item(item_result, item_id)
 
                 login = item["login"]
                 totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
@@ -678,13 +1052,10 @@ class BitwardenService:
             else:
                 LOG.error("No collection ID or organization ID provided -- this is required")
                 raise BitwardenListItemsError("No collection ID or organization ID provided -- this is required")
-            items_result = await BitwardenService.run_command(list_command, timeout=timeout)
+            items_result = await BitwardenService.run_command(list_command, additional_env=session.env, timeout=timeout)
 
             # Parse the items and extract credentials
-            try:
-                items = json.loads(items_result.stdout)
-            except json.JSONDecodeError:
-                raise BitwardenListItemsError("Failed to parse items JSON. Output: " + items_result.stdout)
+            items = BitwardenService._parse_listed_items(items_result)
 
             # Since Bitwarden can't AND multiple filters, we only use organization id in the list command
             # but we still need to filter the items by collection id here
@@ -736,9 +1107,9 @@ class BitwardenService:
                             return single_result.credential
             LOG.warning("No credential in Bitwarden matches the rule, returning the first match")
             return bitwarden_result[0].credential
-        finally:
-            # Step 4: Log out
-            await BitwardenService.logout()
+
+        identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
 
     @staticmethod
     async def get_sensitive_information_from_identity(
@@ -764,18 +1135,18 @@ class BitwardenService:
             await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(timeout):
-                async with BitwardenService._cli_session_lock:
-                    return await BitwardenService._get_sensitive_information_from_identity(
-                        client_id=client_id,
-                        client_secret=client_secret,
-                        master_password=master_password,
-                        bw_organization_id=bw_organization_id,
-                        bw_collection_ids=bw_collection_ids,
-                        collection_id=collection_id,
-                        identity_key=identity_key,
-                        identity_fields=identity_fields,
-                        email=email,
-                    )
+                return await BitwardenService._get_sensitive_information_from_identity(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    master_password=master_password,
+                    bw_organization_id=bw_organization_id,
+                    bw_collection_ids=bw_collection_ids,
+                    collection_id=collection_id,
+                    identity_key=identity_key,
+                    identity_fields=identity_fields,
+                    email=email,
+                    timeout=timeout,
+                )
         except BitwardenAccessDeniedError as e:
             raise e
         except Exception as e:
@@ -814,18 +1185,15 @@ class BitwardenService:
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
         email: str | None = None,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
     ) -> dict[str, str]:
         """
         Get the sensitive information from the Bitwarden CLI.
         """
-        try:
-            await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
-            await BitwardenService.sync()
-            session_key = await BitwardenService.unlock(master_password)
+        if not bw_organization_id and not collection_id:
+            raise BitwardenAccessDeniedError()
 
-            if not bw_organization_id and not collection_id:
-                raise BitwardenAccessDeniedError()
-
+        async def fetch(session: _CliSession) -> dict[str, str]:
             # Step 3: Retrieve the items
             list_command = [
                 "bw",
@@ -834,19 +1202,16 @@ class BitwardenService:
                 "--search",
                 identity_key,
                 "--session",
-                session_key,
+                session.session_key or "",
                 "--collectionid",
                 collection_id,
             ]
             if bw_organization_id:
                 list_command.extend(["--organizationid", bw_organization_id])
-            items_result = await BitwardenService.run_command(list_command)
+            items_result = await BitwardenService.run_command(list_command, additional_env=session.env, timeout=timeout)
 
             # Parse the items and extract sensitive information
-            try:
-                items = json.loads(items_result.stdout)
-            except json.JSONDecodeError:
-                raise BitwardenListItemsError("Failed to parse items JSON. Output: " + items_result.stdout)
+            items = BitwardenService._parse_listed_items(items_result)
             if not items:
                 raise BitwardenListItemsError(
                     f"No items found in Bitwarden for identity key: {identity_key} in collection with ID: {collection_id}"
@@ -879,9 +1244,8 @@ class BitwardenService:
 
             return sensitive_information
 
-        finally:
-            # Step 4: Log out
-            await BitwardenService.logout()
+        identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
 
     @staticmethod
     async def login(
@@ -890,6 +1254,7 @@ class BitwardenService:
         email: str | None = None,
         master_password: str | None = None,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+        appdata_dir: str | None = None,
     ) -> None:
         """
         Log in to the Bitwarden CLI.
@@ -905,6 +1270,8 @@ class BitwardenService:
             "BW_CLIENTSECRET": client_secret or "",
             "BW_PASSWORD": bw_master_password or "",
         }
+        if appdata_dir:
+            env[_BITWARDEN_APPDATA_ENV_VAR] = appdata_dir
         if bw_email and bw_master_password:
             login_command = ["bw", "login", bw_email, "--passwordenv", "BW_PASSWORD"]
         else:
@@ -921,13 +1288,19 @@ class BitwardenService:
         LOG.info("Bitwarden login successful")
 
     @staticmethod
-    async def unlock(master_password: str, timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS) -> str:
+    async def unlock(
+        master_password: str,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+        appdata_dir: str | None = None,
+    ) -> str:
         """
         Unlock the Bitwarden CLI.
         """
         env = {
             "BW_PASSWORD": master_password,
         }
+        if appdata_dir:
+            env[_BITWARDEN_APPDATA_ENV_VAR] = appdata_dir
         unlock_command = ["bw", "unlock", "--passwordenv", "BW_PASSWORD"]
         unlock_result = await BitwardenService.run_command(unlock_command, env, timeout=timeout)
 
@@ -949,24 +1322,32 @@ class BitwardenService:
         return session_key
 
     @staticmethod
-    async def sync(timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS) -> None:
+    async def sync(
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+        session_key: str | None = None,
+        appdata_dir: str | None = None,
+    ) -> None:
         """
         Sync the Bitwarden CLI.
         """
         sync_command = ["bw", "sync"]
+        if session_key:
+            sync_command.extend(["--session", session_key])
+        env = {_BITWARDEN_APPDATA_ENV_VAR: appdata_dir} if appdata_dir else None
         LOG.info("Bitwarden CLI sync started")
-        sync_result = await BitwardenService.run_command(sync_command, timeout=timeout)
+        sync_result = await BitwardenService.run_command(sync_command, additional_env=env, timeout=timeout)
         LOG.info("Bitwarden CLI sync completed")
         if sync_result.stderr:
             raise BitwardenSyncError(sync_result.stderr)
 
     @staticmethod
-    async def logout(timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS) -> None:
+    async def logout(timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS, appdata_dir: str | None = None) -> None:
         """
         Log out of the Bitwarden CLI.
         """
         logout_command = ["bw", "logout"]
-        logout_result = await BitwardenService.run_command(logout_command, timeout=timeout)
+        env = {_BITWARDEN_APPDATA_ENV_VAR: appdata_dir} if appdata_dir else None
+        logout_result = await BitwardenService.run_command(logout_command, additional_env=env, timeout=timeout)
         if logout_result.stderr and "You are not logged in." not in logout_result.stderr:
             raise BitwardenLogoutError(logout_result.stderr)
 
@@ -980,15 +1361,17 @@ class BitwardenService:
         collection_id: str,
         item_id: str,
         email: str | None = None,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
     ) -> dict[str, str]:
         """
         Get the credit card data from the Bitwarden CLI.
         """
-        try:
-            await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
-            await BitwardenService.sync()
-            session_key = await BitwardenService.unlock(master_password)
+        # Bitwarden CLI doesn't support filtering by organization ID or collection ID for credit card data so we just raise an error if no collection ID or organization ID is provided
+        if not bw_organization_id and not collection_id:
+            LOG.error("No collection ID or organization ID provided -- this is required")
+            raise BitwardenAccessDeniedError()
 
+        async def fetch(session: _CliSession) -> dict[str, str]:
             # Step 3: Get the item
             get_command = [
                 "bw",
@@ -996,24 +1379,13 @@ class BitwardenService:
                 "item",
                 item_id,
                 "--session",
-                session_key,
+                session.session_key or "",
             ]
 
-            # Bitwarden CLI doesn't support filtering by organization ID or collection ID for credit card data so we just raise an error if no collection ID or organization ID is provided
-            if not bw_organization_id and not collection_id:
-                LOG.error("No collection ID or organization ID provided -- this is required")
-                raise BitwardenAccessDeniedError()
-
-            item_result = await BitwardenService.run_command(get_command)
+            item_result = await BitwardenService.run_command(get_command, additional_env=session.env, timeout=timeout)
 
             # Parse the item and extract credit card data
-            try:
-                item = json.loads(item_result.stdout)
-            except json.JSONDecodeError:
-                raise BitwardenListItemsError(f"Failed to parse item JSON for item ID: {item_id}")
-
-            if not item:
-                raise BitwardenListItemsError(f"No item found in Bitwarden for item ID: {item_id}")
+            item = BitwardenService._parse_fetched_item(item_result, item_id)
 
             # Check if the bw_organization_id matches
             if bw_organization_id:
@@ -1044,9 +1416,9 @@ class BitwardenService:
             mapped_credit_card_data.update(_extract_credit_card_extra_custom_field_values(item))
 
             return mapped_credit_card_data
-        finally:
-            # Step 4: Log out
-            await BitwardenService.logout()
+
+        identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
 
     @staticmethod
     async def get_credit_card_data(
@@ -1071,17 +1443,16 @@ class BitwardenService:
             await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
-                async with BitwardenService._cli_session_lock:
-                    return await BitwardenService._get_credit_card_data(
-                        client_id=client_id,
-                        client_secret=client_secret,
-                        master_password=master_password,
-                        bw_organization_id=bw_organization_id,
-                        bw_collection_ids=bw_collection_ids,
-                        collection_id=collection_id,
-                        item_id=item_id,
-                        email=email,
-                    )
+                return await BitwardenService._get_credit_card_data(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    master_password=master_password,
+                    bw_organization_id=bw_organization_id,
+                    bw_collection_ids=bw_collection_ids,
+                    collection_id=collection_id,
+                    item_id=item_id,
+                    email=email,
+                )
         except BitwardenAccessDeniedError as e:
             raise e
         except Exception as e:

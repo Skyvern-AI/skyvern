@@ -11,6 +11,7 @@ export type FileUploadNodeData = NodeBaseData & {
   awsAccessKeyId: string | null;
   awsSecretAccessKey: string | null;
   regionName: string | null;
+  endpointUrl: string | null;
   azureStorageAccountName: string | null;
   azureStorageAccountKey: string | null;
   azureBlobContainerName: string | null;
@@ -39,6 +40,7 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   awsAccessKeyId: null,
   awsSecretAccessKey: null,
   regionName: null,
+  endpointUrl: null,
   azureStorageAccountName: null,
   azureStorageAccountKey: null,
   azureBlobContainerName: null,

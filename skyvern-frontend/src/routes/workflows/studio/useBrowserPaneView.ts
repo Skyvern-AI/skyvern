@@ -23,6 +23,9 @@ type BrowserPaneViewState = {
   setView: (view: BrowserPaneViewIntent) => void;
   visuals: RunVisuals;
   runId: string | undefined;
+  // The URL names the run, so the pane is inspecting it rather than falling
+  // back to the workflow's latest run in the edit context.
+  inspectingRun: boolean;
   debugBrowserSessionId: string | null;
   // The inspected run executes in the live debug session, so its live view is
   // the shared singleton stream — never a second socket to the same browser.
@@ -101,6 +104,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     setView,
     visuals,
     runId,
+    inspectingRun: explicit,
     debugBrowserSessionId,
     runInDebugSession,
     liveSurface,

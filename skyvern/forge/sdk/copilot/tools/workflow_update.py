@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
+from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
@@ -97,7 +98,7 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
     render_schema_incompatibility_agent_steer,
     render_schema_incompatibility_user_reason,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
@@ -130,6 +131,8 @@ from .banned_blocks import (
     _copilot_block_authoring_policy,
     _detect_new_banned_blocks,
     _record_banned_block_reject_span,
+    _task_v3_pure_policy_violations,
+    _task_v3_pure_reject_message,
 )
 from .credentials import _credential_id_misbinding_findings, _credential_reference_validation_error
 from .frontier import (
@@ -3832,6 +3835,7 @@ async def _update_workflow(
     ctx: AgentContext,
     *,
     allow_missing_credentials: bool | None = None,
+    originating_call_id: str | None = None,
 ) -> dict[str, Any]:
     def _blocked(block: AuthorTimeBlock) -> dict[str, Any]:
         _clear_code_authoring_repair_context(ctx)
@@ -3975,6 +3979,19 @@ async def _update_workflow(
     # LLM actually saw, not the turn-start persisted state.
     last_yaml = ctx.last_workflow_yaml
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
+        task_v3_pure_violations = _task_v3_pure_policy_violations(workflow_yaml)
+        if task_v3_pure_violations:
+            violation_items = [(violation.label, violation.block_type) for violation in task_v3_pure_violations]
+            _record_banned_block_reject_span("_update_workflow", violation_items)
+            return _blocked(
+                AuthorTimeBlock(
+                    block_id=BANNED_BLOCKS_BLOCK_ID,
+                    error=_task_v3_pure_reject_message(task_v3_pure_violations),
+                    data={"violations": [violation.as_dict() for violation in task_v3_pure_violations]},
+                )
+            )
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -4141,17 +4158,44 @@ async def _update_workflow(
         # otherwise-successful update_workflow tool call. ``isinstance``
         # narrows the parameter's declared ``AgentContext`` to the
         # envelope-aware ``CopilotContext`` for mypy.
+        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
+        written_diffs: list[CodeWriteDiff] = []
+        if isinstance(ctx, CopilotContext):
+            # Best-effort — the workflow is already persisted, so a narrative detail must never
+            # turn a successful write into a failed turn.
+            try:
+                # Keyed by the call that produced it, and extended rather than assigned: parallel
+                # tool calls are the provider default, so a second write can land before the first
+                # one's result drains, and one call can write more than one block.
+                written_diffs, ctx.code_write_patch_budget = build_code_write_diffs(
+                    _workflow_yaml_code_blocks_by_label(prior_workflow_yaml),
+                    changed_code_blocks,
+                    scrub=lambda text: scrub_secrets_from_text(ctx, text),
+                    budget=ctx.code_write_patch_budget,
+                )
+                if written_diffs and originating_call_id is not None:
+                    stashed = ctx.pending_code_write_diffs.get(originating_call_id, [])
+                    ctx.pending_code_write_diffs[originating_call_id] = [*stashed, *written_diffs]
+            except Exception as diff_err:
+                LOG.warning("copilot_code_write_diff_failed", error=str(diff_err))
         if isinstance(ctx, CopilotContext) and ctx.stream is not None:
             try:
                 await maybe_emit_design_end(ctx.stream, ctx)
-                await emit_workflow_draft(ctx.stream, ctx, workflow)
+                # The diffs ride the draft, which fires now, rather than the tool_result: a write
+                # and its test share one tool call, so the result lands only after the run.
+                await emit_workflow_draft(
+                    ctx.stream,
+                    ctx,
+                    workflow,
+                    code_diffs=written_diffs or None,
+                    tool_call_id=originating_call_id,
+                )
             except Exception as emit_err:
                 LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
         data: dict[str, Any] = {
             "message": "Workflow updated successfully.",
             "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
         }
-        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
         stored_code, stored_code_withheld = _accepted_code_delta(changed_code_blocks)
         if stored_code:
             data["stored_code"] = stored_code

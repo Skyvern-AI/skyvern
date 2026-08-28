@@ -145,6 +145,28 @@ async def test_singleton_is_idempotent_and_late_binds_adapter_callbacks(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_evaluate_routes_to_active_controlled_tab() -> None:
+    relay = MagicMock()
+    relay.ensure_root_lease = AsyncMock(return_value={"tabId": 17})
+    relay.list_scoped_tabs = AsyncMock(
+        return_value=[
+            {"tabId": 17, "active": False},
+            {"tabId": 18, "active": True},
+        ]
+    )
+    relay.request = AsyncMock(return_value={"result": {"answer": 42}})
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+
+    assert await runtime.evaluate("({ answer: 6 * 7 })") == {"answer": 42}
+    relay.ensure_root_lease.assert_awaited_once_with()
+    relay.list_scoped_tabs.assert_awaited_once_with()
+    relay.request.assert_awaited_once_with(
+        "dom.evaluate",
+        {"tabId": 18, "expression": "({ answer: 6 * 7 })"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_open_pairing_page_uses_relay_nonce_without_exposing_token(monkeypatch: pytest.MonkeyPatch) -> None:
     install_stubs(monkeypatch)
     opener = MagicMock(return_value=True)

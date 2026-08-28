@@ -2,6 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -20,6 +21,7 @@ import { type ReactNode } from "react";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -274,6 +276,7 @@ function renderRunView(
   initialEntry = "/",
   compact = false,
   extra?: ReactNode,
+  pageSlots: PageSlots = {},
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -282,29 +285,31 @@ function renderRunView(
   // component instances (and the MemoryRouter's URL state) are preserved.
   const makeUi = () => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[initialEntry]}>
-        {/* The toggles live in the pane header (StudioShell); render them
-            alongside the body, under a TooltipProvider, the way the shell
-            composes them. Only headerExtras (the toggles) sit under the
-            compact context in production (StudioShell.tsx), not the body. */}
-        <TooltipProvider delayDuration={0}>
-          <StudioPaneCompactContext.Provider value={compact}>
-            <RunPaneViewToggles />
-          </StudioPaneCompactContext.Provider>
-          {initialEntry.startsWith("/runs/") ? (
-            <Routes>
-              <Route
-                path="/runs/:runId"
-                element={<RunView workflowRunId="wr_1" {...props} />}
-              />
-            </Routes>
-          ) : (
-            <RunView workflowRunId="wr_1" {...props} />
-          )}
-        </TooltipProvider>
-        <LocationSpy />
-        {extra}
-      </MemoryRouter>
+      <PageSlotsProvider value={pageSlots}>
+        <MemoryRouter initialEntries={[initialEntry]}>
+          {/* The toggles live in the pane header (StudioShell); render them
+              alongside the body, under a TooltipProvider, the way the shell
+              composes them. Only headerExtras (the toggles) sit under the
+              compact context in production (StudioShell.tsx), not the body. */}
+          <TooltipProvider delayDuration={0}>
+            <StudioPaneCompactContext.Provider value={compact}>
+              <RunPaneViewToggles />
+            </StudioPaneCompactContext.Provider>
+            {initialEntry.startsWith("/runs/") ? (
+              <Routes>
+                <Route
+                  path="/runs/:runId"
+                  element={<RunView workflowRunId="wr_1" {...props} />}
+                />
+              </Routes>
+            ) : (
+              <RunView workflowRunId="wr_1" {...props} />
+            )}
+          </TooltipProvider>
+          <LocationSpy />
+          {extra}
+        </MemoryRouter>
+      </PageSlotsProvider>
     </QueryClientProvider>
   );
   const view = render(makeUi());
@@ -325,6 +330,37 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
+  test("mounts the milestone slot throughout Overview but not the editor", () => {
+    seedCompletedRun();
+    const MilestoneCard = vi.fn(() => <div data-testid="milestone-card" />);
+    const pageSlots = { workflowRunMilestoneCard: MilestoneCard };
+
+    const editor = renderRunView(
+      {},
+      "/?panes=editor",
+      false,
+      undefined,
+      pageSlots,
+    );
+    expect(MilestoneCard).not.toHaveBeenCalled();
+    expect(editor.queryByTestId("milestone-card")).toBeNull();
+    cleanup();
+
+    const overview = renderRunView(
+      {},
+      "/?panes=overview",
+      false,
+      undefined,
+      pageSlots,
+    );
+    expect(overview.queryByTestId("milestone-card")).not.toBeNull();
+    for (const view of ["inputs", "outputs", "code"] as const) {
+      act(() => useRunPaneViewStore.getState().setView(view));
+      overview.rerenderRunView();
+      expect(overview.queryByTestId("milestone-card")).not.toBeNull();
+    }
+  });
+
   test("does not render run tags in Studio Overview", () => {
     seedCompletedRun();
     const { queryByTestId } = renderRunView();

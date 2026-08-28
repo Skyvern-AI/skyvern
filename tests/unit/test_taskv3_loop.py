@@ -14,6 +14,7 @@ import hashlib
 import json
 import random
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,14 +25,20 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3.loop import (
+    ACTION_LOOP_REASON_PREFIX,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
+    NAV_DEAD_END_REASON_PREFIX,
+    NAVIGATION_DEAD_END_STATUSES,
     NO_TOOL_CALL_NUDGE,
     PERCEPTION_STALL_NUDGE_AFTER,
     PERCEPTION_STALL_REASON_PREFIX,
     PERCEPTION_STALL_SHADOW_EVENT,
     PERCEPTION_STALL_SUPPRESSED_EVENT,
     PERCEPTION_STALL_TERMINATE_AFTER,
+    PROGRESS_LEDGER_FINAL_EVENT,
+    PROGRESS_LEDGER_SHADOW_EVENT,
+    PROGRESS_LEDGER_WINDOW,
     ActivityRecency,
     LoopOutcome,
     SubmitWatch,
@@ -40,9 +47,11 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     _canonical_perception_content,
     _PerceptionLedger,
+    _ProgressLedger,
     make_finish_tool,
     run_agent_tool_loop,
 )
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 
 
 class _ScriptedCaller:
@@ -53,6 +62,12 @@ class _ScriptedCaller:
         self.calls = 0
         self.message_history: list[dict[str, Any]] = []
         self.sent_tools: list[dict[str, Any]] | None = None
+        # Model the real LLMCaller.llm_config the engine dereferences to gate the vision `look` tool.
+        self.llm_config = SimpleNamespace(supports_vision=True)
+        # Per-call record of the transient screenshots= arg the loop passed, and the image-block
+        # count the built request would carry (message_history images + this turn's screenshots).
+        self.screenshots_per_call: list[list[bytes] | None] = []
+        self.image_blocks_per_call: list[int] = []
 
     def supports_tool_choice(self) -> bool:
         return True
@@ -67,8 +82,20 @@ class _ScriptedCaller:
         use_message_history: bool = False,
         raw_response: bool = False,
         tool_choice: str | None = None,
+        screenshots: list[bytes] | None = None,
     ) -> dict[str, Any]:
         self.sent_tools = tools
+        self.screenshots_per_call.append(list(screenshots) if screenshots else None)
+        # The built request = the re-seeded transcript plus this turn's transient screenshots. Mirror
+        # llm_messages_builder_with_history: history images (there should be none) + one block per
+        # screenshot appended to a trailing user message.
+        history_images = sum(
+            1
+            for msg in self.message_history
+            for part in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+            if isinstance(part, dict) and part.get("type") in ("image_url", "image")
+        )
+        self.image_blocks_per_call.append(history_images + (len(screenshots) if screenshots else 0))
         turn = self._script[self.calls] if self.calls < len(self._script) else []
         self.calls += 1
         message: dict[str, Any] = {"content": "reasoning..."}
@@ -138,6 +165,72 @@ async def test_perception_is_on_demand_never_injected() -> None:
     # The loop never perceives on its own — observe fires only when the model asks.
     assert observe_calls == []
     assert len(click_calls) == 2
+
+
+def _look_tool(sink: list[tuple[str, dict[str, Any]]], *, image: bytes = b"\x89PNG-fake") -> ToolSpec:
+    """A `look`-shaped tool: returns a text legend AND a transient screenshot the loop must show the
+    model on the next call only (never persisted to the transcript)."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(("look", args))
+        return ToolResult.ok("[1] button 'Next'", screenshots=[image])
+
+    return ToolSpec(
+        name="look",
+        description="look",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_look_image_is_ephemeral_gone_the_turn_after() -> None:
+    # Operator constraint: the annotated screenshot rides exactly ONE request (the turn after look)
+    # and the request the turn AFTER that carries zero image blocks — the accumulation regression.
+    look_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_look_tool(look_calls), _recording_tool("click", click_calls), make_finish_tool()]
+    script = [
+        [("look", {})],  # turn 1: model looks
+        [("click", {"mark": 1})],  # turn 2: model acts on what it saw
+        [("finish", {"status": "completed", "reason": "ok"})],  # turn 3
+    ]
+    outcome, caller = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    # turn 1 request: no image yet; turn 2 request: the look image; turn 3 request: gone.
+    assert caller.image_blocks_per_call[0] == 0
+    assert caller.image_blocks_per_call[1] == 1
+    assert caller.image_blocks_per_call[2] == 0
+    # The transcript the loop re-seeds each turn never holds an image block.
+    for msg in caller.message_history:
+        content = msg.get("content")
+        if isinstance(content, list):
+            assert all(not (isinstance(p, dict) and p.get("type") in ("image_url", "image")) for p in content)
+
+
+@pytest.mark.asyncio
+async def test_n_looks_add_exactly_n_images_total() -> None:
+    # Cost law: N looks add exactly N images across the whole run, not N x remaining turns.
+    look_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_look_tool(look_calls), _recording_tool("click", click_calls), make_finish_tool()]
+    script = [
+        [("look", {})],
+        [("click", {"mark": 1})],
+        [("look", {})],
+        [("click", {"mark": 2})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert len(look_calls) == 2
+    total_images = sum(len(s) for s in caller.screenshots_per_call if s)
+    assert total_images == 2
+    # And no single request ever carries more than the one image just produced.
+    assert max(caller.image_blocks_per_call) == 1
 
 
 @pytest.mark.asyncio
@@ -225,6 +318,144 @@ async def test_terminal_finish_with_failed_status() -> None:
 
     assert outcome.status == "failed"
     assert outcome.reason == "blocked by captcha"
+
+
+def _navigate_tool(dead_end_status: int | None = None) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        data: dict[str, Any] = {"page_state_changed": True}
+        if dead_end_status is not None:
+            data["navigation_dead_end"] = dead_end_status
+        return ToolResult.ok("navigated", data=data)
+
+    return ToolSpec(
+        name="navigate",
+        description="navigate",
+        parameters={"type": "object", "properties": {"url": {"type": "string"}}},
+        handler=handler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_navigate_dead_end_terminates_run() -> None:
+    # A navigate that landed on a dead/removed posting (HTTP 404/410) must end the run as `terminated`,
+    # matching v1 — NOT left to the model's finish choice (which defaults to failed at agent.py).
+    tools = [_navigate_tool(dead_end_status=404), make_finish_tool()]
+    script = [
+        [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
+        [("finish", {"status": "completed", "reason": "should never run"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_navigate_without_dead_end_does_not_terminate() -> None:
+    # Anti-over-route: an ordinary navigation (no dead-end signal) must NOT be reclassified — the run
+    # proceeds and finishes on the model's own verdict.
+    tools = [_navigate_tool(dead_end_status=None), make_finish_tool()]
+    script = [
+        [("navigate", {"url": "https://jobs.example.test/acme/123"})],
+        [("finish", {"status": "completed", "reason": "applied"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "applied"
+
+
+@pytest.mark.asyncio
+async def test_batched_dead_end_then_live_navigate_recovers() -> None:
+    # The system prompt tells the model to batch aggressively. A turn that batches a speculative
+    # navigate that 404s WITH a fallback navigate to a live page must NOT be terminated on the first
+    # of the batch — the fallback runs and the run proceeds to the model's own verdict.
+    live = _navigate_tool(dead_end_status=None)
+    dead = _navigate_tool(dead_end_status=404)
+    tools = [
+        ToolSpec(name="navigate_dead", description="d", parameters=dead.parameters, handler=dead.handler),
+        ToolSpec(name="navigate_live", description="l", parameters=live.parameters, handler=live.handler),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate_dead", {"url": "https://jobs.example.test/acme/closed"}), ("navigate_live", {"url": "x"})],
+        [("finish", {"status": "completed", "reason": "applied to the live one"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "applied to the live one"
+
+
+@pytest.mark.parametrize("status", sorted(NAVIGATION_DEAD_END_STATUSES))
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_terminates_before_loop(status: int) -> None:
+    # The dominant dead-posting case: the task's STARTING url is dead. It is navigated during browser
+    # setup (before this loop), so the model never calls the `navigate` tool — it just observes the dead
+    # page and finishes (defaulting to failed). The loop must classify the pre-loop status and end
+    # `terminated` WITHOUT ever calling the model.
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "should never run"})]],
+        [make_finish_tool()],
+        initial_navigation_status=status,
+    )
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert caller.calls == 0  # short-circuited before the first LLM call — deterministic, not model-driven
+    assert outcome.turns == 0
+
+
+@pytest.mark.parametrize("status", [None, 200, 302, 401, 403, 429, 500, 503])
+@pytest.mark.asyncio
+async def test_initial_navigation_non_dead_end_runs_normally(status: int | None) -> None:
+    # Anti-over-route: a reachable/soft/recoverable starting status must NOT short-circuit — the run
+    # proceeds and finishes on the model's own verdict.
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "applied"})]],
+        [make_finish_tool()],
+        initial_navigation_status=status,
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "applied"
+    assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_yields_canceled_when_cancelling() -> None:
+    # A run canceled during setup must persist as `canceled` (and stay unbilled), not be pre-empted
+    # into `terminated` by the pre-loop dead-end fast path — cancellation is checked first, exactly as
+    # the first loop turn would.
+    async def _cancel() -> bool:
+        return True
+
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "x"})]],
+        [make_finish_tool()],
+        initial_navigation_status=404,
+        should_cancel=_cancel,
+    )
+
+    assert outcome.status == "canceled"
+    assert caller.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_verification_blocker_refuses_completed_but_not_failed() -> None:
+    async def _blocked() -> str | None:
+        return "verification never delivered a code"
+
+    tools = [make_finish_tool(verification_blocker=_blocked)]
+    script = [
+        [("finish", {"status": "completed", "reason": "done"})],
+        [("finish", {"status": "failed", "reason": "verification never delivered a code"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    tool_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert any("verification never delivered a code" in m["content"] for m in tool_messages)
+    assert outcome.status == "failed"
 
 
 @pytest.mark.asyncio
@@ -3116,6 +3347,95 @@ async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the
 
 
 @pytest.mark.asyncio
+async def test_payload_signed_urls_are_masked_to_their_token_across_every_tool_result_surface() -> None:
+    """The single model-facing masking boundary: a resolved payload signed URL echoed by ANY tool
+    result — a navigate/select/type success echo AND a handler-raised tool_error — is rewritten to
+    the SAME opaque token the prompt masker minted (masking by PROVENANCE/membership, not shape),
+    while a benign signing-shaped live-page URL that was never in the payload passes through
+    untouched. This subsumes the per-surface masks and covers the surfaces they forgot."""
+    signed = (
+        "https://files.example.test/uploads/a1b2c3d4e5f6/resume.pdf"
+        "?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.Q29ycmVjdEhvcnNlQmF0dGVyeVN0YXBsZTAxMjM0NTY3ODk"
+    )
+    signature_slice = "eyJhbGciOiJIUzI1NiJ9.c2lnbmVk"
+    # A live-page URL that is_signed_url() flags by shape but was never in the payload.
+    benign = "https://jobs.example.test/apply?token=abcdefABCDEF0123456789ghijklMNOPqrstuvwx"
+    # The browser reports a payload URL back canonicalized ("/" path inserted, default port dropped),
+    # which is how the real navigate tool echoes page.url — the boundary must still recognize it.
+    pathless = "https://files.example.test:443?token=eyJhbGciOiJIUzI1NiJ9.cGF0aGxlc3M.Q29ycmVjdEhvcnNl"
+    pathless_browser_form = "https://files.example.test/?token=eyJhbGciOiJIUzI1NiJ9.cGF0aGxlc3M.Q29ycmVjdEhvcnNl"
+
+    refs = mask_opaque_urls({"file": signed, "link": pathless})
+    token = refs.masked["file"]
+    pathless_token = refs.masked["link"]
+
+    async def navigate_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"navigated to {signed}, then {pathless_browser_form}.")
+
+    async def select_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error(f"no option matched {signed!r}")
+
+    async def type_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"typed, committed {signed}")
+
+    async def boom_handler(_args: dict[str, Any]) -> ToolResult:
+        raise ValueError(f"download failed for {signed}")
+
+    async def benign_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"you are on {benign} now")
+
+    # A redirect landing URL derived mid-task (navigate) is masked from that moment on.
+    landing = "https://cdn.example.test/blob/resume.pdf?X-Amz-Signature=deadbeefdeadbeefdeadbeefdeadbeef"
+
+    async def redirect_handler(_args: dict[str, Any]) -> ToolResult:
+        refs.derive(landing)
+        return ToolResult.ok(f"navigated to {landing}")
+
+    empty = {"type": "object", "properties": {}}
+    tools = [
+        ToolSpec(name="redirect", description="r", parameters=empty, handler=redirect_handler),
+        ToolSpec(name="navigate", description="n", parameters=empty, handler=navigate_handler),
+        ToolSpec(name="select", description="s", parameters=empty, handler=select_handler),
+        ToolSpec(name="type", description="t", parameters=empty, handler=type_handler),
+        ToolSpec(name="boom", description="b", parameters=empty, handler=boom_handler),
+        ToolSpec(name="benign", description="g", parameters=empty, handler=benign_handler),
+        make_finish_tool(),
+    ]
+    # The loop skips the rest of a batch after a tool errors, so the error/raise surfaces each get
+    # their own turn; the boundary must mask every one regardless of batching.
+    script = [
+        [("navigate", {}), ("type", {}), ("benign", {}), ("redirect", {})],
+        [("select", {})],
+        [("boom", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+
+    ctx = SkyvernContext(task_id="tsk_opaque")
+    ctx.opaque_url_refs = refs.refs
+    skyvern_context.set(ctx)
+    try:
+        outcome, caller = await _run(script, tools)
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    tool_messages = {m["name"]: m["content"] for m in caller.message_history if m.get("role") == "tool"}
+    # The raw signed bytes appear NOWHERE in the model-facing transcript.
+    assert all(signature_slice not in m["content"] for m in caller.message_history if m.get("role") == "tool")
+    assert all("cGF0aGxlc3M" not in m["content"] for m in caller.message_history if m.get("role") == "tool")
+    # Every echoing surface — success and error — shows the SAME token the prompt masker minted.
+    assert tool_messages["navigate"] == f"navigated to {token}, then {pathless_token}."
+    assert token in tool_messages["select"]
+    assert token in tool_messages["type"]
+    assert token in tool_messages["boom"]
+    # A benign signing-shaped live-page URL never in the payload is left intact (membership, not shape).
+    assert tool_messages["benign"] == f"you are on {benign} now"
+    assert "deadbeef" not in tool_messages["redirect"] and tool_messages["redirect"].startswith(
+        "navigated to opaque_url_"
+    )
+
+
+@pytest.mark.asyncio
 async def test_on_pre_action_fires_before_dispatch_only_for_submit_shaped_actions() -> None:
     # The pre-action hook fires BEFORE the handler runs (after it the page may be the confirmation
     # page) and only for the loop's own submit-shaped predicate: any click, an Enter press, a type
@@ -3657,3 +3977,291 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
     # call's probe already carries the name it staged.
     assert probe_seen == [frozenset({"in.pdf"})]
     assert blocker_seen == [frozenset({"in.pdf"})]
+
+
+# --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
+
+
+def _form_observe(name: str, invalid_seq: list[int]) -> ToolSpec:
+    """Observe fake: call i returns UNIQUE content plus summary.invalid_fields=invalid_seq[i] (last
+    value repeats). Unique content each call keeps the perception-stall / oscillation guards from
+    firing, isolating the net-progress ledger as the only thing under test."""
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        i = min(calls["n"], len(invalid_seq) - 1)
+        inv = invalid_seq[i]
+        calls["n"] += 1
+        return ToolResult.ok(f"url=x round={calls['n']} err-{i}", data={"summary": {"invalid_fields": inv}})
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_shadow_fires_on_varied_action_zero_net_progress() -> None:
+    # SKY-14998 shape: varied actions (a fresh selector every turn) against a form whose invalid-field
+    # count never improves. Each observe differs and each click's args differ, so NONE of the three
+    # repetition guards trip — yet net progress is zero, so the ledger shadow-fires (and only shadows:
+    # the run is not terminated).
+    rounds = 10
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    fires = [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+    assert len(fires) == 1  # one-shot per run
+    assert fires[0]["form_armed"] is True
+    assert fires[0]["actions"] >= PROGRESS_LEDGER_WINDOW
+    assert fires[0]["invalid_fields"] == 3
+    assert outcome.status == "completed"
+    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_when_invalid_fields_ratchets_down() -> None:
+    # A slow-but-progressing form: the invalid-field count reaches a NEW LOW every few actions, which
+    # is real net progress and resets the ledger, so it must never shadow-fire however long the run.
+    invalid_seq = [6, 6, 6, 5, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 0]
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", invalid_seq), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_never_arms_without_a_form() -> None:
+    # A run with no form fields (invalid_fields always 0) has no distance-to-done metric, so the
+    # ledger must never arm — the primary guard against false-fail-fast on non-form work (reading,
+    # extraction) that legitimately shows no navigation for long stretches.
+    rounds = 14
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [0] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_across_a_click_driven_multipage_form() -> None:
+    # The dominant healthy shape: a multi-page application wizard. An ordinary billable "Next" click —
+    # NOT the explicit navigate tool, so no page_state_changed — advances to page 2, whose fresh
+    # required fields make invalid_fields RISE above page 1's floor. The run makes continuous real
+    # progress (each page's count ratchets to a new low), so the ledger must stay silent; measuring
+    # page 2 against page 1's minimum is the false-fire this guards. The tail stays above zero so the
+    # deciding observe is form_armed — otherwise the run stays silent whether or not the rise branch
+    # fires, and the test would not discriminate the branch it names (per review).
+    invalid_seq = [4, 3, 2, 1, 0, 9, 9, 8, 8, 7, 7, 6, 6, 5, 5]  # page 1 ratchets to 0, page 2 rises then ratchets
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", invalid_seq), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_when_downloads_keep_landing() -> None:
+    # A "download next file" flow on a formful page clicks the same control many times against a page
+    # whose invalid_fields never moves, but each click lands a download — hard progress that resets
+    # the window, so the ledger stays silent (mirrors the action-loop guard's download exemption).
+    rounds = 15
+    dl: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", [3] * rounds),
+        _billable_tool("download", dl, data={"download_notice": True}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("download", {"selector": "#next-file"})] for _ in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+def test_progress_ledger_unit_takes_the_verdict_on_a_confirming_observe() -> None:
+    # No form in view → an observe never fires, however many billable actions accrue; the peak streak
+    # is still tracked for the survival record.
+    unarmed = _ProgressLedger()
+    for _ in range(PROGRESS_LEDGER_WINDOW * 2):
+        unarmed.on_billable()
+    assert unarmed.observe(0) is False
+    assert unarmed.peak_actions_since_progress >= PROGRESS_LEDGER_WINDOW
+
+    # Armed and flat → the confirming observe fires once at the window, then latches.
+    armed = _ProgressLedger()
+    assert armed.observe(3) is False  # arms + baselines, no actions yet
+    for _ in range(PROGRESS_LEDGER_WINDOW):
+        armed.on_billable()
+    assert armed.observe(3) is True  # a full window of actions, and this look confirms no progress
+    for _ in range(PROGRESS_LEDGER_WINDOW):
+        armed.on_billable()
+    assert armed.observe(3) is False  # one-shot latch
+
+    # The verdict waits for a confirming look: a window of actions batched before re-observing does
+    # NOT fire, and the confirming look then shows a new low (real progress).
+    deferred = _ProgressLedger()
+    deferred.observe(10)
+    for _ in range(PROGRESS_LEDGER_WINDOW * 3):
+        deferred.on_billable()
+    assert deferred.observe(2) is False
+
+    # A rise re-baselines (a new page's fresh required fields), so the streak cannot carry across it.
+    paged = _ProgressLedger()
+    paged.observe(4)
+    for _ in range(PROGRESS_LEDGER_WINDOW - 1):
+        paged.on_billable()
+    assert paged.observe(9) is False  # rose → reset + re-baseline
+    for _ in range(PROGRESS_LEDGER_WINDOW - 1):
+        paged.on_billable()
+    assert paged.observe(9) is False  # only window-1 actions since that reset
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_on_click_driven_equal_count_transition() -> None:
+    # SKY-15020 Lever C #3 (was a false-positive): every click drives a REAL page transition
+    # (page_transitioned=True) to a fresh page that happens to show the SAME invalid_fields count. The
+    # real transition signal is hard progress, so the coincidentally-equal count is never read as a
+    # stalled look and the ledger stays silent. Before the flag the click surfaced nothing, the equal
+    # count read as flat, and the ledger false-fired on a progressing multi-page run (RED against main).
+    rounds = 12
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", [3] * rounds),
+        _billable_tool("click", clicks, data={"page_transitioned": True}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_on_url_stable_spa_advance() -> None:
+    # SKY-15020 Lever C, the regression the CP ruling guards against: a URL-STABLE multi-step SPA form
+    # (Workday/Greenhouse/iCIMS-style) advances page-to-page WITHOUT moving the URL, so every click
+    # reports page_transitioned=False, yet each fresh step surfaces MORE required fields — a rising
+    # invalid_fields count that is genuine progress. URL-unchanged does NOT prove same-page, so the
+    # ledger must NEVER suppress the rise re-baseline on a False signal: the rise re-baselines exactly
+    # as on main, the streak never accrues, and a healthy progressing run stays silent. RED against the
+    # rejected (A) impl, which suppressed the re-baseline on False and would false-fire here.
+    invalid_seq = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24]
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", invalid_seq),
+        _billable_tool("click", clicks, data={"page_transitioned": False}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_documented_fn_oscillating_same_page_stays_silent() -> None:
+    # SKY-15020 Lever C KNOWN LIMITATION: a genuinely-stuck form whose invalid_fields OSCILLATES on the
+    # SAME page (a submit that keeps surfacing a different error set without advancing) is NOT caught.
+    # page_transitioned=False cannot distinguish this oscillating-stuck run from a URL-stable SPA
+    # advance (test above) — both report False with a rising count — so the ledger takes the SAFE
+    # direction and re-baselines on every up-swing, exactly as on main. This documents the accepted
+    # false-negative (no regression, no new FP); the same-page-oracle follow-up is what would close it.
+    invalid_seq = [3, 5, 3, 5, 3, 5, 3, 5, 3, 5, 3, 5]
+    rounds = len(invalid_seq)
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", invalid_seq),
+        _billable_tool("click", clicks, data={"page_transitioned": False}),
+        make_finish_tool(),
+    ]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_emits_terminal_survival_record() -> None:
+    # Per-run terminal instrumentation: the ledger's peak no-progress streak and whether it would
+    # have fired, tagged with the run's outcome — the survival-distribution data for choosing an
+    # enforce threshold from data rather than gut.
+    rounds = 10
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    final = [e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]
+    assert len(final) == 1
+    assert final[0]["outcome_status"] == "completed"
+    assert final[0]["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
+    assert final[0]["would_fire"] is True
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_silent_when_actions_batch_before_a_confirming_observe() -> None:
+    # Healthy batch: the model fixes several fields in one turn before re-observing (markers stay
+    # valid until the page re-renders, so acting several times per observe is expected). The
+    # confirming observe then reveals the invalid-field count dropped — real progress. The verdict
+    # must wait for that look, never fire on the action count alone.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [10, 2]), _billable_tool("click", clicks), make_finish_tool()]
+    batch = [("click", {"selector": f"#f{i}"}) for i in range(PROGRESS_LEDGER_WINDOW)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        batch,
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_fires_at_the_confirming_observe_after_a_fruitless_batch() -> None:
+    # Same batch shape, but the confirming observe shows NO improvement: the run acted a full window
+    # of times and, when it finally looked, nothing advanced. The verdict lands on that observe.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [10, 10]), _billable_tool("click", clicks), make_finish_tool()]
+    batch = [("click", {"selector": f"#f{i}"}) for i in range(PROGRESS_LEDGER_WINDOW)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        batch,
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    fires = [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
+    assert len(fires) == 1
+    assert fires[0]["actions"] >= PROGRESS_LEDGER_WINDOW
+    assert outcome.status == "completed"

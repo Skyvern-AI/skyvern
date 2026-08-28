@@ -856,7 +856,10 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             # 2000 chars ~= 500 LLM tokens — enough for the model to see the
             # overall shape without consuming a meaningful slice of the prompt
             # budget. Over this, point the model at get_block_schema instead.
-            if len(schema_str) > 2000:
+            # get_block_schema is exempt: the schema is what it was called for, and the steering
+            # message names the call that produced it, so truncating here leaves the model no route
+            # to the fields it asked for.
+            if len(schema_str) > 2000 and tool_name != "get_block_schema":
                 data["schema"] = {
                     "_truncated": True,
                     "message": (
@@ -1238,11 +1241,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
             return "Evaluated JavaScript"
         return f"Evaluated JavaScript — returned {_describe_value_shape(result_val)}"
     if tool_name == "click":
-        target = data.get("effective_target") or data.get("selector") or data.get("resolved_selector") or "?"
+        target = (
+            data.get("effective_target")
+            or data.get("selector")
+            or data.get("executed_selector")
+            or data.get("resolved_selector")
+            or "?"
+        )
         return f"Clicked '{target}'"
     if tool_name == "type_text":
         length = data.get("typed_length") or data.get("text_length", "?")
-        return f"Typed {length} chars into '{data.get('selector', '?')}'"
+        target = data.get("effective_target") or data.get("selector") or data.get("executed_selector") or "?"
+        return f"Typed {length} chars into '{target}'"
     if tool_name == "scroll":
         return f"Scrolled {data.get('direction', '?')}"
     if tool_name == "console_messages":

@@ -118,15 +118,8 @@ function Settings() {
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">1Password Integration</CardTitle>
           <CardDescription>
-            Manage your 1Password service account token.{" "}
-            <a
-              href="https://developer.1password.com/docs/service-accounts/get-started/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 underline"
-            >
-              Learn how to create a service account and get your token.
-            </a>
+            Connect a 1Password service account so agent logins can use items
+            from your vaults. The steps below walk through creating the token.
           </CardDescription>
         </CardHeader>
         <CardContent className="p-8">

@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { NarrativeView } from "./NarrativeView";
@@ -138,19 +144,16 @@ describe("NarrativeView collapse default", () => {
     expect(screen.getByText("Working…")).toBeTruthy();
   });
 
-  it.each([false, true])(
-    "renders an interim completed row as neutral in uxV1=%s",
-    (uxV1) => {
-      render(<NarrativeView turn={interimRunTurn()} uxV1={uxV1} />);
+  it("renders an interim completed row as neutral", () => {
+    render(<NarrativeView turn={interimRunTurn()} />);
 
-      const row = screen.getByTitle("Highlight block_1 on canvas");
-      expect(row.textContent).toContain("ran");
-      expect(row.textContent).not.toContain("!");
-      expect(row.textContent).not.toContain("✓");
-      expect(screen.queryByText(/Outcome not confirmed/)).toBeNull();
-      expect(screen.queryByText(SHORT_OUTCOME_REASON)).toBeNull();
-    },
-  );
+    const row = screen.getByTitle("Highlight block_1 on canvas");
+    expect(row.textContent).toContain("ran");
+    expect(row.textContent).not.toContain("!");
+    expect(row.textContent).not.toContain("✓");
+    expect(screen.queryByText(/Outcome not confirmed/)).toBeNull();
+    expect(screen.queryByText(SHORT_OUTCOME_REASON)).toBeNull();
+  });
 
   it.each([undefined, "adjudicated" as const])(
     "keeps role=%s not-demonstrated rows amber",
@@ -250,7 +253,8 @@ describe("NarrativeView collapse default", () => {
     expect(screen.getByText(HEADLINE)).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.queryByText("Halted")).toBeNull();
-    expect(screen.getAllByText("add_to_cart")).toHaveLength(1);
+    const changedSection = screen.getByText("What changed").parentElement!;
+    expect(within(changedSection).getAllByText("Add To Cart")).toHaveLength(1);
   });
 
   it("appends a truncated not-demonstrated reason to the collapsed subtitle", () => {
@@ -443,7 +447,7 @@ const askAfterScoutingTurn = (): TurnNarrativeState => ({
 
 describe("NarrativeView rollup expand affordance", () => {
   it("renders a pure needs-input ask as a plain, non-expandable card", () => {
-    render(<NarrativeView turn={pureAskTurn()} uxV1 />);
+    render(<NarrativeView turn={pureAskTurn()} />);
 
     expect(screen.getByText("Which login should I use?")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
@@ -451,7 +455,7 @@ describe("NarrativeView rollup expand affordance", () => {
   });
 
   it("keeps the chevron for an ask that follows scouting and reveals the thought stream on expand", () => {
-    render(<NarrativeView turn={askAfterScoutingTurn()} uxV1 />);
+    render(<NarrativeView turn={askAfterScoutingTurn()} />);
 
     const head = screen.getByRole("button");
     expect(head.getAttribute("aria-expanded")).toBe("false");
@@ -473,13 +477,12 @@ describe("NarrativeView rollup expand affordance", () => {
   });
 
   it("gains the expand affordance when activity arrives after a content-free render", () => {
-    const { rerender } = render(<NarrativeView turn={pureAskTurn()} uxV1 />);
+    const { rerender } = render(<NarrativeView turn={pureAskTurn()} />);
     expect(screen.queryByRole("button")).toBeNull();
 
     rerender(
       <NarrativeView
         turn={{ ...pureAskTurn(), blocks: [completedBlock("block_1")] }}
-        uxV1
       />,
     );
     const head = screen.getByRole("button");
@@ -514,9 +517,19 @@ describe("a stopped block stays inspectable", () => {
   it("names the stopped block in the collapsed rollup", () => {
     render(<NarrativeView turn={stoppedTurn()} />);
 
-    expect(screen.getByText("Stopped", { selector: "div" })).toBeTruthy();
-    expect(screen.getByText("log_in")).toBeTruthy();
+    const stoppedSection = screen.getByText("Stopped", {
+      selector: "div",
+    }).parentElement!;
+    expect(within(stoppedSection).getByText("Log In")).toBeTruthy();
     expect(screen.queryByText("Halted")).toBeNull();
+  });
+
+  // A non-solo run row keeps its block cards in the collapsed body, so the log
+  // is not a substitute for the summary list on a finished turn.
+  it("still names a stopped block on the activity-log surface", () => {
+    render(<NarrativeView turn={stoppedTurn()} />);
+
+    expect(screen.getByText("Stopped", { selector: "div" })).toBeTruthy();
   });
 
   // A stop is not a failure, so the row must not auto-open and shout — but what
@@ -532,5 +545,64 @@ describe("a stopped block stays inspectable", () => {
     fireEvent.click(screen.getByTitle("Highlight log_in on canvas"));
 
     expect(screen.getByText("opened the sign-in page")).toBeTruthy();
+  });
+
+  // A two-block turn is the case a one-block fixture hides: the run row is not a
+  // solo block, so its cards sit in the collapsed body and name nothing there.
+  it("names a failed block on a two-block turn, on both surfaces", () => {
+    const twoBlockTurn = (): TurnNarrativeState => ({
+      ...terminalBuildTurn(),
+      designActivity: [
+        {
+          kind: "tool_result",
+          toolName: "update_and_run_blocks",
+          text: "Ran the blocks",
+          success: true,
+          iteration: 0,
+          id: "tr-run",
+        },
+      ],
+      blocks: [completedBlock("log_in"), failedBlock("download")],
+    });
+
+    const legacy = render(<NarrativeView turn={twoBlockTurn()} />);
+    expect(screen.getAllByText(/download/i).length).toBeGreaterThan(0);
+    legacy.unmount();
+
+    render(<NarrativeView turn={twoBlockTurn()} />);
+    expect(screen.getAllByText(/download/i).length).toBeGreaterThan(0);
+  });
+
+  // The write/run row the design shows titled renders as a block card, which
+  // previously discarded the narrator title entirely.
+  it("titles a solo block row with the narrator label, without losing the block name", () => {
+    const narratedRunTurn = (): TurnNarrativeState => ({
+      ...terminalBuildTurn(),
+      designActivity: [
+        {
+          kind: "tool_result",
+          toolName: "update_and_run_blocks",
+          text: "Ran the blocks",
+          success: true,
+          iteration: 0,
+          id: "tr-run",
+        },
+        {
+          kind: "narration",
+          text: "Checking the saved steps survive a real run",
+          iteration: 0,
+          activeLabel: "Running it",
+          outcomeLabel: "Rewrote the download step",
+          id: "n-run",
+        },
+      ],
+      blocks: [completedBlock("download_report")],
+    });
+
+    render(<NarrativeView turn={narratedRunTurn()} />);
+
+    expect(screen.getByText("Rewrote the download step")).toBeTruthy();
+    // The block itself is still named by the rollup's own list.
+    expect(screen.getAllByText(/download.report/i).length).toBeGreaterThan(0);
   });
 });

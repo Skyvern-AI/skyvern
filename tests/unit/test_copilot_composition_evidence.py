@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 from bs4 import BeautifulSoup
+from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -30,6 +32,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     _STRUCTURED_EVIDENCE_BODY,
+    COMPOSITION_STRIPPED_HTML_EXPRESSION,
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
@@ -54,6 +57,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     has_witnessed_value_content,
     merge_visual_composition_evidence,
+    model_visible_composition_evidence,
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
@@ -61,8 +65,10 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
+from skyvern.forge.sdk.copilot.tools.composition_capture import _model_facing_inspect_result
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
@@ -175,7 +181,7 @@ def test_composition_parse_html_extracts_labeled_fields_and_submit_controls() ->
     assert parsed["navigation_targets"][0]["text"] == "Find a Record"
     assert parsed["navigation_targets"][0]["href"] == "https://example.com/registry/search"
     assert [item["text"] for item in parsed["navigation_targets"]] == ["Find a Record"]
-    assert parsed["result_containers"][0]["selector"] == "#results"
+    assert parsed["result_containers"][0]["selector_candidates"][0]["selector"] == "#results"
     assert parsed["result_containers"][0]["row_selector"] == "#results tbody tr"
     assert "#results tbody tr td:first-child" in parsed["result_containers"][0]["expand_toggle_candidates"]
     assert parsed["evidence_sources"] == ["dom_html"]
@@ -244,7 +250,7 @@ def test_composition_parse_html_extracts_modal_overlay_controls() -> None:
         current_url="https://example.com/results",
     )
 
-    assert parsed["modal_overlays"][0]["selector"] == "#newsletter"
+    assert parsed["modal_overlays"][0]["selector_candidates"][0]["selector"] == "#newsletter"
     assert parsed["modal_overlays"][0]["role"] == "dialog"
     assert parsed["modal_overlays"][0]["dismiss_controls"][0]["text"] == "x"
     assert parsed["modal_overlays"][0]["dismiss_controls"][0]["aria_label"] == "Close modal"
@@ -298,7 +304,49 @@ def test_composition_parse_html_ignores_hidden_modal_overlay_markup() -> None:
     assert parsed["page_obstructions"] == []
 
 
-def test_composition_parse_html_marks_generic_fullscreen_barrier_for_visual_fallback() -> None:
+def test_raw_html_visibility_override_fails_closed_without_preserving_hidden_siblings() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div style="visibility:hidden">
+            <form><label>Secret stale field</label><button>Submit hidden stale state</button></form>
+            <div id="dialog" role="dialog" style="visibility:visible">
+              <button>Dismiss</button>
+            </div>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
+    assert "Secret stale field" not in parsed["visible_text_excerpt"]
+    assert "Submit hidden stale state" not in parsed["visible_text_excerpt"]
+
+
+@pytest.mark.parametrize("style", ["display:none !important", "visibility:hidden !important"])
+def test_raw_html_important_hidden_modal_is_excluded(style: str) -> None:
+    parsed = parse_composition_html(
+        f"""
+        <html><body>
+          <div id="dialog" role="dialog" style="{style}">
+            Hidden private state
+            <button>Dismiss</button>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
+    assert "Hidden private state" not in parsed["visible_text_excerpt"]
+
+
+def test_composition_parse_html_reports_actionable_fullscreen_barrier_through_dom() -> None:
     parsed = parse_composition_html(
         """
         <html><body>
@@ -306,9 +354,11 @@ def test_composition_parse_html_marks_generic_fullscreen_barrier_for_visual_fall
             <input id="query" name="query" type="text" />
             <button>Search</button>
           </form>
-          <section
-            id="interruption"
-            style="position: fixed; inset: 0; z-index: 1200; background: rgba(0,0,0,.35);"
+              <section
+                id="interruption"
+                data-page-evidence-rendered-style="true"
+                data-page-evidence-intercepts-outside-control="true"
+                style="position: fixed; inset: 0; z-index: 1200; background: rgba(0,0,0,.35);"
           >
             <article>
               <p>Finish this checkpoint before continuing.</p>
@@ -322,41 +372,14 @@ def test_composition_parse_html_marks_generic_fullscreen_barrier_for_visual_fall
     )
 
     assert parsed["modal_overlays"] == []
-    assert parsed["page_obstructions"] == []
-    assert parsed["visual_obstruction_candidates"] == [
-        {
-            "source": "dom_style",
-            "position": "fixed",
-            "coverage": "viewport",
-            "has_visible_controls": True,
-        }
-    ]
+    obstruction = parsed["page_obstructions"][0]
+    assert obstruction["kind"] == "interaction_blocking_layer"
+    assert obstruction["source"] == "dom_html"
+    assert obstruction["intercepts_outside_control"] is True
+    assert obstruction["visible_controls"][0]["selector_candidates"]
+    assert parsed["visual_obstruction_candidates"][0]["coverage"] == "viewport"
     assert has_bounded_page_schema(parsed) is True
     assert page_evidence_needs_visual_fallback(parsed) is True
-
-    merged = merge_visual_composition_evidence(
-        parsed,
-        visual_summary={
-            "summary": "A centered checkpoint panel blocks the search form.",
-            "challenge_detected": False,
-            "submit_blocked": False,
-            "page_obstruction_detected": True,
-            "obstruction_kind": "checkpoint_panel",
-            "obstruction_location": "Centered over the search form.",
-            "underlying_page_blocked": True,
-            "visible_dismiss_controls": ["Continue"],
-        },
-    )
-
-    assert merged["page_obstructions"] == [
-        {
-            "kind": "checkpoint_panel",
-            "source": "vision_summary",
-            "visual_location": "Centered over the search form.",
-            "visible_controls": [{"text": "Continue"}],
-            "underlying_page_blocked": True,
-        }
-    ]
 
 
 def test_composition_parse_html_does_not_screenshot_normal_fixed_footer() -> None:
@@ -379,6 +402,146 @@ def test_composition_parse_html_does_not_screenshot_normal_fixed_footer() -> Non
     assert parsed["visual_obstruction_candidates"] == []
     assert has_bounded_page_schema(parsed) is True
     assert page_evidence_needs_visual_fallback(parsed) is False
+
+
+def test_composition_parse_html_reports_identity_neutral_blocking_layer_without_calling_it_modal() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div id="veil" data-page-evidence-rendered-style="true"
+               data-page-evidence-intercepts-outside-control="true"
+               style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+            <button id="veil-close" aria-label="Dismiss notice">Dismiss</button>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    obstruction = parsed["page_obstructions"][0]
+    assert obstruction["kind"] == "interaction_blocking_layer"
+    assert obstruction["intercepts_outside_control"] is True
+    control = obstruction["visible_controls"][0]
+    assert control["selector_candidates"]
+    assert control["identity"]["label_context"] == "Dismiss notice"
+    assert obstruction["source"] == "dom_html"
+    assert parsed["visual_obstruction_candidates"][0]["coverage"] == "viewport"
+
+
+def test_interaction_blocking_layer_reports_every_action_without_choosing_one() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div id="veil" data-page-evidence-rendered-style="true"
+               data-page-evidence-intercepts-outside-control="true"
+               style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+            <button id="accept">Accept</button>
+            <button id="reject">Reject</button>
+            <button id="settings">Settings</button>
+            <input id="continue-image" type="image" alt="Continue" src="continue.png">
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    obstruction = parsed["page_obstructions"][0]
+    assert [control["text"] for control in obstruction["visible_controls"]] == [
+        "Accept",
+        "Reject",
+        "Settings",
+        "Continue",
+    ]
+    assert "dismiss_controls" not in obstruction
+
+
+@pytest.mark.parametrize(
+    "control",
+    [
+        pytest.param('<button style="pointer-events:none">Dismiss</button>', id="pointer_disabled_button"),
+        pytest.param("<button disabled>Dismiss</button>", id="disabled_button"),
+        pytest.param('<button style="display:none">Dismiss</button>', id="hidden_button"),
+        pytest.param(
+            '<input type="password" value="top-secret-password">',
+            id="secret_bearing_non_action_input",
+        ),
+        pytest.param('<input type="hidden" value="top-secret-password">', id="hidden_secret_input"),
+    ],
+)
+def test_composition_parse_html_blocking_layer_rejects_non_actionable_control(control: str) -> None:
+    parsed = parse_composition_html(
+        (
+            '<html><body><div id="veil" data-page-evidence-rendered-style="true" '
+            'data-page-evidence-intercepts-outside-control="true" '
+            'style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">'
+            f"{control}</div></body></html>"
+        ),
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
+    assert "top-secret-password" not in json.dumps(parsed)
+
+
+def test_composition_parse_html_blocking_layer_rejects_unstamped_stylesheet_geometry() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><style>
+          #veil { position:fixed; inset:0; z-index:1200; opacity:1; pointer-events:auto; }
+        </style></head><body>
+          <div id="veil"><button id="dismiss">Dismiss</button></div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
+
+
+@pytest.mark.parametrize(
+    "style, control",
+    [
+        (
+            "position:fixed;inset:0;z-index:1200;opacity:0;pointer-events:auto",
+            '<button aria-label="Dismiss">x</button>',
+        ),
+        (
+            "position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:none",
+            '<button aria-label="Dismiss">x</button>',
+        ),
+        (
+            "position:fixed;left:0;bottom:0;z-index:1200;opacity:1;pointer-events:auto",
+            '<button aria-label="Dismiss">x</button>',
+        ),
+        ("position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto", "<button></button>"),
+        (
+            "position:absolute;inset:0;z-index:1200;opacity:1;pointer-events:auto",
+            '<button aria-label="Dismiss">x</button>',
+        ),
+        (
+            "position:fixed;inset:0;z-index:9;opacity:1;pointer-events:auto",
+            '<button aria-label="Dismiss">x</button>',
+        ),
+    ],
+)
+def test_composition_parse_html_rejects_incomplete_interaction_blocking_layer(style: str, control: str) -> None:
+    parsed = parse_composition_html(
+        '<html><body><div id="veil" data-page-evidence-rendered-style="true" '
+        f'data-page-evidence-intercepts-outside-control="true" style="{style}">{control}</div></body></html>',
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
 
 
 def test_composition_parse_html_ignores_empty_modal_root_as_bounded_schema() -> None:
@@ -440,16 +603,20 @@ def test_composition_parse_html_preserves_stable_control_selectors_and_values() 
     )
 
     fields = parsed["forms"][0]["fields"]
-    assert fields[0]["selector"] == 'input.credentialTypeChoice[value="STANDARD"]'
+    assert 'input.credentialTypeChoice[value="STANDARD"]' in {
+        candidate["selector"] for candidate in fields[0]["selector_candidates"]
+    }
     assert fields[0]["label"] == "Standard"
     assert fields[0]["value"] == "STANDARD"
-    assert fields[1]["selector"] == "#id-first_name"
-    assert fields[2]["selector"] == "#id-last_name"
+    assert fields[1]["selector_candidates"][0]["selector"] == "#id-first_name"
+    assert fields[2]["selector_candidates"][0]["selector"] == "#id-last_name"
     assert fields[3]["options"][1] == {"text": "Massachusetts", "value": "MA", "selected": False}
-    assert fields[4]["selector"] == 'input.acknowledgementCheck[value="yes"]'
+    assert 'input.acknowledgementCheck[value="yes"]' in {
+        candidate["selector"] for candidate in fields[4]["selector_candidates"]
+    }
     assert fields[4]["label"] == "I agree"
     assert fields[4]["disabled"] is False
-    assert parsed["forms"][0]["submit_controls"][0]["selector"] == "#btnSubmit"
+    assert parsed["forms"][0]["submit_controls"][0]["selector_candidates"][0]["selector"] == "#btnSubmit"
     assert parsed["forms"][0]["submit_controls"][0]["value"] == "Search"
     assert parsed["forms"][0]["submit_controls"][0]["disabled"] is False
 
@@ -655,22 +822,26 @@ def test_composition_parse_html_surfaces_human_verification_controls_after_long_
         "challenge",
         "human-verification",
     }.issubset(set(parsed["anti_bot_indicators"]))
-    assert {control["selector"] for control in parsed["challenge_controls"]} >= {
+    assert {
+        candidate["selector"]
+        for control in parsed["challenge_controls"]
+        for candidate in control["selector_candidates"]
+    } >= {
         "#human-verification-widget",
         "#human-verification-response",
     }
-    assert parsed["forms"][0]["submit_controls"][0]["selector"] == "#btnSubmit"
+    assert parsed["forms"][0]["submit_controls"][0]["selector_candidates"][0]["selector"] == "#btnSubmit"
     assert parsed["forms"][0]["submit_controls"][0]["disabled"] is True
     assert parsed["challenge_state"]["gates_submit_controls"] is True
-    assert parsed["challenge_state"]["gated_submit_controls"] == [
-        {
-            "text": "Search",
-            "id": "btnSubmit",
-            "name": "btnSubmit",
-            "selector": "#btnSubmit",
-            "disabled": True,
-        }
-    ]
+    gated = parsed["challenge_state"]["gated_submit_controls"][0]
+    assert {"text": gated["text"], "id": gated["id"], "name": gated["name"], "disabled": gated["disabled"]} == {
+        "text": "Search",
+        "id": "btnSubmit",
+        "name": "btnSubmit",
+        "disabled": True,
+    }
+    assert gated["selector_candidates"][0] == {"selector": "#btnSubmit", "source": "id", "match_count": 1}
+    assert "selector" not in gated
 
 
 def test_composition_parse_html_excludes_challenge_controls_inside_hidden_ancestors() -> None:
@@ -690,7 +861,11 @@ def test_composition_parse_html_excludes_challenge_controls_inside_hidden_ancest
         current_url="https://example.com/search",
     )
 
-    selectors = {control["selector"] for control in parsed["challenge_controls"]}
+    selectors = {
+        candidate["selector"]
+        for control in parsed["challenge_controls"]
+        for candidate in control["selector_candidates"]
+    }
     assert "#human-verification-widget" in selectors
     assert "#turnstile-solved" not in selectors
     assert "#challenge-stale" not in selectors
@@ -721,13 +896,19 @@ def test_composition_parse_html_surfaces_interactive_descendants_of_challenge_ca
         current_url="https://example.com/challenge",
     )
 
-    selectors = {control["selector"] for control in parsed["challenge_controls"]}
+    selectors = {
+        candidate["selector"]
+        for control in parsed["challenge_controls"]
+        for candidate in control["selector_candidates"]
+    }
     assert {"#notRobot", "button.btn-primary", "button.goback"}.issubset(selectors)
     assert "#hidden" not in selectors
-    assert (
-        next(control for control in parsed["challenge_controls"] if control["selector"] == "#disabled")["disabled"]
-        is True
+    disabled = next(
+        control
+        for control in parsed["challenge_controls"]
+        if any(candidate["selector"] == "#disabled" for candidate in control["selector_candidates"])
     )
+    assert disabled["disabled"] is True
 
 
 def test_composition_parse_html_passed_challenge_markup_escalates_without_assertion() -> None:
@@ -2308,6 +2489,7 @@ def test_structured_preserves_live_key_and_table_binding_shape() -> None:
                 "tag": "table",
                 "selector": "#records",
                 "selector_match_count": 1,
+                "selector_candidates": [{"selector": "#records", "source": "id", "match_count": 1}],
                 "visible": True,
                 "span_free": True,
                 "nested_table_free": True,
@@ -2364,7 +2546,9 @@ def test_structured_preserves_live_key_and_table_binding_shape() -> None:
     assert parsed["key_value_relations_truncated"] is False
     assert parsed["result_containers_truncated"] is False
     assert parsed["result_containers"][0]["headers"] == payload["result_containers"][0]["headers"]
-    assert parsed["result_containers"][0]["selector_match_count"] == 1
+    assert parsed["result_containers"][0]["selector_candidates"] == [
+        {"selector": "#records", "source": "id", "match_count": 1}
+    ]
     assert parsed["result_containers"][0]["rows_truncated"] is False
     assert parsed["result_containers"][0]["nested_table_free"] is True
     assert parsed["result_containers"][0]["row_selector"] == "#records > tbody > tr"
@@ -2446,8 +2630,8 @@ def test_html_packet_excludes_hidden_bindings_and_preserves_revealed_structure()
     assert hidden["result_containers"] == []
     assert revealed["key_value_relations"][0]["key_text"] == "Record Identifier"
     table = revealed["result_containers"][0]
-    assert table["selector"] == "#records"
-    assert table["selector_match_count"] == 1
+    assert table["selector_candidates"][0]["selector"] == "#records"
+    assert table["selector_candidates"][0]["match_count"] == 1
     assert table["headers"] == [
         {"text": "Address", "column_index": 0},
         {"text": "Status", "column_index": 1},
@@ -2715,6 +2899,8 @@ def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
                 "id": "",
                 "class": ["modal"],
                 "selector": "div.modal",
+                "selector_candidates": [{"selector": "div.modal", "source": "class", "match_count": 1}],
+                "identity": {"tag": "div", "role": "dialog", "label_context": "Subscribe"},
                 "text": "Subscribe",
                 "dismiss_controls": [
                     {
@@ -2723,6 +2909,8 @@ def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
                         "aria_label": "",
                         "title": "",
                         "selector": "button.x",
+                        "selector_candidates": [{"selector": "button.x", "source": "class", "match_count": 1}],
+                        "identity": {"tag": "button", "role": "button", "label_context": "Close"},
                         "type": "",
                     }
                 ],
@@ -2739,7 +2927,7 @@ def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
 
     assert parsed is not None
     overlay = parsed["modal_overlays"][0]
-    assert overlay["selector"] == "div.modal"
+    assert overlay["selector_candidates"] == [{"selector": "div.modal", "source": "class", "match_count": 1}]
     assert overlay["dismiss_controls"][0]["text"] == "Close"
     assert "aria_modal" in overlay and overlay["aria_modal"] is True
     assert parsed["page_obstructions"]
@@ -3066,7 +3254,11 @@ def test_clickable_controls_surface_grounded_selectors_outside_forms() -> None:
         inspected_url=_STANDALONE_CONTROLS_URL,
         current_url=_STANDALONE_CONTROLS_URL,
     )
-    by_selector = {control.get("selector"): control for control in parsed["clickable_controls"]}
+    by_selector = {
+        candidate["selector"]: control
+        for control in parsed["clickable_controls"]
+        for candidate in control["selector_candidates"]
+    }
     assert "#biz-tile" in by_selector
     assert 'div[data-action="selectAddress"]' in by_selector
     assert by_selector['div[data-action="selectAddress"]']["text"] == "2468 Peach Orchard Ct"
@@ -3084,16 +3276,14 @@ def test_clickable_controls_preserve_disclosure_state_and_controlled_region_visi
         current_url=_STANDALONE_CONTROLS_URL,
     )
 
-    assert parsed["clickable_controls"] == [
-        {
-            "text": "More options",
-            "selector": "#more",
-            "tag": "button",
-            "expanded": False,
-            "controls": "alternatives",
-            "controlled_region_visible": False,
-        }
-    ]
+    control = model_visible_composition_evidence(parsed)["clickable_controls"][0]
+    assert "selector" not in control
+    assert control["text"] == "More options"
+    assert control["tag"] == "button"
+    assert control["expanded"] is False
+    assert control["controls"] == "alternatives"
+    assert control["controlled_region_visible"] is False
+    assert any(candidate["selector"] == "#more" for candidate in control["selector_candidates"])
 
 
 def test_structured_clickable_controls_preserve_disclosure_facts() -> None:
@@ -3104,6 +3294,8 @@ def test_structured_clickable_controls_preserve_disclosure_facts() -> None:
                 {
                     "text": "More options",
                     "selector": "#more",
+                    "selector_candidates": [{"selector": "#more", "source": "id", "match_count": 1}],
+                    "identity": {"tag": "button", "role": "button", "label_context": "More options"},
                     "tag": "button",
                     "expanded": False,
                     "controls": "alternatives",
@@ -3116,9 +3308,10 @@ def test_structured_clickable_controls_preserve_disclosure_facts() -> None:
     )
 
     assert parsed is not None
-    assert parsed["clickable_controls"][0] == {
+    assert model_visible_composition_evidence(parsed)["clickable_controls"][0] == {
         "text": "More options",
-        "selector": "#more",
+        "selector_candidates": [{"selector": "#more", "source": "id"}],
+        "identity": {"tag": "button", "role": "button", "label_context": "More options"},
         "tag": "button",
         "expanded": False,
         "controls": "alternatives",
@@ -3151,7 +3344,11 @@ def test_clickable_controls_exclude_in_form_buttons() -> None:
         inspected_url=_STANDALONE_CONTROLS_URL,
         current_url=_STANDALONE_CONTROLS_URL,
     )
-    selectors = {control.get("selector") for control in parsed["clickable_controls"]}
+    selectors = {
+        candidate["selector"]
+        for control in parsed["clickable_controls"]
+        for candidate in control["selector_candidates"]
+    }
     assert "#in-form" not in selectors
     assert "#out-form" in selectors
 
@@ -3271,6 +3468,14 @@ _FIDELITY_HTML = """<!DOCTYPE html>
 
 def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
     """Project the acceptance-criteria fields (forms/labels/modal/anti-bot/nav/challenge) for parity."""
+
+    def non_browser_only_selectors(carrier: dict[str, Any]) -> tuple[str, ...]:
+        return tuple(
+            candidate["selector"]
+            for candidate in carrier["selector_candidates"]
+            if candidate["source"] != "text_anchor"
+        )
+
     forms = [
         {
             "fields": [(field["name"], field["label"], field["type"], field["required"]) for field in form["fields"]],
@@ -3284,17 +3489,28 @@ def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
         "forms": forms,
         "navigation_targets": sorted(target["href"] for target in evidence["navigation_targets"]),
         "clickable_controls": sorted(
-            (control.get("selector", ""), control.get("text", "")) for control in evidence["clickable_controls"]
+            (control.get("identity", {}).get("label_context", ""), control.get("text", ""))
+            for control in evidence["clickable_controls"]
         ),
-        "result_containers": sorted((rc["tag"], rc["selector"]) for rc in evidence["result_containers"]),
+        "result_containers": sorted((rc["tag"], rc.get("row_count")) for rc in evidence["result_containers"]),
         "result_content": sorted(
-            (rc["selector"], rc.get("row_count"), tuple(rc.get("sample_rows") or []), rc.get("text_excerpt", ""))
+            (
+                rc.get("row_count"),
+                tuple(rc.get("sample_rows") or []),
+                rc.get("text_excerpt", ""),
+            )
             for rc in evidence["result_containers"]
         ),
         "modal_selectors": sorted(
-            (overlay["selector"], bool(overlay.get("dismiss_controls"))) for overlay in evidence["modal_overlays"]
+            (
+                non_browser_only_selectors(overlay),
+                bool(overlay.get("dismiss_controls")),
+            )
+            for overlay in evidence["modal_overlays"]
         ),
-        "challenge_selectors": sorted(control["selector"] for control in evidence["challenge_controls"]),
+        "challenge_selectors": sorted(
+            non_browser_only_selectors(control) for control in evidence["challenge_controls"]
+        ),
         "anti_bot_indicators": evidence["anti_bot_indicators"],
         "challenge_detected": challenge_state["detected"],
         "challenge_kind": challenge_state["kind"],
@@ -3302,10 +3518,15 @@ def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _capture_live_dom(url: str, html: str, wait_selector: str) -> tuple[str, str]:
-    from playwright.async_api import async_playwright
-
-    async def _handle(route: Any) -> None:
+async def _capture_live_dom(
+    url: str,
+    html: str,
+    wait_selector: str,
+    *,
+    rendered_style_snapshot: bool = False,
+    interact: Callable[[Page], Awaitable[None]] | None = None,
+) -> tuple[str, str]:
+    async def _handle(route: Route) -> None:
         if route.request.url == url:
             await route.fulfill(status=200, content_type="text/html", body=html)
         else:
@@ -3318,8 +3539,14 @@ async def _capture_live_dom(url: str, html: str, wait_selector: str) -> tuple[st
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_selector(wait_selector)
+        if interact is not None:
+            await interact(page)
         raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
-        content = await page.content()
+        content = (
+            await page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION)
+            if rendered_style_snapshot
+            else await page.content()
+        )
         await context.close()
         await browser.close()
 
@@ -3447,7 +3674,637 @@ async def test_structured_extractor_matches_html_parser_on_live_dom() -> None:
     # Sanity: the fixture really exercised the detectors.
     assert structured["forms"] and structured["challenge_controls"]
     assert structured["anti_bot_indicators"] and structured["challenge_state"]["detected"] is True
-    assert any(overlay["selector"] == "#signup" for overlay in structured["modal_overlays"])
+    assert any(
+        candidate["selector"] == "#signup"
+        for overlay in structured["modal_overlays"]
+        for candidate in overlay["selector_candidates"]
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_interaction_blocking_layer_evidence_matches_on_the_same_rendered_page() -> None:
+    url = "https://test.example.com/statements"
+    html = """
+    <html><body>
+      <button id="underlay">Continue</button>
+      <div id="veil" style="position:fixed;inset:0;z-index:1300;opacity:1;pointer-events:auto">
+        <button id="veil-close" aria-label="Dismiss notice">Dismiss</button>
+        <input id="veil-image" type="image" alt="Continue" src="continue.png">
+      </div>
+      <footer id="footer" style="position:fixed;bottom:0;left:0;right:0;z-index:1200">
+        <button aria-label="Accept">Accept</button>
+      </footer>
+      <div id="transparent" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:none">
+        <button aria-label="Dismiss">Dismiss</button>
+      </div>
+      <div id="invisible" style="position:fixed;inset:0;z-index:1200;opacity:0;pointer-events:auto">
+        <button aria-label="Dismiss">Dismiss</button>
+      </div>
+      <div id="partial" style="position:fixed;top:0;left:0;width:50vw;height:50vh;z-index:1200">
+        <button aria-label="Dismiss">Dismiss</button>
+      </div>
+      <div id="anonymous" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+        <button></button>
+      </div>
+      <div id="hidden-dialog" role="dialog" aria-modal="true" hidden>
+        <button aria-label="Dismiss">Dismiss</button>
+      </div>
+    </body></html>
+    """
+
+    raw, content = await _capture_live_dom(url, html, "#veil-close", rendered_style_snapshot=True)
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert structured["modal_overlays"] == parsed["modal_overlays"] == []
+    structured_obstruction = structured["page_obstructions"][0]
+    parsed_obstruction = parsed["page_obstructions"][0]
+    assert structured_obstruction["selector"] == parsed_obstruction["selector"] == "#veil"
+    assert structured_obstruction["kind"] == parsed_obstruction["kind"] == "interaction_blocking_layer"
+    structured_controls = structured_obstruction["visible_controls"]
+    parsed_controls = parsed_obstruction["visible_controls"]
+    assert [control["selector"] for control in structured_controls] == ["#veil-close", "#veil-image"]
+    assert [control["selector"] for control in parsed_controls] == ["#veil-close", "#veil-image"]
+    for structured_control, parsed_control in zip(structured_controls, parsed_controls, strict=True):
+        assert set(structured_control) == set(parsed_control)
+        assert structured_control["selector_candidates"] == parsed_control["selector_candidates"]
+        assert structured_control["identity"] == parsed_control["identity"]
+    assert structured_obstruction["source"] == "dom_html"
+    assert parsed_obstruction["source"] == "dom_html"
+    assert structured["visual_obstruction_candidates"]
+    assert parsed["visual_obstruction_candidates"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role_value", ["button", "BUTTON"])
+async def test_aria_role_button_and_root_selectors_match_on_the_same_blocking_layer(role_value: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        f"""
+        <html><body>
+          <button id="underlay">Continue</button>
+          <section aria-label="Blocking layer"
+                   style="position:fixed;inset:0;z-index:1300;opacity:1;pointer-events:auto">
+            <div role="{role_value}" tabindex="0" aria-label="Continue">Continue</div>
+          </section>
+        </body></html>
+        """,
+        "[role]",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        assert evidence["modal_overlays"] == []
+        assert len(evidence["page_obstructions"]) == 1
+    structured_obstruction = structured["page_obstructions"][0]
+    parsed_obstruction = parsed["page_obstructions"][0]
+    assert (
+        structured_obstruction["selector"] == parsed_obstruction["selector"] == ('section[aria-label="Blocking layer"]')
+    )
+    assert [control["selector"] for control in structured_obstruction["visible_controls"]] == [
+        'div[aria-label="Continue"]'
+    ]
+    structured_control = structured_obstruction["visible_controls"][0]
+    parsed_control = parsed_obstruction["visible_controls"][0]
+    structured_portable = {
+        **structured_control,
+        "selector_candidates": [
+            candidate for candidate in structured_control["selector_candidates"] if candidate["source"] != "text_anchor"
+        ],
+    }
+    assert structured_portable == parsed_control
+    assert any(candidate["source"] == "text_anchor" for candidate in structured_control["selector_candidates"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param("#layer-action { display:none; }", id="stylesheet_hidden"),
+        pytest.param("#layer-action { pointer-events:none; }", id="stylesheet_pointer_disabled"),
+    ],
+)
+async def test_stylesheet_disabled_aria_role_button_rejects_blocker_in_both_twins(override: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        f"""
+        <html><head><style>{override}</style></head><body>
+          <button id="underlay">Continue</button>
+          <section aria-label="Blocking layer"
+                   style="position:fixed;inset:0;z-index:1300;opacity:1;pointer-events:auto">
+            <div id="layer-action" role="button" tabindex="0" aria-label="Continue">Continue</div>
+          </section>
+        </body></html>
+        """,
+        "body",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        assert evidence["modal_overlays"] == []
+        assert evidence["page_obstructions"] == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_interaction_blocking_layer_does_not_carry_action_values_or_link_destinations() -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><body>
+          <button id="underlay">Continue</button>
+          <div id="veil" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+            <button name="csrf" value="TOPSECRET">Continue securely</button>
+            <a href="/continue?access_token=TOPSECRET#private">Next</a>
+            <input name="submission" type="submit" value="TOPSECRET" aria-label="Submit">
+          </div>
+        </body></html>
+        """,
+        "#veil",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        serialized = json.dumps(evidence["page_obstructions"])
+        assert "TOPSECRET" not in serialized
+        assert "access_token" not in serialized
+        controls = evidence["page_obstructions"][0]["visible_controls"]
+        assert len(controls) == 3
+        assert all(
+            '[value="' not in candidate["selector"]
+            for control in controls
+            for candidate in control["selector_candidates"]
+        )
+        assert all(
+            'a[href="' not in candidate["selector"]
+            for control in controls
+            for candidate in control["selector_candidates"]
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "opening_tag, closing_tag",
+    [
+        pytest.param(
+            '<a href="/continue?access_token=TOPSECRET#private"',
+            "</a>",
+            id="link_destination",
+        ),
+        pytest.param('<div name="csrf" value="TOPSECRET"', "</div>", id="action_value"),
+    ],
+)
+async def test_interaction_blocking_layer_root_selector_omits_secret_attributes(
+    opening_tag: str, closing_tag: str
+) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        (
+            '<html><body><button id="underlay">Continue</button>'
+            f'{opening_tag} style="display:block;position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">'
+            f'<button id="layer-action">Continue securely</button>{closing_tag}</body></html>'
+        ),
+        "#layer-action",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        obstruction = evidence["page_obstructions"][0]
+        assert "TOPSECRET" not in obstruction["selector"]
+        assert "access_token" not in obstruction["selector"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control",
+    [
+        pytest.param('<button id="control" style="pointer-events:none">Dismiss</button>', id="pointer_disabled_button"),
+        pytest.param('<button id="control" disabled>Dismiss</button>', id="disabled_button"),
+        pytest.param('<button id="control" style="display:none">Dismiss</button>', id="hidden_button"),
+        pytest.param(
+            '<input id="control" type="password" value="top-secret-password">',
+            id="secret_bearing_non_action_input",
+        ),
+    ],
+)
+async def test_structured_blocking_layer_rejects_non_actionable_control(control: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, _ = await _capture_live_dom(
+        url,
+        (
+            '<html><body><button id="underlay">Continue</button><div id="veil" '
+            'style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">'
+            f"{control}</div></body></html>"
+        ),
+        "#veil",
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert structured["modal_overlays"] == []
+    assert structured["page_obstructions"] == []
+    assert "top-secret-password" not in raw
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_explicit_modal_input_values_are_not_reported_by_either_twin() -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><body>
+          <div id="dialog" role="dialog" aria-modal="true">
+            <input name="credential" type="password" value="top-secret-password">
+            <input name="preferences" type="checkbox" value="accepted-secret-choice">
+            <button id="dismiss">Dismiss</button>
+          </div>
+        </body></html>
+        """,
+        "#dismiss",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        controls = evidence["modal_overlays"][0]["dismiss_controls"]
+        assert [control["selector"] for control in controls] == [
+            'input[name="credential"]',
+            'input[name="preferences"]',
+            "#dismiss",
+        ]
+        assert all(control.get("text", "") == "" for control in controls[:2])
+        serialized = json.dumps(
+            {
+                "modal_overlays": evidence["modal_overlays"],
+                "page_obstructions": evidence["page_obstructions"],
+            }
+        )
+        assert "top-secret-password" not in serialized
+        assert "accepted-secret-choice" not in serialized
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_stylesheet_defined_interaction_blocking_layer_matches_on_the_rendered_snapshot() -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><head><style>
+          #veil { position:fixed; inset:0; z-index:1200; opacity:1; pointer-events:auto; }
+        </style></head><body>
+          <button id="underlay">Continue</button>
+          <div id="veil"><button id="dismiss">Dismiss</button></div>
+        </body></html>
+        """,
+        "#dismiss",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert structured["modal_overlays"] == parsed["modal_overlays"] == []
+    assert [obstruction["selector"] for obstruction in structured["page_obstructions"]] == ["#veil"]
+    assert [obstruction["selector"] for obstruction in parsed["page_obstructions"]] == ["#veil"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_fullscreen_application_shell_is_not_reported_as_interaction_blocker_by_either_twin() -> None:
+    url = "https://test.example.com/application"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><body>
+          <button id="offscreen" style="position:absolute;top:2000px">Outside action</button>
+          <div id="app" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+            <main><button id="save">Save changes</button></main>
+          </div>
+        </body></html>
+        """,
+        "#save",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        assert evidence["modal_overlays"] == []
+        assert evidence["page_obstructions"] == []
+        assert evidence["visual_obstruction_candidates"][0]["coverage"] == "viewport"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param("#veil { pointer-events: none !important; }", id="root_pointer_events"),
+        pytest.param("#veil { visibility: hidden; }", id="root_visibility"),
+        pytest.param("#veil { right: auto !important; width: 50vw !important; }", id="root_size"),
+        pytest.param("#veil { transform: translateX(120vw); }", id="root_transform"),
+        pytest.param("#dismiss { pointer-events: none !important; }", id="control_pointer_events"),
+        pytest.param("#dismiss { display: none; }", id="control_visibility"),
+        pytest.param("#dismiss { width: 0; height: 0; padding: 0; border: 0; }", id="control_size"),
+        pytest.param("#dismiss { transform: scale(0); }", id="control_transform"),
+    ],
+)
+async def test_stylesheet_overrides_reject_interaction_blocking_layer_in_both_twins(override: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        f"""
+        <html><head><style>{override}</style></head><body>
+          <button id="underlay">Continue</button>
+          <div id="veil" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+            <button id="dismiss" style="pointer-events:auto">Dismiss</button>
+          </div>
+        </body></html>
+        """,
+        "body",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for evidence in (structured, parsed):
+        assert evidence["modal_overlays"] == []
+        assert evidence["page_obstructions"] == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("twin", [pytest.param("structured", id="structured"), pytest.param("parsed", id="parsed")])
+async def test_ancestor_opacity_rejects_interaction_blocking_layer_for_each_twin(twin: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><head><style>#transparent-parent { opacity: 0; }</style></head><body>
+          <button id="underlay">Continue</button>
+          <div id="transparent-parent">
+            <div id="veil" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+              <button id="dismiss">Dismiss</button>
+            </div>
+          </div>
+        </body></html>
+        """,
+        "#dismiss",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    evidence = structured if twin == "structured" else parsed
+    assert evidence["modal_overlays"] == []
+    assert evidence["page_obstructions"] == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("twin", [pytest.param("structured", id="structured"), pytest.param("parsed", id="parsed")])
+async def test_visible_descendant_overrides_hidden_ancestor_for_each_twin(twin: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><head><style>
+          #hidden-parent { visibility: hidden; }
+          #veil, #dismiss { visibility: visible; }
+        </style></head><body>
+          <button id="underlay">Continue</button>
+          <div id="hidden-parent">
+            <div id="veil" style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">
+              <button id="dismiss">Dismiss</button>
+            </div>
+          </div>
+        </body></html>
+        """,
+        "#dismiss",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    evidence = structured if twin == "structured" else parsed
+    assert evidence["modal_overlays"] == []
+    assert [obstruction["selector"] for obstruction in evidence["page_obstructions"]] == ["#veil"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("twin", [pytest.param("structured", id="structured"), pytest.param("parsed", id="parsed")])
+async def test_visible_explicit_modal_overrides_hidden_ancestor_for_each_twin(twin: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><head><style>
+          #hidden-parent { visibility: hidden; }
+          #dialog, #dismiss { visibility: visible; }
+        </style></head><body>
+          <div id="hidden-parent">
+            <form id="hidden-form">
+              <label>Secret stale field</label>
+              <input name="credential" type="password" value="TOPSECRET">
+              <button>Submit hidden stale state</button>
+            </form>
+            <div id="dialog" role="dialog"><button id="dismiss">Dismiss</button></div>
+          </div>
+        </body></html>
+        """,
+        "#dismiss",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    evidence = structured if twin == "structured" else parsed
+    assert [modal["selector"] for modal in evidence["modal_overlays"]] == ["#dialog"]
+    obstruction = evidence["page_obstructions"][0]
+    assert "selector" not in obstruction
+    assert obstruction["selector_candidates"][0]["selector"] == "#dialog"
+    assert "Secret stale field" not in evidence["visible_text_excerpt"]
+    assert "Submit hidden stale state" not in evidence["visible_text_excerpt"]
+    assert "TOPSECRET" not in json.dumps(evidence["forms"])
+    assert all(form.get("id") != "hidden-form" for form in evidence["forms"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("twin", [pytest.param("structured", id="structured"), pytest.param("parsed", id="parsed")])
+async def test_descendant_pointer_override_is_actionable_for_each_obstruction_site(twin: str) -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><head><style>
+          #veil, #dismiss { pointer-events: auto; }
+        </style></head><body>
+          <button id="underlay">Continue</button>
+          <div id="wrapper" style="pointer-events:none">
+            <div id="veil" style="position:fixed;inset:0;z-index:1200;opacity:1">
+              <button id="dismiss">Dismiss</button>
+            </div>
+          </div>
+        </body></html>
+        """,
+        "#dismiss",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    evidence = structured if twin == "structured" else parsed
+    assert evidence["modal_overlays"] == []
+    assert [obstruction["selector"] for obstruction in evidence["page_obstructions"]] == ["#veil"]
+    assert [control["selector"] for control in evidence["page_obstructions"][0]["visible_controls"]] == ["#dismiss"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_stylesheet_hidden_explicit_modal_is_rejected_by_both_twins() -> None:
+    url = "https://test.example.com/statements"
+    raw, content = await _capture_live_dom(
+        url,
+        """
+        <html><head><style>#dialog { display: none; }</style></head><body>
+          <div id="dialog" role="dialog" aria-modal="true">
+            <button id="dismiss">Dismiss</button>
+          </div>
+        </body></html>
+        """,
+        "body",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert structured["modal_overlays"] == []
+    assert parsed["modal_overlays"] == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_blocking_layer_reports_actionable_controls_in_dom_order() -> None:
+    url = "https://test.example.com/statements"
+    unlabeled_controls = "".join(
+        f'<button id="empty-{index}"></button>' for index in range(_MAX_MODAL_DISMISS_CONTROLS)
+    )
+    raw, _ = await _capture_live_dom(
+        url,
+        (
+            '<html><body><button id="underlay">Continue</button><div id="veil" '
+            'style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">'
+            f'{unlabeled_controls}<button id="dismiss">Dismiss</button></div></body></html>'
+        ),
+        "#dismiss",
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert structured["modal_overlays"] == []
+    obstruction = structured["page_obstructions"][0]
+    controls = obstruction["visible_controls"]
+    assert [control["selector"] for control in controls] == ["#dismiss"]
+    assert obstruction.get("visible_controls_omitted") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_blocking_layer_twins_report_exact_omitted_control_count() -> None:
+    url = "https://test.example.com/statements"
+    offered_controls = "".join(
+        f'<button id="option-{index}">Option {index}</button>' for index in range(_MAX_VISIBLE_CONTROLS + 2)
+    )
+    raw, content = await _capture_live_dom(
+        url,
+        (
+            '<html><body><button id="underlay">Continue</button><div id="veil" '
+            'style="position:fixed;inset:0;z-index:1200;opacity:1;pointer-events:auto">'
+            f"{offered_controls}</div></body></html>"
+        ),
+        "#option-0",
+        rendered_style_snapshot=True,
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    for obstruction in (structured["page_obstructions"][0], parsed["page_obstructions"][0]):
+        assert [control["selector"] for control in obstruction["visible_controls"]] == [
+            f"#option-{index}" for index in range(_MAX_VISIBLE_CONTROLS)
+        ]
+        assert obstruction["visible_controls_omitted"] == 2
+        assert "visible_controls_truncated" not in obstruction
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_rendered_snapshot_skips_hit_testing_for_non_viewport_fixed_layers() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport={"width": 1280, "height": 720})
+            await page.set_content(
+                """
+                <html><body>
+                  <button id="outside">Outside action</button>
+                  <footer style="position:fixed;bottom:0;left:0;right:0;height:40px;z-index:1200">
+                    <button>Footer action</button>
+                  </footer>
+                </body></html>
+                """
+            )
+            await page.evaluate(
+                """() => {
+                  const original = document.elementFromPoint.bind(document);
+                  window.__pageEvidenceHitTests = 0;
+                  document.elementFromPoint = (...args) => {
+                    window.__pageEvidenceHitTests += 1;
+                    return original(...args);
+                  };
+                }"""
+            )
+
+            await page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION)
+
+            assert await page.evaluate("window.__pageEvidenceHitTests") == 0
+        finally:
+            await browser.close()
 
 
 @_skip_no_browser
@@ -3505,13 +4362,19 @@ async def test_structured_extractor_matches_class_only_challenge_carrier_control
 
     assert structured is not None
     assert _ac_projection(structured) == _ac_projection(html_parsed)
-    selectors = {control["selector"] for control in structured["challenge_controls"]}
+    selectors = {
+        candidate["selector"]
+        for control in structured["challenge_controls"]
+        for candidate in control["selector_candidates"]
+    }
     assert {"#human", "#continue", "#verify", "#disabled"}.issubset(selectors)
     assert "#hidden" not in selectors
-    assert (
-        next(control for control in structured["challenge_controls"] if control["selector"] == "#disabled")["disabled"]
-        is True
+    disabled = next(
+        control
+        for control in structured["challenge_controls"]
+        if any(candidate["selector"] == "#disabled" for candidate in control["selector_candidates"])
     )
+    assert disabled["disabled"] is True
 
 
 _HEAVY_URL = "https://test.example.com/cart"
@@ -3586,7 +4449,11 @@ async def test_structured_extractor_matches_html_parser_on_standalone_controls_d
 
     assert structured is not None
     assert _ac_projection(structured) == _ac_projection(html_parsed)
-    surfaced = {control.get("selector", "") for control in structured["clickable_controls"]}
+    surfaced = {
+        candidate["selector"]
+        for control in structured["clickable_controls"]
+        for candidate in control["selector_candidates"]
+    }
     assert "#biz-tile" in surfaced
     assert 'div[data-action="selectAddress"]' in surfaced
 
@@ -4629,8 +5496,6 @@ async def test_browser_twin_spends_the_container_budget_on_containers_a_value_ca
     # The twins have to agree about what a result container is, and only this one runs against a real
     # page: an icon sprite sheet sits at the top of the document, so a substring test that reads "row"
     # out of "arrow" claims every slot of the bounded budget before any real result is reached.
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
     async with async_playwright() as runner:
         browser = await runner.chromium.launch()
         try:
@@ -4858,8 +5723,24 @@ def _typed_candidate_payload() -> dict[str, Any]:
                 "identity": {"tag": "button", "role": "button", "label_context": "Export"},
             }
         ],
-        "challenge_controls": [],
-        "modal_overlays": [],
+        "challenge_controls": [
+            {
+                "tag": "input",
+                "type": "checkbox",
+                "selector": "#verify",
+                "selector_candidates": [{"selector": "#verify", "source": "id"}],
+                "identity": {"tag": "input", "role": "checkbox", "label_context": "Verify"},
+            }
+        ],
+        "modal_overlays": [
+            {
+                "role": "dialog",
+                "selector": "#notice",
+                "selector_candidates": [{"selector": "#notice", "source": "id"}],
+                "identity": {"tag": "div", "role": "dialog", "label_context": "Notice"},
+                "dismiss_controls": [],
+            }
+        ],
         "visual_obstruction_candidates": [],
         "visible_text_excerpt": "Visitors 9.42K",
         "anti_bot_indicators": [],
@@ -4881,6 +5762,8 @@ def test_structured_preserves_typed_selector_candidates_and_identity_on_every_ca
         parsed["result_containers"][0],
         parsed["key_value_relations"][0],
         parsed["clickable_controls"][0],
+        parsed["challenge_controls"][0],
+        parsed["modal_overlays"][0],
     ]
     for carrier in carriers:
         assert carrier["selector_candidates"], carrier
@@ -4889,12 +5772,152 @@ def test_structured_preserves_typed_selector_candidates_and_identity_on_every_ca
             assert candidate["source"] in _SELECTOR_CANDIDATE_SOURCES
     relation = parsed["key_value_relations"][0]
     sources = [candidate["source"] for candidate in relation["selector_candidates"]]
-    assert sources.index("text_anchor") < sources.index("structural")
+    assert {"text_anchor", "structural"}.issubset(sources)
     assert relation["identity"]["label_context"] == "Visitors"
 
 
+def test_structured_element_address_packets_withdraw_candidate_counts_after_neutral_ablation() -> None:
+    payload = _typed_candidate_payload()
+    for carrier in (
+        payload["forms"][0]["fields"][0],
+        payload["forms"][0]["submit_controls"][0],
+        payload["navigation_targets"][0],
+        payload["result_containers"][0],
+        payload["clickable_controls"][0],
+        payload["challenge_controls"][0],
+        payload["modal_overlays"][0],
+    ):
+        carrier["selector_match_count"] = 1
+        for index, candidate in enumerate(carrier["selector_candidates"]):
+            candidate["match_count"] = index + 1
+
+    parsed = parse_composition_structured(
+        payload,
+        inspected_url="https://example.com/web",
+        current_url="https://example.com/web",
+    )
+
+    assert parsed is not None
+    model_visible = model_visible_composition_evidence(parsed)
+    carriers = [
+        model_visible["forms"][0]["fields"][0],
+        model_visible["forms"][0]["submit_controls"][0],
+        model_visible["navigation_targets"][0],
+        model_visible["result_containers"][0],
+        model_visible["clickable_controls"][0],
+        model_visible["challenge_controls"][0],
+        model_visible["modal_overlays"][0],
+        model_visible["key_value_relations"][0],
+    ]
+    for carrier in carriers:
+        assert "selector" not in carrier
+        assert "selector_match_count" not in carrier
+        assert "container_selector" not in carrier
+        assert "container_match_count" not in carrier
+        assert all(set(candidate) == {"selector", "source"} for candidate in carrier["selector_candidates"])
+
+
+def test_model_facing_inspect_projection_preserves_internal_selector_custody() -> None:
+    parsed = parse_composition_structured(
+        _typed_candidate_payload(),
+        inspected_url="https://example.com/web",
+        current_url="https://example.com/web",
+    )
+
+    assert parsed is not None
+    stored_target = parsed["navigation_targets"][0]
+    projected = _model_facing_inspect_result({"ok": True, "data": parsed})
+    visible_target = projected["data"]["navigation_targets"][0]
+    assert stored_target["selector"]
+    assert "selector" not in visible_target
+    assert visible_target["selector_candidates"] == [
+        {"selector": candidate["selector"], "source": candidate["source"]}
+        for candidate in stored_target["selector_candidates"]
+    ]
+
+
+def test_live_html_relations_withdraw_singular_selector_aliases_without_candidates() -> None:
+    metric = parse_composition_html(
+        _METRIC_DASHBOARD_HTML,
+        inspected_url="https://example.test/web",
+        current_url="https://example.test/web",
+    )
+    nested = parse_composition_html(
+        _DEEP_TILE_HTML,
+        inspected_url="https://example.test/web",
+        current_url="https://example.test/web",
+        requested_targets=("Visitors",),
+    )
+
+    stored_metric = next(relation for relation in metric["key_value_relations"] if relation["key_text"] == "Visitors")
+    stored_nested = next(relation for relation in nested["key_value_relations"] if relation["key_text"] == "Visitors")
+    assert "selector_candidates" not in stored_metric
+    assert stored_metric["container_selector"]
+    assert "selector_candidates" not in stored_nested
+    assert stored_nested["container_selector"]
+    assert stored_nested["label_selector"]
+
+    for visible in (
+        model_visible_composition_evidence(metric)["key_value_relations"][0],
+        model_visible_composition_evidence(nested)["key_value_relations"][0],
+    ):
+        assert visible["key_text"] == "Visitors"
+        assert "container_selector" not in visible
+        assert "container_match_count" not in visible
+        assert "label_selector" not in visible
+
+
+def test_live_html_table_withdraws_server_derived_row_and_expand_selectors() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <table id="results">
+            <thead><tr><th>Name</th></tr></thead>
+            <tbody><tr><td>Jane Doe</td></tr></tbody>
+          </table>
+        </body></html>
+        """,
+        inspected_url="https://example.test/results",
+        current_url="https://example.test/results",
+    )
+
+    stored = parsed["result_containers"][0]
+    assert stored["row_selector"] == "#results tbody tr"
+    assert stored["expand_toggle_candidates"]
+    assert stored["selector_candidates"]
+
+    visible = model_visible_composition_evidence(parsed)["result_containers"][0]
+    assert "selector" not in visible
+    assert "selector_match_count" not in visible
+    assert "row_selector" not in visible
+    assert "expand_toggle_candidates" not in visible
+    assert visible["selector_candidates"] == [
+        {"selector": candidate["selector"], "source": candidate["source"]}
+        for candidate in stored["selector_candidates"]
+    ]
+
+
+def test_structured_element_address_never_falls_back_to_a_singular_selector() -> None:
+    payload = _typed_candidate_payload()
+    target = payload["navigation_targets"][0]
+    target["selector_candidates"] = []
+
+    parsed = parse_composition_structured(
+        payload,
+        inspected_url="https://example.com/web",
+        current_url="https://example.com/web",
+    )
+
+    assert parsed is not None
+    normalized = parsed["navigation_targets"][0]
+    assert normalized["selector"]
+    projected = model_visible_composition_evidence(parsed)["navigation_targets"][0]
+    assert "selector" not in projected
+    assert projected["selector_candidates"] == []
+
+
 def test_structured_keeps_unknown_sources_and_drops_overlong_selector_candidates() -> None:
-    """An unfamiliar rung name loses its ranking, never its selector; only unusable data is dropped."""
+    """An unfamiliar rung name keeps its selector; only unusable data is dropped."""
     payload = _typed_candidate_payload()
     payload["key_value_relations"][0]["selector_candidates"] = [
         {"selector": "div.card", "source": "a_rung_added_after_this_parser"},
@@ -4912,9 +5935,9 @@ def test_structured_keeps_unknown_sources_and_drops_overlong_selector_candidates
 
     assert parsed is not None
     assert parsed["key_value_relations"][0]["selector_candidates"] == [
-        {"selector": "div.card", "source": "a_rung_added_after_this_parser"},
-        {"selector": "div.tile", "source": "class"},
-        {"selector": "div.panel", "source": _UNKNOWN_SELECTOR_SOURCE},
+        {"selector": "div.card", "source": "a_rung_added_after_this_parser", "match_count": None},
+        {"selector": "div.tile", "source": "class", "match_count": None},
+        {"selector": "div.panel", "source": _UNKNOWN_SELECTOR_SOURCE, "match_count": None},
     ]
     assert "identity" not in parsed["clickable_controls"][0]
 
@@ -4930,9 +5953,58 @@ def test_selector_candidate_source_vocabulary_matches_the_page_side_ladder() -> 
         re.findall(r"source: '([a-z_]+)'", text_rung)
     )
 
-    # Drift detection, not enforcement: an emitted rung the parser cannot rank still reaches the model,
-    # but the two lists diverging means someone added a rung and left it unrankable.
+    # Drift detection, not enforcement: an unfamiliar source still reaches the model, but the two
+    # lists diverging means someone added a rung without preserving its provenance vocabulary.
     assert emitted == set(_SELECTOR_CANDIDATE_SOURCES) - {_UNKNOWN_SELECTOR_SOURCE}
+
+
+def test_fallback_selector_matches_are_cached_for_the_parse_tree() -> None:
+    soup = BeautifulSoup('<main id="content"><button id="go">Go</button></main>', "html.parser")
+    button = soup.find("button")
+    assert button is not None
+    original_select = soup.select
+    calls: list[str] = []
+
+    def counted_select(selector: str, *args: Any, **kwargs: Any) -> Any:
+        calls.append(selector)
+        return original_select(selector, *args, **kwargs)
+
+    soup.select = counted_select  # type: ignore[method-assign]
+
+    assert _selector_for(button) == "#go"
+    _carried_selector_candidates(button)
+
+    assert calls.count("#go") == 1
+
+
+def test_fallback_selector_cache_is_reset_after_hidden_dom_cleanup() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <button class="primary" title="captcha verification">Verify</button>
+          <button class="primary" style="display:none">Stale hidden twin</button>
+        </body></html>
+        """,
+        inspected_url="https://example.com/verify",
+        current_url="https://example.com/verify",
+    )
+
+    verify = next(control for control in parsed["clickable_controls"] if control.get("text") == "Verify")
+    class_candidate = next(
+        candidate for candidate in verify["selector_candidates"] if candidate["selector"] == "button.primary"
+    )
+    assert class_candidate["match_count"] == 1
+
+
+def test_browser_selector_candidates_are_cached_per_element() -> None:
+    assert "const cssSelectorMatchCache = new Map();" in _STRUCTURED_EVIDENCE_BODY
+    assert "const cssMatchesFor = (selector) =>" in _STRUCTURED_EVIDENCE_BODY
+    assert "const selectorCandidateCache = new WeakMap();" in _STRUCTURED_EVIDENCE_BODY
+    assert "const cacheKey = [includeNonActionInputValue, includeActionValue, includeHref].join(':');" in (
+        _STRUCTURED_EVIDENCE_BODY
+    )
+    assert "if (cachedByOptions && cachedByOptions.has(cacheKey))" in _STRUCTURED_EVIDENCE_BODY
+    assert "cachedByOptions.set(cacheKey, offered);" in _STRUCTURED_EVIDENCE_BODY
 
 
 _VISION_CHALLENGE_SUMMARY = {
@@ -5337,7 +6409,7 @@ def test_structured_dismiss_controls_carry_producer_fields_they_do_not_name() ->
     assert len(entry["occluded_by"]) == _MAX_CARRIED_VALUE_CHARS
     # A shape the carry does not model is bounded, not dropped: the field this test is named for.
     assert "10" in entry["bounding_box"] and "20" in entry["bounding_box"]
-    assert entry["selector_candidates"] == [{"selector": "#accept", "source": "id"}]
+    assert entry["selector_candidates"] == [{"selector": "#accept", "source": "id", "match_count": None}]
     assert entry["identity"]["label_context"] == "Accept cookies"
 
 
@@ -5352,7 +6424,8 @@ def test_structured_dismiss_controls_reject_unbounded_evidence_the_producer_sent
 
     entry = _structured_modal_dismiss_controls([control])[0]
 
-    assert "selector_candidates" not in entry
+    assert entry["selector_candidates"] == []
+    assert "selector" not in model_visible_composition_evidence({"control": entry})["control"]
     assert "identity" not in entry
 
 
@@ -5400,9 +6473,9 @@ def test_a_producer_field_emitted_as_null_or_empty_is_absent_rather_than_rendere
 
 
 def test_a_control_named_only_by_its_wrapping_label_is_not_reported_anonymous() -> None:
-    # A checkbox has no text of its own, so the label wrapping it is the only thing naming it. The
+    # An input button has no text of its own, so the label wrapping it is the only thing naming it. The
     # browser producer reports that label; the parsed twin reported nothing until it mirrored the ladder.
-    html = '<div role="dialog"><label><input type="checkbox" id="accept-terms" /><span>I agree.</span></label></div>'
+    html = '<div role="dialog"><label><input type="button" id="accept-terms" /><span>I agree.</span></label></div>'
 
     parsed = parse_composition_html(html, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
 
@@ -5462,7 +6535,7 @@ def test_both_dismiss_control_producers_agree_on_the_fields_they_report() -> Non
         found: dict[str, dict[str, str]] = {}
         for overlay in evidence["modal_overlays"]:
             for control in overlay["dismiss_controls"]:
-                found.setdefault(control["selector"], control["identity"])
+                found.setdefault(control["selector_candidates"][0]["selector"], control["identity"])
         return found
 
     from_html, from_structured = identities(parsed_html), identities(parsed_structured)
@@ -5510,7 +6583,11 @@ def test_obstruction_conversion_hands_over_every_control_and_candidate_untouched
 
 def test_page_obstruction_evidence_carries_candidates_and_identity() -> None:
     payload = json.loads(_DISMISS_FIXTURE_STRUCTURED.read_text())
-    produced = payload["modal_overlays"][0]["dismiss_controls"][0]
+    produced = next(
+        control
+        for control in payload["modal_overlays"][0]["dismiss_controls"]
+        if control.get("tag") != "input" or control.get("type") in {"button", "reset", "submit"}
+    )
 
     parsed = parse_composition_structured(
         payload,
@@ -5523,12 +6600,23 @@ def test_page_obstruction_evidence_carries_candidates_and_identity() -> None:
         "selector_candidates",
         "identity",
     }
-    normalized = parsed["modal_overlays"][0]["dismiss_controls"][0]
-    assert normalized["selector_candidates"] == produced["selector_candidates"]
+    normalized = next(
+        control
+        for control in parsed["modal_overlays"][0]["dismiss_controls"]
+        if control["selector"] == produced["selector"]
+    )
+    assert normalized["selector_candidates"] == [
+        {**candidate, "match_count": candidate.get("match_count")} for candidate in produced["selector_candidates"]
+    ]
     assert normalized["identity"]["tag"] == produced["identity"]["tag"]
 
-    control = parsed["page_obstructions"][0]["visible_controls"][0]
-    assert control["selector_candidates"] == produced["selector_candidates"]
+    control = next(
+        control
+        for control in parsed["page_obstructions"][0]["visible_controls"]
+        if control["selector"] == produced["selector"]
+    )
+    assert control["selector_candidates"]
+    assert all(set(candidate) == {"selector", "source", "match_count"} for candidate in control["selector_candidates"])
     assert control["identity"]["tag"] == produced["identity"]["tag"]
 
 
@@ -5611,3 +6699,158 @@ def test_parsed_dismiss_controls_offer_selector_sources_in_the_browser_rung_orde
         "class_type",
         "structural",
     ]
+
+
+_OBSERVED_STATE_URL = "https://test.example.com/booking"
+_OBSERVED_STATE_HTML = """<!DOCTYPE html>
+<html><body>
+  <form id="booking">
+    <label for="depart">Depart date</label>
+    <input type="date" id="depart" name="depart" />
+    <label for="cabin">Cabin</label>
+    <select id="cabin" name="cabin">
+      <option value="economy" selected>Economy</option>
+      <option value="business">Business</option>
+    </select>
+    <label for="insured">Add insurance</label>
+    <input type="checkbox" id="insured" name="insured" />
+    <label for="pw">Password</label>
+    <input type="password" id="pw" name="pw" />
+    <label for="note">Notes</label>
+    <textarea type="date" id="note" name="note"></textarea>
+    <button type="submit">Book</button>
+  </form>
+</body></html>
+"""
+_OBSERVED_STATE_SECRET = "hunter2-not-a-real-secret"
+
+
+async def _fill_booking_form(page: Page) -> None:
+    await page.fill("#depart", "2026-09-14")
+    await page.select_option("#cabin", "business")
+    await page.check("#insured")
+    await page.fill("#pw", _OBSERVED_STATE_SECRET)
+    await page.fill("#note", _OBSERVED_STATE_SECRET)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_field_state_the_agent_produced_survives_capture_while_markup_attributes_do_not() -> None:
+    raw, _ = await _capture_live_dom(_OBSERVED_STATE_URL, _OBSERVED_STATE_HTML, "#depart", interact=_fill_booking_form)
+    captured = {entry["name"]: entry for entry in json.loads(raw)["forms"][0]["fields"]}
+    assert captured["depart"]["observed_value"] == "2026-09-14"
+    assert captured["note"]["type"] == "date"
+    assert "observed_value" not in captured["note"]
+
+    parsed = parse_composition_structured(
+        json.loads(raw), inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL
+    )
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert fields["depart"]["value"] == ""
+    assert fields["depart"]["observed_value"] == "2026-09-14"
+    assert fields["insured"]["checked"] is False
+    assert fields["insured"]["observed_checked"] is True
+    cabin_options = {option["value"]: option for option in fields["cabin"]["options"]}
+    assert cabin_options["economy"]["selected"] is True
+    assert cabin_options["economy"]["observed_selected"] is False
+    assert cabin_options["business"]["selected"] is False
+    assert cabin_options["business"]["observed_selected"] is True
+
+    assert "observed_value" not in fields["pw"]
+    assert "observed_checked" not in fields["pw"]
+    assert fields["note"]["type"] == "date"
+    assert "observed_value" not in fields["note"]
+    assert _OBSERVED_STATE_SECRET not in json.dumps(parsed)
+
+    assert _runtime_form_summaries(parsed["forms"]) == [
+        "Depart date date 2026-09-14",
+        "Cabin select Business",
+        "Add insurance checkbox checked",
+        "Password password",
+        "Notes date",
+    ]
+
+
+def test_a_structured_packet_claiming_an_observed_password_value_is_not_admitted() -> None:
+    payload = {
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "name": "pw",
+                        "type": "password",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "name": "note",
+                        "type": "textarea",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "liar",
+                        "type": "date",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "checkliar",
+                        "type": "checkbox",
+                        "observed_checked": True,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "depart",
+                        "type": "date",
+                        "observed_value": "2026-09-14",
+                        "identity": {"tag": "input"},
+                    },
+                ]
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL)
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert "observed_value" not in fields["pw"]
+    assert "observed_value" not in fields["note"]
+    assert "observed_value" not in fields["liar"]
+    assert "observed_checked" not in fields["checkliar"]
+    assert fields["depart"]["observed_value"] == "2026-09-14"
+    assert _OBSERVED_STATE_SECRET not in json.dumps(parsed)
+
+
+def test_a_structured_packet_claiming_an_observed_option_on_a_non_select_is_not_admitted() -> None:
+    payload = {
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "name": "liar",
+                        "type": "select",
+                        "identity": {"tag": "div"},
+                        "options": [{"text": _OBSERVED_STATE_SECRET, "observed_selected": True}],
+                    },
+                    {
+                        "name": "depart",
+                        "type": "select",
+                        "identity": {"tag": "select"},
+                        "options": [{"text": "2026-09-14", "observed_selected": True}],
+                    },
+                ]
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL)
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert all("observed_selected" not in option for option in fields["liar"]["options"])
+    assert fields["depart"]["options"][0]["observed_selected"] is True
+    assert fields["liar"]["option_count"] == 1

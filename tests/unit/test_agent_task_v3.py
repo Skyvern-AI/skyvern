@@ -28,6 +28,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
+from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import (
@@ -1057,6 +1058,45 @@ async def test_execute_step_bare_task_with_verification_url_dispatches_to_v3() -
     )
     v3_mock.assert_awaited_once()
     step_engine_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_v3_block_consumes_enabled_dispatch_seam_without_legacy_fallback() -> None:
+    provider = MagicMock(spec=BaseExperimentationProvider)
+    provider.is_feature_enabled_cached = AsyncMock(return_value=False)
+    block = _make_block(TaskBlock, label="pure_task", engine=agent_module.RunEngine.skyvern_v3)
+
+    v3_mock, step_engine_mock = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=block,
+        experimentation_provider=provider,
+        workflow_run_id="wr_task_v3_pure",
+    )
+
+    v3_mock.assert_awaited_once()
+    step_engine_mock.assert_not_awaited()
+    disable_call = provider.is_feature_enabled_cached.await_args
+    assert disable_call.args == (DISABLE_TASK_V3_FLAG, "wr_task_v3_pure")
+    assert disable_call.kwargs["properties"] == {
+        "organization_id": make_organization(datetime.now(UTC)).organization_id
+    }
+
+
+@pytest.mark.asyncio
+async def test_disabled_v3_dispatch_is_not_credited_as_pure() -> None:
+    provider = MagicMock(spec=BaseExperimentationProvider)
+    provider.is_feature_enabled_cached = AsyncMock(return_value=True)
+    block = _make_block(TaskBlock, label="disabled_pure_task", engine=agent_module.RunEngine.skyvern_v3)
+
+    v3_mock, step_engine_mock = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=block,
+        experimentation_provider=provider,
+        workflow_run_id="wr_task_v3_disabled",
+    )
+
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2316,6 +2356,29 @@ async def test_execute_task_v3_router_selected_data_only_validation_goes_page_fr
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The finish gate the loop receives must be the same VerificationState the auth tools mutate;
+    # a fresh or detached state would let a refused source false-complete despite the blocker.
+    seen_states: list[Any] = []
+
+    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
+        seen_states.append(state)
+        return [], ""
+
+    monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    blocker = loop_mock.await_args.kwargs["verification_blocker"]
+    assert blocker is not None
+    assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
+    assert await blocker() is None
+    seen_states[0].source_failed = True
+    assert await blocker() is not None
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2325,7 +2388,7 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     seen_keys: list[str | None] = []
     seen_providers: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
         ctx = skyvern_context.current()
         seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
         seen_providers.append(page_provider)
@@ -2354,7 +2417,7 @@ async def test_execute_task_v3_withholds_the_page_provider_from_auth_tools_when_
     # navigate; a page-aware run must be, or the sign-in-link tool is silently never offered.
     seen_providers: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
         seen_providers.append(page_provider)
         return [], ""
 

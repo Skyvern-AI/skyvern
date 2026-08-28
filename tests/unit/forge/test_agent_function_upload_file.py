@@ -19,7 +19,12 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 
 
-def _s3_destination(bucket: str = "customer-bucket", key: str = "k.bin") -> FileUploadDestination:
+def _s3_destination(
+    bucket: str = "customer-bucket",
+    key: str = "k.bin",
+    endpoint_url: str | None = None,
+    endpoint_resolved_ips: tuple[str, ...] | None = None,
+) -> FileUploadDestination:
     return FileUploadDestination(
         storage_type=FileStorageType.S3,
         customer_uri=f"s3://{bucket}/{key}",
@@ -28,6 +33,8 @@ def _s3_destination(bucket: str = "customer-bucket", key: str = "k.bin") -> File
         s3_key=key,
         aws_access_key_id="AKIA-test",
         aws_secret_access_key="secret-test",
+        endpoint_url=endpoint_url,
+        endpoint_resolved_ips=endpoint_resolved_ips,
     )
 
 
@@ -78,6 +85,39 @@ async def test_s3_direct_path_calls_async_aws_client(small_file: Path) -> None:
         aws_access_key_id="AKIA-test",
         aws_secret_access_key="secret-test",
         region_name=None,
+        endpoint_url=None,
+        endpoint_resolved_ips=None,
+    )
+    fake_aws.upload_file_from_path.assert_awaited_once_with(
+        uri=destination.sdk_uri,
+        file_path=str(small_file),
+        raise_exception=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_s3_direct_path_passes_endpoint_url_and_pinned_ips_to_aws_client(small_file: Path) -> None:
+    destination = _s3_destination(
+        endpoint_url="https://storage.example.com",
+        endpoint_resolved_ips=("198.51.100.7",),
+    )
+    fake_aws = AsyncMock()
+    fake_aws.upload_file_from_path = AsyncMock()
+
+    with patch("skyvern.forge.agent_functions.AsyncAWSClient", return_value=fake_aws) as MockClient:
+        result = await AgentFunction().upload_file_to_customer_storage(
+            file_path=str(small_file),
+            destination=destination,
+            organization_id="o_1",
+        )
+
+    assert result == destination.customer_uri
+    MockClient.assert_called_once_with(
+        aws_access_key_id="AKIA-test",
+        aws_secret_access_key="secret-test",
+        region_name=None,
+        endpoint_url="https://storage.example.com",
+        endpoint_resolved_ips=("198.51.100.7",),
     )
     fake_aws.upload_file_from_path.assert_awaited_once_with(
         uri=destination.sdk_uri,

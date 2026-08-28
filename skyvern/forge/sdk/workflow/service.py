@@ -54,7 +54,6 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
-    BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
     InProcessScriptExecutionDenied,
@@ -479,17 +478,6 @@ _WORKFLOW_RUN_ESCAPED_EXCEPTION_FAILURE_CATEGORY = [
         "reasoning": "No keyword match found",
     }
 ]
-
-# Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
-# run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
-CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
-# Wall clock, not an attempt count: a waiting run holds a whole worker pod
-# (max_concurrent_activities=1), so what has to stay bounded is the time pinned, whatever the
-# per-attempt startup deadline happens to be.
-CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS = 90.0
-# Bounds the run-end close of an auto-provisioned CodeBlock session so a slow close cannot pin
-# the worker pod; on timeout the session timeout above still reaps the session.
-CODE_BLOCK_SESSION_CLOSE_TIMEOUT_SECONDS = 30.0
 
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
@@ -3803,122 +3791,6 @@ class WorkflowService:
         )
         return bool(profile and profile.is_managed)
 
-    async def auto_create_browser_session_for_code_block_if_needed(
-        self,
-        organization_id: str,
-        workflow: Workflow,
-        *,
-        workflow_run_id: str,
-        browser_session_id: str | None = None,
-        browser_profile_id: str | None = None,
-        proxy_location: ProxyLocationInput = None,
-    ) -> PersistentBrowserSession | None:
-        """Auto-provision a persistent browser session for runs that contain a CodeBlock.
-
-        The secure CodeBlock runner brokers page operations against a live persistent browser
-        session, so a CodeBlock with no caller-supplied session would otherwise fall back to
-        the legacy in-process executor. When the org is enabled for the secure runner, provision
-        a session here so the CodeBlock routes to the runner. A run's browser_profile_id is loaded
-        into the session so profile-backed CodeBlock workflows still reach the runner. Returns None
-        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, or a
-        session was already supplied. Session-creation failure propagates: an enrolled run must fail
-        closed rather than silently downgrade its code to in-process execution.
-        """
-        if browser_session_id:  # the caller supplied a session; respect it unchanged
-            return None
-
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        if not any(block.block_type == BlockType.CODE for block in all_blocks):
-            return None
-
-        should_create = await app.AGENT_FUNCTION.should_auto_create_browser_session_for_code_block(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            workflow_id=workflow.workflow_id,
-        )
-        if not should_create:
-            return None
-
-        try:
-            browser_session = await self._create_code_block_browser_session(
-                organization_id=organization_id,
-                browser_profile_id=browser_profile_id,
-                proxy_location=proxy_location,
-                workflow_run_id=workflow_run_id,
-            )
-        except Exception:
-            LOG.error(
-                "Failed to auto-create browser session for CodeBlock run; failing the run closed",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                exc_info=True,
-            )
-            raise
-
-        LOG.info(
-            "Auto-created browser session for CodeBlock run",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            browser_session_id=browser_session.persistent_browser_session_id,
-        )
-        return browser_session
-
-    async def _create_code_block_browser_session(
-        self,
-        *,
-        organization_id: str,
-        browser_profile_id: str | None,
-        proxy_location: ProxyLocationInput,
-        workflow_run_id: str,
-    ) -> PersistentBrowserSession:
-        """Create the CodeBlock session, retrying only a startup timeout.
-
-        A startup timeout means the session fleet had no free capacity inside the deadline,
-        not that the request was invalid — the fleet scales on demand, so a fresh attempt
-        often lands on pods that came up just after the previous deadline expired. Every
-        other failure is deterministic, so retrying it only delays the run.
-
-        Retrying is bounded by wall clock rather than by attempts because the waiting run
-        occupies a whole worker pod, and it does so during exactly the capacity crunch that
-        causes the timeout — so the cost to bound is time held, not requests made.
-        """
-        deadline = time.monotonic() + CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                    organization_id=organization_id,
-                    timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
-                    browser_profile_id=browser_profile_id,
-                    proxy_location=proxy_location,
-                    inherit_profile_proxy=True,
-                )
-            except BrowserSessionStartupTimeout:
-                if time.monotonic() >= deadline:
-                    raise
-                # A cancel can land while we wait. Provisioning another billed session for a
-                # run that already finished helps nobody and deepens the shortage.
-                workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
-                if workflow_run.status.is_final():
-                    LOG.info(
-                        "Workflow run reached a final state while its CodeBlock session was starting; not retrying",
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                        workflow_status=workflow_run.status,
-                    )
-                    raise
-                LOG.warning(
-                    "Browser session for CodeBlock run timed out starting; retrying",
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    attempt=attempt,
-                    budget_seconds=CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS,
-                )
-
     @staticmethod
     async def _close_reused_session_best_effort(*, organization_id: str, session_id: str) -> None:
         try:
@@ -5021,7 +4893,6 @@ class WorkflowService:
                 return workflow_run
 
         browser_session = None
-        code_block_browser_session_id: str | None = None
         using_managed_browser_profile = await self._browser_profile_is_managed(
             organization_id=organization.organization_id,
             browser_profile_id=browser_profile_id,
@@ -5034,49 +4905,6 @@ class WorkflowService:
                 browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
                 proxy_location=workflow_run.proxy_location,
             )
-
-        # The CodeBlock auto-PBS path is intentionally NOT gated on browser_profile_id: a
-        # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
-        # profile is loaded into the auto-created session instead of skipping it.
-        if browser_session is None and browser_session_id is None:
-            # The helper raises only for a secure-runner-enrolled run whose session could not be
-            # created; letting that run continue would silently execute its code in-process instead
-            # of the sandbox, so fail closed like the sidecar-absent posture.
-            try:
-                browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
-                    organization.organization_id,
-                    workflow,
-                    workflow_run_id=workflow_run_id,
-                    browser_session_id=browser_session_id,
-                    browser_profile_id=browser_profile_id,
-                    proxy_location=workflow_run.proxy_location,
-                )
-            except Exception as e:
-                failure_reason = (
-                    "Failed to create the browser session required for secure code execution: "
-                    f"{get_user_facing_exception_message(e)}"
-                )
-                # Conditional: a cancel can land while the session is still starting, and an
-                # unconditional write would overwrite that terminal status with ``failed``.
-                workflow_run = (
-                    await self.mark_workflow_run_as_failed_if_not_final(
-                        workflow_run_id=workflow_run_id, failure_reason=failure_reason
-                    )
-                    or workflow_run
-                )
-                await self.clean_up_workflow(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    api_key=api_key,
-                    browser_session_id=browser_session_id,
-                    close_browser_on_completion=close_browser_on_completion,
-                    need_call_webhook=need_call_webhook,
-                )
-                return workflow_run
-            # A session set here came from the CodeBlock helper — the one session this run owns
-            # and must close at cleanup.
-            if browser_session is not None:
-                code_block_browser_session_id = browser_session.persistent_browser_session_id
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -5102,11 +4930,20 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                 )
             except Exception as e:
-                LOG.exception(
-                    "Failed to begin browser session for workflow run",
-                    browser_session_id=browser_session_id,
-                    workflow_run_id=workflow_run_id,
-                )
+                # An expired session is the caller's to resolve, and the run record already carries
+                # the same message as failure_reason. Every other lease failure keeps its traceback.
+                if isinstance(e, BrowserSessionClosed):
+                    LOG.warning(
+                        "Browser session expired before the workflow run could lease it",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                else:
+                    LOG.exception(
+                        "Failed to begin browser session for workflow run",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                    )
                 failure_reason = (
                     f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
                 )
@@ -5121,12 +4958,11 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=close_browser_on_completion,
                     need_call_webhook=need_call_webhook,
-                    code_block_browser_session_id=code_block_browser_session_id,
                 )
                 return workflow_run
             # Start background task to periodically renew the browser session
             renewal_task = asyncio.create_task(
-                self._renew_browser_session_loop(browser_session_id, organization.organization_id),
+                self._renew_browser_session_loop(browser_session_id, organization.organization_id, workflow_run_id),
                 name=f"browser_session_renewal_{workflow_run_id}",
             )
 
@@ -5619,12 +5455,13 @@ class WorkflowService:
                 browser_persistence_status=browser_persistence_status,
                 skip_browser_session_write_back=browser_write_back_exhausted,
                 schedule_credential_fallback_retry=not finally_block_set_terminal_outcome,
-                code_block_browser_session_id=code_block_browser_session_id,
             )
 
         return workflow_run
 
-    async def _renew_browser_session_loop(self, browser_session_id: str, organization_id: str) -> None:
+    async def _renew_browser_session_loop(
+        self, browser_session_id: str, organization_id: str, workflow_run_id: str
+    ) -> None:
         """Periodically renew a browser session to prevent timeout during long-running workflows."""
         max_renewal_seconds = 2 * 60 * 60  # 2 hours
         start_time = asyncio.get_event_loop().time()
@@ -5640,7 +5477,11 @@ class WorkflowService:
                         elapsed_seconds=elapsed,
                     )
                     return
-                await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(browser_session_id, organization_id)
+                await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
+                    browser_session_id,
+                    organization_id,
+                    workflow_run_id=workflow_run_id,
+                )
                 LOG.debug(
                     "Browser session renewal check completed",
                     browser_session_id=browser_session_id,
@@ -5760,10 +5601,13 @@ class WorkflowService:
                         script_revision_id=script.script_revision_id,
                         organization_id=organization_id,
                     )
-                    await script_service.load_scripts(script, script_files)
+                    written_paths = await script_service.load_scripts(script, script_files)
 
                     script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
-                    if os.path.exists(script_path):
+                    # Gate on what this run wrote, not on what is on disk. TEMP_PATH is reused
+                    # across runs and keyed by script_id rather than revision, so an earlier run's
+                    # copy can outlive the code it came from and make os.path.exists lie.
+                    if script_path in written_paths:
                         # setup script run
                         parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
                             workflow_run_id=workflow_run.workflow_run_id
@@ -5834,11 +5678,16 @@ class WorkflowService:
                                     script_id=script.script_id,
                                 )
                     else:
+                        # This run has no code for the script: either the revision's stored code
+                        # is gone, or the fetch failed. Either way every run_signature would resolve
+                        # against an empty namespace, and keeping the block map would report the run
+                        # as "code" and suppress the regeneration below.
                         LOG.warning(
                             "Script file not found at path",
                             script_path=script_path,
                             script_id=script.script_id,
                         )
+                        script_blocks_by_label = {}
             except InProcessScriptExecutionDenied as denial:
                 if denial.fail_closed:
                     raise
@@ -11198,7 +11047,6 @@ class WorkflowService:
         browser_persistence_status: WorkflowRunStatus | None = None,
         skip_browser_session_write_back: bool = False,
         schedule_credential_fallback_retry: bool = True,
-        code_block_browser_session_id: str | None = None,
     ) -> None:
         # Direct cleanup callers can enter with a terminal row. When browser cleanup is still
         # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
@@ -11320,42 +11168,6 @@ class WorkflowService:
             # suppress it because replaying the workflow cannot repair post-run cleanup.
             if schedule_credential_fallback_retry:
                 self._schedule_credential_fallback_retry(workflow_run)
-
-            # A session this run auto-created for its CodeBlock has no owner once the run ends;
-            # caller-supplied sessions are deliberately left open. Positional args: the cloud
-            # manager and the OSS protocol disagree on the second parameter's name.
-            if code_block_browser_session_id:
-                try:
-                    has_active_child_run = False
-                    if child_workflow_run_ids:
-                        child_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
-                            parent_workflow_run_id=workflow_run.workflow_run_id,
-                            organization_id=workflow_run.organization_id,
-                        )
-                        has_active_child_run = any(not child.status.is_final() for child in child_runs)
-                    if has_active_child_run:
-                        # A fire-and-forget child (use_parent_browser_session) may have inherited this
-                        # session; leave it to the session timeout instead of closing it mid-child-run.
-                        LOG.info(
-                            "Skipping CodeBlock browser session close while child workflow runs are active",
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            browser_session_id=code_block_browser_session_id,
-                        )
-                    else:
-                        await asyncio.wait_for(
-                            app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                                workflow_run.organization_id,
-                                code_block_browser_session_id,
-                            ),
-                            timeout=CODE_BLOCK_SESSION_CLOSE_TIMEOUT_SECONDS,
-                        )
-                except Exception:
-                    LOG.warning(
-                        "Failed to close the auto-created CodeBlock browser session",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        browser_session_id=code_block_browser_session_id,
-                        exc_info=True,
-                    )
 
     async def prepare_workflow_webhook(
         self,

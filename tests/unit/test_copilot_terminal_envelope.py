@@ -471,6 +471,21 @@ def test_render_terminal_message_stopped_degraded_envelope_uses_minimal_honest_s
     assert rendered == "I stopped without confirming the goal was met."
 
 
+def test_render_terminal_message_stopped_with_a_recorded_run_reports_that_it_ran() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict="not_evaluated",
+        run_display_reason=None,
+        response_kind="stopped",
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+
+    assert replaced is True
+    assert rendered == "I ran the workflow. The latest recorded run completed."
+
+
 def test_render_terminal_message_no_run_blocker_stop_keeps_blocker_evidence() -> None:
     blocker = "The site demands SSO before any page loads."
     envelope = TerminalOutcomeEnvelope(
@@ -641,6 +656,31 @@ def test_render_terminal_message_completed_turn_is_not_stamped_by_deadline_cause
     assert envelope.next_state == "completed"
     assert rendered == message
     assert replaced is False
+
+
+def test_run_without_output_projects_unverified_blocker_never_success() -> None:
+    blocker = "The run stayed queued and produced no terminal result before the deadline."
+    envelope = _assemble(
+        proposal_disposition="auto_applicable",
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", output_report=None)],
+        blocker_reason=blocker,
+        halt_kind="deadline_expired",
+        terminal_cause="deadline_expired",
+    )
+    finalized = finalize_applied_state(envelope, applied=False)
+
+    rendered, replaced = render_terminal_message(finalized, agent_module._TIMEOUT_REPLY_DEFAULT, cancelled=False)
+
+    assert finalized.verified is False
+    assert finalized.workflow_applied is False
+    assert finalized.next_state == "stopped"
+    assert finalized.response_kind == "stopped"
+    assert finalized.run_output_report is None
+    assert finalized.blocker_reason == blocker
+    assert rendered == agent_module._TIMEOUT_REPLY_DEFAULT
+    assert replaced is True
+    assert "completed" not in rendered.lower()
+    assert "success" not in rendered.lower()
 
 
 def test_deadline_cause_survives_envelope_round_trip() -> None:

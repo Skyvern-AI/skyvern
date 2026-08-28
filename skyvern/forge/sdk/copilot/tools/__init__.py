@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 from agents import function_tool
 from agents.run_context import RunContextWrapper
+from agents.tool_context import ToolContext
 from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
@@ -22,8 +23,12 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    requested_output_designation_capability,
+    value_designation_probe_expression,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
 )
@@ -226,6 +231,13 @@ _CREDENTIAL_DEFERRED_DRAFT_MESSAGE = (
 )
 
 
+def _originating_call_id(ctx: RunContextWrapper) -> str | None:
+    """The id of the tool call currently executing, so a write's diff can be handed back to that
+    call's result rather than to whichever code-write result arrives first. The SDK passes a
+    ``ToolContext`` at call time; the annotation is its base class, so narrow before reading."""
+    return ctx.tool_call_id if isinstance(ctx, ToolContext) else None
+
+
 def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
     """Credential-deferred drafts persist without a run, so they carry the same skip markers and
     set the same flag the combined tool's skip branch does — credential-pause routing reads it."""
@@ -294,6 +306,7 @@ async def update_workflow_tool(
             copilot_ctx,
             allow_missing_credentials=credential_deferred_draft
             or getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
+            originating_call_id=_originating_call_id(ctx),
         )
         if credential_deferred_draft and result.get("ok"):
             _mark_credential_deferred_draft(copilot_ctx, result)
@@ -316,6 +329,7 @@ async def _persist_block_scoped_edit(
     workflow_yaml: str,
     arguments: dict,
     *,
+    originating_call_id: str | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     block_observation_refs: list[BlockObservationRef] | None = None,
 ) -> str:
@@ -333,7 +347,7 @@ async def _persist_block_scoped_edit(
         params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
         params["raw_block_observation_refs"] = block_observation_refs
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow(params, copilot_ctx)
+        result = await _update_workflow(params, copilot_ctx, originating_call_id=originating_call_id)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
         finalize_build_test_result(
@@ -402,7 +416,9 @@ async def edit_block_tool(
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
-    return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
+    return await _persist_block_scoped_edit(
+        copilot_ctx, "edit_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+    )
 
 
 @function_tool(
@@ -489,6 +505,7 @@ async def edit_block_and_run_tool(
             {"workflow_yaml": workflow_yaml},
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
+            originating_call_id=_originating_call_id(ctx),
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
     if not update_result.get("ok"):
@@ -585,6 +602,7 @@ async def add_block_tool(
         arguments,
         code_artifact_metadata=code_artifact_metadata,
         block_observation_refs=block_observation_refs,
+        originating_call_id=_originating_call_id(ctx),
     )
 
 
@@ -619,7 +637,9 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
-    return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
+    return await _persist_block_scoped_edit(
+        copilot_ctx, "delete_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+    )
 
 
 class RequestedOutputRead(TypedDict):
@@ -685,11 +705,14 @@ async def _verify_requested_output_reads(
         if isinstance(raw_candidates, list):
             for candidate in raw_candidates:
                 if isinstance(candidate, str) and candidate:
-                    candidates.append({"selector": candidate, "match_count": None, "position": None})
+                    candidates.append(
+                        {"selector": candidate, "source": "unknown", "match_count": None, "position": None}
+                    )
                 elif isinstance(candidate, dict) and isinstance(candidate.get("selector"), str):
                     candidates.append(
                         {
                             "selector": candidate["selector"],
+                            "source": str(candidate.get("source") or "unknown"),
                             "match_count": candidate.get("match_count"),
                             "position": candidate.get("position"),
                         }
@@ -697,15 +720,17 @@ async def _verify_requested_output_reads(
         if not candidates:
             unverified.append({"output_path": output_path, "reason": "no-stable-selector"})
             continue
-        verified.append(
-            {
-                "output_path": output_path,
-                "label": label,
-                "rendered_value": payload["text"],
-                "selector_candidates": candidates,
-                "page_url": str(payload.get("url") or ""),
-            }
-        )
+        label_association = str(payload.get("label_association") or "")
+        fact = {
+            "output_path": output_path,
+            "label": label if label_association != "not_found" else "",
+            "rendered_value": payload["text"],
+            "selector_candidates": candidates,
+            "page_url": str(payload.get("url") or ""),
+        }
+        if label_association:
+            fact["label_association"] = label_association
+        verified.append(fact)
     LOG.info(
         "copilot_requested_output_designation_facts",
         verified_paths=[fact["output_path"] for fact in verified],
@@ -1012,6 +1037,7 @@ async def update_and_run_blocks_tool(
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
+            originating_call_id=_originating_call_id(ctx),
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
 
@@ -1255,6 +1281,18 @@ async def inspect_page_for_composition_tool(
             data["requested_output_designations"] = verified
             if unverified:
                 data["unverified_output_designations"] = unverified
+                retry_paths = [item["output_path"] for item in unverified if item.get("output_path")]
+                if retry_paths:
+                    data["requested_output_designation_capability"] = requested_output_designation_capability(
+                        retry_paths
+                    )
+    elif result.get("ok"):
+        requested_paths = requested_output_paths_for_derivation(ctx.context)
+        data = result.get("data")
+        if requested_paths and isinstance(data, dict):
+            data["requested_output_designation_capability"] = requested_output_designation_capability(
+                list(requested_paths)
+            )
     scrubbed_result = scrub_secrets_from_structure(ctx.context, result)
     return json.dumps(_model_facing_inspect_result(scrubbed_result))
 

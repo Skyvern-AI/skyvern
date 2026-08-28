@@ -12,10 +12,10 @@ import {
   TurnNarrativeState,
   condenseActivityEntries,
   formatElapsed,
+  hasPendingToolCall,
   isInterimOutcome,
   latestBlocksByLabel,
   parseUtcIsoMs,
-  toolCallIdOf,
 } from "./narrativeState";
 
 export { AUTHORING_TOOLS, RUN_TOOLS };
@@ -55,21 +55,6 @@ export function showPhaseChecklist(turn: TurnNarrativeState): boolean {
       turn.blocks.length > 0 ||
       turn.terminal === null)
   );
-}
-
-// A tool_call still has no matching tool_result — the narrator can emit a
-// TOOL_STARTED progress narration mid-flight (streaming_adapter.py), so
-// checking only the LAST entry's kind isn't enough; match ids instead.
-function hasPendingToolCall(designActivity: ActivityEntry[]): boolean {
-  const pending = new Set<string>();
-  for (const entry of designActivity) {
-    if (entry.kind === "tool_call") {
-      pending.add(toolCallIdOf(entry) ?? "");
-    } else if (entry.kind === "tool_result") {
-      pending.delete(toolCallIdOf(entry) ?? "");
-    }
-  }
-  return pending.size > 0;
 }
 
 // Whether the 8s drafting-gap timer should arm for this narrative snapshot.

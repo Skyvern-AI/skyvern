@@ -12,7 +12,6 @@ import {
   FeatureFlagContext,
   FeatureFlagValueContext,
 } from "@/hooks/useFeatureFlag";
-import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
 
 type HistoryData = {
   workflow_copilot_chat_id: string | null;
@@ -23,14 +22,14 @@ type HistoryData = {
 
 // Only chat-history GETs are deferred (held here so a test controls
 // isLoadingHistory); every other GET resolves immediately.
-const { postStreaming, cancelPost, historyQueue, flagMap, boolFlags } =
-  vi.hoisted(() => ({
+const { postStreaming, cancelPost, historyQueue, boolFlags } = vi.hoisted(
+  () => ({
     postStreaming: vi.fn(() => new Promise<void>(() => {})),
     cancelPost: vi.fn().mockResolvedValue({}),
     historyQueue: [] as Array<(resp: { data: HistoryData }) => void>,
-    flagMap: { current: {} as Record<string, boolean> },
     boolFlags: { current: {} as Record<string, boolean> },
-  }));
+  }),
+);
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -75,10 +74,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
     }),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: (flag: string) => flagMap.current[flag] ?? false,
-}));
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({
@@ -226,7 +221,6 @@ beforeEach(() => {
   cancelPost.mockClear();
   cancelPost.mockResolvedValue({});
   historyQueue.length = 0;
-  flagMap.current = {};
   boolFlags.current = {};
 });
 
@@ -238,8 +232,7 @@ afterEach(() => {
 // Item 1 (SKY-12384): during a chat-history SWITCH, a prior chat's action card
 // must not stay actionable — its action would post into the OUTGOING chat.
 describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () => {
-  it("hides the review gate's Accept while a chat switch is loading (flag-on)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+  it("hides the review gate's Accept while a chat switch is loading", async () => {
     await renderChat();
     await flushHistory(
       historyData({
@@ -267,8 +260,7 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
     await flushHistory(historyData({ workflow_copilot_chat_id: "chat_other" }));
   });
 
-  it("hides the Confirm chip while a chat switch is loading (flag-on)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+  it("hides the Confirm chip while a chat switch is loading", async () => {
     await renderChat();
     await flushHistory(
       historyData({
@@ -302,7 +294,6 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
 // load must keep one owner — footer while the bubble exists, else the chip.
 describe("WorkflowCopilotChat — queued prompt survives initial history load (item 2)", () => {
   it("keeps the queued status + Cancel visible after the history load lands", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     boolFlags.current = { ENABLE_WORKFLOW_COPILOT_V2: true };
     await renderChat({ requiresLiveBrowser: true, isLiveBrowserReady: false });
 

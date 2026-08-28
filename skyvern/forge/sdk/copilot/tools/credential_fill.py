@@ -555,10 +555,18 @@ async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, finge
     await _capture_scout_selector_candidates(copilot_ctx, selector)
     captured_selector_candidates = copilot_ctx.pending_scout_selector_candidates
     copilot_ctx.pending_scout_selector_candidates = None
-    selector_candidates: list[ScoutedSelectorCandidate] = [{"selector": selector, "source": "requested"}]
+    selector_candidates: list[ScoutedSelectorCandidate] = [
+        {"selector": selector, "source": "requested", "match_count": None}
+    ]
     for candidate in captured_selector_candidates or []:
-        if candidate not in selector_candidates:
+        existing = next(
+            (item for item in selector_candidates if item["selector"] == candidate["selector"]),
+            None,
+        )
+        if existing is None:
             selector_candidates.append(candidate)
+        elif existing["match_count"] is None:
+            existing["match_count"] = candidate["match_count"]
     role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
     return _ScoutTargetProbe(
         selector=selector,
@@ -752,6 +760,7 @@ async def _fill_credential_field_impl_serial(
                 "credential_field": field,
             }
         return finish(error_result)
+    fill_outcome: ScoutReadbackOutcome | None = None
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
@@ -785,6 +794,8 @@ async def _fill_credential_field_impl_serial(
                 ),
             }
         )
+
+    assert fill_outcome is not None
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
     source_url = _consume_scout_source_url(copilot_ctx)

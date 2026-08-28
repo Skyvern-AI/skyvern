@@ -28,6 +28,9 @@ class BrowserState(Protocol):
     # The per-run pinned engine (or None for states built outside the per-run engine seam), so
     # recovery code can classify driver-native errors against THIS run's selected engine.
     engine_selection: BrowserEngineSelection | None
+    # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
+    # response). The Task V3 loop reads it to classify a dead/removed starting URL.
+    last_navigation_status: int | None
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 

@@ -10,8 +10,12 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
+import yarl
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TURNS,
@@ -22,6 +26,7 @@ from skyvern.forge.taskv3.engine import (
     taskv3_runaway_backstops,
 )
 from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
@@ -59,6 +64,73 @@ async def test_engine_accepts_first_finish() -> None:
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="noop"
     )
     assert outcome.status == "completed" and outcome.turns == 1
+
+
+@pytest.mark.asyncio
+async def test_navigate_through_a_payload_ref_redirect_masks_the_landing_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A payload ref that redirects hands its provenance to the landing URL: the real navigate tool
+    derives a ref for it, the engine's context holds the same dict, and the boundary masks it."""
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)  # no DNS in unit tests
+    signed = "https://files.example.test/uploads/deadbeef/resume.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    landing = "https://cdn.example.test/blob/resume.pdf?X-Amz-Signature=0123456789abcdef0123456789abcdef"
+
+    class _RedirectingPage(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+            await super().goto(url, timeout, wait_until)
+            self.url = landing
+
+    token = mask_opaque_urls({"file": signed}).masked["file"]
+    caller = _ScriptedCaller([[("navigate", {"url": token})], [("finish", {"status": "completed", "reason": "done"})]])
+    ctx = SkyvernContext(task_id="tsk_redirect")
+    skyvern_context.set(ctx)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_RedirectingPage()),
+            llm_caller=caller,
+            goal="g",
+            parameters={"file": signed},
+        )
+    finally:
+        skyvern_context.reset()
+    navigate_message = next(m["content"] for m in caller.message_history if m.get("role") == "tool")
+    assert "0123456789abcdef" not in navigate_message and navigate_message.startswith("navigated to opaque_url_")
+    assert landing in ctx.opaque_url_refs.values()
+
+
+@pytest.mark.asyncio
+async def test_engine_overwrites_opaque_url_refs_so_a_prior_blocks_refs_never_bleed() -> None:
+    """The masking boundary reads ctx.opaque_url_refs, and one SkyvernContext is shared across every
+    task block in a workflow run. The engine must OVERWRITE that field with the current task's refs —
+    the minted set, or empty when the task mints none — never merge or leave a prior block's stale
+    entry. Otherwise a later block masks a URL to a token only the earlier block's resolver can
+    reverse, which the model then cannot round-trip back through a tool call."""
+    signed = "https://files.example.test/uploads/deadbeef/resume.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    ctx = SkyvernContext(task_id="tsk_prior")
+    ctx.opaque_url_refs = {"opaque_url_stale00": "https://old.example.test/x?token=STALE"}
+    skyvern_context.set(ctx)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+            goal="g",
+            parameters={"file": signed},
+        )
+        # Overwritten with exactly this task's refs; the prior block's stale entry is gone.
+        assert ctx.opaque_url_refs == mask_opaque_urls({"file": signed}).refs
+        assert "opaque_url_stale00" not in ctx.opaque_url_refs
+
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+            goal="g",
+            parameters={"first_name": "John"},
+        )
+        # A task that mints no refs resets the field to empty, not the previous task's refs.
+        assert ctx.opaque_url_refs == {}
+    finally:
+        skyvern_context.reset()
 
 
 @pytest.mark.asyncio
@@ -449,6 +521,158 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
 
 
 @pytest.mark.asyncio
+async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A presigned file URL reaches the model only as its opaque_url_ token in the payload; the tools
+    # resolve that token to the untouched bytes (navigate's goto, file_upload's download), and the
+    # finish output is un-masked so the customer never sees the token.
+    segment = ("0123456789abcdef" * 3)[:40]
+    host_and_path = f"https://files.example.test/uploads/{segment}/resume.pdf"
+    credential_value = "AKIAEXAMPLE0123456%2F20260824%2Fus-east-1%2Fs3%2Faws4_request"
+    signature = "f1e2d3c4b5a697887766554433221100aabbccddeeff00112233445566778899"
+    signed_url = (
+        f"{host_and_path}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={credential_value}"
+        f"&X-Amz-Date=20260824T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature={signature}"
+    )
+    plain_url = "https://portfolio.example.test/jo"
+    parameters = {"first_name": "Jo", "resume_url": signed_url, "portfolio_url": plain_url}
+    token = next(iter(mask_opaque_urls(parameters).refs))
+
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+
+    captured_source: dict[str, str] = {}
+
+    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        captured_source["source"] = source
+        request_info = aiohttp.RequestInfo(
+            url=yarl.URL(signed_url), method="GET", headers={}, real_url=yarl.URL(signed_url)
+        )
+        raise aiohttp.ClientResponseError(request_info=request_info, history=(), status=400, message="Bad Request")
+
+    import skyvern.forge.sdk.api.files as files_module
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+
+    script = [
+        [("navigate", {"url": token})],
+        [("file_upload", {"selector": "#cv", "file": token})],
+        [
+            (
+                "finish",
+                {
+                    "status": "failed",
+                    "reason": f"upload of {token} was rejected",
+                    "extracted_output": {"uploaded": [token], "note": f"used {token}"},
+                },
+            )
+        ],
+    ]
+    caller = _ScriptedCaller(script)
+    page = _FakePage()
+    ctx = SkyvernContext(task_id="tsk_1")
+    skyvern_context.set(ctx)
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal="Apply to the role and upload the attached resume.",
+            parameters=parameters,
+        )
+        assert ctx.runtime_secret_values == set()  # the customer's own URL is never enrolled in redaction
+    finally:
+        skyvern_context.reset()
+
+    assert captured_source["source"] == signed_url  # the real bytes reached the download call
+    assert page.url == signed_url  # navigate resolved the token before goto
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert signed_url not in user_prompt
+    assert signature not in user_prompt and credential_value not in user_prompt
+    assert token in user_prompt
+    assert plain_url in user_prompt  # nosemgrep: incomplete-url-substring-sanitization
+
+    assert outcome.status == "failed"
+    assert signed_url in outcome.reason  # nosemgrep: incomplete-url-substring-sanitization
+    assert token not in outcome.reason
+    assert outcome.extracted_output == {"uploaded": [signed_url], "note": f"used {signed_url}"}
+
+
+@pytest.mark.asyncio
+async def test_business_identifier_value_under_a_non_signing_key_stays_readable() -> None:
+    # A token-shaped VALUE under an ordinary business KEY (order id, not a signing param) must never be
+    # tokenized: neither in the payload nor in ordinary page content the model reads.
+    order_id = "ORD2026AUG24X7Q1A"
+    order_url = f"https://shop.example.test/orders?orderId={order_id}"
+    parameters = {"order_url": order_url}
+
+    class _OrderPage(_FakePage):
+        async def content(self) -> str:
+            return f"<html><body>Order {order_id} shipped</body></html>"
+
+    script = [
+        [("get_html", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    caller = _ScriptedCaller(script)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_OrderPage()),
+        llm_caller=caller,
+        goal="check order status",
+        parameters=parameters,
+    )
+    user_message = next(m for m in outcome.messages if m.get("role") == "user")["content"]
+    assert order_url in user_message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "opaque_url_" not in user_message
+
+    tool_messages = {m["name"]: m["content"] for m in outcome.messages if m.get("role") == "tool"}
+    assert f"Order {order_id} shipped" in tool_messages["get_html"]
+
+
+@pytest.mark.asyncio
+async def test_hash_route_job_url_is_not_masked() -> None:
+    # A SPA hash-route job URL is an ordinary payload value, not a signed URL: it must reach the
+    # model verbatim in the user prompt, not as an opaque_url_ token.
+    job_url = "https://careers.example.test/#/jobs/software-engineer-2026"
+    parameters = {"job_url": job_url}
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    ctx = SkyvernContext(task_id="tsk_2")
+    skyvern_context.set(ctx)
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Apply using the given job URL.",
+            parameters=parameters,
+        )
+    finally:
+        skyvern_context.reset()
+
+    transcript = json.dumps(outcome.messages)
+    assert job_url in transcript  # nosemgrep: incomplete-url-substring-sanitization
+    assert "opaque_url_" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_page_free_mode_does_not_mask_signed_urls() -> None:
+    # Page-free mode has no tools to resolve an opaque_url_ token, so the payload stays verbatim.
+    signed_url = "https://files.example.test/uploads/x?token=eyJhbGciOiJIUzI1NiJ9c2lnbmVkQ29ycmVjdEhvcnNl"
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "criteria hold"})]])
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),  # never consulted: page_free has no tools
+        llm_caller=caller,
+        goal="assess",
+        page_free=True,
+        parameters={"u": signed_url},
+        max_turns=4,
+    )
+    user_message = next(m for m in outcome.messages if m.get("role") == "user")["content"]
+    assert (
+        signed_url in user_message and "opaque_url_" not in user_message
+    )  # nosemgrep: incomplete-url-substring-sanitization
+
+
+@pytest.mark.asyncio
 async def test_engine_forwards_completion_hooks_and_gates_guidance_on_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     # completion_probe must reach the loop and completion_blocker must reach the finish tool, and
     # the download-completion guidance is appended to the system prompt only when a probe is given.
@@ -578,6 +802,9 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     async def blocker(_staged: frozenset[str]) -> str | None:
         return "no download yet"
 
+    async def verification_blocker() -> str | None:
+        return "no code arrived"
+
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),
         llm_caller=_ScriptedCaller([]),
@@ -585,8 +812,80 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
         page_free=True,
         completion_probe=probe,
         completion_blocker=blocker,
+        verification_blocker=verification_blocker,
     )
     assert loop_kwargs["completion_probe"] is None
     assert finish_kwargs["completion_blocker"] is None
+    assert finish_kwargs["verification_blocker"] is None
     assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
     assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_free", [False, True])
+async def test_engine_system_prompt_carries_the_current_date(monkeypatch: pytest.MonkeyPatch, page_free: bool) -> None:
+    # A relative-date goal ("two weeks from today") is unanswerable without a reference date; the
+    # model was observed typing past dates. The date is computed at assembly, never hardcoded.
+    from datetime import UTC, datetime
+
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    before = datetime.now(UTC)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="fill in the date available: two weeks from today",
+        page_free=page_free,
+    )
+    after = datetime.now(UTC)
+    system_prompt = loop_kwargs["system_prompt"]
+    assert any(
+        f"Today's date is {d.strftime('%Y-%m-%d')} ({d.strftime('%A')})" in system_prompt for d in (before, after)
+    ), system_prompt[-300:]
+
+
+@pytest.mark.asyncio
+async def test_engine_system_prompt_dates_in_the_runs_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The browser runs in the proxy's timezone (browser_factory sets ctx.tz_info); the stated date
+    # must be that zone's today, or UTC drifts a day ahead of/behind the page every evening.
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    # One of the two extreme zones is always on a different calendar day than UTC.
+    tz = next(
+        z
+        for z in (ZoneInfo("Pacific/Kiritimati"), ZoneInfo("Etc/GMT+12"))
+        if datetime.now(z).date() != datetime.now(UTC).date()
+    )
+    ctx = SkyvernContext(task_id="tsk_tz")
+    ctx.tz_info = tz
+    skyvern_context.set(ctx)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([]),
+            goal="fill in the date available: two weeks from today",
+        )
+    finally:
+        skyvern_context.reset()
+    system_prompt = loop_kwargs["system_prompt"]
+    assert f"Today's date is {datetime.now(tz).strftime('%Y-%m-%d')}" in system_prompt, system_prompt[-200:]
+    assert f"Today's date is {datetime.now(UTC).strftime('%Y-%m-%d')}" not in system_prompt

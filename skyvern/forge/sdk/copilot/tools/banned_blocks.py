@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -21,6 +22,7 @@ class CopilotBlockPolicyStatus(StrEnum):
 class CopilotBlockPolicyScope(StrEnum):
     ALL = "all"
     CODE_ONLY_BROWSER = "code_only_browser"
+    TASK_V3_PURE = "task_v3_pure"
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class CopilotBlockPolicy:
 _P = CopilotBlockPolicy
 _ALL = CopilotBlockPolicyScope.ALL
 _CODE_ONLY = CopilotBlockPolicyScope.CODE_ONLY_BROWSER
+_TASK_V3_PURE = CopilotBlockPolicyScope.TASK_V3_PURE
 _BANNED = CopilotBlockPolicyStatus.BANNED
 _PENDING = CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
 _AI_LEAF = CopilotBlockPolicyStatus.DECLARED_AI_LEAF
@@ -66,6 +69,12 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
             "The legacy task_v2 agent is not available in the workflow copilot; decompose the goal into explicit "
             "workflow blocks or focused code blocks instead."
         ),
+    ),
+    "code": _P(
+        _BANNED,
+        _TASK_V3_PURE,
+        "Task V3-only execution",
+        "Use engine-less deterministic blocks or a supported task block pinned to `skyvern-3.0`.",
     ),
     **{
         block_type: _P(
@@ -110,7 +119,45 @@ _COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(
     for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
     if policy.scope == CopilotBlockPolicyScope.ALL
 )
-_COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(_COPILOT_BLOCK_TYPE_POLICIES.keys())
+_COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(
+    block_type
+    for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
+    if policy.scope in {CopilotBlockPolicyScope.ALL, CopilotBlockPolicyScope.CODE_ONLY_BROWSER}
+)
+_TASK_V3_PURE_TASK_BLOCK_TYPES: frozenset[str] = frozenset(
+    {"task", "navigation", "login", "action", "validation", "extraction", "file_download"}
+)
+_TASK_V3_PURE_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(
+    block_type
+    for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
+    if policy.scope == CopilotBlockPolicyScope.TASK_V3_PURE
+    or (policy.status == CopilotBlockPolicyStatus.DECLARED_AI_LEAF and block_type not in _TASK_V3_PURE_TASK_BLOCK_TYPES)
+)
+_TASK_V3_ENGINE = "skyvern-3.0"
+
+
+class TaskV3PureViolationCode(StrEnum):
+    BLOCK_TYPE_UNAVAILABLE = "block_type_unavailable"
+    ENGINE_NOT_SKYVERN_V3 = "engine_not_skyvern_v3"
+    UNSUPPORTED_V3_COMBINATION = "unsupported_v3_combination"
+    SYNTHETIC_TASK_CONTROL_FLOW = "synthetic_task_control_flow"
+
+
+@dataclass(frozen=True)
+class TaskV3PurePolicyViolation:
+    label: str
+    block_type: str
+    code: TaskV3PureViolationCode
+    guidance: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "label": self.label,
+            "block_type": self.block_type,
+            "code": self.code.value,
+            "guidance": self.guidance,
+        }
+
 
 # Shared suffix across every LLM-facing rejection message for banned
 # block emission — the pre-hook (schema-lookup reject) and the post-
@@ -147,15 +194,21 @@ def _copilot_block_authoring_policy(ctx: AgentContext | None) -> BlockAuthoringP
 
 
 def _copilot_banned_block_types(ctx: AgentContext | None) -> frozenset[str]:
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    policy = _copilot_block_authoring_policy(ctx)
+    if policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
+    if policy == BlockAuthoringPolicy.TASK_V3_PURE:
+        return _TASK_V3_PURE_BANNED_BLOCK_TYPES
     return _COPILOT_BANNED_BLOCK_TYPES
 
 
 def _active_policy_scopes(ctx: AgentContext | None) -> frozenset[CopilotBlockPolicyScope]:
     scopes = {CopilotBlockPolicyScope.ALL}
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    policy = _copilot_block_authoring_policy(ctx)
+    if policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         scopes.add(CopilotBlockPolicyScope.CODE_ONLY_BROWSER)
+    elif policy == BlockAuthoringPolicy.TASK_V3_PURE:
+        scopes.add(CopilotBlockPolicyScope.TASK_V3_PURE)
     return frozenset(scopes)
 
 
@@ -164,6 +217,8 @@ def _copilot_block_policy(
     ctx: AgentContext | None,
 ) -> tuple[str, CopilotBlockPolicy] | None:
     normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
+    if normalized == "task" and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
+        return None
     policy = _COPILOT_BLOCK_TYPE_POLICIES.get(normalized)
     if policy is not None and policy.scope in _active_policy_scopes(ctx):
         return normalized, policy
@@ -267,9 +322,131 @@ Runtime facts:
 
 
 def _copilot_banned_block_alternatives(ctx: AgentContext | None) -> str:
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    policy = _copilot_block_authoring_policy(ctx)
+    if policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _code_only_browser_unavailable_summary()
+    if policy == BlockAuthoringPolicy.TASK_V3_PURE:
+        return (
+            "Use engine-less workflow blocks for deterministic orchestration and integrations, or one of "
+            "`task`, `navigation`, `login`, `action`, `validation`, `extraction`, and `file_download` with "
+            "`engine: skyvern-3.0`."
+        )
     return _COPILOT_BANNED_BLOCK_ALTERNATIVES
+
+
+def _task_v3_pure_policy_violations(workflow_yaml: str) -> list[TaskV3PurePolicyViolation]:
+    """Validate the complete proposed definition, including pre-existing leaves.
+
+    Task-V3-pure mode deliberately does not grandfather legacy blocks: accepting
+    any edit means the resulting workflow is pure, rather than only the edited
+    labels being pure.
+    """
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if blocks is None:
+        return []
+    violations: list[TaskV3PurePolicyViolation] = []
+    for block in blocks:
+        if isinstance(block, Mapping):
+            violations.extend(_task_v3_pure_block_violations(block))
+    return violations
+
+
+def _task_v3_pure_block_violations(block: Mapping[str, object]) -> list[TaskV3PurePolicyViolation]:
+    raw_type = block.get("block_type")
+    if not isinstance(raw_type, str):
+        return []
+    block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
+    raw_label = block.get("label")
+    label = raw_label if isinstance(raw_label, str) else "(unlabeled)"
+    violations: list[TaskV3PurePolicyViolation] = []
+
+    if block_type in _TASK_V3_PURE_BANNED_BLOCK_TYPES:
+        violations.append(
+            TaskV3PurePolicyViolation(
+                label=label,
+                block_type=block_type,
+                code=TaskV3PureViolationCode.BLOCK_TYPE_UNAVAILABLE,
+                guidance="Task-V3-pure mode does not allow code or task_v2 blocks.",
+            )
+        )
+    elif block_type in _TASK_V3_PURE_TASK_BLOCK_TYPES:
+        if block.get("engine") != _TASK_V3_ENGINE:
+            violations.append(
+                TaskV3PurePolicyViolation(
+                    label=label,
+                    block_type=block_type,
+                    code=TaskV3PureViolationCode.ENGINE_NOT_SKYVERN_V3,
+                    guidance="Set the submitted block engine exactly to `skyvern-3.0`.",
+                )
+            )
+        if block_type == "validation" and block.get("complete_on_download") is True:
+            violations.append(
+                TaskV3PurePolicyViolation(
+                    label=label,
+                    block_type=block_type,
+                    code=TaskV3PureViolationCode.UNSUPPORTED_V3_COMBINATION,
+                    guidance="Use a separate file_download block; Task V3 does not support download-gated validation.",
+                )
+            )
+
+    if block_type == "for_loop":
+        loop_variable_reference = block.get("loop_variable_reference")
+        loop_over_parameter_key = block.get("loop_over_parameter_key")
+        has_free_form_loop_reference = (
+            not isinstance(loop_variable_reference, str)
+            or loop_variable_reference.strip(" {}") != loop_over_parameter_key
+        )
+        if loop_variable_reference not in (None, "") and has_free_form_loop_reference:
+            violations.append(
+                TaskV3PurePolicyViolation(
+                    label=label,
+                    block_type=block_type,
+                    code=TaskV3PureViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
+                    guidance="Use `loop_over_parameter_key`; free-form loop input creates a synthetic task.",
+                )
+            )
+    elif block_type == "while_loop":
+        condition = block.get("condition")
+        if isinstance(condition, Mapping) and condition.get("criteria_type", "jinja2_template") != "jinja2_template":
+            violations.append(
+                TaskV3PurePolicyViolation(
+                    label=label,
+                    block_type=block_type,
+                    code=TaskV3PureViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
+                    guidance="Use a `jinja2_template` condition; prompt criteria create a synthetic task.",
+                )
+            )
+    elif block_type == "conditional":
+        branch_conditions = block.get("branch_conditions")
+        if isinstance(branch_conditions, list) and any(
+            isinstance(branch, Mapping)
+            and isinstance(branch.get("criteria"), Mapping)
+            and branch["criteria"].get("criteria_type", "jinja2_template") != "jinja2_template"
+            for branch in branch_conditions
+        ):
+            violations.append(
+                TaskV3PurePolicyViolation(
+                    label=label,
+                    block_type=block_type,
+                    code=TaskV3PureViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
+                    guidance="Use `jinja2_template` branch criteria; prompt criteria create a synthetic task.",
+                )
+            )
+
+    loop_blocks = block.get("loop_blocks")
+    if isinstance(loop_blocks, list):
+        for nested in loop_blocks:
+            if isinstance(nested, Mapping):
+                violations.extend(_task_v3_pure_block_violations(nested))
+    return violations
+
+
+def _task_v3_pure_reject_message(violations: list[TaskV3PurePolicyViolation]) -> str:
+    details = " ".join(
+        f"{violation.label} ({violation.block_type}, {violation.code.value}): {violation.guidance}"
+        for violation in violations
+    )
+    return f"The submitted workflow violates the active Task-V3-pure block policy. {details}"
 
 
 def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext | None = None) -> str:

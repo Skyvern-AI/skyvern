@@ -25,6 +25,9 @@ CODE_BLOCK_FILENAME = "<code_block>"
 CODE_LINE_OFFSET = 2
 MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS = 20
 PENDING_CALL_DELAY_SECONDS = 20.0
+# Every writer and the copilot projection share this, so a failure is bounded once. Wide enough
+# for the head of a Playwright call log that states whether the locator resolved and whether the
+# element was visible and stable — the lines that separate a tool failure from a bad locator.
 RECORDED_FAILURE_RESPONSE_MAX_CHARS = 500
 RECORDED_FAILURE_CAPTURE_MAX_CHARS = 8000
 
@@ -102,7 +105,7 @@ class PendingAction:
     action_order: int | None = None
 
 
-OnPendingAction = Callable[[PendingAction], Awaitable[None]]
+OnPendingAction = Callable[[PendingAction], None]
 
 
 def _frame_user_line() -> int | None:
@@ -304,14 +307,11 @@ class _Recorder:
         self._on_pending_action = on_pending_action
         self.credential_release_guard = credential_release_guard
 
-    async def _emit_pending_action(self, pending_action: PendingAction) -> None:
-        await asyncio.sleep(pending_action.threshold_seconds)
+    def _emit_pending_action(self, pending_action: PendingAction) -> None:
         if self._on_pending_action is None:
             return
         try:
-            await self._on_pending_action(pending_action)
-        except asyncio.CancelledError:
-            raise
+            self._on_pending_action(pending_action)
         except Exception:
             LOG.warning(
                 "Code block pending action sink failed",
@@ -319,46 +319,34 @@ class _Recorder:
                 call_name=pending_action.call_name,
             )
 
-    def _arm_pending(self, pending_action: PendingAction) -> asyncio.Task[None] | None:
+    def _arm_pending(self, pending_action: PendingAction) -> asyncio.TimerHandle | None:
         if self._on_pending_action is None:
             return None
-        return asyncio.create_task(self._emit_pending_action(pending_action), name="code-block-call-pending")
-
-    async def _retire_pending(self, pending_task: asyncio.Task[None]) -> bool:
-        """Cancel and drain the pending timer, reporting whether the caller itself was cancelled."""
-        current_task = asyncio.current_task()
-        cancellation_count = current_task.cancelling() if current_task is not None else 0
-        cleanup_cancelled = False
-        pending_task.cancel()
-        while not pending_task.done():
-            try:
-                await asyncio.shield(pending_task)
-            except asyncio.CancelledError:
-                if current_task is not None and current_task.cancelling() > cancellation_count:
-                    cleanup_cancelled = True
-        if pending_task.cancelled():
-            cleanup_cancelled = cleanup_cancelled or (
-                current_task is not None and current_task.cancelling() > cancellation_count
-            )
-        return cleanup_cancelled
+        # A timer handle over a plain callback, never a task: the OTel asyncio instrumentor wraps
+        # every scheduled coroutine, and a coroutine cancelled before its first step is dropped
+        # inside that wrapper, which CPython reports as a "never awaited" RuntimeWarning. Cancelling
+        # a handle is also synchronous, so the guarded call's finally never awaits and can no longer
+        # swallow a cancellation aimed at the caller.
+        return asyncio.get_running_loop().call_later(
+            pending_action.threshold_seconds, self._emit_pending_action, pending_action
+        )
 
     async def await_pending_aware(self, awaitable: Awaitable[Any], call_name: str) -> Any:
         if self._on_pending_action is None:
             return await awaitable
-        pending_task = self._arm_pending(
+        pending_handle = self._arm_pending(
             PendingAction(
                 call_name=call_name,
                 threshold_seconds=PENDING_CALL_DELAY_SECONDS,
                 code_line=_frame_user_line(),
             )
         )
-        if pending_task is None:
+        if pending_handle is None:
             return await awaitable
         try:
             return await awaitable
         finally:
-            if await self._retire_pending(pending_task):
-                raise asyncio.CancelledError
+            pending_handle.cancel()
 
     async def enforce_credential_release(
         self,
@@ -403,8 +391,7 @@ class _Recorder:
             {**common_fields, **_recorded_action_fields(action_type, name, target, args, kwargs)},
             warning="Failed to instantiate recorded action subclass, falling back to base Action",
         )
-        cleanup_cancelled = False
-        pending_task = self._arm_pending(
+        pending_handle = self._arm_pending(
             PendingAction(
                 call_name=name,
                 threshold_seconds=PENDING_CALL_DELAY_SECONDS,
@@ -432,8 +419,8 @@ class _Recorder:
             self.last_exception = exc
             raise
         finally:
-            if pending_task is not None:
-                cleanup_cancelled = await self._retire_pending(pending_task)
+            if pending_handle is not None:
+                pending_handle.cancel()
             duration_ms = int((time.monotonic() - started) * 1000)
             action.started_at = started_wall
             action.finished_at = naive_utc_now()
@@ -445,8 +432,6 @@ class _Recorder:
                     await self._on_action(action)
                 except Exception:
                     LOG.warning("Code block action sink failed", action_type=action_type)
-            if cleanup_cancelled:
-                raise asyncio.CancelledError
         return result
 
 

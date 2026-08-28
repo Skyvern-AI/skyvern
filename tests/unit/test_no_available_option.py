@@ -2127,3 +2127,161 @@ class TestSameLevelClickMarksWidgetMutation:
             skyvern_context.reset()
 
         assert excinfo.value.widget_mutated is True
+
+
+def _already_open_anchor(
+    *,
+    expanded: bool | None = True,
+    anchor_sk: str = "anchor-sk",
+    listbox_dom: str = "listbox-dom",
+) -> dict:
+    # domUtils scrapes aria-expanded as a real bool, so mirror that shape here rather than a string.
+    attributes: dict = {"role": "combobox", "aria-controls": listbox_dom, "id": "anchor-dom"}
+    if expanded is not None:
+        attributes["aria-expanded"] = expanded
+    return {"id": anchor_sk, "tagName": "div", "attributes": attributes, "children": []}
+
+
+def _already_open_option(sk: str, label: str) -> dict:
+    return {
+        "id": sk,
+        "tagName": "li",
+        "attributes": {"role": "option"},
+        "text": label,
+        "interactable": True,
+        "children": [],
+    }
+
+
+def _already_open_listbox(
+    *, options: list[dict], listbox_sk: str = "listbox-sk", listbox_dom: str = "listbox-dom"
+) -> dict:
+    return {
+        "id": listbox_sk,
+        "tagName": "ul",
+        "attributes": {"role": "listbox", "id": listbox_dom},
+        "children": list(options),
+    }
+
+
+def _already_open_pages(
+    *, anchor: dict, listbox: dict, extra_elements: list[dict] | None = None
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Before/after scraped pages whose strict new-element diff is empty because the combobox is already open."""
+    elements = [anchor, listbox, *listbox["children"], *(extra_elements or [])]
+    tree_root = {"id": "root", "tagName": "div", "attributes": {}, "children": [anchor, listbox]}
+    before = SimpleNamespace(id_to_css_dict={})
+    after = SimpleNamespace(
+        id_to_css_dict={},
+        id_to_element_dict={anchor["id"]: anchor},
+        elements=elements,
+        element_tree_trimmed=[tree_root],
+    )
+    return before, after
+
+
+def _install_dom_after_open(monkeypatch: pytest.MonkeyPatch, *, interactable_ids: set[str]) -> MagicMock:
+    def _element_for(element_id: str) -> MagicMock:
+        element = MagicMock()
+        element.is_interactable = MagicMock(return_value=element_id in interactable_ids)
+        element.get_attr = AsyncMock(return_value=None)
+        element.scroll_into_view = AsyncMock()
+        element.click = AsyncMock()
+        return element
+
+    dom_after_open = MagicMock()
+    dom_after_open.get_skyvern_element_by_id = AsyncMock(side_effect=_element_for)
+    monkeypatch.setattr(handler, "DomUtil", MagicMock(return_value=dom_after_open))
+    return dom_after_open
+
+
+async def _run_emerging_already_open(before: SimpleNamespace, after: SimpleNamespace) -> handler.ActionResult:
+    return await handler.select_from_emerging_elements(
+        current_element_id="anchor-sk",
+        options=handler.CustomSelectPromptOptions(target_value="Alpha"),
+        page=MagicMock(),
+        scraped_page=before,
+        scraped_page_after_open=after,
+        step=SimpleNamespace(step_id="step-1"),
+        task=_task(),  # type: ignore[arg-type]
+        engine_selection=None,
+    )
+
+
+class TestAlreadyOpenOwnedListboxRecovery:
+    """SKY-14931: when the combobox is already open, select from its uniquely aria-owned listbox
+    instead of raising no-incremental — and stay fail-closed on closed/ambiguous/empty widgets."""
+
+    @pytest.mark.asyncio
+    async def test_selects_from_already_open_owned_listbox_instead_of_raising(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor = _already_open_anchor()
+        listbox = _already_open_listbox(
+            options=[_already_open_option("opt-a", "Alpha"), _already_open_option("opt-b", "Beta")]
+        )
+        before, after = _already_open_pages(anchor=anchor, listbox=listbox)
+        _install_dom_after_open(monkeypatch, interactable_ids={"opt-a", "opt-b"})
+        monkeypatch.setattr(handler, "json_to_html", MagicMock(return_value="<li>Alpha</li>"))
+        deterministic = AsyncMock(return_value=(handler.ActionSuccess(), "Alpha"))
+        monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic)
+
+        with skyvern_context.scoped(SkyvernContext(tz_info=UTC)):
+            result = await _run_emerging_already_open(before, after)
+
+        assert isinstance(result, handler.ActionSuccess)
+        assert deterministic.await_count == 1
+        candidates = deterministic.await_args.kwargs["get_option_candidates"]()
+        assert {candidate["label"] for candidate in candidates} == {"Alpha", "Beta"}
+
+    @pytest.mark.asyncio
+    async def test_closed_combobox_stays_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        anchor = _already_open_anchor(expanded=False)
+        listbox = _already_open_listbox(options=[_already_open_option("opt-a", "Alpha")])
+        before, after = _already_open_pages(anchor=anchor, listbox=listbox)
+        _install_dom_after_open(monkeypatch, interactable_ids={"opt-a"})
+        deterministic = AsyncMock(return_value=(handler.ActionSuccess(), "Alpha"))
+        monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic)
+
+        with (
+            skyvern_context.scoped(SkyvernContext(tz_info=UTC)),
+            pytest.raises(NoIncrementalElementFoundForCustomSelection),
+        ):
+            await _run_emerging_already_open(before, after)
+
+        deterministic.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_owning_anchor_stays_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        anchor = _already_open_anchor()
+        duplicate_anchor = _already_open_anchor(anchor_sk="anchor-sk-2")
+        listbox = _already_open_listbox(options=[_already_open_option("opt-a", "Alpha")])
+        before, after = _already_open_pages(anchor=anchor, listbox=listbox, extra_elements=[duplicate_anchor])
+        _install_dom_after_open(monkeypatch, interactable_ids={"opt-a"})
+        deterministic = AsyncMock(return_value=(handler.ActionSuccess(), "Alpha"))
+        monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic)
+
+        with (
+            skyvern_context.scoped(SkyvernContext(tz_info=UTC)),
+            pytest.raises(NoIncrementalElementFoundForCustomSelection),
+        ):
+            await _run_emerging_already_open(before, after)
+
+        deterministic.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_owned_listbox_stays_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        anchor = _already_open_anchor()
+        listbox = _already_open_listbox(options=[])
+        before, after = _already_open_pages(anchor=anchor, listbox=listbox)
+        _install_dom_after_open(monkeypatch, interactable_ids=set())
+        deterministic = AsyncMock(return_value=(handler.ActionSuccess(), "Alpha"))
+        monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic)
+
+        with (
+            skyvern_context.scoped(SkyvernContext(tz_info=UTC)),
+            pytest.raises(NoIncrementalElementFoundForCustomSelection),
+        ):
+            await _run_emerging_already_open(before, after)
+
+        deterministic.assert_not_awaited()

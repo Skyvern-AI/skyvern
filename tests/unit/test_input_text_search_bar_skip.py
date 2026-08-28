@@ -114,7 +114,10 @@ async def _run_search_bar_input(stop_flag: bool, incremental: list[dict]) -> lis
             return_value="123456",
         ),
         patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=context)),
-        patch("skyvern.webeye.actions.handler._incremental_tree_contains_target_value", return_value=True),
+        patch(
+            "skyvern.webeye.actions.handler._incremental_tree_contains_option_subtree_with_target_value",
+            return_value=True,
+        ),
         patch(
             "skyvern.webeye.actions.handler.sequentially_select_from_dropdown",
             new=AsyncMock(return_value=select_result),

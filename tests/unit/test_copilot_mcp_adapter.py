@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from mcp.types import CallToolResult
@@ -21,7 +22,12 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _requested_output_path_choices,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import AgentContext, CopilotBrowserSessionUnavailable, mcp_to_copilot
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    CopilotBrowserLivenessUndetermined,
+    CopilotBrowserSessionUnavailable,
+    mcp_to_copilot,
+)
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -126,11 +132,11 @@ def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[float]]:
 @pytest.fixture
 def _stub_browser_session(monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]) -> Iterator[None]:
     async def _no_error(_ctx: AgentContext, **_kwargs: Any) -> None:
-        _fake_clock[0] += _BROWSER_BOOT_SECONDS
         return None
 
     @asynccontextmanager
     async def _no_session_scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        _fake_clock[0] += _BROWSER_BOOT_SECONDS
         yield
 
     monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _no_error)
@@ -141,7 +147,7 @@ def _stub_browser_session(monkeypatch: pytest.MonkeyPatch, _fake_clock: list[flo
 def _install_timed_context(monkeypatch: pytest.MonkeyPatch, clock: list[float]) -> None:
     @asynccontextmanager
     async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
-        clock[0] += _CONTEXT_ENTER_SECONDS
+        clock[0] += _BROWSER_BOOT_SECONDS + _CONTEXT_ENTER_SECONDS
         try:
             yield
         finally:
@@ -770,19 +776,20 @@ class TestMCPToolTiming:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
-    async def test_a_call_cancelled_while_resolving_its_session_still_reports_the_budget_it_spent(
+    async def test_a_call_cancelled_while_attaching_still_reports_the_budget_it_spent(
         self, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
     ) -> None:
-        async def _cancelled(_ctx: AgentContext, **_kwargs: Any) -> None:
+        @asynccontextmanager
+        async def _cancelled(_ctx: AgentContext) -> AsyncIterator[None]:
             _fake_clock[0] += _BROWSER_BOOT_SECONDS
             raise asyncio.CancelledError
+            yield
 
-        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _cancelled)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _cancelled)
         server = _server_whose_call_takes_time({"ok": True}, SchemaOverlay(requires_browser=True), _fake_clock)
 
-        with capture_logs() as captured:
-            with pytest.raises(asyncio.CancelledError):
-                await _call(server, call_path)
+        with capture_logs() as captured, pytest.raises(asyncio.CancelledError):
+            await _call(server, call_path)
 
         records = _timing_records(captured)
         assert len(records) == 1
@@ -790,8 +797,8 @@ class TestMCPToolTiming:
         assert records[0]["call_path"] == call_path
         assert records[0]["wall_clock_ms"] == _SESSION_ONLY_MS
         assert records[0]["server_timing_ms"] is None
-        assert records[0]["timing_phase"] == "session_prepare"
-        assert records[0]["phase_session_prepare_ms"] == _SESSION_ONLY_MS
+        assert records[0]["timing_phase"] == "context_enter"
+        assert records[0]["phase_context_enter_ms"] == _SESSION_ONLY_MS
         assert records[0]["phase_dispatch_ms"] == 0
         assert records[0]["phase_residual_ms"] >= 0
 
@@ -822,14 +829,16 @@ class TestMCPToolTiming:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
-    async def test_a_session_that_raises_instead_of_returning_an_error_still_reports_its_budget(
+    async def test_an_attach_that_raises_still_reports_its_budget(
         self, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
     ) -> None:
-        async def _session_raises(_ctx: AgentContext, **_kwargs: Any) -> None:
+        @asynccontextmanager
+        async def _attach_raises(_ctx: AgentContext) -> AsyncIterator[None]:
             _fake_clock[0] += _BROWSER_BOOT_SECONDS
             raise RuntimeError("adoption failed")
+            yield
 
-        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _session_raises)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _attach_raises)
         server = _server_whose_call_takes_time({"ok": True}, SchemaOverlay(requires_browser=True), _fake_clock)
 
         with capture_logs() as captured:
@@ -837,7 +846,7 @@ class TestMCPToolTiming:
 
         records = _timing_records(captured)
         assert len(records) == 1
-        assert records[0]["call_status"] == "session_error"
+        assert records[0]["call_status"] == "error"
         assert records[0]["call_path"] == call_path
         assert records[0]["wall_clock_ms"] == _SESSION_ONLY_MS
 
@@ -892,8 +901,8 @@ class TestMCPToolTiming:
         record = _timing_records(captured)[0]
         assert record["wall_clock_ms"] == _GAP_WALL_MS
         assert record["server_timing_ms"] == 815
-        assert record["phase_session_prepare_ms"] == _SESSION_ONLY_MS
-        assert record["phase_context_enter_ms"] == _CONTEXT_ENTER_MS
+        assert record["phase_session_prepare_ms"] == 0
+        assert record["phase_context_enter_ms"] == _SESSION_ONLY_MS + _CONTEXT_ENTER_MS
         assert record["phase_dispatch_ms"] == _MCP_CALL_MS
         assert record["phase_context_exit_ms"] == _CONTEXT_EXIT_MS
         assert record["phase_residual_ms"] == 0
@@ -1183,6 +1192,9 @@ class TestBrowserSessionContinuity:
     ) -> None:
         shared_cache = _SharedLocalCache()
         monkeypatch.setattr(mcp_adapter.app, "CACHE", shared_cache)
+        manager = MagicMock()
+        manager.get_browser_session_startup_timeout_seconds.return_value = 55.0
+        monkeypatch.setattr(mcp_adapter.app, "PERSISTENT_SESSIONS_MANAGER", manager)
         first_ctx = make_copilot_ctx(browser_session_id="pbs_shared_lost")
         second_ctx = make_copilot_ctx(browser_session_id="pbs_shared_lost")
         allocations = 0
@@ -1308,7 +1320,7 @@ class TestBrowserSessionContinuity:
         assert ctx.blocker_signal.internal_reason_code == "tool_error_browser_session_lost"
 
     @pytest.mark.asyncio
-    async def test_session_lost_between_probe_and_dispatch_reestablishes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_session_lost_during_attach_reestablishes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_lost")
 
         async def _ensure(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
@@ -1331,125 +1343,50 @@ class TestBrowserSessionContinuity:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
-    async def test_session_replaced_during_pre_dispatch_probe_surfaces_continuity_loss(
-        self, call_path: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        ctx = make_copilot_ctx(browser_session_id="pbs_lost")
-        dispatched: list[bool] = []
-
-        ensure_calls = 0
-
-        async def _ensure(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
-            nonlocal ensure_calls
-            ensure_calls += 1
-            recovery_ctx.browser_session_id = "pbs_replacement"
-
-        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
-        server = _make_server(
-            ctx,
-            {"ok": True},
-            SchemaOverlay(requires_browser=True),
-            on_call=lambda: dispatched.append(True),
-        )
-
-        with capture_logs() as logs:
-            result = await _call(server, call_path)
-        result_text = result.content[0].text if isinstance(result, CallToolResult) else json.dumps(result)
-
-        assert "fresh browser session" in result_text
-        assert "inspect the page" in result_text
-        assert ctx.browser_session_replacements == {"pbs_lost": "pbs_replacement"}
-        assert ensure_calls == 1
-        assert dispatched == []
-        timing = _timing_records(logs)
-        assert len(timing) == 1
-        assert timing[0]["call_status"] == "session_error"
-
-    @pytest.mark.asyncio
-    async def test_concurrent_call_queued_during_pre_dispatch_recovery_is_suppressed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        ctx = make_copilot_ctx(browser_session_id="pbs_lost")
-        replacement_installed = asyncio.Event()
-        finish_first_probe = asyncio.Event()
-        ensure_calls = 0
-        dispatched: list[bool] = []
-
-        async def _ensure(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
-            nonlocal ensure_calls
-            ensure_calls += 1
-            if ensure_calls == 1:
-                recovery_ctx.browser_session_id = "pbs_replacement"
-                replacement_installed.set()
-                await finish_first_probe.wait()
-
-        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
-        server = _make_server(
-            ctx,
-            {"ok": True},
-            SchemaOverlay(requires_browser=True),
-            on_call=lambda: dispatched.append(True),
-        )
-
-        first = asyncio.create_task(server.call_tool("evaluate", {"expression": "first_stale_action()"}))
-        await replacement_installed.wait()
-        second = asyncio.create_task(server.call_tool("evaluate", {"expression": "second_stale_action()"}))
-        await asyncio.sleep(0)
-        finish_first_probe.set()
-        results = await asyncio.gather(first, second)
-
-        assert all("fresh browser session" in result.content[0].text for result in results)
-        assert dispatched == []
-        assert ctx.browser_session_continuity_generation == 1
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("call_path", ["model", "internal"])
-    async def test_pre_dispatch_probe_uncertainty_dispatches_instead_of_claiming_loss(
+    async def test_attach_uncertainty_returns_a_typed_error_without_claiming_loss(
         self, call_path: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_lost")
 
-        async def _undetermined(_ctx: AgentContext, *, require_verified_session: bool = False) -> Any:
+        async def _ensure(_ctx: AgentContext) -> None:
             await asyncio.sleep(0)
-            # Only a caller that demands verification is handed a verdict; everyone else is
-            # allowed through to attach and find out.
-            return {"ok": False, "error": "unverified"} if require_verified_session else None
 
         @asynccontextmanager
-        async def _attached(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _undetermined(_ctx: AgentContext) -> AsyncIterator[None]:
+            raise CopilotBrowserLivenessUndetermined()
             yield
 
-        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _undetermined)
-        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _attached)
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _undetermined)
         server = _make_server(ctx, {"ok": True}, SchemaOverlay(requires_browser=True))
 
         with capture_logs() as logs:
-            await _call(server, call_path)
+            result = await _call(server, call_path)
 
         assert ctx.blocker_signal is None
         assert ctx.browser_session_id == "pbs_lost"
         assert ctx.browser_session_replacements == {}
+        assert "could not be determined" in _surfaced_error(result, call_path)
         continuity = [record for record in logs if record.get("event") == "copilot_browser_session_continuity_loss"]
         assert continuity == []
         timing = _timing_records(logs)
         assert len(timing) == 1
-        assert timing[0]["call_status"] == "ok"
+        assert timing[0]["call_status"] == "error"
 
     @pytest.mark.asyncio
-    async def test_reestablish_budget_expiry_terminalizes_session_loss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_manager_reestablish_failure_terminalizes_session_loss(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_lost")
         closed: list[str] = []
 
-        async def _never_finishes(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
+        async def _manager_times_out(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
             recovery_ctx.browser_session_id = "pbs_partial"
-            await asyncio.Event().wait()
+            raise TimeoutError
 
         async def _close(_organization_id: str, session_id: str) -> None:
             closed.append(session_id)
 
-        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _never_finishes)
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _manager_times_out)
         monkeypatch.setattr(mcp_adapter, "close_browser_session_quietly", _close)
-        monkeypatch.setattr(mcp_adapter, "_SESSION_REESTABLISH_TIMEOUT_SECONDS", 0.01)
 
         disposition = await _handle_browser_session_loss(
             ctx,
@@ -1544,3 +1481,12 @@ class TestBrowserSessionContinuity:
         assert "fresh browser session" not in result.content[0].text
         assert ctx.browser_session_replacements == {}
         assert ctx.blocker_signal is None
+
+
+def test_reestablish_lock_budget_is_derived_from_the_managers_startup_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = MagicMock()
+    manager.get_browser_session_startup_timeout_seconds.return_value = 55.0
+    monkeypatch.setattr(mcp_adapter.app, "PERSISTENT_SESSIONS_MANAGER", manager)
+
+    assert mcp_adapter._reestablish_lock_seconds() == 85
+    assert not hasattr(mcp_adapter, "_SESSION_REESTABLISH_TIMEOUT_SECONDS")

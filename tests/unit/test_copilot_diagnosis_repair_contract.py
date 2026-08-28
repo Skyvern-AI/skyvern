@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     merge_visual_composition_evidence,
+    model_visible_composition_evidence,
     parse_composition_html,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
@@ -546,9 +547,9 @@ def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_pa
     assert "current_title_present" not in CodeAuthoringRepairContext.model_fields
     assert repair_context.page_evidence_source == "inspect_page_for_composition"
     assert repair_context.observed_after_workflow_run is True
-    assert repair_context.page_form_summaries == ["Search #search", "Go button.search disabled"]
-    assert repair_context.page_result_summaries == ["#results No matching records"]
-    assert repair_context.page_action_summaries == ["Next page a.next"]
+    assert repair_context.page_form_summaries == ["Search", "Go disabled"]
+    assert repair_context.page_result_summaries == ["No matching records"]
+    assert repair_context.page_action_summaries == ["Next page"]
     assert "case=secret" not in repair_context.model_dump_json()
 
 
@@ -2180,11 +2181,7 @@ def test_codeblock_failure_result_carries_same_run_page_facts_for_both_execution
     repair_context = CodeAuthoringRepairContext.model_validate(data["authoring_repair_context"])
     assert repair_context.current_url == "https://example.test/app/results"
     assert repair_context.current_title == "Results"
-    assert repair_context.page_result_summaries == [
-        "#results #results tbody tr",
-        "#results tbody tr button",
-        "First result row",
-    ]
+    assert repair_context.page_result_summaries == ["First result row"]
     assert repair_context.observed_after_workflow_run is True
 
 
@@ -2336,7 +2333,8 @@ def test_post_run_failure_page_store_mark_inject_grounds_repair_without_finalizi
     assert repair_context.observed_after_workflow_run is True
     assert result["data"]["authoring_repair_context"]["observed_after_workflow_run"] is True
     grounded = repair_context.page_form_summaries + repair_context.page_action_summaries
-    assert any("button.icon-btn" in summary for summary in grounded)
+    assert any(summary in {"Query", "Details"} for summary in grounded)
+    assert all("button.icon-btn" not in summary for summary in grounded)
     assert repair_context.page_result_summaries
 
 
@@ -3300,14 +3298,14 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
     summaries = repair_context.page_obstruction_summaries
     source_obstructions = ctx.composition_page_evidence["page_obstructions"]
     assert [obstruction.model_dump(exclude_none=True) for obstruction in repair_context.page_obstructions] == (
-        source_obstructions
+        [model_visible_composition_evidence(obstruction) for obstruction in source_obstructions]
     )
     assert [
         [candidate.model_dump() for candidate in control.selector_candidates]
         for obstruction in repair_context.page_obstructions
         for control in obstruction.visible_controls
     ] == [
-        control["selector_candidates"]
+        model_visible_composition_evidence(control)["selector_candidates"]
         for obstruction in source_obstructions
         for control in obstruction["visible_controls"]
     ]
@@ -3322,16 +3320,21 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
         for control in obstruction["visible_controls"]
         if "identity" in control
     ]
-    assert [summary.split()[1] for summary in summaries] == ["#terms-overlay", "#terms-modal"]
+    assert len(summaries) == 2
     for summary in summaries:
-        assert "#accept-terms" in summary
-        assert "Continue #btn-continue" in summary
+        assert "Terms" in summary
+        assert "Continue" in summary
+        assert "#terms-" not in summary
+        assert "#accept-terms" not in summary
+        assert "#btn-continue" not in summary
     prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
     assert "runtime_failure_reason: TimeoutError: Locator.wait_for: Timeout 10000ms exceeded." in prompt_lines
     assert "observed_after_workflow_run: true" in prompt_lines
     obstruction_line = next(line for line in prompt_lines if line.startswith("page_obstructions:"))
-    assert "#terms-overlay" in obstruction_line
-    assert "#btn-continue" in obstruction_line
+    assert "Terms" in obstruction_line
+    assert "Continue" in obstruction_line
+    assert "#terms-overlay" not in obstruction_line
+    assert "#btn-continue" not in obstruction_line
 
     ctx.last_code_authoring_repair_context = repair_context.model_copy(update={"selector": "#btn-continue"})
     selector_prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
@@ -3339,7 +3342,7 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
     assert obstruction_line in selector_prompt_lines
 
 
-def test_overlay_selectors_longer_than_a_summary_field_reach_the_prompt_whole() -> None:
+def test_overlay_selectors_do_not_reach_the_repair_prompt() -> None:
     ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))
     long_selector = f"#{_LONG_OVERLAY_SELECTOR_ID}"
     assert len(long_selector) > 100
@@ -3348,9 +3351,11 @@ def test_overlay_selectors_longer_than_a_summary_field_reach_the_prompt_whole() 
 
     assert repair_context is not None
     summary = repair_context.page_obstruction_summaries[0]
-    assert summary.startswith(f"modal_overlay {long_selector} ")
-    assert summary.endswith("#btn-four")
-    assert f"page_obstructions: modal_overlay {long_selector} " in _code_authoring_repair_context_prompt(ctx)
+    assert summary.startswith("modal_overlay Notice ")
+    assert summary.endswith("Close")
+    assert long_selector not in summary
+    assert "#btn-four" not in summary
+    assert long_selector not in _code_authoring_repair_context_prompt(ctx)
 
 
 def test_every_obstruction_keeps_dismiss_controls_when_controls_outnumber_the_summary_budget() -> None:
@@ -3360,16 +3365,12 @@ def test_every_obstruction_keeps_dismiss_controls_when_controls_outnumber_the_su
     repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
 
     assert repair_context is not None
-    per_obstruction = {
-        selector: [summary for summary in repair_context.page_obstruction_summaries if selector in summary]
-        for selector in (long_selector, "#inner-modal")
-    }
-    assert [len(summaries) for summaries in per_obstruction.values()] == [1, 1]
-    assert [
-        selector
-        for selector in ("#btn-one", "#btn-two", "#btn-three", "#btn-four")
-        if selector in per_obstruction["#inner-modal"][0]
-    ] == ["#btn-one", "#btn-two", "#btn-three", "#btn-four"]
+    summaries = repair_context.page_obstruction_summaries
+    assert len(summaries) == 2
+    assert all(label in summaries[1] for label in ("Accept", "Decline", "Manage", "Close"))
+    assert long_selector not in " ".join(summaries)
+    assert "#inner-modal" not in " ".join(summaries)
+    assert all(selector not in " ".join(summaries) for selector in ("#btn-one", "#btn-two", "#btn-three", "#btn-four"))
 
 
 def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> None:
@@ -3383,7 +3384,11 @@ def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> No
     for summary, obstruction in zip(
         repair_context.page_obstruction_summaries, ctx.composition_page_evidence["page_obstructions"]
     ):
-        source_control_order = [control.get("selector") for control in obstruction["visible_controls"]]
+        source_control_order = [
+            control.get("text") or control.get("aria_label") or control.get("title")
+            for control in obstruction["visible_controls"]
+        ]
+        source_control_order = [value for value in source_control_order if isinstance(value, str) and value]
         assert sorted(source_control_order, key=summary.index) == source_control_order
     assert json.dumps(ctx.composition_page_evidence, sort_keys=True) == evidence_before
     assert pending_before is not None
@@ -3423,14 +3428,13 @@ def test_modal_overlay_dismiss_controls_are_read_only_when_page_obstructions_is_
     repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
 
     assert repair_context is not None
-    assert repair_context.page_obstruction_summaries == ["#gate-modal Accept All button.accept"]
+    assert repair_context.page_obstruction_summaries == ["Accept All"]
     assert [obstruction.model_dump(exclude_none=True) for obstruction in repair_context.page_obstructions] == [
         {
-            "selector": "#gate-modal",
+            "selector_candidates": [],
             "visible_controls": [
                 {
                     "text": "Accept All",
-                    "selector": "button.accept",
                     "selector_candidates": [],
                 }
             ],
@@ -3543,7 +3547,7 @@ def test_same_run_matcher_keeps_a_stored_obstruction_only_packet() -> None:
     assert post_run_inspection_cleanly_matches(stored, "wr_other") is False
 
 
-def test_a_long_control_text_never_costs_the_prompt_the_dismiss_selector() -> None:
+def test_a_long_control_text_never_leaks_the_dismiss_selector() -> None:
     control_selector = "#" + "dismiss-the-full-page-notice-" * 5
     ctx = _overlay_repair_ctx(
         {
@@ -3570,14 +3574,15 @@ def test_a_long_control_text_never_costs_the_prompt_the_dismiss_selector() -> No
     assert repair_context is not None
     summary = repair_context.page_obstruction_summaries[0]
     assert len(summary) <= OBSTRUCTION_SUMMARY_MAX_CHARS
-    assert summary.endswith(control_selector)
+    assert control_selector not in summary
+    assert "Accept and continue past this notice." in summary
     obstruction_lines = [
         line
         for line in _code_authoring_repair_context_prompt(ctx).splitlines()
         if line.startswith("page_obstructions:")
     ]
     assert obstruction_lines
-    assert control_selector in obstruction_lines[0]
+    assert control_selector not in obstruction_lines[0]
 
 
 _CHALLENGE_PAGE_URL = "https://sso.example.test/challenge"
@@ -3728,3 +3733,314 @@ def test_unbound_credentials_still_ask_even_beside_a_clearable_captcha(monkeypat
     data = {"workflow_run_id": "wr_mixed", "skip_reason": "workflow_credential_inputs_unbound"}
 
     assert runtime_authoring_repair._result_has_terminal_or_ask_precedence(ctx, data, {"ok": False}) is True
+
+
+_OBSERVED_FIELD_SECRET = "s3cret-not-a-real-password"
+
+
+def _observed_state_page_evidence() -> dict[str, Any]:
+    return {
+        "current_url": "https://example.test/booking",
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "label": "Depart date",
+                        "type": "date",
+                        "value": "",
+                        "observed_value": "2026-09-14",
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "label": "Cabin",
+                        "type": "select",
+                        "identity": {"tag": "select"},
+                        "options": [
+                            {"text": "Economy", "value": "economy", "selected": True, "observed_selected": False},
+                            {"text": "Business", "value": "business", "selected": False, "observed_selected": True},
+                        ],
+                    },
+                    {
+                        "label": "Add insurance",
+                        "type": "checkbox",
+                        "value": "yes",
+                        "checked": False,
+                        "observed_checked": True,
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "label": "Password",
+                        "type": "password",
+                        "value": _OBSERVED_FIELD_SECRET,
+                        "filled": True,
+                        "identity": {"tag": "input"},
+                    },
+                ],
+                "submit_controls": [{"text": "Book", "disabled": False}],
+            }
+        ],
+    }
+
+
+def test_repair_prompt_carries_the_field_state_the_run_produced_not_the_markup_default() -> None:
+    ctx = _overlay_repair_ctx(_observed_state_page_evidence())
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == [
+        "Depart date date 2026-09-14",
+        "Cabin select Business",
+        "Add insurance checkbox checked",
+        "Password password",
+        "Book enabled",
+    ]
+    assert "page_forms: Depart date date 2026-09-14" in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_a_password_value_never_reaches_the_repair_prompt_beside_the_observed_field_state() -> None:
+    ctx = _overlay_repair_ctx(_observed_state_page_evidence())
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert _OBSERVED_FIELD_SECRET not in repair_context.model_dump_json()
+    assert _OBSERVED_FIELD_SECRET not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_an_observed_value_on_a_secret_typed_field_is_still_not_rendered() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Password",
+            "type": "password",
+            "observed_value": _OBSERVED_FIELD_SECRET,
+            "identity": {"tag": "input"},
+        },
+        {
+            "label": "Notes",
+            "type": "textarea",
+            "observed_value": _OBSERVED_FIELD_SECRET,
+            "identity": {"tag": "textarea"},
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Password password", "Notes textarea"]
+    assert _OBSERVED_FIELD_SECRET not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_a_field_whose_declared_type_lies_about_its_tag_renders_no_observed_state() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Notes",
+            "type": "date",
+            "observed_value": _OBSERVED_FIELD_SECRET,
+            "identity": {"tag": "textarea"},
+        },
+        {
+            "label": "Agree",
+            "type": "checkbox",
+            "observed_checked": True,
+            "identity": {"tag": "textarea"},
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Notes date", "Agree checkbox"]
+    assert _OBSERVED_FIELD_SECRET not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_a_checkbox_state_is_not_rendered_through_the_disabled_key_mapping() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Add insurance",
+            "type": "checkbox",
+            "checked": False,
+            "observed_checked": False,
+            "identity": {"tag": "input"},
+        }
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(_overlay_repair_ctx(evidence))
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Add insurance checkbox unchecked"]
+
+
+def test_a_select_typed_field_whose_real_tag_is_not_select_renders_no_observed_state() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Departure",
+            "type": "select",
+            "identity": {"tag": "div"},
+            "options": [{"text": "2026-09-14", "value": "2026-09-14", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Departure select"]
+
+
+def test_a_real_select_still_renders_its_observed_option() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Departure",
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [{"text": "2026-09-14", "value": "2026-09-14", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Departure select 2026-09-14"]
+
+
+def test_an_admitted_but_empty_observed_value_is_distinguishable_from_no_observation() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": "Departure", "type": "date", "observed_value": "", "identity": {"tag": "input"}},
+        {"label": "Return", "type": "date", "identity": {"tag": "input"}},
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Departure date empty", "Return date"]
+
+
+def test_a_long_label_cannot_truncate_the_observed_state_away() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "D" * 200,
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [{"text": "Departing " + "x" * 40 + "2026-09-14", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries[0].endswith("2026-09-14")
+
+
+def test_a_filled_control_is_not_displaced_by_controls_that_observed_nothing() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": "Origin station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Destination station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Departure date", "type": "date", "observed_value": "", "identity": {"tag": "input"}},
+    ] + [
+        {"label": label, "type": "checkbox", "observed_checked": False, "identity": {"tag": "input"}}
+        for label in ("Aisle seat", "Window seat", "Extra legroom", "Travel insurance", "Seat alerts")
+    ]
+    evidence["forms"][0]["submit_controls"] = [{"text": "Continue to payment", "disabled": False}]
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summaries = repair_context.page_form_summaries
+    assert summaries[0] == "Origin station text"
+    assert summaries[1] == "Destination station text"
+    assert "Departure date date empty" in summaries
+
+
+def test_a_control_that_observed_something_still_leads_the_summary_cap() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": f"Filler {index}", "type": "text", "identity": {"tag": "input"}} for index in range(8)
+    ] + [
+        {"label": "Departure", "type": "date", "observed_value": "2026-09-14", "identity": {"tag": "input"}},
+        {"label": "Aisle seat", "type": "checkbox", "observed_checked": True, "identity": {"tag": "input"}},
+    ]
+    evidence["forms"][0]["submit_controls"] = [{"text": "Continue to payment", "disabled": False}]
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summaries = repair_context.page_form_summaries
+    assert summaries[:2] == ["Departure date 2026-09-14", "Aisle seat checkbox checked"]
+    assert summaries[2:] == ["Filler 0 text", "Filler 1 text", "Filler 2 text"]
+
+
+def test_a_select_on_its_blank_leading_option_does_not_displace_filled_controls() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": "Origin station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Destination station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Passenger name", "type": "text", "identity": {"tag": "input"}},
+    ] + [
+        {
+            "label": label,
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [
+                {"text": "", "value": "", "observed_selected": True},
+                {"text": option, "value": option},
+            ],
+        }
+        for label, option in (("Departure day", "1"), ("Departure month", "Jan"), ("Departure year", "2026"))
+    ]
+    evidence["forms"][0]["submit_controls"] = [{"text": "Continue to payment", "disabled": False}]
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == [
+        "Origin station text",
+        "Destination station text",
+        "Passenger name text",
+        "Departure day select",
+        "Departure month select",
+    ]
+
+
+def test_a_select_on_a_real_option_still_leads_the_summary_cap() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": f"Filler {index}", "type": "text", "identity": {"tag": "input"}} for index in range(6)
+    ] + [
+        {
+            "label": "Departure month",
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [{"text": "", "value": ""}, {"text": "Jan", "value": "1", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries[0] == "Departure month select Jan"

@@ -40,10 +40,14 @@ class ToolResult:
     status: ToolStatus
     content: str
     data: dict[str, Any] | None = None
+    # Transient images the loop must show the model on the NEXT call only (the on-demand `look`
+    # tool's annotated screenshot). Threaded into one .call()'s ephemeral screenshots= arg and never
+    # appended to the transcript, so it costs one image on one turn and is gone the turn after.
+    screenshots: list[bytes] | None = None
 
     @classmethod
-    def ok(cls, content: str, data: dict[str, Any] | None = None) -> ToolResult:
-        return cls("ok", content, data)
+    def ok(cls, content: str, data: dict[str, Any] | None = None, screenshots: list[bytes] | None = None) -> ToolResult:
+        return cls("ok", content, data, screenshots)
 
     @classmethod
     def error(cls, content: str, data: dict[str, Any] | None = None) -> ToolResult:
@@ -58,6 +62,9 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 # receive the basenames tools staged into the downloads dir this run, to exclude from detection.
 CompletionProbe = Callable[[frozenset[str]], Awaitable[str | None]]
 CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
+# Consulted from finish(completed) like CompletionBlocker, but takes no arguments -- it gates on
+# state the caller already tracks (e.g. a verification-code budget), not on staged downloads.
+VerificationBlocker = Callable[[], Awaitable[str | None]]
 
 
 @dataclass
@@ -184,6 +191,19 @@ ACTION_LOOP_TERMINATE_AFTER = 6
 
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
+
+# Hard "the resource does not exist / is gone" HTTP statuses. A navigation landing on one of these is
+# a genuine non-capability dead-end (a dead or removed posting), which v1 routes to `terminated`. Both
+# the in-loop `navigate` tool and the pre-loop initial-URL navigation classify against this set. NARROW
+# on purpose: auth (401/403), rate-limit (429) and transient server errors (5xx) are recoverable or
+# capability failures, not dead-ends, and are left to the model / stay `failed`.
+NAVIGATION_DEAD_END_STATUSES = frozenset({404, 410})
+
+# A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
+# removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
+# verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
+# navigation. Facetable sibling of the prefixes above.
+NAV_DEAD_END_REASON_PREFIX = "navigation_dead_end:"
 
 # Emitted, never acted on, when the oscillation rule WOULD have terminated. The step engine's
 # tripwires (skyvern/forge/sdk/fail_fast/shadow.py) earn the right to act by publishing this event
@@ -321,6 +341,107 @@ class _PerceptionLedger:
         return False
 
 
+# Net-progress ledger (SKY-15020 Lever C). The repetition guards above ask whether the page or
+# action REPEATED; this asks whether the run made NET PROGRESS. Real stuck-ness is often VARIED
+# actions with zero net progress (SKY-14998: 21 input-timeouts on different selectors — varied
+# actions, varied perception — so no repetition guard trips and the run oscillates to the cap). The
+# ledger is SHADOW-ONLY and ADDITIVE: it emits a "would fail-fast" event but terminates nothing and
+# leaves the three guards untouched. Adding live terminations is a release-posture change gated on
+# this event's own decision precision plus operator sign-off.
+PROGRESS_LEDGER_WINDOW = 8
+# Facetable event names; the offline precision/survival metrics key on these — change only with the
+# dashboards that read them.
+PROGRESS_LEDGER_SHADOW_EVENT = "taskv3 loop progress ledger would fail-fast"
+PROGRESS_LEDGER_FINAL_EVENT = "taskv3 loop progress ledger final"
+
+
+@dataclass
+class _ProgressLedger:
+    """Billable actions since the last net-progress signal, plus its per-run peak.
+
+    The already-computed distance-to-done metric is the observe summary's ``invalid_fields`` count.
+    Net progress is any of: a navigation or download landing (hard progress), the count reaching a
+    NEW LOW (a real form advance), or the count RISING since the last look (a fresh page's required
+    fields, or a submit that surfaced new errors — either way the context changed, so the prior
+    no-progress streak is stale). Novelty is deliberately NOT progress: varied thrash produces novel
+    perception, which is why the streak is counted against the invalid-field trend, not the page
+    digest.
+
+    Two invariants keep the over-termination direction safe:
+    - The verdict is taken on an OBSERVE that CONFIRMS no progress, never on the raw action count: a
+      run that batches several fixes before re-observing (markers stay valid until the page
+      re-renders) has not yet shown a stalled look, so the streak withholds rather than fires.
+    - ``form_armed`` reflects the CURRENT look, not a sticky earlier one, so a form-less page (a
+      confirmation/extraction page, or a solved form) can never be judged stuck here.
+
+    The design is intentionally biased toward PRECISION over recall — a shadow verdict headed for a
+    future live terminator must not fire on a progressing run. A real page-transition signal (the click
+    tool's ``page_transitioned``, from its already-computed url_before/url_after) closes ONE precision
+    gap the rise heuristic left: a click that moves the URL re-baselines cleanly as hard progress, so a
+    fresh page whose ``invalid_fields`` count coincidentally equals the prior page's no longer reads as a
+    stalled look. Only the POSITIVE direction is used — a URL change proves a transition — because URL
+    equality does NOT prove same-page (a URL-stable SPA multi-step form advances without moving the URL),
+    so the ledger never suppresses a re-baseline on an unchanged URL. That leaves known false-NEGATIVES
+    (the SAFE direction) the shadow numbers under-count: a run whose ``invalid_fields`` OSCILLATES or
+    CREEPS still re-baselines on every up-swing (the rise heuristic cannot separate same-page thrash from
+    a real advance without a stronger same-page oracle — the Lever C recall follow-up), and a form
+    silently rejected while showing zero invalid fields never arms.
+
+    Reads only what the loop already computed — no extra LLM turn, no re-observe.
+    """
+
+    window: int = PROGRESS_LEDGER_WINDOW
+    actions_since_progress: int = 0
+    peak_actions_since_progress: int = 0
+    invalid_baseline: int | None = None  # floor for the current page/context; rebased on rise or new low
+    last_invalid: int | None = None
+    form_armed: bool = False
+    ever_armed: bool = False  # a form was seen at least once — the runs the survival record is emitted for
+    shadow_reported: bool = False
+
+    def observe(self, invalid_fields: int) -> bool:
+        """Record an observation; return True the first time one CONFIRMS window-length no-progress."""
+        prev = self.last_invalid
+        self.last_invalid = invalid_fields
+        # Reflects THIS look only: a page with no invalid fields must not be judged stuck here.
+        self.form_armed = invalid_fields > 0
+        self.ever_armed = self.ever_armed or self.form_armed
+        if self.invalid_baseline is None:
+            self.invalid_baseline = invalid_fields
+            return False
+        if invalid_fields < self.invalid_baseline:
+            # A new low: real net progress on the form. Reset the streak and re-baseline.
+            self.actions_since_progress = 0
+            self.invalid_baseline = invalid_fields
+            return False
+        if prev is not None and invalid_fields > prev:
+            # The count rose since the last look: a new page's fresh required fields, or a submit that
+            # surfaced new errors. Re-baseline to the new floor instead of measuring it against a
+            # stale, lower one. A real click-driven transition instead arrives as hard_progress()
+            # upstream (baseline cleared); this rise path is the fallback for same-page count changes
+            # and for transitions no tool witnessed.
+            self.actions_since_progress = 0
+            self.invalid_baseline = invalid_fields
+            return False
+        # Flat, with no new low and no rise: this look confirms no net progress since the last one.
+        if self.actions_since_progress >= self.window and self.form_armed and not self.shadow_reported:
+            self.shadow_reported = True
+            return True
+        return False
+
+    def hard_progress(self) -> None:
+        # Navigation or a download landing: unambiguous progress. The old page's distance metric is
+        # stale, so drop the baseline; the next observe re-arms from the new page.
+        self.actions_since_progress = 0
+        self.form_armed = False
+        self.invalid_baseline = None
+
+    def on_billable(self) -> None:
+        """Count one billable action toward the no-progress streak (the verdict is taken on observe)."""
+        self.actions_since_progress += 1
+        self.peak_actions_since_progress = max(self.peak_actions_since_progress, self.actions_since_progress)
+
+
 # Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
 # solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
 # complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
@@ -454,6 +575,8 @@ def _unblocker_options(available_tools: set[str]) -> list[str]:
         options.append("if the page may be waiting on a verification widget, call solve_captcha")
     if "get_html" in available_tools:
         options.append("take ONE targeted get_html look at the region that should be changing")
+    if "look" in available_tools:
+        options.append("if you can't tell what's on the page or why an action isn't taking, call look to see it")
     options.append("if the goal is already met, call finish(status=completed)")
     options.append("if genuinely blocked, call finish(status=terminated) naming the blocker as the reason")
     return options
@@ -543,6 +666,7 @@ def make_finish_tool(
     submit_watch: SubmitWatch | None = None,
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
+    verification_blocker: VerificationBlocker | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -654,6 +778,19 @@ def make_finish_tool(
                 )
             if blocker_message:
                 return ToolResult.error(blocker_message)
+        if status == "completed" and verification_blocker is not None:
+            try:
+                verification_message = await verification_blocker()
+            except Exception:
+                # Fail closed: an exception here must not let a blank verification step read as done.
+                LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
+                return ToolResult.error(
+                    "Could not verify that the verification-code step completed cleanly; retry "
+                    "finish(status=completed) once verified, or finish with status=failed or "
+                    "status=terminated."
+                )
+            if verification_message:
+                return ToolResult.error(verification_message)
         if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
             try:
                 settled = await _settled()
@@ -808,11 +945,13 @@ async def run_agent_tool_loop(
     stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
     action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
     action_terminate_after: int | None = ACTION_LOOP_TERMINATE_AFTER,
+    progress_window: int | None = PROGRESS_LEDGER_WINDOW,
     activity: ActivityRecency | None = None,
     submit_watch: SubmitWatch | None = None,
     telemetry_salt: str | None = None,
     completion_probe: CompletionProbe | None = None,
     staged_downloads: set[str] | None = None,
+    initial_navigation_status: int | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     # Per run, never logged: the hashes it keys are stable within this run (the only scope any guard
@@ -833,6 +972,8 @@ async def run_agent_tool_loop(
     # compaction can keep only the newest of each without inferring "real snapshot" from content size.
     snapshot_indices: set[int] = set()
     perception = _PerceptionLedger()
+    # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
+    progress = _ProgressLedger(window=progress_window) if progress_window is not None else None
     # The action-loop counter: (repeat count, first turn of the streak) per billable action
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
@@ -870,7 +1011,29 @@ async def run_agent_tool_loop(
     total_tokens = 0
     billable_actions: list[str] = []
     action_steps = 0
+    # Images produced by an on-demand `look` this turn, to show the model on the NEXT call only. Passed
+    # as the transient screenshots= arg once, then cleared, so a look costs one image on one turn and
+    # never enters `messages` (the transcript re-seeds message_history each turn, so it's structurally
+    # gone the turn after).
+    pending_screenshots: list[bytes] = []
     started_at = time.monotonic()
+
+    # The task's starting URL is navigated during browser setup, before this loop runs, so a dead/removed
+    # starting posting never routes through the in-loop `navigate` tool — the model just observes the dead
+    # page and finishes (defaulting to failed). Classify that pre-loop navigation here so the dominant
+    # dead-posting case ends `terminated`, matching v1, without waiting on the model's finish discretion.
+    # Cancellation is checked first, exactly as the first loop turn would: a run canceled during setup must
+    # persist as `canceled` (and stay unbilled), not be pre-empted into `terminated` by this fast path.
+    if outcome is None and initial_navigation_status in NAVIGATION_DEAD_END_STATUSES:
+        if should_cancel is not None and await should_cancel():
+            outcome = LoopOutcome("canceled", "run canceled")
+        else:
+            LOG.info("taskv3 loop initial navigation dead end", http_status=initial_navigation_status)
+            outcome = LoopOutcome(
+                "terminated",
+                f"{NAV_DEAD_END_REASON_PREFIX} the task's starting URL returned HTTP {initial_navigation_status} "
+                "— the target no longer exists or has been removed, so the goal cannot be completed there",
+            )
 
     while outcome is None:
         if should_cancel is not None and await should_cancel():
@@ -898,6 +1061,10 @@ async def run_agent_tool_loop(
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
         _compact_transcript(messages, snapshot_indices)
         llm_caller.message_history = list(messages)
+        # Consume any pending look image into THIS call only, then clear: the image rides one request
+        # and is never appended to `messages`, so the turn after carries zero image blocks.
+        screenshots_for_call = pending_screenshots or None
+        pending_screenshots = []
         # Retry only the LLM call on transient provider errors. No browser tool has run this
         # turn, so re-issuing the same call is side-effect-free — unlike a whole-task retry,
         # which would re-execute prior clicks/types. This restores the step engine's transient
@@ -913,6 +1080,7 @@ async def run_agent_tool_loop(
                     tools=openai_tools,
                     use_message_history=True,
                     raw_response=True,
+                    screenshots=screenshots_for_call,
                     **active_call_kwargs,
                 )
                 break
@@ -974,6 +1142,10 @@ async def run_agent_tool_loop(
         stall_nudges_due: list[tuple[str, int]] = []
         action_nudges_due: list[tuple[str, dict[str, Any], int]] = []
         round_actions: list[tuple[str, dict[str, Any], bool]] = []
+        # A hard 404/410 from an in-loop navigate, applied only AFTER the batch so a same-turn fallback
+        # navigate can clear it — the model is told to batch aggressively, and terminating on the first
+        # of a batched [navigate(dead), navigate(live)] would discard the recovery it planned.
+        pending_nav_dead_end: int | None = None
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -1071,7 +1243,28 @@ async def run_agent_tool_loop(
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
+            # A look's annotated screenshot is shown to the model on the next call only, never stored in
+            # the transcript. Consumed and cleared at the top of the next turn. Only the LATEST snapshot
+            # survives: a second look in the same turn supersedes the first (its marks replace the prior
+            # ones), so re-sending the stale image would just hand the model a dead numbering.
+            if result.screenshots:
+                pending_screenshots = list(result.screenshots)
             result_data = result.data or {}
+            if progress is not None and observe_summary:
+                invalid_fields = observe_summary.get("invalid_fields")
+                if invalid_fields is not None and progress.observe(invalid_fields):
+                    # Shadow only: a full window of billable actions passed and this look confirms no
+                    # net progress (a formful page whose invalid-field count never improved). Emit,
+                    # never terminate.
+                    LOG.info(
+                        PROGRESS_LEDGER_SHADOW_EVENT,
+                        actions=progress.actions_since_progress,
+                        invalid_fields=progress.last_invalid,
+                        form_armed=progress.form_armed,
+                        tool=tool_name,
+                        turn=turns,
+                        **attribution,
+                    )
             if staged_downloads is not None and result_data.get("staged_download"):
                 staged_downloads.add(result_data["staged_download"])
             if spec is not None and (result_data.get("download_notice") or result_data.get("page_state_changed")):
@@ -1080,6 +1273,17 @@ async def run_agent_tool_loop(
                 # (a "download next" flow), or re-trying after navigating to a fresh page, is a
                 # healthy loop, not a stuck one.
                 _clear_action_state()
+                if progress is not None:
+                    progress.hard_progress()
+            # A click that moved the URL is a real page transition (H1 hard progress) for the shadow
+            # ledger: re-baseline so a fresh page whose invalid-field count coincidentally matches the
+            # prior page's does not read as a stalled look. Only the POSITIVE (True) direction is acted
+            # on — a URL change proves a transition, but URL equality does NOT prove same-page (a
+            # URL-stable SPA form advance), so page_transitioned=False is left to the rise heuristic and
+            # never suppresses a re-baseline. Kept OUT of the live page_state_changed branch above so it
+            # does not clear the action-loop guard's state — this signal is shadow-only and additive.
+            if result_data.get("page_transitioned") is True and progress is not None:
+                progress.hard_progress()
             if content_digest is not None:
                 snap = perception.record(action_key, content_digest)
                 if snap.progressed:
@@ -1138,6 +1342,8 @@ async def run_agent_tool_loop(
                     # crosses the threshold exactly once per streak and before any live verdict.
                     stall_nudges_due.append((tool_name, snap.tool_identical))
             if spec is not None and spec.billable:
+                if progress is not None:
+                    progress.on_billable()
                 # Errored dispatches count too: a failed attempt consumed a step (see the action-step
                 # accounting above) and a repeat-failing action is the same no-progress pathology.
                 repeat_count, first_turn = action_counts.get(action_key, (0, turns))
@@ -1212,6 +1418,16 @@ async def run_agent_tool_loop(
                     _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "completion probe fired")
                     break
 
+            dead_end_status = result_data.get("navigation_dead_end")
+            if dead_end_status is not None:
+                # A hard 404/410 landing is a non-capability dead-end (a dead/removed posting). Remember
+                # it but do NOT break the batch: a later navigate in the same turn can land the run on a
+                # live page and clear it below. Applied once the batch settles (after this for-loop).
+                pending_nav_dead_end = dead_end_status
+            elif result_data.get("page_state_changed"):
+                # A successful navigate moved the run off any dead page seen earlier this batch.
+                pending_nav_dead_end = None
+
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
                 outcome = LoopOutcome(
@@ -1227,6 +1443,17 @@ async def run_agent_tool_loop(
                 # the model re-plans next turn from the error rather than acting on a stale assumption.
                 _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "earlier tool call in this batch failed")
                 break
+
+        # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
+        # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
+        # failed/terminated choice to the model's finish tool (which does not converge on this class).
+        if outcome is None and pending_nav_dead_end is not None:
+            LOG.info("taskv3 loop navigation dead end", http_status=pending_nav_dead_end, turn=turns)
+            outcome = LoopOutcome(
+                "terminated",
+                f"{NAV_DEAD_END_REASON_PREFIX} navigate landed on a dead page (HTTP {pending_nav_dead_end}) — "
+                "the target no longer exists or has been removed, so the goal cannot be completed there",
+            )
 
         # Warn only after the batch completes: a user message may not sit between an assistant
         # turn's tool results, and the model reads it with the snapshot that tripped it.
@@ -1268,6 +1495,24 @@ async def run_agent_tool_loop(
 
     if outcome is None:
         outcome = LoopOutcome("loop_error", "loop exited without an outcome")
+
+    if progress is not None and progress.ever_armed:
+        # Per-run survival record, emitted only for runs that ever saw a form (the population the
+        # ledger applies to — this bounds the added log volume to formful runs, not every v3 run):
+        # the peak no-progress streak and whether the shadow verdict would have fired, tagged with the
+        # terminal outcome — joined offline (by task_id via log context) to grade the ledger's
+        # precision and to pick an enforce window from the streak distribution at completion vs
+        # budget-death, not by gut. Read fire-precision as trustworthy but recall as a FLOOR: the
+        # ledger is precision-biased (see _ProgressLedger), so FEW FIRES != FEW STUCK RUNS.
+        LOG.info(
+            PROGRESS_LEDGER_FINAL_EVENT,
+            peak_actions_since_progress=progress.peak_actions_since_progress,
+            actions_since_progress=progress.actions_since_progress,
+            form_armed=progress.form_armed,
+            would_fire=progress.shadow_reported,
+            outcome_status=outcome.status,
+            turns=turns,
+        )
 
     outcome.turns = turns
     outcome.no_tool_call_turns = no_tool_call_turns

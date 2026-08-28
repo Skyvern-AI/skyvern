@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     ExplicitCacheEnvelope,
     build_explicit_cache_envelope,
 )
+from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
 LOG = structlog.get_logger()
@@ -276,6 +277,7 @@ class CopilotLitellmModel(LitellmModel):
         conversation_id: str | None = None,
         prompt: Any | None = None,
     ) -> ModelResponse:
+        attach_tool_surface_to_pending_capture(tools)
         with model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
@@ -307,6 +309,7 @@ class CopilotLitellmModel(LitellmModel):
         conversation_id: str | None = None,
         prompt: Any | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
+        attach_tool_surface_to_pending_capture(tools)
         with model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,

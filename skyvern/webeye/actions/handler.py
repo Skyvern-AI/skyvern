@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -172,6 +173,7 @@ from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelectio
 from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
+    BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     begin_requested_download_for_context,
@@ -193,7 +195,12 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapedPage,
     json_to_html,
 )
-from skyvern.webeye.scraper.scraper import IncrementalScrapePage, hash_element, trim_element_tree
+from skyvern.webeye.scraper.scraper import (
+    IncrementalScrapePage,
+    hash_element,
+    structural_identity,
+    trim_element_tree,
+)
 from skyvern.webeye.transient_page_observer import (
     TransientPageTextObserver,
     match_user_defined_errors_from_transient_text,
@@ -207,6 +214,7 @@ from skyvern.webeye.utils.dom import (
     is_element_detached_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
+    resolve_locator,
 )
 from skyvern.webeye.utils.page import (
     SkyvernFrame,
@@ -1195,6 +1203,12 @@ async def _save_adopted_session_download(
         return None
 
 
+# Set for the duration of a file-download block's non-download click that is authorized as a
+# false-click candidate. Read by handle_click_action to enable the same-action download bypass of
+# the expensive dropdown/custom-select rescrape; never gates persistence or task finalization.
+_false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_download_eligible", default=False)
+
+
 def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
     off = getattr(page, "off", None)
     if callable(off):
@@ -1207,6 +1221,36 @@ def _remove_download_listener(page: Page, callback: Callable[[Download], None]) 
         return
 
     LOG.warning("Page does not support removing download listeners")
+
+
+def _register_false_click_download_probe(page: Page, observed: asyncio.Event) -> Callable[[], None]:
+    """Flag ``observed`` when a download is minted on the clicked page or a popup it spawns
+    during the click window. Returns a cleanup that removes every listener it installed."""
+    download_handles: list[tuple[Page, Callable[[Download], None]]] = []
+
+    def _flag_download(_download: Download) -> None:
+        observed.set()
+
+    def _on_popup(popup_page: Page) -> None:
+        popup_page.on("download", _flag_download)
+        download_handles.append((popup_page, _flag_download))
+
+    page.on("download", _flag_download)
+    download_handles.append((page, _flag_download))
+    page.on("popup", _on_popup)
+
+    def _cleanup() -> None:
+        try:
+            _remove_popup_listener(page, _on_popup)
+        except Exception:
+            LOG.warning("Failed to remove false-click download popup listener", exc_info=True)
+        for observed_page, callback in download_handles:
+            try:
+                _remove_download_listener(observed_page, callback)
+            except Exception:
+                LOG.warning("Failed to remove false-click download listener", exc_info=True)
+
+    return _cleanup
 
 
 def _remove_popup_listener(page: Page, callback: Callable[[Page], None]) -> None:
@@ -2607,6 +2651,112 @@ def _exact_value_input_type(input_type: str | None) -> str:
     return (input_type or "").strip().lower()
 
 
+_DATE_VALUE_SEPARATORS = re.compile(r"[^0-9]+")
+_DATE_MASK_SEPARATORS = re.compile(r"[^a-z]+")
+
+
+def _strict_date_mask_order(placeholder: str | None) -> tuple[str, ...] | None:
+    # The day/month/year order a strict placeholder mask declares ("mm/dd/yyyy" -> ("m","d","y")), or None
+    # when it is not a fully-specified mask: each separator-delimited token must be a pure run of one date
+    # letter (d/dd, m/mm, yyyy), so prose, first-letter lookalikes, and partial years never define an order.
+    if not placeholder:
+        return None
+    tokens = [token for token in _DATE_MASK_SEPARATORS.split(placeholder.strip().lower()) if token]
+    if len(tokens) != 3:
+        return None
+    order: list[str] = []
+    for token in tokens:
+        if re.fullmatch(r"d{1,2}", token):
+            order.append("d")
+        elif re.fullmatch(r"m{1,2}", token):
+            order.append("m")
+        elif re.fullmatch(r"y{4}", token):
+            order.append("y")
+        else:
+            return None
+    if sorted(order) != ["d", "m", "y"]:
+        return None
+    return tuple(order)
+
+
+def _canonical_iso_date(text: str, placeholder: str | None) -> str | None:
+    # ``text`` as the YYYY-MM-DD an <input type=date> accepts, or None when it is not a date or the order
+    # cannot be trusted. Order comes from the field's own strict mask; without a mask only an unambiguous
+    # reading (four-digit year first, or a component above 12 pinning the day) is taken, and datetime()
+    # rejects impossible calendar dates -- so an ambiguous value is refused, never written as a wrong date.
+    parts = [part for part in _DATE_VALUE_SEPARATORS.split(text.strip()) if part]
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    order = _strict_date_mask_order(placeholder)
+    if order is None:
+        if len(parts[0]) == 4:
+            order = ("y", "m", "d")
+        elif len(parts[2]) == 4 and int(parts[0]) > 12:
+            order = ("d", "m", "y")
+        elif len(parts[2]) == 4 and int(parts[1]) > 12:
+            order = ("m", "d", "y")
+        else:
+            return None
+    fields = dict(zip(order, parts))
+    if len(fields) != 3 or len(fields["y"]) != 4:
+        return None
+    try:
+        return datetime(int(fields["y"]), int(fields["m"]), int(fields["d"])).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _is_malformed_value_error(exc: BaseException) -> bool:
+    # locator.fill() raises "Malformed value" when the live node is a structured input (a date input takes
+    # only YYYY-MM-DD) and the value is not canonical; it validates before committing, so the field is left
+    # untouched and the write can be retried in canonical form.
+    return "malformed value" in str(exc).lower()
+
+
+async def _live_date_input_canonical_value(
+    skyvern_element: SkyvernElement,
+    text: str,
+    fill_error: BaseException,
+    engine_selection: BrowserEngineSelection | None,
+) -> str | None:
+    # The canonical YYYY-MM-DD to re-fill after locator.fill() rejected ``text`` as malformed, or None when
+    # the failure is not a live date input rejecting a recoverable value. The LIVE type and placeholder --
+    # not the stale scraped type -- decide recovery, so a non-date field or an unrelated error yields None
+    # and the caller re-raises unchanged.
+    if not (_is_selected_engine_error(fill_error, engine_selection) and _is_malformed_value_error(fill_error)):
+        return None
+    try:
+        if _exact_value_input_type(await skyvern_element.get_attr("type", mode="dynamic")) != "date":
+            return None
+        placeholder = await skyvern_element.get_attr("placeholder", mode="dynamic")
+    except Exception:
+        # A live read can itself fail when a navigation/DOM race destroys the node; without recovery
+        # evidence return None so the caller re-raises the original malformed-value failure rather than
+        # letting this secondary read error mask it (and be tolerated elsewhere as a false success).
+        return None
+    return _canonical_iso_date(text, placeholder)
+
+
+async def _recover_atomic_fill_as_live_date(
+    skyvern_element: SkyvernElement,
+    text: str,
+    fill_error: BaseException,
+    engine_selection: BrowserEngineSelection | None,
+) -> str | None:
+    # Single owner of the malformed-value recovery shared by every path that atomically fills a native
+    # exact-value input: the ordinary branch and the secret read-back branch. After an atomic fill raised,
+    # a field scraped as text but live type=date rejects a displayed locale value as malformed, so re-fill
+    # in canonical YYYY-MM-DD read from the live DOM. Returns the committed canonical value -- the field then
+    # holds the ISO value, not ``text``, so the caller reads that value back, not ``text``. Returns None for an
+    # ambiguous, non-date, or unrelated failure so the caller re-raises it unchanged and keeps its existing
+    # semantics. No value is logged.
+    canonical = await _live_date_input_canonical_value(skyvern_element, text, fill_error, engine_selection)
+    if canonical is None:
+        return None
+    await skyvern_element.input_fill(text=canonical)
+    return canonical
+
+
 def _secret_readback_is_unreadable_mask(actual_value: str | None, *, is_password: bool) -> bool:
     # Unreadable only when the read-back is ENTIRELY mask glyphs (optionally separator-grouped, e.g.
     # "•••• ••••" / "****-****"): a custom reveal/mask widget is rendering only bullets, not the real
@@ -2693,13 +2843,31 @@ async def _fill_secret_with_readback(
 
     # Parity with the ordinary atomic-fill branch: re-resolve a locator that went stale between scrape and
     # write so a re-mounted controlled input is filled instead of timing out on a zero-match cached target.
+    # The value the field is expected to hold after the first write and the transport the retry uses. Both stay
+    # the intended secret unless a stale-scraped date recovered to canonical ISO below, in which case the field
+    # holds YYYY-MM-DD and the retry must re-fill that ISO atomically (never the locale text, never the
+    # per-character seam, which corrupts a structured date value).
+    readback_expected = text
+    date_recovered = False
     await skyvern_element.refresh_locator_if_stale()
     if sequential_first:
         await skyvern_element.input_sequentially(text=text)
     else:
-        await skyvern_element.input_fill(text=text)
+        try:
+            await skyvern_element.input_fill(text=text)
+        except Exception as fill_error:
+            # A stale-scraped text field that is live type=date rejects the displayed locale value as
+            # malformed; recover in canonical ISO form. It then holds YYYY-MM-DD, not ``text`` -- but a
+            # controlled date node can still accept that fill and asynchronously clear/rewrite it, so the
+            # read-back below verifies the canonical value rather than trusting the accepted write. A
+            # non-date/ambiguous failure re-raises unchanged.
+            canonical = await _recover_atomic_fill_as_live_date(skyvern_element, text, fill_error, engine_selection)
+            if canonical is None:
+                raise
+            readback_expected = canonical
+            date_recovered = True
 
-    if _secret_input_cannot_round_trip(text, maxlength=maxlength):
+    if _secret_input_cannot_round_trip(readback_expected, maxlength=maxlength):
         LOG.info(
             "Leaving credential as filled: field cannot round-trip the value by its declared contract",
             element_id=skyvern_element.get_id(),
@@ -2725,7 +2893,7 @@ async def _fill_secret_with_readback(
         return None
     # Exact equality first: a value that round-trips exactly is confirmed, even one made only of mask-like
     # characters -- so an all-"*" secret is a match, never misclassified as an unreadable mask.
-    if not _secret_readback_is_mismatch(text, actual_value):
+    if not _secret_readback_is_mismatch(readback_expected, actual_value):
         return None
 
     if _secret_readback_is_unreadable_mask(actual_value, is_password=is_password):
@@ -2739,10 +2907,15 @@ async def _fill_secret_with_readback(
     # attr, so it stayed atomic-fill eligible): repeating the same atomic fill can never emit the key events
     # that advance through the sibling boxes. Re-resolve a possibly re-mounted locator, then retry with the
     # sequential transport instead of another identical fill. The read-back below still verifies the target and
-    # fails closed -- a sequential write that merely did not raise is not success (SKY-13821).
+    # fails closed -- a sequential write that merely did not raise is not success (SKY-13821). A recovered date
+    # instead re-fills the canonical ISO atomically: the per-character seam hard-throws on a structured date
+    # input and the locale text is not what the field accepts.
     await skyvern_element.refresh_locator_if_stale()
     await skyvern_element.input_clear()
-    await skyvern_element.input_sequentially(text=text)
+    if date_recovered:
+        await skyvern_element.input_fill(text=readback_expected)
+    else:
+        await skyvern_element.input_sequentially(text=text)
     actual_value, navigated = await _read_back()
     if navigated:
         LOG.info(
@@ -2750,7 +2923,7 @@ async def _fill_secret_with_readback(
             element_id=skyvern_element.get_id(),
         )
         return None
-    if _secret_readback_matches(text, actual_value):
+    if _secret_readback_matches(readback_expected, actual_value):
         return None
 
     LOG.warning(
@@ -3630,6 +3803,7 @@ class ActionHandler:
         action: Action,
         *,
         file_download_false_click_eligible: bool = False,
+        allow_stale_refresh: bool = False,
     ) -> list[ActionResult]:
         # task_id, step_id auto-attached by @traced from SkyvernContext
         _action_span = otel_trace.get_current_span()
@@ -3654,23 +3828,37 @@ class ActionHandler:
         _action_span.set_attribute("triggers_download", trigger_download_action)
         _tracer = otel_trace.get_tracer("skyvern")
         if not trigger_download_action:
+            # Authorizes the same-action download bypass in handle_click_action. This is decoupled
+            # from popup grace: the bypass only skips the dead dropdown rescrape and never persists,
+            # so a FileDownloadBlock false-click candidate arms it regardless of the grace setting.
+            false_click_bypass_eligible = (
+                file_download_false_click_eligible and isinstance(action, ClickAction) and action.download is False
+            )
+            # The popup-grace persistence wrapper stays separately gated: it captures/persists a
+            # download the click mints on a popup, which is only worth its cost when grace > 0.
             observe_false_click = (
-                file_download_false_click_eligible
-                and isinstance(action, ClickAction)
-                and action.download is False
+                false_click_bypass_eligible
                 and browser_state is not None
                 and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0
             )
             if not observe_false_click:
-                with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
-                    apply_context_attrs(_hi_span)
-                    results = await ActionHandler._handle_action(
-                        scraped_page=scraped_page,
-                        task=task,
-                        step=step,
-                        page=page,
-                        action=action,
-                    )
+                false_click_eligible_token = (
+                    _false_click_download_eligible.set(True) if false_click_bypass_eligible else None
+                )
+                try:
+                    with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
+                        apply_context_attrs(_hi_span)
+                        results = await ActionHandler._handle_action(
+                            scraped_page=scraped_page,
+                            task=task,
+                            step=step,
+                            page=page,
+                            action=action,
+                            allow_stale_refresh=allow_stale_refresh,
+                        )
+                finally:
+                    if false_click_eligible_token is not None:
+                        _false_click_download_eligible.reset(false_click_eligible_token)
             else:
                 assert browser_state is not None
                 page_url_before_download = page.url
@@ -3765,6 +3953,7 @@ class ActionHandler:
                                 download_popup, browser_state, page, page_url_before_download
                             )
 
+                    false_click_eligible_token = _false_click_download_eligible.set(True)
                     try:
                         with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                             apply_context_attrs(_hi_span)
@@ -3775,6 +3964,7 @@ class ActionHandler:
                                     step=step,
                                     page=page,
                                     action=action,
+                                    allow_stale_refresh=allow_stale_refresh,
                                 )
                             except asyncio.CancelledError:
                                 raise
@@ -3791,6 +3981,7 @@ class ActionHandler:
                                 raise
                         await process_captured_download(results)
                     finally:
+                        _false_click_download_eligible.reset(false_click_eligible_token)
                         try:
                             _remove_popup_listener(page, on_popup)
                         except Exception:
@@ -3942,6 +4133,7 @@ class ActionHandler:
                     step=step,
                     page=page,
                     action=action,
+                    allow_stale_refresh=allow_stale_refresh,
                 )
             # The execution window ends when the inner action completes: the download wait
             # below (up to BROWSER_DOWNLOAD_TIMEOUT) is settle observation, excluded to match
@@ -4469,6 +4661,7 @@ class ActionHandler:
         step: Step,
         page: Page,
         action: Action,
+        allow_stale_refresh: bool = False,
     ) -> list[ActionResult]:
         action.tel_input_outcome = None
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
@@ -4498,6 +4691,22 @@ class ActionHandler:
                     if invalid_web_action_check:
                         actions_result.extend(invalid_web_action_check)
                         return actions_result
+
+                    # A preceding action in this batch may have remounted/reflowed this action's
+                    # target, leaving the pre-batch reference stale. Opportunistically remap it here,
+                    # before the handler runs, so any remap is free of a half-applied side effect. Only
+                    # enabled for non-first batch actions (see the step owner seam). When a remap cannot
+                    # be established this is a no-op and the original binding falls through to the
+                    # existing handler and owner-loop control flow unchanged.
+                    if allow_stale_refresh:
+                        refreshed = await _refresh_stale_web_action_before_dispatch(scraped_page, page, action)
+                        if refreshed is not None:
+                            scraped_page, action = refreshed
+                            LOG.info(
+                                "Re-resolved a stale web action to a remounted control before dispatch",
+                                action_type=action.action_type,
+                                fresh_element_id=action.element_id,
+                            )
 
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
@@ -4650,6 +4859,171 @@ def check_for_invalid_web_action(
         return [ActionFailure(MissingElement(element_id=action.element_id), stop_execution_on_failure=False)]
 
     return []
+
+
+def _is_identity_anchor_key(key: str) -> bool:
+    # The HTML ``id`` is the only per-instance identity we trust: it is document-unique by spec, so a
+    # structural match on it is the same instance. Everything else is excluded -- ``name`` is NOT
+    # reliably per-instance (repeated rows / wizard states expose one same-name control per snapshot),
+    # and generic role/state attributes (any ``aria-*`` such as aria-label / aria-expanded, any
+    # ``data-*`` such as data-state or a generic data-testid, ``class``, ``role``) can be unique in one
+    # snapshot yet name a DIFFERENT repeated-component instance after a transition. (The incident's
+    # select controls carry a stable inner form ``id``, so ticket recovery still remaps; a same-name or
+    # generic-anchor decoy correctly declines to the legacy path.)
+    return key == "id"
+
+
+def _has_identity_anchor(element: dict) -> bool:
+    """True when the element (or a descendant) carries a per-instance identity attribute, so a
+    structural match reflects a real, stable instance identity rather than a generic role/state
+    attribute shared across repeated component instances. Without such an anchor we decline to remap
+    (and let the legacy path stay authoritative) rather than risk binding a different instance."""
+    if not isinstance(element, dict):
+        return False
+    for key, value in (element.get("attributes") or {}).items():
+        if key == SKYVERN_ID_ATTR or not isinstance(value, str) or not value.strip():
+            continue
+        if _is_identity_anchor_key(key):
+            return True
+    return any(_has_identity_anchor(child) for child in (element.get("children") or []) if isinstance(child, dict))
+
+
+async def _refresh_stale_web_action_before_dispatch(
+    scraped_page: ScrapedPage,
+    page: Page,
+    action: Action,
+) -> tuple[ScrapedPage, Action] | None:
+    """Opportunistic, side-effect-free remap for a WebAction whose element -- present in this batch's
+    scrape -- may have been remounted/reflowed by a preceding action in the same batch (a fresh DOM
+    node without the injected ``unique_id`` and a shifted tag-name xpath). It runs BEFORE the handler.
+
+    Returns a ``(scraped_page, action)`` pair ONLY when the exact scraped node is no longer live (by
+    the injected ``unique_id`` marker, never the positional xpath fallback) AND the same control can be
+    re-resolved by a position-independent structural identity that is anchored by a real identity
+    attribute and unique -- WITHIN the target's own frame -- both before and after one bounded refresh,
+    the target is in the main frame (the only frame identity that is stable across scrapes), the
+    document did not change (URL continuity), and at least one injected marker survives (the document
+    was not wholly replaced). In every other case -- the node is still live, the target is a coordinate
+    click or lives in an iframe, there is no anchor, the identity is ambiguous or volatile, the element
+    was removed, a match exists only in another frame, the document navigated / was replaced, or the
+    probe/refresh is indeterminate -- it returns ``None`` so
+    the caller dispatches the ORIGINAL scraped_page/action unchanged. Nothing here synthesizes a
+    failure, skip, or retry: the pre-existing handler (including its own xpath fallback and
+    MissingElement handling) and the owner loop's control flow remain authoritative. This intentionally
+    preserves the pre-existing positional-xpath residual risk whenever a remap cannot be established.
+    """
+    if not isinstance(action, WebAction) or not action.element_id:
+        return None
+    if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
+        return None
+    element_dict = scraped_page.id_to_element_dict
+    if not isinstance(element_dict, dict):
+        return None
+    original = element_dict.get(action.element_id)
+    if not isinstance(original, dict) or not _has_identity_anchor(original):
+        return None
+
+    # Document continuity: the batch was planned against scraped_page.url. If an earlier action in the
+    # batch navigated / switched document, the planned action does not belong to the live page -- so
+    # decline (before spending a re-scrape) rather than remap it onto an identically-structured control
+    # on the destination page.
+    planned_url = getattr(scraped_page, "url", None)
+    live_url = getattr(page, "url", None)
+    if isinstance(planned_url, str) and isinstance(live_url, str) and planned_url != live_url:
+        return None
+
+    css = scraped_page.id_to_css_dict.get(action.element_id)
+    frame = scraped_page.id_to_frame_dict.get(action.element_id)
+    if not css or not frame:
+        return None
+    # Frame continuity: only the main frame has an identity that is stable across scrapes
+    # ("main.frame"); an iframe's frame token is a per-scrape skyvern id, so a target inside one cannot
+    # be matched across a refresh. Decline any non-main-frame target, and (in _unique_match below) only
+    # accept candidates in that same frame, so a stale main-frame target is never rebound to an
+    # identically id-anchored control in another document.
+    if frame != "main.frame":
+        return None
+    try:
+        locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
+        if await locator.count() == 1:
+            return None  # the exact injected node is still live -> not stale -> dispatch unchanged
+        # The exact node is gone. Before spending a re-scrape, require at least one injected marker to
+        # survive in the planned element's frame. Zero markers means the whole document was replaced --
+        # a same-URL reload / postback the URL guard cannot see. Re-scraping it would re-inject markers
+        # on scan-order strangers and can recycle a later sibling's planned id onto the wrong element,
+        # so decline (without scraping) and leave the legacy path authoritative.
+        if await frame_content.locator(f"[{SKYVERN_ID_ATTR}]").count() == 0:
+            return None
+    except Exception:
+        return None  # cannot confirm liveness / marker survival -> decline; legacy path authoritative
+
+    def _unique_match(
+        elements_by_id: dict[str, Any], frame_by_id: dict[str, Any], signature: str, tag_name: Any
+    ) -> str | None:
+        # Restrict to the target's own frame (an HTML id is only document-unique), and require the same
+        # tag -- both necessary for the same instance, and cheap, so they prune the per-element hashing
+        # on this (rare) stale-resolution path.
+        matches = [
+            element_id
+            for element_id, element in elements_by_id.items()
+            if isinstance(element, dict)
+            and frame_by_id.get(element_id) == frame
+            and element.get("tagName") == tag_name
+            and structural_identity(element) == signature
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    try:
+        tag_name = original.get("tagName")
+        signature = structural_identity(original)
+        # Two structurally-identical controls cannot be told apart safely; require the target's
+        # identity to be unique in the batch's own scrape (and frame) before trusting a re-scrape.
+        if _unique_match(element_dict, scraped_page.id_to_frame_dict, signature, tag_name) != action.element_id:
+            return None
+    except Exception:
+        return None
+
+    try:
+        fresh_scraped_page = await scraped_page.generate_scraped_page_without_screenshots()
+        fresh_dict = fresh_scraped_page.id_to_element_dict
+        fresh_frames = getattr(fresh_scraped_page, "id_to_frame_dict", None)
+        fresh_element_id = (
+            _unique_match(fresh_dict, fresh_frames, signature, tag_name)
+            if isinstance(fresh_dict, dict) and isinstance(fresh_frames, dict)
+            else None
+        )
+    except Exception:
+        LOG.warning("Failed to refresh the scraped page for a stale web action", exc_info=True)
+        return None
+
+    # The refresh re-scrapes the current page; if that landed on a different document than the batch was
+    # planned on, the destination's identically-structured control is not our target -- decline.
+    if isinstance(planned_url, str) and getattr(fresh_scraped_page, "url", None) != planned_url:
+        return None
+
+    if not fresh_element_id or fresh_element_id == action.element_id:
+        LOG.info(
+            "No unique anchored structural match after a bounded refresh; leaving the legacy path authoritative",
+            element_id=action.element_id,
+        )
+        return None
+    # Rebind the caller's own Action in place (not a copy) so the effective remapped element_id, and
+    # every field the normal handler goes on to set, are the ones recorded in the persisted step
+    # output and passed to post_action_execution -- the original object never lingers as stale/pending.
+    # The owner loop's duplicate-id chain and ordering were already computed from the planned ids
+    # before dispatch, so this does not alter action-list ordering or failure policy.
+    action.element_id = fresh_element_id
+    # Refresh the fresh element's provenance the same way parse_actions builds it, so
+    # skyvern_element_hash (cached-action matching) and skyvern_element_data (Action.get_xpath()) stay
+    # consistent with the remapped element rather than pointing at the stale one.
+    fresh_hash_map = getattr(fresh_scraped_page, "id_to_element_hash", None)
+    action.skyvern_element_hash = fresh_hash_map.get(fresh_element_id) if isinstance(fresh_hash_map, dict) else None
+    fresh_url = getattr(fresh_scraped_page, "url", None)
+    fresh_element = fresh_dict.get(fresh_element_id)
+    action.skyvern_element_data = (
+        {**fresh_element, "page_url": fresh_url} if isinstance(fresh_element, dict) else {"page_url": fresh_url}
+    )
+    return fresh_scraped_page, action
 
 
 @traced(name="skyvern.agent.action.solve_captcha")
@@ -5517,6 +5891,13 @@ async def handle_click_action(
         return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
         incremental_scraped: IncrementalScrapePage | None = None
+        # Inside a file-download block, a non-download click authorized as a false-click candidate can
+        # still mint the file. If it does, the post-click dropdown/custom-select rescrape below is dead
+        # work that costs ~90-120s; observing the download lets us skip straight to the click result.
+        false_click_download_observed: asyncio.Event | None = (
+            asyncio.Event() if _false_click_download_eligible.get() else None
+        )
+        remove_download_probe: Callable[[], None] | None = None
         try:
             engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
             skyvern_frame = await SkyvernFrame.create_instance(
@@ -5527,6 +5908,8 @@ async def handle_click_action(
                 engine_selection=engine_selection,
             )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+            if false_click_download_observed is not None:
+                remove_download_probe = _register_false_click_download_probe(page, false_click_download_observed)
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
             results = await chain_click(
@@ -5546,11 +5929,36 @@ async def handle_click_action(
                 return results
 
             try:
+                if false_click_download_observed is not None and false_click_download_observed.is_set():
+                    LOG.info(
+                        "Same-action download observed for a file-download click; bypassing dropdown rescrape",
+                        element_id=skyvern_element.get_id(),
+                    )
+                    return results
+
                 if has_onclick_attr:
                     LOG.info(
                         "The element has onclick attribute, waiting for 1 second to load new elements", action=action
                     )
                     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="click.onclick")
+
+                if false_click_download_observed is not None:
+                    # Browser.downloadWillBegin can arrive on a later loop turn, just after the
+                    # click await resolves; give the real probe event a narrow admission window
+                    # before paying for the sequential rescrape.
+                    try:
+                        await asyncio.wait_for(
+                            false_click_download_observed.wait(),
+                            timeout=BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    if false_click_download_observed.is_set():
+                        LOG.info(
+                            "Late same-action download observed for a file-download click; bypassing dropdown rescrape",
+                            element_id=skyvern_element.get_id(),
+                        )
+                        return results
 
                 if sequential_click_result := await handle_sequential_click_with_submit_bypass(
                     action=action,
@@ -5581,6 +5989,8 @@ async def handle_click_action(
                 return results
 
         finally:
+            if remove_download_probe is not None:
+                remove_download_probe()
             if incremental_scraped:
                 try:
                     await incremental_scraped.stop_listen_dom_increment()
@@ -5976,49 +6386,16 @@ def _normalize_dropdown_match_text(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "", value).lower()
 
 
-def _incremental_tree_contains_target_value(elements: list[dict], target_value: str) -> bool:
-    """Return True when newly surfaced elements contain the requested value.
-
-    Search-combobox results often render formatted labels like ``(CODE) 12345678``
-    while the action text is just ``12345678``. Normalize punctuation and
-    whitespace so post-input dropdown handling is gated on a concrete target
-    match instead of any arbitrary search suggestion.
-    """
-
-    normalized_target = _normalize_dropdown_match_text(target_value)
-    if not normalized_target:
-        return False
-
-    stack = list(elements)
-    while stack:
-        element = stack.pop()
-        for key in (
-            "text",
-            "value",
-            "label",
-            "ariaLabel",
-            "placeholder",
-            "title",
-            "beforePseudoText",
-            "afterPseudoText",
-        ):
-            value = element.get(key)
-            if isinstance(value, str) and normalized_target in _normalize_dropdown_match_text(value):
-                return True
-        attributes = element.get("attributes")
-        if isinstance(attributes, dict):
-            for attr_value in attributes.values():
-                if isinstance(attr_value, str) and normalized_target in _normalize_dropdown_match_text(attr_value):
-                    return True
-        children = element.get("children", [])
-        if isinstance(children, list):
-            stack.extend(children)
-    return False
+def _custom_select_node_is_disabled(attributes: dict) -> bool:
+    # Reuse the canonical static disabled convention (disabled / aria-disabled, any non-"false" value is disabled)
+    # so an empty-state placeholder rendered as an aria-disabled option cannot admit the force-select option gate.
+    # An enabled option (no disabled attribute, or aria-disabled="false") stays eligible.
+    return SkyvernElement._disabled_attrs_indicate_disabled(attributes)
 
 
 def _incremental_tree_contains_option_with_target_value(elements: list[dict], target_value: str) -> bool:
-    # Match the target only against real option candidates (what the selector would click), unlike the
-    # broad search-bar helper above, so a "No results for <target>" banner cannot admit a selection.
+    # Match the target only against real option candidates (what the selector would click) by their label,
+    # so a "No results for <target>" banner cannot admit a selection.
     normalized_target = _normalize_dropdown_match_text(target_value)
     if not normalized_target:
         return False
@@ -6027,6 +6404,80 @@ def _incremental_tree_contains_option_with_target_value(elements: list[dict], ta
         if isinstance(label, str) and normalized_target in _normalize_dropdown_match_text(label):
             return True
     return False
+
+
+def _option_subtree_text(node: dict) -> str:
+    # A large search combobox renders an option's value in nested spans, so the row's text is not on the
+    # option node itself; gather the node's own text plus all descendants' in document order (so a value
+    # split across sibling text nodes, e.g. <b>12345</b><b>67890</b>, is not scrambled).
+    parts: list[str] = []
+    stack: list[dict] = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        text = current.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+        children = current.get("children")
+        if isinstance(children, list):
+            stack.extend(reversed(children))
+    return " ".join(parts)
+
+
+def _incremental_tree_contains_option_subtree_with_target_value(elements: list[dict], target_value: str) -> bool:
+    # Gate = selector's label-candidate match OR an option/choice subtree-text extension. The first arm
+    # delegates to _custom_select_candidates_from_elements (via the label matcher), so the gate is a superset
+    # of every family the selector can commit -- role/tag/<li>-in-choice-surface options, clickable choices,
+    # checkbox/radio inputs, <label>-wrapped inputs, and attribute-only (aria-label/title/value) labels -- by
+    # construction. The second arm adds only what a label match genuinely misses: an option whose value
+    # renders in nested spans (empty own text), gated on option/choice nodes so a status/banner echo stays
+    # excluded, and reading its subtree text in document order.
+    normalized_target = _normalize_dropdown_match_text(target_value)
+    if not normalized_target:
+        return False
+    if _incremental_tree_contains_option_with_target_value(elements, target_value):
+        return True
+    queue: deque[tuple[dict, bool, bool]] = deque((element, False, False) for element in elements)
+    while queue:
+        node, in_choice_surface, in_disabled_subtree = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+        attributes = node.get("attributes") or {}
+        role = str(attributes.get("role") or "").lower()
+        tag = str(node.get("tagName") or "").lower()
+        label = _select_shadow_label_from_node(node) or _custom_select_choice_value(node)
+        is_option_node = role in _CUSTOM_SELECT_CHOICE_ROLES or tag == "option" or (tag == "li" and in_choice_surface)
+        has_choice_state = "aria-selected" in attributes or "aria-checked" in attributes
+        is_clickable_choice = (
+            bool(node.get("interactable"))
+            and bool(label)
+            and role not in _CUSTOM_SELECT_CONTAINER_ROLES
+            and tag not in {"input", "select", "textarea"}
+            and not (tag == "a" and bool(attributes.get("href")))
+            and (in_choice_surface or has_choice_state)
+        )
+        # A disabled ancestor (aria-disabled=true, disabled fieldset/wrapper) disables the whole subtree; a
+        # descendant aria-disabled=false cannot re-enable it, so inheritance is monotonic (OR, never reset).
+        node_in_disabled_subtree = in_disabled_subtree or _custom_select_node_is_disabled(attributes)
+        if (
+            (is_option_node or is_clickable_choice)
+            and not node_in_disabled_subtree
+            and normalized_target in _normalize_dropdown_match_text(_option_subtree_text(node))
+        ):
+            return True
+        child_in_choice_surface = in_choice_surface or _is_custom_select_choice_surface(role)
+        for child in node.get("children") or []:
+            queue.append((child, child_in_choice_surface, node_in_disabled_subtree))
+    return False
+
+
+def _incremental_tree_has_enabled_selectable_option(elements: list[dict]) -> bool:
+    # An "enabled selectable option candidate" is exactly what the selector could click:
+    # _custom_select_candidates_from_elements already excludes disabled options and disabled subtrees, so a
+    # non-empty candidate list means the dropdown is already populated -- the deferred-empty render race is
+    # over. A disabled-only snapshot yields no candidate, so it stays settle-eligible.
+    return bool(_custom_select_candidates_from_elements(elements))
 
 
 def _attr_indicates_aria_invalid(raw: object) -> bool:
@@ -7038,7 +7489,18 @@ async def _handle_input_text_action(
                 )
                 if fill_atomically:
                     await skyvern_element.refresh_locator_if_stale()
-                    await skyvern_element.input_fill(text)
+                    try:
+                        await skyvern_element.input_fill(text)
+                    except Exception as fill_error:
+                        # A field scraped as text but live type=date rejects a locale value here; recover in
+                        # canonical form from the live DOM, else re-raise so an ambiguous or non-date failure
+                        # keeps its existing semantics.
+                        if (
+                            await _recover_atomic_fill_as_live_date(skyvern_element, text, fill_error, engine_selection)
+                            is None
+                        ):
+                            raise
+                        return [ActionSuccess()]
                 else:
                     await skyvern_element.input_sequentially(text=text)
                     # The residual per-character seam can still lose a leading prefix on a caret-resetting
@@ -7065,21 +7527,38 @@ async def _handle_input_text_action(
                     tel_outcome.actual_digit_count = actual_digit_count
                     tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
 
-            incremental_element = await incremental_scraped.get_incremental_element_tree(
-                clean_and_remove_element_tree_factory(
-                    task=task,
-                    step=step,
-                    check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
-                    engine_selection=engine_selection,
-                ),
+            incremental_cleanup = clean_and_remove_element_tree_factory(
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             )
+            incremental_element = await incremental_scraped.get_incremental_element_tree(incremental_cleanup)
+            # A search combobox may render its filtered options a frame or two after the keystroke, so the
+            # first incremental read can contain zero options; give it exactly one bounded render settle
+            # (double-rAF, 250ms-liveness-capped) and re-read. Entered only for a live combobox/typeahead
+            # whose first snapshot has neither the enabled target option nor any enabled selectable option --
+            # the observed deferred-empty race. If the enabled target is already present (even as an option
+            # whose value renders in nested spans, which the label-candidate predicate alone misses) or any
+            # enabled option is already rendered, that is a populated state, not the race, so it adds no
+            # settle; the target-option gate below still guards force selection.
+            if (
+                input_or_select_context is not None
+                and input_or_select_context.is_search_bar
+                and not is_secret_value
+                and await _is_combobox_or_typeahead(skyvern_element)
+                and not _incremental_tree_contains_option_subtree_with_target_value(incremental_element, text)
+                and not _incremental_tree_has_enabled_selectable_option(incremental_element)
+            ):
+                await _wait_custom_select_render_settle(skyvern_element)
+                incremental_element = await incremental_scraped.get_incremental_element_tree(incremental_cleanup)
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
                 if (
                     input_or_select_context
                     and input_or_select_context.is_search_bar
                     and not is_secret_value
-                    and _incremental_tree_contains_target_value(incremental_element, text)
+                    and _incremental_tree_contains_option_subtree_with_target_value(incremental_element, text)
                 ):
                     LOG.info(
                         "Detected target-matching dropdown after search-bar input; attempting custom selection",
@@ -10396,13 +10875,13 @@ class _CustomSelectCandidate(TypedDict):
 
 
 def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_CustomSelectCandidate]:
-    queue: deque[tuple[dict, bool, bool]] = deque((element, False, False) for element in elements)
+    queue: deque[tuple[dict, bool, bool, bool]] = deque((element, False, False, False) for element in elements)
     candidates: list[_CustomSelectCandidate] = []
     seen: set[tuple[str | None, str | None, str | None]] = set()
     covered_choice_input_ids: set[str] = set()
 
     while queue:
-        node, in_choice_surface, in_multiselectable = queue.popleft()
+        node, in_choice_surface, in_multiselectable, in_disabled_subtree = queue.popleft()
         if not isinstance(node, dict):
             continue
 
@@ -10437,9 +10916,18 @@ def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_Custo
             )
         )
 
+        # A disabled ancestor (aria-disabled=true, disabled fieldset/wrapper, disabled <label>) disables the
+        # whole subtree; a descendant aria-disabled=false cannot re-enable it, so inheritance is monotonic.
+        node_in_disabled_subtree = in_disabled_subtree or _custom_select_node_is_disabled(attrs)
+
         if is_choice_input and element_id in covered_choice_input_ids:
             pass
-        elif element_id and label and (is_option_node or is_choice_input or is_label_choice or is_clickable_choice):
+        elif (
+            element_id
+            and label
+            and not node_in_disabled_subtree
+            and (is_option_node or is_choice_input or is_label_choice or is_clickable_choice)
+        ):
             candidate = _select_shadow_candidate(label, element_id=element_id, value=value)
             if candidate is not None:
                 key = (candidate.get("element_id"), candidate.get("label"), candidate.get("value"))
@@ -10462,7 +10950,7 @@ def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_Custo
             isinstance(aria_multiselectable, str) and aria_multiselectable.lower() == "true"
         )
         for child in node.get("children") or []:
-            queue.append((child, child_in_choice_surface, child_in_multiselectable))
+            queue.append((child, child_in_choice_surface, child_in_multiselectable, node_in_disabled_subtree))
 
     return candidates
 
@@ -10484,7 +10972,7 @@ _SELECTED_LABEL_PREFIXES = ("selected ", "selected:")
 
 _CUSTOM_SELECT_MATCHED_STATE_JS = r"""
 (el) => {
-    const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const label = [
         el.textContent,
         el.getAttribute("aria-label"),
@@ -10522,7 +11010,7 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
     const anchorIsComboboxInput = args.anchorIsComboboxInput;
     const allowAriaSelectedOptionTokens = args.allowAriaSelectedOptionTokens !== false;
     const allowSingleValueScope = args.allowSingleValueScope === true;
-    const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const splitValues = (value) => {
         const normalized = normalize(value);
         if (!normalized) return [];
@@ -10710,6 +11198,20 @@ def _custom_select_matched_state_confirms_pre_click(state: dict | None, expected
     if str(state.get("role") or "").lower() == "option" and not bool(state.get("inMultiselectable")):
         return False
     return bool(state.get("ariaSelected"))
+
+
+async def _custom_select_committed_readback_confirms(
+    selected_element: SkyvernElement, requested_value: str | None
+) -> bool:
+    # A strict scope read can miss a commit the chosen option itself reflects, so re-read the option's
+    # own matched state before ownership recovery. Exact normalized label plus a committed signal only:
+    # a bare single-select highlight, a mismatch, or an unreadable state is never success (SKY-14909).
+    expected_label = _normalize_select_shadow_text(requested_value)
+    if not expected_label:
+        return False
+    return _custom_select_matched_state_confirms_pre_click(
+        await _read_custom_select_matched_state(selected_element), expected_label
+    )
 
 
 async def _custom_select_scope_confirms_committed(
@@ -11364,6 +11866,42 @@ def _matching_custom_select_anchor_ids(
     ]
 
 
+def _collect_subtree_element_ids(subtrees: list[dict]) -> list[str]:
+    ids: list[str] = []
+    stack = list(subtrees)
+    while stack:
+        node = stack.pop()
+        node_id = node.get("id")
+        if node_id:
+            ids.append(str(node_id))
+        stack.extend(node.get("children", []) or [])
+    return ids
+
+
+def _resolve_already_open_owned_listbox(
+    *,
+    current_element_id: str,
+    scraped_page_after_open: ScrapedPage,
+) -> tuple[str, list[dict]] | None:
+    """Resolve the anchor's single aria-owned listbox when the strict new-element diff is empty
+    because the combobox was already open.
+
+    Returns ``(anchor_id, owned_subtrees)`` only when the anchor is a ``role=combobox`` that is
+    currently ``aria-expanded=true`` and uniquely owns exactly one listbox subtree; otherwise
+    ``None`` so the caller stays fail-closed and raises no-incremental.
+    """
+    original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
+    if original_anchor is None:
+        return None
+    attributes = original_anchor.get("attributes") or {}
+    if str(attributes.get("aria-expanded") or "").lower() != "true":
+        return None
+    return _resolve_owned_custom_select_recovery(
+        original_anchor=original_anchor,
+        refreshed_page=scraped_page_after_open,
+    )
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -11397,7 +11935,26 @@ async def select_from_emerging_elements(
     ]
 
     if len(new_interactable_element_ids) == 0:
-        raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+        already_open = _resolve_already_open_owned_listbox(
+            current_element_id=current_element_id,
+            scraped_page_after_open=scraped_page_after_open,
+        )
+        if already_open is None:
+            raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+        _anchor_id, owned_subtrees = already_open
+        new_element_ids = set(_collect_subtree_element_ids(owned_subtrees))
+        new_interactable_element_ids = [
+            element_id
+            for element_id in new_element_ids
+            if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+        ]
+        if len(new_interactable_element_ids) == 0:
+            raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+        LOG.info(
+            "Custom-select combobox already open; selecting from its aria-owned listbox",
+            current_element_id=current_element_id,
+            owned_option_count=len(new_interactable_element_ids),
+        )
 
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
@@ -11581,7 +12138,11 @@ async def select_from_emerging_elements(
 
     original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
     await selected_element.scroll_into_view()
-    await selected_element.click(page=page, engine_selection=engine_selection)
+    await selected_element.click(
+        page=page,
+        engine_selection=engine_selection,
+        intercept_js_fallback_label=requested_value,
+    )
     readback_scope_element = await _resolve_custom_select_readback_scope_element(
         get_readback_scope_element=get_readback_scope_element,
         target_value=options.target_value or "",
@@ -11642,6 +12203,21 @@ async def select_from_emerging_elements(
     try:
         refreshed_page = await scraped_page_after_open.generate_scraped_page_without_screenshots()
         refreshed_dom = DomUtil(scraped_page=refreshed_page, page=page, engine_selection=engine_selection)
+        # A strict scope verify can read not-committed while the chosen option itself reflects the commit;
+        # honor that BEFORE any ownership-dependent branch (missing, ambiguous, or no owned listbox) so a
+        # set field is not failed just because recovery ownership cannot be resolved.
+        if await _custom_select_committed_readback_confirms(selected_element, requested_value):
+            _log_custom_select_verification_outcome(
+                "Custom-select committed readback outcome",
+                phase="committed_readback",
+                settles=recovery_settles,
+                committed=True,
+                verification_branch="matched_state",
+                verification_reason="committed_readback",
+                recovery_attempted=False,
+                recovery_succeeded=False,
+            )
+            return ActionSuccess()
         ownership = _custom_select_anchor_ownership(original_anchor)
         if ownership is None:
             raise ValueError("Custom-select recovery ownership is missing")

@@ -34,7 +34,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _elapsed_run_seconds,
     _requested_output_labels_by_path,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    resolve_browser_state_for_context,
+)
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.task_output_envelope import (
     _TASK_ENVELOPE_BLOCK_TYPES,
@@ -725,22 +728,25 @@ async def _composition_get_stripped_html(copilot_ctx: Any) -> tuple[str | None, 
     return value, len(value) >= _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 
 
-async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> tuple[str, str | None, bool, bool]:
+async def _composition_get_html(
+    copilot_ctx: Any, *, skip_raw: bool = False, rendered_style_snapshot: bool = False
+) -> tuple[str, str | None, bool, bool]:
     """Return body HTML for composition parsing, surviving the MCP response size cap.
 
-    `skyvern_get_html("body")` is the fast path, but the shared size cap DROPS the
-    payload (no `html` field, just truncation metadata) when the serialized body
-    exceeds the limit — heavy commerce pages routinely do, so the inspector would
-    parse an empty string and report hollow evidence. On an empty/capped read, fall
-    back to an `evaluate` that returns the body with script/style/svg/etc. stripped
-    and length-bounded; that fits under the cap while preserving the form/link
-    structure. Returns (html, error, truncated, used_stripped): error is set only on
+    Composition capture requests the bounded evaluate first because it serializes
+    the computed style facts needed by the parsed extractor's interaction-blocking evidence.
+    Other discovery callers retain `skyvern_get_html("body")` as their fast path.
+    Returns (html, error, truncated, used_stripped): error is set only on
     a hard read failure; truncated is True when the stripped fallback was sliced at
     the cap; used_stripped is True when the bounded read was the source (raw skipped
     or cap-dropped). `skip_raw` goes straight to the stripped read so a caller that
     has already seen the raw serialization get cap-dropped for this page need not
     re-issue it.
     """
+    if rendered_style_snapshot:
+        rendered, rendered_truncated = await _composition_get_stripped_html(copilot_ctx)
+        if rendered and rendered.strip():
+            return rendered, None, rendered_truncated, True
     html_result: dict[str, Any] = {}
     if not skip_raw:
         html_result = await _discovery_get_html(copilot_ctx)

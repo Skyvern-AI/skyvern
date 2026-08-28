@@ -1,4 +1,5 @@
 import {
+  GlobeIcon,
   ImageIcon,
   OpenInNewWindowIcon,
   PlayIcon,
@@ -43,11 +44,18 @@ import { ViewToggle } from "./ViewToggle";
 const RECORDING_ARCHIVED_LABEL =
   "Recording archived — contact support@skyvern.com to request restoration";
 
+const FINISHED_RUN_BROWSER_LABEL =
+  "This run has finished — shows the agent's debug browser, not the run";
+
 export function BrowserPaneViewPills() {
   const compact = useStudioPaneCompact();
   const { browserStreamingMode } = useBrowserStreamingMode();
-  const { view, setView, visuals } = useBrowserPaneView();
+  const { view, setView, visuals, inspectingRun } = useBrowserPaneView();
   const hasRecording = visuals.recordingUrls.length > 0;
+  // Sitting beside the inspected run's replay pills, a pulsing "Live" reads as
+  // the run's own status. Once that run is over this view is the debug browser
+  // — a surface the run left behind — so it has to say so.
+  const finishedRun = inspectingRun && visuals.finalized;
 
   return (
     <>
@@ -65,9 +73,14 @@ export function BrowserPaneViewPills() {
           active={view === "live"}
           onClick={() => setView("live")}
           compact={compact}
-          label="Live"
+          label={finishedRun ? "Debug browser" : "Live"}
+          title={finishedRun ? FINISHED_RUN_BROWSER_LABEL : undefined}
           icon={
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
+            finishedRun ? (
+              <GlobeIcon className="h-3 w-3" />
+            ) : (
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
+            )
           }
         />
         {!hasRecording && visuals.recordingArchived ? (
