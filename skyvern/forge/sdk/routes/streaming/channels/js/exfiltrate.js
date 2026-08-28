@@ -120,6 +120,34 @@
       return isUniqueSelector(selector) ? selector : null;
     };
 
+    const SECRET_INPUT_TYPES = new Set(["password"]);
+    const SECRET_AUTOCOMPLETE_TOKENS = new Set([
+      "current-password",
+      "new-password",
+      "one-time-code",
+      "cc-number",
+      "cc-csc",
+      "cc-exp",
+      "cc-exp-month",
+      "cc-exp-year",
+    ]);
+
+    const isSecretField = (element) => {
+      if (!element) {
+        return false;
+      }
+      const inputType = String(element.type || "").toLowerCase();
+      if (SECRET_INPUT_TYPES.has(inputType)) {
+        return true;
+      }
+      const autocomplete = String(
+        (element.getAttribute && element.getAttribute("autocomplete")) || "",
+      ).toLowerCase();
+      return autocomplete
+        .split(/\s+/)
+        .some((token) => SECRET_AUTOCOMPLETE_TOKENS.has(token));
+    };
+
     const IMPLICIT_INPUT_ROLES = {
       button: "button",
       submit: "button",
@@ -346,7 +374,7 @@
                 eventType,
                 id: e.target?.id,
                 className: e.target?.className,
-                value: e.target?.value,
+                value: isSecretField(e.target) ? null : e.target?.value,
                 text: getElementText(e.target),
                 labels: getAssociatedLabels(e.target),
                 skyId: e.target?.dataset?.skyId,
@@ -368,6 +396,12 @@
           const classText = String(
             e.target.classList?.value ?? e.target.getAttribute("class") ?? "",
           );
+          const secretField = isSecretField(e.target);
+          const autocomplete = e.target?.getAttribute?.("autocomplete") || null;
+          // Named keys ("Enter", "Tab") survive: the input-text state machine emits on Enter,
+          // which is the only signal an Enter-submitted login produces before it navigates away.
+          const redactKeystroke =
+            secretField && typeof e.key === "string" && e.key.length === 1;
 
           const eventData = {
             url: window.location.href,
@@ -379,7 +413,7 @@
               isHtml: e.target instanceof HTMLElement,
               isSvg: e.target instanceof SVGElement,
               className: classText,
-              value: e.target?.value,
+              value: secretField ? null : e.target?.value,
               text: getElementText(e.target),
               labels: getAssociatedLabels(e.target),
               skyId: e.target?.dataset?.skyId,
@@ -399,10 +433,13 @@
                 e.target?.tagName === "BUTTON"
                   ? e.target?.type || null
                   : null,
+              autocomplete,
             },
-            inputValue: ["input", "focus", "blur"].includes(eventType)
-              ? e.target?.value
-              : undefined,
+            inputValue: secretField
+              ? null
+              : ["input", "focus", "blur"].includes(eventType)
+                ? e.target?.value
+                : undefined,
             mousePosition: {
               xa: Number.isFinite(e.clientX) ? e.clientX : null,
               ya: Number.isFinite(e.clientY) ? e.clientY : null,
@@ -415,8 +452,8 @@
                   ? e.clientY / window.innerHeight
                   : null,
             },
-            key: e.key,
-            code: e.code,
+            key: redactKeystroke ? null : e.key,
+            code: redactKeystroke ? null : e.code,
             activeElement: {
               tagName: document.activeElement?.tagName,
               id: document.activeElement?.id,

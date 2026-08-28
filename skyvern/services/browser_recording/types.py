@@ -92,6 +92,7 @@ class ActionTarget(BaseModel):
     role: str | None = None
     accessible_name: str | None = None
     input_type: str | None = None
+    autocomplete: str | None = None
 
 
 class Mouse(BaseModel):
@@ -133,6 +134,7 @@ class RecordingDraftStep(BaseModel):
     # locally-captured artifacts (e.g. stream screenshots) with each step.
     timestamp_start: float | None = None
     timestamp_end: float | None = None
+    credential_kind: Literal["password", "totp", "credit_card"] | None = None
 
 
 class RecordingInterpretationUpdate(BaseModel):
@@ -195,6 +197,7 @@ class EventTarget(BaseModel):
     role: str | None = None
     accessibleName: str | None = None
     inputType: str | None = None
+    autocomplete: str | None = None
 
 
 class MousePosition(BaseModel):

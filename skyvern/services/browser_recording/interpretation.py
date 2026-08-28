@@ -16,6 +16,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels import exfiltration as streaming_exfiltration
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEventSource
+from skyvern.services.browser_recording.redact import credential_kind_for_target, redact_console_event
 from skyvern.services.browser_recording.service import (
     Processor,
     deterministic_input_text_parameter_key,
@@ -77,7 +78,7 @@ def streaming_events_to_recording_events(
             if source == "cdp":
                 reified_events.append(ExfiltratedCdpEvent(**payload))
             elif source == "console":
-                reified_events.append(ExfiltratedConsoleEvent(**payload))
+                reified_events.append(redact_console_event(ExfiltratedConsoleEvent(**payload)))
             else:
                 LOG.debug("Skipping recording interpretation event with unsupported source", source=source)
         except Exception:
@@ -110,6 +111,12 @@ def _extra_field(block: OutputBlock, field_name: str, fallback: t.Any) -> t.Any:
     return fallback
 
 
+def _credential_kind_for_action(action: Action) -> t.Literal["password", "totp", "credit_card"] | None:
+    if not isinstance(action, ActionInputText):
+        return None
+    return credential_kind_for_target(action.target.input_type, action.target.autocomplete)
+
+
 def _draft_step_from_block(
     *,
     browser_session_id: str,
@@ -138,6 +145,7 @@ def _draft_step_from_block(
             parameter_keys=block.parameter_keys or [],
             timestamp_start=action.timestamp_start,
             timestamp_end=action.timestamp_end,
+            credential_kind=_credential_kind_for_action(action),
         )
 
     if isinstance(block, WorkflowDefinitionYamlBlocksItem_GotoUrl):
@@ -223,6 +231,7 @@ def _placeholder_step_from_action(
         label=normalize_recording_block_label(f"{action.kind.value}_{text}", fallback=action.kind.value),
         title=title,
         navigation_goal=navigation_goal,
+        url=action.url,
         status=RecordingDraftStepStatus.INTERPRETING,
         editable_fields=[
             RecordingDraftStepEditableField.LABEL,
@@ -233,6 +242,7 @@ def _placeholder_step_from_action(
         parameter_keys=parameter_keys,
         timestamp_start=action.timestamp_start,
         timestamp_end=action.timestamp_end,
+        credential_kind=_credential_kind_for_action(action),
     )
 
 
@@ -508,6 +518,10 @@ class RecordingInterpretationSession:
             step.navigation_goal = enriched.navigation_goal
             step.parameters = enriched.parameters
             step.parameter_keys = enriched.parameter_keys
+            if enriched.credential_kind:
+                step.credential_kind = enriched.credential_kind
+            if enriched.url:
+                step.url = enriched.url
 
         step.status = RecordingDraftStepStatus.READY
         self._emit(changed_steps=[step])
