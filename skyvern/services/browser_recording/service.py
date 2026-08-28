@@ -24,6 +24,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
+from skyvern.services.browser_recording.redact import is_secret_field, redact_console_event
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
@@ -330,7 +331,7 @@ class Processor:
             else:
                 LOG.error(f"{self.class_name} Unknown event source: {event.get('source')}", **self.identity)
                 continue
-            reified_events.append(reified_event)
+            reified_events.append(redact_console_event(reified_event))
 
         return reified_events
 
@@ -588,6 +589,12 @@ class Processor:
 
         if action.kind == ActionKind.INPUT_TEXT:
             prompt_name = "recording-action-block-prompt-input-text"
+            if (
+                isinstance(action, ActionInputText)
+                and is_secret_field(action.target.input_type, action.target.autocomplete)
+                and action.input_value
+            ):
+                action = action.model_copy(update={"input_value": ""})
         else:
             prompt_name = "recording-action-block-prompt"
 

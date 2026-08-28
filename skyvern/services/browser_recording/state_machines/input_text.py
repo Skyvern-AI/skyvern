@@ -2,6 +2,7 @@ import typing as t
 
 import structlog
 
+from skyvern.services.browser_recording.redact import is_secret_field
 from skyvern.services.browser_recording.types import (
     Action,
     ActionInputText,
@@ -101,11 +102,12 @@ class StateMachineInputText(StateMachine):
         xp = (self.mouse.xp or -1) if self.mouse else None
         yp = (self.mouse.yp or -1) if self.mouse else None
 
-        LOG.debug("~ emitting input text action", exfiltrated_event=event)
+        LOG.debug("~ emitting input text action")
 
+        secret = is_secret_field(self.target.inputType, self.target.autocomplete)
         input_value = event.params.target.value
 
-        if input_value is None:
+        if input_value is None and not secret:
             LOG.debug("~ cannot emit, missing input value; resetting")
 
             self.reset()
@@ -122,6 +124,7 @@ class StateMachineInputText(StateMachine):
             role=self.target.role,
             accessible_name=self.target.accessibleName,
             input_type=self.target.inputType,
+            autocomplete=self.target.autocomplete,
         )
 
         action = ActionInputText(
@@ -130,7 +133,7 @@ class StateMachineInputText(StateMachine):
             timestamp_start=self.timestamp_start,
             timestamp_end=event.params.timestamp,
             url=event.params.url,
-            input_value=str(input_value),
+            input_value="" if secret else str(input_value),
         )
 
         self.reset()
