@@ -157,9 +157,19 @@ describe("StartNode inputs summary", () => {
     expect(screen.queryByRole("button", { name: /add/i })).toBeNull();
   });
 
-  test("Add does not also open workflow settings", () => {
-    // The click bubbles to FlowRenderer's onNodeClick, which dispatches
-    // OPEN_WORKFLOW_SETTINGS_EVENT for the root start node.
+  test("no click on the card opens workflow settings", () => {
+    // Any click reaching the node runs FlowRenderer's onNodeClick, which
+    // dispatches OPEN_WORKFLOW_SETTINGS_EVENT for the root start node.
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "order_id",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+      ],
+    });
     const onNodeClick = vi.fn();
     render(
       <MemoryRouter initialEntries={["/workflows/wpid_abc/studio"]}>
@@ -169,6 +179,8 @@ describe("StartNode inputs summary", () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(screen.getByText("Inputs"));
+    fireEvent.click(screen.getByText("order_id"));
     fireEvent.click(screen.getByRole("button", { name: /add/i }));
 
     expect(onNodeClick).not.toHaveBeenCalled();

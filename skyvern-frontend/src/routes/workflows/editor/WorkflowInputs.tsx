@@ -66,7 +66,13 @@ function WorkflowInputsCard({ editable }: { editable: boolean }) {
   }
 
   return (
-    <div className="nodrag nopan w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4">
+    // The card sits inside the start node, whose canvas click selects it and
+    // expands Workflow Settings (FlowRenderer's onNodeClick). This summary is
+    // its own surface, so no click in it reaches that.
+    <div
+      className="nodrag nopan w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4"
+      onClick={(event) => event.stopPropagation()}
+    >
       <div className="flex items-center justify-between gap-3">
         <span className="flex items-center gap-2 text-sm">
           <InputIcon className="size-4 text-muted-foreground" aria-hidden />
@@ -77,13 +83,9 @@ function WorkflowInputsCard({ editable }: { editable: boolean }) {
             variant="tertiary"
             size="sm"
             disabled={isRecording}
-            // A click that reaches the node selects the start node and
-            // dispatches OPEN_WORKFLOW_SETTINGS_EVENT (FlowRenderer's
-            // onNodeClick), so Add would also expand Workflow Settings.
-            onClick={(event) => {
-              event.stopPropagation();
-              setWorkflowPanelState({ active: true, content: "parameters" });
-            }}
+            onClick={() =>
+              setWorkflowPanelState({ active: true, content: "parameters" })
+            }
           >
             <PlusIcon className="mr-1 size-3.5" aria-hidden />
             Add
