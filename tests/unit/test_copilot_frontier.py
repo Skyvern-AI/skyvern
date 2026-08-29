@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     summarize_tool_result,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
 from skyvern.forge.sdk.copilot.tools import (
@@ -3735,6 +3736,12 @@ async def test_completed_test_result_handoff_uses_ordinary_acting_agent_surface(
         ctx.workflow_verification_evidence.full_workflow_verified = True
         ctx.workflow_verification_evidence.workflow_run_id = "wr_completed_test_result_handoff"
         ctx.last_executed_block_labels = ["inspect_result"]
+        # The real run path records a source-bound receipt per executed block
+        # (run_execution._record_executed_block_labels); this stub replaces that path.
+        ctx.executed_block_labels.add("inspect_result")
+        ctx.executed_block_fingerprints["inspect_result"] = set(
+            workflow_block_fingerprints(workflow_yaml)["inspect_result"]
+        )
         ctx.secret_scrub_values.append(fixture["registered_secret_value"])
         ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
             phase="persisted_block_run",

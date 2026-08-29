@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
+    record_build_test_outcome,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
@@ -81,6 +82,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
@@ -113,8 +115,28 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
+from tests.unit.copilot_test_helpers import passing_run, two_page_login_yaml
+
+_COVERED_DRAFT_YAML = """title: Draft
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: task
+    label: open_page
+    prompt: Open the page
+"""
+
+
+def _covered_draft_receipts() -> dict[str, set[str]]:
+    return {label: set(values) for label, values in workflow_block_fingerprints(_COVERED_DRAFT_YAML).items()}
+
+
+def _clean_recorded_run() -> RecordedRunOutcome:
+    return RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_clean", run_completed=True)
+
 
 _HISTORY_SENTINEL_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -990,7 +1012,9 @@ class TestVerifiedGoalSatisfiedStop:
         ctx = _ctx(
             turn_origin=TurnOrigin.runtime_self_heal,
             last_workflow=workflow,
-            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_workflow_yaml=_COVERED_DRAFT_YAML,
+            executed_block_fingerprints=_covered_draft_receipts(),
+            last_run_outcome=_clean_recorded_run(),
             last_test_ok=True,
             last_full_workflow_test_ok=True,
             tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
@@ -999,7 +1023,7 @@ class TestVerifiedGoalSatisfiedStop:
         result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is workflow
-        assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
+        assert result.workflow_yaml == _COVERED_DRAFT_YAML
         assert result.proposal_disposition == "review_tested"
         assert result.user_response == "The unattended recovery check completed."
         assert result.narrative_payload is not None
@@ -2554,7 +2578,9 @@ class TestTranslateToAgentResultGating:
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             last_workflow=workflow,
-            last_workflow_yaml="title: Structural Draft",
+            last_workflow_yaml=_COVERED_DRAFT_YAML,
+            executed_block_fingerprints=_covered_draft_receipts(),
+            last_run_outcome=_clean_recorded_run(),
             last_test_ok=True,
             last_full_workflow_test_ok=True,
             latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
@@ -2592,7 +2618,8 @@ class TestTranslateToAgentResultGating:
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             last_workflow=workflow,
-            last_workflow_yaml="title: Verified Draft",
+            last_workflow_yaml=_COVERED_DRAFT_YAML,
+            executed_block_fingerprints=_covered_draft_receipts(),
             last_test_ok=True,
             last_full_workflow_test_ok=True,
             has_staged_proposal=True,
@@ -2604,7 +2631,7 @@ class TestTranslateToAgentResultGating:
                 verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
             ),
             last_run_blocks_workflow_run_id="wr_1",
-            last_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1"),
+            last_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1", run_completed=True),
         )
 
         agent_result = agent_module._build_wip_exit_result(
@@ -2963,7 +2990,10 @@ class TestTranslateToAgentResultGating:
         )
 
         assert agent_result.updated_workflow is replacement
-        assert agent_result.proposal_disposition == "review_tested"
+        # A tested pill now needs receipts bound to the staged source, and this stub proposal
+        # carries no blocks to bind, so the full-test flags alone no longer earn one. The
+        # satisfaction path is proven against real blocks in TestCanonicalTurnFacts.
+        assert agent_result.proposal_disposition == "review_untested"
 
     def test_inline_replace_workflow_steers_on_stale_block_metadata(self, monkeypatch) -> None:
         # A label still describing the prior subject is authoring quality, not disclosure, so the
@@ -3540,12 +3570,14 @@ workflow_definition:
             )
             return _ctx(
                 last_workflow=verified_wf,
-                last_workflow_yaml="verified: yaml",
+                last_workflow_yaml=_COVERED_DRAFT_YAML,
+                executed_block_fingerprints=_covered_draft_receipts(),
+                last_run_outcome=_clean_recorded_run(),
                 last_test_ok=True,
                 last_full_workflow_test_ok=True,
                 has_staged_proposal=True,
                 staged_workflow=verified_wf,
-                staged_workflow_yaml="verified: yaml",
+                staged_workflow_yaml=_COVERED_DRAFT_YAML,
             )
 
         ask_ctx = build_ctx()
@@ -6119,3 +6151,400 @@ class TestToolFactOwnership:
         for duplicated in ("- CSS SELECTORS:", "- SCROLL:", "- SELECT_OPTION:", "- PRESS_KEY:", "- CONSOLE_MESSAGES:"):
             assert duplicated not in prompt
         assert "Use evaluate for reading/inspection" not in prompt
+
+
+class TestCanonicalTurnFacts:
+    """One fact bundle behind the terminal card, the proposal pill and the terminal prose."""
+
+    @staticmethod
+    def _two_block_yaml(second_prompt: str = "Read it") -> str:
+        return f"""
+title: Sign in and read the metric
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: task
+    label: sign_in
+    next_block_label: read_metric
+    prompt: Sign in
+  - block_type: task
+    label: read_metric
+    prompt: {second_prompt}
+"""
+
+    @staticmethod
+    def _render(ctx: Any, staged_yaml: str, **overrides: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "user_response": "ok",
+            "global_llm_context": None,
+            "updated_workflow": None,
+            "workflow_yaml": staged_yaml,
+            "proposal_disposition": "review_tested",
+            "narrative_payload": {
+                "turnId": "turn-1",
+                "turnIndex": 0,
+                "designStarted": True,
+                "designEnded": True,
+                "draft": None,
+                "blocks": [],
+                "terminal": "response",
+                "terminalMessage": "done",
+                "narrativeSummary": "Built it.",
+                "priorBlockCount": None,
+                "designActivity": [],
+                "startedAt": None,
+                "endedAt": None,
+            },
+        }
+        kwargs.update(overrides)
+        result = agent_module._make_agent_result(ctx, **kwargs)
+        assert result.narrative_payload is not None
+        return {
+            "facts": result.narrative_payload["turnFacts"],
+            "review": result.narrative_payload.get("review"),
+            "disposition": result.proposal_disposition,
+        }
+
+    def test_partial_current_source_coverage_states_counts_and_drops_the_tested_pill(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged)
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["authoredBlockCount"] == 2
+        assert rendered["facts"]["matchingSourceBlockCount"] == 1
+        assert rendered["facts"]["blocksRunThisTurn"] == 1
+        assert rendered["facts"]["factsAvailable"] is True
+        assert rendered["disposition"] == "review_untested"
+
+    def test_full_current_source_coverage_keeps_the_tested_pill(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged, last_run_outcome=_clean_recorded_run())
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["authoredBlockCount"] == 2
+        assert rendered["facts"]["matchingSourceBlockCount"] == 2
+        assert rendered["facts"]["runCompleted"] is True
+        assert rendered["facts"]["evaluationState"] == "not_evaluated"
+        assert rendered["disposition"] == "review_tested"
+
+    def test_full_coverage_over_an_unfinished_run_drops_the_tested_pill(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(
+            persisted_workflow_yaml=staged,
+            last_run_outcome=RecordedRunOutcome(
+                verdict="not_evaluated", workflow_run_id="wr_partial", run_completed=False
+            ),
+        )
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["matchingSourceBlockCount"] == 2
+        assert rendered["facts"]["runCompleted"] is False
+        assert rendered["disposition"] == "review_untested"
+
+    def test_a_block_failure_no_later_run_re_exercised_drops_the_tested_pill(self) -> None:
+        staged = two_page_login_yaml()
+        ctx = _ctx(
+            persisted_workflow_yaml=staged,
+            workflow_yaml=staged,
+            last_run_outcome=_clean_recorded_run(),
+        )
+        record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+        record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in_and_read"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["matchingSourceBlockCount"] == rendered["facts"]["authoredBlockCount"]
+        assert rendered["facts"]["runCompleted"] is True
+        assert rendered["disposition"] == "review_untested"
+
+    def test_full_coverage_over_an_unconfirmed_outcome_drops_the_tested_pill(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(
+            persisted_workflow_yaml=staged,
+            last_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated", workflow_run_id="wr_blocked", run_completed=True
+            ),
+        )
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["matchingSourceBlockCount"] == 2
+        assert rendered["facts"]["evaluationState"] == "not_demonstrated"
+        assert rendered["disposition"] == "review_untested"
+
+    def test_an_edited_block_is_no_longer_counted_against_its_stale_receipt(self) -> None:
+        tested = self._two_block_yaml()
+        staged = self._two_block_yaml("Read it twice")
+        ctx = _ctx(persisted_workflow_yaml=tested)
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(tested).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["matchingSourceBlockCount"] == 1
+        assert rendered["disposition"] == "review_untested"
+
+    def test_a_deadline_turn_reports_its_cause_and_never_a_tested_draft(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged)
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+        ctx.copilot_total_timeout_exceeded = True
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["terminalCause"] == "deadline_expired"
+        assert rendered["facts"]["blocksRunThisTurn"] == 2
+        assert rendered["disposition"] == "review_untested"
+
+    def test_removed_blocks_leave_the_authored_count(self) -> None:
+        persisted = self._two_block_yaml()
+        staged = """
+title: Sign in and read the metric
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: task
+    label: sign_in
+    prompt: Sign in
+"""
+        ctx = _ctx(persisted_workflow_yaml=persisted)
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["authoredBlockCount"] == 1
+        assert rendered["facts"]["matchingSourceBlockCount"] == 1
+
+    def test_unavailable_review_facts_report_no_counts_and_no_tested_pill(self) -> None:
+        duplicate_labels = """
+title: Sign in twice
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: task
+    label: sign_in
+    prompt: Sign in
+  - block_type: task
+    label: sign_in
+    prompt: Sign in again
+"""
+        ctx = _ctx(persisted_workflow_yaml=duplicate_labels)
+
+        rendered = self._render(ctx, duplicate_labels)
+
+        assert rendered["facts"]["factsAvailable"] is False
+        assert "authoredBlockCount" not in rendered["facts"]
+        assert "matchingSourceBlockCount" not in rendered["facts"]
+        assert rendered["disposition"] == "review_untested"
+
+    def test_a_draft_with_no_authored_blocks_is_not_a_tested_draft(self) -> None:
+        empty = "title: Nothing yet\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
+        ctx = _ctx(persisted_workflow_yaml=empty)
+
+        rendered = self._render(ctx, empty)
+
+        assert rendered["facts"]["authoredBlockCount"] == 0
+        assert rendered["disposition"] == "review_untested"
+
+    def test_coverage_facts_survive_a_failed_envelope_assembly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _explode(**_kwargs: Any) -> None:
+            raise RuntimeError("envelope assembly failed")
+
+        monkeypatch.setattr(agent_module, "assemble_terminal_envelope", _explode)
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged)
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["factsAvailable"] is True
+        assert rendered["facts"]["authoredBlockCount"] == 2
+        assert rendered["facts"]["matchingSourceBlockCount"] == 1
+        assert rendered["facts"]["runCompleted"] is None
+        assert rendered["facts"]["evaluationState"] is None
+        assert rendered["disposition"] == "review_untested"
+
+    def test_run_lifecycle_and_evaluation_state_are_separate_facts(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged, last_test_ok=None)
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+        ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1", run_completed=True)
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["runCompleted"] is True
+        assert rendered["facts"]["evaluationState"] == "not_evaluated"
+        assert rendered["facts"]["runId"] == "wr_1"
+        assert rendered["facts"]["authoredBlockCount"] == 2
+        assert rendered["facts"]["matchingSourceBlockCount"] == 1
+        assert rendered["disposition"] == "review_untested"
+
+    @pytest.mark.parametrize(
+        ("tested_reply", "unvalidated_reply"),
+        [
+            (agent_module._TIMEOUT_REPLY_TESTED, agent_module._TIMEOUT_REPLY_UNVALIDATED),
+            (agent_module._MAX_TURNS_REPLY_TESTED, agent_module._MAX_TURNS_REPLY_UNVALIDATED),
+            (agent_module._UNEXPECTED_ERROR_REPLY_TESTED, agent_module._UNEXPECTED_ERROR_REPLY_UNVALIDATED),
+            (agent_module._CANCEL_REPLY_TESTED, agent_module._CANCEL_REPLY_UNVALIDATED),
+        ],
+    )
+    def test_a_partially_covered_draft_claims_no_tested_draft_on_any_terminal_cause(
+        self, tested_reply: str, unvalidated_reply: str
+    ) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(
+            persisted_workflow_yaml=staged,
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
+            last_workflow_yaml=staged,
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+
+        result = agent_module._build_wip_exit_result(
+            ctx,
+            None,
+            default_reply="No draft.",
+            unvalidated_reply=unvalidated_reply,
+            tested_reply=tested_reply,
+            terminal_reason="max_turns",
+        )
+
+        assert "tested draft" not in result.user_response
+        assert result.user_response == unvalidated_reply
+        assert result.proposal_disposition == "review_untested"
+
+    def test_a_fully_covered_draft_keeps_its_tested_reply(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(
+            persisted_workflow_yaml=staged,
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
+            last_workflow_yaml=staged,
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=_clean_recorded_run(),
+        )
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+
+        result = agent_module._build_wip_exit_result(
+            ctx,
+            None,
+            default_reply="No draft.",
+            unvalidated_reply=agent_module._TIMEOUT_REPLY_UNVALIDATED,
+            tested_reply=agent_module._TIMEOUT_REPLY_TESTED,
+            terminal_reason="max_turns",
+        )
+
+        assert result.user_response == agent_module._TIMEOUT_REPLY_TESTED
+        assert result.proposal_disposition == "review_tested"
+
+    def test_a_renamed_block_reports_unknown_coverage_and_drops_the_tested_claim(self) -> None:
+        tested = self._two_block_yaml()
+        staged = tested.replace("label: read_metric", "label: read_metric_v2").replace(
+            "next_block_label: read_metric", "next_block_label: read_metric_v2"
+        )
+        ctx = _ctx(persisted_workflow_yaml=tested)
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(tested).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+
+        rendered = self._render(ctx, staged)
+        review = rendered["review"]
+
+        assert [(row["label"], row.get("coverage")) for row in review["blocks"]] == [
+            ("sign_in", "different_source"),
+            ("read_metric_v2", "unknown"),
+            ("read_metric", None),
+        ]
+        assert rendered["disposition"] == "review_untested"
+
+    def test_a_self_heal_verified_exit_claims_no_tested_draft_on_partial_coverage(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(
+            turn_origin=TurnOrigin.runtime_self_heal,
+            persisted_workflow_yaml=staged,
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
+            last_workflow_yaml=staged,
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+
+        result = agent_module._build_wip_exit_result(
+            ctx,
+            None,
+            default_reply="No draft.",
+            unvalidated_reply=agent_module._TIMEOUT_REPLY_UNVALIDATED,
+            tested_reply=agent_module._TIMEOUT_REPLY_TESTED,
+            terminal_reason="max_turns",
+        )
+
+        assert outcome_fully_verified(ctx) is True
+        assert result.proposal_disposition == "auto_applicable"
+        assert "tested draft" not in result.user_response
+
+    def test_a_partially_covered_last_good_draft_claims_no_tested_draft(self) -> None:
+        staged = self._two_block_yaml()
+        good = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            persisted_workflow_yaml=staged,
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
+            last_workflow_yaml=self._two_block_yaml("Read it twice"),
+            last_good_workflow=good,
+            last_good_workflow_yaml=staged,
+        )
+        ctx.executed_block_fingerprints = {"sign_in": set(workflow_block_fingerprints(staged)["sign_in"])}
+        ctx.executed_block_labels = {"sign_in"}
+
+        result = agent_module._build_wip_exit_result(
+            ctx,
+            None,
+            default_reply="No draft.",
+            unvalidated_reply=agent_module._TIMEOUT_REPLY_UNVALIDATED,
+            tested_reply=agent_module._TIMEOUT_REPLY_TESTED,
+            terminal_reason="max_turns",
+        )
+
+        assert result.updated_workflow is good
+        assert "tested draft" not in result.user_response
+        assert result.proposal_disposition == "review_untested"

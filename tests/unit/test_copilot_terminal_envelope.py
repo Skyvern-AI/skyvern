@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    MINIMAL_HONEST_STOP,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
     finalize_applied_state,
@@ -456,7 +457,26 @@ def test_render_terminal_message_stopped_not_demonstrated_contains_verbatim_reas
     assert all(phrase not in lowered for phrase in forbidden_phrases)
 
 
-def test_render_terminal_message_stopped_degraded_envelope_uses_minimal_honest_stop() -> None:
+def test_render_terminal_message_stopped_without_recorded_facts_keeps_the_agent_text() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        run_verdict=None,
+        run_display_reason=None,
+        response_kind="stopped",
+    )
+    message = "The portal does not expose invoices; archived statements are emailed instead."
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    # The agent's own explanation survives intact, but a stopped turn with no run behind
+    # it still says so -- the renderer cannot tell an honest explanation from a claim.
+    assert replaced is True
+    assert rendered.startswith(message)
+    assert rendered.endswith(MINIMAL_HONEST_STOP)
+
+
+def test_render_terminal_message_stopped_falls_back_to_honest_stop_without_agent_text() -> None:
     envelope = TerminalOutcomeEnvelope(
         next_state="stopped",
         verified=False,
@@ -465,10 +485,10 @@ def test_render_terminal_message_stopped_degraded_envelope_uses_minimal_honest_s
         response_kind="stopped",
     )
 
-    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+    rendered, replaced = render_terminal_message(envelope, "   ", cancelled=False)
 
     assert replaced is True
-    assert rendered == "I stopped without confirming the goal was met."
+    assert rendered == MINIMAL_HONEST_STOP
 
 
 def test_render_terminal_message_stopped_with_a_recorded_run_reports_that_it_ran() -> None:
@@ -476,6 +496,7 @@ def test_render_terminal_message_stopped_with_a_recorded_run_reports_that_it_ran
         next_state="stopped",
         verified=False,
         run_verdict="not_evaluated",
+        run_completed=True,
         run_display_reason=None,
         response_kind="stopped",
     )
@@ -483,7 +504,14 @@ def test_render_terminal_message_stopped_with_a_recorded_run_reports_that_it_ran
     rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
 
     assert replaced is True
-    assert rendered == "I ran the workflow. The latest recorded run completed."
+    assert rendered == "legacy. The recorded run completed, and its outcome was not evaluated."
+
+    # Lifecycle is read from the recorded run, never inferred from the verdict: without a
+    # recorded completion the same verdict may not claim the run finished.
+    unknown_lifecycle = envelope.model_copy(update={"run_completed": None})
+    rendered_unknown, _ = render_terminal_message(unknown_lifecycle, "legacy", cancelled=False)
+    assert rendered_unknown == "legacy. The recorded run's outcome was not evaluated."
+    assert "completed" not in rendered_unknown
 
 
 def test_render_terminal_message_no_run_blocker_stop_keeps_blocker_evidence() -> None:
@@ -497,10 +525,12 @@ def test_render_terminal_message_no_run_blocker_stop_keeps_blocker_evidence() ->
         response_kind="stopped",
     )
 
-    rendered, replaced = render_terminal_message(envelope, "legacy", cancelled=False)
+    message = "The portal does not expose invoices; archived statements are emailed instead."
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
 
     assert replaced is True
-    assert rendered.startswith("I stopped without confirming the goal was met.")
+    assert rendered.startswith(message)
     assert blocker in rendered
 
 
@@ -596,18 +626,28 @@ def test_render_terminal_message_keeps_deadline_copy_on_stopped_fallthrough() ->
 
     assert envelope.next_state == "stopped"
     assert envelope.response_kind == "stopped"
-    assert rendered == message
+    assert rendered.startswith(message)
     assert rendered != "I stopped without confirming the goal was met."
     assert replaced is True
 
 
-def test_render_terminal_message_still_generic_without_deadline_cause() -> None:
-    envelope = _assemble(proposal_disposition="auto_applicable", run_outcomes=[])
+def test_render_terminal_message_under_budget_stop_keeps_the_reply_and_names_the_unevaluated_outcome() -> None:
+    envelope = _assemble(
+        proposal_disposition="auto_applicable",
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1", run_completed=True)],
+        blocks_run_this_turn=1,
+    )
+    message = "I built and end-to-end tested the workflow, and verified the account and date range match."
 
-    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_DEFAULT, cancelled=False)
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
 
-    assert rendered == "I stopped without confirming the goal was met."
+    assert envelope.next_state == "stopped"
+    assert envelope.response_kind == "stopped"
     assert replaced is True
+    assert rendered.startswith(message)
+    assert "1 block ran this turn." in rendered
+    assert "The recorded run completed, and its outcome was not evaluated." in rendered
+    assert "The latest recorded run completed." not in rendered
 
 
 def test_render_terminal_message_held_draft_text_survives_with_deadline_cause() -> None:
@@ -617,7 +657,7 @@ def test_render_terminal_message_held_draft_text_survives_with_deadline_cause() 
     rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
 
     assert envelope.next_state == "proposal_pending"
-    assert rendered == message
+    assert rendered.startswith(message)
     assert replaced is True
 
 
@@ -677,7 +717,9 @@ def test_run_without_output_projects_unverified_blocker_never_success() -> None:
     assert finalized.response_kind == "stopped"
     assert finalized.run_output_report is None
     assert finalized.blocker_reason == blocker
-    assert rendered == agent_module._TIMEOUT_REPLY_DEFAULT
+    assert rendered.startswith(agent_module._TIMEOUT_REPLY_DEFAULT)
+    assert "The recorded run's outcome was not evaluated." in rendered
+    assert "The turn reached its time limit." in rendered
     assert replaced is True
     assert "completed" not in rendered.lower()
     assert "success" not in rendered.lower()
@@ -777,3 +819,98 @@ def test_max_turns_exit_has_no_cause_when_neither_latch_is_set() -> None:
 
     assert result.terminal_envelope is not None
     assert result.terminal_envelope["terminal_cause"] is None
+
+
+def test_a_deadline_turn_states_blocks_run_evaluation_and_the_time_limit() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_tested",
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", run_completed=True)],
+        terminal_cause="deadline_expired",
+        blocks_run_this_turn=1,
+    )
+
+    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
+
+    assert "1 block ran this turn." in rendered
+    assert "The recorded run completed, and its outcome was not evaluated." in rendered
+    assert "reached its time limit" in rendered
+    assert "failed" not in rendered.lower()
+    assert replaced is True
+
+
+def test_an_unevaluated_outcome_alone_never_claims_the_run_finished() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_tested",
+        run_outcomes=[_run_outcome("not_evaluated")],
+        terminal_cause="deadline_expired",
+        blocks_run_this_turn=1,
+    )
+
+    rendered, _ = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
+
+    assert "The recorded run's outcome was not evaluated." in rendered
+    assert "run completed" not in rendered
+
+
+@pytest.mark.parametrize("run_outcomes", [[], [_run_outcome("evaluating")]])
+def test_a_deadline_turn_without_a_settled_verdict_states_only_what_it_knows(
+    run_outcomes: list[RecordedRunOutcome],
+) -> None:
+    envelope = _assemble(
+        proposal_disposition="review_tested",
+        run_outcomes=run_outcomes,
+        terminal_cause="deadline_expired",
+        blocks_run_this_turn=2,
+    )
+
+    rendered, _ = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
+
+    assert "2 blocks ran this turn." in rendered
+    assert "reached its time limit" in rendered
+    assert "not evaluated" not in rendered
+
+
+def test_a_deadline_turn_with_no_run_facts_leaves_the_agent_copy_alone() -> None:
+    envelope = _assemble(proposal_disposition="review_tested", terminal_cause="deadline_expired")
+
+    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_UNVALIDATED, cancelled=False)
+
+    assert rendered == agent_module._TIMEOUT_REPLY_UNVALIDATED
+    assert replaced is True
+
+
+def test_a_deadline_turn_omits_the_block_count_it_was_never_given() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_tested",
+        run_outcomes=[_run_outcome("not_evaluated")],
+        terminal_cause="deadline_expired",
+    )
+
+    rendered, _ = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
+
+    assert "ran this turn" not in rendered
+    assert "reached its time limit" in rendered
+
+
+def test_the_envelope_carries_the_recorded_run_id() -> None:
+    envelope = _assemble(run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1")])
+
+    assert envelope.run_id == "wr_1"
+
+
+def test_run_lifecycle_and_run_id_name_the_same_archived_outcome() -> None:
+    completed = _assemble(
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1", run_completed=True)]
+    )
+
+    assert completed.run_id == "wr_1"
+    assert completed.run_completed is True
+
+    halted = _assemble(
+        run_outcomes=[
+            RecordedRunOutcome(verdict="not_demonstrated", workflow_run_id="wr_2", run_completed=False),
+        ]
+    )
+
+    assert halted.run_id == "wr_2"
+    assert halted.run_completed is False

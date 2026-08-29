@@ -138,6 +138,7 @@ def _terminal_payload(
     workflow_applied: bool,
     workflow_mutated: bool = True,
     workflow_attempted: bool = True,
+    blocks_run_this_turn: int = 0,
 ) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
@@ -150,6 +151,7 @@ def _terminal_payload(
         attempted="Attempted full run.",
         workflow_mutated=workflow_mutated,
         workflow_attempted=workflow_attempted,
+        blocks_run_this_turn=blocks_run_this_turn,
     )
     assert envelope is not None
     return envelope.model_dump(mode="json")
@@ -662,7 +664,7 @@ async def test_finalise_normal_turn_logs_render_decision(
     decisions = [entry for entry in logs if entry["event"] == "copilot_terminal_render_decision"]
     assert len(decisions) == 1
     assert decisions[0]["flag_enabled"] is flag_enabled
-    # This fixture's envelope is a stopped/stopped shape, so flag-on replaces.
+    # This fixture's envelope is a stopped/stopped shape, so flag-on appends recorded facts.
     assert decisions[0]["replaced"] is flag_enabled
     assert decisions[0]["next_state"] == "stopped"
     assert decisions[0]["response_kind"] == "stopped"
@@ -707,7 +709,7 @@ async def test_finalise_normal_turn_flag_on_stopped_envelope_renders_terminal_te
         agent_result=agent_result,
     )
 
-    expected = "I stopped without confirming the goal was met."
+    expected = "done. 0 blocks ran this turn."
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
     assert response_frame.message == expected
