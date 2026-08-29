@@ -2417,11 +2417,10 @@ def test_store_post_run_page_evidence_refuses_a_packet_read_from_another_browser
     assert "workflow_run_id" not in stored
     assert any(entry["event"] == _SOURCE_MISMATCH_EVENT for entry in logs)
 
-    same_session_twin = recorded_outcome_from_run_blocks_result(
+    refused = recorded_outcome_from_run_blocks_result(
         _cross_session_run_result(), page_evidence={**stored, "source_browser_session_id": "pbs_run"}
     )
-    assert same_session_twin is not None
-    assert any("example.test" in ref for ref in same_session_twin.page_evidence_refs)
+    assert refused is None
 
 
 def test_unknown_run_session_grants_a_foreign_packet_so_producers_must_stamp_the_run_session() -> None:
@@ -2668,7 +2667,7 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
 
     monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_page(
+    capture = await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
     )
 
@@ -2677,8 +2676,56 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
     assert evidence["workflow_run_id"] == "wr_failed"
     assert evidence["observed_after_workflow_run"] is True
     assert post_run_inspection_cleanly_matches(evidence, "wr_failed")
+    assert capture.status == "captured"
     assert ctx.page_inspection_calls_this_turn == 0
     assert ctx.browser_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_post_run_capture_refused_for_a_foreign_session_reports_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+    async def fake_read(
+        _ctx: CopilotContext, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, object], str, None, None]:
+        return _bounded_failure_page_evidence(), "foreign_session", None, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
+
+    capture = await run_execution_module._capture_and_store_post_run_page(
+        ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
+    )
+
+    assert capture.status == "unavailable"
+    assert capture.omission == "page_capture_unavailable"
+    assert run_execution_module._same_run_page_evidence_for_result(ctx, "wr_failed") is None
+
+
+@pytest.mark.asyncio
+async def test_screenshot_capture_failure_keeps_a_typed_omission_on_structured_page_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    monkeypatch.setattr(
+        composition_capture_module,
+        "_composition_get_screenshot",
+        AsyncMock(return_value={"ok": False, "error": "browser session unavailable"}),
+    )
+
+    evidence, captured_frame = await composition_capture_module._augment_composition_evidence_with_visual_fallback(
+        ctx,
+        {
+            "current_url": "https://example.test/checkout/payment",
+            "forms": [{"submit_controls": [{"text": "Place order", "disabled": False}]}],
+        },
+    )
+
+    assert captured_frame is None
+    assert evidence["visual_capture_omissions"] == ["screenshot_capture_failed"]
+    assert evidence["forms"] == [{"submit_controls": [{"text": "Place order", "disabled": False}]}]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -35,6 +36,7 @@ from skyvern.forge.sdk.copilot.output_utils import project_build_test_packet_for
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _authored_literal_locator_selectors,
     _failed_block_code,
@@ -1836,6 +1838,287 @@ def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_ll
     assert compacted.failure is not None and compacted.failure.page_state is not None
     assert any("repeated packet facts shortened further" in notice for notice in compacted.omission_notices)
     assert compacted.failure.page_state.action_summaries == ["Continue to statements disabled", "Section 0"]
+
+
+def test_screenshot_ablation_replays_preserve_page_facts_without_minting_a_decision() -> None:
+    """A missing frame changes only capture facts; the recorded run's failure remains a run fact."""
+
+    def rendered_bytes(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    def replay(*, screenshot_present: bool) -> tuple[dict[str, object], dict[str, object], str]:
+        ctx = _locator_packet_ctx()
+        page_evidence: dict[str, object] = {
+            "workflow_run_id": "wr_capture_failure",
+            "source_browser_session_id": "pbs_capture_failure",
+            "run_browser_session_id": "pbs_capture_failure",
+            "observed_after_workflow_run": True,
+            "source_tool": "inspect_page_for_composition",
+            "current_url": "https://example.test/checkout/payment",
+            "forms": [{"submit_controls": [{"text": "Place order", "disabled": False}]}],
+            "clickable_controls": [{"text": "Continue to payment", "disabled": False}],
+            **({} if screenshot_present else {"visual_capture_omissions": ["screenshot_capture_failed"]}),
+        }
+        result: dict[str, object] = {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_capture_failure",
+                "browser_session_id": "pbs_capture_failure",
+                "overall_status": "failed",
+                "requested_block_labels": ["continue_to_payment"],
+                "executed_block_labels": ["continue_to_payment"],
+                "blocks": [
+                    {
+                        "label": "continue_to_payment",
+                        "status": "failed",
+                        "failure_reason": "Click did not reach payment options.",
+                    }
+                ],
+                "post_run_page_evidence": page_evidence,
+                **({"screenshot_base64": "c2NyZWVuc2hvdA=="} if screenshot_present else {}),
+            },
+        }
+        stored, preserved = store_post_run_page_evidence(
+            ctx,
+            page_evidence,
+            run_id="wr_capture_failure",
+            current_url="https://example.test/checkout/payment",
+            source_browser_session_id="pbs_capture_failure",
+            run_browser_session_id="pbs_capture_failure",
+        )
+        assert preserved is False
+        assert stored["observed_after_workflow_run"] is True
+        result["data"]["post_run_page_evidence"] = run_execution_module._same_run_page_evidence_for_result(
+            ctx, "wr_capture_failure"
+        )
+        outcome = recorded_outcome_from_run_blocks_result(
+            result,
+            page_evidence=result["data"]["post_run_page_evidence"],
+        )
+        assert outcome is not None
+        packet = project_build_test_packet_for_llm(
+            build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+        ).model_dump(mode="json", exclude_none=True)
+        ordinary_input = _build_user_context(
+            workflow_yaml=ctx.workflow_yaml,
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text=_prior_run_debug_text(packet),
+            user_message="Repair the recorded run.",
+        )
+        return outcome.model_dump(mode="json"), packet, ordinary_input
+
+    with_screenshot = [replay(screenshot_present=True) for _ in range(3)]
+    without_screenshot = [replay(screenshot_present=False) for _ in range(3)]
+    assert len({rendered_bytes(replay_outcome) for replay_outcome, _, _ in with_screenshot}) == 1
+    assert len({rendered_bytes(replay_outcome) for replay_outcome, _, _ in without_screenshot}) == 1
+    assert len({rendered_bytes(packet) for _, packet, _ in with_screenshot}) == 1
+    assert len({rendered_bytes(packet) for _, packet, _ in without_screenshot}) == 1
+
+    baseline_outcome, baseline_packet, _ = with_screenshot[0]
+    missing_outcome, missing_packet, ordinary_input = without_screenshot[0]
+    assert {key: value for key, value in baseline_outcome.items() if key != "page_capture"} == {
+        key: value for key, value in missing_outcome.items() if key != "page_capture"
+    }
+    assert missing_packet["page_capture"] == {"status": "captured", "omission": "screenshot_capture_failed"}
+    assert baseline_packet["screenshot"]["present"] is True
+    assert missing_packet["screenshot"]["present"] is False
+    assert {
+        key: value
+        for key, value in baseline_packet.items()
+        if key not in {"page_capture", "screenshot", "omission_notices"}
+    } == {
+        key: value
+        for key, value in missing_packet.items()
+        if key not in {"page_capture", "screenshot", "omission_notices"}
+    }
+    assert not {"success_verdict", "terminal", "repair_decision"}.intersection(missing_packet)
+    decision_surface = {
+        key: value
+        for key, value in missing_packet.items()
+        if key not in {"page_capture", "screenshot", "omission_notices"}
+    }
+    assert b"success_verdict" not in rendered_bytes(decision_surface)
+    assert b"terminal" not in rendered_bytes(decision_surface)
+    assert b"repair_decision" not in rendered_bytes(decision_surface)
+    assert '"workflow_run_id": "wr_capture_failure"' in ordinary_input
+    assert '"browser_session_id": "pbs_capture_failure"' in ordinary_input
+    assert "Place order" in ordinary_input
+    assert "Continue to payment" in ordinary_input
+    assert '"screenshot_capture_failed"' in ordinary_input
+
+
+def test_unavailable_page_capture_is_a_typed_omission_without_invented_page_state() -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_page_unavailable",
+            "overall_status": "failed",
+            "failure_type": "runtime_error",
+            "requested_block_labels": ["continue_to_payment"],
+            "executed_block_labels": ["continue_to_payment"],
+            "blocks": [
+                {
+                    "label": "continue_to_payment",
+                    "status": "failed",
+                    "failure_reason": "Click did not reach payment options.",
+                }
+            ],
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+        },
+    }
+
+    replayed_outcomes_and_packets = []
+    for _ in range(3):
+        outcome = recorded_outcome_from_run_blocks_result(result)
+        assert outcome is not None
+        packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+        replayed_outcomes_and_packets.append((outcome, packet))
+    assert len({outcome.model_dump_json() for outcome, _ in replayed_outcomes_and_packets}) == 1
+    assert len({packet.model_dump_json() for _, packet in replayed_outcomes_and_packets}) == 1
+    outcome, packet = replayed_outcomes_and_packets[0]
+
+    assert outcome.page_capture is not None
+    assert outcome.page_capture.status == "unavailable"
+    assert outcome.page_capture.omission == "page_capture_unavailable"
+    assert packet.page_capture == outcome.page_capture
+    assert packet.failure is not None and packet.failure.page_state is None
+    assert packet.page_state is None
+    assert "success_verdict" not in packet.model_dump_json()
+    assert "repair_decision" not in packet.model_dump_json()
+    assert "terminal" not in packet.model_dump_json()
+
+
+def test_stale_page_evidence_cannot_infer_a_capture_for_the_current_run() -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_current",
+            "browser_session_id": "pbs_current",
+            "overall_status": "failed",
+            "failure_type": "runtime_error",
+            "blocks": [{"label": "continue", "status": "failed", "failure_reason": "Click failed."}],
+        },
+    }
+    stale_scout_packet = {
+        "source_browser_session_id": "pbs_current",
+        "observed_after_workflow_run": False,
+        "forms": [{"submit_controls": [{"text": "Place order", "disabled": False}]}],
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result, page_evidence=stale_scout_packet)
+    assert outcome is not None
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert outcome.page_capture is None
+    assert outcome.page_evidence_refs == []
+    assert packet.page_capture is None
+
+
+def test_required_input_unbound_outcome_preserves_the_typed_capture_fact() -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_unbound",
+            "overall_status": "failed",
+            "blocks": [{"label": "continue", "status": "failed", "failure_reason": "Input was not bound."}],
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        unbound_required_parameter_keys=["checkout_id"],
+        block_parameter_keys={"continue": ["checkout_id"]},
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "required_input_unbound"
+    assert outcome.page_capture is not None
+    assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
+
+
+@pytest.mark.parametrize(
+    "return_path",
+    [
+        "terminal_challenge",
+        "demonstrated",
+        "not_evaluated",
+        "no_structural_identity",
+        "degraded_floor",
+        "recorded_failed_block",
+        "run_failed_block",
+    ],
+)
+def test_every_run_outcome_return_path_preserves_the_typed_capture_fact(return_path: str) -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_capture_paths",
+            "overall_status": "failed",
+            "failure_type": "runtime_error",
+            "blocks": [{"label": "continue", "status": "failed", "failure_reason": "Click failed."}],
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+        },
+    }
+    recorded_run_outcome: RecordedRunOutcome | None = None
+    completion_verification: CompletionVerificationResult | None = None
+    if return_path == "terminal_challenge":
+        recorded_run_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="terminal_challenge_blocker",
+            workflow_run_id="wr_capture_paths",
+        )
+    elif return_path == "demonstrated":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": []}}
+        recorded_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_capture_paths")
+    elif return_path == "not_evaluated":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": []}}
+        recorded_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_capture_paths")
+    elif return_path == "no_structural_identity":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": [], "failure_type": None}}
+        recorded_run_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            workflow_run_id="wr_capture_paths",
+        )
+    elif return_path == "degraded_floor":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": [], "failure_type": None}}
+        recorded_run_outcome = RecordedRunOutcome(verdict="not_demonstrated", workflow_run_id="wr_capture_paths")
+        completion_verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="no_evidence")],
+            degraded_criterion_ids=["c0"],
+        )
+    elif return_path == "recorded_failed_block":
+        recorded_run_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            workflow_run_id="wr_capture_paths",
+        )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=recorded_run_outcome,
+        completion_verification=completion_verification,
+    )
+
+    assert outcome is not None
+    assert outcome.page_capture is not None
+    assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
+
+
+def test_page_capture_rejects_an_unavailable_page_without_its_typed_omission() -> None:
+    with pytest.raises(ValidationError, match="page_capture_unavailable"):
+        BuildTestEvidencePacket.model_validate(
+            {
+                "canonical_workflow_source": "unavailable",
+                "run": {},
+                "screenshot": {"present": False},
+                "page_capture": {"status": "unavailable"},
+            }
+        )
 
 
 def test_locator_observations_reach_the_failure_packet() -> None:
