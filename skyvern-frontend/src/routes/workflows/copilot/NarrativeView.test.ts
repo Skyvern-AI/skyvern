@@ -1101,6 +1101,19 @@ const draft3 = {
   summary: null,
 };
 
+// What the backend publishes for a draft whose blocks all ran clean on current source.
+const testedFacts = {
+  factsAvailable: true,
+  authoredBlockCount: 3,
+  matchingSourceBlockCount: 3,
+  evaluationState: null,
+  runId: "wr_1",
+  runCompleted: true,
+  terminalCause: null,
+  blocksRunThisTurn: 3,
+  ranCleanOnCurrentSource: true,
+} as const;
+
 describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
   it("hydrates responseKind without inventing an authoring success stamp", () => {
     const turn = hydrateNarrativeFromPayload(
@@ -1348,8 +1361,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       responseType: "REPLY",
     });
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
@@ -1417,7 +1430,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     },
   );
 
-  it("renders a verdict-authorized tested success green with drafts", () => {
+  it("names the build without claiming it was tested when no coverage facts arrive", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -1425,12 +1438,12 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
-  it("renders a verdict-authorized edit turn green", () => {
+  it("names an edit turn without claiming a re-test when no coverage facts arrive", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -1438,8 +1451,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Applied edits and re-tested");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Applied edits");
+    expect(summary.accent).toBe("qa");
   });
 
   it("does not infer a completed run from a build response kind alone", () => {
@@ -1471,8 +1484,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
@@ -1489,8 +1502,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Applied edits and re-tested");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Applied edits");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
@@ -1509,7 +1522,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         proposalDisposition: "review_tested",
         responseKind: "build",
       }),
-      "Workflow ready for review",
+      // No facts back the tested framing, so the card states what it built and no more.
+      "Built the workflow",
     ],
   ])(
     "keeps stopped or review-required states when there is no clean completed run (%#)",
@@ -1525,6 +1539,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const askTurn = buildTurn({
       draft: draft3,
       proposalDisposition: "review_tested",
+      turnFacts: testedFacts,
       responseKind: "clarify",
       responseType: "ASK_QUESTION",
       terminalMessage: "Is that output format okay?",
@@ -1568,8 +1583,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
   it("legacy payload without adjudication renders via the unchanged inference chain", () => {
     const turn = hydrateNarrativeFromPayload(reproClarifyPayload())!;
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.stats).toEqual(["15:02", "3 blocks ran", "3 new"]);
   });
 });
@@ -1593,6 +1608,7 @@ describe("computeTurnSummary — disposition-first reorder", () => {
         responseKind: "clarify",
         draft: draft3,
         proposalDisposition: "review_tested",
+        turnFacts: testedFacts,
       }),
     );
     expect(summary.headline).toBe("Workflow ready for review");
@@ -1692,8 +1708,8 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
     })!;
     expect(turn.responseKind).toBe("build");
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
   });
 
   it("tolerates missing or unknown turn_outcome", () => {

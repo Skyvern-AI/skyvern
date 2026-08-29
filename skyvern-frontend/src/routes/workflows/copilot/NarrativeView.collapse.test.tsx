@@ -60,7 +60,7 @@ const inFlightTurn = (): TurnNarrativeState => ({
   terminal: null,
 });
 
-const HEADLINE = "Built and tested the workflow";
+const HEADLINE = "Built the workflow";
 const REVIEW_HEADLINE = "Draft needs review";
 const REVIEW_TESTED_HEADLINE = "Workflow ready for review";
 const LONG_OUTCOME_REASON =
@@ -124,6 +124,18 @@ describe("NarrativeView collapse default", () => {
         turn={{
           ...terminalBuildTurn(),
           proposalDisposition: "review_tested",
+          // One block, run clean on current source — what backs a tested review proposal.
+          turnFacts: {
+            factsAvailable: true,
+            authoredBlockCount: 1,
+            matchingSourceBlockCount: 1,
+            evaluationState: null,
+            runId: "wr_1",
+            runCompleted: true,
+            terminalCause: null,
+            blocksRunThisTurn: 1,
+            ranCleanOnCurrentSource: true,
+          },
           narrativeSummary: "Workflow ready for review.",
         }}
       />,
