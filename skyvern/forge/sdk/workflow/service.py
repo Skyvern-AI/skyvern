@@ -925,17 +925,18 @@ def truncate_oversized_response_value(
 
 @dataclass(frozen=True)
 class DebugSessionProfileDecision:
-    """Asymmetric decision for LoginBlock credential-profile flow.
+    """Decision for LoginBlock credential-profile flow.
 
     attach_browser_session_id: the PBS id to thread into
-        BROWSER_MANAGER.get_or_create_for_workflow_run so the visible browser
-        is the one the agent acts on. None for non-debug runs (preserve
-        existing behavior — credential-profile launches a fresh browser).
+        BROWSER_MANAGER.get_or_create_for_workflow_run so the visible/supplied
+        browser is the one the agent acts on. None when the run has no explicit
+        browser_session_id (preserve existing behavior — credential-profile
+        launches a fresh browser).
 
-    incompatible_reason: None when compatible / non-debug; otherwise the
-        structured reason for the warning emit. Callers branch on this:
+    incompatible_reason: None when compatible / no explicit session; otherwise
+        the structured reason for the warning emit. Callers branch on this:
         None → take the existing skip-login fast path, set → emit the
-        structured warning, attach the PBS, fall through to ordinary login.
+        structured warning, attach the session, fall through to ordinary login.
     """
 
     attach_browser_session_id: str | None
@@ -7089,14 +7090,14 @@ class WorkflowService:
             )
 
             if decision.incompatible_reason is not None:
-                # Debug session whose visible PBS is profile-incompatible.
-                # Stream fidelity wins: attach the visible PBS so the user
-                # can watch the action, but DO NOT write
+                # The run's explicit browser session is profile-incompatible.
+                # Live-session fidelity wins: attach that session so the run (or
+                # the user watching a debug session) sees it, but DO NOT write
                 # workflow_run.browser_profile_id, DO NOT rewrite the
                 # navigation_goal, and DO NOT emit "skipping login agent".
                 # Fall through to ordinary LoginBlock execution below.
                 LOG.warning(
-                    "Debug session profile incompatible with LoginBlock credential",
+                    "Explicit browser session profile incompatible with LoginBlock credential",
                     code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
                     reason=decision.incompatible_reason,
                     workflow_run_id=workflow_run_id,
@@ -7591,16 +7592,13 @@ class WorkflowService:
         resolved_browser_profile_id: str,
         organization_id: str,
     ) -> DebugSessionProfileDecision:
-        """Asymmetric LoginBlock credential-profile decision: debug-session runs
-        attach the visible PBS only when its saved profile matches the credential
-        profile; mismatches surface a reason for downstream warning + fall-through."""
-        is_debug_run = workflow_run.is_debug_session
-        if not is_debug_run:
-            return DebugSessionProfileDecision(
-                attach_browser_session_id=None,
-                incompatible_reason=None,
-            )
-
+        """LoginBlock credential-profile decision: a run with an explicit
+        browser_session_id (a debug session, or one supplied by a caller such as
+        MCP's skyvern_login) attaches that live session and only skips the
+        login agent when its saved profile matches the credential profile;
+        mismatches surface a reason for downstream warning + fall-through. A
+        run with no explicit session keeps the legacy behavior: the credential
+        profile boots a fresh browser."""
         if not browser_session_id:
             return DebugSessionProfileDecision(
                 attach_browser_session_id=None,

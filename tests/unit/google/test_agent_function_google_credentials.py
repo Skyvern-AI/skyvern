@@ -203,6 +203,43 @@ async def test_get_google_workspace_credentials_returns_none_when_encryption_dis
 
 
 @pytest.mark.asyncio
+async def test_get_google_workspace_credentials_resolves_a_connection_name_to_its_credential_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive/Docs/Gmail blocks carry the connection's display name, same as Sheets blocks
+    did before SKY-15024's fix; the workspace path must resolve it too or a fully connected
+    account fails with the same "no valid access token" message a bad id would produce."""
+    connection = SimpleNamespace(
+        id="goac_9",
+        credential_name="Ada's Docs",
+        email_address=None,
+        state=google_oauth_service.STATE_ACTIVE,
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "get_visible_credentials_for_org",
+        AsyncMock(return_value=[connection]),
+    )
+    secrets = google_oauth_service.GoogleCredentialSecrets(refresh_token="rt", scopes=[])
+    fake_credentials = SimpleNamespace(token="ya29.access-token")
+    load_secrets = AsyncMock(return_value=secrets)
+    monkeypatch.setattr(google_oauth_service, "load_credential_secrets", load_secrets)
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=fake_credentials),
+    )
+
+    result = await AgentFunction().get_google_workspace_credentials(
+        organization_id="org_1",
+        credential_id="Ada's Docs",
+    )
+
+    assert result is fake_credentials
+    load_secrets.assert_awaited_once_with(organization_id="org_1", credential_id="goac_9")
+
+
+@pytest.mark.asyncio
 async def test_get_google_workspace_credentials_returns_none_on_unexpected_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

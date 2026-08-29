@@ -1841,6 +1841,7 @@ class AgentFunction:
         ``required_scopes`` gates use of a credential whose grant does not cover
         the API the caller is about to use.
         """
+        credential_id = await self.resolve_google_credential_id(organization_id, credential_id)
         try:
             secrets = await google_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
