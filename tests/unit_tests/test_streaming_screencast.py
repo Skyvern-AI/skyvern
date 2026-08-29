@@ -9,6 +9,7 @@ from unittest.mock import ANY, AsyncMock, Mock
 import pytest
 from fastapi import WebSocketDisconnect
 
+from skyvern.forge.sdk.encrypt.base import TokenDecryptionError
 from tests.unit_tests._stub_streaming import import_with_stubs
 
 screencast = import_with_stubs(
@@ -128,6 +129,30 @@ async def test_wait_for_browser_state_returns_none_on_timeout(monkeypatch: pytes
     assert result is None
     assert resolve_mock.await_count == 3
     assert browser_state.get_working_page.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_wait_for_browser_state_gives_up_when_the_org_token_cannot_be_decrypted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The candidate key set is fixed for the process, so every remaining poll would pay a browser
+    attach to fail identically. SKY-15074 burned 480 attaches per websocket that way."""
+    resolve_mock = AsyncMock(side_effect=TokenDecryptionError("Failed to decrypt token"))
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(screencast, "_resolve_browser_state", resolve_mock)
+    monkeypatch.setattr(screencast.asyncio, "sleep", sleep_mock)
+
+    result = await screencast.wait_for_browser_state(
+        "pbs_1",
+        "browser_session",
+        timeout=0.3,
+        poll_interval=0.1,
+        organization_id="o_1",
+    )
+
+    assert result is None
+    assert resolve_mock.await_count == 1
+    sleep_mock.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
