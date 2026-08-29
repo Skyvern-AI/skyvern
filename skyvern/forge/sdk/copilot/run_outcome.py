@@ -42,6 +42,9 @@ class RecordedRunOutcome:
     display_reason: str | None = None
     workflow_run_id: str | None = None
     output_report: str | None = None
+    # Recorded lifecycle, kept apart from ``verdict``: reaching a completed status says
+    # nothing about whether the outcome was evaluated. ``None`` on frames predating the field.
+    run_completed: bool | None = None
     # ``adjudicated`` remains accepted for persisted legacy frames. New
     # interactive authoring frames are factual records.
     role: RunOutcomeRole = "recorded"
