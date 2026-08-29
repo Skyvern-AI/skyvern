@@ -46,7 +46,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.result_evidence import scout_observation_bound_paths
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, bound_call_browser_session
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
@@ -1731,6 +1731,37 @@ class TestTerminalActionObservationStampSeam:
             )
         assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
         assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
+
+    def test_an_interaction_records_the_browser_it_was_demonstrated_in(self) -> None:
+        # Untagged, a commit demonstrated on the page a run failed on is indistinguishable from one
+        # the chat drove itself. The tag is provenance the model reads; it withholds no credit.
+        ctx = self._ctx_with(self._terminal_action_criterion())
+
+        with bound_call_browser_session("pbs_run"):
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="click",
+                selector="#find-address",
+                source_url=self._BUSINESS_URL,
+                role="button",
+                accessible_name="Find Address",
+            )
+
+        assert ctx.scout_trajectory[-1]["demonstrated_browser_session_id"] == "pbs_run"
+
+    def test_an_interaction_in_the_chats_own_browser_carries_no_browser_tag(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector="#find-address",
+            source_url=self._BUSINESS_URL,
+            role="button",
+            accessible_name="Find Address",
+        )
+
+        assert "demonstrated_browser_session_id" not in ctx.scout_trajectory[-1]
 
     def test_matching_prior_page_observation_marks_demonstrated_control_readiness(self) -> None:
         ctx = self._ctx_with()

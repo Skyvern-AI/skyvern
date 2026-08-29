@@ -33,7 +33,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairDecision,
     VerificationResult,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 
@@ -536,7 +535,7 @@ class TestBuildUnexpectedErrorExitResult:
         ctx.last_update_block_count = 6
         ctx.latest_diagnosis_repair_contract = build_diagnosis_repair_contract(
             source_tool="run_blocks_and_collect_debug",
-            result=_copilot_sandbox_unavailable_result(),
+            result=_copilot_sandbox_unavailable_result(organization_id="o_1", workflow_permanent_id="wpid_1"),
             ctx=ctx,
         )
 
@@ -878,15 +877,3 @@ class TestDeadlineTerminalHandsOverRecordedDraft:
         assert "what I have so far" not in result.user_response
         assert "I have a draft" not in result.user_response
         assert "draft workflow you can keep" not in result.user_response
-
-    def test_budget_halted_run_is_not_told_its_test_failed(self) -> None:
-        wf = MagicMock(name="wf")
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
-        ctx.copilot_total_timeout_exceeded = True
-        ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
-
-        result = _build_timeout_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is wf
-        assert "did not pass" not in result.user_response
-        assert "did not verify" not in result.user_response

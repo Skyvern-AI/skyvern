@@ -89,7 +89,6 @@ async def test_copilot_turn_span_parents_inner_spans(
         chat_request=chat_request,
         chat_history=chat_history,
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
     )
 
@@ -125,7 +124,6 @@ async def test_copilot_turn_span_uses_explicit_turn_index(
         chat_request=chat_request,
         chat_history=chat_history,
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
         turn_index=42,
     )
@@ -147,7 +145,6 @@ async def test_copilot_turn_span_omits_session_id_when_missing(
         chat_request=chat_request,
         chat_history=[],
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
     )
 
@@ -170,7 +167,6 @@ async def test_copilot_turn_span_ingress_telemetry_is_content_free(
         chat_request=chat_request,
         chat_history=[],
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
     )
 
@@ -194,7 +190,6 @@ async def test_outer_turn_recovery_records_error_attrs_on_turn_span(
         chat_request=chat_request,
         chat_history=[],
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
     )
 
@@ -239,7 +234,6 @@ async def test_outer_turn_recovery_preserves_browser_ablation_session_for_cleanu
         chat_request=_make_chat_request(),
         chat_history=[],
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
         api_key="sk-test",
         eval_mode=copilot_agent.CopilotEvalMode.BROWSER_ABLATION,
@@ -282,7 +276,6 @@ async def test_cancelled_browser_ablation_turn_closes_created_session(
             chat_request=_make_chat_request(),
             chat_history=[],
             global_llm_context=None,
-            debug_run_info_text="",
             llm_api_handler=None,
             api_key="sk-test",
             eval_mode=copilot_agent.CopilotEvalMode.BROWSER_ABLATION,

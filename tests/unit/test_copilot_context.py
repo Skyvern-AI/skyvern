@@ -23,7 +23,10 @@ from skyvern.forge.sdk.copilot.context import (
     sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    redact_raw_secrets_for_structured_prompt,
+    redact_raw_secrets_in_object,
+)
 
 
 @pytest.mark.parametrize(
@@ -818,3 +821,23 @@ def test_legacy_fill_carry_payload_still_loads() -> None:
     assert [(entry["tool_name"], entry["executed_selector"]) for entry in parsed.carried_trajectory] == [
         ("type_text", "#search")
     ]
+
+
+def test_redacting_a_run_packet_keeps_the_facts_a_repair_acts_on() -> None:
+    """Redacting the serialized document instead of its strings eats the delimiters and yields
+    nothing, which an absence-only assertion cannot tell apart from a redaction that worked."""
+    packet = {
+        "run": {"workflow_run_id": "wr_1", "status": "failed"},
+        "failure": {
+            "reason": "extraction failed with password=hunter2",
+            "failing_line": 6,
+            "error_codes": ["user_code_error"],
+        },
+    }
+
+    redacted = redact_raw_secrets_in_object(packet)
+
+    assert "hunter2" not in json.dumps(redacted)
+    assert redacted["failure"]["failing_line"] == 6
+    assert redacted["failure"]["error_codes"] == ["user_code_error"]
+    assert redacted["run"]["workflow_run_id"] == "wr_1"

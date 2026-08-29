@@ -1036,13 +1036,13 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
             workflow_copilot_chat_id="chat-1",
+            workflow_run_id=None,
             workflow_yaml="",
             browser_session_id=None,
             product_action=None,
         ),
         chat_history=[],
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
         raw_secret_safety_handler=AsyncMock(
             return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}

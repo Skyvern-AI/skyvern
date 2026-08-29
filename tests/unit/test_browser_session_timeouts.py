@@ -104,6 +104,33 @@ def test_seconds_until_expiry_uses_the_later_base_or_activity_deadline() -> None
     )
 
 
+def test_activity_does_not_extend_a_deadline_the_infrastructure_fixes() -> None:
+    """SKY-15044: a 20-minute vendor session five minutes in reported ~19:34 left rather than
+    14:46, because a CDP command 26s earlier renewed an activity lease its provider does not
+    honour. The provider killed it at 20:00.4 regardless."""
+    fixed_timeout = 20 * 60
+
+    assert (
+        seconds_until_expiry(
+            seconds_since_start=314,
+            base_timeout_seconds=fixed_timeout,
+            seconds_since_last_activity=26,
+            idle_timeout_seconds=fixed_timeout,
+            activity_extends_deadline=False,
+        )
+        == fixed_timeout - 314
+    )
+    assert (
+        seconds_until_expiry(
+            seconds_since_start=314,
+            base_timeout_seconds=fixed_timeout,
+            seconds_since_last_activity=26,
+            idle_timeout_seconds=fixed_timeout,
+        )
+        == fixed_timeout - 26
+    )
+
+
 def test_seconds_until_expiry_is_capped_by_max_lifetime() -> None:
     assert (
         seconds_until_expiry(

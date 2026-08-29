@@ -3,17 +3,28 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime_authoring_repair
-from skyvern.forge.sdk.copilot.agent import _code_authoring_repair_context_prompt
-from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_from_run_blocks_result
+from skyvern.forge.sdk.copilot.agent import (
+    _build_dynamic_system_prompt,
+    _build_user_context,
+    _code_authoring_repair_context_prompt,
+    _prior_run_debug_text,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestEvidencePacket,
+    RecordedBuildTestOutcome,
+    recorded_outcome_from_run_blocks_result,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_KIND_KEY,
     ChallengeKind,
@@ -26,7 +37,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     model_visible_composition_evidence,
     parse_composition_html,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
@@ -49,6 +60,8 @@ from skyvern.forge.sdk.copilot.tools import composition_capture as composition_c
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
 
 def _ctx() -> CopilotContext:
@@ -587,6 +600,193 @@ def test_post_run_observation_is_false_when_all_four_summary_collections_are_emp
     assert repair_context.page_action_summaries == []
     assert repair_context.page_challenge_summaries == []
     assert repair_context.observed_after_workflow_run is False
+
+
+def _standalone_control_page_evidence() -> dict[str, object]:
+    return {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "page_title": "Statements",
+        "navigation_targets": [{"text": "Next page", "selector": "a.next"}],
+        "clickable_controls": [
+            {
+                "text": "Continue to statements",
+                "selector": "#continue-btn-x9",
+                "tag": "button",
+                "disabled": True,
+                "html": '<button id="continue-btn-x9">Continue to statements</button>',
+            },
+            {"text": "Filters", "selector": "#filters-toggle-q7", "tag": "button", "expanded": False},
+            {"text": "Next page", "selector": "a.next", "tag": "a", "expanded": False},
+            {"selector": "#icon-only-z3", "tag": "button"},
+        ],
+    }
+
+
+def test_page_action_summaries_carry_navigation_targets_and_standalone_clickable_controls() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = _standalone_control_page_evidence()
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == [
+        "Continue to statements disabled",
+        "Filters collapsed",
+        "Next page collapsed",
+    ]
+    assert repair_context.observed_after_workflow_run is True
+    rendered = repair_context.model_dump_json()
+    for leaked in ("#continue-btn-x9", "#filters-toggle-q7", "#icon-only-z3", "a.next", "<button"):
+        assert leaked not in rendered
+
+
+def test_page_action_summaries_keep_a_control_behind_text_less_ones() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(6)],
+        "clickable_controls": [{"selector": f"#icon-{index}", "tag": "button"} for index in range(5)]
+        + [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries[0] == "Continue to statements"
+    assert repair_context.page_action_summaries[1:3] == ["Section 0", "Section 1"]
+
+
+def test_page_action_summaries_skip_text_less_navigation_targets() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"selector": f"a.icon{index}"} for index in range(5)]
+        + [{"text": "Next page", "selector": "a.next"}],
+        "challenge_controls": [{"selector": f"#c{index}"} for index in range(5)]
+        + [{"text": "Verify you are human", "selector": "#verify"}],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == ["Next page"]
+    assert repair_context.page_challenge_summaries == []
+
+
+def test_page_action_summaries_keep_two_controls_on_a_navigation_heavy_page() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(6)],
+        "clickable_controls": [
+            {"text": "Continue to statements", "selector": "#continue", "tag": "button"},
+            {"text": "Download all", "selector": "#download", "tag": "button"},
+        ],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == [
+        "Continue to statements",
+        "Download all",
+        "Section 0",
+        "Section 1",
+        "Section 2",
+    ]
+
+
+def test_page_action_summaries_keep_an_element_listed_in_both_collections_when_the_cap_is_full() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(4)]
+        + [{"text": "Continue to statements", "selector": "a.continue"}],
+        "clickable_controls": [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}]
+        + [{"text": f"Filter {index}", "selector": f"#f{index}", "tag": "button"} for index in range(5)],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries.count("Continue to statements") == 1
+    assert repair_context.page_action_summaries[0] == "Continue to statements"
+
+
+def test_runtime_authoring_repair_admits_a_page_whose_only_content_is_a_clickable_control() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "clickable_controls": [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == ["Continue to statements"]
+    assert repair_context.observed_after_workflow_run is True
+    assert "page_actions: Continue to statements" in _code_authoring_repair_context_prompt(ctx)
+
+
+def _text_less_control_only_page_evidence() -> dict[str, object]:
+    return {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "clickable_controls": [{"selector": f"#icon-{index}", "tag": "button"} for index in range(3)],
+    }
+
+
+def test_a_text_less_control_only_packet_is_not_admissible_repair_evidence() -> None:
+    assert post_run_inspection_cleanly_matches(_text_less_control_only_page_evidence(), "wr_failed") is False
+
+
+def test_a_text_less_control_only_packet_finalizes_no_repair_context() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = _text_less_control_only_page_evidence()
+
+    assert finalize_runtime_authoring_repair_context_from_page_observation(ctx) is None
 
 
 def test_failed_run_injects_pending_runtime_authoring_context_before_page_observation() -> None:
@@ -2869,6 +3069,126 @@ def test_user_code_error_still_repairs_through_the_contract() -> None:
     assert contract.repair_decision.next_action != RepairNextAction.STOP
 
 
+@pytest.mark.asyncio
+async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_repair_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    now = datetime(2026, 8, 28, tzinfo=UTC)
+    output_parameter = OutputParameter(
+        output_parameter_id="out_confirmation",
+        workflow_id="wf_run_snapshot",
+        key="confirmation",
+        description="Confirmation details",
+        created_at=now,
+        modified_at=now,
+    )
+    run_workflow = SimpleNamespace(
+        organization_id=ctx.organization_id,
+        workflow_definition=SimpleNamespace(
+            parameters=[output_parameter],
+            blocks=[SimpleNamespace(label="open_result", block_type="CODE", output_parameter=output_parameter)],
+        ),
+    )
+    run = SimpleNamespace(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        browser_session_id="pbs_completed_missing_output",
+        status="completed",
+        failure_reason=None,
+    )
+    block = SimpleNamespace(
+        label="open_result",
+        block_type=SimpleNamespace(name="CODE"),
+        status="completed",
+        failure_reason=None,
+        error_codes=[],
+        output=None,
+        final_url="https://example.test/complete",
+    )
+    artifact = make_stub_html_artifact("art_completed_terminal", ArtifactType.HTML_ACTION)
+    html = (
+        b"<html><body><main><h1>Complete</h1><form>"
+        b"<button type='submit'>View confirmation</button></form></main></body></html>"
+    )
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(return_value=run),
+                get_workflow_run_output_parameters=AsyncMock(return_value=[]),
+            ),
+            observer=SimpleNamespace(get_workflow_run_blocks=AsyncMock(return_value=[block])),
+            workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=run_workflow)),
+            artifacts=SimpleNamespace(get_artifacts_for_run=AsyncMock(return_value=[artifact])),
+        ),
+        AGENT_FUNCTION=SimpleNamespace(should_dispatch_copilot_block_run_to_worker=AsyncMock(return_value=True)),
+        ARTIFACT_MANAGER=SimpleNamespace(retrieve_artifact=AsyncMock(return_value=html)),
+    )
+    monkeypatch.setattr(run_execution_module, "app", fake_app)
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
+    monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
+    produced_outcomes: list[RecordedBuildTestOutcome] = []
+    transported_outcomes: list[RecordedBuildTestOutcome | None] = []
+    real_producer = run_execution_module.recorded_outcome_from_run_blocks_result
+    real_packet_builder = run_execution_module.build_test_evidence_packet
+
+    def capture_producer(*args: object, **kwargs: object) -> RecordedBuildTestOutcome:
+        produced = real_producer(*args, **kwargs)
+        produced_outcomes.append(produced)
+        return produced
+
+    def capture_packet(
+        context: CopilotContext,
+        result: object,
+        *,
+        recorded_outcome: RecordedBuildTestOutcome | None = None,
+    ) -> BuildTestEvidencePacket:
+        transported_outcomes.append(recorded_outcome)
+        return real_packet_builder(context, result, recorded_outcome=recorded_outcome)
+
+    monkeypatch.setattr(run_execution_module, "recorded_outcome_from_run_blocks_result", capture_producer)
+    monkeypatch.setattr(run_execution_module, "build_test_evidence_packet", capture_packet)
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr_completed_missing_output")
+    system_input = str(
+        _build_dynamic_system_prompt("", CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER))(
+            SimpleNamespace(context=ctx), None
+        )
+    )
+    ordinary_input = (
+        system_input
+        + "\n"
+        + _build_user_context(
+            workflow_yaml=ctx.workflow_yaml,
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text=_prior_run_debug_text(hydrated),
+            user_message="Repair the recorded run.",
+        )
+    )
+
+    assert hydrated is not None
+    assert len(produced_outcomes) == 1
+    assert produced_outcomes[0].workflow_run_id == "wr_completed_missing_output"
+    assert len(produced_outcomes[0].missing_requested_output_facts) == 1
+    assert produced_outcomes[0].missing_requested_output_facts[0]["output_path"] == "output.confirmation"
+    assert produced_outcomes[0].missing_requested_output_facts[0]["reason_code"] == "registered_output_missing"
+    assert transported_outcomes == [produced_outcomes[0]]
+    assert ctx.latest_recorded_build_test_outcome is None
+    assert '"status": "completed"' in ordinary_input
+    assert '"workflow_run_id": "wr_completed_missing_output"' in ordinary_input
+    assert '"output_parameter_id": "out_confirmation"' in ordinary_input
+    assert '"output_parameter_key": "confirmation"' in ordinary_input
+    assert '"output_path": "output.confirmation"' in ordinary_input
+    assert '"reason_code": "registered_output_missing"' in ordinary_input
+    assert hydrated.get("page_state") is not None
+    assert '"page_state"' in ordinary_input
+    assert "Complete" in ordinary_input
+    assert "View confirmation" in ordinary_input
+    assert "success_verdict" not in ordinary_input
+    assert "RECORDED BUILD-TEST OUTCOME" not in system_input
+    assert "repairable_failure" not in system_input
+    assert "wr_completed_missing_output" not in system_input
+
+
 def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> None:
     # SKY-13624 B2: the strict-render failure is run evidence that arms repair targeting the failed
     # block, never an evidence-free fresh-build route.
@@ -2950,6 +3270,7 @@ def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
     run_execution_module._attach_run_session_facts(
         data,
         used_fresh_run_session=True,
+        run_detached_from_chat=False,
         run_ok=False,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -2964,6 +3285,7 @@ def test_run_envelope_omits_the_challenge_stall_fact_without_a_structured_packet
     run_execution_module._attach_run_session_facts(
         data,
         used_fresh_run_session=True,
+        run_detached_from_chat=False,
         run_ok=False,
         page_evidence=None,
     )
@@ -2978,6 +3300,7 @@ def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
     run_execution_module._attach_run_session_facts(
         data,
         used_fresh_run_session=True,
+        run_detached_from_chat=False,
         run_ok=True,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -3266,6 +3589,71 @@ def test_an_overlay_seen_later_in_the_run_replaces_the_earlier_clean_capture() -
 
     assert overlay.get("page_obstructions"), "the overlay the run actually hit must not be discarded"
     assert ctx.composition_page_evidence.get("page_obstructions")
+
+
+def test_a_control_only_page_seen_later_in_the_run_replaces_the_earlier_clean_capture() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_test_ok = False
+
+    clean, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+    ctx.composition_page_evidence = clean
+
+    control_only, preserved = store_post_run_page_evidence(
+        ctx,
+        {
+            "source_tool": "inspect_page_for_composition",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+            "clickable_controls": [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}],
+        },
+        run_id="wr_failed",
+        current_url="https://example.test/app/statements",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+
+    assert preserved is False
+    assert control_only.get("clickable_controls")
+    assert ctx.composition_page_evidence.get("clickable_controls")
+    assert not ctx.composition_page_evidence.get("navigation_targets")
+
+
+def test_a_text_less_control_only_page_does_not_evict_the_earlier_clean_capture() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_test_ok = False
+
+    clean, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+    ctx.composition_page_evidence = clean
+
+    _, preserved = store_post_run_page_evidence(
+        ctx,
+        _text_less_control_only_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/statements",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+
+    assert preserved is True
+    assert ctx.composition_page_evidence.get("navigation_targets")
 
 
 def test_obstruction_without_dismiss_controls_still_finalizes_a_repair_context() -> None:

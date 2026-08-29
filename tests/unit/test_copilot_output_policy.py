@@ -116,6 +116,7 @@ def _chat_request() -> SimpleNamespace:
         workflow_permanent_id="wfp-1",
         workflow_copilot_chat_id="chat-1",
         workflow_yaml="title: Prior",
+        product_action=None,
     )
 
 

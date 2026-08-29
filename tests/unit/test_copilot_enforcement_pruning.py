@@ -1244,3 +1244,55 @@ class TestPageEvidenceCompaction:
 
         assert len(compacted) < 5000, f"compacted output was {len(compacted)} chars"
         assert json.loads(compacted)["page_evidence"]["forms"], "the first facts still survive"
+
+
+def test_the_run_packets_typed_failure_facts_survive_compaction() -> None:
+    # Retention is an allowlist, so a field added after it was written is dropped in silence. A
+    # repair conversation of any length outlives three tool outputs.
+    payload = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_cold",
+            "overall_status": "failed",
+            "failing_code_line": 6,
+            "blocks": [
+                {
+                    "label": "extract_failure_rate",
+                    "status": "failed",
+                    "failure_reason": "code error at line 6",
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+            "build_test_packet": {
+                "contract_version": "build_test_evidence_packet_v1",
+                "run": {"workflow_run_id": "wr_cold", "status": "failed"},
+                "failure": {
+                    "block_label": "extract_failure_rate",
+                    "error_codes": ["user_code_error"],
+                    "failing_line": 6,
+                    "locator_observations": [{"authored_selector": "x", "match_count": 0}] * 40,
+                },
+            },
+            "page_text": "x" * 6000,
+        },
+    }
+
+    parsed = json.loads(_summarize_tool_output(json.dumps(payload)))
+
+    assert parsed["failing_code_line"] == 6
+    assert parsed["blocks"][0]["error_codes"] == ["user_code_error"]
+    retained = parsed["build_test_packet"]
+    assert retained["run"]["workflow_run_id"] == "wr_cold"
+    assert retained["failure"]["error_codes"] == ["user_code_error"]
+    assert retained["failure"]["failing_line"] == 6
+    # The list tail is what yields, not the scalars a repair acts on.
+    assert "locator_observations" not in retained["failure"]
+
+
+def test_a_compacted_output_without_a_packet_gains_no_empty_one() -> None:
+    payload = {"ok": True, "data": {"workflow_run_id": "wr_1", "overall_status": "completed", "pad": "y" * 6000}}
+
+    parsed = json.loads(_summarize_tool_output(json.dumps(payload)))
+
+    assert "build_test_packet" not in parsed
+    assert "failing_code_line" not in parsed

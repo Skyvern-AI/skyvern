@@ -25,6 +25,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
+from skyvern.forge.sdk.copilot.runtime import browser_page_custody_lock
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
@@ -1245,6 +1246,61 @@ class TestCredentialFillInCallSubmit:
         }
         assert page.fill_calls == []
         assert page.click_calls == []
+
+
+@pytest.mark.asyncio
+async def test_in_flight_sensitive_taint_suppresses_fill_result_screenshot_and_recorded_page_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page)
+    ctx = _ctx()
+    existing_interaction = {"tool_name": "click", "selector": "#existing"}
+    existing_trajectory = {**existing_interaction, "trajectory_index": 0}
+    existing_flow = {"step": 1, "evidence": {"source_tool": "existing"}}
+    ctx.scouted_interactions = [existing_interaction]
+    ctx.scout_trajectory = [existing_trajectory]
+    ctx.flow_evidence = [existing_flow]
+    ctx.scouted_output_covered_paths = {"output.existing"}
+    ctx.scout_observation_contract = {"existing": True}
+    ctx.pending_browser_interaction_observation = SimpleNamespace(tool_name="click", url="https://existing.test")
+    unrelated_commit: asyncio.Task[None] | None = None
+
+    async def append_unrelated_evidence() -> None:
+        async with browser_page_custody_lock(ctx):
+            ctx.scouted_interactions.append({"tool_name": "click", "selector": "#parallel"})
+            ctx.scout_trajectory.append({"tool_name": "click", "selector": "#parallel", "trajectory_index": 1})
+            ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "parallel"}})
+
+    async def taint_before_screenshot(*_args: Any, **_kwargs: Any) -> bool:
+        nonlocal unrelated_commit
+        unrelated_commit = asyncio.create_task(append_unrelated_evidence())
+        await asyncio.sleep(0)
+        assert not unrelated_commit.done()
+        ctx.sensitive_origin_browser_session_ids = {"pbs_1"}
+        return False
+
+    screenshot = AsyncMock(side_effect=taint_before_screenshot)
+    monkeypatch.setattr(credential_fill_module, "_capture_post_interaction_screenshot", screenshot)
+
+    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    assert unrelated_commit is not None
+    await unrelated_commit
+
+    assert result["ok"] is False
+    assert "specific named URL" in result["error"]
+    screenshot.assert_awaited_once()
+    assert ctx.scouted_interactions == [existing_interaction, {"tool_name": "click", "selector": "#parallel"}]
+    assert ctx.scout_trajectory == [
+        existing_trajectory,
+        {"tool_name": "click", "selector": "#parallel", "trajectory_index": 1},
+    ]
+    assert ctx.flow_evidence == [existing_flow, {"step": 2, "evidence": {"source_tool": "parallel"}}]
+    assert ctx.scouted_output_covered_paths == {"output.existing"}
+    assert ctx.scout_observation_contract == {"existing": True}
+    assert ctx.pending_browser_interaction_observation == SimpleNamespace(
+        tool_name="click", url="https://existing.test"
+    )
 
 
 class TestPublicToolCall:
