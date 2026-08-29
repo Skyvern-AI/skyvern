@@ -843,7 +843,11 @@ class WorkflowRunsRepository(BaseRepository):
             # canceled run, but that's an implementation detail, not the contract — restrict to
             # the failure statuses explicitly so a canceled run is never returned regardless.
             category_match_clause = None
-            failure_statuses = ("failed", "terminated", "timed_out")
+            failure_statuses = (
+                WorkflowRunStatus.failed.value,
+                WorkflowRunStatus.terminated.value,
+                WorkflowRunStatus.timed_out.value,
+            )
             if failure_category:
                 top_category = (
                     func.json_extract(WorkflowRunModel.failure_category, "$[0].category")

@@ -2190,6 +2190,38 @@ class WorkflowService:
             and (bool(parameter.credential_ids) or bool(parameter.fallback_credential_ids))
         ]
 
+    def _rotating_credential_profile_segment(self, workflow: Workflow, parameter_values: dict[str, Any]) -> str | None:
+        """Segment folded into a managed browser profile's key so each credential in a rotation pool
+        gets its own profile automatically, even when browser_profile_key doesn't reference it or
+        isn't set (SKY-15192). Reads the resolved selection already in parameter_values; a parameter
+        with no resolved selection (fail-open legacy pool) is skipped, not guessed. Joining multiple
+        selections with "," is unambiguous because a resolved value is always a generate_credential_id
+        row (cred_<int>), never free text that could itself contain a comma."""
+        segments = [
+            selected
+            for parameter in self._get_rotating_credential_parameters(workflow)
+            if isinstance(selected := parameter_values.get(parameter.key), str) and selected
+        ]
+        return ",".join(segments) or None
+
+    def _managed_browser_profile_digest_key(
+        self, workflow: Workflow, parameter_values: dict[str, Any], rendered_key: str | None
+    ) -> tuple[str | None, str | None]:
+        """(digest_key, credential_segment) for a managed browser profile. rendered_key is an
+        unrestricted Jinja render of workflow-parameter values (browser_profile_key.py) — it can
+        contain any character, so joining it with credential_segment by a plain delimiter would let
+        two different (key, credential) pairs collide onto the same digest (e.g. key renders
+        "acct|1" with no credential vs. key "acct" with credential "1"). Collapse rendered_key to its
+        fixed-width digest before combining, so the split point is never ambiguous. When the two are
+        already identical (the customer's key already IS the credential value), skip combining
+        entirely and keep today's exact digest rather than gratuitously reseeding."""
+        credential_segment = self._rotating_credential_profile_segment(workflow, parameter_values)
+        if not credential_segment or rendered_key == credential_segment:
+            return rendered_key or credential_segment, credential_segment
+        if not rendered_key:
+            return credential_segment, credential_segment
+        return f"{build_browser_profile_key_digest(rendered_key)}:{credential_segment}", credential_segment
+
     def _get_run_credential_parameter_overrides(
         self,
         *,
@@ -3308,14 +3340,21 @@ class WorkflowService:
                 browser_profile_key=workflow.browser_profile_key,
             )
             rendered_key = None
-        digest = build_browser_profile_key_digest(rendered_key)
+        digest_key, credential_segment = self._managed_browser_profile_digest_key(
+            workflow, parameter_values, rendered_key
+        )
+        digest = build_browser_profile_key_digest(digest_key)
         profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
             organization_id=workflow_run.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             browser_profile_key_digest=digest,
-            name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+            name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
         )
-        if created:
+        # A credential-segmented profile has no legacy counterpart (the wpid_ archive predates
+        # per-credential rotation and was never scoped to one credential) — seeding it would risk
+        # loading a different credential's saved state onto this one, the exact bug this segment
+        # exists to prevent. Skip seeding; the profile just starts empty and accumulates normally.
+        if created and not credential_segment:
             try:
                 await self._seed_managed_browser_profile_from_legacy_session(
                     workflow=workflow,
@@ -3511,23 +3550,30 @@ class WorkflowService:
             if not workflow.persist_browser_session or workflow_request.browser_profile_id:
                 return None
 
+            parameter_values = self._profile_key_render_values(workflow, workflow_request)
+            if extra_parameter_values:
+                parameter_values.update(extra_parameter_values)
+
             rendered_key = None
             if workflow.browser_profile_key:
-                parameter_values = self._profile_key_render_values(workflow, workflow_request)
-                if extra_parameter_values:
-                    parameter_values.update(extra_parameter_values)
                 rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
                 if not rendered_key:
                     return None
 
-            digest = build_browser_profile_key_digest(rendered_key)
+            digest_key, credential_segment = self._managed_browser_profile_digest_key(
+                workflow, parameter_values, rendered_key
+            )
+            digest = build_browser_profile_key_digest(digest_key)
             profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 browser_profile_key_digest=digest,
-                name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+                name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
             )
-            if created:
+            # See _ensure_managed_browser_profile: a credential-segmented profile has no legacy
+            # counterpart, so seeding it from the un-credentialed archive would risk leaking a
+            # different credential's saved state onto it.
+            if created and not credential_segment:
                 try:
                     await self._seed_managed_browser_profile_from_legacy_session(
                         workflow=workflow,

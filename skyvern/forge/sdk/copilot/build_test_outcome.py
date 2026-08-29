@@ -69,6 +69,8 @@ PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "no
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
 BuildTestPacketWorkflowSource = Literal["accepted_write_readback", "turn_start_persisted_readback", "unavailable"]
 BuildTestPacketUnfinishedKind = Literal["unverified_block", "missing_requested_output"]
+BuildTestPacketPageCaptureStatus = Literal["captured", "unavailable"]
+BuildTestPacketPageCaptureOmission = Literal["screenshot_capture_failed", "page_capture_unavailable"]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
     "run_browser_unavailable",
@@ -128,6 +130,7 @@ class BuildTestPacketRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     workflow_run_id: str | None = None
+    browser_session_id: str | None = None
     status: str | None = None
     browser: BuildTestPacketRunBrowser | None = None
 
@@ -146,6 +149,26 @@ class BuildTestPacketPageState(BaseModel):
     challenge_summaries: list[str] = Field(default_factory=list)
     obstruction_summaries: list[str] = Field(default_factory=list)
     obstructions: list[PageObstruction] = Field(default_factory=list)
+
+
+class BuildTestPacketPageCapture(BaseModel):
+    """The factual result of trying to retain post-run page evidence.
+
+    This is transport metadata only. It does not classify the run or choose a repair action.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: BuildTestPacketPageCaptureStatus
+    omission: BuildTestPacketPageCaptureOmission | None = None
+
+    @model_validator(mode="after")
+    def validate_capture_state(self) -> BuildTestPacketPageCapture:
+        if self.status == "unavailable" and self.omission != "page_capture_unavailable":
+            raise ValueError("an unavailable page capture must carry page_capture_unavailable")
+        if self.status == "captured" and self.omission == "page_capture_unavailable":
+            raise ValueError("a captured page cannot carry a page-unavailable omission")
+        return self
 
 
 class BuildTestPacketLocatorObservation(BaseModel):
@@ -255,6 +278,7 @@ class BuildTestEvidencePacket(BaseModel):
     action_observations: list[str] = Field(default_factory=list)
     failure: BuildTestPacketFailure | None = None
     page_state: BuildTestPacketPageState | None = None
+    page_capture: BuildTestPacketPageCapture | None = None
     requested_outputs: list[BuildTestPacketRequestedOutput] = Field(default_factory=list)
     registered_outputs: list[BuildTestPacketRegisteredOutput] = Field(default_factory=list)
     downloads: list[BuildTestPacketDownload] = Field(default_factory=list)
@@ -281,6 +305,7 @@ class RecordedBuildTestOutcome(BaseModel):
     structural_failure_identity: str = ""
     verified_progress_marker: str = ""
     page_evidence_refs: list[str] = Field(default_factory=list)
+    page_capture: BuildTestPacketPageCapture | None = None
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
     runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
@@ -785,6 +810,7 @@ def _required_input_unbound_outcome(
     requested_block_labels: list[str],
     block_shape_hashes: Mapping[str, str],
     workflow_run_id: str | None,
+    page_capture: BuildTestPacketPageCapture | None,
     authored_structure_signature: str | None,
     referenced_unbound_keys: Sequence[str],
 ) -> RecordedBuildTestOutcome:
@@ -799,6 +825,7 @@ def _required_input_unbound_outcome(
         requested_block_labels=requested_block_labels,
         block_shape_hashes=dict(block_shape_hashes),
         structural_failure_identity=_required_input_unbound_identity(failed_block, referenced_unbound_keys),
+        page_capture=page_capture,
         authored_structure_signature=authored_structure_signature,
         observed_evidence_summary=_bounded_text(
             "unbound required inputs: " + ", ".join(_clean_list(referenced_unbound_keys))
@@ -840,16 +867,9 @@ def recorded_outcome_from_run_blocks_result(
         unbound_required_parameter_keys or [],
         block_parameter_keys or {},
     )
-    graded_page_evidence = (
-        page_evidence
-        if page_evidence is not None
-        and page_evidence_source_matches_run(
-            _safe_str(page_evidence.get("source_browser_session_id")),
-            _safe_str(data.get("browser_session_id")),
-        )
-        else None
-    )
+    graded_page_evidence = page_evidence if _post_run_page_evidence_matches_result(data, page_evidence) else None
     page_refs = _page_evidence_refs(graded_page_evidence)
+    page_capture = post_run_page_capture_from_result(data, graded_page_evidence)
     output_refs = _output_evidence_refs(blocks)
     verification_identity = _completion_verification_identity(completion_verification)
     authoritative_workflow_run_id = (
@@ -912,6 +932,7 @@ def recorded_outcome_from_run_blocks_result(
                 block_labels=block_labels,
                 requested_block_labels=requested_block_labels,
                 block_shape_hashes=block_shape_hashes,
+                page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "terminal blocker precedence suppresses repair prompt"},
@@ -927,6 +948,7 @@ def recorded_outcome_from_run_blocks_result(
                 requested_block_labels=requested_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 verified_progress_marker=verification_identity or "run_completed_verified",
+                page_capture=page_capture,
                 evidence_refs=output_refs,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "Completion verification passed.",
@@ -945,6 +967,7 @@ def recorded_outcome_from_run_blocks_result(
                 block_labels=block_labels,
                 requested_block_labels=requested_block_labels,
                 block_shape_hashes=block_shape_hashes,
+                page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
@@ -956,6 +979,7 @@ def recorded_outcome_from_run_blocks_result(
                 requested_block_labels,
                 block_shape_hashes,
                 recorded_run_outcome.workflow_run_id or workflow_run_id or None,
+                page_capture,
                 authored_structure_signature,
                 referenced_unbound_keys,
             )
@@ -971,6 +995,7 @@ def recorded_outcome_from_run_blocks_result(
                 block_labels=block_labels,
                 requested_block_labels=requested_block_labels,
                 block_shape_hashes=block_shape_hashes,
+                page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "no typed verification/page/output identity available"},
@@ -989,6 +1014,7 @@ def recorded_outcome_from_run_blocks_result(
                 block_labels=block_labels,
                 requested_block_labels=requested_block_labels,
                 block_shape_hashes=block_shape_hashes,
+                page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "turn-unsatisfiable fallback floor, no reachable route"},
@@ -1004,6 +1030,7 @@ def recorded_outcome_from_run_blocks_result(
             block_shape_hashes=block_shape_hashes,
             structural_failure_identity=structural_identity,
             page_evidence_refs=page_refs,
+            page_capture=page_capture,
             evidence_refs=evidence_refs,
             missing_requested_output_facts=missing_output_facts,
             runtime_output_repair_facts=runtime_output_facts,
@@ -1039,6 +1066,7 @@ def recorded_outcome_from_run_blocks_result(
             requested_block_labels,
             block_shape_hashes,
             workflow_run_id or None,
+            page_capture,
             authored_structure_signature,
             referenced_unbound_keys,
         )
@@ -1108,6 +1136,7 @@ def recorded_outcome_from_run_blocks_result(
         block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,
+        page_capture=page_capture,
         evidence_refs=output_refs,
         missing_requested_output_facts=missing_output_facts,
         authored_structure_signature=authored_structure_signature,
@@ -1445,6 +1474,48 @@ def _page_evidence_refs(page_evidence: Mapping[str, object] | None) -> list[str]
     refs.extend(_result_refs(page_evidence.get("result_containers")))
     refs.extend(_action_refs(page_evidence.get("navigation_targets")))
     return refs[:12]
+
+
+def post_run_page_capture_from_result(
+    data: Mapping[str, object],
+    page_evidence: Mapping[str, object] | None,
+) -> BuildTestPacketPageCapture | None:
+    """Read only the typed post-run capture fact carried by the run result.
+
+    A usable page packet establishes that capture reached the page. Screenshot availability is a
+    separate fact, so its omission must not erase the page or action facts already retained.
+    """
+    raw_capture = data.get("post_run_page_capture")
+    if isinstance(raw_capture, Mapping):
+        try:
+            return BuildTestPacketPageCapture.model_validate(raw_capture)
+        except ValueError:
+            return None
+    if not _post_run_page_evidence_matches_result(data, page_evidence):
+        return None
+    assert page_evidence is not None
+    omissions = page_evidence.get("visual_capture_omissions")
+    if isinstance(omissions, list) and "screenshot_capture_failed" in omissions:
+        return BuildTestPacketPageCapture(status="captured", omission="screenshot_capture_failed")
+    return BuildTestPacketPageCapture(status="captured")
+
+
+def _post_run_page_evidence_matches_result(
+    data: Mapping[str, object],
+    page_evidence: Mapping[str, object] | None,
+) -> bool:
+    """Only evidence stamped after this result's run can establish that capture succeeded."""
+    workflow_run_id = _safe_str(data.get("workflow_run_id"))
+    return bool(
+        page_evidence is not None
+        and workflow_run_id
+        and page_evidence.get("observed_after_workflow_run") is True
+        and page_evidence.get("workflow_run_id") == workflow_run_id
+        and page_evidence_source_matches_run(
+            _safe_str(page_evidence.get("source_browser_session_id")),
+            _safe_str(data.get("browser_session_id")),
+        )
+    )
 
 
 def _post_run_page_path_failure(

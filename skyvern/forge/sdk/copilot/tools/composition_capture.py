@@ -312,8 +312,9 @@ async def _augment_composition_evidence_with_visual_fallback(
     screenshot_result = await _composition_get_screenshot(ctx, dispatch_session_id=capture_session_id)
     if not screenshot_result.get("ok"):
         return (
-            _composition_add_evidence_omission(
+            _composition_add_visual_capture_omission(
                 evidence,
+                "screenshot_capture_failed",
                 f"screenshot_capture_failed: {screenshot_result.get('error', 'unknown')}",
             ),
             None,
@@ -353,6 +354,22 @@ def _composition_add_evidence_omission(evidence: dict[str, Any], message: str) -
     if message:
         omissions.append(message[:160])
     merged["visual_evidence_omissions"] = list(dict.fromkeys(omissions))[:5]
+    return merged
+
+
+def _composition_add_visual_capture_omission(
+    evidence: dict[str, Any],
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    """Record a bounded typed capture fact alongside its operator-facing detail."""
+    merged = _composition_add_evidence_omission(evidence, message)
+    omission_codes = [
+        item for item in merged.get("visual_capture_omissions") or [] if item in {"screenshot_capture_failed"}
+    ]
+    if code == "screenshot_capture_failed":
+        omission_codes.append(code)
+    merged["visual_capture_omissions"] = list(dict.fromkeys(omission_codes))[:1]
     return merged
 
 
