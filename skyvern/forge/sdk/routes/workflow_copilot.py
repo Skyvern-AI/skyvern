@@ -47,7 +47,6 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
-from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
     build_recoverable_failure,
@@ -337,18 +336,6 @@ class RunInfo:
     block_status: str | None
     failure_reason: str | None
     html: str | None
-
-
-# New-copilot richer block shape (used only from the ENABLE_WORKFLOW_COPILOT_V2
-# dispatch path). Kept side-by-side with the old RunInfo so the old-copilot
-# body stays untouched; consolidation is SKY-8916's job.
-@dataclass(frozen=True)
-class BlockRunInfo:
-    block_label: str | None
-    block_type: str
-    block_status: str | None
-    failure_reason: str | None
-    output: str | None
 
 
 COPILOT_CANCEL_TTL = timedelta(minutes=5)
@@ -1200,7 +1187,7 @@ async def _finalise_normal_turn(
             organization_id
         )
         replaced = False
-        if should_render_terminal_from_envelope:
+        if should_render_terminal_from_envelope and chat_request.product_action != "test_end_to_end":
             # rendered_from_envelope means "flag on, envelope is display
             # authority" for the FE — not that this turn's text was replaced.
             terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
@@ -1223,6 +1210,7 @@ async def _finalise_normal_turn(
         LOG.info(
             "copilot_terminal_render_decision",
             flag_enabled=should_render_terminal_from_envelope,
+            product_action=chat_request.product_action,
             replaced=replaced,
             run_verdict=terminal_envelope_model.run_verdict,
             next_state=terminal_envelope_model.next_state,
@@ -1427,42 +1415,6 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
         failure_reason=block.failure_reason,
         html=html,
     )
-
-
-async def _get_new_copilot_block_infos(
-    organization_id: str, workflow_run_id: str | None
-) -> tuple[list[BlockRunInfo], str | None]:
-    """Variant of _get_debug_run_info used by the ENABLE_WORKFLOW_COPILOT_V2 path.
-
-    Returns a list of per-block records plus the run's VISIBLE_ELEMENTS_TREE
-    HTML artifact. Coexists with _get_debug_run_info which returns the
-    simpler single-block shape used by the old-copilot path.
-    """
-    if not workflow_run_id:
-        return [], None
-
-    blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-        workflow_run_id=workflow_run_id, organization_id=organization_id
-    )
-    if not blocks:
-        return [], None
-
-    block_infos: list[BlockRunInfo] = []
-    for block in blocks:
-        block_type_name = block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type)
-        block_infos.append(
-            BlockRunInfo(
-                block_label=block.label,
-                block_type=block_type_name,
-                block_status=block.status,
-                failure_reason=block.failure_reason,
-                output=truncate_output(getattr(block, "output", None)),
-            )
-        )
-
-    html = await _get_debug_html(organization_id, workflow_run_id)
-
-    return block_infos, html
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -2121,24 +2073,6 @@ async def _new_copilot_chat_post(
                     )
                 chat_request.workflow_yaml = pending_proposal_yaml
 
-            block_infos, debug_html = await _get_new_copilot_block_infos(
-                organization.organization_id, chat_request.workflow_run_id
-            )
-
-            debug_run_info_text = ""
-            if block_infos:
-                parts: list[str] = []
-                for bi in block_infos:
-                    block_text = f"Block: {bi.block_label} ({bi.block_type}) — {bi.block_status}"
-                    if bi.failure_reason:
-                        block_text += f"\n  Failure Reason: {bi.failure_reason}"
-                    if bi.output:
-                        block_text += f"\n  Output: {bi.output}"
-                    parts.append(block_text)
-                debug_run_info_text = "\n".join(parts)
-                if debug_html:
-                    debug_run_info_text += f"\n\nVisible Elements Tree (HTML):\n{debug_html}"
-
             await stream.send(
                 WorkflowCopilotProcessingUpdate(
                     type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
@@ -2307,7 +2241,6 @@ async def _new_copilot_chat_post(
                     chat_history=convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
                     prior_user_messages=convert_to_history_messages(chat_messages),
                     global_llm_context=global_llm_context,
-                    debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
                     raw_secret_safety_handler=raw_secret_safety_handler,
                     api_key=api_key,

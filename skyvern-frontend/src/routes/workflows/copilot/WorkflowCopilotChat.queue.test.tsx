@@ -295,6 +295,33 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
+  it("reserves inline space for a user-message timestamp", async () => {
+    const content = "How would I loop the same block over a list of websites?";
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content,
+          created_at: "2026-05-25T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    const message = screen.getByText(content);
+    const row = message.parentElement!;
+    const timestamp = row.querySelector("span")!;
+    expect(message.className).toContain("min-w-0");
+    expect(message.className).toContain("flex-1");
+    expect(row.className).toContain("items-end");
+    expect(timestamp.className).toContain("shrink-0");
+    expect(timestamp.className).not.toContain("absolute");
+  });
+
   it("leaves the input enabled while a turn is in flight", async () => {
     await renderChat();
     await submit("build me a workflow");
@@ -942,7 +969,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Needs your input")).toBeTruthy();
+    expect(screen.getByTestId("copilot-terminal-prose")).toBeTruthy();
+    expect(screen.queryByText("Needs your input")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 

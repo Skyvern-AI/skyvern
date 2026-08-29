@@ -673,7 +673,12 @@ async def test_runtime_self_heal_inline_replace_is_downgraded(monkeypatch: pytes
         stream=SimpleNamespace(),  # type: ignore[arg-type]
         turn_origin=TurnOrigin.runtime_self_heal,
     )
-    chat_request = SimpleNamespace(workflow_id="wf_1", workflow_permanent_id="wpid_1", workflow_yaml="")
+    chat_request = SimpleNamespace(
+        workflow_id="wf_1",
+        workflow_permanent_id="wpid_1",
+        workflow_yaml="",
+        product_action=None,
+    )
 
     agent_result = await agent_module._translate_to_agent_result(
         object(),

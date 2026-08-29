@@ -1675,35 +1675,34 @@ class WorkflowService:
         self,
         *,
         organization_id: str,
-        candidates: Sequence[WorkflowScript],
+        workflow_permanent_id: str,
         block_labels_to_disable: Sequence[str],
     ) -> tuple[list[CachedScriptBlocks], list[CachedScriptBlocks]]:
-        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared."""
+        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared.
+
+        Looks up matching blocks by label directly in SQL (``get_cached_block_groups_by_labels``)
+        rather than loading every cached script for the workflow — some workflows accumulate tens
+        of thousands of cached scripts, and loading them all to filter in Python made saves time
+        out (SKY-15102).
+        """
         cached_groups: list[CachedScriptBlocks] = []
         published_groups: list[CachedScriptBlocks] = []
-        target_labels = set(block_labels_to_disable)
         seen_group_keys: set[tuple[ScriptStatus | str, str, tuple[str, ...]]] = set()
 
-        scripts_by_id = await app.DATABASE.scripts.get_latest_scripts_by_ids(
+        rows = await app.DATABASE.scripts.get_cached_block_groups_by_labels(
             organization_id=organization_id,
-            script_ids=[candidate.script_id for candidate in candidates],
-        )
-        blocks_by_revision = await app.DATABASE.scripts.get_script_blocks_by_script_revision_ids(
-            organization_id=organization_id,
-            script_revision_ids=[script.script_revision_id for script in scripts_by_id.values()],
+            workflow_permanent_id=workflow_permanent_id,
+            block_labels=block_labels_to_disable,
         )
 
-        for candidate in candidates:
-            script = scripts_by_id.get(candidate.script_id)
-            if not script:
-                continue
+        blocks_by_candidate: dict[str, list[Any]] = {}
+        candidate_by_id: dict[str, tuple[Any, Any]] = {}
+        for workflow_script, script, script_block in rows:
+            blocks_by_candidate.setdefault(workflow_script.workflow_script_id, []).append(script_block)
+            candidate_by_id[workflow_script.workflow_script_id] = (workflow_script, script)
 
-            script_blocks = blocks_by_revision.get(script.script_revision_id, [])
-            blocks_to_clear = [
-                block for block in script_blocks if block.script_block_label in target_labels and block.run_signature
-            ]
-            if not blocks_to_clear:
-                continue
+        for workflow_script_id, (candidate, script) in candidate_by_id.items():
+            blocks_to_clear = blocks_by_candidate[workflow_script_id]
 
             group_key = (
                 candidate.status,
@@ -8708,15 +8707,11 @@ class WorkflowService:
                 previous_blocks=current_definition.get("blocks", []),
                 new_blocks=new_definition.get("blocks", []),
             )
-            candidates = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
-                organization_id=organization_id,
-                workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-            )
 
             if plan.has_targets:
                 cached_groups, published_groups = await self._partition_cached_blocks(
                     organization_id=organization_id,
-                    candidates=candidates,
+                    workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
                     block_labels_to_disable=plan.block_labels_to_disable,
                 )
 
@@ -8777,7 +8772,10 @@ class WorkflowService:
                 )
                 return
 
-            to_delete = candidates
+            to_delete = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
+                organization_id=organization_id,
+                workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+            )
 
             if len(to_delete) > 0:
                 try:
@@ -10079,6 +10077,7 @@ class WorkflowService:
     async def get_output_parameter_workflow_run_output_parameter_tuples(
         workflow_id: str,
         workflow_run_id: str,
+        workflow: Workflow | None = None,
     ) -> list[tuple[OutputParameter, WorkflowRunOutputParameter]]:
         workflow_run_output_parameters = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
             workflow_run_id=workflow_run_id
@@ -10090,11 +10089,18 @@ class WorkflowService:
             ]
         )
 
+        output_parameters_by_id = {
+            output_parameter.output_parameter_id: output_parameter for output_parameter in output_parameters
+        }
+        if workflow is not None:
+            for parameter in workflow.workflow_definition.parameters:
+                if isinstance(parameter, OutputParameter):
+                    output_parameters_by_id.setdefault(parameter.output_parameter_id, parameter)
+
         return [
-            (output_parameter, workflow_run_output_parameter)
+            (output_parameters_by_id[workflow_run_output_parameter.output_parameter_id], workflow_run_output_parameter)
             for workflow_run_output_parameter in workflow_run_output_parameters
-            for output_parameter in output_parameters
-            if output_parameter.output_parameter_id == workflow_run_output_parameter.output_parameter_id
+            if workflow_run_output_parameter.output_parameter_id in output_parameters_by_id
         ]
 
     async def get_last_task_for_workflow_run(self, workflow_run_id: str) -> Task | None:
@@ -10483,7 +10489,9 @@ class WorkflowService:
                 workflow_run_tasks=workflow_run_tasks,
             ),
             self.get_output_parameter_workflow_run_output_parameter_tuples(
-                workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+                workflow_id=workflow_run.workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow=workflow,
             ),
             self._fetch_recording_urls(workflow_run, task_v2, organization_id),
             self._fetch_downloaded_files(workflow_run, task_v2),

@@ -446,24 +446,23 @@ const askAfterScoutingTurn = (): TurnNarrativeState => ({
 });
 
 describe("NarrativeView rollup expand affordance", () => {
-  it("renders a pure needs-input ask as a plain, non-expandable card", () => {
+  it("renders a pure needs-input ask as plain, non-expandable prose", () => {
     render(<NarrativeView turn={pureAskTurn()} />);
 
-    expect(screen.getByText("Which login should I use?")).toBeTruthy();
+    expect(screen.getByTestId("copilot-terminal-prose")).toBeTruthy();
+    expect(
+      screen.getByTestId("copilot-terminal-prose-visual").textContent,
+    ).toBe("Which login should I use?");
     expect(screen.queryByRole("button")).toBeNull();
     expect(document.querySelector("[aria-expanded]")).toBeNull();
   });
 
-  it("keeps the chevron for an ask that follows scouting and reveals the thought stream on expand", () => {
+  it("does not box a question just because background scouting was narrated", () => {
     render(<NarrativeView turn={askAfterScoutingTurn()} />);
 
-    const head = screen.getByRole("button");
-    expect(head.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.getByTestId("copilot-terminal-prose")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByText(SCOUT_NARRATION)).toBeNull();
-
-    fireEvent.click(head);
-    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
-    expect(screen.getByText(SCOUT_NARRATION)).toBeTruthy();
   });
 
   it("still shows the expand chevron for a build turn with blocks", () => {
@@ -476,7 +475,7 @@ describe("NarrativeView rollup expand affordance", () => {
     expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
   });
 
-  it("gains the expand affordance when activity arrives after a content-free render", () => {
+  it("makes later block evidence inspectable after a prose-only ask", () => {
     const { rerender } = render(<NarrativeView turn={pureAskTurn()} />);
     expect(screen.queryByRole("button")).toBeNull();
 
@@ -485,8 +484,7 @@ describe("NarrativeView rollup expand affordance", () => {
         turn={{ ...pureAskTurn(), blocks: [completedBlock("block_1")] }}
       />,
     );
-    const head = screen.getByRole("button");
-    expect(head.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.getByRole("button")).toBeTruthy();
   });
 });
 

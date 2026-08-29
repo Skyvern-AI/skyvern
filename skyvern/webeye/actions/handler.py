@@ -166,7 +166,14 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
     WebAction,
 )
-from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import (
+    STALE_TARGET_TOOL_RESULT,
+    ActionAbort,
+    ActionFailure,
+    ActionResult,
+    ActionSuccess,
+    StaleActionAbort,
+)
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
@@ -180,6 +187,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     download_filename_from_suffix,
     extract_filename,
     finish_requested_download_for_context,
+    has_download_interceptor_for_context,
     is_download_response,
     normalize_download_filename,
     publish_download_bytes_for_context,
@@ -205,6 +213,7 @@ from skyvern.webeye.transient_page_observer import (
     TransientPageTextObserver,
     match_user_defined_errors_from_transient_text,
 )
+from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.dom import (
     COMMON_INPUT_TAGS,
     DomUtil,
@@ -221,6 +230,7 @@ from skyvern.webeye.utils.page import (
     _all_page_frames,
     _blob_url_origin,
     apply_secret_visual_mask_to_active_element,
+    install_blob_url_retention,
     probe_blob_action_freshness,
     take_element_screenshot,
     teardown_blob_url_retention,
@@ -255,6 +265,12 @@ DOWNLOAD_ABORTED_FAILURE_MESSAGE = (
     "The browser started this download but aborted it before any file was saved. "
     "The download link may have expired; regenerate it before trying the download again."
 )
+DOWNLOAD_OBSERVED_BUT_EMPTY_FOLLOWUP_MESSAGE = (
+    "A file download was observed but no file could be saved from it. "
+    "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+)
+# Arming/tearing down blob URL retention is best-effort and must never stall a download action.
+_BLOB_RETENTION_ARMING_TIMEOUT_SECONDS = 5.0
 SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
     "The sensitive paste completed, but the clipboard could not be cleared. "
     "Do not repeat the paste; stop and report the clipboard safety failure."
@@ -983,19 +999,21 @@ async def _close_eager_capture_then_teardown_retention(
     eager_blob_capture: _EagerAdoptedBlobCapture,
     page: Page,
     *,
-    browser_session_id: str | None,
+    retention_armed: bool,
     workflow_run_id: str | None,
 ) -> None:
     # aclose() can re-raise CancelledError when the enclosing action is cancelled; the retention
     # wrapper patches page-realm URL.createObjectURL/revokeObjectURL and must be torn down anyway, or
-    # a cancelled adopted session leaks the patched globals. The original cancellation still
-    # propagates after the finally, and a teardown failure stays fail-open/debug-only.
+    # a cancelled session leaks the patched globals. Teardown runs whenever arming was attempted
+    # (a partial install still patches the globals). The original cancellation still propagates after
+    # the finally, and a teardown failure stays fail-open/debug-only.
     try:
         await eager_blob_capture.aclose()
     finally:
-        if browser_session_id:
+        if retention_armed:
             try:
-                await teardown_blob_url_retention(page, workflow_run_id=workflow_run_id)
+                async with asyncio.timeout(_BLOB_RETENTION_ARMING_TIMEOUT_SECONDS):
+                    await teardown_blob_url_retention(page, workflow_run_id=workflow_run_id)
             except Exception:
                 LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
 
@@ -4122,7 +4140,24 @@ class ActionHandler:
         if task.browser_session_id:
             page.on("popup", _register_download_popup)
         requested_download_token = begin_requested_download_for_context(page.context)
+        # Arm blob URL retention for every structurally download-capturing context: adopted/persistent
+        # sessions and any context bound to a CDPDownloadInterceptor (which includes pooled sessions).
+        # A page that mints a PDF blob and synchronously revokes it drops the object URL before the
+        # interceptor's post-event in-page read; retention defers the revoke so the read can recover it.
+        retention_armed = bool(task.browser_session_id) or has_download_interceptor_for_context(page.context)
         try:
+            if retention_armed:
+                # Install before the interaction so the createObjectURL/revokeObjectURL patch is in place
+                # when the click/select mints the blob. Fail-open and time-bounded: retention is a
+                # recovery aid, never a gate on the action itself.
+                try:
+                    async with asyncio.timeout(_BLOB_RETENTION_ARMING_TIMEOUT_SECONDS):
+                        await install_blob_url_retention(page, workflow_run_id=task.workflow_run_id)
+                except Exception:
+                    LOG.debug(
+                        "Failed to install blob URL retention before download action",
+                        workflow_run_id=task.workflow_run_id,
+                    )
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
             with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
@@ -4140,6 +4175,8 @@ class ActionHandler:
             # the cached-script writer's semantics.
             action.finished_at = naive_utc_now()
             if not results:
+                return results
+            if isinstance(results[-1], ActionAbort) and results[-1].skip_remaining_actions:
                 return results
             # Let request events already queued by the action enter before closing admission.
             await asyncio.sleep(0)
@@ -4566,6 +4603,13 @@ class ActionHandler:
                     Exception(f"{DOWNLOAD_ABORTED_FAILURE_MESSAGE} (browser reported: {aborted_reason})"),
                     download_triggered=True,
                 )
+            elif isinstance(results[-1], ActionSuccess):
+                # A download was observed/credited but finalization produced no artifact and the
+                # browser reported no abort reason. Returning a plain success implies a file exists;
+                # flag needs_followup so the agent keeps trying rather than treating a missing file as
+                # a completed download.
+                results[-1].needs_followup = True
+                results[-1].followup_message = DOWNLOAD_OBSERVED_BUT_EMPTY_FOLLOWUP_MESSAGE
             if xhr_fallback_moved_paths:
                 post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
                 if post_settle_extra_paths:
@@ -4588,7 +4632,7 @@ class ActionHandler:
             await _close_eager_capture_then_teardown_retention(
                 eager_blob_capture,
                 page,
-                browser_session_id=task.browser_session_id,
+                retention_armed=retention_armed,
                 workflow_run_id=task.workflow_run_id,
             )
             for observed_popup, popup_callback in download_popup_callbacks:
@@ -4707,6 +4751,21 @@ class ActionHandler:
                                 action_type=action.action_type,
                                 fresh_element_id=action.element_id,
                             )
+                        elif await _batched_target_stale_beyond_remap(scraped_page, page, action):
+                            # The target was remounted by a preceding action in this same batch and could
+                            # not be safely remapped (anchorless / ambiguous / volatile identity).
+                            # Dispatching the stale pre-batch binding would act on a positional look-alike
+                            # or a dead stub, and a later Save in the same batch would then serialize a
+                            # form this batch never fully applied. Stop the batch instead so the next step
+                            # re-plans and re-dispatches the remaining actions against a fresh scrape.
+                            LOG.info(
+                                "Stale batched action could not be safely remapped; stopping the batch to re-plan",
+                                action_type=action.action_type,
+                            )
+                            stop_result = StaleActionAbort()
+                            stop_result.skip_remaining_actions = True
+                            actions_result.append(stop_result)
+                            return actions_result
 
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
@@ -4795,7 +4854,12 @@ class ActionHandler:
                 tool_result_content = "Tool executed successfully"
             elif actions_result and isinstance(actions_result[-1], ActionAbort):
                 action.status = ActionStatus.skipped
-                tool_result_content = "Tool executed successfully"
+                if isinstance(actions_result[-1], StaleActionAbort):
+                    # The action did NOT run (its target went stale). Tell the tool caller the truth so
+                    # the next planning turn re-observes, rather than reporting a false success.
+                    tool_result_content = STALE_TARGET_TOOL_RESULT
+                else:
+                    tool_result_content = "Tool executed successfully"
             else:
                 tool_result_content = "Tool execution failed"
                 # either actions_result is empty or the last action is a failure
@@ -4888,6 +4952,45 @@ def _has_identity_anchor(element: dict) -> bool:
     return any(_has_identity_anchor(child) for child in (element.get("children") or []) if isinstance(child, dict))
 
 
+async def _batched_target_stale_beyond_remap(
+    scraped_page: ScrapedPage,
+    page: Page,
+    action: Action,
+) -> bool:
+    """Fail-closed probe: ``True`` only when a non-first batched WebAction's target was remounted away by
+    a preceding action in the SAME batch (its injected ``unique_id`` marker is gone) on the SAME, intact
+    document, so dispatching its pre-batch binding would act on a positional look-alike / dead stub
+    rather than the live control. It is consulted only after ``_refresh_stale_web_action_before_dispatch``
+    has already declined to remap, and it never re-scrapes or mutates anything. It returns ``False`` for
+    anything it cannot positively confirm -- a coordinate click, a non-main-frame or missing target, a
+    navigated / wholly-replaced document, a still-live node, or an indeterminate probe -- so the legacy
+    dispatch path stays authoritative in every ambiguous case.
+
+    A separate probe (rather than a richer return from the remap) is deliberate: the remap declines
+    anchorless / ambiguous targets BEFORE it probes liveness, yet those are exactly the targets this must
+    catch. The precondition set (coordinate / URL-continuity / main-frame / liveness / marker-survival) is
+    intentionally identical to the remap's; keep the two in sync -- widening one without the other would
+    desync "can we remap?" from "must we stop the batch?".
+    """
+    if not isinstance(action, WebAction) or not action.element_id:
+        return False
+    if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
+        return False
+    if await _document_continuity(scraped_page, page) is not True:
+        return False
+    css = scraped_page.id_to_css_dict.get(action.element_id)
+    frame = scraped_page.id_to_frame_dict.get(action.element_id)
+    if not css or frame != "main.frame":
+        return False  # only the main frame has a scrape-stable identity to reason about
+    try:
+        locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
+        if await locator.count() == 1:
+            return False  # the exact injected node is still live -> not stale
+    except Exception:
+        return False  # cannot confirm staleness -> decline; legacy dispatch stays authoritative
+    return True
+
+
 async def _refresh_stale_web_action_before_dispatch(
     scraped_page: ScrapedPage,
     page: Page,
@@ -4927,9 +5030,7 @@ async def _refresh_stale_web_action_before_dispatch(
     # batch navigated / switched document, the planned action does not belong to the live page -- so
     # decline (before spending a re-scrape) rather than remap it onto an identically-structured control
     # on the destination page.
-    planned_url = getattr(scraped_page, "url", None)
-    live_url = getattr(page, "url", None)
-    if isinstance(planned_url, str) and isinstance(live_url, str) and planned_url != live_url:
+    if await _document_continuity(scraped_page, page) is not True:
         return None
 
     css = scraped_page.id_to_css_dict.get(action.element_id)
@@ -4947,13 +5048,6 @@ async def _refresh_stale_web_action_before_dispatch(
         locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
         if await locator.count() == 1:
             return None  # the exact injected node is still live -> not stale -> dispatch unchanged
-        # The exact node is gone. Before spending a re-scrape, require at least one injected marker to
-        # survive in the planned element's frame. Zero markers means the whole document was replaced --
-        # a same-URL reload / postback the URL guard cannot see. Re-scraping it would re-inject markers
-        # on scan-order strangers and can recycle a later sibling's planned id onto the wrong element,
-        # so decline (without scraping) and leave the legacy path authoritative.
-        if await frame_content.locator(f"[{SKYVERN_ID_ATTR}]").count() == 0:
-            return None
     except Exception:
         return None  # cannot confirm liveness / marker survival -> decline; legacy path authoritative
 
@@ -4998,7 +5092,7 @@ async def _refresh_stale_web_action_before_dispatch(
 
     # The refresh re-scrapes the current page; if that landed on a different document than the batch was
     # planned on, the destination's identically-structured control is not our target -- decline.
-    if isinstance(planned_url, str) and getattr(fresh_scraped_page, "url", None) != planned_url:
+    if await _document_continuity(scraped_page, page) is not True:
         return None
 
     if not fresh_element_id or fresh_element_id == action.element_id:
@@ -5024,6 +5118,19 @@ async def _refresh_stale_web_action_before_dispatch(
         {**fresh_element, "page_url": fresh_url} if isinstance(fresh_element, dict) else {"page_url": fresh_url}
     )
     return fresh_scraped_page, action
+
+
+async def _document_continuity(scraped_page: ScrapedPage, page: Page) -> bool | None:
+    """Return whether the live page still has the batch's original document.
+
+    ``None`` is deliberately indeterminate: destroyed execution contexts and failed probes must
+    fall through to the legacy dispatch path rather than being treated as continuity.
+    """
+    stored_loader_id = getattr(scraped_page, "_document_loader_id", None)
+    if stored_loader_id is None:
+        return None
+    current_loader_id = await get_main_document_loader_id(page)
+    return current_loader_id == stored_loader_id if current_loader_id is not None else None
 
 
 @traced(name="skyvern.agent.action.solve_captcha")

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import structlog
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     carrier_backed_anti_bot_categories,
@@ -69,6 +69,14 @@ PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "no
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
 BuildTestPacketWorkflowSource = Literal["accepted_write_readback", "turn_start_persisted_readback", "unavailable"]
 BuildTestPacketUnfinishedKind = Literal["unverified_block", "missing_requested_output"]
+BuildTestPacketLocatorUnobservedReason = Literal[
+    "worker_owned_run",
+    "run_browser_unavailable",
+    "run_page_unavailable",
+    "observation_deadline_exceeded",
+    "locator_resolution_failed",
+    "identity_read_failed",
+]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
@@ -107,11 +115,21 @@ class PostRunPagePathFailure(BaseModel):
         return self.kind != "non_page_outcome" and bool(self.continuation_targets)
 
 
+class BuildTestPacketRunBrowser(BaseModel):
+    """Which browser this run executed in, relative to the one the chat's tools drive."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ran_outside_this_chats_browser: bool
+    note: str
+
+
 class BuildTestPacketRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     workflow_run_id: str | None = None
     status: str | None = None
+    browser: BuildTestPacketRunBrowser | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -130,14 +148,51 @@ class BuildTestPacketPageState(BaseModel):
     obstructions: list[PageObstruction] = Field(default_factory=list)
 
 
+class BuildTestPacketLocatorObservation(BaseModel):
+    """What one authored locator resolved to on the page the failure left behind.
+
+    Capture order, no ranking: the count and the identities are reported, the repair is not chosen.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    authored_selector: str = Field(min_length=1)
+    match_count: int | None = Field(default=None, ge=0, strict=True)
+    match_index: Literal[0] | None = None
+    observed_after_run: Literal[True] = True
+    observed_candidates: list[str] | None = None
+    unobserved_reason: BuildTestPacketLocatorUnobservedReason | None = None
+
+    @model_validator(mode="after")
+    def validate_observation_state(self) -> BuildTestPacketLocatorObservation:
+        if self.unobserved_reason is not None:
+            if self.match_count is not None or self.match_index is not None or self.observed_candidates is not None:
+                raise ValueError("an unobserved locator cannot carry observed fields")
+            return self
+        if self.match_count is None:
+            raise ValueError("a locator row must be observed or carry an unobserved reason")
+        if self.match_count == 0:
+            if self.match_index is not None or self.observed_candidates is not None:
+                raise ValueError("a zero-match locator cannot carry an index or identities")
+            return self
+        if type(self.match_index) is not int or self.match_index != 0 or not self.observed_candidates:
+            raise ValueError("a positive locator count requires match index zero and an identity")
+        if any(not candidate for candidate in self.observed_candidates):
+            raise ValueError("locator identities must be non-empty")
+        return self
+
+
 class BuildTestPacketFailure(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     block_label: str | None = None
     block_status: str | None = None
     reason: str | None = None
+    error_codes: list[str] = Field(default_factory=list)
+    failing_line: int | None = None
     action_trace: list[str] = Field(default_factory=list)
     page_state: BuildTestPacketPageState | None = None
+    locator_observations: list[BuildTestPacketLocatorObservation] = Field(default_factory=list)
 
 
 class BuildTestPacketRegisteredOutput(BaseModel):
@@ -150,6 +205,17 @@ class BuildTestPacketRegisteredOutput(BaseModel):
     block_type: str | None = None
     value: JsonValue = None
     value_complete: bool = True
+
+
+class BuildTestPacketRequestedOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_run_id: str = Field(min_length=1)
+    output_parameter_id: str = Field(min_length=1)
+    output_parameter_key: str = Field(min_length=1)
+    description: str | None = None
+    block_label: str | None = None
+    block_type: str | None = None
 
 
 class BuildTestPacketDownload(BaseModel):
@@ -186,7 +252,10 @@ class BuildTestEvidencePacket(BaseModel):
     attempted_block_labels: list[str] = Field(default_factory=list)
     executed_block_labels: list[str] = Field(default_factory=list)
     run: BuildTestPacketRun
+    action_observations: list[str] = Field(default_factory=list)
     failure: BuildTestPacketFailure | None = None
+    page_state: BuildTestPacketPageState | None = None
+    requested_outputs: list[BuildTestPacketRequestedOutput] = Field(default_factory=list)
     registered_outputs: list[BuildTestPacketRegisteredOutput] = Field(default_factory=list)
     downloads: list[BuildTestPacketDownload] = Field(default_factory=list)
     screenshot: BuildTestPacketScreenshot
@@ -274,6 +343,8 @@ def _recorded_outcome_degrade_eligible(
 
 class _RecordedBuildTestOutcomeContext(Protocol):
     workflow_yaml: str
+    persisted_workflow_yaml: str | None
+    staged_workflow_yaml: str | None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
     recorded_build_test_outcome_history: list[dict[str, object]]
     recorded_persisted_block_run_workflow_run_id: str | None
@@ -315,6 +386,11 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
         is_authoritative=outcome.is_authoritative,
         workflow_run_id=outcome.workflow_run_id,
         authored_structure_signature=outcome.authored_structure_signature,
+        # The three fields `unresolved_runtime_block_failure` branches on. Without them a suppressed
+        # honesty note cannot be attributed to a branch from the logs alone.
+        attempted_block_label=outcome.attempted_block_label,
+        attempted_call_ref=outcome.attempted_call_ref,
+        attempted_block_signature=_attempted_block_signature(ctx, outcome),
     )
 
 
@@ -353,22 +429,6 @@ def _code_blocks_by_label(workflow_yaml: str | None) -> dict[str, str]:
 # Over-detection only costs a redundant note; a miss silently drops a real failure.
 _SELECTOR_CALL_ATTRS = frozenset({"locator", "get_by_role", "get_by_text", "get_by_label", "get_by_placeholder"})
 
-_CALL_SKIPPING_NODES = (
-    ast.If,
-    ast.IfExp,
-    ast.BoolOp,
-    ast.Try,
-    ast.TryStar,
-    ast.While,
-    ast.For,
-    ast.AsyncFor,
-    ast.comprehension,
-    ast.Match,
-    ast.Lambda,
-    ast.FunctionDef,
-    ast.AsyncFunctionDef,
-)
-
 
 def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
     """Block code is an async body, so it only parses inside a wrapper; None means unparseable."""
@@ -379,14 +439,6 @@ def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
         # and no caller may propagate a parse failure out of turn assembly.
         return None
     return wrapper if isinstance(wrapper, ast.AsyncFunctionDef) else None
-
-
-def _code_can_skip_a_call(code: str) -> bool:
-    """Unparseable code counts as branching so an unrecognized shape never credits re-exercise."""
-    wrapper = _parse_block_code(code)
-    if wrapper is None:
-        return True
-    return any(isinstance(node, _CALL_SKIPPING_NODES) for stmt in wrapper.body for node in ast.walk(stmt))
 
 
 def _selector_removal_is_provable(code: str) -> bool:
@@ -409,8 +461,35 @@ def _selector_removal_is_provable(code: str) -> bool:
     return True
 
 
-def unresolved_runtime_block_failure(ctx: _RecordedBuildTestOutcomeContext) -> UnresolvedRuntimeFailure | None:
-    """The newest runtime block failure that no later run verifiably re-exercised or edited away."""
+def _yaml_digest(text: str | None) -> str:
+    """Identity of a workflow's bytes, so sources can be compared without logging their content."""
+    return hashlib.sha256((text or "").encode()).hexdigest()[:16] if text else "absent"
+
+
+def unresolved_runtime_block_failure(
+    ctx: _RecordedBuildTestOutcomeContext,
+    *,
+    reported_workflow_yaml: str | None = None,
+    pending_later_run_id: str | None = None,
+) -> UnresolvedRuntimeFailure | None:
+    return unresolved_runtime_block_failure_with_disposition(
+        ctx, reported_workflow_yaml=reported_workflow_yaml, pending_later_run_id=pending_later_run_id
+    )[0]
+
+
+def unresolved_runtime_block_failure_with_disposition(
+    ctx: _RecordedBuildTestOutcomeContext,
+    *,
+    reported_workflow_yaml: str | None = None,
+    pending_later_run_id: str | None = None,
+) -> tuple[UnresolvedRuntimeFailure | None, str]:
+    """The newest runtime block failure the retained evidence does not show was resolved.
+
+    A later run of the same block is not clearance. It proves the code executed again, not that it met
+    the condition that failed: a login step can fail against an already-authenticated page and pass
+    against a signed-out one, same lines, opposite precondition. Only evidence that the code itself
+    changed -- the failing call removed, or the block's signature changed -- clears the failure.
+    """
     history = ctx.recorded_build_test_outcome_history
     for index in range(len(history) - 1, -1, -1):
         entry = history[index]
@@ -423,28 +502,48 @@ def unresolved_runtime_block_failure(ctx: _RecordedBuildTestOutcomeContext) -> U
         # Scout evaluations and author-time rejects share this history, so a later *run* has to be
         # identified by phase and a different run id -- otherwise author-time work after the failure
         # would read as a later run that skipped the block.
-        later_runs = [
+        later_runs: list[object] = [
             entry_after
             for entry_after in history[index + 1 :]
             if entry_after.get("phase") == "persisted_block_run"
             and _safe_str(entry_after.get("workflow_run_id")) not in ("", run_id)
         ]
-        code = _code_blocks_by_label(ctx.workflow_yaml).get(label)
+        # A run asking mid-flight is its own later run: its outcome reaches the history only after the
+        # result it is about has been handed back, so without this it would see nothing after the
+        # failure and decline.
+        if pending_later_run_id and pending_later_run_id != run_id:
+            later_runs.append({"workflow_run_id": pending_later_run_id})
+        # Clearance reads only the workflow the user can actually run. A draft that drops the failing
+        # call would clear a failure the delivered workflow still carries.
+        delivered_yaml = reported_workflow_yaml
+        code = _code_blocks_by_label(delivered_yaml).get(label) if delivered_yaml else None
         if not (label and run_id and later_runs and code):
-            return None
-        # Executing the block re-exercises the failing call only when the block runs straight
-        # through; a branch inside it can reach the end without reaching the call.
-        if not _code_can_skip_a_call(code):
-            for later_run in later_runs:
-                if label in _string_list(later_run.get("block_labels")):
-                    return None
+            if not (label and run_id):
+                return None, "incomplete_failure_record"
+            # `no_later_run` is not a suppression: with nothing after it, the failure is the turn's
+            # own headline and needs no separate qualification.
+            if not later_runs:
+                return None, "no_later_run"
+            # Nothing to read the failing block from: either no delivered candidate at all, or the
+            # block is absent from the one we have because it was authored after the snapshot was
+            # taken. Absence is not proof of repair, so the failure stands.
+            return (
+                UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label),
+                "no_reported_candidate" if not delivered_yaml else "block_absent_from_delivered",
+            )
         if call_ref:
             if call_ref not in selector_identities_in_text(code) and _selector_removal_is_provable(code):
-                return None
-        elif signature and authored_block_signatures_from_workflow(ctx.workflow_yaml).get(label) != signature:
-            return None
-        return UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label)
-    return None
+                LOG.info(
+                    "copilot unresolved runtime failure cleared by call removal",
+                    delivered_digest=_yaml_digest(delivered_yaml),
+                    draft_digest=_yaml_digest(ctx.workflow_yaml),
+                    delivered_is_the_draft=delivered_yaml == ctx.workflow_yaml,
+                )
+                return None, f"failing_call_removed:{run_id}:{label}"
+        elif signature and authored_block_signatures_from_workflow(delivered_yaml).get(label) != signature:
+            return None, f"block_signature_changed:{run_id}:{label}"
+        return UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label), "unresolved"
+    return None, "no_runtime_failure"
 
 
 def bind_post_run_page_path_failure(
@@ -719,6 +818,7 @@ def recorded_outcome_from_run_blocks_result(
     recorded_run_outcome: RecordedRunOutcome | None = None,
     completion_verification: CompletionVerificationResult | None = None,
     authored_structure_signature: str | None = None,
+    requested_output_parameter_payloads: Sequence[BuildTestPacketRequestedOutput] | None = None,
     registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
     unbound_required_parameter_keys: Sequence[str] | None = None,
     block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
@@ -752,10 +852,43 @@ def recorded_outcome_from_run_blocks_result(
     page_refs = _page_evidence_refs(graded_page_evidence)
     output_refs = _output_evidence_refs(blocks)
     verification_identity = _completion_verification_identity(completion_verification)
-    missing_output_facts = _missing_requested_output_facts(completion_verification, blocks)
     authoritative_workflow_run_id = (
         recorded_run_outcome.workflow_run_id if recorded_run_outcome is not None else None
     ) or workflow_run_id
+    requested_output_payloads = list(requested_output_parameter_payloads or [])
+    if requested_output_parameter_payloads is None:
+        for payload in _mapping_list(data.get("requested_output_parameter_definitions")):
+            try:
+                requested_output_payloads.append(BuildTestPacketRequestedOutput.model_validate(payload))
+            except ValueError:
+                continue
+    raw_registered_output_payloads = data.get("registered_output_parameter_values")
+    omission_registered_output_payloads = (
+        registered_output_parameter_payloads
+        if registered_output_parameter_payloads is not None
+        else (
+            _mapping_list(raw_registered_output_payloads) if isinstance(raw_registered_output_payloads, list) else None
+        )
+    )
+    registered_output_models: list[BuildTestPacketRegisteredOutput] = []
+    for payload in omission_registered_output_payloads or []:
+        try:
+            registered_output_models.append(BuildTestPacketRegisteredOutput.model_validate(payload))
+        except ValueError:
+            continue
+    typed_output_omission_facts = (
+        _typed_requested_output_omission_facts(
+            requested_output_payloads,
+            registered_output_models,
+            authoritative_workflow_run_id,
+        )
+        if omission_registered_output_payloads is not None
+        else []
+    )
+    missing_output_facts = _merge_missing_requested_output_facts(
+        _missing_requested_output_facts(completion_verification, blocks),
+        typed_output_omission_facts,
+    )
     page_path_failure = _post_run_page_path_failure(graded_page_evidence, authoritative_workflow_run_id or None)
     runtime_output_facts = _runtime_output_repair_facts(
         completion_verification,
@@ -802,7 +935,7 @@ def recorded_outcome_from_run_blocks_result(
                     "evidence_refs": "run output structure",
                 },
             )
-        if recorded_run_outcome.verdict == "not_evaluated":
+        if recorded_run_outcome.verdict == "not_evaluated" and not typed_output_omission_facts:
             return RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -826,7 +959,7 @@ def recorded_outcome_from_run_blocks_result(
                 authored_structure_signature,
                 referenced_unbound_keys,
             )
-        structural_identity = verification_identity
+        structural_identity = verification_identity or _typed_omission_identity(missing_output_facts)
         evidence_refs = output_refs
         if not structural_identity and not page_refs and not evidence_refs:
             return RecordedBuildTestOutcome(
@@ -864,7 +997,7 @@ def recorded_outcome_from_run_blocks_result(
             phase="persisted_block_run",
             attempted_tool="update_and_run_blocks",
             verdict="repairable_failure",
-            reason_code=reason_code,
+            reason_code="no_meaningful_output" if missing_output_facts else reason_code,
             workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
             block_labels=block_labels,
             requested_block_labels=requested_block_labels,
@@ -878,10 +1011,18 @@ def recorded_outcome_from_run_blocks_result(
             authored_structure_signature=authored_structure_signature,
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
-                "structural_failure_identity": "CompletionVerificationResult verdict structure",
+                "structural_failure_identity": (
+                    "same-run requested-output omission facts"
+                    if typed_output_omission_facts
+                    else "CompletionVerificationResult verdict structure"
+                ),
                 "page_evidence_refs": "bounded post-run page evidence",
                 "evidence_refs": "run output structure",
-                "missing_requested_output_facts": "CompletionVerificationResult unsatisfied output paths and run output shape",
+                "missing_requested_output_facts": (
+                    "same-run requested output definitions and registered values"
+                    if typed_output_omission_facts
+                    else "CompletionVerificationResult unsatisfied output paths and run output shape"
+                ),
                 "runtime_output_repair_facts": "same-run registered output parameters and completion verdicts",
                 "page_path_failure": "same-run bounded post-run page structure and executable continuations",
             },
@@ -901,7 +1042,14 @@ def recorded_outcome_from_run_blocks_result(
             authored_structure_signature,
             referenced_unbound_keys,
         )
-    if not (failure_categories or failure_type or runtime_failure_identity or page_refs or output_refs):
+    if not (
+        failure_categories
+        or failure_type
+        or runtime_failure_identity
+        or page_refs
+        or output_refs
+        or missing_output_facts
+    ):
         return None
     structural_identity = (
         _stable_hash(
@@ -915,15 +1063,19 @@ def recorded_outcome_from_run_blocks_result(
         if failure_categories or failure_type or runtime_failure_identity
         else ""
     )
+    if not structural_identity:
+        structural_identity = _typed_omission_identity(missing_output_facts)
     verdict: BuildTestOutcomeVerdict = (
-        "repairable_failure" if bool(result.get("ok")) is False or failed_block is not None else "progress_observed"
+        "repairable_failure"
+        if bool(result.get("ok")) is False or failed_block is not None or missing_output_facts
+        else "progress_observed"
     )
     if not structural_identity and not page_refs and not output_refs:
         verdict = "not_authoritative"
     reason_code = (
         "runtime_block_failure"
         if failed_block is not None or not bool(result.get("ok"))
-        else "run_completed_unevaluated"
+        else ("no_meaningful_output" if missing_output_facts else "run_completed_unevaluated")
     )
     if any(ref.split(":", 1)[0] == _UNRECOVERABLE_TOOL_ERROR_CATEGORY for ref in failure_categories):
         # The run failed on the tool plane, not on what was authored, so it is not test
@@ -957,6 +1109,7 @@ def recorded_outcome_from_run_blocks_result(
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,
         evidence_refs=output_refs,
+        missing_requested_output_facts=missing_output_facts,
         authored_structure_signature=authored_structure_signature,
         observed_evidence_summary=_bounded_text(run_status),
         key_provenance={
@@ -967,6 +1120,7 @@ def recorded_outcome_from_run_blocks_result(
             ),
             "page_evidence_refs": "bounded post-run page evidence",
             "evidence_refs": "run output structure",
+            "missing_requested_output_facts": "same-run requested output definitions and registered values",
         },
     )
 
@@ -1567,6 +1721,55 @@ def _missing_requested_output_facts(
     return sorted(facts, key=lambda item: str(item.get("output_path") or ""))
 
 
+def _typed_requested_output_omission_facts(
+    requested_outputs: Sequence[BuildTestPacketRequestedOutput],
+    registered_outputs: Sequence[BuildTestPacketRegisteredOutput],
+    workflow_run_id: str,
+) -> list[dict[str, object]]:
+    if not workflow_run_id:
+        return []
+    registered_ids = {
+        output.output_parameter_id
+        for output in registered_outputs
+        if output.workflow_run_id == workflow_run_id and output.output_parameter_id
+    }
+    facts: list[dict[str, object]] = []
+    for requested in requested_outputs:
+        if requested.workflow_run_id != workflow_run_id:
+            continue
+        output_parameter_id = requested.output_parameter_id
+        output_parameter_key = requested.output_parameter_key
+        if output_parameter_id in registered_ids:
+            continue
+        fact: dict[str, object] = {
+            "output_path": f"output.{_bounded_ref(output_parameter_key)}",
+            "output_root": _bounded_ref(output_parameter_key),
+            "output_parameter_id": _bounded_ref(output_parameter_id),
+            "reason_code": "registered_output_missing",
+            "value_status": "not_registered",
+        }
+        block_label = requested.block_label
+        if block_label:
+            fact["block_label"] = _bounded_ref(block_label)
+        facts.append(fact)
+    return sorted(facts, key=lambda item: str(item["output_path"]))
+
+
+def _merge_missing_requested_output_facts(
+    first: Sequence[Mapping[str, object]], second: Sequence[Mapping[str, object]]
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for fact in (*first, *second):
+        output_path = fact.get("output_path")
+        if isinstance(output_path, str) and output_path:
+            merged.setdefault(output_path, dict(fact))
+    return [merged[key] for key in sorted(merged)]
+
+
+def _typed_omission_identity(facts: Sequence[Mapping[str, object]]) -> str:
+    return "typed_output_omission:" + _stable_hash(list(facts)) if facts else ""
+
+
 def _runtime_output_repair_facts(
     completion_verification: CompletionVerificationResult | None,
     blocks: Sequence[Mapping[str, object]],
@@ -1868,3 +2071,8 @@ def _value_shape(value: object, *, depth: int = 0) -> object:
     if value is None:
         return "none"
     return type(value).__name__
+
+
+def history_has_runtime_block_failure(ctx: _RecordedBuildTestOutcomeContext) -> bool:
+    """Whether this turn recorded any runtime block failure, resolved or not."""
+    return any(entry.get("reason_code") == "runtime_block_failure" for entry in ctx.recorded_build_test_outcome_history)

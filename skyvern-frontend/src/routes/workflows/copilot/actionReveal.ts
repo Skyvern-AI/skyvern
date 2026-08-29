@@ -44,11 +44,13 @@ export function revealedCountAt(
   return count;
 }
 
-const MS_PER_CHAR = 14;
+// Eleven milliseconds is roughly 21% faster than the original fourteen while
+// still leaving the moving gradient legible.
+export const REVEAL_MS_PER_CHAR = 11;
 
 // Characters of a narration revealed by `elapsedMs`. A missing arrival stamp
 // yields a far-past elapsed, so a hydrated row lands on the full string.
 export function revealedCharsAt(total: number, elapsedMs: number): number {
   if (elapsedMs < 0) return 0;
-  return Math.min(total, Math.floor(elapsedMs / MS_PER_CHAR));
+  return Math.min(total, Math.floor(elapsedMs / REVEAL_MS_PER_CHAR));
 }

@@ -6,6 +6,8 @@ served in a real scout because the agent acts between inspects.)
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,6 +17,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_structured
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
+from skyvern.forge.sdk.copilot.tools import _shared as shared_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
 from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -430,3 +433,114 @@ async def test_structured_evidence_error_is_bounded_and_redacted() -> None:
     assert error is not None
     assert "zzzz1111yyyy2222" not in error
     assert len(error) < 400
+
+
+# The delay sits strictly between the two deadlines, so the only difference between the arms is
+# which deadline governs the same server response and the same packet bytes.
+_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS = 0.05
+_SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS = 0.2
+_SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS = 2.0
+
+
+def _bounded_example_page_payload() -> dict:
+    return {
+        "page_title": "Example Domain",
+        "forms": [
+            {
+                "id": "lookupForm",
+                "name": "",
+                "action": "/results",
+                "method": "get",
+                "fields": [
+                    {
+                        "name": "q",
+                        "id": "q",
+                        "label": "Search term",
+                        "type": "text",
+                        "value": "",
+                        "class": [],
+                        "placeholder": "search",
+                        "required": True,
+                        "disabled": False,
+                        "checked": False,
+                        "options": [],
+                        "selector": "#q",
+                    }
+                ],
+                "submit_controls": [{"text": "Search", "selector": "#go"}],
+            }
+        ],
+    }
+
+
+def _slow_structured_server() -> SimpleNamespace:
+    async def call_internal_tool(_tool_name: str, _arguments: dict) -> dict:
+        await asyncio.sleep(_SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS)
+        return {"ok": True, "data": {"result": json.dumps(_bounded_example_page_payload())}}
+
+    return SimpleNamespace(call_internal_tool=call_internal_tool)
+
+
+@pytest.mark.asyncio
+async def test_structured_timeout_arm_a_nested_deadline_discards_a_slow_read() -> None:
+    """A nested deadline shorter than the response discards the whole packet."""
+    assert _SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS < _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
+
+    started = time.monotonic()
+    evidence, error = await _composition_get_structured_evidence_result(
+        SimpleNamespace(discovery_mcp_server=_slow_structured_server()),
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+        timeout_seconds=_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert evidence is None
+    assert error == (
+        f"skyvern_evaluate timed out after {_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS:g}s "
+        "while capturing structured page evidence"
+    )
+    assert elapsed < _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
+
+
+class _WaitForRecorder:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def __getattr__(self, name: str):
+        return getattr(asyncio, name)
+
+    def wait_for(self, awaitable, timeout):  # type: ignore[no-untyped-def]
+        self.timeouts.append(timeout)
+        return asyncio.wait_for(awaitable, timeout)
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_arm_b_same_slow_read_completes_under_the_outer_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The identical response and bytes, governed only by an owning outer deadline."""
+    assert _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS < _SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS
+    recorder = _WaitForRecorder()
+    monkeypatch.setattr(shared_module, "asyncio", recorder)
+
+    started = time.monotonic()
+    evidence, error = await asyncio.wait_for(
+        _composition_get_structured_evidence_result(
+            SimpleNamespace(discovery_mcp_server=_slow_structured_server()),
+            inspected_url="https://example.com/",
+            current_url="https://example.com/",
+        ),
+        timeout=_SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert recorder.timeouts == []
+    assert error is None
+    assert evidence == parse_composition_structured(
+        _bounded_example_page_payload(),
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+    )
+    assert evidence["forms"][0]["fields"][0]["label"] == "Search term"
+    assert elapsed >= _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS

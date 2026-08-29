@@ -53,9 +53,10 @@ export function RunPaneViewToggles() {
   const compact = useStudioPaneCompact();
   const { runId } = useStudioInspectedRun();
   const workflowPermanentId = useWorkflowPermanentId();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    runId ? { workflowRunId: runId } : undefined,
-  );
+  const { data: workflowRun, isError: statusUnavailable } =
+    useWorkflowRunWithWorkflowQuery(
+      runId ? { workflowRunId: runId } : undefined,
+    );
   const view = useRunPaneViewStore((s) => s.view);
   const setView = useRunPaneViewStore((s) => s.setView);
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
@@ -103,7 +104,7 @@ export function RunPaneViewToggles() {
   const provisioning =
     workflowRun.status === Status.Created ||
     workflowRun.status === Status.Queued;
-  const showLive = outcome === "running" && !provisioning;
+  const showLive = !statusUnavailable && outcome === "running" && !provisioning;
 
   return (
     <>

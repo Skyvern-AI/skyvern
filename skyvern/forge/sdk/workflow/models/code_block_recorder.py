@@ -25,10 +25,10 @@ CODE_BLOCK_FILENAME = "<code_block>"
 CODE_LINE_OFFSET = 2
 MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS = 20
 PENDING_CALL_DELAY_SECONDS = 20.0
-# Every writer and the copilot projection share this, so a failure is bounded once. Wide enough
-# for the head of a Playwright call log that states whether the locator resolved and whether the
-# element was visible and stable — the lines that separate a tool failure from a bad locator.
-RECORDED_FAILURE_RESPONSE_MAX_CHARS = 500
+# Shared by persistence and Copilot projection. The measured attribute-heavy click fixture's
+# first cause line ends at character 933, so 1000 retains it without forwarding the 8000-character
+# capture budget into storage, the run UI, or model context.
+RECORDED_FAILURE_RESPONSE_MAX_CHARS = 1000
 RECORDED_FAILURE_CAPTURE_MAX_CHARS = 8000
 
 _PAGE_ACTION_MAP: dict[str, ActionType] = {

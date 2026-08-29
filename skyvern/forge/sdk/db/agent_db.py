@@ -9,15 +9,21 @@ from sqlalchemy import (
     event,
     pool,
 )
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.engine.interfaces import ExceptionContext
 from sqlalchemy.exc import (
     SQLAlchemyError,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+try:
+    from opentelemetry import trace
+except ImportError:  # opentelemetry-api ships with the server extra only
+    trace = None
+
 from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
-from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError  # noqa: F401
+from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError, is_connection_failure  # noqa: F401
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
@@ -49,6 +55,7 @@ LOG = structlog.get_logger()
 
 # Transaction-pooler compatibility is intentionally scoped to standard :6543 deployments.
 TRANSACTION_POOLER_PORT = 6543
+DB_CONNECTION_ERROR_FINGERPRINT = "db-connection-unavailable"
 _ENFORCING_SSL_MODES = frozenset({"require", "verify-ca", "verify-full"})
 
 
@@ -354,6 +361,17 @@ def _build_engine(database_string: str) -> AsyncEngine:
         pool_timeout=settings.DATABASE_POOL_TIMEOUT,
         pool_recycle=settings.DATABASE_POOL_RECYCLE,
     )
+
+
+def _fingerprint_connection_error(context: ExceptionContext) -> None:
+    # A refused connect or a dropped session carries a psycopg message that lists the pooler hosts in
+    # varying order, so error tracking would open one issue per ordering; pin those to one fingerprint.
+    if trace is None or not is_connection_failure(context.original_exception):
+        return
+    trace.get_current_span().set_attribute("error.fingerprint", DB_CONNECTION_ERROR_FINGERPRINT)
+
+
+event.listen(Engine, "handle_error", _fingerprint_connection_error)
 
 
 __all__ = ["AgentDB", "ScheduleLimitExceededError"]

@@ -1,4 +1,4 @@
-import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
+import { ExclamationTriangleIcon, ImageIcon } from "@radix-ui/react-icons";
 import { CopyButton } from "@/components/CopyButton";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -18,8 +18,13 @@ import {
 } from "../../types/workflowRunTypes";
 import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
 import { ThoughtCard } from "../ThoughtCard";
+import { Button } from "@/components/ui/button";
 import { CodeBlockFailureDetails } from "../CodeBlockFailureDetails";
-import { describeCodeBlockFailure } from "../codeBlockFailure";
+import {
+  describeCodeBlockFailure,
+  failureSupportsScreenshot,
+} from "../codeBlockFailure";
+import { useBlockScreenshot } from "../useBlockScreenshot";
 import { stringifyTimelineValue } from "./formatValue";
 
 function TruncatedWithTooltip({
@@ -237,7 +242,35 @@ function Section({
   );
 }
 
-function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
+// Mounted only once the screenshot flow is in play: block detail renders in contexts that
+// never set up a QueryClient, so the artifact query cannot live in the parent.
+function BlockScreenshotAction({
+  workflowRunBlockId,
+  blockType,
+  onViewScreenshot,
+}: {
+  workflowRunBlockId: string;
+  blockType?: string | null;
+  onViewScreenshot: () => void;
+}) {
+  const screenshot = useBlockScreenshot(workflowRunBlockId, blockType, true);
+  return screenshot ? (
+    <div className="mt-3 flex flex-wrap gap-2">
+      <Button size="sm" onClick={onViewScreenshot}>
+        <ImageIcon className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+        View block screenshot
+      </Button>
+    </div>
+  ) : null;
+}
+
+function BlockDetailFailure({
+  block,
+  onViewScreenshot,
+}: {
+  block: WorkflowRunBlock;
+  onViewScreenshot?: () => void;
+}) {
   const codeFailure = describeCodeBlockFailure(block);
   if (!block.failure_reason && !codeFailure) return null;
   return (
@@ -259,6 +292,13 @@ function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
               failure={codeFailure}
               reason={block.failure_reason}
             />
+            {onViewScreenshot && failureSupportsScreenshot(codeFailure) ? (
+              <BlockScreenshotAction
+                workflowRunBlockId={block.workflow_run_block_id}
+                blockType={block.block_type}
+                onViewScreenshot={onViewScreenshot}
+              />
+            ) : null}
           </div>
         ) : (
           <span className="min-w-0 flex-1 break-words">

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,6 +11,13 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.runtime import (
+    OriginRunRedactionRegistry,
+    browser_page_custody_lock,
+    register_sensitive_origin_run_lease,
+    release_sensitive_origin_run_lease,
+    sensitive_origin_page_has_active_run,
+)
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
     _inspect_page_for_composition_impl,
@@ -171,6 +179,135 @@ async def test_target_url_inspection_does_not_navigate_away_from_interaction_evi
         "observation_step": 4,
     }
     assert 'target_url="current_page"' in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_sensitive_named_url_inspection_clears_only_its_successfully_navigated_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-debug"
+    ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
+    ctx.last_run_blocks_browser_session_id = "pbs-debug"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr-sensitive",
+        {"password": "origin-secret"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
+
+    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://public.example.test/search"}})
+    capture = AsyncMock(
+        return_value=(
+            {
+                "inspected_url": "https://public.example.test/search",
+                "current_url": "https://public.example.test/search",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate",
+        navigate,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        capture,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url",
+        AsyncMock(),
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://public.example.test/search")
+
+    assert result["ok"] is True
+    assert ctx.sensitive_origin_browser_session_ids == {"pbs-other"}
+    navigate.assert_awaited_once()
+    capture.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sensitive_registration_waits_for_named_navigation_capture_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-debug"
+    ctx.sensitive_origin_browser_session_ids = {"pbs-debug"}
+    registration_task: asyncio.Task[None] | None = None
+
+    async def register_sensitive_run() -> None:
+        async with browser_page_custody_lock(ctx):
+            ctx.sensitive_origin_browser_session_ids.add("pbs-debug")
+            ctx.active_sensitive_origin_browser_session_ids.add("pbs-debug")
+
+    async def navigate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal registration_task
+        registration_task = asyncio.create_task(register_sensitive_run())
+        await asyncio.sleep(0)
+        assert not registration_task.done()
+        return {"ok": True, "data": {"url": "https://public.example.test/search"}}
+
+    async def capture(*_args: object, **_kwargs: object) -> tuple[dict[str, object], None]:
+        assert registration_task is not None
+        assert not registration_task.done()
+        return (
+            {
+                "inspected_url": "https://public.example.test/search",
+                "current_url": "https://public.example.test/search",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error", lambda *_args: None
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate", navigate)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence", capture)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url",
+        AsyncMock(),
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://public.example.test/search")
+    assert registration_task is not None
+    await registration_task
+
+    assert result["ok"] is True
+    assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug"}
+    assert ctx.active_sensitive_origin_browser_session_ids == {"pbs-debug"}
+
+
+def test_terminal_run_releases_only_its_exact_sensitive_run_lease() -> None:
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-shared"
+    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr-paused-a", session_id="pbs-shared")
+    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr-terminal-b", session_id="pbs-shared")
+
+    release_sensitive_origin_run_lease(ctx, workflow_run_id="wr-terminal-b")
+
+    assert ctx.active_sensitive_origin_run_sessions == {"wr-paused-a": "pbs-shared"}
+    assert sensitive_origin_page_has_active_run(ctx) is True
+
+    release_sensitive_origin_run_lease(ctx, workflow_run_id="wr-paused-a")
+
+    assert ctx.active_sensitive_origin_run_sessions == {}
+    assert sensitive_origin_page_has_active_run(ctx) is False
 
 
 @pytest.mark.asyncio

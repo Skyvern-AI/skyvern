@@ -325,20 +325,47 @@ def test_the_qualified_turn_is_still_a_success() -> None:
     assert result.turn_outcome.terminal_reason is None
 
 
-def test_a_re_exercised_failure_leaves_the_reply_and_outcome_unqualified() -> None:
+def test_a_staged_repair_does_not_clear_before_the_route_applies_it() -> None:
+    """A proposal is not yet what anyone can run: this terminal is assembled before the route commits.
+
+    Showing, testing, or intending to auto-apply a repaired candidate does not make it the workflow
+    the user has, so it cannot retire a failure in the workflow they do have.
+    """
+    repaired = two_page_login_yaml(submit_selector="Continue")
     ctx = _ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"], final_selector="Continue")
+    ctx.persisted_workflow_yaml = two_page_login_yaml()
+    _ran_blocks(ctx)
 
     result = _result(
         ctx,
         user_response="Built it.",
         updated_workflow=object(),
+        workflow_yaml=repaired,
         turn_outcome=_outcome(ResponseKind.BUILD),
         narrative_payload=_payload(),
     )
 
     assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is None
-    assert result.user_response == "Built it."
+    assert result.turn_outcome.unresolved_runtime_failure is not None
+
+
+def test_a_mid_turn_persist_flag_does_not_prove_the_repair_was_applied() -> None:
+    """`workflow_was_persisted` records a canonical write the route can still roll back."""
+    ctx = _ran_blocks(_ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"]))
+    ctx.persisted_workflow_yaml = two_page_login_yaml()
+
+    result = _result(
+        ctx,
+        user_response="Built it.",
+        updated_workflow=object(),
+        workflow_yaml=two_page_login_yaml(submit_selector="Continue"),
+        workflow_was_persisted=True,
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is not None
 
 
 def test_a_clarifying_turn_is_never_qualified() -> None:
@@ -388,3 +415,70 @@ def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
         assert "wr_1" not in result.narrative_payload[key], key
         assert contains_internal_machinery_leak(result.narrative_payload[key]) is False, key
         assert "sign_in_and_read" in result.narrative_payload[key], key
+
+
+def _ran_blocks(ctx: CopilotContext) -> CopilotContext:
+    """The turn executed the candidate, which is what makes the note eligible at all."""
+    ctx.last_run_blocks_workflow_run_id = "wr_2"
+    return ctx
+
+
+def test_success_over_an_unresolved_failure_is_qualified_on_every_surface() -> None:
+    """A later passing run on unchanged bytes does not license an unqualified success claim."""
+    ctx = _ran_blocks(_ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"]))
+    success = "Workflow updated and successfully tested in a fresh browser session."
+
+    result = _result(
+        ctx,
+        user_response=success,
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(terminalMessage=success, narrativeSummary=success),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is not None
+    surfaces = [
+        result.user_response,
+        result.narrative_payload["terminalMessage"],
+        result.narrative_payload["narrativeSummary"],
+    ]
+    for surface in surfaces:
+        assert surface != success, "an unqualified success survived on one surface"
+        assert "remains unproven" in surface
+
+
+def test_a_trailing_failure_is_not_given_a_second_note() -> None:
+    """With no later run, the failure is the turn's own headline and needs no qualification."""
+    ctx = _ctx(workflow_yaml=two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    _ran_blocks(ctx)
+    headline = "The sign-in block timed out waiting for a login field."
+
+    result = _result(
+        ctx,
+        user_response=headline,
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(terminalMessage=headline, narrativeSummary=headline),
+    )
+
+    assert result.user_response == headline
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is None
+
+
+def test_a_durably_applied_repair_clears_the_failure() -> None:
+    """The pass path: the workflow the user can run no longer contains the implicated call."""
+    ctx = _ran_blocks(_ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"]))
+    ctx.persisted_workflow_yaml = two_page_login_yaml(submit_selector="Continue")
+
+    result = _result(
+        ctx,
+        user_response="Built it.",
+        updated_workflow=object(),
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is None
+    assert result.user_response == "Built it."

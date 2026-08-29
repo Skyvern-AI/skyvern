@@ -81,7 +81,6 @@ class _Ctx:
     block_observation_refs: dict[str, object] = field(default_factory=dict)
     raw_block_observation_refs: object | None = None
     prior_observed_acted_pages: list[dict] = field(default_factory=list)
-    per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     post_run_page_observation_after_failed_test: bool = False
     last_failure_category_top: str | None = None
@@ -4718,7 +4717,7 @@ async def test_capture_reports_structured_timeout_without_calling_get_html() -> 
     )
 
     assert evidence is None
-    assert error == "skyvern_evaluate timed out after 20s while capturing structured page evidence"
+    assert error == "skyvern_evaluate timed out while capturing structured page evidence"
     assert server.calls.count("skyvern_get_html") == 0
 
 
@@ -4737,7 +4736,7 @@ async def test_inspect_tool_returns_the_structured_observation_timeout_to_copilo
     monkeypatch.setattr(tools_module.composition_capture, "_capture_composition_evidence", failed_capture)
 
     result = await tools_module.composition_capture._inspect_page_for_composition_impl(
-        SimpleNamespace(), "current_page"
+        SimpleNamespace(browser_session_id=None), "current_page"
     )
 
     assert result == {

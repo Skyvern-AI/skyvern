@@ -2,6 +2,7 @@ import { type ReactNode, useMemo, useState } from "react";
 import { AxiosError } from "axios";
 import {
   CalendarIcon,
+  InputIcon,
   Pencil1Icon,
   PlayIcon,
   ReloadIcon,
@@ -29,6 +30,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { statusIsFinalized } from "@/routes/tasks/types";
@@ -37,6 +39,7 @@ import { cn } from "@/util/utils";
 
 import { EditableNodeTitle } from "../editor/nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "../editor/header/EditorOverflowMenu";
+import { InputsCountBadge } from "../editor/WorkflowInputs";
 import { MakeACopyButton } from "../editor/MakeACopyButton";
 import { WorkflowChangesList } from "../editor/WorkflowChangesList";
 import {
@@ -225,37 +228,69 @@ function PanelToggle({
 }: {
   content: "parameters" | "schedules";
   label: string;
-  icon?: ReactNode;
+  icon: ReactNode;
 }) {
   const state = useWorkflowPanelStore((s) => s.workflowPanelState);
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const isRecording = useRecordingStore((s) => s.isRecording);
   const isOpen = state.active && state.content === content;
-  const button = (
-    <Button
-      variant="ghost"
-      size={icon ? "icon" : "default"}
-      disabled={isRecording}
-      aria-pressed={isOpen}
-      className={cn(
-        "text-muted-foreground",
-        icon ? "h-8 w-8" : "h-8 px-3 text-xs",
-        isOpen && "bg-accent text-accent-foreground hover:bg-accent/80",
-      )}
-      onClick={() => (isOpen ? close() : setState({ active: true, content }))}
-      aria-label={label}
-    >
-      {icon ?? label}
-    </Button>
-  );
-  // Only icon-only toggles tooltip; a text label is self-describing.
-  if (!icon) {
-    return button;
-  }
   return (
     <ControlTooltip content={label} blocked={isRecording}>
-      {button}
+      <Button
+        variant="ghost"
+        size="icon"
+        disabled={isRecording}
+        aria-pressed={isOpen}
+        className={cn(
+          "h-8 w-8 text-muted-foreground",
+          isOpen && "bg-accent text-accent-foreground hover:bg-accent/80",
+        )}
+        onClick={() => (isOpen ? close() : setState({ active: true, content }))}
+        aria-label={label}
+      >
+        {icon}
+      </Button>
+    </ControlTooltip>
+  );
+}
+
+/**
+ * Inputs read as chrome next to the run CTA — a borderless, muted text label in
+ * a row of icon buttons — so nobody found it (SKY-14866). It is a peer of Run
+ * now: bordered, icon-led, and carrying the count, so the bar says whether the
+ * agent takes any inputs at all. Tooltipped despite the visible label, because
+ * "Inputs" names the control but not the concept.
+ */
+export function InputsToggle() {
+  const state = useWorkflowPanelStore((s) => s.workflowPanelState);
+  const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
+  const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
+  const isRecording = useRecordingStore((s) => s.isRecording);
+  const count = useWorkflowParametersStore((s) => s.parameters.length);
+  const isOpen = state.active && state.content === "parameters";
+  return (
+    <ControlTooltip
+      content="Placeholder values you can link in any block, and fill in before each run"
+      blocked={isRecording}
+    >
+      <Button
+        variant="outline"
+        disabled={isRecording}
+        aria-pressed={isOpen}
+        className={cn(
+          "h-8 gap-1.5 px-3 text-xs",
+          isOpen && "bg-accent text-accent-foreground hover:bg-accent/80",
+        )}
+        onClick={() =>
+          isOpen ? close() : setState({ active: true, content: "parameters" })
+        }
+        aria-label={count > 0 ? `Inputs (${count})` : "Inputs"}
+      >
+        <InputIcon className="size-3.5" aria-hidden />
+        Inputs
+        <InputsCountBadge count={count} />
+      </Button>
     </ControlTooltip>
   );
 }
@@ -271,11 +306,14 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    runId ? { workflowRunId: runId } : undefined,
-  );
+  const { data: workflowRun, isError: statusUnavailable } =
+    useWorkflowRunWithWorkflowQuery(
+      runId ? { workflowRunId: runId } : undefined,
+    );
   const activeRunId = workflowRun?.workflow_run_id;
-  const running = runOutcomeFromStatus(workflowRun?.status) === "running";
+  const running =
+    !statusUnavailable &&
+    runOutcomeFromStatus(workflowRun?.status) === "running";
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
@@ -499,9 +537,7 @@ export function StudioTopBar() {
             </>
           ) : null}
           <div className="flex items-center gap-2">
-            {authoring ? (
-              <PanelToggle content="parameters" label="Inputs" />
-            ) : null}
+            {authoring ? <InputsToggle /> : null}
             <RunStopButton />
           </div>
         </div>

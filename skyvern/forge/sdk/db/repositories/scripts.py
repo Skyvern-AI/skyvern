@@ -1223,6 +1223,81 @@ class ScriptsRepository(BaseRepository):
             query = query.order_by(WorkflowScriptModel.modified_at.desc())
             return (await session.scalars(query)).all()
 
+    @db_operation("get_cached_block_groups_by_labels")
+    async def get_cached_block_groups_by_labels(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        block_labels: Sequence[str],
+    ) -> list[tuple[WorkflowScriptModel, ScriptModel, ScriptBlockModel]]:
+        """Cached script blocks for a workflow whose label is in ``block_labels``, scoped to
+        each script's latest non-deleted version.
+
+        Filters by label in SQL instead of loading every cached script for the workflow and
+        filtering in Python: a workflow can accumulate tens of thousands of cached scripts, and
+        loading them all just to find the handful of blocks matching a couple of labels made
+        workflow saves time out (SKY-15102).
+        """
+        labels = list(dict.fromkeys(block_labels))
+        if not labels:
+            return []
+
+        async with self.Session() as session:
+            # Scoped to this workflow's own script_ids (not every script_id in the org) so the
+            # aggregation stays cheap for orgs with many other workflows.
+            workflow_script_ids_subquery = (
+                select(WorkflowScriptModel.script_id)
+                .filter(WorkflowScriptModel.organization_id == organization_id)
+                .filter(WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id)
+                .filter(WorkflowScriptModel.deleted_at.is_(None))
+                .subquery()
+            )
+            latest_versions_subquery = (
+                select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
+                .filter(ScriptModel.organization_id == organization_id)
+                .filter(ScriptModel.deleted_at.is_(None))
+                .filter(ScriptModel.script_id.in_(select(workflow_script_ids_subquery.c.script_id)))
+                .group_by(ScriptModel.script_id)
+                .subquery()
+            )
+            query = (
+                select(WorkflowScriptModel, ScriptModel, ScriptBlockModel)
+                .join(
+                    ScriptModel,
+                    and_(
+                        ScriptModel.organization_id == WorkflowScriptModel.organization_id,
+                        ScriptModel.script_id == WorkflowScriptModel.script_id,
+                    ),
+                )
+                .join(
+                    latest_versions_subquery,
+                    and_(
+                        ScriptModel.script_id == latest_versions_subquery.c.script_id,
+                        ScriptModel.version == latest_versions_subquery.c.latest_version,
+                    ),
+                )
+                .join(
+                    ScriptBlockModel,
+                    and_(
+                        ScriptBlockModel.organization_id == ScriptModel.organization_id,
+                        ScriptBlockModel.script_revision_id == ScriptModel.script_revision_id,
+                    ),
+                )
+                .where(
+                    WorkflowScriptModel.organization_id == organization_id,
+                    WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowScriptModel.deleted_at.is_(None),
+                    ScriptModel.deleted_at.is_(None),
+                    ScriptBlockModel.script_block_label.in_(labels),
+                    # Matches the old Python truthy check (`if block.run_signature`), which
+                    # excluded an empty-string signature as well as None.
+                    ScriptBlockModel.run_signature.isnot(None),
+                    ScriptBlockModel.run_signature != "",
+                )
+            )
+            result = await session.execute(query)
+            return [(row.WorkflowScriptModel, row.ScriptModel, row.ScriptBlockModel) for row in result]
+
     # -- Script Run / Stats ------------------------------------------------
 
     @db_operation("get_workflow_runs_for_script")

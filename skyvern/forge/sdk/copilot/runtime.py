@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
@@ -66,11 +69,38 @@ LOG = structlog.get_logger()
 # run began in a composition state the workflow itself established.
 FrontierStartProvenance = Literal["initial", "replayed", "resumed", "unanchored"]
 
+
+def _immutable_redaction_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _immutable_redaction_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_immutable_redaction_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_immutable_redaction_value(item) for item in value)
+    return deepcopy(value)
+
+
+@dataclass(frozen=True)
+class OriginRunRedactionRegistry:
+    """Serialized parameter values owned by one concrete workflow run."""
+
+    workflow_run_id: str
+    parameters: Mapping[str, Any]
+    contains_sensitive_values: bool
+    contains_all_sensitive_values: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", _immutable_redaction_value(self.parameters))
+
+
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 # Browser contexts can lag the persistent-session row under load; this keeps
 # Copilot from handing a not-yet-attachable session to the next MCP tool.
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
+# A session this close to a deadline its infrastructure will not move is not worth attaching to:
+# a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
+_FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
 CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
@@ -211,6 +241,10 @@ class ScoutedInteraction(TypedDict):
     # those named in context._TURN_EPHEMERAL_INTERACTION_FIELDS. A field added here that holds a
     # raw value — a literal, page text — has to be listed there too; nothing enforces the pair.
     tool_name: str
+    # Set only when the action was demonstrated somewhere other than the chat's own browser, so
+    # absence means the chat's browser. Without it a demonstration in the last run's browser is
+    # indistinguishable from one the chat drove.
+    demonstrated_browser_session_id: NotRequired[str]
     selector: NotRequired[str]
     executed_selector: NotRequired[str]
     selector_candidates: NotRequired[list[ScoutedSelectorCandidate]]
@@ -302,6 +336,9 @@ class AgentContext:
     # under that lock so every sibling queued against stale page state is suppressed.
     browser_session_continuity_generation: int = 0
     browser_session_continuity_disposition: str | None = None
+    # Whether the session this turn lost was ended by the deadline its infrastructure fixes, rather
+    # than by an unexplained browser failure. Reported to the model and the user as the cause.
+    browser_session_continuity_deadline_expired: bool = False
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     pending_frame_lease: PendingFrameLease | None = None
@@ -468,6 +505,15 @@ class AgentContext:
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
     credential_fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serializes model-visible browser evidence commits with sensitive-run custody changes. Raw
+    # browser work may overlap, but a post-hook or native credential fill owns this lock while it
+    # decides whether its facts are admissible, so rollback cannot erase another call's evidence.
+    browser_page_custody_locks_by_session_id: dict[str, asyncio.Lock] = field(default_factory=dict)
+    browser_evidence_commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # A tainted page cannot be released by fresh navigation while its sensitive workflow run still
+    # owns the same browser. Paused runs retain this lease until a terminal result is observed.
+    active_sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
+    active_sensitive_origin_run_sessions: dict[str, str] = field(default_factory=dict)
     # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
     org_credentials_for_turn: list[Credential] | None = None
     vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
@@ -526,6 +572,11 @@ class AgentContext:
     # scrubbed against this set before being recorded or returned to the model.
     secret_scrub_values: list[str] = field(default_factory=list)
     codeblock_redaction_parameters: dict[str, Any] = field(default_factory=dict)
+    origin_run_redaction_registry: OriginRunRedactionRegistry | None = None
+    # Browser session whose current page may contain values entered by a sensitive inline run.
+    # This is mutable page custody, separate from the immutable run redaction registry: only a
+    # successful fresh navigation of this exact session clears it.
+    sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
@@ -653,12 +704,131 @@ async def _resolve_self_heal_browser_state_inner(ctx: AgentContext) -> tuple[str
     return session_id, browser_state, page
 
 
+_CALL_BROWSER_SESSION_ID: ContextVar[str | None] = ContextVar("copilot_call_browser_session_id", default=None)
+
+
+@contextmanager
+def bound_call_browser_session(session_id: str | None) -> Iterator[None]:
+    """Bind one tool call's browser for everything it reaches: hooks, preparation, dispatch.
+
+    A ContextVar rather than a field on the shared context: sibling tool calls from one model turn
+    run as separate tasks, so each keeps its own binding instead of reading another call's.
+    """
+    if session_id is None:
+        yield
+        return
+    token = _CALL_BROWSER_SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _CALL_BROWSER_SESSION_ID.reset(token)
+
+
+def current_call_browser_session_override() -> str | None:
+    """The browser this call was explicitly targeted at, or None when it named none."""
+    return _CALL_BROWSER_SESSION_ID.get()
+
+
+def effective_browser_session_id(ctx: AgentContext) -> str | None:
+    """The browser the current tool call acts in — its target when it named one, else the chat's.
+
+    Anything resolved inside a call's dynamic extent reads this: a helper that goes straight to
+    ``ctx.browser_session_id`` describes the chat's page while the call acts on another.
+    """
+    return _CALL_BROWSER_SESSION_ID.get() or ctx.browser_session_id
+
+
+SENSITIVE_ORIGIN_PAGE_ERROR = (
+    "This browser page is unavailable after a run with sensitive inputs. Navigate to a specific named URL first; "
+    "a successful fresh navigation makes browser inspection available again."
+)
+SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR = (
+    "This browser page is unavailable while a run with sensitive inputs is active. Wait for that run to finish and "
+    "call get_run_results; then navigate to a specific named URL to make browser inspection available again."
+)
+
+
+def sensitive_origin_page_is_tainted(ctx: AgentContext) -> bool:
+    tainted_session_ids: set[str] = getattr(ctx, "sensitive_origin_browser_session_ids", set())
+    if not tainted_session_ids:
+        return False
+    return effective_browser_session_id(ctx) in tainted_session_ids
+
+
+def browser_page_custody_lock(ctx: AgentContext, *, session_id: str | None = None) -> asyncio.Lock:
+    """Return the per-turn lock that makes sensitive-page custody and evidence commits atomic."""
+    lock_key = session_id or effective_browser_session_id(ctx) or "__unbound_browser_session__"
+    locks = getattr(ctx, "browser_page_custody_locks_by_session_id", None)
+    if not isinstance(locks, dict):
+        locks = {}
+        ctx.browser_page_custody_locks_by_session_id = locks
+    lock = locks.get(lock_key)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        locks[lock_key] = lock
+    return lock
+
+
+def browser_evidence_commit_lock(ctx: AgentContext) -> asyncio.Lock:
+    lock = getattr(ctx, "browser_evidence_commit_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        ctx.browser_evidence_commit_lock = lock
+    return lock
+
+
+def active_sensitive_origin_page_sessions(ctx: AgentContext) -> set[str]:
+    active_session_ids = getattr(ctx, "active_sensitive_origin_browser_session_ids", None)
+    if not isinstance(active_session_ids, set):
+        active_session_ids = set()
+        ctx.active_sensitive_origin_browser_session_ids = active_session_ids
+    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
+    if not isinstance(active_run_sessions, dict):
+        active_run_sessions = {}
+        ctx.active_sensitive_origin_run_sessions = active_run_sessions
+    active_session_ids.update(session_id for session_id in active_run_sessions.values() if session_id)
+    return active_session_ids
+
+
+def register_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: str, session_id: str) -> None:
+    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
+    if not isinstance(active_run_sessions, dict):
+        active_run_sessions = {}
+        ctx.active_sensitive_origin_run_sessions = active_run_sessions
+    active_run_sessions[workflow_run_id] = session_id
+    active_sensitive_origin_page_sessions(ctx).add(session_id)
+
+
+def release_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: str) -> None:
+    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
+    if not isinstance(active_run_sessions, dict):
+        return
+    released_session_id = active_run_sessions.pop(workflow_run_id, None)
+    if released_session_id and released_session_id not in active_run_sessions.values():
+        active_session_ids = getattr(ctx, "active_sensitive_origin_browser_session_ids", None)
+        if isinstance(active_session_ids, set):
+            active_session_ids.discard(released_session_id)
+
+
+def sensitive_origin_page_has_active_run(ctx: AgentContext) -> bool:
+    return effective_browser_session_id(ctx) in active_sensitive_origin_page_sessions(ctx)
+
+
+def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
+    session_id = effective_browser_session_id(ctx)
+    active_session_ids = active_sensitive_origin_page_sessions(ctx)
+    if session_id is not None and session_id not in active_session_ids:
+        ctx.sensitive_origin_browser_session_ids.discard(session_id)
+
+
 async def resolve_browser_state_for_context(
     ctx: AgentContext,
     *,
     session_id: str | None = None,
 ) -> BrowserState | None:
-    resolved_session_id = session_id if session_id is not None else ctx.browser_session_id
+    resolved_session_id = session_id if session_id is not None else _CALL_BROWSER_SESSION_ID.get()
+    if resolved_session_id is None:
+        resolved_session_id = ctx.browser_session_id
     if not resolved_session_id:
         return None
     if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
@@ -740,9 +910,13 @@ def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None
 
 
 @asynccontextmanager
-async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
-    """Push copilot browser state into the MCP session ContextVar for tool calls."""
-    browser_session_id = ctx.browser_session_id
+async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
+    """Push copilot browser state into the MCP session ContextVar for tool calls.
+
+    ``session_id_override`` carries one call's resolved browser so a tool the model targeted at the
+    last run's browser resolves there, without a sibling call reading it off the shared context.
+    """
+    browser_session_id = session_id_override or ctx.browser_session_id
     # Equality, not identity: a plain-string origin must still route to the fail-closed heal branch.
     if ctx.turn_origin != TurnOrigin.runtime_self_heal and not browser_session_id:
         raise RuntimeError("No browser_session_id set on agent context")
@@ -854,11 +1028,53 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         reset_api_key_override(override_token)
 
 
+async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> None:
+    """Drop a held id whose infrastructure is about to end it, so a replacement is created instead.
+
+    The attach in mcp_browser_context stays the oracle for a session that is already gone. This
+    answers what the attach structurally cannot: a session in its final minute attaches fine and
+    then dies mid-call, because its provider pinned the deadline when it created the browser and
+    no renewal moves it (SKY-15044). Infrastructure that can serve a later deadline answers None
+    and nothing here applies to it.
+    """
+    session_id = ctx.browser_session_id
+    if not session_id:
+        return
+    try:
+        remaining_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
+            session_id, ctx.organization_id
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Not an answer about the session, and the attach that follows is one. Keeping the id costs
+        # a failed call at worst; dropping it discards a live browser and its page state on a blip.
+        LOG.warning(
+            "Could not read the browser session's deadline; keeping the held session",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+        return
+    if remaining_seconds is None or remaining_seconds >= _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS:
+        return
+    LOG.info(
+        "Held browser session is at the deadline its infrastructure fixes; replacing it before use",
+        session_id=session_id,
+        organization_id=ctx.organization_id,
+        remaining_seconds=remaining_seconds,
+    )
+    # Stop using it, do not close it: the studio browser pane streams this same session, and it is
+    # going to be torn down on its own deadline within the minute either way.
+    retire_browser_session_id(ctx, session_id)
+
+
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
     """Create a browser session if the context holds none. Returns None on success, error dict on failure.
 
     An existing id is not probed here: the attach in mcp_browser_context is the oracle, and a
-    session it finds gone is retired and replaced where that is discovered.
+    session it finds gone is retired and replaced where that is discovered. The one thing the
+    attach cannot see is a deadline landing mid-call, which is read from the manager instead.
 
     Exception: the self-heal path raises HealAdoptionFailed instead of returning an
     error dict, so a failed adoption aborts the turn rather than degrading to a normal
@@ -877,6 +1093,7 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
         )
         ctx.browser_session_id = None
 
+    await _drop_browser_session_id_at_its_fixed_deadline(ctx)
     if ctx.browser_session_id:
         return None
 
@@ -953,7 +1170,11 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
 async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
     """For callers that hand the id to an out-of-process run without attaching: one attach here is
     the oracle. A session the manager says is gone is replaced; an attach that could not complete
-    returns the facts instead of forwarding an unverified id."""
+    returns the facts instead of forwarding an unverified id.
+
+    The attach cannot see a deadline that lands after it, and this path hands the id to a run that
+    outlives the check by far more than the tool calls do, so the same pre-emption runs here."""
+    await _drop_browser_session_id_at_its_fixed_deadline(ctx)
     if not ctx.browser_session_id:
         return await ensure_browser_session(ctx)
     examined_session_id = ctx.browser_session_id

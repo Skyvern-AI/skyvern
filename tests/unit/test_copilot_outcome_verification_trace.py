@@ -242,7 +242,6 @@ async def test_run_copilot_agent_finalizes_false_gate_on_turn_span(
         chat_request=chat_request,
         chat_history=[],
         global_llm_context=None,
-        debug_run_info_text="",
         llm_api_handler=None,
     )
 

@@ -282,11 +282,13 @@ function NodeHeader({
   const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
-  const { data: workflowRun } = useWorkflowRunQuery({
-    workflowRunId: activeWorkflowRunId,
-  });
+  const { data: workflowRun, isError: statusUnavailable } = useWorkflowRunQuery(
+    {
+      workflowRunId: activeWorkflowRunId,
+    },
+  );
   const workflowRunIsRunningOrQueued =
-    workflowRun && statusIsRunningOrQueued(workflowRun);
+    !statusUnavailable && workflowRun && statusIsRunningOrQueued(workflowRun);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -848,7 +850,9 @@ function NodeHeader({
     cancelBlock.mutate();
   };
 
-  const isRunning = workflowRun ? statusIsRunningOrQueued(workflowRun) : false;
+  const isRunning =
+    !statusUnavailable &&
+    (workflowRun ? statusIsRunningOrQueued(workflowRun) : false);
   const createdAt = toDate(workflowRun?.created_at ?? "", null);
   const finishedAt = toDate(workflowRun?.finished_at ?? "", null);
   const dt = finishedAt
@@ -958,7 +962,9 @@ function NodeHeader({
           ) : null}
           {dt ? <div className="text-sm opacity-70">{dt}</div> : <span />}
           <div>
-            <StatusBadge status={workflowRun?.status ?? "pending"} />
+            {!statusUnavailable ? (
+              <StatusBadge status={workflowRun?.status ?? "pending"} />
+            ) : null}
           </div>
         </div>
       ) : null}

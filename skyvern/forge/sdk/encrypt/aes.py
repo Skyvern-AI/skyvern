@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
+from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod, TokenDecryptionError
 
 # key/salt path: md5 output is fed into PBKDF2HMAC-SHA256 (100k iterations) inside
 # _derive_key(); md5 is only a string->16-byte normalizer, so usedforsecurity=False is
@@ -74,7 +74,7 @@ class AES(BaseEncryptor):
         try:
             encrypted_data = base64.b64decode(ciphertext.encode("utf-8"))
         except Exception as e:
-            raise Exception("Failed to decrypt token") from e
+            raise TokenDecryptionError("Failed to decrypt token") from e
 
         candidates: list[tuple[bytes, bytes]] = [(self.salt, self.iv), *self._fallback_decrypt_params]
         last_error: Exception | None = None
@@ -90,7 +90,7 @@ class AES(BaseEncryptor):
                 last_error = e
                 continue
 
-        raise Exception("Failed to decrypt token") from last_error
+        raise TokenDecryptionError("Failed to decrypt token") from last_error
 
     def _pad(self, data: bytes) -> bytes:
         block_size = 16

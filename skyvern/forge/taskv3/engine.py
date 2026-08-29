@@ -102,6 +102,10 @@ DOWNLOAD_REQUIRED_GUIDANCE = """
 
 This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
 
+AUTO_OBSERVE_GUIDANCE = """
+
+When an action result already ends with an auto-observe block, act from that snapshot instead of calling observe again. If an action changes only styling or focus (hover menus, toggles), the result may say no markup change was detected — observe if you expect something new to be visible. If the next action on the same page does not depend on seeing this one's result, put it in the same turn (the button that advances the form included); type a whole value or key sequence in one `type`/`press_key`, never one character per turn."""
+
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int]:
     """Return (max_turns, max_tool_calls) anti-runaway guards for an action-step budget.
@@ -200,6 +204,7 @@ async def run_task_v3_agent_loop(
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
+    reload_page: Callable[[], Awaitable[None]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -286,6 +291,7 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
+    auto_observe = settings.TASK_V3_AUTO_OBSERVE and not page_free
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
@@ -293,37 +299,49 @@ async def run_task_v3_agent_loop(
         extra_system_guidance = extra_system_guidance + DOWNLOAD_COMPLETION_GUIDANCE
     elif completion_blocker is not None and completion_probe is None:
         extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
+    if auto_observe:
+        extra_system_guidance = extra_system_guidance + AUTO_OBSERVE_GUIDANCE
     system_prompt = base_system_prompt + extra_system_guidance
     system_prompt += datetime.now(ctx.tz_info if ctx and ctx.tz_info else UTC).strftime(
         "\n\nToday's date is %Y-%m-%d (%A), %Z."
     )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
-    outcome = await run_agent_tool_loop(
-        llm_caller=llm_caller,
-        system_prompt=system_prompt,
-        user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
-        tools=tools,
-        max_turns=max_turns,
-        max_tool_calls=max_tool_calls,
-        max_action_steps=max_action_steps,
-        prompt_name=prompt_name,
-        organization_id=organization_id,
-        call_kwargs=_build_call_kwargs(step, llm_caller),
-        should_cancel=should_cancel,
-        on_action_round=on_action_round,
-        on_pre_action=on_pre_action,
-        max_tokens=max_tokens,
-        deadline_seconds=deadline_seconds,
-        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
-        max_call_retries=DEFAULT_MAX_CALL_RETRIES,
-        activity=activity,
-        submit_watch=None if page_free else submit_watch,
-        completion_probe=completion_probe,
-        staged_downloads=staged_downloads,
-        initial_navigation_status=initial_navigation_status,
-        page_probe=None if page_free else page_probe,
-    )
+    try:
+        outcome = await run_agent_tool_loop(
+            llm_caller=llm_caller,
+            system_prompt=system_prompt,
+            user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
+            tools=tools,
+            max_turns=max_turns,
+            max_tool_calls=max_tool_calls,
+            max_action_steps=max_action_steps,
+            prompt_name=prompt_name,
+            organization_id=organization_id,
+            call_kwargs=_build_call_kwargs(step, llm_caller),
+            should_cancel=should_cancel,
+            on_action_round=on_action_round,
+            on_pre_action=on_pre_action,
+            max_tokens=max_tokens,
+            deadline_seconds=deadline_seconds,
+            retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+            max_call_retries=DEFAULT_MAX_CALL_RETRIES,
+            activity=activity,
+            submit_watch=None if page_free else submit_watch,
+            completion_probe=completion_probe,
+            staged_downloads=staged_downloads,
+            initial_navigation_status=initial_navigation_status,
+            page_probe=None if page_free else page_probe,
+            page_fingerprint=None if page_free else page_fingerprint,
+            reload_page=None if page_free else reload_page,
+            auto_observe=auto_observe,
+        )
+    finally:
+        # The context outlives this run; a signal raised as the loop was cancelled must not fire
+        # on the next block's first action.
+        _exit_ctx = skyvern_context.current()
+        if _exit_ctx is not None and _exit_ctx.refresh_working_page:
+            _exit_ctx.refresh_working_page = False
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)

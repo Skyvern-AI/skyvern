@@ -72,6 +72,10 @@ vi.mock("posthog-js/react", () => ({
 }));
 vi.mock("@clerk/clerk-react", () => ({
   useAuth: () => ({ userId: "user-a" }),
+  useUser: () => ({
+    isLoaded: true,
+    user: { createdAt: new Date("2026-08-28T00:00:00Z") },
+  }),
 }));
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
   useGlobalWorkflowsQuery: () => ({

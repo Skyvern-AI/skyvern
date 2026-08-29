@@ -721,8 +721,11 @@ class RealBrowserState(BrowserState):
         if is_engine_timeout(error, self.engine_selection):
             skyvern_context.record_browser_timeout(BrowserOperation.RELOAD)
 
-    async def reload_page(self, degradation: bool = False) -> None:
-        page = await self.__assert_page()
+    async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None:
+        # A caller that pins its own page passes it, since the working-page accessor would reload
+        # (and repoint to) the newest tab instead.
+        if page is None:
+            page = await self.__assert_page()
         url = page.url
 
         if not degradation:

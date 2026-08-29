@@ -1,6 +1,9 @@
 import { describe, expect, test } from "vitest";
 
-import { runViewTabBasePath } from "./runViewTabBasePath";
+import {
+  runOverviewScreenshotLocation,
+  runViewTabBasePath,
+} from "./runViewTabBasePath";
 
 describe("runViewTabBasePath keeps each mounted route family", () => {
   test("agent long-form route -> /agents/{workflowPermanentId}/{workflowRunId}", () => {
@@ -18,5 +21,18 @@ describe("runViewTabBasePath keeps each mounted route family", () => {
 
   test("runs splat -> /runs/{runId}", () => {
     expect(runViewTabBasePath({ runId: "wr_1" })).toBe("/runs/wr_1");
+  });
+});
+
+test("screenshot handoff returns legacy child routes to Overview", () => {
+  expect(
+    runOverviewScreenshotLocation(
+      "/runs/wr_1",
+      "?embed=true&active=act_1&iteration=2",
+      "wrb_failed",
+    ),
+  ).toEqual({
+    pathname: "/runs/wr_1/overview",
+    search: "?embed=true&active=wrb_failed",
   });
 });

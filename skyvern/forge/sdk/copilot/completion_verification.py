@@ -22,7 +22,6 @@ import yaml
 
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionCriterion,
@@ -963,6 +962,10 @@ def _coerce_result(
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str):
+        # Local to keep completion verification importable while output_utils imports the typed
+        # build-test packet classes at module scope.
+        from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+
         raw = parse_final_response(raw)
     if not isinstance(raw, dict):
         return _UNAVAILABLE

@@ -154,6 +154,8 @@ import {
   processDimensionChanges,
   resetDimensionConvergence,
 } from "./dimensionConvergence";
+import { hasStructuralNodeChange } from "./structuralNodeChanges";
+import { useCanvasSelectionSync } from "./hooks/useCanvasSelectionSync";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
@@ -671,24 +673,7 @@ function FlowRenderer({
     };
   }, [reactFlowInstance, readOnly]);
 
-  // Keep React Flow's internal `selected` flag in lockstep with the
-  // store; downstream RF features (delete-key, multi-select) read it.
-  // The updater returns `current` unchanged when no node flips, so RF
-  // skips a full canvas re-render on the typical two-node delta.
-  useEffect(() => {
-    reactFlowInstance.setNodes((current) => {
-      let changed = false;
-      const next = current.map((node) => {
-        const shouldBeSelected = node.id === selectedBlockId;
-        if (Boolean(node.selected) === shouldBeSelected) {
-          return node;
-        }
-        changed = true;
-        return { ...node, selected: shouldBeSelected };
-      });
-      return changed ? next : current;
-    });
-  }, [selectedBlockId, reactFlowInstance]);
+  useCanvasSelectionSync(selectedBlockId);
 
   // Track layout phase for animation control:
   // "pre-layout" = nodes hidden while Dagre hasn't computed positions yet
@@ -2331,17 +2316,7 @@ function FlowRenderer({
                 nodes={nodes}
                 edges={edges}
                 onNodesChange={(changes) => {
-                  // User drag-drop. `dragging === false` fires once at the end
-                  // of a drag gesture. Programmatic position updates (mount-time
-                  // layout, setNodes from node components) leave `dragging`
-                  // undefined, so this filter doesn't falsely trip for them.
-                  const hasStructuralChange = changes.some(
-                    (change) =>
-                      change.type === "add" ||
-                      change.type === "remove" ||
-                      change.type === "replace" ||
-                      (change.type === "position" && change.dragging === false),
-                  );
+                  const hasStructuralChange = hasStructuralNodeChange(changes);
 
                   // A genuine structural edit re-arms the convergence budget so
                   // a real resize that follows isn't starved by a prior loop.

@@ -105,7 +105,10 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
-from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
+from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
+    YutoriNavigatorLLMCaller,
+    derive_navigator_pending_result,
+)
 from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_response_to_actions
 from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
@@ -209,7 +212,6 @@ from skyvern.webeye.actions.actions import (
     TerminateAction,
     UploadFileAction,
     VerificationStatus,
-    WaitAction,
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
@@ -344,6 +346,7 @@ _TASKV3_TOOL_ACTION_TYPES = {
     "scroll": ActionType.SCROLL,
     "wait": ActionType.WAIT,
     "solve_captcha": ActionType.SOLVE_CAPTCHA,
+    "reload_page": ActionType.RELOAD_PAGE,
 }
 
 
@@ -387,6 +390,8 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
         return UploadFileAction(element_id=selector, file_url=str(args.get("file") or ""), **fields)
     if tool_name == "navigate":
         return GotoUrlAction(url=str(args.get("url") or ""), **fields)
+    if tool_name == "reload_page":
+        return ReloadPageAction(reasoning=str(args.get("reason") or ""), **fields)
     return Action(action_type=_TASKV3_TOOL_ACTION_TYPES.get(tool_name, ActionType.CLICK), **fields)
 
 
@@ -1803,6 +1808,23 @@ class ForgeAgent:
             nonce = await peek.evaluate(_DOCUMENT_NONCE_JS)
             return f"{peek.url}|{nonce}"
 
+        async def _reload_page() -> None:
+            # Observed by the action policy like the legacy internal refresh; the loop records it in
+            # the action round. A bare task pins one page, so it is passed explicitly.
+            pinned = None if task_block is not None else await _page_provider()
+            preflight_action(
+                ReloadPageAction(
+                    reasoning="a page-level handler requested a refresh",
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                ),
+                pinned if pinned is not None else await _fingerprint_page(),
+                site="internal_refresh",
+            )
+            await browser_state.reload_page(page=pinned)
+
         # Whether the control the run CLICKED is still in flight. Scoped to that one control on
         # purpose: "is anything on this page busy?" strands a finished run on an unrelated upload
         # widget or a stale modal the app left in the DOM. Narrow for the same reason -- every
@@ -1850,6 +1872,7 @@ class ForgeAgent:
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
                 page_probe=_page_probe,
+                reload_page=_reload_page,
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
@@ -3443,20 +3466,7 @@ class ForgeAgent:
                 for action, results in detailed_agent_step_output.actions_and_results:
                     if not results or not action.tool_call_id:
                         continue
-                    r = results[-1]
-                    result_str: str | None
-                    if isinstance(action, WaitAction):
-                        # Skyvern's handle_wait_action always returns ActionFailure by
-                        # design (to discourage v1/v2 engines from leaning on wait), but
-                        # Navigator emits wait as a deliberate cooperative pause —
-                        # surface a positive tool result so the model sees WaitAction success.
-                        result_str = f"Waited {action.seconds}s"
-                    elif r.success:
-                        # Use actual data when available (JS output, etc.)
-                        result_str = str(r.data) if r.data is not None else None
-                    else:
-                        # Provide error details so the model can recover
-                        result_str = f"ERROR: {r.exception_message or 'Action failed'}"
+                    result_str = derive_navigator_pending_result(action, results[-1])
                     nav_caller.update_pending_result(action.tool_call_id, result_str)
 
         # Check if Skyvern already returned a complete action, if so, don't run user goal check
