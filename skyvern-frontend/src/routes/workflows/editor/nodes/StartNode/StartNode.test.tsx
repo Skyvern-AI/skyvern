@@ -10,6 +10,8 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { StartNode } from "./StartNode";
 import {
   OPEN_WORKFLOW_SETTINGS_EVENT,
@@ -80,16 +82,101 @@ const StartNodeForTest = StartNode as unknown as (
   props: StartNodeComponentProps,
 ) => JSX.Element;
 
-function renderStartNode() {
+function renderStartNode(overrides: Partial<WorkflowStartNodeData> = {}) {
   return render(
     <MemoryRouter initialEntries={["/workflows/wpid_abc/studio"]}>
-      <StartNodeForTest id="start" data={startNodeData} />
+      <StartNodeForTest id="start" data={{ ...startNodeData, ...overrides }} />
     </MemoryRouter>,
   );
 }
 
 afterEach(() => {
   cleanup();
+  useWorkflowParametersStore.setState({ parameters: [] });
+  useWorkflowPanelStore.setState({
+    workflowPanelState: { active: false, content: "parameters" },
+  });
+});
+
+describe("StartNode inputs summary", () => {
+  test("states the declared inputs, and Add opens the Inputs panel", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "order_id",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+        {
+          key: "vendor_email",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+      ],
+    });
+    renderStartNode();
+
+    expect(screen.getByText("order_id")).toBeDefined();
+    expect(screen.getByText("vendor_email")).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: /add/i }));
+
+    expect(useWorkflowPanelStore.getState().workflowPanelState).toEqual({
+      active: true,
+      content: "parameters",
+    });
+  });
+
+  test("an agent with no inputs says what inputs are, rather than nothing", () => {
+    // The zero-input case is the one the header never distinguished, and the
+    // reason nobody found the feature (SKY-14866).
+    renderStartNode();
+
+    expect(screen.getByText(/None yet/)).toBeDefined();
+  });
+
+  test("a view-only workflow can read its inputs but not add one", () => {
+    // editable is false for global workflows and deleted snapshots, which the
+    // editor headers already hide Inputs for. WorkflowParametersPanel mutates,
+    // so reaching it here would dirty a workflow that cannot be saved.
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "order_id",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+      ],
+    });
+    renderStartNode({ editable: false });
+
+    expect(screen.getByText("order_id")).toBeDefined();
+    expect(screen.queryByRole("button", { name: /add/i })).toBeNull();
+  });
+
+  test("Add does not also open workflow settings", () => {
+    // The click bubbles to FlowRenderer's onNodeClick, which dispatches
+    // OPEN_WORKFLOW_SETTINGS_EVENT for the root start node.
+    const onNodeClick = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/studio"]}>
+        <div onClick={onNodeClick}>
+          <StartNodeForTest id="start" data={startNodeData} />
+        </div>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /add/i }));
+
+    expect(onNodeClick).not.toHaveBeenCalled();
+    expect(useWorkflowPanelStore.getState().workflowPanelState).toEqual({
+      active: true,
+      content: "parameters",
+    });
+  });
 });
 
 describe("StartNode workflow settings affordance", () => {

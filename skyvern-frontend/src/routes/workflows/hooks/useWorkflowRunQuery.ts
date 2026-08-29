@@ -19,12 +19,12 @@ const RUN_STATUS_POLL_INTERVAL_MS = 5000;
 // Generous against the poll interval because the gap is measured from the last success, and sleep,
 // hidden-tab timer throttling, and retry backoff all widen that gap before an outage even starts.
 const POLL_OUTAGE_BUDGET_MS = 120000;
+const RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS = 30000;
 
-// Data from before a failed refetch is retained, so stopping the poll on the
-// first error leaves a run that has since finished rendered as still running
-// until the page is remounted. Poll through a bounded outage instead, so a run
-// whose workflow stops resolving mid-run still cannot poll its error every 5s
-// forever. The budget is measured from the last success rather than from
+// Data from before a failed refetch is retained. Poll frequently through a
+// short outage, then retry at a quieter cadence until the run status resolves.
+// This keeps reconciliation automatic without retrying a persistent error every
+// five seconds. The outage is measured from the last success rather than from
 // fetchFailureCount, which query-core resets at the start of every fetch.
 function getRunStatusRefetchInterval(state: {
   status: "pending" | "error" | "success";
@@ -42,7 +42,7 @@ function getRunStatusRefetchInterval(state: {
     state.status === "error" &&
     state.errorUpdatedAt - state.dataUpdatedAt > POLL_OUTAGE_BUDGET_MS
   ) {
-    return false;
+    return RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS;
   }
   return RUN_STATUS_POLL_INTERVAL_MS;
 }
@@ -107,6 +107,7 @@ function useWorkflowRunQuery(options?: {
 export {
   getRunStatusRefetchInterval,
   POLL_OUTAGE_BUDGET_MS,
+  RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,
   useWorkflowRunQuery,
 };

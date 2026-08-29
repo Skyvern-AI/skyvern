@@ -7,8 +7,11 @@ import {
   useRef,
   useState,
 } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import {
+  REVEAL_MS_PER_CHAR,
   buildRevealOffsets,
   revealedCharsAt,
   revealedCountAt,
@@ -45,6 +48,8 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+const TERMINAL_PROSE_GRADIENT_CHARS = 32;
+const TERMINAL_PROSE_GRADIENT_SETTLE_MS = 420;
 
 function normalizeOutcomeReason(
   reason: string | null | undefined,
@@ -411,7 +416,7 @@ function useTick(active: boolean, intervalMs = 1000): void {
 }
 
 // Both reveals advance faster than an interval coarse enough for status text:
-// narration moves a character every 14ms, and buildRevealOffsets scales a long
+// narration moves a character every REVEAL_MS_PER_CHAR, and buildRevealOffsets scales a long
 // block's steps under 150ms, so a timer samples them in visible jumps.
 function useFrameTick(active: boolean): void {
   const [, setTick] = useState(0);
@@ -1879,6 +1884,251 @@ interface NarrativeViewProps {
   workingRowActive?: boolean;
 }
 
+type TerminalProseTone = "answer" | "question";
+
+interface MarkdownTreeNode {
+  type: string;
+  value?: string;
+  tagName?: string;
+  properties?: Record<string, unknown>;
+  children?: MarkdownTreeNode[];
+}
+
+interface MarkdownReveal {
+  shown: number;
+  gradientStart: number;
+  onCharacterCount: (count: number) => void;
+}
+
+// ReactMarkdown has already parsed the model output into a structured HAST.
+// Reveal those text nodes in document order so formatting never depends on
+// interpreting a partial Markdown string.
+function terminalMarkdownRevealPlugin(reveal: MarkdownReveal) {
+  return () => (tree: MarkdownTreeNode) => {
+    let offset = 0;
+    let lastGradientNode: MarkdownTreeNode | null = null;
+
+    const revealChildren = (node: MarkdownTreeNode) => {
+      if (!node.children) return;
+      const visibleChildren: MarkdownTreeNode[] = [];
+
+      for (const child of node.children) {
+        if (child.type !== "text") {
+          const offsetBeforeChild = offset;
+          revealChildren(child);
+          if (
+            (child.children && child.children.length > 0) ||
+            (!child.children && offsetBeforeChild < reveal.shown)
+          ) {
+            visibleChildren.push(child);
+          }
+          continue;
+        }
+
+        const value = child.value ?? "";
+        const start = offset;
+        offset += value.length;
+        const visibleLength = Math.min(
+          value.length,
+          Math.max(0, reveal.shown - start),
+        );
+        if (visibleLength === 0) continue;
+
+        const stableLength = Math.min(
+          visibleLength,
+          Math.max(0, reveal.gradientStart - start),
+        );
+        if (stableLength > 0) {
+          visibleChildren.push({
+            type: "text",
+            value: value.slice(0, stableLength),
+          });
+        }
+
+        const gradientLength = visibleLength - stableLength;
+        for (let i = 0; i < gradientLength; i += 1) {
+          const characterOffset = start + stableLength + i;
+          const progress =
+            (characterOffset - reveal.gradientStart + 1) /
+            Math.max(1, reveal.shown - reveal.gradientStart);
+          const opacity = Math.max(0.12, 1 - progress * 0.88);
+          const gradientNode: MarkdownTreeNode = {
+            type: "element",
+            tagName: "span",
+            properties: { style: `opacity: ${opacity.toFixed(2)}` },
+            children: [
+              {
+                type: "text",
+                value: value[stableLength + i],
+              },
+            ],
+          };
+          visibleChildren.push(gradientNode);
+          lastGradientNode = gradientNode;
+        }
+      }
+
+      node.children = visibleChildren;
+    };
+
+    revealChildren(tree);
+    const gradientEdge = lastGradientNode as MarkdownTreeNode | null;
+    if (gradientEdge) {
+      gradientEdge.properties = {
+        ...gradientEdge.properties,
+        "data-testid": "copilot-terminal-prose-gradient",
+      };
+    }
+    reveal.onCharacterCount(offset);
+  };
+}
+
+function TerminalMarkdown({
+  text,
+  reveal,
+}: {
+  text: string;
+  reveal?: MarkdownReveal;
+}) {
+  return (
+    <div className="whitespace-normal [&_a]:underline [&_a]:underline-offset-2 [&_code]:rounded [&_code]:bg-slate-500/15 [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.92em] [&_li+li]:mt-1 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-5 [&_p+p]:mt-3 [&_pre]:my-3 [&_pre]:overflow-x-auto [&_pre]:whitespace-pre-wrap [&_pre]:rounded-md [&_pre]:bg-slate-500/15 [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-5">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={
+          reveal ? [terminalMarkdownRevealPlugin(reveal)] : undefined
+        }
+        skipHtml
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function hasRecordedTerminalEvidence(turn: TurnNarrativeState): boolean {
+  return (
+    turn.blocks.length > 0 ||
+    (turn.draft?.blockCount ?? 0) > 0 ||
+    turn.lastRunOutcome !== null
+  );
+}
+
+function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
+  // This is intentionally driven only by the structured terminal outcome.
+  // Agent language is freeform, so parsing it to decide whether the user needs
+  // to respond would turn presentation into a brittle copy contract.
+  if (turn.terminal !== "response" || turn.cancelled) return null;
+  // A run whose outcome was not demonstrated needs its existing warning and
+  // expandable evidence. Freeform clarification prose cannot replace that
+  // inspection path.
+  if (notConfirmedOutcome(turn) !== null) return null;
+  if (
+    turn.proposalDisposition === "review_untested" ||
+    turn.proposalDisposition === "review_tested"
+  ) {
+    return null;
+  }
+  // A terminal question can follow a partial build or test. Keep recorded work
+  // on the expandable evidence path rather than losing it to prose-only chrome.
+  if (hasRecordedTerminalEvidence(turn)) return null;
+  if (turn.responseKind === "clarify" || turn.responseType === "ASK_QUESTION") {
+    return "question";
+  }
+  if (
+    turn.responseKind === "answer" ||
+    turn.responseKind === "diagnose" ||
+    turn.responseKind === "refuse" ||
+    turn.responseKind === "recover"
+  ) {
+    return "answer";
+  }
+  return null;
+}
+
+function TerminalProse({
+  text,
+  tone,
+  arrivedAt,
+}: {
+  text: string;
+  tone: TerminalProseTone;
+  arrivedAt: string | null;
+}) {
+  const visibleLengthRef = useRef({ text, length: text.length });
+  if (visibleLengthRef.current.text !== text) {
+    visibleLengthRef.current = { text, length: text.length };
+  }
+  const onCharacterCount = useCallback(
+    (count: number) => {
+      visibleLengthRef.current = { text, length: Math.max(1, count) };
+    },
+    [text],
+  );
+  const reducedMotion =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // A hydrated history row should never replay. The terminal timestamp is the
+  // recorded arrival time for a live response, while an absent timestamp means
+  // the browser cannot truthfully reconstruct the original reveal.
+  const arrivalMs = parseUtcIsoMs(arrivedAt);
+  const elapsedMs = arrivalMs === null ? null : Date.now() - arrivalMs;
+  const visibleLength = visibleLengthRef.current.length;
+  const shown =
+    reducedMotion || elapsedMs === null
+      ? visibleLength
+      : Math.min(
+          visibleLength,
+          Math.max(1, revealedCharsAt(visibleLength, elapsedMs)),
+        );
+  const revealing = shown < visibleLength;
+  const settleProgress =
+    !revealing && elapsedMs !== null
+      ? Math.min(
+          1,
+          Math.max(
+            0,
+            (elapsedMs - visibleLength * REVEAL_MS_PER_CHAR) /
+              TERMINAL_PROSE_GRADIENT_SETTLE_MS,
+          ),
+        )
+      : 0;
+  const settling =
+    !reducedMotion && elapsedMs !== null && !revealing && settleProgress < 1;
+  const gradientChars = revealing
+    ? TERMINAL_PROSE_GRADIENT_CHARS
+    : Math.ceil(TERMINAL_PROSE_GRADIENT_CHARS * (1 - settleProgress));
+  const gradientStart =
+    revealing || settling ? Math.max(0, shown - gradientChars) : shown;
+  useFrameTick(revealing || settling);
+
+  return (
+    <div
+      data-testid="copilot-terminal-prose"
+      className={[
+        "whitespace-pre-wrap text-[13px] leading-[1.55]",
+        tone === "question"
+          ? "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]"
+          : "text-foreground dark:text-slate-200",
+      ].join(" ")}
+    >
+      <div className="sr-only">
+        <TerminalMarkdown text={text} />
+      </div>
+      <div data-testid="copilot-terminal-prose-visual" aria-hidden="true">
+        <TerminalMarkdown
+          text={text}
+          reveal={
+            revealing || settling
+              ? { shown, gradientStart, onCharacterCount }
+              : undefined
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
 export function NarrativeView({
   turn,
   onBlockSelect,
@@ -1887,6 +2137,10 @@ export function NarrativeView({
   const summary = useMemo(() => computeTurnSummary(turn), [turn]);
   const isInFlight = turn.terminal === null;
   const isComplete = !isInFlight;
+  const proseTone = terminalProseTone(turn);
+  const proseText = humanizeJudgeText(
+    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+  );
   const [userRolled, setUserRolled] = useState<boolean | null>(null);
   const activityInteractionRef = useRef<string | null>(null);
   const rolled = userRolled === null ? isComplete : userRolled;
@@ -1902,6 +2156,16 @@ export function NarrativeView({
     }
     pendingTurnFocus.current = null;
   }, [rolled]);
+
+  if (proseTone !== null && proseText) {
+    return (
+      <TerminalProse
+        text={proseText}
+        tone={proseTone}
+        arrivedAt={turn.endedAt}
+      />
+    );
+  }
 
   if (rolled && isComplete) {
     return (

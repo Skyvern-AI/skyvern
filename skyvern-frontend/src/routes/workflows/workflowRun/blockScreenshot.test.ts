@@ -6,6 +6,7 @@ import { isBlockScreenshot, selectBlockScreenshot } from "./blockScreenshot";
 function artifact(
   artifactType: ArtifactType,
   artifactId = "a_1",
+  archived = false,
 ): ArtifactApiResponse {
   return {
     created_at: "2026-06-16T00:00:00Z",
@@ -16,6 +17,7 @@ function artifact(
     artifact_type: artifactType,
     uri: "s3://bucket/key",
     organization_id: "o_1",
+    archived,
   };
 }
 
@@ -69,6 +71,18 @@ describe("selectBlockScreenshot", () => {
     expect(selectBlockScreenshot(artifacts)?.artifact_id).toBe(
       "a_action_newest",
     );
+  });
+
+  test("skips archived screenshots and falls back to an available capture", () => {
+    const artifacts = [
+      artifact(ArtifactType.ActionScreenshot, "a_action_archived", true),
+      artifact(ArtifactType.LLMScreenshot, "a_llm_available"),
+    ];
+
+    expect(
+      selectBlockScreenshot(artifacts, WorkflowBlockTypes.Code)?.artifact_id,
+    ).toBe("a_llm_available");
+    expect(isBlockScreenshot(artifacts[0]!)).toBe(false);
   });
 
   test("returns undefined when no screenshot is present", () => {

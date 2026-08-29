@@ -21,6 +21,7 @@ type RunSummaryStripProps = {
   // Ticking elapsed while the run is live; null once finalized, when the strip
   // reads "Ran for …" from the run's own endpoints instead.
   liveElapsed: string | null;
+  statusUnavailable?: boolean;
   // Controls pinned to the right end (the block search), outside the wrap.
   trailing?: ReactNode;
 };
@@ -35,6 +36,7 @@ export function RunSummaryStrip({
   workflowRun,
   timeline,
   liveElapsed,
+  statusUnavailable = false,
   trailing,
 }: RunSummaryStripProps) {
   const finalized = statusIsFinalized(workflowRun);
@@ -57,8 +59,10 @@ export function RunSummaryStrip({
   return (
     <div className="flex shrink-0 items-start gap-2 [container-name:status] [container-type:inline-size]">
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1 py-1 text-xs">
-        <StatusBadge status={workflowRun.status} collapsible />
-        {workflowRun.failure_category?.length ? (
+        {!statusUnavailable ? (
+          <StatusBadge status={workflowRun.status} collapsible />
+        ) : null}
+        {!statusUnavailable && workflowRun.failure_category?.length ? (
           <FailureCategoryBadge
             failureCategory={workflowRun.failure_category}
           />

@@ -33,12 +33,14 @@ import { WorkflowRunTimeline } from "./WorkflowRunTimeline";
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
+  statusUnavailable: false,
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => ({
     data: mocks.workflowRun,
     isLoading: false,
+    isError: mocks.statusUnavailable,
   }),
 }));
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
@@ -182,9 +184,29 @@ afterEach(() => {
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
+  mocks.statusUnavailable = false;
 });
 
 describe("WorkflowRunTimeline", () => {
+  it("does not offer a live stream from an unavailable status payload", () => {
+    mocks.workflowRun = {
+      status: Status.Running,
+      total_steps: 0,
+      credits_used: 0,
+      cached_credits_used: 0,
+      workflow: { workflow_definition: { finally_block_label: null } },
+    };
+    mocks.timeline = [];
+    mocks.statusUnavailable = true;
+
+    renderTimeline(null);
+    expect(
+      screen.queryByRole("button", {
+        name: "Jump to the live stream of the running workflow",
+      }),
+    ).toBeNull();
+  });
+
   it("renders blocks in global execution order, not branch-tree order", () => {
     // Regression: block_8/block_12 are branch children of conditional
     // block_2 but executed after root loop block_5. The tree rendering used
