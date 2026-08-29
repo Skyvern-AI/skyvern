@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketFailure,
     BuildTestPacketLocatorObservation,
     BuildTestPacketLocatorUnobservedReason,
+    BuildTestPacketPageCapture,
     BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
@@ -44,6 +45,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
+    post_run_page_capture_from_result,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
     unresolved_runtime_block_failure_with_disposition,
@@ -1786,13 +1788,13 @@ async def _capture_and_store_post_run_page(
     run_session_id: str,
     run_id: str,
     current_url: str,
-) -> None:
+) -> BuildTestPacketPageCapture:
     """A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
     registry = ctx.origin_run_redaction_registry
     if registry is not None and registry.workflow_run_id == run_id and registry.contains_sensitive_values:
         ctx.composition_page_evidence = None
-        return
+        return BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
     evidence, observed_session_id, _, captured_frame = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
@@ -1805,9 +1807,11 @@ async def _capture_and_store_post_run_page(
             source_browser_session_id=observed_session_id,
             run_browser_session_id=run_session_id,
         )
+        same_run_stored_evidence = _same_run_page_evidence_for_result(ctx, run_id)
         if (
             captured_frame is not None
             and not preserved_stored_evidence
+            and same_run_stored_evidence is not None
             and not (
                 ctx.origin_run_redaction_registry is not None
                 and ctx.origin_run_redaction_registry.workflow_run_id == run_id
@@ -1831,9 +1835,14 @@ async def _capture_and_store_post_run_page(
                 ),
                 captured_at=captured_frame.captured_at,
             )
-        return
+        stored_capture = post_run_page_capture_from_result(
+            {"workflow_run_id": run_id, "browser_session_id": run_session_id},
+            same_run_stored_evidence,
+        )
+        return stored_capture or BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
     if not post_run_inspection_cleanly_matches(ctx.composition_page_evidence, run_id):
         ctx.composition_page_evidence = None
+    return BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
 
 
 def _pre_run_baseline_is_provenance_valid(evidence: Mapping[str, Any] | None) -> bool:
@@ -3176,6 +3185,7 @@ async def _run_blocks_and_collect_debug(
                 LOG.debug("Failed to capture post-run screenshot", exc_info=True)
 
         locator_observations: list[AuthoredLocatorObservationRow] | None = None
+        post_run_page_capture: BuildTestPacketPageCapture | None = None
         if not sensitive_origin_run:
             if (
                 not dispatch_to_worker
@@ -3186,7 +3196,7 @@ async def _run_blocks_and_collect_debug(
                 # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
                 # A dispatched run therefore carries no locator observation, and the packet says so.
                 _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
-                await _capture_and_store_post_run_page(
+                post_run_page_capture = await _capture_and_store_post_run_page(
                     ctx,
                     run_session_id=run_session_id,
                     run_id=workflow_run.workflow_run_id,
@@ -3245,6 +3255,8 @@ async def _run_blocks_and_collect_debug(
         post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id)
         if post_run_page_evidence is not None:
             result_data["post_run_page_evidence"] = model_visible_composition_evidence(post_run_page_evidence)
+        if post_run_page_capture is not None:
+            result_data["post_run_page_capture"] = post_run_page_capture.model_dump(mode="json")
         _attach_run_session_facts(
             result_data,
             used_fresh_run_session=used_fresh_run_session,
@@ -4777,6 +4789,13 @@ def build_test_evidence_packet(
     if not action_observations:
         omission_notices.append("action_observations empty: no same-run action observation was recorded.")
     page_state = _packet_page_state(data, omission_notices)
+    raw_page_evidence = data.get("post_run_page_evidence")
+    page_capture = post_run_page_capture_from_result(
+        data,
+        raw_page_evidence if isinstance(raw_page_evidence, Mapping) else None,
+    )
+    if page_capture is None and recorded_outcome is not None:
+        page_capture = recorded_outcome.page_capture
     failure: BuildTestPacketFailure | None = None
     if failed_block is not None or result.get("ok") is False:
         failure = BuildTestPacketFailure(
@@ -4852,10 +4871,16 @@ def build_test_evidence_packet(
         canonical_workflow_yaml_complete=workflow_yaml is not None,
         attempted_block_labels=attempted_labels,
         executed_block_labels=executed_labels,
-        run=BuildTestPacketRun(workflow_run_id=run_id, status=run_status, browser=_packet_run_browser(data)),
+        run=BuildTestPacketRun(
+            workflow_run_id=run_id,
+            browser_session_id=_packet_string(data.get("browser_session_id")),
+            status=run_status,
+            browser=_packet_run_browser(data),
+        ),
         action_observations=action_observations,
         failure=failure,
         page_state=page_state if failure is None else None,
+        page_capture=page_capture,
         requested_outputs=requested_outputs,
         registered_outputs=registered_outputs,
         downloads=downloads,

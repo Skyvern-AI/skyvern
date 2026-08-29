@@ -4318,7 +4318,8 @@ async def get_runs_v2(
         description=(
             "Exact-match filter on a workflow run's top classifier failure category "
             "(`failure_category[0].category`). Only failed, terminated, and timed_out runs are "
-            "eligible; canceled runs are never returned by this filter."
+            "eligible; canceled runs are never returned by this filter. Applies to "
+            "`run_type=workflow_run` only — combined with a task run_type it matches nothing."
         ),
         examples=["ANTI_BOT_DETECTION", "AUTH_FAILURE"],
     ),

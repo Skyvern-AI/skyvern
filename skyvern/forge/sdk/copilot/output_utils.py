@@ -924,6 +924,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                 max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                 notices=notices,
             ),
+            "browser_session_id": _bounded_packet_string(
+                projected.run.browser_session_id,
+                field_name="run.browser_session_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
             "status": _bounded_packet_string(
                 projected.run.status,
                 field_name="run.status",
