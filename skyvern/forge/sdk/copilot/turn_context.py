@@ -64,9 +64,10 @@ class TranscriptContext(BaseModel):
 
 
 class RunContext(BaseModel):
-    summary: str
-    original_chars: int
-    truncated: bool = False
+    """The prior run, typed. A rendered sentence cannot say which error code fired or which line
+    raised, and those are the facts a repair acts on."""
+
+    packet: dict[str, Any] | None = None
 
 
 class CredentialMetadata(BaseModel):
@@ -110,7 +111,6 @@ class TurnContextPacket(BaseModel):
             "omission_reasons": [omission.reason for omission in self.omissions],
             "workflow_truncated": bool(self.workflow_context and self.workflow_context.truncated),
             "proposal_truncated": bool(self.proposal_context and self.proposal_context.truncated),
-            "run_truncated": bool(self.run_context and self.run_context.truncated),
             "workflow_change_kind": self.workflow_change_context.kind if self.workflow_change_context else None,
         }
 
@@ -123,7 +123,7 @@ class TurnContextInputs(BaseModel):
     workflow_yaml: str = ""
     prior_workflow_yaml: str = ""
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list)
-    debug_run_info_text: str = ""
+    prior_run_packet: dict[str, Any] | None = None
 
 
 def _dedupe_nonempty(values: list[str]) -> list[str]:
@@ -187,12 +187,10 @@ class TurnContextAssembler:
         *,
         workflow_char_budget: int = 12_000,
         proposal_char_budget: int = 2_000,
-        run_char_budget: int = 4_000,
         credential_count_budget: int = 20,
     ) -> None:
         self.workflow_char_budget = workflow_char_budget
         self.proposal_char_budget = proposal_char_budget
-        self.run_char_budget = run_char_budget
         self.credential_count_budget = credential_count_budget
 
     def assemble(self, inputs: TurnContextInputs) -> TurnContextPacket:
@@ -262,17 +260,8 @@ class TurnContextAssembler:
 
         runnable_draft_context = self._runnable_draft_context(inputs)
 
-        if inputs.debug_run_info_text.strip():
-            summary, original_chars, truncated = _bounded_text(inputs.debug_run_info_text, self.run_char_budget)
-            run_context = RunContext(summary=summary, original_chars=original_chars, truncated=truncated)
-            if truncated:
-                omissions.append(
-                    TurnContextOmission(
-                        context_key="latest_run_result",
-                        reason="truncated_to_budget",
-                        detail=f"run context exceeded {self.run_char_budget} chars",
-                    )
-                )
+        if inputs.prior_run_packet:
+            run_context = RunContext(packet=inputs.prior_run_packet)
         else:
             omissions.append(TurnContextOmission(context_key="latest_run_result", reason="unavailable"))
 

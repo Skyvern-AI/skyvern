@@ -122,3 +122,19 @@ class ActionAbort(ActionResult):
             interacted_with_parent=interacted_with_parent,
             setup_performed=setup_performed,
         )
+
+
+# The tool-result text a tool caller (e.g. Yutori Navigator) must see when an action was skipped
+# because its target went stale: the action did NOT run, so the model must re-observe and re-plan
+# rather than assume it executed. Generic, carries no customer or DOM text.
+STALE_TARGET_TOOL_RESULT = (
+    "The target element became stale before this action ran, so it was NOT executed. "
+    "Re-observe the current page and re-plan from what is visible now; do not assume this action ran."
+)
+
+
+class StaleActionAbort(ActionAbort):
+    """A batched action that was NOT executed because its target went stale -- remounted by a preceding
+    action in the same batch -- and could not be safely remapped. It is an ActionAbort so the batch
+    still stops and the action persists as ``skipped``, but tool callers must be told the action did not
+    execute and the page must be re-observed, never that it succeeded (see STALE_TARGET_TOOL_RESULT)."""

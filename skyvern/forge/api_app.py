@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import OperationalError
 from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -40,7 +41,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_config
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
@@ -66,6 +67,23 @@ from skyvern.services.workflow_schedule_service import (
 )
 
 LOG = structlog.get_logger()
+
+
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+async def db_unavailable_handler(request: Request, exc: OperationalError) -> JSONResponse:
+    if not is_connection_failure(exc.orig):
+        raise exc
+    LOG.warning("Database unavailable", error_type=type(exc.orig).__name__, sqlstate=exc.orig.sqlstate)
+    # A connection that drops while a commit is in flight may already have committed, so only a
+    # safe method is told to retry; a write gets the 503 without the hint.
+    headers = {"Retry-After": "1"} if request.method in SAFE_METHODS else None
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": "Database temporarily unavailable"},
+        headers=headers,
+    )
 
 
 SECURITY_HEADERS = {
@@ -467,6 +485,8 @@ def create_api_app() -> FastAPI:
     @fastapi_app.exception_handler(SkyvernHTTPException)
     async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+    fastapi_app.add_exception_handler(OperationalError, db_unavailable_handler)
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:

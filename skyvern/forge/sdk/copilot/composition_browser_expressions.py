@@ -295,6 +295,7 @@ _JS_SELECTOR_CANDIDATES_HELPER = (
     "  const type = attr(el, 'type'); if (type) add(tag + '[type=\"' + type.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'type');"
     "  const classes = Array.from(el.classList || []).filter(Boolean);"
     "  if (classes.length) add(tag + classes.map((value) => '.' + esc(value)).join(''), 'class_list');"
+    "  add(tag, 'tag');"
     "  return candidates;"
     "};"
 )
@@ -315,6 +316,18 @@ def selector_candidates_expression(css_selector: str) -> str:
         f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
         "  return collectCandidates(el, requested);"
         "})()"
+    )
+
+
+def resolved_locator_selector_candidates_expression(requested_selector: str) -> str:
+    """Collect CSS identities from the exact element Playwright resolved at match index zero."""
+    requested = json.dumps(requested_selector)
+    return (
+        "(el) => {"
+        f"  const requested = {requested};"
+        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        "  return collectCandidates(el, requested);"
+        "}"
     )
 
 

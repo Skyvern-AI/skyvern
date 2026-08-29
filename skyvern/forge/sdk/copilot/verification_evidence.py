@@ -14,7 +14,6 @@ class WorkflowVerificationEvidence:
     block_verified: list[str] = field(default_factory=list)
     live_page_state_verified: bool = False
     test_attempted_but_incomplete: bool = False
-    per_tool_budget_on_block: list[str] = field(default_factory=list)
     verified_from_current_browser_state: bool = False
     current_url_observed_after_workflow_run: bool = False
     current_url_may_encode_runtime_state: bool = False
@@ -29,16 +28,12 @@ class WorkflowVerificationEvidence:
     def merge_verified_blocks(self, labels: list[str]) -> None:
         self.block_verified = _dedupe([*self.block_verified, *labels])
 
-    def merge_per_tool_budget_blocks(self, labels: list[str]) -> None:
-        self.per_tool_budget_on_block = _dedupe([*self.per_tool_budget_on_block, *labels])
-
     def has_evidence(self) -> bool:
         return bool(
             self.full_workflow_verified
             or self.block_verified
             or self.live_page_state_verified
             or self.test_attempted_but_incomplete
-            or self.per_tool_budget_on_block
             or self.verified_from_current_browser_state
             or self.current_url_observed_after_workflow_run
             or self.current_url_may_encode_runtime_state
@@ -56,7 +51,9 @@ class WorkflowVerificationEvidence:
             "block_verified_count": len(self.block_verified),
             "live_page_state_verified": self.live_page_state_verified,
             "test_attempted_but_incomplete": self.test_attempted_but_incomplete,
-            "per_tool_budget_on_block_count": len(self.per_tool_budget_on_block),
+            # Compatibility-only telemetry field. Per-tool budgeting no longer exists, but keeping
+            # the key at zero avoids silently breaking dashboards while consumers migrate.
+            "per_tool_budget_on_block_count": 0,
             "verified_from_current_browser_state": self.verified_from_current_browser_state,
             "current_url_observed_after_workflow_run": self.current_url_observed_after_workflow_run,
             "current_url_may_encode_runtime_state": self.current_url_may_encode_runtime_state,
@@ -84,7 +81,6 @@ class WorkflowVerificationEvidence:
             lines.append("current_url_may_encode_runtime_state: true")
         for key, values in (
             ("block_verified", self.block_verified),
-            ("per_tool_budget_on_block", self.per_tool_budget_on_block),
             ("unverified_block_labels", self.unverified_block_labels),
             ("failed_block_labels", self.failed_block_labels),
         ):

@@ -23,9 +23,7 @@ from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
     _DATA_PRODUCING_BLOCK_TYPES,
-    PER_TOOL_CALL_BUDGET_SECONDS,
     _block_data_payload,
-    _copilot_seconds_remaining,
     _is_meaningful_extracted_data,
     _registered_output_parameter_payloads,
     _workflow_output_parameter_payloads,
@@ -532,15 +530,6 @@ def _registered_download_output_values(value: Any) -> list[Any]:
 
 def _code_output_has_registered_download_content(value: Any) -> bool:
     return any(_code_output_has_goal_content(item) for item in _registered_download_output_values(value))
-
-
-def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
-    """One outer wall clock bounds the turn; reserving a slice of it for a reply the model may not
-    need shortens every run for a composition step that costs seconds."""
-    remaining = _copilot_seconds_remaining(ctx)
-    if remaining is None:
-        return PER_TOOL_CALL_BUDGET_SECONDS
-    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining)))
 
 
 def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:

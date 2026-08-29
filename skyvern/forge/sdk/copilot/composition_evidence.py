@@ -25,13 +25,13 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     normalized_challenge_kind,
     vision_challenge_carrier,
 )
-from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
 from skyvern.forge.sdk.copilot.runtime import ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
+INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
 
 # Block types whose acted page, when no url is on the block, is the current
 # frontier (observation of the page suffices). navigation without a url is the
@@ -682,11 +682,7 @@ def _same_url_ignoring_fragment(left: str | None, right: str | None) -> bool:
 
 
 def _post_run_recovery_state(ctx: _PostRunCompositionContext) -> bool:
-    if any(ctx.workflow_verification_evidence.per_tool_budget_on_block):
-        return True
-    if ctx.post_run_page_observation_after_failed_test is True:
-        return True
-    return ctx.last_failure_category_top == "PER_TOOL_BUDGET"
+    return ctx.post_run_page_observation_after_failed_test is True
 
 
 def _post_run_observed_url_goto_error(

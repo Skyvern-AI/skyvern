@@ -15,6 +15,7 @@ from opentelemetry import metrics
 from playwright.async_api import CDPSession
 
 from skyvern.forge import app
+from skyvern.forge.sdk.encrypt.base import TokenDecryptionError
 from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
 from skyvern.webeye.browser_state import BrowserState
 
@@ -84,12 +85,23 @@ async def wait_for_browser_state(
     observed: BrowserState | None = None
     try:
         while elapsed < timeout:
-            browser_state = observed or await _resolve_browser_state(
-                entity_id,
-                entity_type,
-                workflow_run_id,
-                organization_id=organization_id,
-            )
+            try:
+                browser_state = observed or await _resolve_browser_state(
+                    entity_id,
+                    entity_type,
+                    workflow_run_id,
+                    organization_id=organization_id,
+                )
+            except TokenDecryptionError:
+                # Retrying re-derives the same keys, so the remaining polls would each pay a
+                # browser attach to fail identically. Give up now; callers treat None as timeout.
+                LOG.error(
+                    "Giving up on browser state: the organization's API token could not be decrypted",
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                    organization_id=organization_id,
+                )
+                return None
 
             if browser_state is not None:
                 # An observer connection belongs to this websocket, so it is held across polls

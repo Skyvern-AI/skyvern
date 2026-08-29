@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any, TypeGuard
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestPacketPageState
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     RUNTIME_SOLVABLE_CHALLENGE_KINDS,
     ChallengeKind,
@@ -224,6 +226,38 @@ def _runtime_form_summaries(value: Any) -> list[str]:
     return (observed + plain)[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
+def _runtime_action_summaries(navigation_targets: Any, clickable_controls: Any) -> list[str]:
+    navigation: list[str] = []
+    if isinstance(navigation_targets, list):
+        for target in navigation_targets:
+            summary = _runtime_summary_entry(target, ("text", "disabled"))
+            if summary:
+                navigation.append(summary)
+            if len(navigation) == _RUNTIME_SUMMARY_MAX_ITEMS:
+                break
+    controls: list[str] = []
+    seen: set[str] = set()
+    if isinstance(clickable_controls, list):
+        for control in clickable_controls:
+            summary = _runtime_summary_entry(control, ("text", "disabled"))
+            if not summary or summary in seen:
+                continue
+            seen.add(summary)
+            expanded = control.get("expanded") if isinstance(control, dict) else None
+            if isinstance(expanded, bool):
+                summary = _bounded_runtime_text(
+                    f"{summary} {'expanded' if expanded else 'collapsed'}",
+                    _RUNTIME_SUMMARY_MAX_CHARS + _OBSERVED_STATE_MAX_CHARS + 1,
+                )
+            controls.append(summary)
+            if len(controls) == _RUNTIME_SUMMARY_MAX_ITEMS:
+                break
+    # Controls lead because packet compaction keeps only the first two summaries. Navigation dedupes
+    # against the pre-disclosure control strings, so an element in both collections emits exactly once.
+    merged = controls + [target for target in navigation if target not in seen]
+    return merged[:_RUNTIME_SUMMARY_MAX_ITEMS]
+
+
 def _runtime_result_summaries(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -286,9 +320,60 @@ def _has_page_obstruction(evidence: dict[str, Any]) -> bool:
 
 
 def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
-    """A packet whose only structured content is an obstruction carries no bounded page schema, yet
-    it is the entire repair signal for a click the overlay intercepted."""
-    return has_bounded_page_schema(evidence) or _has_page_obstruction(evidence)
+    """A packet whose only structured content is an obstruction or a standalone clickable control
+    carries no bounded page schema, yet it is the entire repair signal for the click that failed. The
+    control arm asks the producer for a renderable summary, so a text-less control admits nothing."""
+    return (
+        has_bounded_page_schema(evidence)
+        or bool(_runtime_action_summaries(None, evidence.get("clickable_controls")))
+        or _has_page_obstruction(evidence)
+    )
+
+
+def build_test_page_state_from_evidence(
+    evidence: Mapping[str, JsonValue], *, workflow_run_id: str
+) -> BuildTestPacketPageState | None:
+    if (
+        not workflow_run_id
+        or evidence.get("workflow_run_id") != workflow_run_id
+        or evidence.get("observed_after_workflow_run") is not True
+    ):
+        return None
+    current_url = evidence.get("current_url") or evidence.get("inspected_url")
+    page_title = evidence.get("page_title") or evidence.get("title")
+    obstructions, _ = _typed_runtime_page_obstructions(evidence)
+    page_state = BuildTestPacketPageState(
+        current_origin=_origin_from_runtime_url(current_url),
+        current_url=_safe_runtime_page_url(current_url),
+        title=_bounded_runtime_text(page_title, 160) or None,
+        evidence_source=_bounded_runtime_text(evidence.get("source_tool"), 80) or None,
+        observed_after_workflow_run=True,
+        form_summaries=_runtime_form_summaries(evidence.get("forms")),
+        result_summaries=_runtime_result_summaries(evidence.get("result_containers")),
+        action_summaries=_runtime_action_summaries(
+            evidence.get("navigation_targets"), evidence.get("clickable_controls")
+        ),
+        challenge_summaries=_runtime_summary_list(evidence.get("challenge_controls"), ("text", "disabled")),
+        obstruction_summaries=_runtime_obstruction_summaries(obstructions),
+        obstructions=obstructions,
+    )
+    return (
+        page_state
+        if any(
+            (
+                page_state.current_origin,
+                page_state.current_url,
+                page_state.title,
+                page_state.form_summaries,
+                page_state.result_summaries,
+                page_state.action_summaries,
+                page_state.challenge_summaries,
+                page_state.obstruction_summaries,
+                page_state.obstructions,
+            )
+        )
+        else None
+    )
 
 
 def _joined_obstruction_summary(obstruction: str, control: str) -> str:
@@ -579,7 +664,9 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
     page_title = evidence.get("page_title") or evidence.get("title")
     page_form_summaries = _runtime_form_summaries(evidence.get("forms"))
     page_result_summaries = _runtime_result_summaries(evidence.get("result_containers"))
-    page_action_summaries = _runtime_summary_list(evidence.get("navigation_targets"), ("text", "disabled"))
+    page_action_summaries = _runtime_action_summaries(
+        evidence.get("navigation_targets"), evidence.get("clickable_controls")
+    )
     page_challenge_summaries = _runtime_summary_list(evidence.get("challenge_controls"), ("text", "disabled"))
     page_obstructions, page_obstruction_omission_notices = _typed_runtime_page_obstructions(evidence)
     page_obstruction_summaries = _runtime_obstruction_summaries(page_obstructions)

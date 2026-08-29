@@ -13,8 +13,8 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Protocol, get_args, runtime_checkable
 
 from opentelemetry import trace as otel_trace
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 import structlog
 import yaml
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
-from pydantic import TypeAdapter, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -51,9 +51,11 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
+    BuildTestEvidencePacket,
     RecordedBuildTestOutcome,
+    history_has_runtime_block_failure,
     observed_value_extraction_scaffold_lines,
-    unresolved_runtime_block_failure,
+    unresolved_runtime_block_failure_with_disposition,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_steps import (
@@ -105,10 +107,7 @@ from skyvern.forge.sdk.copilot.entrypoint import (
     extract_in_turn_entry_url,
     resolve_turn_entrypoint_url,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    PER_TOOL_BUDGET_FAILURE_CATEGORY,
-    block_shape_hashes_by_label,
-)
+from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
@@ -130,8 +129,11 @@ from skyvern.forge.sdk.copilot.output_policy import (
     output_policy_verdict_to_trace_data,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    BUILD_TEST_PACKET_KEY,
     extract_final_text,
     parse_final_response,
+    project_direct_test_handoff_packet_for_llm,
+    sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
@@ -140,6 +142,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     format_recoverable_failure_reply,
     merge_failure_into_context,
 )
+from skyvern.forge.sdk.copilot.repair_origin_run import seed_repair_origin_run
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_QUESTION,
     RAW_SECRET_REFUSAL_SENTINEL,
@@ -161,7 +164,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import OBSTRUCTION_SUMMARY_MAX_CHARS
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
@@ -176,7 +179,12 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
-from skyvern.forge.sdk.copilot.tools.run_execution import run_workflow_end_to_end
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    WatchdogExitReason,
+    finalize_build_test_result,
+    hydrate_prior_run_packet,
+    run_workflow_end_to_end,
+)
 from skyvern.forge.sdk.copilot.tools.scouting import hydrate_prior_carried_trajectory
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
@@ -608,8 +616,8 @@ def _store_turn_context_packet_on_context(
     request_policy: RequestPolicy,
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
-    debug_run_info_text: str,
     prior_copilot_workflow_yaml: str | None,
+    prior_run_packet: dict[str, Any] | None = None,
 ) -> None:
     ctx.turn_context_packet = TurnContextAssembler().assemble(
         TurnContextInputs(
@@ -617,8 +625,8 @@ def _store_turn_context_packet_on_context(
             user_message=chat_request.message,
             workflow_yaml=chat_request.workflow_yaml or "",
             prior_workflow_yaml=prior_copilot_workflow_yaml or "",
+            prior_run_packet=prior_run_packet,
             chat_history=chat_history,
-            debug_run_info_text=debug_run_info_text,
         )
     )
 
@@ -640,7 +648,7 @@ def _build_system_prompt(
 ) -> str:
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
-    current_datetime = datetime.now(timezone.utc).isoformat()
+    current_datetime = datetime.now(UTC).isoformat()
     datetime_boundary = "__SKYVERN_COPILOT_DYNAMIC_DATETIME_BOUNDARY__"
     prompt_with_boundary = prompt_engine.load_prompt(
         template=template,
@@ -1127,7 +1135,13 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
     return "\n\n" + "\n".join(line for line in lines if line)
 
 
-def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
+def _build_dynamic_system_prompt(
+    tool_usage_guide: str,
+    config: CopilotConfig,
+    *,
+    include_runtime_verification_evidence: bool = True,
+    include_recorded_build_test_outcome: bool = True,
+) -> Callable[[object, object], str]:
     base_system_prompt = _build_system_prompt(tool_usage_guide=tool_usage_guide, config=config)
 
     def instructions(context: object, _agent: object) -> str:
@@ -1148,8 +1162,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run "
             + "blocks, and tell the user to store the redacted secret as a saved credential before testing. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
-            + _runtime_verification_evidence_prompt(ctx)
-            + _recorded_build_test_outcome_prompt(ctx)
+            + (_runtime_verification_evidence_prompt(ctx) if include_runtime_verification_evidence else "")
+            + (_recorded_build_test_outcome_prompt(ctx) if include_recorded_build_test_outcome else "")
             + _code_authoring_repair_context_prompt(ctx)
             + todo_list_prompt(ctx)
         )
@@ -1164,6 +1178,17 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         return base_system_prompt + dynamic_context
 
     return instructions
+
+
+def _prior_run_debug_text(packet: dict[str, Any] | None) -> str:
+    """The prior run as the packet a tool would return. A repair opened about an earlier run has
+    made no tool call yet, so without this its first model input carries no record of the run."""
+    if not isinstance(packet, dict) or not packet:
+        return ""
+    try:
+        return json.dumps({BUILD_TEST_PACKET_KEY: packet}, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
 
 
 def _build_user_context(
@@ -1192,7 +1217,7 @@ def _build_user_context(
         workflow_summary=escape_code_fences(_build_workflow_summary(workflow_yaml)),
         chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history_text)),
         global_llm_context=escape_code_fences(redact_raw_secrets_for_structured_prompt(global_llm_context)),
-        debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
+        debug_run_info=escape_code_fences(redact_raw_secrets_for_structured_prompt(debug_run_info_text)),
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
@@ -1483,9 +1508,9 @@ def _assemble_terminal_envelope_safe(
 def _with_unresolved_runtime_failure_note(user_response: str, failure: UnresolvedRuntimeFailure) -> str:
     label = failure.block_label or "an earlier step"
     note = (
-        f'One thing to flag: an earlier test run failed at "{label}", '
-        "the failing call is still in the draft, and no later run "
-        "verifiably re-exercised it — so that step is still unproven."
+        f'One thing to flag: an earlier test run failed at "{label}". A later run passed, but the '
+        "retained evidence does not establish that the earlier failure was resolved, so that step "
+        "remains unproven."
     )
     return f"{user_response.rstrip()}\n\n{note}" if user_response.strip() else note
 
@@ -1610,8 +1635,33 @@ def _make_agent_result(
             ]
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
-    if ctx is not None and turn_outcome is not None and response_type != "ASK_QUESTION" and result_has_workflow_attempt:
-        unresolved_failure = unresolved_runtime_block_failure(ctx)
+    note_eligible = (
+        ctx is not None and turn_outcome is not None and response_type != "ASK_QUESTION" and result_has_workflow_attempt
+    )
+    unresolved_failure = None
+    detector_disposition = "not_evaluated"
+    if ctx is not None and note_eligible:
+        # Only the workflow the user can actually run clears a failure. A staged proposal may be
+        # shown, tested, or auto-applied later, but this terminal is assembled before the route
+        # commits it, so at claim time it is not yet what anyone would run. `workflow_was_persisted`
+        # records a mid-turn canonical write that can still be rolled back, so it proves nothing here.
+        reported_workflow_yaml = ctx.persisted_workflow_yaml
+        unresolved_failure, detector_disposition = unresolved_runtime_block_failure_with_disposition(
+            ctx, reported_workflow_yaml=reported_workflow_yaml
+        )
+    if ctx is not None and history_has_runtime_block_failure(ctx):
+        # A turn that sets a runtime failure aside otherwise leaves no record of having done so, which
+        # makes a wrong clearance untraceable after the fact. Bounded to turns carrying a failure.
+        LOG.info(
+            "copilot unresolved runtime failure disposition",
+            response_type=response_type,
+            turn_outcome_present=turn_outcome is not None,
+            genuine_workflow_attempt=result_has_workflow_attempt,
+            note_eligible=note_eligible,
+            detector_disposition=detector_disposition,
+            note_applied=unresolved_failure is not None,
+        )
+    if turn_outcome is not None and note_eligible:
         if unresolved_failure is not None:
             turn_outcome = turn_outcome.model_copy(update={"unresolved_runtime_failure": unresolved_failure})
             kwargs["user_response"] = _with_unresolved_runtime_failure_note(
@@ -1761,7 +1811,7 @@ def _build_narrative_payload(
     # First terminal builder to reach here seals the turn-level end time;
     # later exit paths reuse it so the persisted elapsed matches the live one.
     if ctx.turn_ended_at is None:
-        ctx.turn_ended_at = datetime.now(timezone.utc).isoformat()
+        ctx.turn_ended_at = datetime.now(UTC).isoformat()
     payload: TurnNarrativePayload = {
         "turnId": ctx.turn_id,
         "turnIndex": ctx.turn_index,
@@ -1888,34 +1938,89 @@ def _build_exit_result(
     )
 
 
-def _end_to_end_run_reply(result: dict[str, Any], block_count: int) -> str:
-    data = result.get("data")
-    detail = (data.get("failure_reason") if isinstance(data, dict) else None) or result.get("error")
-    detail_text = detail.strip() if isinstance(detail, str) and detail.strip() else None
-    # block_count is the planned label list, so a failure that never reached a run must not be
-    # reported as though those steps were tested.
-    run_started = isinstance(data, dict) and bool(data.get("workflow_run_id"))
-    if block_count == 0 or (not result.get("ok") and not run_started):
-        return detail_text or "I could not start an end-to-end test run."
-    steps = "step" if block_count == 1 else "steps"
-    opening = f"Tested all {block_count} {steps} together in a browser session opened just for this run."
-    if result.get("ok"):
-        return f"{opening} Every step completed."
-    if isinstance(data, dict) and (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
-        return f"{opening} The run is paused and waiting on you — the run details are above."
-    if detail_text:
-        return f"{opening} It did not get through: {detail_text}"
-    return f"{opening} It did not get through — the run details are above."
-
-
 async def _run_end_to_end_test_turn(
     ctx: CopilotContext,
     *,
     workflow_yaml: str,
-    global_llm_context: str | None,
-) -> AgentResult:
-    result = await run_workflow_end_to_end(ctx, workflow_yaml)
-    block_count = len(ctx.last_executed_block_labels or [])
+) -> list[dict[str, str]]:
+    setup_error_for_llm: str | None = None
+    try:
+        result = await run_workflow_end_to_end(ctx, workflow_yaml)
+    except Exception as exc:
+        LOG.warning(
+            "copilot_test_end_to_end_run_failed_before_result",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            turn_id=ctx.turn_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        setup_error_for_llm = "The end-to-end test could not be started."
+        result = {"ok": False, "error": setup_error_for_llm}
+    result_data = result.get("data")
+    if result.get("ok") is False and (not isinstance(result_data, dict) or not result_data.get("workflow_run_id")):
+        if not isinstance(result_data, dict):
+            result_data = {}
+            result["data"] = result_data
+        result_data.setdefault("overall_status", "setup_failed")
+    finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+    )
+    raw_packet = result["data"].get(BUILD_TEST_PACKET_KEY)
+    if isinstance(raw_packet, dict):
+        try:
+            packet = BuildTestEvidencePacket.model_validate(raw_packet)
+        except ValueError:
+            # Leave the invalid packet present for the shared sanitizer. Its
+            # presence activates packet-associated raw-copy stripping before
+            # the sanitizer removes the invalid packet on its fail-closed path.
+            pass
+        else:
+            result["data"][BUILD_TEST_PACKET_KEY] = project_direct_test_handoff_packet_for_llm(packet).model_dump(
+                mode="json", exclude_none=True
+            )
+    sanitized = scrub_secrets_from_structure(
+        ctx,
+        sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result),
+    )
+    sanitized_data = sanitized.get("data")
+    packet = sanitized_data.get(BUILD_TEST_PACKET_KEY) if isinstance(sanitized_data, dict) else None
+    handoff_data: dict[str, JsonValue] = {}
+    if isinstance(packet, dict):
+        handoff_data[BUILD_TEST_PACKET_KEY] = packet
+        run = packet.get("run")
+        if isinstance(run, dict):
+            if isinstance(run.get("workflow_run_id"), str):
+                handoff_data["workflow_run_id"] = run["workflow_run_id"]
+            if isinstance(run.get("status"), str):
+                handoff_data["overall_status"] = run["status"]
+    elif isinstance(sanitized_data, dict) and isinstance(sanitized_data.get("build_test_packet_omitted"), str):
+        handoff_data["build_test_packet_omitted"] = sanitized_data["build_test_packet_omitted"]
+    control_signal = sanitized_data.get("control_signal") if isinstance(sanitized_data, dict) else None
+    control_kind = control_signal.get("kind") if isinstance(control_signal, dict) else None
+    watchdog_control_kinds = {
+        f"watchdog_{exit_reason}" for exit_reason in get_args(WatchdogExitReason) if exit_reason != "success"
+    }
+    if control_kind in watchdog_control_kinds:
+        handoff_data["control_signal"] = {"kind": control_kind}
+    attempted_labels = packet.get("attempted_block_labels") if isinstance(packet, dict) else None
+    handoff_result: dict[str, JsonValue] = {
+        "ok": sanitized.get("ok") is True,
+        "data": handoff_data,
+    }
+    if (control_kind in watchdog_control_kinds or setup_error_for_llm is not None) and isinstance(
+        sanitized.get("error"), str
+    ):
+        handoff_result["error"] = sanitized["error"]
+    arguments = json.dumps(
+        {
+            "block_labels": attempted_labels if isinstance(attempted_labels, list) else [],
+            "parameters": {},
+        },
+        separators=(",", ":"),
+    )
+    call_id = f"call_test_end_to_end_{ctx.turn_id}"
     LOG.info(
         "copilot_test_end_to_end_turn_finished",
         workflow_permanent_id=ctx.workflow_permanent_id,
@@ -1925,12 +2030,19 @@ async def _run_end_to_end_test_turn(
         composition_verified_labels=ctx.composition_verified_labels,
         terminal_ready=ctx.last_full_workflow_test_ok,
     )
-    return _build_exit_result(
-        ctx,
-        _end_to_end_run_reply(result, block_count),
-        global_llm_context,
-        proposal_disposition="review_tested" if ctx.last_full_workflow_test_ok else "review_untested",
-    )
+    return [
+        {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "run_blocks_and_collect_debug",
+            "arguments": arguments,
+        },
+        {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(handoff_result, separators=(",", ":")),
+        },
+    ]
 
 
 async def _build_goal_satisfied_exit_result(
@@ -2419,10 +2531,8 @@ def _observed_facts_halt_reply(ctx: CopilotContext) -> str:
     )
 
 
-def _halted_mid_progress(ctx: CopilotContext, internal_tool_instruction_failure: bool) -> bool:
-    if internal_tool_instruction_failure:
-        return True
-    return getattr(ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
+def _halted_mid_progress(internal_tool_instruction_failure: bool) -> bool:
+    return internal_tool_instruction_failure
 
 
 def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
@@ -2583,7 +2693,7 @@ def _recorded_failure_reply(
         internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     # A guard-halted or budget-paced run was interrupted, not disproven; render
     # observed facts instead of a failure verdict built from internal text.
-    if _halted_mid_progress(ctx, internal_tool_instruction_failure):
+    if _halted_mid_progress(internal_tool_instruction_failure):
         return _observed_facts_halt_reply(ctx)
 
     run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80).lower()
@@ -2625,7 +2735,7 @@ def _build_wip_exit_result(
 ) -> AgentResult:
     """Non-success exits surface the most recent successfully parsed workflow."""
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
-    halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
+    halted_mid_progress = _halted_mid_progress(internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
     )
@@ -3125,6 +3235,7 @@ async def _translate_to_agent_result(
                     prior_global_llm_context=global_llm_context,
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=inline_diagnostics,
+                    require_full_workflow_test=chat_request.product_action == "test_end_to_end",
                 )
             # REPLACE_WORKFLOW bypasses the update_workflow tool guardrail, so
             # policy and post-emission rejects run here before YAML processing.
@@ -3235,6 +3346,7 @@ async def _translate_to_agent_result(
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
+        ctx.last_full_workflow_test_ok = False
         clear_active_run_evidence_on_workflow_edit(ctx)
         # Inline REPLACE_WORKFLOW is untested by construction; emit a draft
         # envelope without staging onto ctx so terminal auto-accept can't fire,
@@ -3277,7 +3389,8 @@ async def _translate_to_agent_result(
     # ``blocker_active`` short-circuits the salvage/failure rewrites — the
     # renderer owns the final reply, so reshaping the agent's prose first
     # would be wasted work the finalization shim discards.
-    if not blocker_active and resp_type != "ASK_QUESTION" and not salvaged_reply:
+    direct_test_handoff = chat_request.product_action == "test_end_to_end"
+    if not blocker_active and resp_type != "ASK_QUESTION" and not salvaged_reply and not direct_test_handoff:
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     last_workflow = None
@@ -3388,6 +3501,7 @@ async def _translate_to_agent_result(
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
             output_policy_diagnostics=output_policy_diagnostics,
+            require_full_workflow_test=direct_test_handoff,
         )
 
     final_user_response = str(user_response)
@@ -3437,6 +3551,14 @@ async def _translate_to_agent_result(
             proposal_disposition=(
                 "no_proposal"
                 if unbacked_workflow_delivery_rewritten and last_workflow is None
+                else "review_tested"
+                if chat_request.product_action == "test_end_to_end"
+                and last_workflow is not None
+                and ctx.last_full_workflow_test_ok is True
+                else "review_untested"
+                if chat_request.product_action == "test_end_to_end" and last_workflow is not None
+                else "no_proposal"
+                if chat_request.product_action == "test_end_to_end"
                 else "review_untested"
                 if unvalidated
                 else "review_tested"
@@ -3472,7 +3594,7 @@ async def _run_agent_loop_with_surface(
     ctx: Any,
     stream: EventSourceStream,
     chat_id: str,
-    user_message: str,
+    initial_input: str | list[dict[str, str]],
     system_prompt: Callable[[object, object], str] | str,
     model_name: str,
     run_config: Any,
@@ -3516,21 +3638,23 @@ async def _run_agent_loop_with_surface(
     try:
         async with MCPServerManager([mcp_server]) as manager:
             agent.mcp_servers = list(manager.active_servers)
-            if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION:
+            if ctx.eval_mode is not None:
                 advertised_mcp_tools = await mcp_server.list_tools()
                 ctx.eval_tool_surface_sha256 = CopilotToolSurface(
                     native_tools=tuple(native_tools),
                     alias_map=alias_map,
                     overlays=overlays,
                     ordered_native_names=tuple(tool.name for tool in native_tools),
-                    ordered_mcp_names=tuple(alias_map),
+                    # Without the ablation's ordered allowlist the server publishes in its own
+                    # order, so record the order advertised rather than asserting one.
+                    ordered_mcp_names=tuple(tool.name for tool in advertised_mcp_tools),
                 ).advertised_sha256(advertised_mcp_tools)
             attempts = 2 if allow_untested_retry else 1
             for attempt in range(attempts):
                 try:
                     result = await run_with_enforcement(
                         agent=agent,
-                        initial_input=user_message,
+                        initial_input=initial_input,
                         ctx=ctx,
                         stream=stream,
                         max_turns=copilot_config.max_turns,
@@ -3900,6 +4024,7 @@ def _build_output_policy_blocked_result(
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
+    require_full_workflow_test: bool = False,
 ) -> AgentResult:
     # A blocker turn whose signal owns final rendering never ships a proposal;
     # steering-only blockers should still flow through normal output-policy
@@ -4018,6 +4143,7 @@ def _build_output_policy_blocked_result(
                 reason_code="output_policy_block",
                 terminal_reason="output_policy_block",
             )
+    proposal_tested = ctx.last_full_workflow_test_ok if require_full_workflow_test else ctx.last_test_ok
     return _make_agent_result(
         ctx,
         user_response=final_user_response,
@@ -4035,9 +4161,9 @@ def _build_output_policy_blocked_result(
         proposal_disposition=(
             "no_proposal"
             if preserved_workflow is None
-            else "review_untested"
-            if ctx.last_test_ok is not True
             else "review_tested"
+            if proposal_tested is True
+            else "review_untested"
         ),
         output_policy_diagnostics=output_policy_diagnostics
         or build_output_policy_diagnostics(
@@ -4065,7 +4191,6 @@ async def run_copilot_agent(
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str | None,
-    debug_run_info_text: str,
     llm_api_handler: LLMAPIHandler | None,
     raw_secret_safety_handler: LLMAPIHandler | None = None,
     api_key: str | None = None,
@@ -4110,7 +4235,6 @@ async def run_copilot_agent(
                     chat_request=chat_request,
                     chat_history=chat_history,
                     global_llm_context=global_llm_context,
-                    debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
                     raw_secret_safety_handler=raw_secret_safety_handler,
                     api_key=api_key,
@@ -4211,7 +4335,6 @@ async def _run_copilot_turn_impl(
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str | None,
-    debug_run_info_text: str,
     llm_api_handler: LLMAPIHandler | None,
     raw_secret_safety_handler: LLMAPIHandler | None,
     api_key: str | None,
@@ -4311,6 +4434,20 @@ async def _run_copilot_turn_impl(
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
         },
     )
+    # Before the turn acts: a repair opened about a failed run inherits that run's identity and the
+    # browser it used, so a tool asked to look at the run has something to look at from the first
+    # call rather than only after this turn has run something itself.
+    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=chat_request.workflow_run_id)
+    # The same run, read as the packet a same-turn test would have produced. The route's own
+    # rendering of these blocks carries no error code and no failing line. Every message sent from
+    # a run page carries that run's id, so this reads the run once it is over — a run that reports
+    # success can still be the one the user is complaining about.
+    prior_run_packet = (
+        await hydrate_prior_run_packet(ctx, workflow_run_id=chat_request.workflow_run_id)
+        if repair_origin_binding.finished
+        else None
+    )
+
     LOG.info(
         "copilot_block_authoring_policy_resolved",
         block_authoring_policy=normalize_block_authoring_policy(ctx.block_authoring_policy).name,
@@ -4393,7 +4530,7 @@ async def _run_copilot_turn_impl(
             request_policy=request_policy,
             chat_request=chat_request,
             chat_history=chat_history,
-            debug_run_info_text=debug_run_info_text,
+            prior_run_packet=prior_run_packet,
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
@@ -4469,6 +4606,7 @@ async def _run_copilot_turn_impl(
         else:
             seeded_context.entrypoint_url = eval_entrypoint_url
             safe_global_llm_context = seeded_context.to_json_str()
+    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
@@ -4485,11 +4623,11 @@ async def _run_copilot_turn_impl(
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
     ctx.browser_session_id = validated_browser_session_id
 
+    direct_test_handoff: list[dict[str, str]] | None = None
     if chat_request.product_action == "test_end_to_end":
-        return await _run_end_to_end_test_turn(
+        direct_test_handoff = await _run_end_to_end_test_turn(
             ctx,
             workflow_yaml=chat_request.workflow_yaml or "",
-            global_llm_context=global_llm_context,
         )
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
@@ -4501,11 +4639,15 @@ async def _run_copilot_turn_impl(
 
     alias_map = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays(copilot_config.block_authoring_policy)
+    registered_mcp_tools = (
+        await skyvern_mcp.list_tools(run_middleware=False) if eval_mode == CopilotEvalMode.BROWSER_ABLATION else None
+    )
     surface = resolve_copilot_tool_surface(
         mode=eval_mode,
         native_tools=list(NATIVE_TOOLS),
         alias_map=alias_map,
         overlays=overlays,
+        registered_mcp_tools=registered_mcp_tools,
     )
     native_tools = list(surface.native_tools)
     alias_map = surface.alias_map
@@ -4521,6 +4663,8 @@ async def _run_copilot_turn_impl(
     system_prompt = _build_dynamic_system_prompt(
         tool_usage_guide=tool_usage_guide,
         config=copilot_config,
+        include_runtime_verification_evidence=direct_test_handoff is None,
+        include_recorded_build_test_outcome=direct_test_handoff is None,
     )
 
     user_workflow_change_summary = ""
@@ -4561,11 +4705,14 @@ async def _run_copilot_turn_impl(
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
         global_llm_context=scoped_global_llm_context,
-        debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
+        debug_run_info_text=_prior_run_debug_text(prior_run_packet),
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
         runnable_draft_summary=runnable_draft_summary,
     )
+    initial_input: str | list[dict[str, str]] = user_message
+    if direct_test_handoff is not None:
+        initial_input = [{"role": "user", "content": user_message}, *direct_test_handoff]
 
     LOG.info(
         "Starting copilot agent loop",
@@ -4600,7 +4747,7 @@ async def _run_copilot_turn_impl(
             ctx=ctx,
             stream=stream,
             chat_id=chat_id,
-            user_message=user_message,
+            initial_input=initial_input,
             system_prompt=system_prompt,
             model_name=attempt_model_name,
             run_config=attempt_run_config,
@@ -4685,6 +4832,7 @@ async def _run_copilot_turn_impl(
                     prior_global_llm_context=global_llm_context,
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=_output_policy_diagnostics_from_guardrail_exception(exc),
+                    require_full_workflow_test=chat_request.product_action == "test_end_to_end",
                 )
             except CopilotTurnHalt as exc:
                 LOG.info(

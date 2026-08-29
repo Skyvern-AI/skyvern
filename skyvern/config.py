@@ -522,6 +522,9 @@ class Settings(BaseSettings):
     # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
     # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
+    # Append a fresh observe digest to a page-changing action batch's tool result, so the model can act
+    # from it without spending a separate perception turn.
+    TASK_V3_AUTO_OBSERVE: bool = False
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
