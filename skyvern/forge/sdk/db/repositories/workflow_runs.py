@@ -832,10 +832,25 @@ class WorkflowRunsRepository(BaseRepository):
         run_type: list[str] | None = None,
         workflow_permanent_ids: list[str] | None = None,
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
+        failure_category: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
             run_tag_subqueries = run_tag_run_id_subqueries(run_tags, organization_id)
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
+            # Matches workflow_runs.failure_category[0].category only (the classifier's top
+            # category); task_run_type != workflow_run rows join WorkflowRunModel as NULL, so
+            # they're excluded here for free. A failure classification is never assigned to a
+            # canceled run, but that's an implementation detail, not the contract — restrict to
+            # the failure statuses explicitly so a canceled run is never returned regardless.
+            category_match_clause = None
+            failure_statuses = ("failed", "terminated", "timed_out")
+            if failure_category:
+                top_category = (
+                    func.json_extract(WorkflowRunModel.failure_category, "$[0].category")
+                    if self._dialect_name == "sqlite"
+                    else cast(WorkflowRunModel.failure_category, JSONB)[0]["category"].astext
+                )
+                category_match_clause = top_category == failure_category
             # task_runs.workflow_permanent_id is unreliable on legacy workflow_run rows; the joined
             # workflow_runs row carries the canonical WPID, so coalesce both before deriving anything.
             effective_wpid = func.coalesce(
@@ -878,6 +893,9 @@ class WorkflowRunsRepository(BaseRepository):
 
             if status:
                 query = query.filter(effective_status.in_(status))
+
+            if category_match_clause is not None:
+                query = query.filter(category_match_clause).filter(effective_status.in_(failure_statuses))
 
             if run_type:
                 query = query.filter(TaskRunModel.task_run_type.in_(run_type))
@@ -957,6 +975,10 @@ class WorkflowRunsRepository(BaseRepository):
                         fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
                         fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                    if category_match_clause is not None:
+                        fallback_query = fallback_query.filter(category_match_clause).filter(
+                            WorkflowRunModel.status.in_(failure_statuses)
+                        )
                     if workflow_permanent_ids:
                         fallback_query = fallback_query.filter(
                             WorkflowRunModel.workflow_permanent_id.in_(workflow_permanent_ids)
