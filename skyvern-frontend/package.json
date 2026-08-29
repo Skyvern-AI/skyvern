@@ -80,7 +80,7 @@
     "react-github-btn": "^1.4.0",
     "react-hook-form": "^7.51.1",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "^6.30.4",
+    "react-router-dom": "^6.30.5",
     "remark-gfm": "^4.0.1",
     "serve-handler": "^6.1.7",
     "tailwind-merge": "^2.2.2",
