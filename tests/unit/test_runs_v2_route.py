@@ -56,6 +56,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page_size=5,
         search_key="abc",
         run_type=[RunType.workflow_run, RunType.task_v1],
+        failure_category=None,
     )
 
     mock_workflow_runs.get_all_runs_v2.assert_awaited_once_with(
@@ -67,6 +68,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         run_type=["workflow_run", "task_v1"],
         workflow_permanent_ids=None,
         run_tags=None,
+        failure_category=None,
     )
     assert orjson.loads(response.body) == [
         {
@@ -98,6 +100,7 @@ async def test_get_runs_v2_forwards_workflow_permanent_id_filter(monkeypatch: py
         page_size=10,
         search_key=None,
         workflow_permanent_id=["wpid_a", "wpid_b"],
+        failure_category=None,
     )
 
     mock_workflow_runs.get_all_runs_v2.assert_awaited_once_with(
@@ -109,6 +112,7 @@ async def test_get_runs_v2_forwards_workflow_permanent_id_filter(monkeypatch: py
         run_type=None,
         workflow_permanent_ids=["wpid_a", "wpid_b"],
         run_tags=None,
+        failure_category=None,
     )
 
 

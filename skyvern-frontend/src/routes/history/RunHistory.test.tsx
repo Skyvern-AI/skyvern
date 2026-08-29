@@ -288,6 +288,24 @@ describe("RunHistory agent filters", () => {
   });
 });
 
+describe("RunHistory failure category filter", () => {
+  it("passes a failure_category deep link through to the runs query", () => {
+    renderRunHistory(["/history?failure_category=ANTI_BOT_DETECTION"]);
+
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.failureCategory).toBe(
+      "ANTI_BOT_DETECTION",
+    );
+  });
+
+  it("ignores an empty failure_category instead of filtering to nothing", () => {
+    renderRunHistory(["/history?failure_category="]);
+
+    expect(
+      runsQueryCalls[runsQueryCalls.length - 1]?.failureCategory,
+    ).toBeUndefined();
+  });
+});
+
 describe("RunHistory inputs during filtering", () => {
   it("keeps Run Inputs collapsed while a search is active", () => {
     renderRunHistory();

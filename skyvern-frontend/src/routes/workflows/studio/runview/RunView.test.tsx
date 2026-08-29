@@ -31,6 +31,7 @@ import {
   type ActionsApiResponse,
 } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
@@ -40,6 +41,7 @@ import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
 import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneViewToggles } from "./RunPaneHeader";
 import { RunView } from "./RunView";
@@ -101,6 +103,7 @@ vi.mock("@/components/ui/scroll-area", () => ({
 // The header's "…" menu (Radix DropdownMenu) scrolls its focused item into
 // view on open; jsdom implements neither that nor ResizeObserver.
 Element.prototype.scrollIntoView = () => {};
+Element.prototype.scrollTo = () => {};
 if (typeof globalThis.ResizeObserver === "undefined") {
   globalThis.ResizeObserver = class {
     observe() {}
@@ -242,6 +245,24 @@ function seedCompletedRun(overrides: Record<string, unknown> = {}) {
       workflow_definition: { blocks: [], finally_block_label: null },
     },
     ...overrides,
+  };
+}
+
+function sealedSavedRunReplayOverrides(): Record<string, unknown> {
+  const runId = process.env.SAVED_RUN_REPLAY_RUN_ID;
+  if (runId === undefined) {
+    return {};
+  }
+  expect(runId).toBe("wr_568303252034165152");
+  expect(process.env.SAVED_RUN_REPLAY_TERMINAL_STATUS).toBe(Status.Completed);
+  expect(process.env.SAVED_RUN_REPLAY_BLOCK_OUTPUT).toBe("null");
+  expect(process.env.SAVED_RUN_REPLAY_MISSING_FIELD).toBe(
+    "workflow_run_block_output",
+  );
+  return {
+    workflow_run_id: runId,
+    status: process.env.SAVED_RUN_REPLAY_TERMINAL_STATUS,
+    outputs: null,
   };
 }
 
@@ -1518,6 +1539,7 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("No outputs for this run")).toBeNull();
     expect(scope.getByText("Run outputs")).not.toBeNull();
     expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
+    expect(scope.getByText("22600")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {
@@ -1534,8 +1556,8 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("Errors")).toBeNull();
   });
 
-  test("shows the Outputs empty state when run signals are absent", () => {
-    seedCompletedRun();
+  test("renders a genuinely omitted output as an empty Outputs state", () => {
+    seedCompletedRun(sealedSavedRunReplayOverrides());
 
     const { container } = renderRunView();
     const scope = within(container);
@@ -1544,5 +1566,53 @@ describe("RunView output signals", () => {
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
     expect(scope.queryByText("Errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
+  });
+
+  test("does not substitute persisted Copilot prose for a genuinely omitted output", async () => {
+    const corroboratingProse =
+      "Copilot found 22.9k stars, matching the value visible in the source.";
+    getSpy.mockImplementation((path: string) => {
+      if (path === "/workflow/copilot/chat-history") {
+        return Promise.resolve({
+          data: {
+            workflow_copilot_chat_id: "chat_1",
+            chat_history: [
+              {
+                sender: "ai",
+                content: corroboratingProse,
+                created_at: "2026-08-29T11:01:20Z",
+              },
+            ],
+            proposed_workflow: null,
+            auto_accept: false,
+          },
+        });
+      }
+      return Promise.resolve({ data: [] });
+    });
+    seedCompletedRun(sealedSavedRunReplayOverrides());
+    const copilotPortal = document.createElement("div");
+    document.body.appendChild(copilotPortal);
+
+    const { container } = renderRunView(
+      {},
+      "/",
+      false,
+      <WorkflowPermanentIdContext.Provider value="wpid_1">
+        <WorkflowCopilotChat docked portalTarget={copilotPortal} />
+      </WorkflowPermanentIdContext.Provider>,
+    );
+    const runView = within(container);
+
+    await waitFor(() =>
+      expect(screen.getByText(corroboratingProse)).not.toBeNull(),
+    );
+    fireEvent.click(runView.getByRole("button", { name: "Outputs" }));
+
+    expect(runView.getByText("No outputs for this run")).not.toBeNull();
+    expect(runView.queryByText(corroboratingProse)).toBeNull();
+    expect(runView.queryByText("22.9k")).toBeNull();
+
+    copilotPortal.remove();
   });
 });
