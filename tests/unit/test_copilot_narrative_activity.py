@@ -303,8 +303,20 @@ workflow_definition:
 
     assert payload["review"] == {
         "blocks": [
-            {"label": "existing", "blockType": "task", "change": "changed", "neverTested": False},
-            {"label": "added", "blockType": "task", "change": "added", "neverTested": True},
+            {
+                "label": "existing",
+                "blockType": "task",
+                "change": "changed",
+                "neverTested": False,
+                "coverage": "current_source",
+            },
+            {
+                "label": "added",
+                "blockType": "task",
+                "change": "added",
+                "neverTested": True,
+                "coverage": "never_run",
+            },
         ],
         "duplicateWrites": [],
     }
@@ -341,7 +353,13 @@ workflow_definition:
 
     assert payload["review"] == {
         "blocks": [
-            {"label": "first_draft", "blockType": "task", "change": "added", "neverTested": True},
+            {
+                "label": "first_draft",
+                "blockType": "task",
+                "change": "added",
+                "neverTested": True,
+                "coverage": "never_run",
+            },
         ],
         "duplicateWrites": [],
     }

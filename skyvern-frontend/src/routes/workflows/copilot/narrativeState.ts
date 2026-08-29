@@ -156,6 +156,37 @@ export interface TerminalEnvelopeFacts {
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type BlockCoverage =
+  | "current_source"
+  | "different_source"
+  | "never_run"
+  | "unknown";
+
+const BLOCK_COVERAGE: readonly BlockCoverage[] = [
+  "current_source",
+  "different_source",
+  "never_run",
+  "unknown",
+];
+
+// The canonical per-turn facts the backend publishes; card, pill and prose each
+// render a projection of this bundle rather than deriving their own verdict.
+export interface TurnFacts {
+  factsAvailable: boolean;
+  authoredBlockCount: number | null;
+  matchingSourceBlockCount: number | null;
+  evaluationState: BlockOutcome | null;
+  runId: string | null;
+  runCompleted: boolean | null;
+  terminalCause: string | null;
+  blocksRunThisTurn: number | null;
+  ranCleanOnCurrentSource: boolean;
+}
+
+// The backend decides the tested claim and publishes it here; no surface recomputes it.
+export function ranCleanOnCurrentSource(facts: TurnFacts | null): boolean {
+  return facts?.ranCleanOnCurrentSource === true;
+}
 
 export interface ReviewProjection {
   blocks: Array<{
@@ -163,6 +194,7 @@ export interface ReviewProjection {
     blockType: string;
     change: ReviewChange;
     neverTested?: boolean;
+    coverage?: BlockCoverage;
   }>;
   duplicateWrites: Array<{
     blockType: string;
@@ -335,6 +367,7 @@ export interface TurnNarrativeState {
   connectedAccountChoices: ConnectedAccountChoice[];
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
+  turnFacts: TurnFacts | null;
 }
 
 export interface GoogleConnectionNotice {
@@ -373,6 +406,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   connectedAccountChoices: [],
   googleConnectionNotices: [],
   review: null,
+  turnFacts: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -1404,6 +1438,34 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
   return out;
 }
 
+function parseTurnFacts(raw: unknown): TurnFacts | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.factsAvailable !== "boolean") return null;
+  const count = (key: string): number | null =>
+    typeof value[key] === "number" ? (value[key] as number) : null;
+  const text = (key: string): string | null =>
+    typeof value[key] === "string" ? (value[key] as string) : null;
+  const evaluationState = value.evaluationState;
+  return {
+    factsAvailable: value.factsAvailable,
+    authoredBlockCount: count("authoredBlockCount"),
+    matchingSourceBlockCount: count("matchingSourceBlockCount"),
+    evaluationState:
+      evaluationState === "demonstrated" ||
+      evaluationState === "not_demonstrated" ||
+      evaluationState === "not_evaluated"
+        ? evaluationState
+        : null,
+    runId: text("runId"),
+    runCompleted:
+      typeof value.runCompleted === "boolean" ? value.runCompleted : null,
+    terminalCause: text("terminalCause"),
+    blocksRunThisTurn: count("blocksRunThisTurn"),
+    ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
+  };
+}
+
 function parseReviewProjection(raw: unknown): ReviewProjection | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
@@ -1426,11 +1488,14 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
     ) {
       return null;
     }
+    // An unrecognised coverage value drops off this block rather than voiding the
+    // whole projection, so a newer backend vocabulary cannot blank the review.
     blocks.push({
       label: block.label,
       blockType: block.blockType,
       change: block.change,
       neverTested: block.neverTested,
+      coverage: BLOCK_COVERAGE.find((known) => known === block.coverage),
     });
   }
   const duplicateWrites: ReviewProjection["duplicateWrites"] = [];
@@ -1567,12 +1632,16 @@ export function hydrateNarrativeFromPayload(
   const endedAtIso =
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
+  const turnFacts = parseTurnFacts(payload.turnFacts);
+  // A deadline cuts a running block off; that is a stop, so it must not be swept
+  // to failed and then read back as the turn having failed.
+  const halted = cancelled || turnFacts?.terminalCause === "deadline_expired";
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: cancelled
+              state: halted
                 ? "stopped"
                 : terminal === "error"
                   ? "failed"
@@ -1638,6 +1707,7 @@ export function hydrateNarrativeFromPayload(
       payload.googleConnectionNotices,
     ),
     review: parseReviewProjection(payload.review),
+    turnFacts,
   };
 }
 
@@ -1809,7 +1879,6 @@ function adjudicatedSummaryParts(
     needsTestedProposalReview: boolean;
     hasEdited: boolean;
     hasDrafts: boolean;
-    hasCleanCompletedBuild: boolean;
   },
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
@@ -1856,21 +1925,35 @@ function adjudicatedSummaryParts(
   return null;
 }
 
+// A deadline exit stamps terminal="error" for budget reasons; that is a halt,
+// not a block failure, so no surface may give it failure's treatment.
+export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" &&
+    !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
 export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   // A cancelled turn's terminal is "error" purely because the user stopped it,
   // so that arm must not brand their own stop a failure.
+  const anyBlockFailed = rollupBlocks.some((b) => b.state === "failed");
+  const facts = turn.turnFacts;
+  const deadlineHalt = isDeadlineHalt(turn);
   const isFail =
     !turn.cancelled &&
-    (turn.terminal === "error" ||
-      rollupBlocks.some((b) => b.state === "failed"));
+    !deadlineHalt &&
+    (turn.terminal === "error" || anyBlockFailed);
   // A stop halts the turn without failing it — a user cancel, or a budget halt
   // that cancels a block mid-run. It suppresses a success verdict exactly like
   // a failure, but never wears failure's treatment. `turn.cancelled` is load
   // bearing on its own: a stop during the thinking phase, or on a QA turn,
   // touches no block at all and would otherwise read as a clean success.
   const isStopped =
-    turn.cancelled || rollupBlocks.some((b) => b.state === "stopped");
+    turn.cancelled ||
+    deadlineHalt ||
+    rollupBlocks.some((b) => b.state === "stopped");
   const mode = effectiveMode(turn);
   const needsInput = asksUserForInput(turn);
   const isQA =
@@ -1879,15 +1962,26 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
     mode === "clarify" ||
     mode === "refuse";
   const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
+  const cleanFullCurrentSourceCoverage = ranCleanOnCurrentSource(facts);
   const needsUntestedProposalReview =
     hasDrafts && turn.proposalDisposition === "review_untested";
+  // The tested framing is a claim like any other, so it reads the published verdict
+  // rather than the disposition alone.
   const needsTestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_tested";
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-  const hasCleanCompletedBuild =
     hasDrafts &&
-    rollupBlocks.length > 0 &&
-    rollupBlocks.every((block) => isBlockOk(block));
+    turn.proposalDisposition === "review_tested" &&
+    cleanFullCurrentSourceCoverage;
+  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
+  const authoredBlockCount = facts?.factsAvailable
+    ? facts.authoredBlockCount
+    : null;
+  const matchingSourceBlockCount = facts?.factsAvailable
+    ? facts.matchingSourceBlockCount
+    : null;
+  const coverageKnown =
+    authoredBlockCount !== null &&
+    authoredBlockCount > 0 &&
+    matchingSourceBlockCount !== null;
   const hasReviewableDraft =
     hasDrafts &&
     (turn.proposalDisposition === "review_untested" ||
@@ -1904,7 +1998,6 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
           needsTestedProposalReview,
           hasEdited,
           hasDrafts,
-          hasCleanCompletedBuild,
         });
 
   const headline = adjudicated
@@ -1927,11 +2020,13 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
                     : mode === "clarify"
                       ? "Needs your input"
                       : "Answered"
-                  : hasEdited
-                    ? "Applied edits and re-tested"
-                    : hasDrafts
-                      ? "Built and tested the workflow"
-                      : "Completed the run";
+                  : cleanFullCurrentSourceCoverage
+                    ? "Every block ran clean on the current draft"
+                    : hasEdited
+                      ? "Applied edits"
+                      : hasDrafts
+                        ? "Built the workflow"
+                        : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
@@ -1941,8 +2036,30 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
     const failed = rollupBlocks.filter((b) => b.state === "failed").length;
     const stopped = rollupBlocks.filter((b) => b.state === "stopped").length;
     const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-    if (newBlocks) stats.push(`${newBlocks} new`);
+    if (coverageKnown) {
+      stats.push(
+        `${authoredBlockCount} block${authoredBlockCount === 1 ? "" : "s"} authored`,
+      );
+      stats.push(
+        `${matchingSourceBlockCount}/${authoredBlockCount} ran on current source`,
+      );
+      if (facts?.runCompleted === true) {
+        stats.push("run completed");
+      } else if (facts?.runCompleted === false) {
+        stats.push("run did not complete");
+      }
+      if (facts?.evaluationState === "not_evaluated") {
+        stats.push("outcome not evaluated");
+      } else if (facts?.evaluationState === "not_demonstrated") {
+        stats.push("outcome not confirmed");
+      }
+      if (facts?.terminalCause === "deadline_expired") {
+        stats.push("time limit reached");
+      }
+    } else {
+      if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
+      if (newBlocks) stats.push(`${newBlocks} new`);
+    }
     if (failed) stats.push(`${failed} failed`);
     if (stopped) stats.push(`${stopped} stopped`);
   }
@@ -1956,7 +2073,8 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
         : isStopped ||
             needsUntestedProposalReview ||
             needsTestedProposalReview ||
-            isQA
+            isQA ||
+            (hasDrafts && !cleanFullCurrentSourceCoverage)
           ? "qa"
           : "ok";
   return {
@@ -1967,7 +2085,10 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
       ? adjudicated.glyph
       : isStoppedWithDraft ||
           needsUntestedProposalReview ||
-          needsTestedProposalReview
+          needsTestedProposalReview ||
+          // A draft still awaiting review never wears a success tick, whether or not
+          // facts back its tested framing.
+          (hasDrafts && turn.proposalDisposition === "review_tested")
         ? "!"
         : isFail
           ? "✕"

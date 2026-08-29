@@ -52,24 +52,60 @@ const turn = (
   ...overrides,
 });
 
+const coveredFacts = {
+  factsAvailable: true,
+  authoredBlockCount: 1,
+  matchingSourceBlockCount: 1,
+  evaluationState: null,
+  runId: "wr_1",
+  runCompleted: true,
+  terminalCause: null,
+  blocksRunThisTurn: 1,
+  ranCleanOnCurrentSource: true,
+} as const;
+
 describe("getReviewGateVerdict", () => {
-  it("treats review_tested as tested", () => {
+  it("treats review_tested as tested when the turn's coverage facts back it", () => {
     expect(
       getReviewGateVerdict(
-        turn({ proposalDisposition: "review_tested" }),
+        turn({ proposalDisposition: "review_tested", turnFacts: coveredFacts }),
         null,
       ),
     ).toBe("tested");
   });
 
-  it("treats auto_applicable as tested — the backend only assigns this disposition to verified changes", () => {
+  it("treats auto_applicable as tested when the turn's coverage facts back it", () => {
     expect(
       getReviewGateVerdict(
-        turn({ proposalDisposition: "auto_applicable" }),
+        turn({
+          proposalDisposition: "auto_applicable",
+          turnFacts: coveredFacts,
+        }),
         null,
       ),
     ).toBe("tested");
   });
+
+  it.each(["review_tested", "auto_applicable"] as const)(
+    "refuses a tested pill for %s when coverage is partial",
+    (proposalDisposition) => {
+      expect(
+        getReviewGateVerdict(
+          turn({
+            proposalDisposition,
+            // Partial coverage is decided by the backend, which publishes both the
+            // count and the verdict it implies.
+            turnFacts: {
+              ...coveredFacts,
+              matchingSourceBlockCount: 0,
+              ranCleanOnCurrentSource: false,
+            },
+          }),
+          null,
+        ),
+      ).toBe("untested");
+    },
+  );
 
   it("treats review_untested as untested", () => {
     expect(
@@ -89,11 +125,17 @@ describe("getReviewGateVerdict", () => {
     ).toBe("untested");
   });
 
-  it("has no verdict for a legacy proposal carrying no evidence either way", () => {
+  it("refuses a tested pill for a legacy proposal that carries no coverage facts", () => {
     const legacyProposal = {} as unknown as WorkflowApiResponse;
     expect(
       getReviewGateVerdict(turn({ proposalDisposition: null }), legacyProposal),
-    ).toBe(null);
+    ).toBe("untested");
+    expect(
+      getReviewGateVerdict(
+        turn({ proposalDisposition: null, turnFacts: coveredFacts }),
+        legacyProposal,
+      ),
+    ).toBe("tested");
   });
 
   it("returns null with no disposition and no proposal", () => {
@@ -395,5 +437,109 @@ describe("ReviewGateCard — recorded review projection", () => {
 
     expect(hydrated?.review?.blocks[0]?.label).toBe("saved_step");
     expect(malformed?.review).toBeNull();
+  });
+});
+
+describe("ReviewGateCard — source coverage", () => {
+  const noop = () => {};
+
+  it("separates a block run against different source from one never run", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          review: {
+            blocks: [
+              {
+                label: "sign_in",
+                blockType: "code",
+                change: "changed",
+                neverTested: true,
+                coverage: "different_source",
+              },
+              {
+                label: "read_metric",
+                blockType: "code",
+                change: "added",
+                neverTested: true,
+                coverage: "never_run",
+              },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("Different source")).not.toBeNull();
+    expect(screen.getByText("Never tested")).not.toBeNull();
+  });
+
+  it("says a renamed block is untested under this name, not that it failed", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          review: {
+            blocks: [
+              {
+                label: "sign_in_v2",
+                blockType: "code",
+                change: "added",
+                neverTested: true,
+                coverage: "unknown",
+              },
+              {
+                label: "read_metric",
+                blockType: "code",
+                change: "unchanged",
+                neverTested: false,
+                coverage: "current_source",
+              },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("Not tested under this name")).not.toBeNull();
+    expect(screen.queryByText("Never tested")).toBeNull();
+    expect(screen.queryByText(/failed/i)).toBeNull();
+    expect(screen.queryByText(/invalid/i)).toBeNull();
+  });
+
+  it("stays non-committal on a proposal whose turn published no facts", () => {
+    expect(
+      getReviewGateVerdict(
+        turn({
+          proposalDisposition: "auto_applicable",
+          turnFacts: {
+            factsAvailable: false,
+            authoredBlockCount: null,
+            matchingSourceBlockCount: null,
+            evaluationState: null,
+            runId: null,
+            runCompleted: null,
+            terminalCause: null,
+            blocksRunThisTurn: null,
+            ranCleanOnCurrentSource: false,
+          },
+        }),
+        null,
+      ),
+    ).toBe("untested");
   });
 });

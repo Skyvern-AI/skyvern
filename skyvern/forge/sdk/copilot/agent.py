@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     history_has_runtime_block_failure,
     observed_value_extraction_scaffold_lines,
+    unresolved_runtime_block_failure,
     unresolved_runtime_block_failure_with_disposition,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
@@ -83,6 +84,7 @@ from skyvern.forge.sdk.copilot.context import (
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
+    NarrativeTurnFacts,
     ProposalDisposition,
     ResponseType,
     StructuredContext,
@@ -154,7 +156,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
     redact_refused_secret_turns,
 )
-from skyvern.forge.sdk.copilot.review_gate import build_review_projection, serialize_execution_receipts
+from skyvern.forge.sdk.copilot.review_gate import (
+    NarrativeReviewBlock,
+    NarrativeReviewProjection,
+    build_review_projection,
+    serialize_execution_receipts,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime import (
     BrowserProbeOutcome,
@@ -175,6 +182,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalCause,
     assemble_terminal_envelope,
     reason_in_reply_shadow,
+    select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
@@ -1457,6 +1465,85 @@ def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
     return None
 
 
+def _authored_review_blocks(review: NarrativeReviewProjection | None) -> list[NarrativeReviewBlock]:
+    if review is None:
+        return []
+    return [block for block in review["blocks"] if block.get("change") != "removed"]
+
+
+def _draft_ran_on_current_source(
+    facts: NarrativeTurnFacts, unresolved_failure: UnresolvedRuntimeFailure | None
+) -> bool:
+    """A tested draft claims full current-source coverage and a lifecycle that contradicts nothing:
+    a halted turn, an unfinished or unconfirmed run, or an open block failure each disqualify it.
+    ``runCompleted`` is None when no run is anchored to this turn, leaving the source-bound receipts
+    as the only claim."""
+    authored = facts.get("authoredBlockCount")
+    if not facts["factsAvailable"] or not authored or facts.get("matchingSourceBlockCount") != authored:
+        return False
+    if facts["terminalCause"] is not None or unresolved_failure is not None:
+        return False
+    return facts["runCompleted"] is not False and facts["evaluationState"] != "not_demonstrated"
+
+
+def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> NarrativeReviewProjection | None:
+    if not isinstance(proposal_yaml, str):
+        return None
+    return build_review_projection(
+        ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
+        proposal_yaml,
+        ctx.executed_block_fingerprints,
+    )
+
+
+def _tested_draft_reply(
+    ctx: CopilotContext,
+    review: NarrativeReviewProjection | None,
+    *,
+    tested_reply: str,
+    unvalidated_reply: str,
+) -> str:
+    """The reply and the proposal disposition read one predicate, so prose cannot outrun the pill."""
+    tested = _turn_facts_for_context(ctx, review)["ranCleanOnCurrentSource"]
+    return tested_reply if tested else unvalidated_reply
+
+
+def _turn_fact_bundle(
+    review: NarrativeReviewProjection | None,
+    run_outcome: RecordedRunOutcome | None,
+    terminal_cause: TerminalCause | None,
+    blocks_run_this_turn: int | None,
+    unresolved_failure: UnresolvedRuntimeFailure | None = None,
+) -> NarrativeTurnFacts:
+    run_id = run_outcome.workflow_run_id if run_outcome is not None else None
+    facts: NarrativeTurnFacts = {
+        "factsAvailable": review is not None,
+        "evaluationState": run_outcome.verdict if run_outcome is not None else None,
+        "runId": (run_id.strip() or None) if isinstance(run_id, str) else None,
+        "runCompleted": run_outcome.run_completed if run_outcome is not None else None,
+        "terminalCause": terminal_cause,
+        "blocksRunThisTurn": blocks_run_this_turn,
+        # Overwritten below, once the coverage counts it reads are in place.
+        "ranCleanOnCurrentSource": False,
+    }
+    if review is not None:
+        authored = _authored_review_blocks(review)
+        facts["authoredBlockCount"] = len(authored)
+        facts["matchingSourceBlockCount"] = sum(1 for block in authored if block.get("coverage") == "current_source")
+    facts["ranCleanOnCurrentSource"] = _draft_ran_on_current_source(facts, unresolved_failure)
+    return facts
+
+
+def _turn_facts_for_context(ctx: CopilotContext, review: NarrativeReviewProjection | None) -> NarrativeTurnFacts:
+    return _turn_fact_bundle(
+        review,
+        select_run_outcome_anchor(_terminal_envelope_run_outcomes(ctx)),
+        _terminal_cause_for_context(ctx),
+        len(ctx.executed_block_labels),
+        unresolved_runtime_block_failure(ctx),
+    )
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
@@ -1471,6 +1558,7 @@ def _assemble_terminal_envelope_safe(
     workflow_attempted: bool,
     final_message: str,
     terminal_cause: TerminalCause | None = None,
+    blocks_run_this_turn: int | None = None,
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1485,6 +1573,7 @@ def _assemble_terminal_envelope_safe(
             workflow_mutated=workflow_mutated,
             workflow_attempted=workflow_attempted,
             terminal_cause=terminal_cause,
+            blocks_run_this_turn=blocks_run_this_turn,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1565,18 +1654,23 @@ def _make_agent_result(
     if ctx is not None and narrative_payload is None:
         raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     if ctx is not None and isinstance(narrative_payload, dict) and isinstance(proposal_yaml, str):
-        review = build_review_projection(
-            ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
-            proposal_yaml,
-            ctx.executed_block_fingerprints,
-        )
+        review = _review_projection_for(ctx, proposal_yaml)
         narrative_payload = {key: value for key, value in narrative_payload.items() if key != "review"}
         if review is not None:
             narrative_payload["review"] = review
         kwargs["narrative_payload"] = narrative_payload
+    review_projection: NarrativeReviewProjection | None = (
+        narrative_payload.get("review") if isinstance(narrative_payload, dict) else None
+    )
+    terminal_cause = _terminal_cause_for_context(ctx) if ctx is not None else None
+    turn_facts = _turn_facts_for_context(ctx, review_projection) if ctx is not None else None
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
-    proposal_disposition = kwargs.get("proposal_disposition")
+    raw_disposition = kwargs.get("proposal_disposition")
+    proposal_disposition: str | None = raw_disposition if isinstance(raw_disposition, str) else None
+    if turn_facts is not None and proposal_disposition == "review_tested" and not turn_facts["ranCleanOnCurrentSource"]:
+        proposal_disposition = "review_untested"
+        kwargs["proposal_disposition"] = proposal_disposition
     result_carries_workflow = (
         kwargs.get("updated_workflow") is not None
         or kwargs.get("staged_workflow") is not None
@@ -1696,9 +1790,14 @@ def _make_agent_result(
             workflow_mutated=workflow_mutated,
             workflow_attempted=ctx.has_genuine_workflow_attempt(),
             final_message=str(kwargs.get("user_response") or ""),
-            terminal_cause=_terminal_cause_for_context(ctx),
+            terminal_cause=terminal_cause,
+            blocks_run_this_turn=len(ctx.executed_block_labels),
         )
     kwargs["terminal_envelope"] = terminal_envelope
+    if turn_facts is not None:
+        payload = kwargs.get("narrative_payload")
+        if isinstance(payload, dict):
+            kwargs["narrative_payload"] = {**payload, "turnFacts": turn_facts}
     if ctx is not None and "executed_block_fingerprints" not in kwargs:
         kwargs["executed_block_fingerprints"] = {
             label: set(fingerprints) for label, fingerprints in ctx.executed_block_fingerprints.items()
@@ -2770,7 +2869,14 @@ def _build_wip_exit_result(
 
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     if outcome_fully_verified(ctx) and verified_workflow is not None:
-        final_text, outcome = _guard(tested_reply)
+        final_text, outcome = _guard(
+            _tested_draft_reply(
+                ctx,
+                _review_projection_for(ctx, verified_yaml),
+                tested_reply=tested_reply,
+                unvalidated_reply=unvalidated_reply,
+            )
+        )
         proposal_disposition = "auto_applicable"
         return _finalize_result_with_blocker_override(
             ctx,
@@ -2810,7 +2916,13 @@ def _build_wip_exit_result(
         and not ctx.last_test_suspicious_success
     ):
         append_failure_detail = recorded_failure_reply and not deadline_suppresses_failure_detail
-        reply = _last_good_failure_reply(ctx, tested_reply) if append_failure_detail else tested_reply
+        held_reply = _tested_draft_reply(
+            ctx,
+            _review_projection_for(ctx, ctx.last_good_workflow_yaml),
+            tested_reply=tested_reply,
+            unvalidated_reply=unvalidated_reply,
+        )
+        reply = _last_good_failure_reply(ctx, held_reply) if append_failure_detail else held_reply
         final_text, outcome = _guard(reply)
         return _finalize_result_with_blocker_override(
             ctx,
@@ -2848,7 +2960,16 @@ def _build_wip_exit_result(
         if unvalidated and recorded_failure_reply:
             reply = _deadline_owned_or(unvalidated_reply, recorded_failure_reply) or unvalidated_reply
         else:
-            reply = unvalidated_reply if unvalidated else tested_reply
+            reply = (
+                unvalidated_reply
+                if unvalidated
+                else _tested_draft_reply(
+                    ctx,
+                    _review_projection_for(ctx, ctx.last_workflow_yaml),
+                    tested_reply=tested_reply,
+                    unvalidated_reply=unvalidated_reply,
+                )
+            )
         final_text, outcome = _guard(reply)
         proposal_disposition = "review_untested" if unvalidated else "review_tested"
         if not unvalidated and outcome_fully_verified(ctx):

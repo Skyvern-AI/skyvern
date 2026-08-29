@@ -106,6 +106,19 @@ class NarrativeConnectedAccountChoice(TypedDict):
     email_address: str | None
 
 
+class NarrativeTurnFacts(TypedDict):
+    factsAvailable: bool
+    evaluationState: str | None
+    runId: str | None
+    runCompleted: bool | None
+    terminalCause: str | None
+    blocksRunThisTurn: int | None
+    authoredBlockCount: NotRequired[int]
+    matchingSourceBlockCount: NotRequired[int]
+    # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
+    ranCleanOnCurrentSource: bool
+
+
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
@@ -139,6 +152,7 @@ class TurnNarrativePayload(TypedDict):
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
     testedBlockFingerprints: NotRequired[dict[str, list[str]]]
+    turnFacts: NotRequired[NarrativeTurnFacts]
 
 
 if TYPE_CHECKING:

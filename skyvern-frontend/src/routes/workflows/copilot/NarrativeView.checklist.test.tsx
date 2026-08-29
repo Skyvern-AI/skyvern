@@ -163,7 +163,7 @@ describe("NarrativeView — activity log", () => {
   it("moves focus between the terminal rollup and detail disclosures", async () => {
     render(<NarrativeView turn={repairLoopTurn()} />);
     const rollup = screen.getByRole("button", {
-      name: /Built and tested the workflow/,
+      name: /Built the workflow/,
     });
     expect(rollup.getAttribute("aria-expanded")).toBe("false");
     expect(rollup.hasAttribute("aria-controls")).toBe(false);
@@ -178,7 +178,7 @@ describe("NarrativeView — activity log", () => {
 
     fireEvent.click(collapse);
     const restored = screen.getByRole("button", {
-      name: /Built and tested the workflow/,
+      name: /Built the workflow/,
     });
     await waitFor(() => expect(document.activeElement).toBe(restored));
   });

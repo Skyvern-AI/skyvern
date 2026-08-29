@@ -8,7 +8,10 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import bundles from "./narrativeState.turnFacts.fixture.json";
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
+
+const editOneOfTwoBundle = bundles["different-source-edit-one-of-two"];
 
 type StreamBody = {
   message: string;
@@ -466,6 +469,8 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
     expect(screen.getByText("Proposed changes")).toBeTruthy();
+    // The gate itself still appears live (SKY-14099); with no turn behind it there are
+    // no facts to project, so it carries no verdict pill either way.
     expect(screen.queryByText("Tested")).toBeNull();
   });
 
@@ -496,5 +501,31 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       screen.getByText("Discarded — canvas reverted to the previous version"),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  it("surfaces per-block coverage tags through the mounted chat, not only in an isolated card", async () => {
+    await renderChat();
+
+    await submit("edit one block after it passed.");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft needs review.", {
+          narrative_payload: {
+            ...editOneOfTwoBundle,
+            turnId: "turn-1",
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText("Different source")).toBeTruthy(),
+    );
+    expect(
+      screen.getByText(/3 blocks authored · 0\/3 ran on current source/),
+    ).toBeTruthy();
+    expect(screen.queryByText("Built and tested the workflow")).toBeNull();
   });
 });

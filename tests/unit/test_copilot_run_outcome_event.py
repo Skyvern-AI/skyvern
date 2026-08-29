@@ -304,6 +304,7 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
         reason_code=final.reason_code,
         display_reason=final.display_reason,
         workflow_run_id="wr_test",
+        run_completed=False,
     )
     assert ctx.last_run_outcome_block_labels == final.block_labels
 
@@ -319,6 +320,7 @@ def test_challenge_failure_records_observation_without_halting_agent() -> None:
         reason_code="blocker_reported",
         display_reason=run_outcome_display_reason("Human verification challenge blocked the search."),
         workflow_run_id="wr_challenge",
+        run_completed=False,
     )
     assert ctx.last_run_outcome == outcome
     assert ctx.last_test_ok is False
@@ -396,6 +398,7 @@ async def test_completion_judge_cannot_overturn_run_output() -> None:
     assert outcome == RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id="wr_test",
+        run_completed=True,
     )
     assert ctx.completion_verification_result is None
     assert ctx.last_test_suspicious_success is False
@@ -457,6 +460,7 @@ async def test_completed_partial_run_does_not_promote_full_workflow() -> None:
     assert ctx.last_run_outcome == RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id="wr_test",
+        run_completed=True,
     )
 
 
@@ -483,6 +487,7 @@ async def test_failed_run_emits_its_own_outcome() -> None:
     assert [frame.verdict for frame in frames] == ["not_demonstrated"]
     assert ctx.last_run_outcome is not None
     assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.last_run_outcome.run_completed is False
 
 
 @pytest.mark.asyncio
@@ -823,6 +828,7 @@ def test_completed_run_uses_retained_terminal_output_when_parameter_identity_can
             'Recorded output from the latest completed run: {"retrieve_resale_demand_document":'
             '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
         ),
+        run_completed=True,
     )
     assert ctx.last_test_ok is True
     assert ctx.last_full_workflow_test_ok is True

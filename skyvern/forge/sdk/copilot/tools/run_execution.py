@@ -4052,6 +4052,7 @@ def _record_run_blocks_result(
         recorded_outcome = _recorded_run_outcome(
             workflow_run_id=run_id if isinstance(run_id, str) else None,
             output_report=output_report,
+            run_completed=run_ok,
         )
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         composition_unverified = _composition_unverified_current_workflow_labels(copilot_ctx)
@@ -4123,6 +4124,7 @@ def _record_run_blocks_result(
             copilot_ctx.last_test_failure_reason or str(result.get("error") or "The run failed.")
         ),
         workflow_run_id=run_id if isinstance(run_id, str) else None,
+        run_completed=False,
     )
     _record_build_test_outcome(copilot_ctx, result, recorded_outcome)
     return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
@@ -4231,12 +4233,14 @@ def _recorded_run_outcome(
     *,
     workflow_run_id: str | None = None,
     output_report: str | None = None,
+    run_completed: bool | None = None,
 ) -> RecordedRunOutcome:
     """Record the completed run status without interpreting whether it met the request."""
     return RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id=workflow_run_id,
         output_report=output_report,
+        run_completed=run_completed,
     )
 
 

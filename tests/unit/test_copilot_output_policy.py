@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.tools import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     NATIVE_TOOLS,
@@ -66,6 +67,9 @@ def _policy(**overrides: object) -> RequestPolicy:
     defaults = dict(resolved_credentials=[_credential()])
     defaults.update(overrides)
     return RequestPolicy(**defaults)
+
+
+_COVERED_DRAFT_YAML = """title: Draft\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: task\n    label: step\n    prompt: Do it\n"""
 
 
 def _ctx(**overrides: object) -> CopilotContext:
@@ -1643,7 +1647,10 @@ def test_output_policy_credential_block_asks_for_credential_confirmation(
 def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None:
     ctx = _ctx()
     ctx.last_workflow = SimpleNamespace(name="draft")
-    ctx.last_workflow_yaml = "title: Draft"
+    ctx.last_workflow_yaml = _COVERED_DRAFT_YAML
+    ctx.executed_block_fingerprints = {
+        label: set(values) for label, values in workflow_block_fingerprints(_COVERED_DRAFT_YAML).items()
+    }
     ctx.workflow_persisted = True
     ctx.last_test_ok = True
 
@@ -1658,7 +1665,7 @@ def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None
 
     assert result.response_type == "ASK_QUESTION"
     assert result.updated_workflow is ctx.last_workflow
-    assert result.workflow_yaml == "title: Draft"
+    assert result.workflow_yaml == _COVERED_DRAFT_YAML
     assert result.workflow_was_persisted is True
     assert result.clear_proposed_workflow is False
     assert result.proposal_disposition == "review_tested"
