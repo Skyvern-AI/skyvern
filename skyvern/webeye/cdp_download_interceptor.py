@@ -30,6 +30,7 @@ import stat
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer
 
 LOG = structlog.get_logger()
+RECOVERY_MARKER_HEADER = "x-skyvern-recovery-marker"
 
 CDP_DOWNLOAD_HTTP_SINK_KIND = "browser.download.http"
 
@@ -131,6 +133,9 @@ STREAM_IO_READ_CHUNK_SIZE = 256 * 1024  # 256 KiB
 # treated as dead so the extraction aborts instead of holding the lock forever (which would deadlock later
 # captures and hang teardown's task drain).
 STREAM_IO_READ_TIMEOUT_SECONDS = 120.0
+# Bound same-origin browser fetches used to recover downloads independently of the generic
+# browser action timeout; valid authenticated transfers may take longer than five seconds.
+DOWNLOAD_RECOVERY_TIMEOUT_MS = 30_000
 
 
 @dataclass
@@ -627,6 +632,9 @@ class CDPDownloadInterceptor:
        - Response download → extract body → save to disk → Fetch.fulfillRequest
     """
 
+    _MAX_ACTIVE_RECOVERY_MARKERS = 64
+    _MAX_RECOVERY_REQUEST_IDS = 128
+
     def __init__(
         self,
         output_dir: str | None = None,
@@ -642,6 +650,11 @@ class CDPDownloadInterceptor:
         self._download_directory_identities: dict[Path, tuple[int, int]] = {}
         self._proxy_username: str | None = proxy_username
         self._proxy_password: str | None = proxy_password
+        self._recovery_marker = uuid.uuid4().hex
+        self._active_recovery_markers: set[str] = set()
+        # Recovery execution is serialized per interceptor; this tracks markers owned by the
+        # encompassing helper call while it retries across pages.
+        self._active_recovery_call_markers: set[str] = set()
         self._network_egress_monitor = network_egress_monitor
         self._redirect_hop_authorizer = redirect_hop_authorizer
         self._download_scope = (
@@ -651,6 +664,7 @@ class CDPDownloadInterceptor:
         )
         self._cdp_sessions: list[CDPSession] = []
         self._active_request_interceptors: dict[CDPSession, tuple[Page, Callable[[Page], None]]] = {}
+        self._recovery_request_ids: OrderedDict[tuple[CDPSession, str], str] = OrderedDict()
         self._enrolling_pages: list[Page] = []
         self._enabled = False
         self._download_index = 0
@@ -933,6 +947,7 @@ class CDPDownloadInterceptor:
             )
             self._artifact_scope_generation += 1
             self._artifact_scope_valid = True
+            self._recovery_marker = uuid.uuid4().hex
             if dir_changed:
                 self._downloaded_urls.clear()
             self._reset_download_accounting()
@@ -954,6 +969,46 @@ class CDPDownloadInterceptor:
 
     def _artifact_scope_is_active(self, generation: int) -> bool:
         return self._artifact_scope_valid and generation == self._artifact_scope_generation
+
+    def _register_recovery_marker(self, marker: str) -> bool:
+        if marker in self._active_recovery_markers:
+            return True
+        if len(self._active_recovery_markers) >= self._MAX_ACTIVE_RECOVERY_MARKERS:
+            LOG.warning("Recovery marker capacity exhausted; denying new recovery")
+            return False
+        self._active_recovery_markers.add(marker)
+        return True
+
+    def _register_recovery_request(self, session: CDPSession, request_id: str, marker: str) -> bool:
+        key = (session, request_id)
+        if key in self._recovery_request_ids:
+            return self._recovery_request_ids[key] == marker
+        if len(self._recovery_request_ids) >= self._MAX_RECOVERY_REQUEST_IDS:
+            LOG.warning("Recovery request capacity exhausted; denying new recovery")
+            return False
+        self._recovery_request_ids[key] = marker
+        return True
+
+    def _discard_recovery_request(self, session: CDPSession, request_id: str) -> None:
+        marker = self._recovery_request_ids.pop((session, request_id), None)
+        if (
+            marker is not None
+            and marker not in self._recovery_request_ids.values()
+            and marker not in self._active_recovery_call_markers
+        ):
+            self._active_recovery_markers.discard(marker)
+
+    def _discard_unowned_recovery_marker(self, marker: str) -> None:
+        """Release a marker that was never associated with a paused request."""
+        if marker not in self._recovery_request_ids.values() and marker not in self._active_recovery_call_markers:
+            self._active_recovery_markers.discard(marker)
+
+    def _drop_session_recovery_state(self, session: CDPSession) -> None:
+        for key in [k for k in self._recovery_request_ids if k[0] is session]:
+            self._recovery_request_ids.pop(key)
+        for marker in tuple(self._active_recovery_markers):
+            if marker not in self._recovery_request_ids.values() and marker not in self._active_recovery_call_markers:
+                self._active_recovery_markers.discard(marker)
 
     @property
     def download_scope(self) -> str | None:
@@ -1078,6 +1133,7 @@ class CDPDownloadInterceptor:
 
     def _unregister_active_request_interceptor(self, cdp_session: CDPSession) -> None:
         registration = self._active_request_interceptors.pop(cdp_session, None)
+        self._drop_session_recovery_state(cdp_session)
         if registration is None:
             return
         page, close_listener = registration
@@ -1668,6 +1724,31 @@ class CDPDownloadInterceptor:
 
         normalized_filename = normalize_download_filename(response_filename, content_type)
         if _payload_is_html_login_masquerade(data, content_type, normalized_filename):
+            # A browser-context fetch preserves same-origin session/request state; retain the
+            # masquerade guard if recovery is unavailable or returns HTML.
+            if artifact_scope_generation is None:
+                artifact_scope_generation = self._artifact_scope_generation
+            recovered = await self._fetch_download_bytes_in_page(url, recovery_allowance_bytes=remaining_run_bytes)
+            if not self._artifact_scope_is_active(artifact_scope_generation):
+                return
+            if recovered is not None and not _body_starts_with_html(recovered):
+                # The masquerade bytes were reserved above; release them before reserving the real
+                # payload so this attempt is charged against the run-size budget only once.
+                self._run_download_bytes -= len(data)
+                if not self._reserve_download_bytes(attempt, len(recovered)):
+                    return
+                save_path, filename = self._resolve_save_path(suggested_filename)
+                self._atomically_write_bytes(save_path, recovered, artifact_scope_generation)
+                LOG.info(
+                    "CDP download saved (in-page same-origin fetch)",
+                    filename_fp=diagnostic_fingerprint(filename),
+                    size=len(recovered),
+                    save_path_fp=diagnostic_fingerprint(str(save_path)),
+                    download_index=self._download_index,
+                    method="in_page_same_origin_fetch",
+                )
+                self._record_download_saved(attempt)
+                return
             LOG.error(
                 "Direct download returned an HTML page for a non-HTML file; not saving "
                 "(likely an unauthenticated fetch landing on a login/session-gate page)",
@@ -1716,6 +1797,60 @@ class CDPDownloadInterceptor:
             ):
                 parts.append(f"{name}={value}")
         return "; ".join(parts)
+
+    async def _fetch_download_bytes_in_page(
+        self, url: str, recovery_allowance_bytes: int | None = None
+    ) -> bytes | None:
+        """Read bytes through a same-origin HTTPS browser-context fetch, failing closed."""
+        if self._browser_context is None:
+            return None
+        if urlparse(url).scheme.lower() != "https":
+            return None
+        remaining_run_bytes = MAX_RUN_DOWNLOAD_BYTES - self._run_download_bytes
+        max_size_bytes = min(
+            MAX_FILE_SIZE_BYTES,
+            recovery_allowance_bytes if recovery_allowance_bytes is not None else remaining_run_bytes,
+        )
+        if max_size_bytes < 1:
+            return None
+        call_owned_recovery_markers: set[str] = set()
+        try:
+            for page in list(self._browser_context.pages):
+                active_session = next(
+                    (
+                        session
+                        for session, (registered_page, _) in self._active_request_interceptors.items()
+                        if registered_page is page
+                    ),
+                    None,
+                )
+                recovery_marker: str | None = self._recovery_marker if active_session is not None else None
+                if recovery_marker is not None:
+                    if not self._register_recovery_marker(recovery_marker):
+                        continue
+                    self._active_recovery_call_markers.add(recovery_marker)
+                    call_owned_recovery_markers.add(recovery_marker)
+                try:
+                    data = await SkyvernFrame.read_http_url_bytes(
+                        page=page,
+                        url=url,
+                        max_size_bytes=max_size_bytes,
+                        timeout_ms=DOWNLOAD_RECOVERY_TIMEOUT_MS,
+                        headers={RECOVERY_MARKER_HEADER: recovery_marker} if recovery_marker is not None else None,
+                        redirect="error",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOG.debug("same-origin download recovery failed for browser page", exc_info=True)
+                    continue
+                if data is not None and not _body_starts_with_html(data):
+                    return data
+        finally:
+            for marker in call_owned_recovery_markers:
+                self._active_recovery_call_markers.discard(marker)
+                self._discard_unowned_recovery_marker(marker)
+        return None
 
     async def _download_blob_url(
         self,
@@ -1802,35 +1937,6 @@ class CDPDownloadInterceptor:
             except Exception:
                 pass
         self._page_listener = None
-        self._accepting_cdp_handlers = False
-        try:
-            await self._drain_tasks(self._page_enable_tasks)
-            await self._drain_tasks(self._cdp_handler_tasks)
-        finally:
-            sessions = tuple(self._cdp_sessions)
-            for cdp_session in sessions:
-                self._unregister_active_request_interceptor(cdp_session)
-            for cdp_session in sessions:
-                try:
-                    await cdp_session.send("Fetch.disable")
-                except Exception as error:
-                    if _is_stale_interception_error(error):
-                        # Normal teardown usually finds the target already closed/detached
-                        # (SKY-11964); that benign race carries no live interception to leave
-                        # untracked, so it doesn't warrant invalidating the monitor.
-                        LOG.debug(
-                            "CDP Fetch interception was already stale at disable (benign race)",
-                            error_type=type(error).__name__,
-                        )
-                        continue
-                    # Interception may still be live on a session we have already unregistered,
-                    # which would leave requests egressing untracked. Mirror the enable path.
-                    self._network_egress_monitor.invalidate()
-                    LOG.warning("Failed to disable CDP Fetch interception", error_type=type(error).__name__)
-            detach_cancellation = await self._detach_sessions(sessions, phase="page CDP session detach")
-            self._cdp_sessions.clear()
-        session_count = len(sessions)
-
         async with self._browser_download_monitor_lock:
             self._accepting_browser_downloads = False
             browser_session = self._browser_session
@@ -1844,17 +1950,51 @@ class CDPDownloadInterceptor:
                         pass
             self._browser_download_listener = None
 
+        detach_cancellation: asyncio.CancelledError | None = None
+        try:
+            await self._drain_tasks(self._page_enable_tasks)
+        except asyncio.CancelledError as cancellation:
+            detach_cancellation = cancellation
+        try:
             await self._drain_tasks(self._browser_download_tasks)
+        except asyncio.CancelledError as cancellation:
+            detach_cancellation = detach_cancellation or cancellation
 
-            if browser_session is not None:
-                browser_detach_cancellation = await self._detach_sessions(
-                    (browser_session,), phase="browser CDP session detach"
-                )
-                if detach_cancellation is None:
-                    detach_cancellation = browser_detach_cancellation
-            self._browser_session = None
-            self._browser_context = None
+        if browser_session is not None:
+            browser_detach_cancellation = await self._detach_sessions(
+                (browser_session,), phase="browser CDP session detach"
+            )
+            if detach_cancellation is None:
+                detach_cancellation = browser_detach_cancellation
+        self._browser_session = None
+        self._browser_context = None
 
+        self._accepting_cdp_handlers = False
+        try:
+            await self._drain_tasks(self._cdp_handler_tasks)
+        finally:
+            self._recovery_request_ids.clear()
+            self._active_recovery_markers.clear()
+            sessions = tuple(self._cdp_sessions)
+            for cdp_session in sessions:
+                self._unregister_active_request_interceptor(cdp_session)
+            for cdp_session in sessions:
+                try:
+                    await cdp_session.send("Fetch.disable")
+                except Exception as error:
+                    if _is_stale_interception_error(error):
+                        LOG.debug(
+                            "CDP Fetch interception was already stale at disable (benign race)",
+                            error_type=type(error).__name__,
+                        )
+                        continue
+                    self._network_egress_monitor.invalidate()
+                    LOG.warning("Failed to disable CDP Fetch interception", error_type=type(error).__name__)
+            page_detach_cancellation = await self._detach_sessions(sessions, phase="page CDP session detach")
+            if detach_cancellation is None:
+                detach_cancellation = page_detach_cancellation
+            self._cdp_sessions.clear()
+        session_count = len(sessions)
         if page_context is not None and getattr(page_context, "_skyvern_cdp_download_interceptor", None) is self:
             page_context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
         self._page_context = None
@@ -2045,10 +2185,31 @@ class CDPDownloadInterceptor:
         url = event.get("request", {}).get("url", "<unknown>")
 
         try:
+            response_error_reason = event.get("responseErrorReason")
+            if response_status is None and response_error_reason is not None:
+                self._discard_recovery_request(cdp_session, request_id)
+                await self._fail_request(
+                    cdp_session,
+                    request_id,
+                    error_reason=response_error_reason if isinstance(response_error_reason, str) else "Failed",
+                )
+                return
             # Request stage: authorize before continueRequest can put browser credentials on the
             # wire. A missing, failed, or negative collaborator is unenrolled and fails closed.
             if response_status is None:
                 request = event.get("request", {})
+                raw_request_headers = request.get("headers", {})
+                if isinstance(raw_request_headers, list):
+                    normalized_headers = {
+                        str(h.get("name", "")).lower(): h.get("value", "")
+                        for h in raw_request_headers
+                        if isinstance(h, dict)
+                    }
+                elif isinstance(raw_request_headers, dict):
+                    normalized_headers = {str(k).lower(): v for k, v in raw_request_headers.items()}
+                else:
+                    normalized_headers = {}
+                marker_value = normalized_headers.get(RECOVERY_MARKER_HEADER)
                 try:
                     monitor = self._network_egress_monitor
                     authorized = monitor is not None and monitor.authorize_request(
@@ -2066,13 +2227,45 @@ class CDPDownloadInterceptor:
                         error_reason="BlockedByClient",
                     )
                     return
-                await cdp_session.send("Fetch.continueRequest", {"requestId": request_id})
+                redirected_request_id = event.get("redirectedRequestId")
+                marked_recovery = marker_value is not None and marker_value in self._active_recovery_markers
+                if redirected_request_id is not None and marked_recovery:
+                    await self._fail_request(cdp_session, request_id, error_reason="BlockedByClient")
+                    return
+                if marker_value is not None and not marked_recovery:
+                    await self._fail_request(cdp_session, request_id, error_reason="BlockedByClient")
+                    return
+                continue_params: dict[str, Any] = {"requestId": request_id}
+                if marker_value is not None:
+                    header_items = (
+                        raw_request_headers.items()
+                        if isinstance(raw_request_headers, dict)
+                        else ((h.get("name"), h.get("value")) for h in raw_request_headers if isinstance(h, dict))
+                    )
+                    continue_params["headers"] = [
+                        {"name": str(name), "value": str(value)}
+                        for name, value in header_items
+                        if str(name).lower() != RECOVERY_MARKER_HEADER
+                    ]
+                    if not self._register_recovery_request(cdp_session, request_id, marker_value):
+                        await self._fail_request(cdp_session, request_id, error_reason="BlockedByClient")
+                        return
+                try:
+                    await cdp_session.send("Fetch.continueRequest", continue_params)
+                except Exception:
+                    self._discard_recovery_request(cdp_session, request_id)
+                    raise
                 return
 
             # Response stage: check for downloads
             raw_response_headers = event.get("responseHeaders", [])
             response_headers = _parse_headers(raw_response_headers)
             resource_type = event.get("resourceType", "")
+            recovery_key = (cdp_session, request_id)
+            recovery_marker = self._recovery_request_ids.get(recovery_key)
+            marked_recovery = recovery_marker is not None
+            if marked_recovery:
+                self._discard_recovery_request(cdp_session, request_id)
 
             LOG.debug(
                 "CDP Fetch response paused",
@@ -2082,7 +2275,12 @@ class CDPDownloadInterceptor:
                 content_disposition=response_headers.get("content-disposition", ""),
             )
 
-            if is_download_response(response_headers, response_status, resource_type):
+            if marked_recovery:
+                if 300 <= int(response_status) < 400:
+                    await self._fail_request(cdp_session, request_id, error_reason="BlockedByClient")
+                else:
+                    await self._continue_response(cdp_session, request_id)
+            elif is_download_response(response_headers, response_status, resource_type):
                 LOG.info(
                     "CDP download response detected",
                     resource_type=resource_type,
