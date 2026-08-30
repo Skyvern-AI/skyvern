@@ -1025,8 +1025,26 @@ class _TypeaheadFakePage:
             }
         if "noSuggestionList" in js:
             return self._committed
+        if "fromFocus" in js:
+            # _SUGG_ROW_INFO_JS: read back the row _FIND_SUGGESTION_JS tagged data-tv3-sugg="N" once the
+            # caller has picked it. This fake only ever models a single reacting row (n=1).
+            if not self._suggestion:
+                return None
+            return {"text": self._suggestion.get("text"), "fromFocus": False, "declared": []}
+        if "(arg && arg.attr)" in js:
+            # _MENU_OPTION_TEXTS_JS: the full-length read of every tagged row.
+            if not self._suggestion:
+                return []
+            return [{"n": 1, "text": self._suggestion.get("text"), "nav": False, "setsize": 0}]
+        if "if (fieldOwnPopup(field, false)) return true;" in js:
+            # _FIELD_DECLARES_LIST_JS. This fake models an ARIA combobox: it declares its own list.
+            return True
         if "data-tv3-sugg" in js:
-            return self._suggestion
+            # _FIND_SUGGESTION_JS: {count, options} over every reacting row — this fake only
+            # ever models a single reacting row, tagged data-tv3-sugg="1", in a list the field declares.
+            if self._suggestion is None:
+                return None
+            return {"count": 1, "options": [{"n": 1, "text": self._suggestion.get("text")}], "declared": True}
         # The typeable-vs-open-list gate the shared commit path runs before typing. This fake models a
         # real typeahead <input>, so it is typeable unless its field type is one an <input> cannot type
         # into — mirroring _ANCHOR_TYPEABLE_JS's NONTEXT set.
@@ -1094,7 +1112,7 @@ async def test_type_auto_commits_reacting_typeahead(monkeypatch: pytest.MonkeyPa
         committed="San Francisco, CA, USA",
     )
     tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "type").handler({"selector": "#location-input", "text": "San Francisco, California"})
+    r = await _tool(tools, "type").handler({"selector": "#location-input", "text": "San Francisco, CA, USA"})
     assert r.status == "ok"
     assert "San Francisco, CA, USA" in r.content  # the value the widget committed (normalized), not raw text
     assert page.clicked_suggestion  # it clicked the tagged suggestion rather than leaving typed text
@@ -1136,7 +1154,7 @@ async def test_select_combobox_commits_reacting_suggestion(monkeypatch: pytest.M
         field_type="text", suggestion={"text": "San Francisco, CA, USA", "score": 2}, committed="San Francisco, CA, USA"
     )
     tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
+    r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, CA, USA"})
     assert r.status == "ok" and "San Francisco, CA, USA" in r.content
     assert page.clicked_suggestion
 
@@ -1345,9 +1363,10 @@ async def _snapshot_react_find(page: Any, inject_js: str) -> Any:
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_finder_picks_row_over_container_and_ignores_static_text() -> None:
-    # A dropdown container holding two rows appears under the field IN REACTION to typing. The finder must
-    # (a) ignore the pre-existing static text that outscores the rows, and (b) tag the matching ROW — not
-    # the container (whose center-click would land on the wrong row: "San Francisco" -> "San Jose").
+    # A dropdown container holding two rows appears under the field IN REACTION to typing, neither row
+    # declared by the widget. The finder must (a) ignore the pre-existing static text that outscores both
+    # rows, and (b) tag the higher-scoring ROW itself -- not the container (whose center-click would land
+    # on an arbitrary row).
     inject = """() => {
       const c = document.createElement('div');
       c.id = 'dd'; c.setAttribute('style', 'position:absolute;top:132px;left:40px;width:300px');
@@ -1360,9 +1379,12 @@ async def test_finder_picks_row_over_container_and_ignores_static_text() -> None
     }"""
     async with _finder_page() as page:
         found = await _snapshot_react_find(page, inject)
-        assert found is not None and found["text"] == "San Francisco, CA, USA"
+        assert found is not None and found["count"] == 1
+        assert found["options"][0]["text"] == "San Francisco, CA, USA"
         tagged = await page.eval_on_selector_all("[data-tv3-sugg]", "els => els.map(e => e.textContent.trim())")
-        assert tagged == ["San Francisco, CA, USA"]  # exactly one tag, on the row (not the container)
+        # Only the higher-scoring row is tagged -- neither the container, the lower-scoring sibling, nor
+        # the static text.
+        assert tagged == ["San Francisco, CA, USA"]
         static_tagged = await page.eval_on_selector("#static-distractor", "e => e.hasAttribute('data-tv3-sugg')")
         assert static_tagged is False  # pre-existing text excluded despite its higher token score
 
@@ -7441,10 +7463,19 @@ class _AliasTypeaheadPage(_FakeAliasPage):
         return "text"
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
+        # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), and the
+        # row-info read is a second probe over the same tag.
         if "noSuggestionList" in js:
             return self._committed
+        if "(arg && arg.attr)" in js:
+            # _MENU_OPTION_TEXTS_JS: the full-length read of every tagged row.
+            return [{"n": 1, "text": self._suggestion_text, "nav": False, "setsize": 0}]
+        if "fromFocus" in js:
+            # _SUGG_ROW_INFO_JS: the picked row's declared values and how it was revealed.
+            return {"text": self._suggestion_text, "fromFocus": False, "declared": []}
         if "data-tv3-sugg" in js:
-            return {"text": self._suggestion_text, "score": 2}
+            # _FIND_SUGGESTION_JS: {count, options} over every reacting row; this fake models one.
+            return {"count": 1, "options": [{"n": 1, "text": self._suggestion_text}]}
         if "isContentEditable" in js:
             return True
         if "'unprobeable'" in js:
@@ -9066,6 +9097,107 @@ async def test_a_page_that_moves_the_suggestion_stamp_onto_a_link_cannot_redirec
         r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Iowa City"})
         assert not page.url.endswith("#hijacked"), page.url
         assert r.status == "error", r.content
+
+
+# isNavRow is inert once a row declares role=option, so the decoy here wraps a link under an option
+# role -- the same hijack, but onto a shape the click-time guard used to wave through unchecked.
+_SUGGESTION_STAMP_HIJACK_TO_OPTION_DECOY_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="city" type="text" autocomplete="off"
+         style="position:absolute;top:40px;left:40px;width:260px;height:24px">
+  <script>
+    var inp = document.getElementById('city');
+    inp.addEventListener('input', function () {
+      var old = document.getElementById('dd');
+      if (old) old.remove();
+      if (!inp.value) return;
+      var dd = document.createElement('div');
+      dd.id = 'dd';
+      dd.setAttribute('role', 'listbox');
+      dd.setAttribute('style', 'position:absolute;top:70px;left:40px;width:260px;background:#fff');
+      var row = document.createElement('div');
+      row.setAttribute('role', 'option');
+      row.setAttribute('style', 'height:22px;display:block');
+      row.textContent = 'Iowa City';
+      var decoy = document.createElement('li');
+      decoy.setAttribute('role', 'option');
+      decoy.setAttribute('style', 'height:22px;display:block;list-style:none');
+      var nav = document.createElement('a');
+      nav.href = '#hijacked';
+      nav.setAttribute('style', 'height:22px;display:block');
+      nav.textContent = 'Iowa City';
+      decoy.appendChild(nav);
+      dd.appendChild(row);
+      dd.appendChild(decoy);
+      document.body.appendChild(dd);
+      new MutationObserver(function () {
+        if (row.hasAttribute('data-tv3-sugg')) {
+          row.removeAttribute('data-tv3-sugg');
+          decoy.setAttribute('data-tv3-sugg', '1');
+        }
+      }).observe(row, { attributes: true });
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_that_moves_the_stamp_onto_an_option_decoy_wrapping_a_link_cannot_redirect_the_click() -> None:
+    async with _live_page(_SUGGESTION_STAMP_HIJACK_TO_OPTION_DECOY_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Iowa City"})
+        assert not page.url.endswith("#hijacked"), page.url
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") != "Iowa City", r.content
+
+
+# A <button> with no type attribute defaults to a form submit -- role=option does not change that.
+_TYPELESS_SUBMIT_OPTION_ROW_IN_FORM_HTML = """
+<!doctype html><html><body style="margin:0">
+<form id="f" action="#gone">
+  <input id="city" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="city-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+</form>
+<script>
+  window.__submitted = false;
+  document.getElementById('f').addEventListener('submit', function (e) {
+    e.preventDefault();
+    window.__submitted = true;
+  });
+  var input = document.getElementById('city');
+  var list = document.getElementById('city-list');
+  input.addEventListener('input', function () {
+    list.innerHTML = '';
+    if (!input.value.trim()) return;
+    var row = document.createElement('button');
+    row.setAttribute('role', 'option');
+    row.style.cssText = 'display:block;width:100%;height:24px;text-align:left';
+    row.textContent = 'Springfield';
+    row.addEventListener('click', function () {
+      input.value = 'Springfield';
+      input.setAttribute('data-committed', 'Springfield');
+      list.innerHTML = '';
+    });
+    list.appendChild(row);
+  });
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_never_clicks_a_typeless_button_option_row_inside_a_form() -> None:
+    async with _live_page(_TYPELESS_SUBMIT_OPTION_ROW_IN_FORM_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Springfield"})
+        assert await page.evaluate("() => window.__submitted") is False, r.content
+        assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None, r.content
+        assert await page.eval_on_selector_all("[data-tv3-sugg]", "els => els.length") == 0, r.content
 
 
 _GROUPED_LISTBOX_FIXTURE_HTML = """
@@ -15861,6 +15993,199 @@ async def test_select_combobox_commits_non_virtualized_button_listbox_control() 
         assert value == "Germany", value
 
 
+# --- A cascading-address lookup. Three role="combobox" fields (#state, #city, #postal) each own a
+# role="grid" popup of role="row" > role="gridcell" rows -- the ARIA 1.2 grid-combobox pattern, not the
+# role="listbox"/role="option" shape every other fixture in this file uses -- and each row wraps the
+# matched leading run in its own <span class="highlight">, sibling to the rest of the label. Clicking a
+# row commits its FULL text to data-committed but writes only the LEADING CLAUSE into the input's
+# visible value for #city/#postal, so the input never round-trips the disambiguating suffix. #city and
+# #postal filter server-search style: a query holding a comma always renders zero rows. ---
+
+_ADDRESS_LOOKUP_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="state" role="combobox" aria-autocomplete="list" aria-haspopup="grid" aria-controls="state-listbox"
+         type="text" autocomplete="off" style="position:absolute;top:20px;left:20px;width:220px;height:24px">
+  <button id="state-toggle-button" type="button">v</button>
+  <div id="state-listbox" role="grid"
+       style="position:absolute;top:50px;left:20px;width:220px;background:#fff;display:none"></div>
+
+  <input id="city" role="combobox" aria-autocomplete="list" aria-haspopup="grid" aria-controls="city-listbox"
+         type="text" autocomplete="off" style="position:absolute;top:110px;left:20px;width:220px;height:24px">
+  <button id="city-toggle-button" type="button">v</button>
+  <div id="city-listbox" role="grid"
+       style="position:absolute;top:140px;left:20px;width:220px;background:#fff;display:none"></div>
+
+  <input id="postal" role="combobox" aria-autocomplete="list" aria-haspopup="grid" aria-controls="postal-listbox"
+         type="text" autocomplete="off" style="position:absolute;top:200px;left:20px;width:220px;height:24px">
+  <button id="postal-toggle-button" type="button">v</button>
+  <div id="postal-listbox" role="grid"
+       style="position:absolute;top:230px;left:20px;width:220px;background:#fff;display:none"></div>
+
+  <input id="citytr" role="combobox" aria-autocomplete="list" aria-haspopup="grid" aria-controls="citytr-listbox"
+         type="text" autocomplete="off" style="position:absolute;top:290px;left:20px;width:220px;height:24px">
+  <div id="citytr-listbox" role="grid"
+       style="position:absolute;top:320px;left:20px;width:220px;background:#fff;display:none"></div>
+
+  <script>
+    var STATE_OPTIONS = ['CA', 'IL', 'IN', 'IA', 'NY'];
+    var CITY_ALL = [
+      'Springfield Center, Otsego, NY',
+      'Springfield Gardens, Queens, NY',
+      'Springfield, Aiken, SC',
+      'Springfield, Baca, CO',
+      'Springfield, Sangamon, IL',
+      'Springfield, Clark, OH',
+      'Shelbyville, Sango, TN'
+    ];
+    var POSTAL_BY_CITY = {
+      'Springfield, Sangamon, IL': [
+        '62701, Springfield, Sangamon, IL',
+        '62702, Springfield, Sangamon, IL',
+        '62703, Springfield, Sangamon, IL',
+        '62704, Springfield, Sangamon, IL',
+        '62705, Springfield, Sangamon, IL'
+      ]
+    };
+
+    function committedOf(id) {
+      var el = document.getElementById(id);
+      return el ? (el.getAttribute('data-committed') || '') : '';
+    }
+
+    function rowsFor(fieldId, query) {
+      // Server-search semantics: a query holding a comma never matches (the real widget would issue a
+      // fresh server lookup keyed on the whole string, which none of these fixtures' vocabulary hits).
+      if (query.indexOf(',') >= 0) return [];
+      var q = query.toLowerCase();
+      if (fieldId === 'state') {
+        return STATE_OPTIONS.filter(function (o) { return o.toLowerCase().indexOf(q) === 0; });
+      }
+      if (fieldId === 'city' || fieldId === 'citytr') {
+        var state = committedOf('state');
+        var pool = CITY_ALL.filter(function (c) { return c.toLowerCase().indexOf(q) === 0; });
+        if (state) pool = pool.filter(function (c) { return c.slice(-(state.length + 2)) === ', ' + state; });
+        return pool;
+      }
+      if (fieldId === 'postal') {
+        var city = committedOf('city');
+        var pool = POSTAL_BY_CITY[city] || [];
+        return pool.filter(function (p) { return p.toLowerCase().indexOf(q) === 0; });
+      }
+      return [];
+    }
+
+    function makeCombobox(fieldId, fullTextValue, transientCommaRow) {
+      var input = document.getElementById(fieldId);
+      var listbox = document.getElementById(fieldId + '-listbox');
+      var timer = null;
+
+      function commitClause(text) {
+        if (fullTextValue) return text;
+        var idx = text.indexOf(',');
+        return idx === -1 ? text : text.slice(0, idx);
+      }
+
+      // The matched leading run is wrapped in its own <span class="highlight">, SIBLING to a span
+      // holding the rest of the label -- the highlighting shape a real lookup renders, where the
+      // innermost element that overlaps the query carries only the query text back.
+      function paint(cell, text, q) {
+        var container = document.createElement('div');
+        container.className = 'cx-select__list-item-container';
+        var content = document.createElement('span');
+        content.className = 'cx-select__list-item--content';
+        if (q && text.toLowerCase().indexOf(q.toLowerCase()) === 0) {
+          var hi = document.createElement('span');
+          hi.className = 'highlight';
+          hi.textContent = text.slice(0, q.length);
+          content.appendChild(hi);
+          var rest = document.createElement('span');
+          rest.textContent = text.slice(q.length);
+          content.appendChild(rest);
+        } else {
+          var whole = document.createElement('span');
+          whole.textContent = text;
+          content.appendChild(whole);
+        }
+        container.appendChild(content);
+        cell.appendChild(container);
+      }
+
+      function render(rows, q) {
+        listbox.innerHTML = '';
+        if (rows.length === 0) {
+          listbox.setAttribute('role', 'status');
+          listbox.textContent = 'No results were found.';
+        } else {
+          listbox.setAttribute('role', 'grid');
+          rows.forEach(function (text, i) {
+            var row = document.createElement('div');
+            row.setAttribute('role', 'row');
+            var cell = document.createElement('div');
+            cell.setAttribute('role', 'gridcell');
+            cell.id = fieldId + '-listitem-' + i;
+            cell.style.height = '24px';
+            cell.style.display = 'block';
+            paint(cell, text, q);
+            cell.addEventListener('click', function () {
+              input.value = commitClause(text);
+              input.setAttribute('data-committed', text);
+              hide();
+            });
+            row.appendChild(cell);
+            listbox.appendChild(row);
+          });
+        }
+        listbox.style.display = 'block';
+      }
+
+      // Closing UNMOUNTS the rows, as a widget that re-queries on every open does.
+      function hide() {
+        listbox.innerHTML = '';
+        listbox.style.display = 'none';
+      }
+
+      input.addEventListener('focus', function () {
+        if (!input.value) render(rowsFor(fieldId, ''), '');
+      });
+      // A widget still settling paints a row for the whole comma-holding string and then throws it
+      // away when its real answer for that string arrives holding nothing. Keyed on the tag rather
+      // than a timer so the row dies at the same point of the sequence on every run.
+      function renderThenDiscard(text, q) {
+        render([text], q);
+        var obs = new MutationObserver(function (recs) {
+          for (var i = 0; i < recs.length; i++) {
+            if (recs[i].attributeName === 'data-tv3-sugg') { obs.disconnect(); render([], q); return; }
+          }
+        });
+        obs.observe(listbox, {attributes: true, subtree: true});
+      }
+
+      input.addEventListener('input', function () {
+        clearTimeout(timer);
+        var q = input.value;
+        timer = setTimeout(function () {
+          var exact = transientCommaRow && q.indexOf(',') >= 0
+            ? CITY_ALL.filter(function (c) { return c.toLowerCase() === q.toLowerCase(); })
+            : [];
+          if (exact.length) { renderThenDiscard(exact[0], q); return; }
+          render(rowsFor(fieldId, q), q);
+        }, 150);
+      });
+    }
+
+    makeCombobox('state', true);
+    makeCombobox('city', false);
+    makeCombobox('postal', false);
+    makeCombobox('citytr', false, true);
+  </script>
+</body></html>
+"""
+
+
+def _address_lookup_page():
+    return _live_page(_ADDRESS_LOOKUP_FIXTURE_HTML)
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_scroll_search_reaches_exact_row_far_beyond_forty_windows() -> None:
@@ -15916,6 +16241,24 @@ async def test_select_combobox_refuses_duplicate_label_in_virtualized_list() -> 
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_select_combobox_refuses_ambiguous_leading_clause_city_instead_of_committing_first_row() -> None:
+    # With no state committed, "Springfield" reaction-matches six rows that share the "springfield"
+    # token and none of which is exact. Geometry must not decide between them: select_combobox refuses
+    # and names them by their own full text, which is only possible once the tagged unit is the ROW
+    # rather than the highlight span that carries the query back verbatim.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield"})
+        assert r.status == "error", r.content
+        assert "Springfield, Sangamon, IL" in r.content, r.content
+        assert "Springfield, Aiken, SC" in r.content, r.content
+        assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None, (
+            "must not silently commit an ambiguous leading-clause match"
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_select_combobox_refuses_prefix_hit_that_names_two_rows_across_windows() -> None:
     # RED-first (SKY-15216): a forward-prefix value ("Other") is only trusted once the whole list has
     # been walked; if the walk meets the same label in two different windows, that is two rows and the
@@ -15942,6 +16285,36 @@ async def test_select_combobox_refuses_prefix_hit_that_names_two_rows_across_win
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_select_combobox_commits_full_row_text_via_leading_clause_retype() -> None:
+    # The caller supplies the full disambiguated row text, "Springfield, Sangamon, IL",
+    # but this widget's own filter treats any comma-holding query as a server-search miss and renders
+    # zero rows. select_combobox re-asks with the leading clause ("Springfield") to surface the real
+    # candidates, then matches the FULL value exactly among them.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield, Sangamon, IL"})
+        assert r.status == "ok", r.content
+        assert (
+            await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')")
+            == "Springfield, Sangamon, IL"
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_vocabulary_on_no_match() -> None:
+    # "Illinois" matches none of #state's vocabulary (2-letter codes only) -- a genuine no-match, which
+    # must stay an error, but a bare one leaves the caller guessing another label. The field's own rows
+    # have to be named, and this grid pattern's role="gridcell" rows are the only place they live.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Illinois"})
+        assert r.status == "error", r.content
+        assert "IL" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_select_combobox_reports_already_selected_row_as_ok() -> None:
     # RED-first (SKY-15216): on the real widget the wanted country is often the pre-selected default;
     # nothing can change on the click, so the verifier's change test reads it as "did not commit" and
@@ -15956,6 +16329,37 @@ async def test_select_combobox_reports_already_selected_row_as_ok() -> None:
         assert expanded == "false", expanded
         label = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-label')")
         assert label == f"Select country calling code: {current}", label
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_unique_row_after_parent_commit() -> None:
+    # The cascade the refusals above exist to protect: once #state is committed to "IL", "Springfield"
+    # narrows #city to exactly one row, and once #city is committed, "62704" narrows #postal to one row.
+    # A lone reacting row still commits only on its full label -- a word-prefix is refused like any
+    # other non-exact match, so the caller supplies each row's full text.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        state_r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "IL"})
+        assert state_r.status == "ok", state_r.content
+
+        city_r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Sangamon, IL"}
+        )
+        assert city_r.status == "ok", city_r.content
+        assert (
+            await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')")
+            == "Springfield, Sangamon, IL"
+        )
+
+        postal_r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#postal", "value": "62704, Springfield, Sangamon, IL"}
+        )
+        assert postal_r.status == "ok", postal_r.content
+        assert (
+            await page.eval_on_selector("#postal", "el => el.getAttribute('data-committed')")
+            == "62704, Springfield, Sangamon, IL"
+        )
 
 
 @_skip_no_browser
@@ -16001,6 +16405,131 @@ _WRAPPED_INPUT_COMBOBOX_HTML = """
   });
 })();
 </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_single_leading_clause_match_when_unique() -> None:
+    # The middle step of the cascade above on its own: with #state committed to "IL", "Springfield" is
+    # a unique city match -- but only a word-prefix of the row's full label, so it is refused rather
+    # than auto-committed; the caller must supply "Springfield, Sangamon, IL".
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        state_r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "IL"})
+        assert state_r.status == "ok", state_r.content
+
+        city_r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield"})
+        assert city_r.status == "error", city_r.content
+        assert "Springfield, Sangamon, IL" in city_r.content, city_r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_a_reduced_query_row_that_is_not_the_requested_value() -> None:
+    # The looser re-search is a way to make rows APPEAR, not a licence to commit one. "Shelbyville,
+    # WrongCounty, XX" reveals exactly one "Shelbyville, ..." row, and a lone row is unambiguous only
+    # for the query that produced it -- committing it answers a question nobody asked.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Shelbyville, WrongCounty, XX"}
+        )
+        assert r.status == "error", r.content
+        assert "Shelbyville, Sango, TN" in r.content, r.content
+        assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None, (
+            "a row revealed by a looser query must not commit as the requested value"
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_when_the_matched_row_is_rerendered_before_the_click() -> None:
+    # #citytr paints a row for the whole comma-holding string and discards it the instant anything
+    # marks it, which is what a lookup still settling does. A row that was matched but never clicked
+    # is a selection never delivered, not one the field refused -- so the coarser question ("Springfield")
+    # still has to be asked, and its settled list is where the requested row is finally committed.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#citytr", "value": "Springfield, Sangamon, IL"})
+        assert r.status == "ok", r.content
+        assert (
+            await page.eval_on_selector("#citytr", "el => el.getAttribute('data-committed')")
+            == "Springfield, Sangamon, IL"
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "row", "commits"),
+    [
+        # A lone row that IS the request under exact-match canonicalization (case/whitespace only).
+        ("Illinois", "Illinois", True),
+        ("yes", "Yes", True),
+        # A word-prefix of a fuller label is a different, more specific label -- only a whole-label
+        # match ever auto-commits; anything less is refused with the rendered row named.
+        ("Yes", "Yes, I consent", False),
+        ("Decline", "Decline to self-identify", False),
+        ("62704", "62704, Springfield, Sangamon, IL", False),
+        # A normalization no precision tier accepts is a DIFFERENT label, not evidence of the value --
+        # a lone row never commits on inferred meaning, only on what the matcher itself names.
+        ("San Francisco, California", "San Francisco, CA, USA", False),
+        ("Springfield, Sangamon, IL", "Alexander, Sangamon, IL", False),
+        ("Springfield, IL", "Springfield, MA", False),
+        ("Zurich", "Zürich", False),
+        # The shared matcher's singular/plural stem tier is not an exact label either.
+        ("State", "States", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_select_combobox_lone_reacting_row_commits_only_when_it_answers_the_request(
+    monkeypatch: pytest.MonkeyPatch, value: str, row: str, commits: bool
+) -> None:
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(field_type="text", suggestion={"text": row, "score": 2}, committed=row)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": value})
+    if commits:
+        assert r.status == "ok", r.content
+        assert page.clicked_suggestion
+    else:
+        assert r.status == "error", r.content
+        assert row in r.content, r.content
+        assert "NOT filled" in r.content, r.content
+        assert not page.clicked_suggestion, "a row that is not the requested value must not be clicked"
+
+
+# A closed vocabulary of short codes that renders NOTHING for an empty query and nothing on focus:
+# the only question that reveals it is a prefix short enough for one of its own labels to answer.
+_SHORT_CODE_VOCABULARY_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="region" role="combobox" aria-autocomplete="list" aria-controls="region-listbox" value="IL"
+         type="text" autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:28px">
+  <div id="region-listbox" role="listbox" style="position:absolute;top:56px;left:20px;width:300px"></div>
+  <script>
+    var OPTIONS = ['CA', 'IL', 'IN', 'IA', 'NY'];
+    var field = document.getElementById('region');
+    var listbox = document.getElementById('region-listbox');
+    field.addEventListener('input', function () {
+      var q = field.value.trim().toLowerCase();
+      listbox.innerHTML = '';
+      if (!q) return;
+      OPTIONS.filter(function (o) { return o.toLowerCase().indexOf(q) === 0; }).forEach(function (o) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.cssText = 'height:24px';
+        row.textContent = o;
+        row.addEventListener('click', function () {
+          field.value = o;
+          field.setAttribute('data-committed', o);
+          listbox.innerHTML = '';
+        });
+        listbox.appendChild(row);
+      });
+    });
+  </script>
 </body></html>
 """
 
@@ -16084,6 +16613,60 @@ _MULTI_SELECT_HTML = """
   });
 })();
 </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_a_short_code_vocabulary_no_wider_query_can_reveal() -> None:
+    # "Illinois" is absent from this field's vocabulary and neither the whole value, an empty query nor
+    # focus renders a row, so a refusal that names nothing sends the caller back to guess another label.
+    # Two characters is the shortest question the widget answers, and the answer is the label to use.
+    async with _live_page(_SHORT_CODE_VOCABULARY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#region", "value": "Illinois"})
+        assert r.status == "error", r.content
+        assert "'IL'" in r.content, r.content
+        assert await page.eval_on_selector("#region", "el => el.getAttribute('data-committed')") is None, r.content
+
+
+# A search input whose results render as an ARIA data grid -- the same role=grid > role=row >
+# role=gridcell markup a grid-combobox uses. Each cell holds a product link above a price line.
+# __DECLARE__ is how the input points at the grid (nothing, aria-controls, or aria-owns) and __TOP__
+# where the grid renders, so one markup covers both an undeclared results table and a DECLARED region
+# sitting past the dropdown window.
+_RESULTS_GRID_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="q" type="text" autocomplete="off" __DECLARE__
+         style="position:absolute;top:20px;left:20px;width:260px;height:24px">
+  <div id="results" role="grid"
+       style="position:absolute;top:__TOP__px;left:20px;width:260px;background:#fff;display:none"></div>
+  <script>
+    var input = document.getElementById('q');
+    var grid = document.getElementById('results');
+    input.addEventListener('input', function () {
+      grid.innerHTML = '';
+      var row = document.createElement('div');
+      row.setAttribute('role', 'row');
+      var cell = document.createElement('div');
+      cell.setAttribute('role', 'gridcell');
+      cell.style.display = 'block';
+      var link = document.createElement('a');
+      link.href = '#product-1';
+      link.style.display = 'block';
+      link.textContent = 'Espresso Machine Pro';
+      link.addEventListener('click', function () { window.__leftTheForm = true; });
+      var price = document.createElement('div');
+      price.style.display = 'block';
+      price.textContent = '$499.00';
+      cell.appendChild(link);
+      cell.appendChild(price);
+      row.appendChild(cell);
+      grid.appendChild(row);
+      grid.style.display = 'block';
+    });
+  </script>
 </body></html>
 """
 
@@ -16175,6 +16758,15 @@ _CODE_VALUE_LISTBOX_HTML = """
 </script>
 </body></html>
 """
+
+
+def _results_grid_html(declare: str = "", grid_top: int = 56, *, listbox: bool = False) -> str:
+    html = _RESULTS_GRID_FIXTURE_HTML.replace("__DECLARE__", f'{declare}="results"' if declare else "").replace(
+        "__TOP__", str(grid_top)
+    )
+    if listbox:
+        html = html.replace('role="grid"', 'role="listbox"').replace("'gridcell'", "'option'")
+    return html
 
 
 @_skip_no_browser
@@ -16376,6 +16968,70 @@ _AUTO_HIGHLIGHT_LISTBOX_HTML = """
   });
 })();
 </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("declare", "grid_top", "listbox"),
+    [
+        ("", 56, False),
+        ("aria-controls", 56, False),
+        ("aria-controls", 700, False),
+        ("aria-owns", 700, False),
+        ("aria-controls", 56, True),
+        ("aria-controls", 700, True),
+    ],
+    ids=["undeclared", "declared-near", "declared-far", "owned-far", "listbox-near", "listbox-far"],
+)
+async def test_type_never_clicks_a_link_in_a_results_grid(declare: str, grid_top: int, listbox: bool) -> None:
+    # A row whose clickable content is a link is navigational however the field declares it: clicking
+    # one leaves the form for a product page. Declaring the region with aria-controls/aria-owns makes
+    # its gridcells this field's option rows and lifts the distance gate off them, so nothing else is
+    # left standing between a far-below results table and an auto-click -- the link must be. A row that
+    # declares role=option leads exactly as far, near or far, so it is refused on the same rule.
+    async with _live_page(_results_grid_html(declare, grid_top, listbox=listbox)) as page:
+        before = page.url
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#q", "text": "Espresso Machine"})
+        assert page.url == before, r.content
+        assert await page.evaluate("window.__leftTheForm || false") is False, r.content
+        assert await page.eval_on_selector_all("[data-tv3-sugg]", "els => els.length") == 0, r.content
+
+
+# A typeahead that renders every row sharing the typed prefix, ranks them itself, and accepts nothing
+# but a clicked row -- the shape where leaving the raw text behind reads as a filled field.
+_TWO_PREFIX_ROWS_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="addr" role="combobox" aria-autocomplete="list" aria-controls="addr-list" type="text"
+         autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="addr-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    var OPTIONS = ['New York, NY, USA', 'New York Mills, MN, USA'];
+    var input = document.getElementById('addr');
+    var list = document.getElementById('addr-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      var q = input.value.trim().toLowerCase();
+      if (!q) return;
+      OPTIONS.filter(function (o) { return o.toLowerCase().indexOf(q.slice(0, 3)) === 0; })
+        .forEach(function (text) {
+          var row = document.createElement('div');
+          row.setAttribute('role', 'option');
+          row.style.height = '24px';
+          row.textContent = text;
+          row.addEventListener('click', function () {
+            input.value = text;
+            input.setAttribute('data-committed', text);
+            list.innerHTML = '';
+          });
+          list.appendChild(row);
+        });
+    });
+  </script>
 </body></html>
 """
 
@@ -16679,6 +17335,143 @@ _HASPOPUP_MENU_HTML = """
 </script>
 </body></html>
 """
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reports_the_rows_when_a_typeahead_leaves_the_pick_undecided() -> None:
+    # Two rows react to "New York" and neither is the value, so the pick refuses -- and this widget
+    # keeps nothing a click did not put there. Reporting "typed into #addr" would name a field that
+    # holds text the widget will discard, so the rows have to be named instead and the pick handed on.
+    async with _live_page(_TWO_PREFIX_ROWS_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#addr", "text": "New York"})
+        assert r.status == "error", r.content
+        assert "New York, NY, USA" in r.content, r.content
+        assert "New York Mills, MN, USA" in r.content, r.content
+        assert "select_combobox" in r.content, r.content
+        assert await page.eval_on_selector("#addr", "el => el.getAttribute('data-committed')") is None, r.content
+        # "the field is NOT filled" has to be true of the field too, not just of the widget's model.
+        assert await page.eval_on_selector("#addr", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_ambiguity_puts_back_the_value_the_field_arrived_with() -> None:
+    # The same refusal on a field the page had already answered with "+1": the query must come back
+    # out and the page's own value go back in, or a later read of the form cannot tell a real answer
+    # from text this call typed and the widget never accepted.
+    async with _live_page(_PREFILLED_COUNTRY_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#country", "text": "United States"})
+        assert r.status == "error", r.content
+        assert "United States (+1)" in r.content, r.content
+        assert "United States Minor Outlying Islands (+1)" in r.content, r.content
+        assert await page.eval_on_selector("#country", "el => el.value") == "+1", r.content
+
+
+# A country/dial-code combobox arriving PREFILLED -- the state a refusal must not overwrite.
+_PREFILLED_COUNTRY_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="country" role="combobox" aria-autocomplete="list" aria-controls="country-list" type="text"
+         value="+1" autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="country-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    var OPTIONS = ['United States (+1)', 'United States Minor Outlying Islands (+1)', 'United Kingdom (+44)'];
+    var input = document.getElementById('country');
+    var list = document.getElementById('country-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      var q = input.value.trim().toLowerCase();
+      if (!q) return;
+      OPTIONS.filter(function (o) { return o.toLowerCase().indexOf(q) === 0; }).forEach(function (text) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.height = '24px';
+        row.textContent = text;
+        row.addEventListener('click', function () {
+          input.value = text;
+          input.setAttribute('data-committed', text);
+          list.innerHTML = '';
+        });
+        list.appendChild(row);
+      });
+    });
+  </script>
+</body></html>
+"""
+
+# A virtualized declared list: it renders only these 5 rows but marks each with aria-setsize="40",
+# declaring 40 total. Only "Springfield, Clark, OH" starts with the bare word "Springfield" -- the
+# other 4 merely contain it, so a forward-prefix match on "Springfield" would otherwise be unique.
+_VIRTUALIZED_DECLARED_TYPEAHEAD_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="city" role="combobox" aria-autocomplete="list" aria-controls="city-list" type="text"
+         autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="city-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    var OPTIONS = [
+      'Springfield, Clark, OH', 'East Springfield, Clark, OH', 'North Springfield, Clark, OH',
+      'South Springfield, Clark, OH', 'West Springfield, Clark, OH'
+    ];
+    var input = document.getElementById('city');
+    var list = document.getElementById('city-list');
+    input.addEventListener('input', function () {
+      list.innerHTML = '';
+      if (!input.value.trim()) return;
+      OPTIONS.forEach(function (text) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-setsize', '40');
+        row.style.height = '24px';
+        row.textContent = text;
+        row.addEventListener('click', function () {
+          input.value = text;
+          input.setAttribute('data-committed', text);
+          list.innerHTML = '';
+        });
+        list.appendChild(row);
+      });
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_declared_typeahead_under_partial_coverage_commits_only_an_exact_row() -> None:
+    # RED (SKY-15216): the list declares 40 rows (aria-setsize) but only renders 5. A forward-prefix
+    # hit over that window could be committing a duplicate-label twin sitting off-window, so only a row
+    # whose FULL label was typed may commit while the window is known to be partial.
+    async with _live_page(_VIRTUALIZED_DECLARED_TYPEAHEAD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        prefix = await _tool(tools, "type").handler({"selector": "#city", "text": "Springfield"})
+        assert prefix.status == "error", prefix.content
+        assert "East Springfield, Clark, OH" in prefix.content, prefix.content
+        assert "declares 40" in prefix.content and "5 are rendered" in prefix.content, prefix.content
+        assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None
+
+    async with _live_page(_VIRTUALIZED_DECLARED_TYPEAHEAD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        exact = await _tool(tools, "type").handler({"selector": "#city", "text": "Springfield, Clark, OH"})
+        assert exact.status == "ok", exact.content
+        committed = await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')")
+        assert committed == "Springfield, Clark, OH", exact.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_auto_clicks_an_action_menu_item() -> None:
+    # A role=menu of menuitems is a command list, not a value list: select_combobox on its trigger must
+    # refuse to click "Delete" however well it matches -- the pick path treats menuitems as navigational.
+    async with _content_page(_HASPOPUP_MENU_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#act", "value": "Delete"})
+        assert r.status == "error", r.content
+        assert await page.evaluate("() => window.__deleteClicked === true") is False
 
 
 @_skip_no_browser
@@ -17244,3 +18037,405 @@ async def test_click_on_a_container_wrapping_a_checkbox_and_a_button_gets_no_rea
         assert "did NOT commit" not in r.content, r.content
         assert await page.evaluate("() => window.__rowClicks") == 1
         assert await page.eval_on_selector("#cb-row", "el => el.checked") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_ambiguity_puts_back_the_value_the_field_arrived_with() -> None:
+    # "United States" matches two rows, so the pick refuses. The field arrived holding "+1" -- a value
+    # the page put there -- and the refusal must hand it back: leaving the query behind replaces a real
+    # answer with text the widget never accepted, and a later read of the form cannot tell the two apart.
+    async with _live_page(_PREFILLED_COUNTRY_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#country", "value": "United States"})
+        assert r.status == "error", r.content
+        assert "United States (+1)" in r.content, r.content
+        assert "United States Minor Outlying Islands (+1)" in r.content, r.content
+        assert await page.eval_on_selector("#country", "el => el.value") == "+1", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_no_match_puts_back_the_value_the_cascade_filled() -> None:
+    # The cascade already answered this field with "IL"; "Illinois" is not in its vocabulary. The
+    # no-match error names what the field does offer, and the field goes back to the code it held --
+    # otherwise a correct cascade answer is destroyed by the very call that failed to change it.
+    async with _address_lookup_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.eval_on_selector("#state", "el => { el.value = 'IL'; }")
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Illinois"})
+        assert r.status == "error", r.content
+        assert "'IL'" in r.content, r.content
+        assert await page.eval_on_selector("#state", "el => el.value") == "IL", r.content
+
+
+# A closed-vocabulary picker: three fixed options, filtered in the page, no server search of any kind.
+_FIXED_VOCABULARY_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="pick" role="combobox" aria-autocomplete="list" aria-controls="pick-list" type="text"
+         autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="pick-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff;display:none"></div>
+  <script>
+    var OPTIONS = ['Man', 'Woman', 'Prefer not to say'];
+    var input = document.getElementById('pick');
+    var list = document.getElementById('pick-list');
+    var live = {};
+    window.__pickRowsMade = 0;
+    function make(text) {
+      var row = document.createElement('div');
+      row.setAttribute('role', 'option');
+      row.style.height = '24px';
+      row.textContent = text;
+      row.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      row.addEventListener('click', function () {
+        input.value = text;
+        input.setAttribute('data-committed', text);
+        list.innerHTML = '';
+        list.style.display = 'none';
+      });
+      window.__pickRowsMade++;
+      return row;
+    }
+    // Keyed reconciliation, as a react-style select does it: a row that still matches keeps its DOM
+    // node, so the rows a refused call leaves open are the same nodes the next call has to pick from.
+    function render(q) {
+      OPTIONS.forEach(function (text) {
+        if (text.toLowerCase().indexOf(q.toLowerCase()) === 0) {
+          live[text] = live[text] || make(text);
+          list.appendChild(live[text]);
+        } else if (live[text]) {
+          live[text].remove();
+          delete live[text];
+        }
+      });
+      list.style.display = 'block';
+    }
+    input.addEventListener('focus', function () { render(''); });
+    input.addEventListener('input', function () { render(input.value); });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_a_closed_vocabulary_then_commits_the_label_it_named() -> None:
+    # A fixed three-option picker has no looser question to ask: a phrasing outside its vocabulary can
+    # only be answered by naming the vocabulary. The error has to carry all three labels, and calling
+    # again with one of them verbatim has to commit -- an offer nothing can act on is not a recovery.
+    async with _live_page(_FIXED_VOCABULARY_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        miss = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": "I do not want to answer"})
+        assert miss.status == "error", miss.content
+        for label in ("Man", "Woman", "Prefer not to say"):
+            assert repr(label) in miss.content, miss.content
+        assert await page.eval_on_selector("#pick", "el => el.getAttribute('data-committed')") is None, miss.content
+
+        # The refusal left this widget's own list open holding the very rows it opened with, so the
+        # retry has to pick one of THOSE -- it will never see a row appear in reaction to its keystrokes.
+        made_before_retry = await page.evaluate("() => window.__pickRowsMade")
+        assert await page.eval_on_selector("#pick-list", "el => el.querySelectorAll('[role=option]').length") == 3
+        hit = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": "Prefer not to say"})
+        assert hit.status == "ok", hit.content
+        assert await page.evaluate("() => window.__pickRowsMade") == made_before_retry, hit.content
+        assert await page.eval_on_selector("#pick", "el => el.getAttribute('data-committed')") == "Prefer not to say", (
+            hit.content
+        )
+
+
+# One widget, one row shape per case: an input whose dropdown renders whatever row markup the case
+# names, so the whole "may this row be auto-clicked" classification reads as a table.
+#
+#   row shape                                          | expectation
+#   ---------------------------------------------------|--------------------------------------------
+#   role=option                                        | a pick, whatever it wraps
+#   role=gridcell, field DECLARES a grid popup         | a pick (the ARIA 1.2 grid-combobox pattern)
+#   every other shape below (nothing declares its rows)| unchanged from main -- the recorded tuple
+#
+# The roleless rows are a REGRESSION table, not a rule table: reconstructing a row nothing declared
+# never converged, so those fields keep the behaviour they had, wart for wart (a row wrapping a link
+# is still clicked; a two-line row is still refused). Each tuple was recorded once by running that
+# fixture against origin/main; changing one means the undeclared path moved.
+_ROW_SHAPE_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+__FORM_OPEN__
+<label for="q">City</label>
+<input id="q" type="text" autocomplete="off" __FIELD__
+       style="position:absolute;top:100px;left:40px;width:340px;height:26px">
+<div id="dd" __LIST__ style="position:absolute;top:__TOP__px;left:40px;width:340px;background:#fff"></div>
+__FORM_CLOSE__
+<script>
+window.__leftTheForm = false;
+window.__submitted = false;
+var DATA = __DATA__;
+var input = document.getElementById('q');
+var dd = document.getElementById('dd');
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  dd.innerHTML = '';
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+    var wrap = document.createElement('div');
+    wrap.innerHTML = __ROW__;
+    var row = wrap.firstElementChild;
+    row.addEventListener('click', function () {
+      input.value = d;
+      input.setAttribute('data-committed', d);
+      dd.innerHTML = '';
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+    });
+    row.querySelectorAll('a[href]').forEach(function (a) {
+      a.addEventListener('click', function (e) { e.preventDefault(); window.__leftTheForm = true; });
+    });
+    dd.appendChild(row);
+  });
+});
+Array.prototype.forEach.call(document.querySelectorAll('form'), function (f) {
+  f.addEventListener('submit', function (e) { e.preventDefault(); window.__submitted = true; });
+});
+</script>
+</body></html>
+"""
+
+_ROW_SHAPE_DATA = "['Springfield, Sangamon, IL', 'Springfield, Clark, OH', 'Chicago, Cook, IL']"
+_ROW_SHAPE_TARGET = "Springfield, Sangamon, IL"
+
+# (status, content, data-committed, field value, url, __leftTheForm, __submitted)
+_MainOutcome = tuple[str, str, str | None, str, str, bool, bool]
+
+
+def _main_picked(row: str, committed: str = _ROW_SHAPE_TARGET, *, left_the_form: bool = False) -> _MainOutcome:
+    return (
+        "ok",
+        f"typed into #q; it is a typeahead \u2014 selected {row!r} (committed value: {committed!r})",
+        committed,
+        committed,
+        "about:blank",
+        left_the_form,
+        False,
+    )
+
+
+_MAIN_TYPED_ONLY: _MainOutcome = ("ok", "typed into #q", None, _ROW_SHAPE_TARGET, "about:blank", False, False)
+
+_ROW_SHAPES: dict[str, tuple[str, dict[str, Any], str | _MainOutcome]] = {
+    "role-option": ("'<div role=\"option\" style=\"height:24px;background:#eee\">' + d + '</div>'", {}, "pick"),
+    "gridcell-declared": (
+        '\'<div role="row"><div role="gridcell" style="height:24px;background:#eee">\' + d + \'</div></div>\'',
+        {"field": 'aria-controls="dd"', "list": 'role="grid"', "top": 700},
+        "pick",
+    ),
+    # Below here nothing declares a row, so the expectation is whatever main does with it.
+    "gridcell-undeclared": (
+        '\'<div role="row"><div role="gridcell" style="height:24px;background:#eee">\' + d + \'</div></div>\'',
+        {"list": 'role="grid"', "top": 700},
+        _MAIN_TYPED_ONLY,
+    ),
+    "split-label": (
+        '\'<div style="height:24px;line-height:24px;background:#eee;white-space:nowrap">'
+        "<span><b>' + d.slice(0, 6) + '</b>' + d.slice(6, d.indexOf(',')) + '</span>"
+        "<span>' + d.slice(d.indexOf(',')) + '</span></div>'",
+        {},
+        _main_picked("Springfield"),
+    ),
+    "two-split-rows": (
+        '\'<div style="height:24px;line-height:24px;background:#eee;white-space:nowrap">'
+        "<span><b>' + d.slice(0, 6) + '</b>' + d.slice(6, d.indexOf(',')) + '</span>"
+        "<span>' + d.slice(d.indexOf(',')) + '</span></div>'",
+        {"typed": "Springfield"},
+        _main_picked("Springfield"),
+    ),
+    "button-row": (
+        '\'<li style="height:24px;background:#eee;list-style:none">'
+        '<button type="button" style="width:100%;height:24px;text-align:left">\' + d + \'</button></li>\'',
+        {},
+        _main_picked(_ROW_SHAPE_TARGET),
+    ),
+    "link-row": (
+        '\'<li style="height:24px;background:#eee;list-style:none">'
+        '<a href="#product" style="display:block;height:24px">\' + d + \'</a></li>\'',
+        {},
+        _main_picked(_ROW_SHAPE_TARGET, left_the_form=True),
+    ),
+    "submit-row": (
+        '\'<li style="height:24px;background:#eee;list-style:none">'
+        '<button type="submit" style="width:100%;height:24px;text-align:left">\' + d + \'</button></li>\'',
+        {"form": True},
+        _main_picked(_ROW_SHAPE_TARGET),
+    ),
+    "typeless-button-in-form-row": (
+        '\'<li style="height:24px;background:#eee;list-style:none">'
+        "<button style=\"width:100%;height:24px;text-align:left\">' + d + '</button></li>'",
+        {"form": True},
+        _main_picked(_ROW_SHAPE_TARGET),
+    ),
+    "decorative-button-row": (
+        "'<div style=\"height:24px;line-height:24px;background:#eee;position:relative\">' + d +"
+        ' \'<button type="button" aria-label="Remove"'
+        ' style="position:absolute;right:2px;top:4px;width:16px;height:16px"></button></div>\'',
+        {},
+        _main_picked(_ROW_SHAPE_TARGET),
+    ),
+    "hidden-button-row": (
+        "'<div style=\"height:24px;line-height:24px;background:#eee;position:relative\">' + d +"
+        ' \'<button type="button" aria-label="Remove" style="display:none"></button></div>\'',
+        {},
+        _main_picked(_ROW_SHAPE_TARGET),
+    ),
+    "role-button-row": (
+        '\'<div role="button" tabindex="0" style="height:24px;line-height:24px;background:#eee">\' + d + \'</div>\'',
+        {},
+        _main_picked(_ROW_SHAPE_TARGET),
+    ),
+    # Rows laid out HORIZONTALLY, one line, no vertical gap between them to read as a boundary.
+    "chip-strip": (
+        "'<span style=\"display:inline-block;height:24px;line-height:24px;background:#eee;margin-right:6px\">'"
+        " + d + '</span>'",
+        {"data": "['Indiana', 'Indianapolis', 'Indiana Dunes']", "typed": "Indiana"},
+        _main_picked("Indiana", "Indiana"),
+    ),
+    # One row whose own label occupies two stacked lines: city, then county and state under it.
+    "stacked-label": (
+        '\'<div style="height:40px;background:#eee">'
+        "<div style=\"height:20px;line-height:20px\">' + d.slice(0, d.indexOf(',')) + '</div>"
+        "<div style=\"height:20px;line-height:20px;font-size:11px\">' + d.slice(d.indexOf(',') + 2) + '</div>"
+        "</div>'",
+        {},
+        _main_picked("Springfield"),
+    ),
+    # One line, two font sizes: the spans sit on different tops even though a reader sees one row.
+    "mixed-font": (
+        '\'<div style="height:26px;line-height:26px;background:#eee;white-space:nowrap">'
+        "<span style=\"font-size:17px\">' + d.slice(0, d.indexOf(',')) + '</span>"
+        "<span style=\"font-size:10px\">' + d.slice(d.indexOf(',')) + '</span></div>'",
+        {},
+        _main_picked(", Sangamon, IL"),
+    ),
+}
+
+
+def _row_shape_html(row_js: str, opts: dict[str, Any]) -> str:
+    form = bool(opts.get("form"))
+    return (
+        _ROW_SHAPE_FIXTURE_HTML.replace("__ROW__", row_js)
+        .replace("__DATA__", str(opts.get("data", _ROW_SHAPE_DATA)))
+        .replace("__FIELD__", str(opts.get("field", "")))
+        .replace("__LIST__", str(opts.get("list", "")))
+        .replace("__TOP__", str(opts.get("top", 132)))
+        .replace("__FORM_OPEN__", "<form action='#gone'>" if form else "")
+        .replace("__FORM_CLOSE__", "</form>" if form else "")
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", list(_ROW_SHAPES), ids=list(_ROW_SHAPES))
+async def test_type_row_shape_classification(shape: str) -> None:
+    row_js, opts, outcome = _ROW_SHAPES[shape]
+    typed = str(opts.get("typed", _ROW_SHAPE_TARGET))
+    async with _live_page(_row_shape_html(row_js, opts)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#q", "text": typed})
+        got: _MainOutcome = (
+            r.status,
+            r.content,
+            await page.eval_on_selector("#q", "el => el.getAttribute('data-committed')"),
+            await page.eval_on_selector("#q", "el => el.value"),
+            page.url,
+            await page.evaluate("() => window.__leftTheForm"),
+            await page.evaluate("() => window.__submitted"),
+        )
+        if outcome == "pick":
+            assert r.status == "ok", r.content
+            assert got[2] == _ROW_SHAPE_TARGET, r.content
+        else:
+            assert got == outcome, r.content
+
+
+# A declared grid-combobox (aria-controls -> role=grid of role=gridcell rows) whose row click writes
+# the value back into the input and re-renders its own list OPEN, covering the field below it.
+_DECLARED_LIST_LINGERS_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city">City</label>
+<input id="city" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"
+       aria-haspopup="grid" aria-controls="city-grid" aria-expanded="false"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<div id="city-grid" role="grid"
+     style="position:absolute;top:30px;left:0;width:300px;z-index:1000;background:#fff"></div>
+
+<label for="region">Region</label>
+<input id="region" type="text" style="position:absolute;top:50px;left:0;width:300px;height:26px">
+
+<script>
+var REVERT_ON_ESCAPE = __REVERT__;
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city');
+var grid = document.getElementById('city-grid');
+
+function renderRows() {
+  var q = input.value.trim().toLowerCase();
+  grid.innerHTML = '';
+  var rows = q ? DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }) : [];
+  rows.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'row');
+    var cell = document.createElement('div');
+    cell.setAttribute('role', 'gridcell');
+    cell.style.cssText = 'height:60px;background:#eee';
+    cell.textContent = d;
+    cell.addEventListener('click', function () {
+      input.value = d;
+      input.setAttribute('data-committed', d);
+      document.getElementById('region').value = d.split(',')[1].trim();
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+    });
+    row.appendChild(cell);
+    grid.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
+}
+
+input.addEventListener('input', renderRows);
+input.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  if (input.getAttribute('aria-expanded') !== 'true') return;
+  if (REVERT_ON_ESCAPE) { input.value = 'Springfield'; }
+  grid.innerHTML = '';
+  input.setAttribute('aria-expanded', 'false');
+});
+</script>
+</body></html>
+"""
+
+
+def _declared_list_lingers_html(*, revert_on_escape: bool) -> str:
+    return _DECLARED_LIST_LINGERS_HTML.replace("__REVERT__", "true" if revert_on_escape else "false")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "revert_on_escape", [False, True], ids=["closes-and-unblocks-next-field", "escape-reverts-value-is-error"]
+)
+async def test_select_combobox_closes_a_declared_list_a_commit_leaves_open(revert_on_escape: bool) -> None:
+    # A verified OK commit on a declared field must close a list the widget re-opened underneath it,
+    # not leave it covering the next field; a widget that reverts the value on Escape is reported, not
+    # silently accepted.
+    async with _content_page(_declared_list_lingers_html(revert_on_escape=revert_on_escape)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Sangamon, IL"}
+        )
+        if revert_on_escape:
+            assert picked.status == "error", picked.content
+            assert repr("Springfield, Sangamon, IL") in picked.content, picked.content
+            assert repr("Springfield") in picked.content, picked.content
+            return
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#city", "el => el.getAttribute('aria-expanded')") == "false"
+        assert await page.eval_on_selector("#city", "el => el.value") == "Springfield, Sangamon, IL"
+
+        unblocked = await _tool(tools, "type").handler({"selector": "#region", "text": "Sangamon"})
+        assert unblocked.status == "ok", unblocked.content
+        assert "covered by" not in unblocked.content, unblocked.content

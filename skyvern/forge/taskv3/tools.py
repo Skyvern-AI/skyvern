@@ -23,13 +23,16 @@ import unicodedata
 import weakref
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
 
 import structlog
 from PIL import Image, ImageDraw
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
-from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
+from skyvern.core.script_generations.fuzzy_matcher import (
+    match_option_exact_or_stem,
+    match_option_exact_or_stem_with_tier,
+)
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
 from skyvern.forge.taskv3.loop import (
     NAVIGATION_DEAD_END_STATUSES,
@@ -675,6 +678,41 @@ def _canon_label(text: str) -> str:
     return " ".join(folded.replace("\u00a0", " ").split()).casefold()
 
 
+class _TypeaheadPick(NamedTuple):
+    """What one type-and-pick attempt at a typeahead established.
+
+    `clicked` False means a row WAS matched but the click never landed — the widget re-rendered the row
+    out from under it. That is a selection never delivered, not one the field refused, so a caller may
+    still ask the same field a coarser question instead of reporting a dead end. `declared` says the
+    rows came from a list the widget declared; where nothing did, the caller keeps the older path.
+    """
+
+    committed: str | None
+    suggestion: str | None
+    readable: bool
+    candidates: list[dict[str, Any]] | None
+    clicked: bool
+    declared: bool
+    note: str | None = None
+
+
+# The smallest query many closed-vocabulary pickers need before they render candidates. Read by the
+# reduced-query ladder as its last rung, where it may only reveal a vocabulary, never commit one.
+_SHORT_PREFIX_RUNG_CHARS = 2
+
+
+def _match_option_exact(value: str, options: list[dict[str, Any]]) -> int | None:
+    """Pick the row whose WHOLE label IS `value` after canonical cleanup (case/whitespace/apostrophes/
+    Unicode forms/zero-width). No stem, prefix, or other inferred tier is ever accepted here — anything
+    short of that exact match returns None so the caller hands the rows back instead of guessing.
+    """
+    rows = [(o.get("n"), str(o.get("text") or "")) for o in options if isinstance(o.get("n"), int)]
+    if not value or not rows:
+        return None
+    idx, tier = match_option_exact_or_stem_with_tier(_canon_label(value), [_canon_label(label) for _, label in rows])
+    return rows[idx][0] if idx is not None and tier == "exact" else None
+
+
 def _match_menu_option(value: str, options: list[dict[str, Any]]) -> int | None:
     """Pick the enumerated menu row (its data-tv3-menu index) whose label matches the wanted value.
 
@@ -710,6 +748,29 @@ def _match_menu_option(value: str, options: list[dict[str, Any]]) -> int | None:
         return None
     prefixed = [n for n, label in rows if (t := toks(label)) and len(want) < len(t) and t[: len(want)] == want]
     return prefixed[0] if len(prefixed) == 1 else None
+
+
+def _ambiguous_rows_error(
+    selector: str, value: str, rows: list[dict[str, Any]], *, next_step: str, note: str | None = None
+) -> ToolResult:
+    """The refusal owed a caller when rows reacted and none of them IS the requested value.
+
+    Geometry must never break a tie, so the rows are named in list order (≤15) and the pick stays the
+    caller's. One wording for both entry points, so a refusal reported by type() and by select_combobox
+    cannot drift into telling a model two different stories about the same page.
+    """
+    shown = rows[:15]
+    listing = "; ".join(repr(str(o.get("text") or "")[:60]) for o in shown)
+    more = len(rows) - len(shown)
+    lead = (
+        f"{value!r} matches several rows in {selector}: "
+        if len(rows) > 1
+        else f"{value!r} is not the one row showing in {selector}: "
+    )
+    tail = f" ({note})" if note else ""
+    return ToolResult.error(
+        f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
+    )
 
 
 # ARIA combobox signals — used by observe() only to add a hint that a field is a typeahead. This is a
@@ -749,8 +810,8 @@ _WIDGET_ROLES_JS = (
 
 # The subset of those that can be a ROW in an opened menu. Derived rather than restated so the two
 # cannot drift. Excluded: combobox/listbox/spinbutton, which are the control or its container and
-# never one of its rows; and tab, which is navigational -- _FIND_SUGGESTION_JS refuses it for the
-# same reason, and a probe that called a tab strip a menu of options would invite a wrong move.
+# never one of its rows; and tab, because a probe that called a tab strip a menu of options would
+# invite a wrong move.
 _MENU_ROW_ROLES_JS = (
     "new Set(" + _WIDGET_ROLES_JS + ".filter((r) => ['combobox','listbox','spinbutton','tab'].indexOf(r) === -1))"
 )
@@ -914,6 +975,7 @@ _PIERCED_QUERY_JS = (
     pQSA('[data-tv3-focus]').forEach((e) => e.removeAttribute('data-tv3-focus'));
     window.__tv3_focus = new WeakSet();
     window.__tv3_focus_offered = null;
+    window.__tv3_open_own = null;
   };
   // 'body *' has no meaning inside a shadow root, whose own descendants are the equivalent scope.
   const pScopeEach = (fn) => {
@@ -952,10 +1014,17 @@ _PRESNAPSHOT_JS = (
 # near the field, and shares a CONTENT word with the typed value. It keys off reaction + geometry + token
 # overlap — NOT any site's CSS classes, ARIA, or field vocabulary — so a bespoke widget (plain <input> +
 # custom dropdown) is handled like an ARIA combobox and it stays durable as sites restyle. Navigational
-# controls (links/buttons) are excluded unless explicitly role=option. Among matches it picks the
-# INNERMOST row — a candidate that contains another match is a container (its text is the union of all
-# rows, so it ties/outranks any single row; clicking it would land on the wrong row), so it's dropped.
-# Tags the winner with data-tv3-sugg and returns {text, score}, or null if nothing reacted.
+# controls (links/buttons) are excluded unless explicitly role=option. A candidate that CONTAINS another
+# match is a container (its text is the union of all rows), so it's dropped.
+# Two outcomes, split on whether the widget DECLARES its rows. When a surviving leaf sits inside a row
+# the field declares (rowSelFor: role=option, or a gridcell of a grid popup the field itself declares),
+# EVERY such row is promoted, tagged data-tv3-sugg="1..N" top-to-bottom and returned as
+# {count, options, declared: true} — geometry must never break a tie between real options, so the
+# caller's own precision matcher (_match_menu_option) picks, over the full text _MENU_OPTION_TEXTS_JS
+# reads back. Where nothing declares a row, reconstructing one from geometry does not converge, so the
+# finder keeps the single-winner contract instead: highest score, innermost, refusing an ambiguous
+# leading-clause tie and a multi-row container, as {count: 1, options: [the row], declared: false}.
+# Returns null when nothing reacted at all.
 # The ONE definition of "may this row be auto-clicked". Every finder that decides that embeds this
 # snippet: two hand-copied predicates drifted once (menuitem listed as both option and nav, so
 # `<a role=menuitem href>` read as an option and was clicked off the form). Semantics resolve from the
@@ -969,28 +1038,105 @@ _ROW_SEMANTICS_JS = r"""
   const isNavRow = (el) => {
     try { return !composedClosest(el, OPT_SEL) && !!composedClosest(el, NAV_SEL); } catch (e) { return true; }
   };
-  // Which of several lists is THIS field's menu: the one it declares (aria-controls/aria-owns,
-  // resolved in the field's root and its ancestor roots), else the single list within the dropdown
-  // window under or above the field. Size alone would name a sibling list's options as its own.
+  // A control the row only WRAPS reaches the click just as the row's own box does -- but only while
+  // it is rendered. A display:none or visibility:hidden action never receives that click, so it says
+  // nothing about where the row leads.
+  const isShown = (n) => {
+    try {
+      const r = n.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return false;
+      const view = (n.ownerDocument && n.ownerDocument.defaultView) || window;
+      const cs = view.getComputedStyle(n);
+      return cs.visibility !== 'hidden' && cs.display !== 'none';
+    } catch (e) { return true; }
+  };
+  // Clicking a row activates whatever control it WRAPS, so a row holding a link or a submit is as
+  // navigational as one that IS a link. Declaring a row role does not change where the click lands, so
+  // this holds for an option row too. Only the DECLARED-row pick path judges rows this way; every other
+  // finder keeps isNavRow.
+  // A <button> with no type attribute defaults to type=submit, same as an explicit one.
+  const DEPARTURE_SEL =
+    'a[href],[role="link"],[role="menuitem"],[role="tab"],' +
+    'button:not([type="button" i]):not([type="reset" i]),input[type="submit" i],input[type="image" i]';
+  const wrapsDeparture = (el) => {
+    try {
+      if (el.matches(DEPARTURE_SEL) && isShown(el)) return true;
+      for (const n of el.querySelectorAll(DEPARTURE_SEL)) if (isShown(n)) return true;
+      return false;
+    } catch (e) { return true; }
+  };
+  // What the field points at with aria-controls/aria-owns, resolved in its own root and its ancestor
+  // roots (an id lives in exactly one root).
+  const declaredTargets = (field) => {
+    const out = [];
+    if (!field || !field.getAttribute) return out;
+    const ids = [];
+    for (const a of ['aria-controls', 'aria-owns']) {
+      const v = field.getAttribute(a);
+      if (v) for (const id of v.split(/\s+/)) if (id) ids.push(id);
+    }
+    if (!ids.length) return out;
+    for (let root = field.getRootNode(), hops = 0; root && hops < 8; hops++, root = root.host ? root.host.getRootNode() : null) {
+      for (const id of ids) {
+        let target = null;
+        try { target = root.getElementById ? root.getElementById(id) : null; } catch (e) { target = null; }
+        if (target && out.indexOf(target) === -1) out.push(target);
+      }
+      if (!root.host) break;
+    }
+    return out;
+  };
+  // Which rows count as this FIELD's option rows. A role=gridcell is one only when the field declares a
+  // GRID popup (aria-haspopup="grid", or an aria-controls/aria-owns target that is or holds a
+  // role="grid") -- the ARIA 1.2 grid-combobox pattern. Everywhere else a gridcell is a cell of tabular
+  // content, and a link or button inside it stays navigational (isNavRow keeps OPT_SEL, so a
+  // search-results grid is never auto-clicked).
+  const rowSelFor = (field) => {
+    if (!field) return OPT_SEL;
+    let grid = false;
+    try { grid = String(field.getAttribute('aria-haspopup') || '').toLowerCase() === 'grid'; } catch (e) { grid = false; }
+    if (!grid) {
+      for (const t of declaredTargets(field)) {
+        let hit = false;
+        try { hit = t.matches('[role="grid"]') || !!t.querySelector('[role="grid"]'); } catch (e) { hit = false; }
+        if (hit) { grid = true; break; }
+      }
+    }
+    return grid ? OPT_SEL + ',[role="gridcell"]' : OPT_SEL;
+  };
+  // The popup this field DECLARES (aria-controls/aria-owns) AND that is a list of its own: the target
+  // carries a list role and holds no other form control (a declared target wrapping inputs is a panel
+  // or a results region, not this field's menu). `rendered` asks for one that is on screen NOW -- a
+  // declaration still stands while the list sits empty, but a geometry rule may only bend for a box
+  // that actually has one.
+  const fieldOwnPopup = (field, rendered) => {
+    if (!field) return null;
+    for (const t of declaredTargets(field)) {
+      if (pContains(t, field)) continue;
+      let listish = false;
+      try { listish = t.matches('[role="listbox"],[role="grid"],[role="menu"],[role="tree"]'); } catch (e) { listish = false; }
+      if (!listish) continue;
+      let holdsControls = false;
+      try {
+        for (const c of t.querySelectorAll('input,select,textarea')) { if (c !== field) { holdsControls = true; break; } }
+      } catch (e) { holdsControls = true; }
+      if (holdsControls) continue;
+      if (!rendered) return t;
+      let tr = null;
+      try { tr = t.getBoundingClientRect(); } catch (e) { tr = null; }
+      if (tr && tr.width > 0 && tr.height > 0) return t;
+    }
+    return null;
+  };
+  // Which of several lists is THIS field's menu: the one it declares (aria-controls/aria-owns), else
+  // the single list within the dropdown window under or above the field. Size alone would name a
+  // sibling list's options as its own.
   const fieldOwnList = (field, lists) => {
     if (!lists.length) return null;
     if (field) {
-      const ids = [];
-      for (const a of ['aria-controls', 'aria-owns']) {
-        const v = field.getAttribute && field.getAttribute(a);
-        if (v) for (const id of v.split(/\s+/)) if (id) ids.push(id);
-      }
-      if (ids.length) {
-        for (let root = field.getRootNode(), hops = 0; root && hops < 8; hops++, root = root.host ? root.host.getRootNode() : null) {
-          for (const id of ids) {
-            let target = null;
-            try { target = root.getElementById ? root.getElementById(id) : null; } catch (e) { target = null; }
-            if (!target) continue;
-            const hit = lists.find((l) => l === target || (target.contains && target.contains(l)) || pContains(target, l));
-            if (hit) return hit;
-          }
-          if (!root.host) break;
-        }
+      for (const target of declaredTargets(field)) {
+        const hit = lists.find((l) => l === target || (target.contains && target.contains(l)) || pContains(target, l));
+        if (hit) return hit;
       }
       let fr = null;
       try { fr = field.getBoundingClientRect(); } catch (e) { fr = null; }
@@ -1017,14 +1163,14 @@ _ROW_SEMANTICS_JS = r"""
 # a value. A widget that commits a code ("CA" for "California") commits one of these, and nothing else
 # short. A positional or boolean attribute (data-index="1", data-selected="true") is not one.
 _DECLARED_VALUES_JS = r"""
-  const declaredValues = (row) => {
+  const declaredValues = (row, rowSel) => {
     const out = [];
     try {
       const VALUE_ATTR = /^(value|data-value|data-val|data-v|data-code|data-key|data-option-value|name|title)$/;
       // An explicit option value may legitimately be "1" or "true"; any other attribute must not
       // contribute one (a positional data-index="1" is not a value the widget commits).
       const EXPLICIT = /^(value|data-value)$/;
-      const opt = composedClosest(row, OPT_SEL);
+      const opt = composedClosest(row, rowSel || OPT_SEL);
       for (const node of new Set([row, opt || row])) {
         for (const a of node.attributes) {
           if (!VALUE_ATTR.test(a.name)) continue;
@@ -1044,7 +1190,6 @@ _FIND_SUGGESTION_JS = (
     r"""(args) => {"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
-    + _DECLARED_VALUES_JS
     + r"""
   const STOP = """
     + _STOPWORDS_JS
@@ -1062,26 +1207,44 @@ _FIND_SUGGESTION_JS = (
   // "cannot judge" and "nothing reacted" are both safe, and a confident wrong click is not.
   if (!field) return null;
   const fr = field.getBoundingClientRect();
+  // Only for a popup the field owns is the VERTICAL half of the dropdown-window gate relaxed — a long
+  // list runs well past the window, and applying it would truncate the field's own options to whichever
+  // ones happen to render near it. The horizontal half still applies: a column of the page that merely
+  // sits under the field is not its menu.
+  const ownPopup = fieldOwnPopup(field, true);
+  const rowSel = rowSelFor(field);
+  // A list this field already had open when the call arrived (see _FOCUS_SNAPSHOT_JS) reacts by
+  // NARROWING rather than by appearing: once it has, the rows it kept are the ones typing selected.
+  let openNarrowed = false;
+  try {
+    const rec = window.__tv3_open_own;
+    if (rec && rec.sel === args.field && rec.list && rec.list.isConnected) {
+      openNarrowed = rec.list.querySelectorAll(rowSel).length < rec.rows;
+    }
+  } catch (e) { openNarrowed = false; }
   const cands = [];
   for (const el of pScopeAll()) {
-    if (preHas(el)) continue;                                         // existed/was visible before typing → not a reaction
+    // Pre-existing → not a reaction, unless it is a surviving row of that narrowed list.
+    if (preHas(el) && !(openNarrowed && focusHas(el))) continue;
     const tag = el.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
-    // never click something navigational (would leave the form) unless it's explicitly an option
-    if (isNavRow(el)) continue;
     if (el.children.length > 8) continue;                             // a suggestion row, not a big container
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0 || r.height > 120) continue;  // visible, row-sized (allows a 2-line row)
     if (fr) {                                                          // in the dropdown region: below, or above if it flipped up
-      if (r.top < fr.top - 400 || r.top > fr.bottom + 500) continue;
       if (r.right < fr.left || r.left > fr.right) continue;
+      if (!(ownPopup && pContains(ownPopup, el)) && (r.top < fr.top - 400 || r.top > fr.bottom + 500)) continue;
     }
     const txt = (el.innerText || '').trim();
     if (!txt || txt.length > 80) continue;
+    // never click something navigational (would leave the form) unless it's explicitly an option;
+    // last of the gates because it is the only one that walks a subtree
+    if (isNavRow(el)) continue;
     let score = 0;
     const norm = txt.replace(/\s+/g, ' ').trim().toLowerCase();
-    // A row whose whole text IS the value outranks every partial match ("New York" over "New York
-    // City"; "No" over "No, I have not ..."), in both scoring modes.
+    // A row whose whole text IS the value outranks a partial match ("New York" over "New York City";
+    // "No" over "No, I have not ..."). This is only the CANDIDATE gate, not a cross-row ranking: every
+    // row that clears score > 0 is tagged below and handed to the caller's own precision matcher.
     const isExact = norm === (exact !== null ? exact : wantNorm);
     if (exact !== null) {
       if (isExact) score = 2;
@@ -1091,13 +1254,47 @@ _FIND_SUGGESTION_JS = (
       for (const w of want) if (have.has(w)) score++;
       if (isExact && score > 0) score += 100;
     }
-    if (score > 0) cands.push({ el, score, h: r.height, exactRow: isExact });
+    if (score > 0) cands.push({ el, score, h: r.height, exactRow: isExact, r });
   }
   if (!cands.length) return null;
-  // Drop any candidate that CONTAINS another candidate (a dropdown container over its own rows), then
-  // take the highest score, breaking ties toward the smallest (innermost) row.
+  // Drop any candidate that CONTAINS another candidate (a dropdown container over its own rows).
   const leaves = cands.filter((c) => !cands.some((o) => o.el !== c.el && pContains(c.el, o.el)));
   const pool = leaves.length ? leaves : cands;
+  if (pool.some((c) => !!composedClosest(c.el, rowSel))) {
+    // The ROW the widget DECLARED is the unit, not the fragment that happens to hold the matched
+    // substring: a widget that wraps only the match in its own highlight span leaves that span as the
+    // innermost candidate, and then every row reads as the same bare query text. Promote each leaf to
+    // its declared row and dedupe by that row, so the text read back is the row's own full label.
+    const byRow = new Map();
+    for (const c of pool) {
+      const row = composedClosest(c.el, rowSel);
+      if (!row || byRow.has(row)) continue;
+      // The promotion can only widen what a click lands on, so the row it produced has to clear the
+      // navigational gate too -- declaring a row does not make one holding a link a pick.
+      if (isNavRow(row) || wrapsDeparture(row)) continue;
+      let r = c.r;
+      try { r = row.getBoundingClientRect(); } catch (e) { r = c.r; }
+      byRow.set(row, { el: row, r });
+    }
+    const promoted = Array.from(byRow.values());
+    // Two leaves can promote onto nested rows; keep the innermost so no tagged row holds another.
+    const rows = promoted.filter((c) => !promoted.some((o) => o.el !== c.el && pContains(c.el, o.el)));
+    if (!rows.length) return null;
+    // Top-to-bottom order, same as _FIND_MENU_JS. This finder only says which rows reacted; the caller
+    // (via _match_menu_option, over the full untruncated text _MENU_OPTION_TEXTS_JS reads back) picks
+    // which one is the wanted value -- geometry never breaks a tie between them.
+    rows.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
+    const options = [];
+    let n = 0;
+    for (const c of rows) {
+      n++;
+      c.el.setAttribute('data-tv3-sugg', String(n));
+      if (options.length < 15) options.push({ n, text: c.el.innerText.trim().slice(0, 60) });
+    }
+    return { count: n, options, declared: true };
+  }
+  // Nothing here declares a row, so there is no unit to name: take the highest score, breaking ties
+  // toward the smallest (innermost) row.
   pool.sort((a, b) => b.score - a.score || a.h - b.h);
   const best = pool[0];
   // Two leading-clause matches for a short value ("No, ..." and "No - ...") with no exact row are
@@ -1113,11 +1310,32 @@ _FIND_SUGGESTION_JS = (
   }
   if (childRows.size >= 2) return null;
   best.el.setAttribute('data-tv3-sugg', '1');
+  return { count: 1, options: [{ n: 1, text: (best.el.innerText || '').trim() }], declared: false };
+}"""
+)
+
+# Read back the row _FIND_SUGGESTION_JS tagged data-tv3-sugg="N" once the caller has picked `n` (via
+# _match_menu_option): its declared value/data-* attributes -- a widget that commits a code ("CA" for a
+# row displaying "California") commits one of these -- and whether it came from the FOCUS-opened list
+# rather than reacting to a keystroke (that pick is verified under the open->observe->pick contract, not
+# the typeahead's change-based one; see _VERIFY_COMMIT_JS's `noSuggestionList`).
+_SUGG_ROW_INFO_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _DECLARED_VALUES_JS
+    + r"""
+  const el = pQS('[data-tv3-sugg="' + arg.n + '"]');
+  if (!el) return null;
+  let field = null;
+  try { field = pQS(arg.sel); } catch (e) { field = null; }
+  if (!field && arg.el && arg.el.isConnected) field = arg.el;
   return {
-    text: (best.el.innerText || '').trim(),
-    score: best.score,
-    fromFocus: focusHas(best.el),
-    declared: declaredValues(best.el),
+    text: (el.innerText || '').trim(),
+    // Revealed BY this call's focus click. A row already open before it is one this same field left
+    // up, and the typing that filtered down to it is the reaction the change-based contract asks for.
+    fromFocus: focusHas(el) && !preHas(el),
+    declared: declaredValues(el, rowSelFor(field)),
   };
 }"""
 )
@@ -1138,17 +1356,55 @@ _FOCUS_SNAPSHOT_JS = (
   // Menu/option semantics, not any list: a plain <ul> that focus revealed is page text, an ARIA
   // list or an option row is the widget's own menu. A list that CONTAINS the field is layout.
   const LIST = LIST_SEL;
+  const rowSel = rowSelFor(field);
   const inOptionList = (el) => {
     for (let n = el; n; n = n.parentNode || n.host || null) {
       if (n.nodeType !== 1) continue;
       let isList = false;
-      try { isList = n.matches(LIST) || n.matches(OPT_SEL); } catch (e) { isList = false; }
+      try { isList = n.matches(LIST) || n.matches(rowSel); } catch (e) { isList = false; }
       if (isList) return !(field && pContains(n, field));
     }
     return false;
   };
+  // A list the field ALREADY declares open was opened by an earlier call on this same field, not by
+  // the page: its rows are options the widget is offering, however long they have been on screen.
+  const declaresOpen = () => {
+    if (!field) return false;
+    if (fieldOwnPopup(field, true)) return true;
+    // The control's own declaration, not any expanded ancestor: a surrounding open accordion says
+    // nothing about whether THIS widget has a list up.
+    let exp = null;
+    try { exp = field.matches('[aria-expanded]') ? field : composedClosest(field, '[role="combobox"][aria-expanded]'); }
+    catch (e) { exp = null; }
+    try { return !!(exp && exp.getAttribute('aria-expanded') === 'true'); } catch (e) { return false; }
+  };
+  // Only the field's OWN list qualifies, resolved the same way the offered-labels read resolves it:
+  // fieldOwnList refuses rather than guess, so an undeclared decoy sharing the window promotes nothing.
+  let openOwn = null;
+  if (declaresOpen()) {
+    const rendered = [];
+    for (const el of pScopeAll()) {
+      let isList = false;
+      try { isList = el.matches(LIST); } catch (e) { isList = false; }
+      if (!isList || (field && pContains(el, field))) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      let hasRow = false;
+      try { hasRow = !!el.querySelector(rowSel); } catch (e) { hasRow = false; }
+      if (hasRow) rendered.push(el);
+    }
+    openOwn = fieldOwnList(field, rendered);
+  }
+  // How many rows that list held BEFORE a single keystroke. The finder treats them as this field's
+  // options only once typing has narrowed the list -- an open list that ignores typing is furniture.
+  if (openOwn) {
+    let held = 0;
+    try { held = openOwn.querySelectorAll(rowSel).length; } catch (e) { held = 0; }
+    if (held) window.__tv3_open_own = { sel: arg.sel, list: openOwn, rows: held };
+  }
   pScopeEach((el, inShadow) => {
-    if (preHas(el)) return;
+    const inOpenOwn = !!openOwn && pContains(openOwn, el);
+    if (preHas(el) && !inOpenOwn) return;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
     if (inOptionList(el)) focusMark(el, inShadow); else preMark(el, inShadow);
@@ -1159,7 +1415,7 @@ _FOCUS_SNAPSHOT_JS = (
   const seen = new Set();
   pScopeEach((el) => {
     if (!focusHas(el)) return;
-    const row = composedClosest(el, OPT_SEL);
+    const row = composedClosest(el, rowSel);
     if (!row || seen.has(row)) return;
     seen.add(row);
     const txt = (row.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1190,12 +1446,13 @@ _FOCUS_OFFERED_LABELS_JS = (
   if (!field && arg.el && arg.el.isConnected) field = arg.el;
   // Rows grouped by their list; fieldOwnList resolves the field's own menu the same way as the
   // snapshot pass, refusing (empty result) rather than guessing when it can't tell which list is whose.
+  const rowSel = rowSelFor(field);
   const byList = new Map();
   const seen = new Set();
   for (const el of pScopeAll()) {
     if (!focusHas(el)) continue;
     if (field && pContains(el, field)) continue;
-    const row = composedClosest(el, OPT_SEL);
+    const row = composedClosest(el, rowSel);
     if (!row || seen.has(row)) continue;
     seen.add(row);
     const txt = (row.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1212,6 +1469,33 @@ _FOCUS_OFFERED_LABELS_JS = (
     if (rec && rec.sel === arg.sel && Array.isArray(rec.labels) && rec.labels.length) return { total: rec.total || rec.labels.length, labels: rec.labels.slice(0, 15) };
   }
   return { total: best.length, labels: best.slice(0, 15) };
+}"""
+)
+
+# Whether this field DECLARES a list popup of its own, or opened one whose rows it declares. Only such a
+# field gets the reduced-query/empty-query recovery; on anything else those questions would be asked of a
+# widget whose rows no rule can name, and the caller keeps the plain no-match path.
+_FIELD_DECLARES_LIST_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  let field = null;
+  try { field = pQS(arg.sel); } catch (e) { field = null; }
+  if (!field && arg.el && arg.el.isConnected) field = arg.el;
+  if (!field) return false;
+  if (fieldOwnPopup(field, false)) return true;
+  // A widget that swaps its empty popup to role=status still declares the popup on the control itself.
+  let haspopup = '';
+  try { haspopup = String(field.getAttribute('aria-haspopup') || '').toLowerCase(); } catch (e) { haspopup = ''; }
+  if (haspopup === 'listbox' || haspopup === 'grid' || haspopup === 'menu' || haspopup === 'tree') return true;
+  const rowSel = rowSelFor(field);
+  for (const el of pScopeAll()) {
+    if (!focusHas(el)) continue;
+    if (pContains(el, field)) continue;
+    if (composedClosest(el, rowSel)) return true;
+  }
+  return false;
 }"""
 )
 
@@ -3428,7 +3712,7 @@ _FIND_MENU_JS = (
       if (composedClosest(p, 'dialog,[role~="dialog"],[aria-modal="true"]')) {
         // Test the closest option-role ANCESTOR, not the reduced leaf: a role=option row with a styled
         // <span> child reduces to the span (null role), so a leaf-only check would wrongly reject it.
-        // menuitem rows are enumerable here (a menu in a dialog is still a menu) but stay nav for clicking.
+        // menuitem rows are enumerable here too: a menu in a dialog is still a menu.
         if (!g.every((c) => composedClosest(c.el, OPT_SEL + ',[role="menuitem"]'))) continue;
       }
     } catch (e) {}
@@ -3489,20 +3773,20 @@ _FIND_MENU_JS = (
 }"""
 )
 
-# Read the FULL (untruncated) label of every row _FIND_MENU_JS tagged data-tv3-menu, across the same
-# pierced reach it tags in. _FIND_MENU_JS caps its returned `options` at 15 and truncates each to 60
-# chars for payload size; the deterministic match must see the whole list at full length so a value at
-# row 20, or a label longer than 60 chars, is neither missed nor matched on a cut-off token. `nav` marks
-# a row this tool must not auto-click — _FIND_MENU_JS enumerates <a href>/<button>/menuitem rows because
-# it only REPORTS, but clicking a navigational row would leave the form (mirrors _FIND_SUGGESTION_JS,
-# which refuses exactly these unless role=option).
+# Read the FULL (untruncated) label of every row tagged data-tv3-<attr>, across the same pierced reach
+# the tagger tags in. A tagger caps its returned `options` at 15 and truncates each to 60 chars for
+# payload size; the deterministic match must see the whole list at full length so a value beyond the
+# 15th row, or a label longer than 60 chars, is neither missed nor matched on a cut-off token. `nav`
+# marks a row this tool must not auto-click. `arg.attr` selects which tagger's rows to read ("menu" for
+# _FIND_MENU_JS, "sugg" for _FIND_SUGGESTION_JS) so the same full-length read serves both.
 _MENU_OPTION_TEXTS_JS = (
-    r"""() => {"""
+    r"""(arg) => {"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
     + r"""
-  return Array.from(pQSA('[data-tv3-menu]')).map((el) => {
-    // `_FIND_MENU_JS` tags the innermost leaf; an option whose ancestor declares aria-setsize is a child
+  const attr = (arg && arg.attr) || 'menu';
+  return Array.from(pQSA('[data-tv3-' + attr + ']')).map((el) => {
+    // The tagger tags the innermost leaf; an option whose ancestor declares aria-setsize is a child
     // that declares none, so read the closest declaring ancestor or the incomplete-list guard is bypassed.
     const nav = isNavRow(el);
     const setEl = composedClosest(el, '[aria-setsize]');
@@ -3512,7 +3796,7 @@ _MENU_OPTION_TEXTS_JS = (
     const sc = pQS('[data-tv3-menu-scroller]');
     const pos = sc ? Math.round(el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop) : null;
     return {
-      n: parseInt(el.getAttribute('data-tv3-menu'), 10),
+      n: parseInt(el.getAttribute('data-tv3-' + attr), 10),
       text: (el.innerText || el.textContent || '').trim(),
       nav: nav,
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
@@ -3575,6 +3859,22 @@ _MENU_OPEN_JS = (
   if (!el) return false;
   const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
   return !!(exp && exp.getAttribute('aria-expanded') === 'true');
+}"""
+)
+
+# Whether a DECLARED field's own list is still open: _MENU_OPEN_JS's aria-expanded check, OR the popup
+# the field declares (fieldOwnPopup, from _ROW_SEMANTICS_JS) is still rendered. A widget that re-searches
+# on the value it just wrote back can leave rows on screen with aria-expanded never having flipped.
+_TYPEAHEAD_LIST_OPEN_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return false;
+  const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
+  if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
+  return !!fieldOwnPopup(el, true);
 }"""
 )
 
@@ -5308,7 +5608,10 @@ _STAMPED_ROW_GUARD_JS = (
   let text = '', aria = '';
   try { text = norm(el.innerText); aria = norm(el.getAttribute('aria-label')); } catch (e) { return false; }
   const same = text === w || aria === w || (w.length >= 80 && (text.startsWith(w) || aria.startsWith(w)));
-  return same && !isNavRow(el);
+  if (!same || isNavRow(el)) return false;
+  // isNavRow is inert once a row declares role=option, so a hijack onto an option decoy wrapping a
+  // link/submit needs the same wrapsDeparture check the declared-row tagger applies before promoting one.
+  return !composedClosest(el, OPT_SEL) || !wrapsDeparture(el);
 }"""
 )
 
@@ -6735,40 +7038,112 @@ def build_browser_tools(
         return True, None
 
     async def _commit_typeahead(
-        page: Any, selector: str, value: str, rounds: int
-    ) -> tuple[str | None, str | None, bool]:
-        # Poll for the suggestion list rendered IN REACTION to the value already typed into `selector`,
-        # click the best match, and verify the field committed. Site-agnostic (see _FIND_SUGGESTION_JS).
-        # Returns (committed_value, suggestion_text): suggestion_text is None when no suggestion ever
-        # surfaced (an ordinary field, or nothing matched); committed is None when a suggestion was
-        # clicked but no value landed.
-        best_txt: str | None = None
-        from_focus = False
-        declared: list[str] = []
-        for _ in range(rounds):
-            await asyncio.sleep(0.4)
+        page: Any, selector: str, value: str, rounds: int, *, exact_only: bool = False, probe: str | None = None
+    ) -> _TypeaheadPick:
+        # Poll for the suggestion rows rendered IN REACTION to whatever is already typed into `selector`,
+        # pick among them, click, and verify the field committed. When the widget DECLARES its rows the
+        # commit is exact-only: a row is picked when its whole label IS `value`, never on a stem or
+        # prefix hit, so an ambiguous reaction is always handed back rather than guessed at. Where
+        # nothing declares a list, the finder returns the single winner it always did and the pick is
+        # that row. `candidates` is the full-text reacting rows when a declared pick refused — the
+        # caller reports these instead of guessing which one was meant; None when nothing reacted, when
+        # a row was clicked, or on the undeclared path, which has no tie to report. committed is None
+        # when a suggestion was clicked but no value landed.
+        # `exact_only` is for a REDUCED query (the field holds less than `value`) on the undeclared
+        # path: the rows on screen answer a broader question than the caller asked, so only a row whose
+        # whole label IS `value` may be committed. `probe` is then what the field actually holds, which
+        # is what the finder's reaction/overlap gate has to be given: rows answering "Il" need not share
+        # a word with "Illinois".
+
+        async def _find() -> dict[str, Any] | None:
             try:
                 found = await page.evaluate(
                     _FIND_SUGGESTION_JS,
-                    {"value": value, "field": selector, "el": (await _probe_arg(page, selector))["el"]},
+                    {"value": probe or value, "field": selector, "el": (await _probe_arg(page, selector))["el"]},
                 )
             except Exception as e:
                 LOG.debug("taskv3 typeahead suggestion-find failed", selector=selector, error=str(e))
-                found = None
-            if isinstance(found, dict) and found.get("text"):
-                best_txt = str(found["text"])
-                from_focus = bool(found.get("fromFocus"))
-                declared = [str(v) for v in (found.get("declared") or []) if isinstance(v, str)]
+                return None
+            return found if isinstance(found, dict) and found.get("count") else None
+
+        async def _full_rows() -> list[dict[str, Any]]:
+            # The tagger truncates each label to 60 chars for payload size; the match must see the whole
+            # text so a value that differs only past char 60, or a >60-char row, is not mismatched. With
+            # no full-length read there is no list to match against -- the truncated labels would feed
+            # both the uniqueness matcher and a whole-text click guard -- so the caller refuses instead.
+            try:
+                raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "sugg"})
+            except Exception as e:
+                LOG.debug("taskv3 typeahead full-text read failed", selector=selector, error=str(e))
+                return []
+            if not isinstance(raw, list):
+                return []
+            # Never auto-click a navigational row. The tagger already refuses them, so this is a
+            # floor under the pick, not the filter that does the work.
+            return [o for o in raw if isinstance(o, dict) and isinstance(o.get("n"), int) and not o.get("nav")]
+
+        def _pick(rows: list[dict[str, Any]]) -> int | None:
+            # A declared row commits solely on an exact label match, never on inferred meaning — an
+            # unmatched row, lone or not, is refused like any other so the model chooses explicitly.
+            return _match_option_exact(value, rows)
+
+        async def _resolve(found: dict[str, Any]) -> tuple[bool, list[dict[str, Any]], int | None, int]:
+            # A widget that declares its rows hands the pick to the exact matcher over every row it
+            # tagged. Where nothing declares one, the finder already reduced the reaction to a single
+            # winner and there is nothing left to choose between — except under a reduced query, whose
+            # rows answer a broader question than the caller asked. The 4th value is the declared
+            # aria-setsize when it exceeds the rendered row count (0 otherwise), reported in the refusal
+            # note so the model knows to name the option's full label rather than retry blindly.
+            tagged = [o for o in (found.get("options") or []) if isinstance(o, dict) and isinstance(o.get("n"), int)]
+            if not tagged:
+                return bool(found.get("declared")), [], None, 0
+            if found.get("declared"):
+                rows = await _full_rows()
+                declared_size = max((int(o.get("setsize") or 0) for o in rows), default=0)
+                overflow = declared_size if rows and declared_size > len(rows) else 0
+                return True, rows, _pick(rows), overflow
+            return False, tagged, (_match_option_exact(value, tagged) if exact_only else 1), 0
+
+        async def _row_info(n: int) -> dict[str, Any]:
+            try:
+                info = await page.evaluate(_SUGG_ROW_INFO_JS, {**(await _probe_arg(page, selector)), "n": n})
+            except Exception:
+                info = None
+            return info if isinstance(info, dict) else {}
+
+        found: dict[str, Any] | None = None
+        for _ in range(rounds):
+            await asyncio.sleep(0.4)
+            found = await _find()
+            if found is not None:
                 break
-        if not best_txt:
-            return None, None, False
-        # Click the tagged best row. If the list re-rendered and dropped the tag, re-find (re-tag the
-        # current best) and click once more — never blind-press ArrowDown/Enter, which would commit
-        # whichever row the widget happens to highlight rather than the one we actually scored.
+        if found is None:
+            return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+        declared_rows, rows, idx, overflow = await _resolve(found)
+        if idx is None:
+            note = (
+                f"the list declares {overflow} rows and only {len(rows)} are rendered — type the option's full label"
+                if declared_rows and overflow
+                else None
+            )
+            return _TypeaheadPick(
+                None,
+                None,
+                False,
+                rows if declared_rows else None,
+                clicked=False,
+                declared=declared_rows,
+                note=note,
+            )
+        best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
+        info = await _row_info(idx)
+        from_focus = bool(info.get("fromFocus"))
+        declared = [str(v) for v in (info.get("declared") or []) if isinstance(v, str)]
+        # Click the picked row. If the list re-rendered and dropped the tags, re-find/re-pick and click
+        # once more — never blind-press ArrowDown/Enter, which would commit whichever row the widget
+        # happens to highlight rather than the one just matched.
         # A pick from a focus-opened list is verified under the pick contract, which needs the hidden
         # values as they were BEFORE the click so a stale leftover cannot read as the commit.
-        # Captured before ANY click: a re-find after a failed first click may land on a focus-revealed
-        # row, and the pick contract it is verified under needs the state as it was before the click.
         pre_hidden: list[str] = []
         pre_value = value
         try:
@@ -6783,36 +7158,39 @@ def build_browser_tools(
             pre_value = value
         clicked = False
         try:
-            if not await _click_stamped_row(page, '[data-tv3-sugg="1"]', best_txt, 3000):
+            if not await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
             clicked = True
         except Exception:
             try:
-                refound = await page.evaluate(
-                    _FIND_SUGGESTION_JS,
-                    {"value": value, "field": selector, "el": (await _probe_arg(page, selector))["el"]},
-                )
-                if isinstance(refound, dict) and refound.get("text"):
-                    best_txt = str(refound["text"])
-                    from_focus = bool(refound.get("fromFocus"))
-                    declared = [str(v) for v in (refound.get("declared") or []) if isinstance(v, str)]
-                    clicked = await _click_stamped_row(page, '[data-tv3-sugg="1"]', best_txt, 3000)
+                refound = await _find()
+                if refound is not None:
+                    declared_rows, rows, idx2, _overflow = await _resolve(refound)
+                    if idx2 is not None:
+                        idx = idx2
+                        best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
+                        info = await _row_info(idx)
+                        from_focus = bool(info.get("fromFocus"))
+                        declared = [str(v) for v in (info.get("declared") or []) if isinstance(v, str)]
+                        clicked = await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000)
             except Exception:
                 clicked = False
         if not clicked:
             # a suggestion surfaced but we couldn't click it — report un-committed, don't guess
             LOG.debug("taskv3 typeahead could not click suggestion", selector=selector, suggestion=best_txt)
-            return None, best_txt, False
+            return _TypeaheadPick(None, best_txt, False, None, clicked=False, declared=declared_rows)
         await asyncio.sleep(0.3)
         readable = False
         try:
             # A row the FOCUS click revealed was offered, not filtered: verify it under the pick
             # contract (the value must BE the chosen label), not the typeahead's change-based one.
+            # `typed` must be what the field actually HELD, which under a reduced query is the rung —
+            # comparing against the fuller request would let leftover rung text read as the commit.
             read = await page.evaluate(
                 _VERIFY_COMMIT_JS,
                 {
                     "field": selector,
-                    "typed": pre_value if from_focus else value,
+                    "typed": pre_value if from_focus else (value if probe is None else probe),
                     "chosen": best_txt,
                     "noSuggestionList": from_focus,
                     "preHidden": pre_hidden,
@@ -6826,11 +7204,50 @@ def build_browser_tools(
         except Exception as e:
             LOG.debug("taskv3 typeahead commit-verify failed", selector=selector, error=str(e))
             committed = ""
-        return (committed or None), best_txt, readable
+        return _TypeaheadPick(committed or None, best_txt, readable, None, clicked=True, declared=declared_rows)
 
-    async def _type_and_commit(
-        page: Any, selector: str, value: str, rounds: int
-    ) -> tuple[str | None, str | None, bool]:
+    async def _read_field_value(page: Any, selector: str) -> str | None:
+        try:
+            return str(await page.locator(selector).first.input_value(timeout=2000))
+        except Exception:
+            pass
+        # input_value() raises on anything that is not a form control, and a contenteditable combobox
+        # is one of those: without this its pre-type text is unreadable and a refusal leaves our query.
+        try:
+            read = await page.locator(selector).first.evaluate(
+                "el => (el.isContentEditable ? el.textContent : el.value)", timeout=2000
+            )
+        except Exception:
+            return None
+        return str(read) if isinstance(read, str) else None
+
+    async def _field_declares_list(page: Any, selector: str) -> bool:
+        # Fail-closed: without a declared list there is no row rule to lean on, so the caller keeps the
+        # path it had rather than asking a widget it cannot read a second, looser question.
+        try:
+            return bool(await page.evaluate(_FIELD_DECLARES_LIST_JS, await _probe_arg(page, selector)))
+        except Exception:
+            return False
+
+    async def _restore_pre_type_value(page: Any, selector: str, pre_value: str | None, typed: list[str]) -> None:
+        # A refusal must hand the field back the way it found it. Leaving our query behind overwrites
+        # whatever the page had already put there -- a cascade-filled code, a prefilled dial code -- with
+        # text the widget never accepted, and a later read of the form cannot tell the two apart. Only
+        # OUR text may be taken back: if the field now holds something else, the widget wrote it in
+        # reaction and that value is the page's, not ours to discard.
+        if pre_value is None:
+            return
+        current = await _read_field_value(page, selector)
+        if current is None or current == pre_value:
+            return
+        if current.strip() and not any(current.strip().lower() == q.strip().lower() for q in typed):
+            return
+        try:
+            await page.fill(selector, pre_value, timeout=15000)
+        except Exception:
+            LOG.debug("taskv3 pre-type value restore failed", selector=selector)
+
+    async def _type_and_commit(page: Any, selector: str, value: str, rounds: int) -> tuple[_TypeaheadPick, str | None]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM BEFORE the focus click, not just before typing: a widget that opens its full list on
         # focus and then filters it in place keeps the same row nodes, so a snapshot taken after the click
@@ -6838,6 +7255,9 @@ def build_browser_tools(
         # Static page text that merely shares a word with the value is still excluded — it was visible
         # before the click too.
         presnapshot_ok = True
+        # Read the field BEFORE clearing it: a refusal further down owes this value back, and after the
+        # fill() below no one can recover it.
+        pre_value = await _read_field_value(page, selector)
         try:
             await page.evaluate(_PRESNAPSHOT_JS)
         except Exception:
@@ -6859,8 +7279,50 @@ def build_browser_tools(
             # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
             # value and let the caller re-observe.
-            return None, None, False
-        return await _commit_typeahead(page, selector, value, rounds)
+            return _TypeaheadPick(None, None, False, None, clicked=False, declared=False), pre_value
+        return await _commit_typeahead(page, selector, value, rounds), pre_value
+
+    async def _close_lingering_typeahead_list(page: Any, selector: str, committed: str | None) -> ToolResult | None:
+        # A declared field's widget can re-search on the value it just committed and leave its list
+        # open, covering whatever the form has below it. Close it with Escape, best-effort: None means
+        # the caller's own OK stands; a ToolResult means closing was not safe to treat as a no-op.
+        try:
+            still_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector)))
+        except Exception:
+            return None
+        if not still_open:
+            return None
+        try:
+            await page.press(selector, "Escape", timeout=5000)
+        except Exception:
+            LOG.debug("taskv3 lingering typeahead list close failed", selector=selector)
+            return None
+        await asyncio.sleep(0.25)
+        try:
+            await page.wait_for_selector(selector, state="visible", timeout=500)
+        except Exception:
+            return ToolResult.error(
+                f"selected value for {selector}, but its still-open list covered the form, and closing it "
+                "with Escape dismissed the field's own container — re-observe before continuing"
+            )
+        after = await _read_field_value(page, selector)
+        if after is None:
+            try:
+                after = str(await page.evaluate(_ANCHOR_SURFACE_JS, await _probe_arg(page, selector)) or "") or None
+            except Exception:
+                after = None
+        if committed is not None and after is not None and after.strip() != committed.strip():
+            return ToolResult.error(
+                f"selected {committed!r} for {selector}, but its still-open list did not just sit there: "
+                f"closing it with Escape changed the value to {after!r} — the commit did not survive; "
+                "re-observe and retry"
+            )
+        try:
+            if bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector))):
+                LOG.debug("taskv3 typeahead list stayed open after Escape", selector=selector)
+        except Exception:
+            pass
+        return None
 
     async def _typeahead_commit_verdict(
         page: Any, selector: str, committed: str | None, readable: bool
@@ -6953,23 +7415,41 @@ def build_browser_tools(
             # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
             # not just on a single `input` from fill — still surfaces them, then commit the best match.
             try:
-                committed, opt_txt, readable = await _type_and_commit(page, selector, text, rounds=3)
+                pick, pre_value = await _type_and_commit(page, selector, text, rounds=3)
             except _FieldCovered as exc:
                 return _covered_error(exc.selector, exc.occluder)
             except _FieldNotEditable as exc:
                 return _not_editable_error(exc)
-            if opt_txt:
-                verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
+            if pick.suggestion is None and pick.candidates:
+                # Several rows reacted and none was a unique precision match, so nothing was picked.
+                # The raw text left behind is exactly what a typeahead discards, so "typed into X" here
+                # is a false success -- name the rows instead and hand the pick to the tool that makes
+                # one. Geometry must not break the tie; only the caller naming a row can. "NOT filled"
+                # has to be true of the field as well as of the widget, so the query goes back out.
+                await _restore_pre_type_value(page, selector, pre_value, [text])
+                return _ambiguous_rows_error(
+                    selector,
+                    text,
+                    pick.candidates,
+                    next_step="call select_combobox with the option's full text",
+                    note=pick.note,
+                )
+            if pick.suggestion:
+                verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
                 if verdict is CommitStatus.OK:
+                    if pick.declared:
+                        closed = await _close_lingering_typeahead_list(page, selector, pick.committed)
+                        if closed is not None:
+                            return closed
                     return ToolResult.ok(
-                        f"typed into {selector}; it is a typeahead — selected {opt_txt!r} "
-                        f"(committed value: {committed!r})"
+                        f"typed into {selector}; it is a typeahead — selected {pick.suggestion!r} "
+                        f"(committed value: {pick.committed!r})"
                     )
                 if verdict is CommitStatus.UNVERIFIED and matches != 1:
                     # INV-1: the field re-resolved to n≠1 after the click (remounted or now ambiguous), so
                     # there is no stable element to read the commit off — soft, not a false did-not-commit.
                     return ToolResult.ok(
-                        f"clicked suggestion {opt_txt!r} for {selector}, but it re-resolved to {matches} "
+                        f"clicked suggestion {pick.suggestion!r} for {selector}, but it re-resolved to {matches} "
                         "elements so the commit could not be verified — re-observe to confirm the value "
                         "before relying on it"
                     )
@@ -6982,18 +7462,18 @@ def build_browser_tools(
                     why = await _unverifiable_because(page, selector)
                     if why:
                         return ToolResult.ok(
-                            f"clicked suggestion {opt_txt!r} for {selector}; {why}, so the commit could not "
+                            f"clicked suggestion {pick.suggestion!r} for {selector}; {why}, so the commit could not "
                             "be verified — re-observe to confirm the value before relying on it"
                         )
                     return ToolResult.error(
-                        f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is "
+                        f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is "
                         "NOT filled; re-observe and retry, do not proceed"
                     )
                 # DID_NOT_COMMIT: the field is NOT filled. The loop then skips any later click or Enter
                 # in the same batch -- it may be an unvalidated submit, and no production submit guard
                 # exists yet.
                 return ToolResult.error(
-                    f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is NOT "
+                    f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is NOT "
                     "filled; re-observe and retry, do not proceed"
                 )
             # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
@@ -7118,7 +7598,7 @@ def build_browser_tools(
         count = int(found.get("count") or 0)
         read: list[dict[str, Any]] = []
         try:
-            full_rows = await page.evaluate(_MENU_OPTION_TEXTS_JS)
+            full_rows = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
             if isinstance(full_rows, list):
                 read = [o for o in full_rows if isinstance(o, dict) and isinstance(o.get("n"), int)]
         except Exception as e:
@@ -7202,7 +7682,7 @@ def build_browser_tools(
                     pass
                 try:
                     await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
-                    texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS)
+                    texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
                 except Exception:
                     texts_raw = None
                 current: list[dict[str, Any]] = []
@@ -7544,15 +8024,125 @@ def build_browser_tools(
         # straight to the open path; a typeable anchor tries typeahead first and falls through to the open
         # path only when NOTHING reacts to keystrokes (the widget doesn't filter). Fails loudly rather than
         # leaving raw typed text a widget won't accept (a false "filled" — the failure mode this prevents).
+
+        async def _typeahead_verdict_result(
+            opt_txt: str, committed: str | None, readable: bool, *, declared: bool
+        ) -> ToolResult:
+            verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
+            if verdict is CommitStatus.OK:
+                if declared:
+                    closed = await _close_lingering_typeahead_list(page, selector, committed)
+                    if closed is not None:
+                        return closed
+                return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
+            if verdict is CommitStatus.UNVERIFIED and matches != 1:
+                # INV-1: re-resolved to n≠1 after the click — no stable element to read the commit off.
+                return ToolResult.ok(
+                    f"selected {opt_txt!r} for {selector}, but it re-resolved to {matches} elements so the "
+                    "commit could not be verified — re-observe to confirm the value before relying on it"
+                )
+            if verdict is CommitStatus.UNVERIFIED:
+                # INV-2 (unreadable): keep the reach-based softening — a portalled/closed-root field is
+                # beyond the verifier, so the read returning nothing is not evidence the value did not commit.
+                why = await _unverifiable_because(page, selector)
+                if why:
+                    return ToolResult.ok(
+                        f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
+                        "re-observe to confirm the value before relying on it"
+                    )
+                return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
+            return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
+
+        def _reduced_queries() -> list[str]:
+            # Ask the widget less until it answers. A search field that rendered nothing for the whole
+            # value may still hold it under its own coarser form: the leading clause before the first
+            # comma ("Springfield, Sangamon, IL" -> "Springfield"). That is the one rung worth a rung —
+            # the finder gates rows on whole-WORD overlap with the query, so a halving prefix that cuts a
+            # word ("Illi" against "Illinois") can never match whatever the widget renders for it, and
+            # spends a poll cycle on every no-match to prove it. The rung is only a way to make rows
+            # appear; it may never be committed as if it were the request (_commit_typeahead's exact_only).
+            # After it, one SHORT prefix: many closed-vocabulary pickers render nothing for an empty
+            # query or on focus and start answering at two characters, which is the only question that
+            # reaches a vocabulary the value itself is absent from ("Illinois" -> "Il" -> "IL").
+            rungs: list[str] = []
+            leading = value.split(",", 1)[0].strip()
+            if leading and leading != value:
+                rungs.append(leading)
+            short = value[:_SHORT_PREFIX_RUNG_CHARS].strip()
+            if short and short != value and short not in rungs:
+                rungs.append(short)
+            return rungs
+
+        async def _reduced_query_ladder() -> ToolResult | list[dict[str, Any]]:
+            # Walk the rungs until one renders rows. A row whose whole label IS the requested value
+            # commits; anything else is reported, never guessed — the rows a looser query revealed are
+            # the field's own vocabulary, which is what a caller needs to name the right label.
+            for rung in _reduced_queries():
+                typed_queries.append(rung)
+                try:
+                    await page.fill(selector, "", timeout=15000)
+                    await asyncio.sleep(0.2)
+                    # A rung is a fresh question, so it needs a fresh answer to "what appeared in
+                    # reaction": the snapshot from before the first attempt would mark the rows the
+                    # PREVIOUS query left on screen as pre-existing, and a widget that keeps its row
+                    # nodes across a re-search would then have no reaction to show at all.
+                    await page.evaluate(_PRESNAPSHOT_JS)
+                    await page.type(selector, rung, delay=15, timeout=15000)
+                except Exception:
+                    return []
+                rung_pick = await _commit_typeahead(page, selector, value, rounds=4, exact_only=True, probe=rung)
+                if rung_pick.suggestion is not None:
+                    return await _typeahead_verdict_result(
+                        rung_pick.suggestion, rung_pick.committed, rung_pick.readable, declared=rung_pick.declared
+                    )
+                if rung_pick.candidates:
+                    return rung_pick.candidates
+            return []
+
+        async def _read_offered() -> tuple[list[str], int]:
+            try:
+                raw_offered = await page.evaluate(_FOCUS_OFFERED_LABELS_JS, await _probe_arg(page, selector))
+            except Exception:
+                return [], 0
+            if not isinstance(raw_offered, dict):
+                return [], 0
+            labels = [str(t) for t in (raw_offered.get("labels") or []) if isinstance(t, str)]
+            return labels, int(raw_offered.get("total") or 0)
+
+        async def _offer_on_empty_query() -> None:
+            # Last resort for a field whose list never opened on focus: an EMPTY query is the widest
+            # question there is, and a closed-vocabulary widget answers it with its whole list. Re-run
+            # the focus pass so those rows are recorded as offered, exactly as if the field had opened
+            # showing them — _FOCUS_OFFERED_LABELS_JS then reads them under the same own-list attribution.
+            try:
+                await page.fill(selector, "", timeout=15000)
+            except Exception:
+                return
+            await asyncio.sleep(0.4)
+            try:
+                await page.evaluate(_FOCUS_SNAPSHOT_JS, await _probe_arg(page, selector))
+            except Exception:
+                LOG.debug("taskv3 empty-query offer snapshot failed", selector=selector)
+
+        # Every query this call puts in the field, so a refusal can tell OUR text (safe to take back)
+        # from a value the widget wrote in reaction (the page's, and not ours to discard).
+        typed_queries: list[str] = [value]
         if await _anchor_typeable(page, selector):
             try:
-                committed, opt_txt, readable = await _type_and_commit(page, selector, value, rounds=8)
+                pick, pre_value = await _type_and_commit(page, selector, value, rounds=8)
             except _FieldCovered as exc:
                 return _covered_error(exc.selector, exc.occluder)
             except _FieldNotEditable as exc:
                 return _not_editable_error(exc)
-            if opt_txt is None:
-                # No MATCHING suggestion reacted -- but that alone does not say a list never rendered: a
+            if pick.suggestion is None:
+                # More than one row reacted and none was a unique precision match -- refuse and
+                # report what actually reacted (list order, ≤15) instead of guessing which one was meant.
+                if pick.candidates:
+                    await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                    return _ambiguous_rows_error(
+                        selector, value, pick.candidates, next_step="pass the option's full text", note=pick.note
+                    )
+                # No suggestion reacted at all -- but that alone does not say a list never rendered: a
                 # searchable typeahead that filtered to zero and a non-searchable widget that never filters
                 # both land here. The finder pierces open shadow roots, so inside a component it saw the
                 # list -- but a portalled/closed-root list stays invisible, so keep the honest "re-observe"
@@ -7564,10 +8154,15 @@ def build_browser_tools(
                         "and no selection was verified — re-observe to confirm the value committed before "
                         "relying on it"
                     )
+                # Everything below that re-asks the widget, or hands the field back, is written for a
+                # control whose rows a rule can name; a field that declares no list keeps today's path.
+                declared_field = await _field_declares_list(page, selector)
                 # A drill-down widget hides its options under expandable category rows, so open→observe→pick's
                 # flat enumeration cannot reach them — surface the categories and fail loudly instead.
                 cats = await _categories_note(page, selector)
                 if cats:
+                    if declared_field:
+                        await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     return ToolResult.error(
                         f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled. {cats}"
                     )
@@ -7592,17 +8187,35 @@ def build_browser_tools(
                     except Exception:
                         searchable = False
                 if searchable:
-                    # Name the choices the widget offered when it opened, so the next call can use the
-                    # exact label instead of guessing one; the contract stays an honest did-not-commit.
                     offered: list[str] = []
                     offered_total = 0
-                    try:
-                        raw_offered = await page.evaluate(_FOCUS_OFFERED_LABELS_JS, await _probe_arg(page, selector))
-                        if isinstance(raw_offered, dict):
-                            offered = [str(t) for t in (raw_offered.get("labels") or []) if isinstance(t, str)]
-                            offered_total = int(raw_offered.get("total") or 0)
-                    except Exception:
-                        offered = []
+                    if declared_field:
+                        # The whole value rendered nothing, but a searchable widget will answer a narrower
+                        # question: re-ask it with less until rows appear, commit only an exact hit on the
+                        # requested value, and otherwise keep what it revealed as the vocabulary to report.
+                        # What the field showed when it OPENED, read before the ladder: every rung resets
+                        # that record, and it is the only account of the list for a widget that opened
+                        # showing its whole vocabulary.
+                        on_open, on_open_total = await _read_offered()
+                        ladder = await _reduced_query_ladder()
+                        if isinstance(ladder, ToolResult):
+                            if ladder.status != "ok":
+                                await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                            return ladder
+                        # Name the choices the widget offered, so the next call can use the exact label
+                        # instead of guessing one; the contract stays an honest did-not-commit.
+                        offered = [str(o.get("text") or "") for o in ladder if str(o.get("text") or "")]
+                        offered_total = len(offered)
+                        if not offered:
+                            offered, offered_total = on_open, on_open_total
+                        if not offered:
+                            await _offer_on_empty_query()
+                            offered, offered_total = await _read_offered()
+                        if len(offered) > 15:
+                            offered = offered[:15]
+                        await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                    else:
+                        offered, offered_total = await _read_offered()
                     if offered and offered_total > len(offered):
                         offered_note = (
                             f". The list offers {offered_total} rows; the first {len(offered)}: "
@@ -7622,27 +8235,21 @@ def build_browser_tools(
                         f"— do not assume success or move on as if it were{offered_note}"
                     )
                 # The focus-click of the type attempt may have opened this widget's list, so close it first.
-                return await _open_observe_pick(page, selector, value, close_open_menu=True)
-            verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
-            if verdict is CommitStatus.OK:
-                return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
-            if verdict is CommitStatus.UNVERIFIED and matches != 1:
-                # INV-1: re-resolved to n≠1 after the click — no stable element to read the commit off.
-                return ToolResult.ok(
-                    f"selected {opt_txt!r} for {selector}, but it re-resolved to {matches} elements so the "
-                    "commit could not be verified — re-observe to confirm the value before relying on it"
-                )
-            if verdict is CommitStatus.UNVERIFIED:
-                # INV-2 (unreadable): keep the reach-based softening — a portalled/closed-root field is
-                # beyond the verifier, so the read returning nothing is not evidence the value did not commit.
-                why = await _unverifiable_because(page, selector)
-                if why:
-                    return ToolResult.ok(
-                        f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
-                        "re-observe to confirm the value before relying on it"
-                    )
-                return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
-            return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
+                opened = await _open_observe_pick(page, selector, value, close_open_menu=True)
+                if declared_field and opened.status != "ok":
+                    await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                return opened
+            if pick.declared and not pick.clicked:
+                # The row was named but the widget re-rendered it away before the click could land. The
+                # same row sits on the list a COARSER query renders, which settles instead of churning,
+                # so ask that question rather than report a dead end over a selection never delivered.
+                laddered = await _reduced_query_ladder()
+                if isinstance(laddered, ToolResult) and laddered.status == "ok":
+                    return laddered
+                await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+            return await _typeahead_verdict_result(
+                pick.suggestion, pick.committed, pick.readable, declared=pick.declared
+            )
         # A non-typeable anchor (a button/div that only opens a list on click): open, observe, pick.
         return await _open_observe_pick(page, selector, value)
 
