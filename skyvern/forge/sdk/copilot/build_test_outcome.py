@@ -208,7 +208,11 @@ class BuildTestPacketLocatorObservation(BaseModel):
 class BuildTestPacketFailure(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    workflow_run_block_id: str | None = None
+    task_id: str | None = None
+    step_id: str | None = None
     block_label: str | None = None
+    block_type: str | None = None
     block_status: str | None = None
     reason: str | None = None
     error_codes: list[str] = Field(default_factory=list)

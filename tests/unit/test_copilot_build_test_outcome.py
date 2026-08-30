@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestEvidencePacket,
     BuildTestPacketDownload,
+    BuildTestPacketFailure,
     BuildTestPacketLocatorObservation,
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
@@ -43,6 +44,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _failing_code_line,
     _first_failed_result,
     _record_run_blocks_result,
+    _recorded_run_block_result,
     build_test_evidence_packet,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -1211,6 +1213,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         failure_reason="Code block failed.",
     )
     block = SimpleNamespace(
+        workflow_run_block_id="wrb_failed_complete_packet",
+        task_id=None,
         label="collect_records",
         block_type=SimpleNamespace(name="CODE"),
         status="failed",
@@ -2400,6 +2404,178 @@ def test_a_failure_the_runner_did_not_type_carries_neither_field() -> None:
     assert packet.failure is not None
     assert packet.failure.error_codes == []
     assert packet.failure.failing_line is None
+
+
+def test_native_failed_block_identity_survives_packet_projection_and_aggregate_compaction() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["action_observations"] = ["click completed"]
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_native",
+            "task_id": "tsk_native",
+            "step_id": "stp_native",
+            "label": "native_task",
+            "block_type": "TASK",
+            "status": "failed",
+            "failure_reason": "Reached the maximum steps (30)",
+        }
+    ]
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+    projected = project_build_test_packet_for_llm(packet)
+    compacted = project_build_test_packet_for_llm(_oversized_packet(packet))
+
+    assert packet.failure is not None
+    assert projected.failure is not None
+    assert compacted.failure is not None
+    expected = ("wrb_native", "tsk_native", "stp_native", "TASK")
+    for failure in (packet.failure, projected.failure, compacted.failure):
+        assert (
+            failure.workflow_run_block_id,
+            failure.task_id,
+            failure.step_id,
+            failure.block_type,
+        ) == expected
+    assert [notice for notice in projected.omission_notices if notice.startswith("failure.page_state omitted:")] == [
+        "failure.page_state omitted: no bounded same-run page state was recorded."
+    ]
+
+
+def test_historical_failure_packet_without_native_identities_remains_valid() -> None:
+    failure = BuildTestPacketFailure(block_label="code", block_status="failed", reason="boom")
+
+    assert failure.workflow_run_block_id is None
+    assert failure.task_id is None
+    assert failure.step_id is None
+    assert failure.block_type is None
+
+
+def test_recorded_run_block_result_keeps_native_machine_identities() -> None:
+    row = SimpleNamespace(
+        workflow_run_block_id="wrb_native",
+        task_id="tsk_native",
+        label="native_task",
+        block_type=SimpleNamespace(name="TASK"),
+        status="failed",
+        failure_reason="Reached the maximum steps (30)",
+        error_codes=["max_steps_exceeded"],
+        output=None,
+    )
+
+    result = _recorded_run_block_result(row)
+
+    assert result == {
+        "workflow_run_block_id": "wrb_native",
+        "task_id": "tsk_native",
+        "label": "native_task",
+        "block_type": "TASK",
+        "status": "failed",
+        "failure_reason": "Reached the maximum steps (30)",
+        "error_codes": ["max_steps_exceeded"],
+    }
+
+
+@pytest.fixture
+def synthetic_native_actions_newest_first() -> list[SimpleNamespace]:
+    """Synthetic rows exercise ordering and privacy without claiming production custody."""
+    return [
+        SimpleNamespace(
+            task_id="tsk_synthetic",
+            step_id="stp_newest",
+            action_type="click",
+            status="completed",
+            reasoning="private reasoning newest",
+            element_id="private-element-newest",
+            output=None,
+            response=None,
+        ),
+        *[
+            SimpleNamespace(
+                task_id="tsk_synthetic",
+                step_id=f"stp_{number}",
+                action_type=action_type,
+                status="completed",
+                reasoning=f"private reasoning {number}",
+                element_id=f"private-element-{number}",
+                output=None,
+                response=None,
+            )
+            for number, action_type in [
+                (5, "scroll"),
+                (4, "wait"),
+                (3, "hover"),
+                (2, "select_option"),
+                (1, "input_text"),
+                (0, "goto_url"),
+            ]
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_actions_use_newest_step_and_keep_newest_six_chronological(
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_native_actions_newest_first: list[SimpleNamespace],
+) -> None:
+    block = SimpleNamespace(task_id="tsk_synthetic")
+    result = {"status": "failed"}
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            tasks=SimpleNamespace(
+                get_recent_actions_for_tasks=AsyncMock(return_value=synthetic_native_actions_newest_first)
+            )
+        )
+    )
+    monkeypatch.setattr(run_execution_module, "app", fake_app)
+
+    await run_execution_module._attach_action_traces([block], [result], "org_native")
+
+    assert result["step_id"] == "stp_newest"
+    assert run_execution_module._retained_action_observations([result]) == [
+        "input_text completed",
+        "select_option completed",
+        "hover completed",
+        "wait completed",
+        "scroll completed",
+        "click completed",
+    ]
+    summary = run_execution_module._failure_action_trace_summary(result)
+    assert summary == run_execution_module._retained_action_observations([result])
+    assert "private" not in str(summary)
+    assert "goto_url" not in str(summary)
+
+
+def test_native_actions_bound_the_global_newest_slice_before_chronological_rendering() -> None:
+    results = [
+        {
+            "action_trace": [
+                {"action": "click", "status": "completed"},
+                {"action": "scroll", "status": "completed"},
+                {"action": "wait", "status": "completed"},
+                {"action": "hover", "status": "completed"},
+            ]
+        },
+        {
+            "action_trace": [
+                {"action": "select_option", "status": "completed"},
+                {"action": "input_text", "status": "completed"},
+                {"action": "goto_url", "status": "completed"},
+                {"action": "reload_page", "status": "completed"},
+            ]
+        },
+    ]
+
+    assert run_execution_module._retained_action_observations(results) == [
+        "input_text completed",
+        "select_option completed",
+        "hover completed",
+        "wait completed",
+        "scroll completed",
+        "click completed",
+    ]
 
 
 def test_the_failing_line_is_read_from_the_recorders_own_stamp() -> None:

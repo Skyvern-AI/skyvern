@@ -169,7 +169,7 @@ from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -438,7 +438,7 @@ def _copilot_sandbox_unavailable_result(*, organization_id: str, workflow_perman
 
 
 async def _attach_action_traces(
-    blocks: list,
+    blocks: list[WorkflowRunBlock],
     results: list[dict[str, Any]],
     organization_id: str,
     *,
@@ -458,7 +458,7 @@ async def _attach_action_traces(
             task_ids=task_ids,
             organization_id=organization_id,
         )
-    except Exception:  # noqa: BLE001 - optional enrichment must not gate a completed run
+    except Exception:
         if not include_completed:
             raise
         LOG.warning(
@@ -469,18 +469,25 @@ async def _attach_action_traces(
         )
         return
 
-    actions_by_task: dict[str, list] = defaultdict(list)
+    actions_by_task: dict[str, list[Action]] = defaultdict(list)
     for row in rows:
         if row.task_id is not None:
             actions_by_task[row.task_id].append(row)
 
     for block, block_result in zip(blocks, results):
-        if not block.task_id or (not include_completed and block_result.get("status") not in _FAILED_BLOCK_STATUSES):
+        task_id = block.task_id
+        if not task_id or (not include_completed and block_result.get("status") not in _FAILED_BLOCK_STATUSES):
             continue
-        task_actions = actions_by_task.get(block.task_id, [])
+        task_actions = actions_by_task.get(task_id, [])
+        newest_step_id = next(
+            (step_id for action in task_actions if isinstance(step_id := action.step_id, str) and step_id),
+            None,
+        )
+        if newest_step_id is not None:
+            block_result["step_id"] = newest_step_id
         action_trace = []
         for action in task_actions:
-            entry = {
+            entry: dict[str, str | int | None] = {
                 "action": action.action_type,
                 "status": action.status,
                 "reasoning": action.reasoning[:150] if action.reasoning else None,
@@ -501,6 +508,23 @@ async def _attach_action_traces(
                     ]
             action_trace.append(entry)
         block_result["action_trace"] = action_trace
+
+
+def _recorded_run_block_result(block: WorkflowRunBlock) -> dict[str, Any]:
+    """Project one persisted run-block row without dropping its machine identity."""
+    result: dict[str, Any] = {
+        "label": block.label,
+        "block_type": block.block_type.name,
+        "status": block.status,
+    }
+    result["workflow_run_block_id"] = block.workflow_run_block_id
+    if block.task_id:
+        result["task_id"] = block.task_id
+    if block.failure_reason:
+        result["failure_reason"] = block.failure_reason
+    if block.error_codes:
+        result["error_codes"] = list(block.error_codes)
+    return result
 
 
 async def _fetch_last_screenshot_b64(task_id: str, organization_id: str) -> str | None:
@@ -737,33 +761,50 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
     return summary
 
 
-def _retained_action_observations(results: list[dict[str, Any]]) -> list[str]:
-    """Project only server-owned typed action facts from the persisted same-run trace."""
-    observations: list[str] = []
+def _retained_action_observations(results: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Render the newest six safe action facts chronologically from newest-block-first results."""
+    bounded_newest: list[dict[str, Any]] = []
+    entries_seen = 0
     for block_result in results:
         action_trace = block_result.get("action_trace")
         if not isinstance(action_trace, list):
             continue
-        for entry in reversed(action_trace[:6]):
-            if not isinstance(entry, dict):
-                continue
-            raw_action = entry.get("action")
-            raw_status = entry.get("status")
-            if not isinstance(raw_action, str) or not isinstance(raw_status, str):
-                continue
-            try:
-                action = ActionType(raw_action)
-                status = ActionStatus(raw_status)
-            except ValueError:
-                continue
-            observation = f"{action.value} {status.value}"
-            code_line = entry.get("code_line")
-            if type(code_line) is int:
-                observation += f" code_line={code_line}"
-            observations.append(observation)
-        if len(observations) >= 6:
-            return observations[:6]
+        for entry in action_trace:
+            entries_seen += 1
+            if isinstance(entry, dict):
+                bounded_newest.append(entry)
+            if entries_seen == 6:
+                break
+        if entries_seen == 6:
+            break
+
+    observations: list[str] = []
+    for entry in reversed(bounded_newest):
+        raw_action = entry.get("action")
+        raw_status = entry.get("status")
+        if not isinstance(raw_action, str) or not isinstance(raw_status, str):
+            continue
+        try:
+            action = ActionType(raw_action)
+            status = ActionStatus(raw_status)
+        except ValueError:
+            continue
+        observation = f"{action.value} {status.value}"
+        code_line = entry.get("code_line")
+        if type(code_line) is int:
+            observation += f" code_line={code_line}"
+        observations.append(observation)
     return observations
+
+
+def _failure_action_trace_summary(failed_result: Mapping[str, Any] | None) -> list[str]:
+    """Keep code-recorder diagnostics; native task rows use only the safe typed projection."""
+    if failed_result is None:
+        return []
+    action_trace = failed_result.get("action_trace")
+    if _failing_code_line(action_trace) is not None:
+        return _summarize_action_trace(action_trace)
+    return _retained_action_observations([failed_result])
 
 
 # Watchdog exit reasons. ``success`` means the run reached a trustworthy
@@ -3093,15 +3134,7 @@ async def _run_blocks_and_collect_debug(
         results = []
         block_outputs_by_label: dict[str, Any] = {}
         for block in blocks:
-            block_result: dict[str, Any] = {
-                "label": block.label,
-                "block_type": block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type),
-                "status": block.status,
-            }
-            if block.failure_reason:
-                block_result["failure_reason"] = block.failure_reason
-            if block.error_codes:
-                block_result["error_codes"] = list(block.error_codes)
+            block_result = _recorded_run_block_result(block)
             if hasattr(block, "output") and block.output:
                 block_result["extracted_data"] = block.output
                 if block.label is not None:
@@ -3135,7 +3168,7 @@ async def _run_blocks_and_collect_debug(
         first_failed = _first_failed_result(results)
         failing_code_line: int | None = None
         if first_failed is not None:
-            action_trace_summary = _summarize_action_trace(first_failed.get("action_trace"))
+            action_trace_summary = _failure_action_trace_summary(first_failed)
             failing_code_line = _failing_code_line(first_failed.get("action_trace"))
         failed_block_code = _failed_block_code(workflow, first_failed)
 
@@ -3441,15 +3474,7 @@ async def _get_run_results(
 
     results = []
     for block in blocks:
-        block_result: dict[str, Any] = {
-            "label": block.label,
-            "block_type": block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type),
-            "status": block.status,
-        }
-        if block.failure_reason:
-            block_result["failure_reason"] = block.failure_reason
-        if block.error_codes:
-            block_result["error_codes"] = list(block.error_codes)
+        block_result = _recorded_run_block_result(block)
         output = truncate_output(getattr(block, "output", None))
         if output:
             block_result["output"] = output
@@ -3460,7 +3485,8 @@ async def _get_run_results(
         await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
 
     first_failed = _first_failed_result(results)
-    action_trace_summary = _summarize_action_trace(first_failed.get("action_trace")) if first_failed else []
+    action_trace_summary = _failure_action_trace_summary(first_failed)
+    action_observations = _retained_action_observations(results)
     result_data: dict[str, Any] = {
         "workflow_run_id": workflow_run_id,
         "browser_session_id": run.browser_session_id,
@@ -3474,6 +3500,7 @@ async def _get_run_results(
         "blocks": results,
         "failing_code_line": _failing_code_line(first_failed.get("action_trace")) if first_failed else None,
         "action_trace_summary": action_trace_summary,
+        "action_observations": action_observations,
     }
     # When worker-dispatch is enabled for this copilot session the run's persistent browser
     # session is worker-owned (for a non-fresh run ctx.browser_session_id == run_session_id), so
@@ -4799,7 +4826,13 @@ def build_test_evidence_packet(
     failure: BuildTestPacketFailure | None = None
     if failed_block is not None or result.get("ok") is False:
         failure = BuildTestPacketFailure(
+            workflow_run_block_id=(
+                _packet_string(failed_block.get("workflow_run_block_id")) if failed_block is not None else None
+            ),
+            task_id=_packet_string(failed_block.get("task_id")) if failed_block is not None else None,
+            step_id=_packet_string(failed_block.get("step_id")) if failed_block is not None else None,
             block_label=_packet_string(failed_block.get("label")) if failed_block is not None else None,
+            block_type=_packet_string(failed_block.get("block_type")) if failed_block is not None else None,
             block_status=_packet_string(failed_block.get("status")) if failed_block is not None else run_status,
             reason=(
                 _packet_string(failed_block.get("failure_reason"))

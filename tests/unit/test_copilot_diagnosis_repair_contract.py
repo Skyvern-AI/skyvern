@@ -60,7 +60,9 @@ from skyvern.forge.sdk.copilot.tools import composition_capture as composition_c
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.schemas.workflows import BlockType
 from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
 
@@ -3143,14 +3145,19 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
         status="completed",
         failure_reason=None,
     )
-    block = SimpleNamespace(
+    block = WorkflowRunBlock(
+        workflow_run_block_id="wrb_completed_missing_output",
+        workflow_run_id="wr_completed_missing_output",
+        organization_id=ctx.organization_id,
         label="open_result",
-        block_type=SimpleNamespace(name="CODE"),
+        block_type=BlockType.CODE,
         status="completed",
         failure_reason=None,
         error_codes=[],
         output=None,
         final_url="https://example.test/complete",
+        created_at=now,
+        modified_at=now,
     )
     artifact = make_stub_html_artifact("art_completed_terminal", ArtifactType.HTML_ACTION)
     html = (

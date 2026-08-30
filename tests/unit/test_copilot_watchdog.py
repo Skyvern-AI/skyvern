@@ -912,6 +912,7 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
             "label": "extract_heading",
             "block_type": "EXTRACTION",
             "status": "completed",
+            "workflow_run_block_id": "wrb_terminal",
             "extracted_data": {"heading": "Example Domain"},
         }
     ]
