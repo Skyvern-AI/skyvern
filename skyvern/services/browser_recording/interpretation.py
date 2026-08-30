@@ -25,8 +25,10 @@ from skyvern.services.browser_recording.service import (
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
+    ActionClick,
     ActionInputText,
     ActionKind,
+    CredentialKind,
     ExfiltratedCdpEvent,
     ExfiltratedConsoleEvent,
     ExfiltratedEvent,
@@ -111,10 +113,17 @@ def _extra_field(block: OutputBlock, field_name: str, fallback: t.Any) -> t.Any:
     return fallback
 
 
-def _credential_kind_for_action(action: Action) -> t.Literal["password", "totp", "credit_card"] | None:
-    if not isinstance(action, ActionInputText):
+def _credential_kind_for_action(action: Action) -> CredentialKind | None:
+    if not isinstance(action, (ActionClick, ActionInputText)):
         return None
-    return credential_kind_for_target(action.target.input_type, action.target.autocomplete)
+    return credential_kind_for_target(
+        action.target.input_type,
+        action.target.autocomplete,
+        field_id=action.target.id,
+        accessible_name=action.target.accessible_name,
+        texts=action.target.texts,
+        tag_name=action.target.tag_name,
+    )
 
 
 def _draft_step_from_block(

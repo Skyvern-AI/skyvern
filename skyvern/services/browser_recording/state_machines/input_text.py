@@ -104,7 +104,14 @@ class StateMachineInputText(StateMachine):
 
         LOG.debug("~ emitting input text action")
 
-        secret = is_secret_field(self.target.inputType, self.target.autocomplete)
+        secret = is_secret_field(
+            self.target.inputType,
+            self.target.autocomplete,
+            field_id=self.target.id,
+            accessible_name=self.target.accessibleName,
+            texts=self.target.text,
+            tag_name=self.target.tagName,
+        )
         input_value = event.params.target.value
 
         if input_value is None and not secret:

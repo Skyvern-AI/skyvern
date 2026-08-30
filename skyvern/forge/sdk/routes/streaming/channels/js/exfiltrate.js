@@ -125,12 +125,56 @@
       "current-password",
       "new-password",
       "one-time-code",
+      "cc-name",
       "cc-number",
       "cc-csc",
       "cc-exp",
       "cc-exp-month",
       "cc-exp-year",
     ]);
+    const CREDIT_CARD_HINT_PHRASES = [
+      "card number",
+      "credit card",
+      "cardholder",
+      "cvv",
+      "cvc",
+    ];
+    const TOTP_HINT_PHRASES = [
+      "otp",
+      "totp",
+      "2fa",
+      "two factor",
+      "one time code",
+      "verification code",
+      "authenticator code",
+    ];
+    const SECRET_HINT_PHRASES = [
+      "api key",
+      "apikey",
+      "access token",
+      "client secret",
+      "webhook secret",
+      "private key",
+      "bearer token",
+      "secret value",
+    ];
+
+    const normalizeHaystack = (...parts) => {
+      const joined = parts.filter(Boolean).join(" ").toLowerCase();
+      const normalized = joined.replace(/[^a-z0-9]+/g, " ").trim();
+      return normalized ? ` ${normalized} ` : "";
+    };
+
+    const haystackHasPhrase = (haystack, phrase) => {
+      if (!haystack) {
+        return false;
+      }
+      const needle = ` ${String(phrase)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()} `;
+      return haystack.includes(needle);
+    };
 
     const isSecretField = (element) => {
       if (!element) {
@@ -143,9 +187,32 @@
       const autocomplete = String(
         (element.getAttribute && element.getAttribute("autocomplete")) || "",
       ).toLowerCase();
-      return autocomplete
-        .split(/\s+/)
-        .some((token) => SECRET_AUTOCOMPLETE_TOKENS.has(token));
+      if (
+        autocomplete
+          .split(/\s+/)
+          .some((token) => SECRET_AUTOCOMPLETE_TOKENS.has(token))
+      ) {
+        return true;
+      }
+      const haystack = normalizeHaystack(
+        element.id,
+        element.name,
+        element.getAttribute && element.getAttribute("name"),
+        element.getAttribute && element.getAttribute("aria-label"),
+        element.getAttribute && element.getAttribute("placeholder"),
+        element.getAttribute && element.getAttribute("title"),
+      );
+      return (
+        CREDIT_CARD_HINT_PHRASES.some((phrase) =>
+          haystackHasPhrase(haystack, phrase),
+        ) ||
+        TOTP_HINT_PHRASES.some((phrase) =>
+          haystackHasPhrase(haystack, phrase),
+        ) ||
+        SECRET_HINT_PHRASES.some((phrase) =>
+          haystackHasPhrase(haystack, phrase),
+        )
+      );
     };
 
     const IMPLICIT_INPUT_ROLES = {

@@ -591,7 +591,14 @@ class Processor:
             prompt_name = "recording-action-block-prompt-input-text"
             if (
                 isinstance(action, ActionInputText)
-                and is_secret_field(action.target.input_type, action.target.autocomplete)
+                and is_secret_field(
+                    action.target.input_type,
+                    action.target.autocomplete,
+                    field_id=action.target.id,
+                    accessible_name=action.target.accessible_name,
+                    texts=action.target.texts,
+                    tag_name=action.target.tag_name,
+                )
                 and action.input_value
             ):
                 action = action.model_copy(update={"input_value": ""})
