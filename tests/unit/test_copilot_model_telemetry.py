@@ -5,7 +5,7 @@ import contextlib
 import json
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,6 +22,7 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.model_telemetry import (
@@ -1000,7 +1001,7 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
         def __init__(self, servers: object) -> None:
             self.active_servers = servers
 
-        async def __aenter__(self) -> FakeMCPServerManager:
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *args: object) -> None:
@@ -1053,3 +1054,154 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
 
     assert result.resolved_model == "model-SECONDARY"
     assert result.resolved_model != "model-PRIMARY"
+
+
+@pytest.mark.asyncio
+async def test_model_setup_failure_does_not_claim_the_unstarted_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingMCPServerManager:
+        def __init__(self, _servers: object) -> None:
+            pass
+
+        async def __aenter__(self) -> Self:
+            raise RuntimeError("setup failed")
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    def fake_resolve_model_config(
+        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+    ) -> tuple[str, object, str, bool]:
+        del copilot_config, llm_key_override
+        return "model-PRIMARY", object(), "PRIMARY", True
+
+    enforcement = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("agents.mcp.MCPServerManager", FailingMCPServerManager)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", enforcement)
+
+    result = await copilot_agent_module.run_copilot_agent(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        organization_id="org-1",
+        chat_request=SimpleNamespace(
+            message="build it",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_run_id=None,
+            workflow_yaml="",
+            browser_session_id=None,
+            product_action=None,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.resolved_model is None
+    enforcement.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("fallback_enabled", "expected_model"),
+    [
+        pytest.param(False, "model-PRIMARY", id="primary"),
+        pytest.param(True, "model-SECONDARY", id="fallback"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_enabled: bool,
+    expected_model: str,
+) -> None:
+    class FakeRateLimitError(Exception):
+        pass
+
+    FakeRateLimitError.__module__ = "openai"
+
+    class FakeMCPServerManager:
+        def __init__(self, servers: object) -> None:
+            self.active_servers = servers
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    def fake_resolve_model_config(
+        _handler: object, *, copilot_config: object = None, llm_key_override: str | None = None
+    ) -> tuple[str, object, str, bool]:
+        del copilot_config
+        key = llm_key_override or "PRIMARY"
+        return f"model-{key}", object(), key, True
+
+    attempt_count = 0
+
+    async def timeout_after_browser_activity(**kwargs: object) -> None:
+        nonlocal attempt_count
+        attempt_count += 1
+        if fallback_enabled and attempt_count == 1:
+            raise FakeRateLimitError("rate limit")
+        ctx = cast(copilot_agent_module.CopilotContext, kwargs["ctx"])
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.eval_tool_activity = [{"tool_name": "navigate_browser", "success": True}]
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.mcp_adapter.SkyvernOverlayMCPServer.list_tools",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+        AsyncMock(side_effect=timeout_after_browser_activity),
+    )
+
+    result = await copilot_agent_module.run_copilot_agent(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        organization_id="org-1",
+        chat_request=SimpleNamespace(
+            message="research it",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_run_id=None,
+            workflow_yaml="",
+            browser_session_id=None,
+            product_action=None,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(fallback_llm_key="SECONDARY" if fallback_enabled else None),
+        eval_mode=CopilotEvalMode.BROWSER_ABLATION,
+    )
+
+    assert result.resolved_model == expected_model
+    assert result.user_response == copilot_agent_module._BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
+    assert "workflow" not in result.user_response.lower()
+    assert "draft" not in result.user_response.lower()
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+    assert result.browser_ablation_metadata is not None
+    assert result.browser_ablation_metadata["eval_mode"] == "browser_ablation"
+    assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]

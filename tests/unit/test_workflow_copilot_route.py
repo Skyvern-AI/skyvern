@@ -228,7 +228,7 @@ async def test_finalise_normal_turn_finalizes_terminal_envelope_without_auto_acc
 
 
 @pytest.mark.asyncio
-async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadata(
+async def test_browser_ablation_timeout_response_preserves_model_terminal_cause_and_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chat = SimpleNamespace(
@@ -248,11 +248,28 @@ async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadat
         "tool_activity": [{"tool_name": "navigate_browser", "success": True}],
         "screenshot_frames": [{"capture_id": "frame-1", "image_b64": "encoded"}],
     }
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=False,
+        workflow_applied=False,
+        proposal_disposition="no_proposal",
+        run_outcomes=[],
+        blocker_reason=None,
+        halt_kind=None,
+        attempted=None,
+        workflow_mutated=False,
+        workflow_attempted=False,
+        terminal_cause="deadline_expired",
+    )
+    assert envelope is not None
     agent_result = AgentResult(
-        user_response="done",
+        user_response=agent_module._BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY,
         updated_workflow=None,
         global_llm_context=None,
         response_type="REPLY",
+        resolved_model="azure/gpt-5.6-terra",
+        proposal_disposition="no_proposal",
+        terminal_envelope=envelope.model_dump(mode="json"),
         browser_ablation_metadata=metadata,
     )
     setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -269,6 +286,10 @@ async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadat
 
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotBrowserAblationResponseUpdate)
+    assert response_frame.resolved_model == "azure/gpt-5.6-terra"
+    assert response_frame.message == agent_module._BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["terminal_cause"] == "deadline_expired"
     for key, value in metadata.items():
         assert getattr(response_frame, key) == value
 
