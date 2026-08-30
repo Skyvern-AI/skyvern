@@ -1,0 +1,45 @@
+{
+  "schema": "generated-code-exception-packet-v1",
+  "provenance": "runner response produced by tests/browser_e2e/test_workflow_copilot_generated_code_exception_repair.py against a live Chromium page",
+  "runner_exception_class": "builtins.NameError",
+  "runner_failing_line": 2,
+  "workflow_yaml": "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: price_the_trip\n    code: |\n      fare = float(await page.locator(\"#fare\").inner_text())\n      total = fare * passenger_count\n      return {\"total\": f\"{total:.2f}\"}\n",
+  "repaired_workflow_yaml": "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: price_the_trip\n    code: |\n      fare = float(await page.locator(\"#fare\").inner_text())\n      passenger_count = int(await page.locator(\"#pax\").inner_text())\n      total = fare * passenger_count\n      return {\"total\": f\"{total:.2f}\"}\n",
+  "recorded_run_outcome": {
+    "verdict": "not_demonstrated",
+    "reason_code": "blocker_reported",
+    "display_reason": "CodeBlock failed with NameError at line 2: name 'passenger_count' is not defined.",
+    "workflow_run_id": "wr_generated_code_exception_fixture",
+    "run_completed": false
+  },
+  "result": {
+    "ok": false,
+    "data": {
+      "workflow_run_id": "wr_generated_code_exception_fixture",
+      "browser_session_id": "pbs_generated_code_exception_fixture",
+      "overall_status": "failed",
+      "requested_block_labels": [
+        "price_the_trip"
+      ],
+      "executed_block_labels": [
+        "price_the_trip"
+      ],
+      "post_run_page_capture": {
+        "status": "unavailable",
+        "omission": "page_capture_unavailable"
+      },
+      "blocks": [
+        {
+          "label": "price_the_trip",
+          "block_type": "CODE",
+          "status": "failed",
+          "workflow_run_block_id": "wrb_generated_code_exception_fixture",
+          "failure_reason": "CodeBlock failed with NameError at line 2: name 'passenger_count' is not defined.",
+          "error_codes": [
+            "user_code_error"
+          ]
+        }
+      ]
+    }
+  }
+}

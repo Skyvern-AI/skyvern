@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,6 +38,8 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockType
 
 
 class _FakeStream:
@@ -114,25 +117,48 @@ workflow_definition:
     assert before < ctx.executed_block_fingerprints["step"]
 
 
-@pytest.mark.asyncio
-async def test_watchdog_receipts_preserve_terminal_block_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    observer = SimpleNamespace(
-        get_workflow_run_blocks=lambda **_kwargs: None,
+def _run_block(label: str, status: str, **fields: Any) -> WorkflowRunBlock:
+    now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    return WorkflowRunBlock(
+        workflow_run_block_id=f"wrb_{label}",
+        workflow_run_id="wr_test",
+        organization_id="org",
+        block_type=BlockType.CODE,
+        label=label,
+        status=status,
+        created_at=now,
+        modified_at=now,
+        **fields,
     )
 
-    async def get_workflow_run_blocks(**_kwargs: Any) -> list[SimpleNamespace]:
+
+@pytest.mark.asyncio
+async def test_watchdog_receipts_carry_why_a_block_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run capped by the watchdog still has to say what failed, not only that something did."""
+
+    async def get_workflow_run_blocks(**_kwargs: Any) -> list[WorkflowRunBlock]:
         return [
-            SimpleNamespace(label="ran", status=SimpleNamespace(value="failed")),
-            SimpleNamespace(label="waiting", status=SimpleNamespace(value="queued")),
+            _run_block(
+                "ran",
+                "failed",
+                failure_reason="CodeBlock failed with NameError at line 2: name 'total' is not defined.",
+                error_codes=["user_code_error"],
+            ),
+            _run_block("waiting", "queued"),
         ]
 
-    observer.get_workflow_run_blocks = get_workflow_run_blocks
-    monkeypatch.setattr(run_execution.app.DATABASE, "observer", observer)
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "observer",
+        SimpleNamespace(get_workflow_run_blocks=get_workflow_run_blocks),
+    )
 
-    assert await _recorded_watchdog_block_receipts("wr_test", "org") == [
-        {"label": "ran", "status": "failed"},
-        {"label": "waiting", "status": "queued"},
-    ]
+    receipts = await _recorded_watchdog_block_receipts("wr_test", "org")
+
+    assert [receipt["status"] for receipt in receipts] == ["failed", "queued"]
+    assert receipts[0]["block_type"] == "CODE"
+    assert receipts[0]["error_codes"] == ["user_code_error"]
+    assert "NameError" in receipts[0]["failure_reason"]
 
 
 def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:

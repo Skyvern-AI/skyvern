@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
     record_build_test_outcome,
+    recorded_outcome_from_run_blocks_result,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
@@ -6300,6 +6301,88 @@ workflow_definition:
 
         assert rendered["facts"]["matchingSourceBlockCount"] == rendered["facts"]["authoredBlockCount"]
         assert rendered["facts"]["runCompleted"] is True
+        assert rendered["disposition"] == "review_untested"
+
+    @staticmethod
+    def _code_yaml(body: str) -> str:
+        return f"workflow_definition:\n  blocks:\n  - block_type: code\n    label: price\n    code: |\n      {body}\n"
+
+    @staticmethod
+    def _raised_run(run_id: str, failure_reason: str) -> Any:
+        return recorded_outcome_from_run_blocks_result(
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": run_id,
+                    "overall_status": "failed",
+                    "requested_block_labels": ["price"],
+                    "blocks": [
+                        {
+                            "label": "price",
+                            "block_type": "CODE",
+                            "status": "failed",
+                            "failure_reason": failure_reason,
+                            "error_codes": ["user_code_error"],
+                        }
+                    ],
+                },
+            }
+        )
+
+    def _proposed_after_code_failure(
+        self,
+        failure_reason: str,
+        proposal: str,
+        *,
+        persisted: str = "workflow_definition:\n  blocks: []\n",
+        raised: str | None = None,
+    ) -> dict[str, Any]:
+        """A code block fails mid-turn, then the turn proposes ``proposal``.
+
+        ``persisted_workflow_yaml`` stays at the turn-start snapshot because nothing writes it
+        mid-turn; a test that hand-sets it to the proposal cannot see either failure direction.
+        """
+        raised = raised or self._code_yaml("total = fare * pax")
+        ctx = _ctx(
+            persisted_workflow_yaml=persisted,
+            workflow_yaml=raised,
+            last_run_outcome=_clean_recorded_run(),
+        )
+        record_build_test_outcome(ctx, self._raised_run("wr_raised", failure_reason))
+        ctx.workflow_yaml = proposal
+        record_build_test_outcome(ctx, passing_run("wr_later", ["price"]))
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(proposal).items()
+        }
+        ctx.executed_block_labels = {"price"}
+        return self._render(ctx, proposal)
+
+    def test_a_repaired_and_passing_code_failure_keeps_the_tested_pill(self) -> None:
+        """The block raised, the model rewrote it, and the re-run passed, so the turn is tested."""
+        rendered = self._proposed_after_code_failure(
+            "CodeBlock failed with NameError at line 1: name 'fare' is not defined.",
+            self._code_yaml("total = float(await page.locator('#fare').inner_text())"),
+        )
+
+        assert rendered["facts"]["ranCleanOnCurrentSource"] is True
+        assert rendered["disposition"] == "review_tested"
+
+    def test_a_proposal_still_carrying_the_failing_call_never_reads_as_tested(self) -> None:
+        """The pill claims the proposal ran clean, so a later passing run cannot launder a draft
+        that still carries the call the failure named.
+
+        The turn-start workflow does carry the block but not that call, so reading persistence here
+        would report the call as already removed and hand the draft a tested pill it never earned.
+        """
+        failing_call = 'await page.locator("#pay-now").click()'
+        rendered = self._proposed_after_code_failure(
+            'Timeout 30000ms exceeded. Call log: waiting for locator("#pay-now") to be visible',
+            self._code_yaml(failing_call),
+            persisted=self._code_yaml('await page.goto("https://shop.test/cart")'),
+            raised=self._code_yaml(failing_call),
+        )
+
+        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
         assert rendered["disposition"] == "review_untested"
 
     def test_full_coverage_over_an_unconfirmed_outcome_drops_the_tested_pill(self) -> None:

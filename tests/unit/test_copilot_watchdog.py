@@ -825,7 +825,18 @@ async def test_non_success_watchdog_result_types_selected_failed_block_locators(
         MagicMock(return_value=True),
     )
     forge_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
-        return_value=[SimpleNamespace(label="click_submit", status=SimpleNamespace(value="failed"))]
+        return_value=[
+            WorkflowRunBlock(
+                label="click_submit",
+                block_type=BlockType.CODE,
+                status="failed",
+                workflow_run_block_id="wrb_click_submit",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+            )
+        ]
     )
     observe = AsyncMock(return_value=[{"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}])
     monkeypatch.setattr(run_execution, "_observe_authored_locators", observe)
