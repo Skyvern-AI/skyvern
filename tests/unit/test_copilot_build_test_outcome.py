@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     build_test_evidence_packet,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -1439,6 +1440,289 @@ def _run_history_ctx(workflow_yaml: str) -> SimpleNamespace:
         recorded_build_test_outcome_history=[],
         recorded_persisted_block_run_workflow_run_id=None,
     )
+
+
+def _raising_code_workflow_yaml(code: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: book_trip\n"
+        "    code: |\n" + "".join(f"      {line}\n" for line in code.splitlines())
+    )
+
+
+def _generated_code_exception_result(
+    workflow_run_id: str,
+    failure_reason: str,
+) -> dict[str, object]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": workflow_run_id,
+            "browser_session_id": "pbs_trip",
+            "overall_status": "failed",
+            "requested_block_labels": ["book_trip"],
+            "executed_block_labels": ["book_trip"],
+            # The run reached the page but retained no usable evidence of it, which is the shape
+            # that used to erase the whole outcome.
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+            "blocks": [
+                {
+                    "label": "book_trip",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "workflow_run_block_id": "wrb_trip",
+                    "failure_reason": failure_reason,
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+        },
+    }
+
+
+def test_generated_code_exception_reaches_repair_and_needs_a_changed_submission() -> None:
+    """A raised exception is the only evidence: no page state, no outputs, no failure categories."""
+    raising_code = "total = passenger_count * fare\nawait page.locator('#pay-now').click()\n"
+    repaired_code = (
+        "total = int(await page.locator('#pax').input_value()) * fare\nawait page.locator('#pay-now').click()\n"
+    )
+    failure_reason = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
+    other_line_reason = "CodeBlock failed with NameError at line 2: name 'passenger_count' is not defined."
+
+    ctx = CopilotContext(
+        organization_id="org",
+        workflow_id="w",
+        workflow_permanent_id="wpid",
+        workflow_yaml=_raising_code_workflow_yaml(raising_code),
+        persisted_workflow_yaml=_raising_code_workflow_yaml(raising_code),
+        browser_session_id=None,
+        stream=None,  # type: ignore[arg-type]
+        api_key=None,
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        _generated_code_exception_result("wr_trip", failure_reason),
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason=failure_reason,
+            workflow_run_id="wr_trip",
+            run_completed=False,
+        ),
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"
+    assert outcome.attempted_block_label == "book_trip"
+    assert outcome.is_authoritative is True
+    assert failure_reason in outcome.observed_evidence_summary
+    assert outcome.page_capture is not None and outcome.page_capture.omission == "page_capture_unavailable"
+
+    # Two exceptions in the same block are different failures, not one repeated one.
+    other_line_outcome = recorded_outcome_from_run_blocks_result(
+        _generated_code_exception_result("wr_trip_again", other_line_reason)
+    )
+    assert other_line_outcome is not None
+    assert other_line_outcome.structural_key != outcome.structural_key
+
+    # The exception's own message is written by the failing code, so it cannot decide identity.
+    # These two ran out of the same unlocatable raise; only the value the message quotes differs.
+    unlocated = "CodeBlock failed with NameError: name 'passenger_count' is not defined."
+    unlocated_quoting_a_line = "CodeBlock failed with NameError: name 'passenger_count' is not defined at line 9."
+    assert (
+        recorded_outcome_from_run_blocks_result(
+            _generated_code_exception_result("wr_trip_third", unlocated_quoting_a_line)
+        ).structural_key  # type: ignore[union-attr]
+        == recorded_outcome_from_run_blocks_result(
+            _generated_code_exception_result("wr_trip_fourth", unlocated)
+        ).structural_key  # type: ignore[union-attr]
+    )
+
+    record_build_test_outcome(ctx, outcome)
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+    assert failure_reason in rendered
+    assert "page_capture: status=unavailable; omission=page_capture_unavailable" in rendered
+
+    # Re-running the same code does not clear the failure; a changed submission does.
+    assert unresolved_runtime_block_failure(
+        ctx,
+        reported_workflow_yaml=_raising_code_workflow_yaml(raising_code),
+        pending_later_run_id="wr_trip_rerun",
+    ) == UnresolvedRuntimeFailure(workflow_run_id="wr_trip", block_label="book_trip")
+    assert (
+        unresolved_runtime_block_failure(
+            ctx,
+            reported_workflow_yaml=_raising_code_workflow_yaml(repaired_code),
+            pending_later_run_id="wr_trip_rerun",
+        )
+        is None
+    )
+
+
+def _looped_code_workflow_yaml(code: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "  - block_type: for_loop\n"
+        "    label: per_passenger\n"
+        "    loop_over: passengers\n"
+        "    loop_blocks:\n"
+        "    - block_type: code\n"
+        "      label: book_trip\n"
+        "      code: |\n" + "".join(f"        {line}\n" for line in code.splitlines())
+    )
+
+
+def test_a_repaired_code_block_inside_a_loop_clears_its_failure() -> None:
+    """A nested block is repaired by editing its code, so its signature has to be readable there."""
+    raising_code = "total = passenger_count * fare\n"
+    repaired_code = "total = int(await page.locator('#pax').input_value()) * fare\n"
+    failure_reason = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
+
+    ctx = _run_history_ctx(_looped_code_workflow_yaml(raising_code))
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_run_blocks_result(_generated_code_exception_result("wr_loop", failure_reason)),
+    )
+
+    assert ctx.recorded_build_test_outcome_history[-1]["attempted_block_signature"]
+    assert unresolved_runtime_block_failure(
+        ctx,
+        reported_workflow_yaml=_looped_code_workflow_yaml(raising_code),
+        pending_later_run_id="wr_loop_rerun",
+    ) == UnresolvedRuntimeFailure(workflow_run_id="wr_loop", block_label="book_trip")
+    assert (
+        unresolved_runtime_block_failure(
+            ctx,
+            reported_workflow_yaml=_looped_code_workflow_yaml(repaired_code),
+            pending_later_run_id="wr_loop_rerun",
+        )
+        is None
+    )
+
+
+def test_a_code_failure_with_no_typed_identity_is_not_admitted() -> None:
+    """Nothing names the failure, so no later edit could ever be shown to have addressed it."""
+    assert (
+        recorded_outcome_from_run_blocks_result(
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_untyped",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["book_trip"],
+                    "blocks": [
+                        {
+                            "label": "book_trip",
+                            "block_type": "CODE",
+                            "status": "failed",
+                            "failure_reason": "the block did not produce the requested output",
+                        }
+                    ],
+                },
+            }
+        )
+        is None
+    )
+
+
+def test_a_recorded_code_failure_always_has_a_route_out_and_native_blocks_stay_out() -> None:
+    """Both edges of admitting a bare block failure.
+
+    A non-builtin exception inside a code block reaches persistence as the runner's generic phrase,
+    naming neither the exception nor a line, and that failure still has to clear when the block is
+    rewritten. A native block — which has no code signature to change — must not be admitted at
+    all, or its unresolved-failure note could never be cleared by any edit.
+    """
+    # Byte-for-byte what the runner persists when the raised class is not a builtin, e.g. a
+    # Playwright timeout: the exception's own words are stripped on the way out.
+    generic_reason = "CodeBlock failed while running user code."
+    timed_out = 'await page.locator("#pay-now").click()\n'
+    repaired_same_selector = 'await page.locator("#pay-now").first.click(timeout=15000)\n'
+
+    ctx = _run_history_ctx(_raising_code_workflow_yaml(timed_out))
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_run_blocks_result(
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_browser_op",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["book_trip"],
+                    "blocks": [
+                        {
+                            "label": "book_trip",
+                            "block_type": "CODE",
+                            "status": "failed",
+                            "failure_reason": generic_reason,
+                            "error_codes": ["user_code_error"],
+                        }
+                    ],
+                },
+            }
+        ),
+    )
+    assert (
+        unresolved_runtime_block_failure(
+            ctx,
+            reported_workflow_yaml=_raising_code_workflow_yaml(repaired_same_selector),
+            pending_later_run_id="wr_browser_op_rerun",
+        )
+        is None
+    )
+
+    # A failure no rewrite could have prevented is not recorded as an authored-code failure: the
+    # same block can pass unchanged once the sandbox is back, the browser reconnects, or the run is
+    # not cancelled, and recording one would hold the block open until an unrelated edit.
+    for code in ("runner_unavailable", "browser_disconnected", "cancelled"):
+        assert (
+            recorded_outcome_from_run_blocks_result(
+                {
+                    "ok": False,
+                    "data": {
+                        "workflow_run_id": f"wr_{code}",
+                        "overall_status": "failed",
+                        "requested_block_labels": ["book_trip"],
+                        "blocks": [
+                            {
+                                "label": "book_trip",
+                                "block_type": "CODE",
+                                "status": "failed",
+                                "failure_reason": generic_reason,
+                                "error_codes": [code],
+                            }
+                        ],
+                    },
+                }
+            )
+            is None
+        ), code
+
+    native_outcome = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_native",
+                "overall_status": "failed",
+                "requested_block_labels": ["inspect_record"],
+                "blocks": [
+                    {
+                        "label": "inspect_record",
+                        "block_type": "TASK",
+                        "status": "failed",
+                        "failure_reason": "Reached the maximum steps (30)",
+                        "error_codes": ["max_steps_exceeded"],
+                    }
+                ],
+            },
+        }
+    )
+    assert native_outcome is None
 
 
 def test_failure_stays_open_when_a_later_run_passes_without_taking_the_failed_branch() -> None:
