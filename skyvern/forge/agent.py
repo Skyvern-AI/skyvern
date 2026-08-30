@@ -127,6 +127,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -1346,7 +1347,14 @@ class ForgeAgent:
             validate_and_fill_extraction_result,
         )
         from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
-        from skyvern.forge.taskv3.block_context import render_block_context
+        from skyvern.forge.taskv3.block_context import (
+            MAX_PERSISTED_FINISH_REASON_CHARS,
+            PreviousBlockHandoff,
+            mask_signed_urls_in_text,
+            render_block_context,
+            sanitize_handoff_url,
+            select_previous_block,
+        )
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
@@ -1358,6 +1366,7 @@ class ForgeAgent:
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import pending_marker
+        from skyvern.utils.token_counter import approx_count_tokens
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
@@ -1446,8 +1455,26 @@ class ForgeAgent:
             if task.workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id)
             else None
         )
+        handoff_enabled = bool(settings.TASK_V3_BLOCK_HANDOFF and task_block is not None and task.workflow_run_id)
+        previous_block: PreviousBlockHandoff | None = None
+        if handoff_enabled and task.workflow_run_id:
+            # Read the durable block rows, not a process-local cache: a Temporal worker can restart
+            # between blocks. Fail open — a lookup error must not fail a healthy run.
+            try:
+                run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+                    workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
+                )
+                previous_block = select_previous_block(run_blocks, task.task_id)
+            except Exception:
+                LOG.warning("task_v3 previous-block handoff lookup failed", task_id=task.task_id, exc_info=True)
         framing, block_context_section = render_block_context(
-            task, task_block, workflow_run_context, page_free_validation=page_free_validation
+            task,
+            task_block,
+            workflow_run_context,
+            page_free_validation=page_free_validation,
+            handoff_enabled=handoff_enabled,
+            previous_block=previous_block,
+            selected_block_labels=context.run_block_labels if context else None,
         )
         if framing:
             goal = f"{goal}\n\n{framing}".strip()
@@ -1899,6 +1926,7 @@ class ForgeAgent:
             turns=outcome.turns,
             tool_calls=outcome.tool_calls,
             action_steps=outcome.action_steps,
+            taskv3_block_context_tokens=approx_count_tokens(block_context_section),
         )
         completion_vetoed = False
         if outcome.status == "completed":
@@ -2060,6 +2088,51 @@ class ForgeAgent:
             )
             if refreshed:
                 task = refreshed
+        if task_block is not None and workflow_run_context is not None:
+            # Record this block's own account and final page for the next block's handoff, now that
+            # the task row is finalized (a vetoed "completed", a reaper timeout, or a cancel that won
+            # the update race must not hand a success story to the next block). Bounded like the frame
+            # persist above so a stalled page or DB read cannot hold up cleanup. Skipped without a run
+            # context: both fields are persisted and API-visible, and masking needs the run's secrets.
+            with contained_effect("task_v3 block handoff persist", task_id=task.task_id):
+                async with asyncio.timeout(30):
+                    try:
+                        own_block = await app.DATABASE.observer.get_workflow_run_block_by_task_id(
+                            task_id=task.task_id, organization_id=organization.organization_id
+                        )
+                    except NotFoundError:
+                        own_block = None
+                    if own_block is not None:
+                        handoff_page = await _fingerprint_page()
+                        raw_final_url = (
+                            handoff_page.url if handoff_page is not None and not handoff_page.is_closed() else None
+                        )
+                        # A login/MFA/OAuth block can leave credentials or server-minted tokens in
+                        # userinfo, query, or fragment, and this column is persisted and API-visible:
+                        # mask registered secrets, then keep only scheme://host/path.
+                        final_url = (
+                            sanitize_handoff_url(workflow_run_context.mask_secrets_in_data(raw_final_url))
+                            if raw_final_url
+                            else None
+                        )
+                        # Mask BEFORE truncating so a secret straddling the cap cannot survive as a
+                        # partial, unmatchable prefix.
+                        handoff_reason = task.failure_reason if task.status != TaskStatus.completed else outcome.reason
+                        finish_reason = (
+                            mask_signed_urls_in_text(str(workflow_run_context.mask_secrets_in_data(handoff_reason)))[
+                                :MAX_PERSISTED_FINISH_REASON_CHARS
+                            ]
+                            if handoff_reason
+                            # An empty string explicitly clears a stale reason left by an earlier
+                            # attempt on the same row (retries reuse the workflow_run_block row).
+                            else ""
+                        )
+                        await app.DATABASE.observer.update_workflow_run_block(
+                            workflow_run_block_id=own_block.workflow_run_block_id,
+                            organization_id=organization.organization_id,
+                            finish_reason=finish_reason,
+                            final_url=final_url,
+                        )
         # A probe-finalized run must not be finalized again (double rename); otherwise the fallback
         # finalize still has to exclude tool-staged inputs from what counts as a download.
         cleanup_list_files_before: list[str] | None = None

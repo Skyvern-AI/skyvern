@@ -470,6 +470,7 @@ class ObserverRepository(BaseRepository):
         output: dict | list | str | None = None,
         failure_reason: str | None = None,
         final_url: str | None = None,
+        finish_reason: str | None = None,
         task_id: str | None = None,
         loop_values: list | None = None,
         current_value: str | None = None,
@@ -531,6 +532,9 @@ class ObserverRepository(BaseRepository):
                     workflow_run_block.failure_reason = failure_reason
                 if final_url:
                     workflow_run_block.final_url = final_url
+                if finish_reason is not None:
+                    # "" explicitly clears a stale reason from a prior attempt on the same row.
+                    workflow_run_block.finish_reason = finish_reason or None
                 # Use `is not None` instead of truthiness checks so that falsy
                 # values like current_index=0, empty loop_values=[], or
                 # current_value="" are correctly persisted. Without this,
