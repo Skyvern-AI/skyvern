@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    INFRASTRUCTURE_RUNNER_ERROR_CODES,
     BuildTestEvidencePacket,
     BuildTestPacketDownload,
     BuildTestPacketFailure,
@@ -265,21 +266,6 @@ _SANDBOX_REQUIRED_BLOCK_TYPES = frozenset(
         BlockType.CODE.value,
         BlockType.WORKFLOW_TRIGGER.value,
         BlockType.TaskV2.value,
-    }
-)
-
-# Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
-# out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
-# a saturated runner gate says nothing about the code, so rewriting it cannot help.
-INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
-    {
-        "runner_unavailable",
-        "protocol_error",
-        "internal_error",
-        "child_exited",
-        "child_no_request",
-        "child_malformed_request",
-        "busy",
     }
 )
 
@@ -648,15 +634,9 @@ async def _recorded_watchdog_block_receipts(workflow_run_id: str, organization_i
     except Exception:
         LOG.debug("Failed to load block receipts after watchdog exit", workflow_run_id=workflow_run_id, exc_info=True)
         return []
-    receipts: list[dict[str, Any]] = []
-    for block in blocks:
-        label = getattr(block, "label", None)
-        raw_status = getattr(block, "status", None)
-        enum_value = getattr(raw_status, "value", None)
-        status = enum_value if isinstance(enum_value, str) else raw_status
-        if isinstance(status, str) and status:
-            receipts.append({"label": label if isinstance(label, str) and label else None, "status": status})
-    return receipts
+    # The same projection a normal run's receipts get: a block that failed before the watchdog exit
+    # failed for a reason, and dropping it here left that failure with no identity to repair.
+    return [_recorded_run_block_result(block) for block in blocks if block.status]
 
 
 def _forget_browser_position(ctx: CopilotContext) -> None:

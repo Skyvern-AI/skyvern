@@ -29,7 +29,7 @@ from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prom
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
 
@@ -93,6 +93,29 @@ _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _BROWSER_OPERATION_FAILED: BuildTestFailedOperationKind = "browser_operation_failed"
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
+# Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
+# out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
+# a saturated runner gate says nothing about the code, so rewriting it cannot help.
+INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "runner_unavailable",
+        "protocol_error",
+        "internal_error",
+        "child_exited",
+        "child_no_request",
+        "child_malformed_request",
+        "busy",
+    }
+)
+
+# The wider question: which failures no rewrite of the block could have prevented. The sandbox
+# faults above, plus the two that end a run from outside it — the browser going away and the run
+# being cancelled. Both can pass unchanged on the next attempt, so recording them as authored-code
+# failures would hold the block open until an edit that had nothing to do with them.
+_NOT_AUTHORED_CODE_ERROR_CODES: frozenset[str] = INFRASTRUCTURE_RUNNER_ERROR_CODES | {
+    "browser_disconnected",
+    "cancelled",
+}
 _PLAYWRIGHT_LOCATOR_WAIT_RE = re.compile(
     r"waiting for locator\((?P<quote>['\"])(?P<selector>.*?)(?P=quote)\)"
     r"(?P<locator_chain>(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)*)\s+to be (?P<state>[a-z_]+)",
@@ -1351,9 +1374,7 @@ def recorded_outcome_from_run_blocks_result(
         attempted_block_label=_redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
         if failed_block is not None
         else "",
-        attempted_call_ref=selector_identity_from_failure(
-            _safe_str(failed_block.get("failure_reason")) if failed_block is not None else ""
-        ),
+        attempted_call_ref=_attempted_call_ref(failed_block),
         verdict=verdict,
         reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
@@ -1369,7 +1390,12 @@ def recorded_outcome_from_run_blocks_result(
         authored_structure_signature=authored_structure_signature,
         failed_operation=failed_operation,
         executed_block_associations=executed_block_associations,
-        observed_evidence_summary=_bounded_text(run_status),
+        # The failed block's recorded reason carries the exception and its line; the run status is
+        # the word "failed" and says nothing a repair can act on.
+        observed_evidence_summary=(
+            _bounded_text(failed_block.get("failure_reason")) if failed_block is not None else ""
+        )
+        or _bounded_text(run_status),
         key_provenance={
             "structural_failure_identity": (
                 "typed runtime failure structure"
@@ -1471,7 +1497,7 @@ def _code_block_signature_payloads(value: object) -> list[dict[str, object]]:
                         "parameter_keys": _string_list(block.get("parameter_keys")),
                     }
                 )
-        for child_key in ("blocks",):
+        for child_key in ("blocks", "loop_blocks"):
             payloads.extend(_code_block_signature_payloads(block.get(child_key)))
         for branch in _mapping_list(block.get("branch_conditions")):
             payloads.extend(_code_block_signature_payloads(branch.get("blocks")))
@@ -1627,6 +1653,65 @@ def _referenced_unbound_input_keys(
 def _runtime_failure_identity(failed_block: Mapping[str, object] | None) -> str:
     if failed_block is None:
         return ""
+    return _locator_wait_failure_identity(failed_block) or _code_execution_failure_identity(failed_block)
+
+
+def _attempted_call_ref(failed_block: Mapping[str, object] | None) -> str:
+    """The selector whose removal clears this failure, and only when the failure is about it.
+
+    Clearance treats a call ref as the one thing that must change, so a reason that merely mentions
+    a locator must not carry one: a code-execution failure is repaired by rewriting the block, which
+    the block signature already witnesses, and demanding the selector be dropped strands a repair
+    that correctly kept it.
+    """
+    if failed_block is None:
+        return ""
+    if not _locator_wait_failure_identity(failed_block) and _code_execution_failure_identity(failed_block):
+        return ""
+    return selector_identity_from_failure(_safe_str(failed_block.get("failure_reason")))
+
+
+def _is_code_block_failure(failed_block: Mapping[str, object] | None) -> bool:
+    """A native block's failure is the agent's run, not authored code, and has no code signature to
+    change, so it has no route out of an unresolved-failure note."""
+    return failed_block is not None and _safe_str(failed_block.get("block_type")).upper() == BlockType.CODE.name
+
+
+def _runner_authored_reason(failure_reason: str) -> str:
+    """The part of a runner failure reason this repository wrote, without the exception's own words.
+
+    ``codeblock/workflow.py::_with_failure_detail`` builds the reason as a fixed phrase, optionally
+    ``at line N``, then ``": "`` and the raised exception's message. Only the part before that
+    delimiter is ours; the message after it is authored by the failing code, so a value it quotes
+    would otherwise decide whether two runs count as the same failure.
+    """
+    return failure_reason.split(": ", 1)[0].strip()
+
+
+def _code_execution_failure_identity(failed_block: Mapping[str, object]) -> str:
+    """Identity of a generated-code execution failure: the runner's typed error codes and the
+    account of the failure the runner itself authored.
+
+    Without this a raised exception carries no identity at all, so two different exceptions in the
+    same block are indistinguishable and a run whose only evidence is the raise records nothing.
+    """
+    if not _is_code_block_failure(failed_block):
+        return ""
+    error_codes = _clean_list(_string_list(failed_block.get("error_codes")))
+    if not error_codes or any(code in _NOT_AUTHORED_CODE_ERROR_CODES for code in error_codes):
+        return ""
+    return _stable_hash(
+        {
+            "source": "generated_code_execution",
+            "error_codes": error_codes,
+            "runner_reason": _runner_authored_reason(_safe_str(failed_block.get("failure_reason"))),
+            "block_label": _safe_str(failed_block.get("label")),
+            "block_status": _safe_str(failed_block.get("status")),
+        }
+    )
+
+
+def _locator_wait_failure_identity(failed_block: Mapping[str, object]) -> str:
     failure_reason = _safe_str(failed_block.get("failure_reason"))
     if not failure_reason:
         return ""

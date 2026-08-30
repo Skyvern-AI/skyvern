@@ -1073,6 +1073,13 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         f"page_evidence_refs: {_render_authoring_repair_prompt_list(outcome.page_evidence_refs)}",
         f"evidence_refs: {_render_authoring_repair_prompt_list(outcome.evidence_refs)}",
     ]
+    # Without this an unavailable capture is indistinguishable from a page that had nothing on it.
+    page_capture = outcome.page_capture
+    if page_capture is not None:
+        capture_fields = f"status={_clean_authoring_repair_prompt_atom(page_capture.status)}"
+        if page_capture.omission:
+            capture_fields += f"; omission={_clean_authoring_repair_prompt_atom(page_capture.omission)}"
+        lines.append(f"page_capture: {capture_fields}")
     if outcome.missing_requested_output_facts:
         lines.append("missing_requested_output_facts:")
         lines.append(
@@ -1526,13 +1533,19 @@ def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> Na
 
 def _tested_draft_reply(
     ctx: CopilotContext,
-    review: NarrativeReviewProjection | None,
+    proposal_yaml: str | None,
     *,
     tested_reply: str,
     unvalidated_reply: str,
 ) -> str:
-    """The reply and the proposal disposition read one predicate, so prose cannot outrun the pill."""
-    tested = _turn_facts_for_context(ctx, review)["ranCleanOnCurrentSource"]
+    """The reply and the proposal disposition read one predicate, so prose cannot outrun the pill.
+
+    Takes the proposal rather than a built projection so the projection and the open-failure check
+    cannot end up describing two different documents.
+    """
+    tested = _turn_facts_for_context(ctx, _review_projection_for(ctx, proposal_yaml), proposal_yaml)[
+        "ranCleanOnCurrentSource"
+    ]
     return tested_reply if tested else unvalidated_reply
 
 
@@ -1562,13 +1575,23 @@ def _turn_fact_bundle(
     return facts
 
 
-def _turn_facts_for_context(ctx: CopilotContext, review: NarrativeReviewProjection | None) -> NarrativeTurnFacts:
+def _turn_facts_for_context(
+    ctx: CopilotContext,
+    review: NarrativeReviewProjection | None,
+    proposal_yaml: str | None,
+) -> NarrativeTurnFacts:
     return _turn_fact_bundle(
         review,
         select_run_outcome_anchor(_terminal_envelope_run_outcomes(ctx)),
         _terminal_cause_for_context(ctx),
         len(ctx.executed_block_labels),
-        unresolved_runtime_block_failure(ctx),
+        # The proposal these facts describe, not the turn-start persisted workflow. The terminal
+        # seam asks whether the workflow the user can run today still carries the failure and is
+        # right to read persistence; this pill claims the draft ran clean, so a failure the draft
+        # still carries must keep it, and a repair the draft made must clear it. Reading the
+        # turn-start snapshot inverts both: a block authored this turn is always absent from it,
+        # and a call the turn only just introduced always reads as already removed.
+        unresolved_runtime_block_failure(ctx, reported_workflow_yaml=proposal_yaml),
     )
 
 
@@ -1702,7 +1725,7 @@ def _make_agent_result(
         narrative_payload.get("review") if isinstance(narrative_payload, dict) else None
     )
     terminal_cause = _terminal_cause_for_context(ctx) if ctx is not None else None
-    turn_facts = _turn_facts_for_context(ctx, review_projection) if ctx is not None else None
+    turn_facts = _turn_facts_for_context(ctx, review_projection, proposal_yaml) if ctx is not None else None
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
     raw_disposition = kwargs.get("proposal_disposition")
@@ -1782,6 +1805,9 @@ def _make_agent_result(
         # shown, tested, or auto-applied later, but this terminal is assembled before the route
         # commits it, so at claim time it is not yet what anyone would run. `workflow_was_persisted`
         # records a mid-turn canonical write that can still be rolled back, so it proves nothing here.
+        # Deliberately a different question from the tested pill above, which judges the proposal:
+        # both can hold at once, and a turn that repairs a block it authored this turn will say the
+        # draft tested clean while its saved workflow still carries the failure.
         reported_workflow_yaml = ctx.persisted_workflow_yaml
         unresolved_failure, detector_disposition = unresolved_runtime_block_failure_with_disposition(
             ctx, reported_workflow_yaml=reported_workflow_yaml
@@ -2945,7 +2971,7 @@ def _build_wip_exit_result(
         final_text, outcome = _guard(
             _tested_draft_reply(
                 ctx,
-                _review_projection_for(ctx, verified_yaml),
+                verified_yaml,
                 tested_reply=tested_reply,
                 unvalidated_reply=unvalidated_reply,
             )
@@ -2991,7 +3017,7 @@ def _build_wip_exit_result(
         append_failure_detail = recorded_failure_reply and not deadline_suppresses_failure_detail
         held_reply = _tested_draft_reply(
             ctx,
-            _review_projection_for(ctx, ctx.last_good_workflow_yaml),
+            ctx.last_good_workflow_yaml,
             tested_reply=tested_reply,
             unvalidated_reply=unvalidated_reply,
         )
@@ -3038,7 +3064,7 @@ def _build_wip_exit_result(
                 if unvalidated
                 else _tested_draft_reply(
                     ctx,
-                    _review_projection_for(ctx, ctx.last_workflow_yaml),
+                    ctx.last_workflow_yaml,
                     tested_reply=tested_reply,
                     unvalidated_reply=unvalidated_reply,
                 )
