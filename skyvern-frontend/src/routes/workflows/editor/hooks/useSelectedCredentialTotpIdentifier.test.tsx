@@ -37,6 +37,16 @@ const PASSWORD_CRED_NO_TOTP = {
   credential: { username: "bob", password: "*", totp_identifier: null },
 };
 
+const PASSWORD_CRED_ROTATED = {
+  credential_id: "cred-3",
+  credential_type: "password" as const,
+  credential: {
+    username: "carol",
+    password: "*",
+    totp_identifier: "carol@example.com",
+  },
+};
+
 beforeEach(() => {
   credentialsQuery.data = [];
   credentialQuery.data = undefined;
@@ -118,6 +128,45 @@ describe("useSelectedCredentialTotpIdentifier", () => {
       useSelectedCredentialTotpIdentifier("missing_key"),
     );
     expect(result.current).toBeNull();
+  });
+
+  test("reflects every rotated credential's totp_identifier, not just the first", () => {
+    credentialsQuery.data = [PASSWORD_CRED, PASSWORD_CRED_ROTATED];
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "my_cred",
+          parameterType: "credential",
+          credentialId: "cred-1",
+          credentialIds: ["cred-1", "cred-3"],
+        },
+      ],
+    });
+    const { result } = renderHook(() =>
+      useSelectedCredentialTotpIdentifier("my_cred"),
+    );
+    expect(result.current).toBe("alice@example.com, carol@example.com");
+  });
+
+  test("de-dupes identical totp_identifiers shared across rotated credentials", () => {
+    credentialsQuery.data = [
+      PASSWORD_CRED,
+      { ...PASSWORD_CRED_ROTATED, credential: PASSWORD_CRED.credential },
+    ];
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "my_cred",
+          parameterType: "credential",
+          credentialId: "cred-1",
+          credentialIds: ["cred-1", "cred-3"],
+        },
+      ],
+    });
+    const { result } = renderHook(() =>
+      useSelectedCredentialTotpIdentifier("my_cred"),
+    );
+    expect(result.current).toBe("alice@example.com");
   });
 
   test("resolves the identifier from the detail query when the first page omits the credential", () => {
