@@ -29260,6 +29260,17 @@
             ],
             "title": "Final Url"
           },
+          "finish_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finish Reason"
+          },
           "navigation_goal": {
             "anyOf": [
               {
