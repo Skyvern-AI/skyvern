@@ -278,9 +278,9 @@ describe("WorkflowCopilotChat — instant acknowledgement", () => {
 
     // Ask turns emit no narrative frames; the placeholder clears when the turn
     // completes (isLoading falls) as the plain reply lands.
-    await completeStream(0, "It scrapes headlines.");
+    await completeStream(0, "It **scrapes** headlines.");
 
-    expect(screen.getByText("It scrapes headlines.")).toBeTruthy();
+    expect(screen.getByText("scrapes", { selector: "strong" })).toBeTruthy();
     expectNoAckLines();
   });
 

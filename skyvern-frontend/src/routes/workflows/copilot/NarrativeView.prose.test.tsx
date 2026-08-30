@@ -153,7 +153,7 @@ describe("NarrativeView terminal prose", () => {
         turn={terminalTurn({
           responseKind: "answer",
           terminalMessage:
-            "Use **records** with `for_loop`.\n\n- One item per iteration\n- Keep the JSON expanded",
+            "Use **records** with `for_loop`.\n\n- One item per iteration\n- Keep the JSON expanded\n\n[Docs](https://docs.skyvern.com) [unsafe](javascript:alert(1)) ![remote tracker](https://example.test/tracker.png)",
         })}
       />,
     );
@@ -174,6 +174,11 @@ describe("NarrativeView terminal prose", () => {
         .getByText("records", { selector: ".sr-only strong" })
         .closest(".whitespace-normal"),
     ).toBeTruthy();
+    expect(
+      visual.querySelector('a[href="https://docs.skyvern.com"]')?.textContent,
+    ).toBe("Docs");
+    expect(visual.querySelectorAll("a")[1]?.getAttribute("href")).toBe("");
+    expect(visual.querySelector("img")).toBeNull();
   });
 
   it("renders Markdown structure while the response is still revealing", () => {
@@ -219,7 +224,7 @@ describe("NarrativeView terminal prose", () => {
         turn={terminalTurn({
           responseKind: "clarify",
           responseType: "REPLY",
-          terminalMessage: "Which login should I use?",
+          terminalMessage: "Which **login** should I use?",
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: "The sign-in flow did not reach the expected page.",
@@ -229,15 +234,50 @@ describe("NarrativeView terminal prose", () => {
     );
 
     expect(screen.queryByTestId("copilot-terminal-prose")).toBeNull();
+    expect(screen.getByText("login", { selector: "strong" })).toBeTruthy();
     expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
-    expect(container.querySelector(".rounded-xl")).not.toBeNull();
+    expect(container.querySelector(".rounded-xl")).toBeNull();
   });
 
-  it("keeps a build result in its structured summary card", () => {
+  it("shows a run-level unconfirmed outcome when completed blocks have no verdict", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "build",
+          terminalMessage: "I built and tested the navigation block.",
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: "The expected destination was not observed.",
+          },
+          blocks: [
+            {
+              workflowRunBlockId: "wrb-open-site",
+              label: "open_site",
+              blockType: "navigation",
+              state: "completed",
+              lastSeenIteration: 0,
+              activity: [],
+              startedAt: null,
+              endedAt: null,
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
+    expect(
+      screen.getByText(/The expected destination was not observed/),
+    ).toBeTruthy();
+  });
+
+  it("keeps a build result in its structured detail view", () => {
     const { container } = render(
       <NarrativeView
         turn={terminalTurn({
           responseKind: "build",
+          terminalMessage:
+            "I built the **navigation** block. [Read the docs](https://docs.skyvern.com)",
           designStarted: true,
           draft: {
             blockCount: 1,
@@ -261,6 +301,17 @@ describe("NarrativeView terminal prose", () => {
     );
 
     expect(screen.queryByTestId("copilot-terminal-prose")).toBeNull();
-    expect(container.querySelector(".rounded-xl")).not.toBeNull();
+    const formattedText = screen.getByText("navigation", {
+      selector: "strong",
+    });
+    expect(formattedText).toBeTruthy();
+    expect(formattedText.closest(".pl-9")).toBeNull();
+    expect(formattedText.closest(".pr-8")).toBeNull();
+    expect(screen.getAllByText("Open Site").length).toBeGreaterThan(0);
+    expect(container.querySelector(".rounded-xl")).toBeNull();
+    const docsLink = screen.getByRole("link", { name: "Read the docs" });
+    expect(docsLink.closest("button")).toBeNull();
+
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
   });
 });
