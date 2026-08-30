@@ -187,6 +187,7 @@ def convert_workflow_definition(
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
+                totp_field_name=parameter.totp_field_name,
                 created_at=now,
                 modified_at=now,
             )

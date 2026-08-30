@@ -200,6 +200,10 @@ class OnePasswordCredentialParameter(Parameter):
     workflow_id: str
     vault_id: str
     item_id: str
+    # Item field id or label to treat as the TOTP secret, overriding 1Password's own field-type
+    # detection. Needed for items whose OTP is stored in a plain field (e.g. named "digits") rather
+    # than a native 1Password one-time-password field.
+    totp_field_name: str | None = None
 
     created_at: datetime
     modified_at: datetime
