@@ -717,8 +717,8 @@ class AgentResult:
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
     # silently passing as cheap.
     total_tokens: int | None = None
-    # Model name the attempt that actually returned ran on (primary or fallback). None when the
-    # turn never reached an attempt; telemetry only.
+    # Model name for the terminal attempt (primary or fallback), including an interrupted attempt.
+    # None when the turn never reached an attempt; telemetry only.
     resolved_model: str | None = None
     # Set when the agent absorbed an asyncio cancellation initiated by an
     # explicit user Stop. Lets the route route to a cancel-specific

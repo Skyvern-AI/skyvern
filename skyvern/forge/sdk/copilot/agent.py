@@ -2284,6 +2284,17 @@ _TIMEOUT_REPLY_UNVALIDATED = (
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _TIMEOUT_REPLY_TESTED = "I ran out of time, but I have a tested draft for you. Accept it to save, or discard."
+_BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT = "The browser task did not finish before this turn ran out of time."
+_BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY = (
+    f"{_BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT} I recorded browser activity before the timeout."
+)
+
+
+def _browser_ablation_timeout_reply(tool_activity_count: int) -> str:
+    if tool_activity_count:
+        return _BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
+    return _BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT
+
 
 _MAX_TURNS_REPLY_DEFAULT = (
     "I've reached the maximum number of steps, and I don't have a draft workflow to hand over. "
@@ -3026,6 +3037,14 @@ def _merge_exit_context(
 
 
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION:
+        return _build_exit_result(
+            ctx,
+            _browser_ablation_timeout_reply(len(ctx.eval_tool_activity)),
+            global_llm_context,
+            terminal_reason="timeout",
+            proposal_disposition="no_proposal",
+        )
     return _build_wip_exit_result(
         ctx,
         global_llm_context,
@@ -3727,6 +3746,9 @@ async def _run_agent_loop_with_surface(
     output_guardrails: list[Any],
     allow_untested_retry: bool = False,
 ) -> Any:
+    # No model owns the attempt until setup completes and enforcement is ready to
+    # enter the model loop. This also clears a prior model before fallback setup.
+    ctx.resolved_model = None
     from agents import Agent
     from agents.mcp import MCPServerManager
 
@@ -3773,6 +3795,7 @@ async def _run_agent_loop_with_surface(
             attempts = 2 if allow_untested_retry else 1
             for attempt in range(attempts):
                 try:
+                    ctx.resolved_model = model_name
                     result = await run_with_enforcement(
                         agent=agent,
                         initial_input=initial_input,
@@ -4880,9 +4903,6 @@ async def _run_copilot_turn_impl(
             output_guardrails=output_guardrails,
             allow_untested_retry=ctx.allow_untested_workflow_draft,
         )
-        # Recorded only after the attempt returns, so a model that failed and fell back is never
-        # reported as the one that produced the turn.
-        ctx.resolved_model = attempt_model_name
         return attempt
 
     try:
