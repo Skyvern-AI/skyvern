@@ -18832,6 +18832,18 @@
             "title": "Onepassword Item Id",
             "description": "1Password item ID"
           },
+          "onepassword_totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Onepassword Totp Field Name",
+            "description": "1Password item field id or label to treat as the TOTP secret, overriding 1Password's own field-type detection"
+          },
           "azure_vault_name": {
             "anyOf": [
               {
@@ -19650,6 +19662,17 @@
             "type": "string",
             "title": "Item Id"
           },
+          "totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Field Name"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -19715,6 +19738,17 @@
           "item_id": {
             "type": "string",
             "title": "Item Id"
+          },
+          "totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Field Name"
           }
         },
         "type": "object",
