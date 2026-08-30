@@ -50,6 +50,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    _TEXT_MAX,
     _VALUE_EXCERPT_MAX,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
@@ -1082,10 +1083,14 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
             if not isinstance(fact, dict):
                 continue
             fields = []
-            for key in ("output_root", "output_path", "value_status", "reason_code"):
+            # block_label included: two blocks can omit the same declared path, and identical
+            # rendered lines would name only one of them for repair. Rendered at the ceiling the
+            # facts themselves carry, because the line above tells the model to copy output_path
+            # verbatim and a clipped path names nothing that exists.
+            for key in ("output_root", "output_path", "block_label", "value_status", "reason_code"):
                 value = fact.get(key)
                 if isinstance(value, str) and value.strip():
-                    fields.append(f"{key}={_clean_authoring_repair_prompt_atom(value)}")
+                    fields.append(f"{key}={_clean_authoring_repair_prompt_atom(value, max_chars=_TEXT_MAX)}")
             if fields:
                 lines.append(f"- {'; '.join(fields)}")
     if outcome.workflow_run_id:

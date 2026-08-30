@@ -3992,7 +3992,9 @@ def _record_run_blocks_result(
     record_pending_runtime_authoring_repair_context(copilot_ctx, result)
 
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
-    anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
+    anti_bot_match, empty_data_blocks, failure_categories, goal_path_omissions = _analyze_run_blocks(
+        result, copilot_ctx
+    )
     infrastructure_runner_codes = _infrastructure_runner_error_codes(result)
     if infrastructure_runner_codes:
         copilot_ctx.last_infrastructure_tool_error = ", ".join(infrastructure_runner_codes)
@@ -4155,7 +4157,7 @@ def _record_run_blocks_result(
             copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
             copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        _record_build_test_outcome(copilot_ctx, result, recorded_outcome)
+        _record_build_test_outcome(copilot_ctx, result, recorded_outcome, goal_path_omissions)
         return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
@@ -4183,7 +4185,7 @@ def _record_run_blocks_result(
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         run_completed=False,
     )
-    _record_build_test_outcome(copilot_ctx, result, recorded_outcome)
+    _record_build_test_outcome(copilot_ctx, result, recorded_outcome, goal_path_omissions)
     return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
 
@@ -4211,6 +4213,7 @@ def _build_recorded_build_test_outcome(
     copilot_ctx: CopilotContext,
     result: dict[str, Any],
     recorded_run_outcome: RecordedRunOutcome | None,
+    declared_goal_path_omissions: Sequence[Mapping[str, str]] | None = None,
 ) -> RecordedBuildTestOutcome | None:
     raw_result_data = result.get("data")
     result_data = raw_result_data if isinstance(raw_result_data, dict) else {}
@@ -4258,6 +4261,7 @@ def _build_recorded_build_test_outcome(
         ),
         requested_output_parameter_payloads=requested_output_parameter_payloads,
         registered_output_parameter_payloads=registered_output_parameter_payloads,
+        declared_goal_path_omissions=declared_goal_path_omissions,
         unbound_required_parameter_keys=list(copilot_ctx.unbound_required_parameter_keys),
         block_parameter_keys=authored_block_parameter_keys_from_workflow(
             workflow_yaml,
@@ -4272,10 +4276,16 @@ def _record_build_test_outcome(
     copilot_ctx: CopilotContext,
     result: dict[str, Any],
     recorded_run_outcome: RecordedRunOutcome | None,
+    declared_goal_path_omissions: Sequence[Mapping[str, str]] | None = None,
 ) -> None:
     record_build_test_outcome(
         copilot_ctx,
-        _build_recorded_build_test_outcome(copilot_ctx, result, recorded_run_outcome),
+        _build_recorded_build_test_outcome(
+            copilot_ctx,
+            result,
+            recorded_run_outcome,
+            declared_goal_path_omissions,
+        ),
     )
 
 
@@ -4792,15 +4802,23 @@ def _packet_unfinished_items(
         if outcome_matches_run
         else []
     )
-    missing_by_path: dict[str, str | None] = {}
+    # Keyed by owning block as well as path: two blocks can omit the same declared path, and
+    # collapsing them here would tell repair to fix one and leave the other broken.
+    missing_by_path: dict[tuple[str, str | None], str | None] = {}
     if outcome is not None and outcome.workflow_run_id == run_id:
         for fact in outcome.missing_requested_output_facts:
             output_path = _packet_string(fact.get("output_path"))
             if output_path is not None:
-                missing_by_path[output_path] = _packet_string(fact.get("reason_code"))
+                block_label = _packet_string(fact.get("block_label"))
+                missing_by_path[(output_path, block_label)] = _packet_string(fact.get("reason_code"))
     unfinished.extend(
-        BuildTestPacketUnfinishedItem(kind="missing_requested_output", output_path=path, reason_code=reason_code)
-        for path, reason_code in missing_by_path.items()
+        BuildTestPacketUnfinishedItem(
+            kind="missing_requested_output",
+            label=block_label,
+            output_path=path,
+            reason_code=reason_code,
+        )
+        for (path, block_label), reason_code in missing_by_path.items()
     )
     return unfinished
 

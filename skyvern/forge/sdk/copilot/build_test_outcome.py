@@ -1001,6 +1001,7 @@ def recorded_outcome_from_run_blocks_result(
     authored_structure_signature: str | None = None,
     requested_output_parameter_payloads: Sequence[BuildTestPacketRequestedOutput] | None = None,
     registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
+    declared_goal_path_omissions: Sequence[Mapping[str, object]] | None = None,
     unbound_required_parameter_keys: Sequence[str] | None = None,
     block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
     block_shape_hashes: Mapping[str, str] | None = None,
@@ -1076,14 +1077,20 @@ def recorded_outcome_from_run_blocks_result(
             registered_output_models.append(BuildTestPacketRegisteredOutput.model_validate(payload))
         except ValueError:
             continue
-    typed_output_omission_facts = (
-        _typed_requested_output_omission_facts(
-            requested_output_payloads,
-            registered_output_models,
+    typed_output_omission_facts = _merge_missing_requested_output_facts(
+        (
+            _typed_requested_output_omission_facts(
+                requested_output_payloads,
+                registered_output_models,
+                authoritative_workflow_run_id,
+            )
+            if omission_registered_output_payloads is not None
+            else []
+        ),
+        _declared_goal_path_omission_facts(
+            declared_goal_path_omissions or [],
             authoritative_workflow_run_id,
-        )
-        if omission_registered_output_payloads is not None
-        else []
+        ),
     )
     missing_output_facts = _merge_missing_requested_output_facts(
         _missing_requested_output_facts(completion_verification, blocks),
@@ -2053,25 +2060,33 @@ def _typed_requested_output_omission_facts(
 ) -> list[dict[str, object]]:
     if not workflow_run_id:
         return []
-    registered_ids = {
-        output.output_parameter_id
-        for output in registered_outputs
-        if output.workflow_run_id == workflow_run_id and output.output_parameter_id
-    }
+    registered_values_by_id: dict[str, list[JsonValue]] = {}
+    for output in registered_outputs:
+        if output.workflow_run_id != workflow_run_id or not output.output_parameter_id:
+            continue
+        registered_values_by_id.setdefault(output.output_parameter_id, []).append(output.value)
     facts: list[dict[str, object]] = []
     for requested in requested_outputs:
         if requested.workflow_run_id != workflow_run_id:
             continue
         output_parameter_id = requested.output_parameter_id
         output_parameter_key = requested.output_parameter_key
-        if output_parameter_id in registered_ids:
+        registered_values = registered_values_by_id.get(output_parameter_id)
+        if registered_values is None:
+            reason_code, value_status = "registered_output_missing", "not_registered"
+        elif all(value is None for value in registered_values):
+            # A retained row proves the block ran, not that it produced what was asked for.
+            # Only a null retained value reads as absent: an empty collection is a value the
+            # code returned, and whether it is the right answer is the model's call, not this one.
+            reason_code, value_status = "registered_output_null", "null_registered_value"
+        else:
             continue
         fact: dict[str, object] = {
             "output_path": f"output.{_bounded_ref(output_parameter_key)}",
             "output_root": _bounded_ref(output_parameter_key),
             "output_parameter_id": _bounded_ref(output_parameter_id),
-            "reason_code": "registered_output_missing",
-            "value_status": "not_registered",
+            "reason_code": reason_code,
+            "value_status": value_status,
         }
         block_label = requested.block_label
         if block_label:
@@ -2080,14 +2095,50 @@ def _typed_requested_output_omission_facts(
     return sorted(facts, key=lambda item: str(item["output_path"]))
 
 
-def _merge_missing_requested_output_facts(
-    first: Sequence[Mapping[str, object]], second: Sequence[Mapping[str, object]]
+def _declared_goal_path_omission_facts(
+    declared_goal_path_omissions: Sequence[Mapping[str, object]],
+    workflow_run_id: str,
 ) -> list[dict[str, object]]:
-    merged: dict[str, dict[str, object]] = {}
-    for fact in (*first, *second):
+    """Same-run declared goal-value paths the completed run retained no value for."""
+    if not workflow_run_id:
+        return []
+    facts: list[dict[str, object]] = []
+    for omission in declared_goal_path_omissions:
+        # The declared path is bounded at the prose ceiling, not the shorter identifier one: the
+        # repair prompt tells the model to copy it verbatim, so a clipped path names nothing that
+        # exists and costs a repair round. Declared metadata paths carry no length limit of their own.
+        output_path = _bounded_text(omission.get("output_path"))
+        if not output_path:
+            continue
+        fact: dict[str, object] = {
+            "output_path": output_path,
+            "reason_code": "declared_goal_path_absent",
+            "value_status": "no_typed_value",
+        }
+        # A top-level array path such as ``[].number`` has no root to group under. The root is
+        # diagnostic grouping only, so its absence must not withhold the path itself.
+        output_root = _output_path_root(output_path)
+        if output_root:
+            fact["output_root"] = output_root
+        block_label = _bounded_ref(omission.get("block_label"))
+        if block_label:
+            fact["block_label"] = block_label
+        facts.append(fact)
+    return sorted(facts, key=lambda item: str(item["output_path"]))
+
+
+def _merge_missing_requested_output_facts(
+    *fact_groups: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    # Two blocks can declare and omit the same path, so the owning label is part of the identity;
+    # a fact with no label keys as before, which keeps cross-source dedup on the path alone.
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for fact in (fact for group in fact_groups for fact in group):
         output_path = fact.get("output_path")
         if isinstance(output_path, str) and output_path:
-            merged.setdefault(output_path, dict(fact))
+            block_label = fact.get("block_label")
+            key = (output_path, block_label if isinstance(block_label, str) else "")
+            merged.setdefault(key, dict(fact))
     return [merged[key] for key in sorted(merged)]
 
 
