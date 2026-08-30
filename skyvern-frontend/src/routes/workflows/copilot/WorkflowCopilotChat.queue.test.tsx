@@ -634,7 +634,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Run halted")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(screen.getByText("Copilot hit an internal error.")).toBeTruthy();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -660,7 +661,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText(/Cancelled\. I have a draft workflow/),
+    ).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -697,7 +701,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(screen.getByText(/draft made progress/)).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -785,7 +790,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText(/Cancelled\. I have a draft workflow/),
+    ).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -982,7 +990,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     const call = streamCalls[0];
     if (!call) throw new Error("no pending stream to complete");
     const longInputRequest =
-      "Please provide the exact BACB lookup/registry URL you want the workflow to use. I will build a general workflow with a person_name input after you provide it.";
+      "Please provide the **exact registry URL** you want the workflow to use. I will build a general workflow with a `person_name` input after you provide it.";
 
     await act(async () => {
       call.onMessage({
@@ -1007,8 +1015,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Needs your input")).toBeTruthy();
-    expect(screen.getByText(longInputRequest)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText("exact registry URL", { selector: "strong" }),
+    ).toBeTruthy();
+    expect(screen.getByText("person_name", { selector: "code" })).toBeTruthy();
     expect(screen.queryByText("Answered")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });

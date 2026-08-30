@@ -76,6 +76,7 @@ import {
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
+import { CopilotMarkdown } from "./CopilotMarkdown";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
@@ -540,9 +541,9 @@ const MessageItem = memo(
     }
     return (
       <div className="flex flex-col gap-2">
-        <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-          {message.content}
-        </p>
+        <div className="pl-1 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
+          <CopilotMarkdown text={message.content} />
+        </div>
         {footer ? (
           <div className="flex flex-wrap gap-2 pl-1">{footer}</div>
         ) : null}

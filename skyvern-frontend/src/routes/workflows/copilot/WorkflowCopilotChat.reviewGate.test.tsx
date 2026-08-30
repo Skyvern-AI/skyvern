@@ -523,9 +523,31 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await waitFor(() =>
       expect(screen.getByText("Different source")).toBeTruthy(),
     );
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
     expect(
-      screen.getByText(/3 blocks authored · 0\/3 ran on current source/),
-    ).toBeTruthy();
+      screen.queryByRole("button", { name: /Draft needs review/ }),
+    ).toBeNull();
     expect(screen.queryByText("Built and tested the workflow")).toBeNull();
+  });
+
+  it("keeps the newest structured response in its expanded reading state", async () => {
+    await renderChat();
+
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Here is a draft workflow for you to review."),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Draft needs review/ }),
+    ).toBeNull();
   });
 });

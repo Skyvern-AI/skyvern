@@ -151,36 +151,13 @@ const repairLoopTurn = (): TurnNarrativeState => ({
 });
 
 describe("NarrativeView — activity log", () => {
-  it("the rollup renders the flat activity rows and drops the phase rail", () => {
+  it("renders flat activity rows and drops the phase rail", () => {
     render(<NarrativeView turn={repairLoopTurn()} />);
     expect(screen.queryByText("Explore site")).toBeNull();
     expect(screen.queryByText("Draft code")).toBeNull();
     expect(screen.queryByText("Test-run")).toBeNull();
     expect(screen.getByText("Opened the sign-in page")).toBeTruthy();
     expect(screen.getByText("Saved 2 blocks")).toBeTruthy();
-  });
-
-  it("moves focus between the terminal rollup and detail disclosures", async () => {
-    render(<NarrativeView turn={repairLoopTurn()} />);
-    const rollup = screen.getByRole("button", {
-      name: /Built the workflow/,
-    });
-    expect(rollup.getAttribute("aria-expanded")).toBe("false");
-    expect(rollup.hasAttribute("aria-controls")).toBe(false);
-    fireEvent.click(rollup);
-
-    const collapse = screen.getByRole("button", { name: "Collapse turn" });
-    expect(collapse.getAttribute("aria-expanded")).toBe("true");
-    expect(
-      document.getElementById(collapse.getAttribute("aria-controls")!),
-    ).toBeTruthy();
-    await waitFor(() => expect(document.activeElement).toBe(collapse));
-
-    fireEvent.click(collapse);
-    const restored = screen.getByRole("button", {
-      name: /Built the workflow/,
-    });
-    await waitFor(() => expect(document.activeElement).toBe(restored));
   });
 
   it("a failed run keeps the server's reason instead of a generic tool label", () => {
@@ -209,7 +186,7 @@ describe("NarrativeView — activity log", () => {
     ]);
   });
 
-  it("the rollup gutter reads the row kinds in happened-order", () => {
+  it("the terminal gutter reads the row kinds in happened-order", () => {
     render(<NarrativeView turn={repairLoopTurn()} />);
     const gutter = screen.getAllByText(KIND_GLYPH_PATTERN);
     expect(gutter.map((g) => g.textContent)).toEqual(["◎", "▷", "⟨⟩"]);
