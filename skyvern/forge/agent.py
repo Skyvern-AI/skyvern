@@ -1346,6 +1346,7 @@ class ForgeAgent:
             validate_and_fill_extraction_result,
         )
         from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
+        from skyvern.forge.taskv3.block_context import render_block_context
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
@@ -1440,46 +1441,18 @@ class ForgeAgent:
                 page_free_validation = bool(router_result.effective_without_page_information)
             except Exception:
                 LOG.warning("task_v3 validation evidence router failed; staying page-aware", task_id=task.task_id)
-        if task_block is not None and not page_free_validation:
-            # A block resumes mid-workflow: an earlier block may already have satisfied this one's
-            # criterion (the step engine's per-step goal check gives it this for free).
-            goal = (
-                f"{goal}\n\nThis task is one block of a larger workflow and starts mid-flow. First read "
-                "the full page text (get_html) and check whether the completion criterion is ALREADY "
-                "satisfied by the page's settled, loaded content - a loading indicator, skeleton, or "
-                "empty container does NOT satisfy a criterion about visible content."
-                + (
-                    " When the goal names an action (open/click/submit), perform it unless the page "
-                    "already shows that action's RESULT."
-                    if task.task_type != TaskType.validation
-                    else ""
-                )
-                + " If the criterion is genuinely satisfied, finish with status=completed "
-                "immediately without acting. Stay "
-                "within this block's goal: never sign out, navigate away from the current flow, or undo "
-                "prior progress unless the goal explicitly asks for it."
-            ).strip()
-        if page_free_validation:
-            # This mode judges only durable inputs/prior outputs; any perception instruction would
-            # contradict it, so it replaces (not extends) the read-the-page framing above.
-            goal = (
-                f"{goal}\n\nThis is a page-free assessment task: judge ONLY from the information already "
-                "provided above and prior workflow context. Do not call observe or get_html, and do not "
-                "modify page state. Evaluate the completion and termination criteria and finish with the "
-                "matching status."
-            ).strip()
-        elif task_block is not None and task.task_type == TaskType.validation:
-            # ValidationBlock tasks judge, not act; without this the loop can treat the criteria
-            # above as something to accomplish by interacting with the page.
-            goal = (
-                f"{goal}\n\nThis is an assessment task: do not modify page state. Evaluate the completion "
-                "and termination criteria above and finish with the matching status. Ground the judgment "
-                "in the page's actual content: read the full page text (get_html) before concluding, and "
-                "never finish with status=terminated on element summaries alone — absence must be "
-                "confirmed against the full text."
-            ).strip()
-        elif task_block is not None and task.task_type == TaskType.action:
-            goal = f"{goal}\n\nThis is a single, focused action: perform it and finish.".strip()
+        workflow_run_context = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+            if task.workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id)
+            else None
+        )
+        framing, block_context_section = render_block_context(
+            task, task_block, workflow_run_context, page_free_validation=page_free_validation
+        )
+        if framing:
+            goal = f"{goal}\n\n{framing}".strip()
+        if block_context_section:
+            goal = f"{goal}\n\n{block_context_section}".strip()
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
