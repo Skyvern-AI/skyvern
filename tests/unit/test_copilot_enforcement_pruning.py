@@ -330,14 +330,16 @@ _EXTRACTION_ENVELOPE_CASES: list[tuple[str, dict[str, Any], bool]] = [
     ids=[case_id for case_id, _, _ in _EXTRACTION_ENVELOPE_CASES],
 )
 def test_analyze_extraction_envelope(overrides: dict[str, Any], expected_empty: bool) -> None:
-    _, empty, _ = _analyze_run_blocks(_run_result([_extraction_block(_envelope(**overrides))]))
+    _, empty, _, _ = _analyze_run_blocks(_run_result([_extraction_block(_envelope(**overrides))]))
     assert empty is expected_empty
 
 
 def test_analyze_text_prompt_default_schema_is_not_empty() -> None:
     # TEXT_PROMPT blocks return the raw LLM response dict (no Task envelope).
     # Default schema is {"llm_response": "<text>"}.
-    _, empty, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"llm_response": "the sentiment is positive"})]))
+    _, empty, _, _ = _analyze_run_blocks(
+        _run_result([_text_prompt_block({"llm_response": "the sentiment is positive"})])
+    )
     assert empty is False
 
 
@@ -346,14 +348,14 @@ def test_analyze_text_prompt_user_schema_named_extracted_information_is_not_slic
     # top-level field "extracted_information". The helper must not mistake
     # that for an EXTRACTION envelope and discard sibling fields.
     block = _text_prompt_block({"extracted_information": "ignored because this is TEXT_PROMPT", "summary": "x"})
-    _, empty, _ = _analyze_run_blocks(_run_result([block]))
+    _, empty, _, _ = _analyze_run_blocks(_run_result([block]))
     assert empty is False
 
 
 def test_analyze_text_prompt_all_null_is_empty() -> None:
     # Symmetric to {"price": None} — a text-prompt response with all-null
     # fields counts as no meaningful output.
-    _, empty, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"summary": None})]))
+    _, empty, _, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"summary": None})]))
     assert empty is True
 
 
