@@ -8,6 +8,8 @@ import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.agent import (
+    _BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT,
+    _BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY,
     _CANCEL_REPLY_DEFAULT,
     _CANCEL_REPLY_TESTED,
     _CANCEL_REPLY_UNVALIDATED,
@@ -25,6 +27,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_timeout_exit_result,
     _build_unexpected_error_exit_result,
 )
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -312,6 +315,32 @@ def test_capacity_exit_state_disposition(
 
 
 class TestBuildTimeoutExitResult:
+    def test_browser_ablation_timeout_without_activity_describes_only_the_browser_task(self) -> None:
+        ctx, _ = _state_ctx("no_workflow")
+        ctx.eval_mode = CopilotEvalMode.BROWSER_ABLATION
+        ctx.eval_tool_activity = []
+        ctx.copilot_total_timeout_exceeded = True
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response == _BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT
+        assert "browser task did not finish" in result.user_response.lower()
+        assert "workflow" not in result.user_response.lower()
+        assert "draft" not in result.user_response.lower()
+
+    @pytest.mark.parametrize("state_kind", ["no_workflow", "untested", "passing_test"])
+    def test_browser_ablation_timeout_uses_browser_work_for_every_draft_state(self, state_kind: str) -> None:
+        ctx, _ = _state_ctx(state_kind)
+        ctx.eval_mode = CopilotEvalMode.BROWSER_ABLATION
+        ctx.eval_tool_activity = [{"tool_name": "navigate_browser", "success": True}]
+        ctx.copilot_total_timeout_exceeded = True
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response == _BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
+        assert "workflow" not in result.user_response.lower()
+        assert "draft" not in result.user_response.lower()
+
     def test_missing_yaml_drops_untested_proposal(self) -> None:
         wf = MagicMock(name="wf")
         ctx = _ctx(last_workflow=wf, last_workflow_yaml=None, last_test_ok=None)
