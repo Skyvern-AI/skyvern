@@ -342,6 +342,7 @@ function convertToParametersYAML(
               description: parameter.description || null,
               vault_id: parameter.vaultId,
               item_id: parameter.itemId,
+              totp_field_name: parameter.totpFieldName || null,
             };
           } else if (parameterIsAzureVaultCredential(parameter)) {
             return {

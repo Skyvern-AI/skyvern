@@ -293,6 +293,21 @@ function useBackgroundBrowserProfileCreate() {
       description,
       isSessionRunning,
     }: StartBackgroundCreateInput) => {
+      const existingActive = useBrowserProfileCreateStore.getState().active;
+      if (
+        existingActive &&
+        existingActive.browserSessionId !== browserSessionId &&
+        Date.now() - existingActive.startTime <= MAX_TOTAL_DURATION_MS
+      ) {
+        toast({
+          title: "Another browser profile save is already in progress",
+          description:
+            "Wait for that save to finish (or time out) before starting a new one, so it isn't discarded.",
+          variant: "destructive",
+        });
+        return;
+      }
+
       cleanup();
 
       const startTime = Date.now();
