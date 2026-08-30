@@ -16,6 +16,7 @@ from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestEvidencePacket,
+    BuildTestFailedOperation,
     BuildTestPacketLocatorObservation,
     BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
@@ -329,6 +330,36 @@ def _bounded_packet_strings(
     if shortened:
         _append_omission(notices, f"{field_name} shortened: {shortened} text value(s) clipped.")
     return rendered
+
+
+def _bounded_failed_operation(
+    operation: BuildTestFailedOperation | None,
+    notices: list[str],
+) -> BuildTestFailedOperation | None:
+    if operation is None:
+        return None
+    return operation.model_copy(
+        update={
+            "workflow_run_id": _bounded_packet_string(
+                operation.workflow_run_id,
+                field_name="failure.failed_operation.workflow_run_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "workflow_run_block_id": _bounded_packet_string(
+                operation.workflow_run_block_id,
+                field_name="failure.failed_operation.workflow_run_block_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "block_label": _bounded_packet_string(
+                operation.block_label,
+                field_name="failure.failed_operation.block_label",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+        }
+    )
 
 
 def _bounded_obstruction_control(
@@ -855,6 +886,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     max_chars=_BUILD_TEST_FAILURE_REASON_MAX_CHARS,
                     notices=notices,
                 ),
+                "failed_operation": _bounded_failed_operation(failure.failed_operation, notices),
                 "action_trace": action_trace,
                 "page_state": _bounded_packet_page_state(
                     failure.page_state, notices, field_prefix="failure.page_state"
