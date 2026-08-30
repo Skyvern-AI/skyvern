@@ -57,7 +57,9 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     build_test_evidence_packet,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
     failed_second_factor_run,
     make_stub_html_artifact,
@@ -3585,3 +3587,641 @@ def test_the_carried_field_claims_only_that_the_pass_proves_nothing() -> None:
     assert carried["note"] == "this run passing does not establish that the earlier failure was resolved"
     for forbidden in ("add", "guard", "should", "must", "conditional", "if "):
         assert forbidden not in carried["note"].lower(), "the note prescribes a fix"
+
+
+def _completed_output_run_result(retained_value: object, *, register_row: bool = True) -> dict[str, object]:
+    run_id = "wr_requested_output"
+    registered_row = {
+        "workflow_run_id": run_id,
+        "output_parameter_id": "op_payment_options",
+        "output_parameter_key": "collect_options_output",
+        "block_label": "collect_options",
+        "block_type": "code",
+        "value": retained_value,
+    }
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_options"],
+            "executed_block_labels": ["collect_options"],
+            "blocks": [
+                {
+                    "label": "collect_options",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"collect_options_output": retained_value},
+                }
+            ],
+            "requested_output_parameter_definitions": [
+                {
+                    "workflow_run_id": run_id,
+                    "output_parameter_id": "op_payment_options",
+                    "output_parameter_key": "collect_options_output",
+                    "block_label": "collect_options",
+                    "block_type": "code",
+                }
+            ],
+            "registered_output_parameter_values": [registered_row] if register_row else [],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "retained_value", "register_row", "expected_reason_code"),
+    [
+        ("no_row", {"payment_options": ["Visa"]}, False, "registered_output_missing"),
+        ("null_value", None, True, "registered_output_null"),
+        # An empty collection is a value the code returned. Whether "no options were offered" is
+        # the right answer is the model's call; reporting it absent would invite invented data.
+        ("empty_object", {}, True, None),
+        ("empty_list", [], True, None),
+        ("run_owned_value", {"payment_options": ["Visa", "PayPal"]}, True, None),
+    ],
+)
+def test_a_completed_run_that_retained_no_requested_output_value_returns_to_ordinary_repair(
+    case: str,
+    retained_value: object,
+    register_row: bool,
+    expected_reason_code: str | None,
+) -> None:
+    """A retained row proves the block ran; it is not proof the requested output was produced."""
+    result = _completed_output_run_result(retained_value, register_row=register_row)
+    data = result["data"]
+    assert isinstance(data, dict)
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_evaluated",
+            workflow_run_id="wr_requested_output",
+            run_completed=True,
+        ),
+        registered_output_parameter_payloads=data["registered_output_parameter_values"],
+    )
+    assert outcome is not None
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    ordinary_input = _build_user_context(
+        workflow_yaml="",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text=_prior_run_debug_text(packet),
+        user_message="Repair the recorded run.",
+    )
+
+    if expected_reason_code is None:
+        assert outcome.missing_requested_output_facts == []
+        assert outcome.verdict == "not_authoritative"
+        assert packet["unfinished_items"] == []
+        if case == "run_owned_value":
+            assert '"payment_options"' in ordinary_input, "the run-owned value is not handed back"
+        return
+
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "no_meaningful_output"
+    assert outcome.is_authoritative is True
+    assert [fact["reason_code"] for fact in outcome.missing_requested_output_facts] == [expected_reason_code]
+    assert [fact["output_path"] for fact in outcome.missing_requested_output_facts] == ["output.collect_options_output"]
+    assert {
+        "kind": "missing_requested_output",
+        "label": "collect_options",
+        "output_path": "output.collect_options_output",
+        "reason_code": expected_reason_code,
+    } in packet["unfinished_items"]
+    assert '"output_path": "output.collect_options_output"' in ordinary_input
+    assert f'"reason_code": "{expected_reason_code}"' in ordinary_input
+
+
+def test_a_declared_goal_path_the_run_left_empty_reaches_repair_and_the_latch_from_one_source() -> None:
+    """The terminal latch and ordinary repair read the same unmet declared goal paths."""
+    run_id = "wr_goal_paths"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_options": {
+            "claimed_outcomes": [
+                {"id": "options", "goal_value_paths": ["$.payment_options", "$.cart_line_item"]},
+            ]
+        }
+    }
+    retained_value = {"url": "https://example.test/cart", "actions": ["click", "click"], "payment_options": ["Visa"]}
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_options"],
+            "executed_block_labels": ["collect_options"],
+            "blocks": [
+                {
+                    "label": "collect_options",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": retained_value,
+                }
+            ],
+        },
+    }
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+
+    # The latch already refused this run; the same unmet paths now reach repair by name.
+    assert empty_data_blocks is True
+    assert goal_path_omissions == [{"block_label": "collect_options", "output_path": "cart_line_item"}]
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "no_meaningful_output"
+    assert outcome.missing_requested_output_facts == [
+        {
+            "output_path": "cart_line_item",
+            "output_root": "cart_line_item",
+            "reason_code": "declared_goal_path_absent",
+            "value_status": "no_typed_value",
+            "block_label": "collect_options",
+        }
+    ]
+    assert {
+        "kind": "missing_requested_output",
+        "label": "collect_options",
+        "output_path": "cart_line_item",
+        "reason_code": "declared_goal_path_absent",
+    } in packet["unfinished_items"]
+
+    satisfied_result = json.loads(json.dumps(result))
+    satisfied_result["data"]["blocks"][0]["extracted_data"]["cart_line_item"] = {"qty": 1}
+    _anti_bot, satisfied_empty, _categories, satisfied_omissions = run_execution_module._analyze_run_blocks(
+        satisfied_result, ctx
+    )
+    assert satisfied_empty is False
+    assert satisfied_omissions == []
+
+
+def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root() -> None:
+    """``$[*].number`` normalizes to ``[].number``, whose root is empty; the path still binds."""
+    run_id = "wr_array_goal_path"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_rows": {"claimed_outcomes": [{"id": "rows", "goal_value_paths": ["$[*].number"]}]}
+    }
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_rows"],
+            "executed_block_labels": ["collect_rows"],
+            "blocks": [
+                {
+                    "label": "collect_rows",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"url": "https://example.test/rows"},
+                }
+            ],
+        },
+    }
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert empty_data_blocks is True
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.missing_requested_output_facts == [
+        {
+            "output_path": "[].number",
+            "reason_code": "declared_goal_path_absent",
+            "value_status": "no_typed_value",
+            "block_label": "collect_rows",
+        }
+    ]
+
+
+def test_two_blocks_omitting_the_same_declared_path_both_reach_repair() -> None:
+    """Deduping on the path alone would repair one block and leave the other silently broken."""
+    run_id = "wr_shared_goal_path"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        label: {"claimed_outcomes": [{"id": label, "goal_value_paths": ["$.status"]}]}
+        for label in ("collect_first", "collect_second")
+    }
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_first", "collect_second"],
+            "executed_block_labels": ["collect_first", "collect_second"],
+            "blocks": [
+                {
+                    "label": label,
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"url": f"https://example.test/{label}"},
+                }
+                for label in ("collect_first", "collect_second")
+            ],
+        },
+    }
+
+    _anti_bot, _empty, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(result, ctx)
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert [(fact["output_path"], fact["block_label"]) for fact in outcome.missing_requested_output_facts] == [
+        ("status", "collect_first"),
+        ("status", "collect_second"),
+    ]
+
+    # Retaining both facts is only half the fix: repair must be able to tell them apart.
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert [
+        (item["output_path"], item["label"])
+        for item in packet["unfinished_items"]
+        if item["kind"] == "missing_requested_output"
+    ] == [("status", "collect_first"), ("status", "collect_second")]
+
+    ctx.latest_recorded_build_test_outcome = outcome
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+    assert "block_label=collect_first" in rendered
+    assert "block_label=collect_second" in rendered
+
+
+def test_a_long_declared_goal_path_reaches_repair_uncut() -> None:
+    """The prompt tells the model to copy output_path verbatim; a clipped path names nothing."""
+    run_id = "wr_long_goal_path"
+    long_path = "$.checkout.summary." + ".".join(f"level_{index:02d}" for index in range(15)) + ".amount_due"
+    normalized = long_path.removeprefix("$.")
+    # Wider than every ceiling the path crosses on its way to the model, and inside the one the
+    # facts themselves carry, so a survivor proves the projections and not a shorter fixture.
+    assert 160 < len(normalized) <= 180, "the fixture must exceed every downstream bound"
+
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_total": {"claimed_outcomes": [{"id": "total", "goal_value_paths": [long_path]}]}
+    }
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_total"],
+            "executed_block_labels": ["collect_total"],
+            "blocks": [
+                {
+                    "label": "collect_total",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"url": "https://example.test/checkout"},
+                }
+            ],
+        },
+    }
+
+    _anti_bot, _empty, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(result, ctx)
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert [fact["output_path"] for fact in outcome.missing_requested_output_facts] == [normalized]
+
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert [
+        item["output_path"] for item in packet["unfinished_items"] if item["kind"] == "missing_requested_output"
+    ] == [normalized]
+
+    ctx.latest_recorded_build_test_outcome = outcome
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    assert f"output_path={normalized}" in _recorded_build_test_outcome_prompt(ctx)
+
+
+def _goal_path_run_result(run_id: str, blocks: list[dict[str, object]]) -> dict[str, object]:
+    labels = [str(block["label"]) for block in blocks]
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": labels,
+            "executed_block_labels": labels,
+            "blocks": blocks,
+        },
+    }
+
+
+def test_a_sibling_blocks_complete_record_does_not_clear_another_blocks_omission() -> None:
+    """A run must not be credited for a path one block omitted because a different block proved its own."""
+    run_id = "wr_sibling_record"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_options": {
+            "claimed_outcomes": [{"id": "options", "goal_value_paths": ["$.payment_options", "$.cart_line_item"]}]
+        }
+    }
+    result = _goal_path_run_result(
+        run_id,
+        [
+            {
+                "label": "collect_options",
+                "block_type": "code",
+                "status": "completed",
+                "extracted_data": {
+                    "url": "https://example.test/cart",
+                    "actions": ["click", "click"],
+                    "payment_options": ["Visa"],
+                },
+            },
+            {
+                "label": "lookup_record",
+                "block_type": "code",
+                "status": "completed",
+                "extracted_data": {
+                    "lookup_record_output": {
+                        "entity_found": True,
+                        "entity_name": "Jordan Example",
+                        "record_number": "1234567890",
+                        "items": [{"item_label": "Sample Practice", "status": "Active"}],
+                        "overall_status": "Active",
+                    }
+                },
+            },
+        ],
+    )
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert goal_path_omissions == [{"block_label": "collect_options", "output_path": "cart_line_item"}]
+    assert empty_data_blocks is True
+    assert outcome.verdict == "repairable_failure"
+
+    ctx.latest_recorded_build_test_outcome = outcome
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+    assert "output_path=cart_line_item" in rendered
+    assert "block_label=collect_options" in rendered
+
+
+def test_a_completed_block_that_retained_nothing_at_all_reports_every_declared_path() -> None:
+    """Retaining no output is the strongest omission there is; it must not skip the arm that records it."""
+    run_id = "wr_null_extracted"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_options": {
+            "claimed_outcomes": [{"id": "options", "goal_value_paths": ["$.payment_options", "$.cart_line_item"]}]
+        }
+    }
+    result = _goal_path_run_result(
+        run_id,
+        [{"label": "collect_options", "block_type": "code", "status": "completed", "extracted_data": None}],
+    )
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert empty_data_blocks is True
+    assert [omission["output_path"] for omission in goal_path_omissions] == ["payment_options", "cart_line_item"]
+    assert outcome.verdict == "repairable_failure"
+
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert sorted(
+        item["output_path"] for item in packet["unfinished_items"] if item["kind"] == "missing_requested_output"
+    ) == ["cart_line_item", "payment_options"]
+
+
+class _CheckoutPage:
+    """The focused local fixture the repaired block reads; no browser, no network."""
+
+    _TEXT = {
+        "#cart-line-item": "Running Jacket / Size M / Qty 1 / 88.00",
+        "#payment-methods": "Card, Wallet, Pay in 4",
+        "#selected-product": "Running Jacket",
+    }
+
+    async def inner_text(self, selector: str) -> str:
+        return self._TEXT[selector]
+
+
+_UNREPAIRED_CODE = """
+url = "https://example.test/checkout"
+actions = ["goto", "click", "click"]
+"""
+
+_REPAIRED_CODE = """
+url = "https://example.test/checkout"
+actions = ["goto", "click", "click"]
+line_item_text = await page.inner_text("#cart-line-item")
+name, size, quantity, price = [part.strip() for part in line_item_text.split("/")]
+cart_line_item = {"name": name, "size": size, "quantity": quantity, "price": price}
+payment_options = [option.strip() for option in (await page.inner_text("#payment-methods")).split(",")]
+selection_output = {"product": await page.inner_text("#selected-product"), "price": price}
+"""
+
+
+async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dict[str, object]:
+    """Run the block through the real CodeBlock executor and return the output it produced."""
+
+    class FakeBrowserState:
+        def __init__(self) -> None:
+            self.browser_artifacts = BrowserArtifacts()
+
+        async def get_working_page(self) -> object:
+            return _CheckoutPage()
+
+    class FakeWorkflowRunContext:
+        values: dict[str, object] = {}
+        secrets: dict[str, object] = {}
+        include_secrets_in_templates = False
+        organization_id = None
+        workflow_title = "Checkout"
+        workflow_id = "w_checkout"
+        workflow_permanent_id = "wpid_checkout"
+        workflow_run_id = "wr_executor_witness"
+        browser_session_id = None
+        workflow_run_outputs: list[object] = []
+
+        def get_block_metadata(self, label: str | None) -> dict[str, object]:
+            return {}
+
+        def build_workflow_run_summary(self) -> str:
+            return ""
+
+        def mask_secrets_in_data(self, data: object, mask: str = "*****") -> object:
+            return data
+
+    async def noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def browser_state(*args: object, **kwargs: object) -> FakeBrowserState:
+        return FakeBrowserState()
+
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", noop)
+    monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", browser_state)
+    monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext())
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", noop)
+
+    now = datetime.now(UTC)
+    block = CodeBlock(
+        label="collect_payment_options",
+        code=code,
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="collect_payment_options_output",
+            description="checkout facts",
+            output_parameter_id="op_checkout",
+            workflow_id="w_checkout",
+            created_at=now,
+            modified_at=now,
+        ),
+    )
+    result = await block.execute(workflow_run_id="wr_executor_witness", workflow_run_block_id="")
+    assert result.success is True, "the fixture block must execute"
+    assert isinstance(result.output_parameter_value, dict)
+    return result.output_parameter_value
+
+
+def _executor_witness_ctx() -> CopilotContext:
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.code_artifact_metadata = {
+        "collect_payment_options": {
+            "claimed_outcomes": [
+                {
+                    "id": "checkout",
+                    "goal_value_paths": ["$.cart_line_item", "$.payment_options", "$.selection_output"],
+                }
+            ]
+        }
+    }
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole chain on executed code: a completed run that owns nothing names the paths it owes,
+    and the repaired block's own execution output clears them."""
+    before_output = await _execute_code_block(monkeypatch, _UNREPAIRED_CODE)
+    after_output = await _execute_code_block(monkeypatch, _REPAIRED_CODE)
+
+    # The outputs under test came out of the executor, not out of a fixture file.
+    assert set(before_output) == {"url", "actions"}
+    assert after_output["payment_options"] == ["Card", "Wallet", "Pay in 4"]
+    assert after_output["cart_line_item"] == {
+        "name": "Running Jacket",
+        "size": "Size M",
+        "quantity": "Qty 1",
+        "price": "88.00",
+    }
+
+    def recorded(output: dict[str, object]) -> tuple[CopilotContext, object]:
+        ctx = _executor_witness_ctx()
+        result = {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_executor_witness",
+                "overall_status": "completed",
+                "requested_block_labels": ["collect_payment_options"],
+                "executed_block_labels": ["collect_payment_options"],
+                "blocks": [
+                    {
+                        "label": "collect_payment_options",
+                        "block_type": "code",
+                        "status": "completed",
+                        "extracted_data": output,
+                    }
+                ],
+                # The value the executor produced, on the surface the runtime registers it on.
+                "registered_output_parameter_values": [
+                    {
+                        "workflow_run_id": "wr_executor_witness",
+                        "output_parameter_id": "op_checkout",
+                        "output_parameter_key": "collect_payment_options_output",
+                        "block_label": "collect_payment_options",
+                        "block_type": "code",
+                        "value": output,
+                    }
+                ],
+            },
+        }
+        run_execution_module._record_run_blocks_result(ctx, result, completion_verification=None)
+        return ctx, result
+
+    before_ctx, _before_result = recorded(before_output)
+    after_ctx, after_result = recorded(after_output)
+
+    before_outcome = before_ctx.latest_recorded_build_test_outcome
+    assert before_outcome is not None
+    assert before_outcome.verdict == "repairable_failure"
+    assert sorted(fact["output_path"] for fact in before_outcome.missing_requested_output_facts) == [
+        "cart_line_item",
+        "payment_options",
+        "selection_output",
+    ]
+    rendered = _recorded_build_test_outcome_prompt(before_ctx)
+    for path in ("cart_line_item", "payment_options", "selection_output"):
+        assert f"output_path={path}" in rendered
+
+    after_outcome = after_ctx.latest_recorded_build_test_outcome
+    assert after_outcome is not None
+    assert after_outcome.missing_requested_output_facts == []
+    assert after_outcome.verdict == "not_authoritative"
+
+    # The corrected run hands back the values its own code produced.
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(after_ctx, after_result, recorded_outcome=after_outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert packet["unfinished_items"] == []
+    run_owned = [
+        output["value"]
+        for output in packet["registered_outputs"]
+        if output["output_parameter_key"] == "collect_payment_options_output"
+    ]
+    assert run_owned == [after_output], "the corrected run does not hand back the output its code produced"

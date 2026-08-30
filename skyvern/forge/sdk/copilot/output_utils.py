@@ -15,6 +15,7 @@ import structlog
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    _TEXT_MAX,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
     BuildTestPacketLocatorObservation,
@@ -927,10 +928,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                     notices=notices,
                 ),
+                # A declared goal path is copied back verbatim by the model, so it is bounded at
+                # the ceiling the facts carry rather than the shorter identifier one.
                 "output_path": _bounded_packet_string(
                     item.output_path,
                     field_name="unfinished_items[].output_path",
-                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    max_chars=max(_BUILD_TEST_IDENTIFIER_MAX_CHARS, _TEXT_MAX),
                     notices=notices,
                 ),
                 "reason_code": _bounded_packet_string(
