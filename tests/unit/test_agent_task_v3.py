@@ -199,8 +199,9 @@ async def test_execute_task_v3_bills_per_browser_action(monkeypatch: pytest.Monk
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
 
-    # The whole task runs as one loop invocation.
+    # The whole task runs as one loop invocation, keyed to this task so per-run gates bucket on it.
     assert loop_mock.await_count == 1
+    assert loop_mock.await_args.kwargs["task_id"] == task.task_id
     assert step.status == StepStatus.completed
 
     # Every reported browser action becomes one action-result with a non-empty results list,
