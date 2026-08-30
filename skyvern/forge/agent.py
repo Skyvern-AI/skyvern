@@ -1888,6 +1888,7 @@ class ForgeAgent:
                 starting_url=task.url,
                 downloads_dir=get_download_dir(download_id),
                 organization_id=organization.organization_id,
+                task_id=task.task_id,
                 max_action_steps=step_cap,
                 max_turns=max_turns,
                 max_tool_calls=max_tool_calls,

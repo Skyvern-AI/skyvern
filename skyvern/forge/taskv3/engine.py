@@ -29,9 +29,11 @@ from typing import Any, Awaitable, Callable
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.taskv3.auto_observe import AutoObserveDecision
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
@@ -181,6 +183,7 @@ async def run_task_v3_agent_loop(
     starting_url: str | None = None,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
+    task_id: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_action_steps: int | None = None,
@@ -291,7 +294,22 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
-    auto_observe = settings.TASK_V3_AUTO_OBSERVE and not page_free
+    # Resolved through the AgentFunction seam so cloud can bucket the run into an A/B; a page-free
+    # run has no observe to append, so it is never resolved and never bands as an arm.
+    auto_observe_decision = (
+        AutoObserveDecision(enabled=False, arm="default")
+        if page_free
+        else await app.AGENT_FUNCTION.resolve_task_v3_auto_observe(task_id=task_id, organization_id=organization_id)
+    )
+    auto_observe = auto_observe_decision.enabled
+    if not page_free:
+        LOG.info(
+            "taskv3 auto-observe resolved",
+            task_id=task_id,
+            organization_id=organization_id,
+            auto_observe=auto_observe,
+            auto_observe_arm=auto_observe_decision.arm,
+        )
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
@@ -353,6 +371,7 @@ async def run_task_v3_agent_loop(
         tool_seconds=outcome.tool_seconds,
         action_steps=outcome.action_steps,
         no_tool_call_turns=outcome.no_tool_call_turns,
+        auto_observe_arm=auto_observe_decision.arm,
         tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,
         tool_choice_in_effect=outcome.tool_choice_in_effect,
     )
