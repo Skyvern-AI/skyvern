@@ -127,7 +127,13 @@ export interface RecordingDraftStep {
   parameter_keys: Array<string>;
   timestamp_start?: number | null;
   timestamp_end?: number | null;
-  credential_kind?: "password" | "totp" | "credit_card" | null;
+  credential_kind?:
+    | "password"
+    | "totp"
+    | "credit_card"
+    | "secret"
+    | "magic_link"
+    | null;
 }
 
 export interface RecordingInterpretationUpdate {
