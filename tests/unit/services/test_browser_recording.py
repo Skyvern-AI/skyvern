@@ -5,12 +5,15 @@ Just an example unit test for now. Will expand later.
 import asyncio
 import base64
 import gzip
+import re
 import time
 import typing as t
 import zlib
+from pathlib import Path
 
 import pytest
 
+import skyvern
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent as StreamingExfiltratedEvent
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
@@ -19,6 +22,7 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltrationChannel,
 )
+from skyvern.services.browser_recording import redact as redact_module
 from skyvern.services.browser_recording.interpretation import RecordingInterpretationSession
 from skyvern.services.browser_recording.service import (
     DUPLICATE_ACTION_WINDOW_MS,
@@ -236,12 +240,26 @@ def _empty_action_target() -> ActionTarget:
     return ActionTarget(mouse=Mouse(xp=None, yp=None))
 
 
-def make_streaming_console_click(timestamp_ms: float) -> StreamingExfiltratedEvent:
+def make_streaming_console_click(
+    timestamp_ms: float,
+    *,
+    target_id: str = "button-1",
+    target_text: str = "Click me",
+    accessible_name: str | None = None,
+) -> StreamingExfiltratedEvent:
+    target: dict[str, t.Any] = {
+        "id": target_id,
+        "skyId": "sky-123",
+        "tagName": "BUTTON",
+        "text": [target_text],
+    }
+    if accessible_name is not None:
+        target["accessibleName"] = accessible_name
     return StreamingExfiltratedEvent(
         event_name="user_interaction",
         params={
             "type": "click",
-            "target": {"id": "button-1", "skyId": "sky-123", "tagName": "BUTTON", "text": ["Click me"]},
+            "target": target,
             "timestamp": timestamp_ms,
             "url": "https://example.com",
             "activeElement": {"tagName": "BUTTON"},
@@ -270,6 +288,7 @@ def make_streaming_console_input(
     target_text: str = "Email",
     input_type: str | None = None,
     autocomplete: str | None = None,
+    accessible_name: str | None = None,
 ) -> list[StreamingExfiltratedEvent]:
     target: dict[str, t.Any] = {
         "id": target_id,
@@ -282,6 +301,8 @@ def make_streaming_console_input(
         target["inputType"] = input_type
     if autocomplete is not None:
         target["autocomplete"] = autocomplete
+    if accessible_name is not None:
+        target["accessibleName"] = accessible_name
     common = {
         "target": target,
         "timestamp": timestamp_ms,
@@ -921,8 +942,27 @@ def test_is_secret_field_and_credential_kind() -> None:
     assert credential_kind_for_target("text", "current-password") == "password"
     assert credential_kind_for_target("text", "one-time-code") == "totp"
     assert credential_kind_for_target("text", "cc-number") == "credit_card"
+    assert credential_kind_for_target("text", "cc-name") == "credit_card"
     assert credential_kind_for_target("email", None) is None
     assert credential_kind_for_target("text", "off") is None
+
+    assert credential_kind_for_target("text", None, field_id="otp", texts=["Verification code"]) == "totp"
+    assert credential_kind_for_target("password", None, accessible_name="API Key") == "secret"
+    assert credential_kind_for_target("text", None, texts=["Card number"], tag_name="input") == "credit_card"
+
+    # `texts` carries innerText for elements with children, so it is only a label on <input>.
+    # A <select> whose options happen to contain a hint phrase must keep its recorded value.
+    assert credential_kind_for_target("text", None, texts=["Card number"], tag_name="select") is None
+    assert (
+        credential_kind_for_target("text", None, texts=["Reason: Verification code issue"], tag_name="select") is None
+    )
+    assert credential_kind_for_target(None, None, texts=["Two factor authentication"], tag_name="div") is None
+    # The label itself still classifies, whatever the tag.
+    assert credential_kind_for_target("text", None, accessible_name="Verification code", tag_name="select") == "totp"
+    assert credential_kind_for_target("password", None, accessible_name="Password") == "password"
+    assert credential_kind_for_target(None, None, accessible_name="Email me a magic link") == "magic_link"
+    assert is_secret_field("password", None, accessible_name="API Key") is True
+    assert is_secret_field(None, None, accessible_name="Email me a magic link") is False
 
 
 def test_reify_strips_secret_values_from_console_events() -> None:
@@ -992,6 +1032,41 @@ def test_password_fill_still_emits_empty_input_text() -> None:
     assert action.target.input_type == "password"
 
 
+def _js_string_literals(source: str, name: str) -> set[str]:
+    match = re.search(rf"const {name} = (?:new Set\()?\[(.*?)\]", source, re.DOTALL)
+    assert match, f"{name} not found in exfiltrate.js"
+    return set(re.findall(r'"([^"]*)"', match.group(1)))
+
+
+def test_secret_matcher_lists_match_between_js_and_python() -> None:
+    """The page script and the Python ingest must classify the same fields as secret.
+
+    A token added to one side only silently changes what gets captured, so parity is
+    asserted here rather than left to the docstring in redact.py.
+    """
+    js_source = (Path(skyvern.__file__).parent / "forge/sdk/routes/streaming/channels/js/exfiltrate.js").read_text()
+    matcher = re.search(r"const isSecretField = \(element\) => \{(.*?)\n    \};", js_source, re.DOTALL)
+    assert matcher, "isSecretField not found in exfiltrate.js"
+    js_matcher_body = matcher.group(1)
+
+    # MAGIC_LINK_HINT_PHRASES is deliberately absent from the JS: "magic_link" is not a
+    # secret kind, so it labels a field without redacting it.
+    for name, python_value in (
+        ("SECRET_INPUT_TYPES", redact_module.SECRET_INPUT_TYPES),
+        ("SECRET_AUTOCOMPLETE_TOKENS", redact_module.SECRET_AUTOCOMPLETE_TOKENS),
+        ("CREDIT_CARD_HINT_PHRASES", redact_module.CREDIT_CARD_HINT_PHRASES),
+        ("TOTP_HINT_PHRASES", redact_module.TOTP_HINT_PHRASES),
+        ("SECRET_HINT_PHRASES", redact_module.SECRET_HINT_PHRASES),
+    ):
+        assert _js_string_literals(js_source, name) == set(python_value), (
+            f"{name} differs between exfiltrate.js and redact.py"
+        )
+        # Matching lists are worthless if the page script stops consulting one: deleting a
+        # clause from isSecretField while leaving its array declared would keep the parity
+        # assertion above green and silently stop redacting that family at source.
+        assert name in js_matcher_body, f"{name} is declared but never used by isSecretField"
+
+
 def test_password_submitted_with_enter_still_emits_input_text() -> None:
     """Enter-to-submit never blurs before navigating, so the Enter keydown is the only emit signal.
 
@@ -1037,6 +1112,37 @@ def test_secret_character_keystrokes_still_redacted() -> None:
     submit = redact_console_event(make_keydown_event(target=target, timestamp=2.0, key="Enter"))
     assert submit.params.key == "Enter"
     assert submit.params.target.value is None
+
+
+def test_phrase_only_secret_has_its_value_stripped_through_the_processor() -> None:
+    """A field classified *only* by its label must lose its value, not just get a kind.
+
+    The password/OTP cases are carried by input_type/autocomplete, so neither proves the
+    phrase matching this PR adds actually reaches redaction.
+    """
+    target = {
+        "id": "field-1",
+        "tagName": "INPUT",
+        "inputType": "text",
+        "autocomplete": None,
+        "accessibleName": "API Key",
+        "value": "sk_live_not_real",
+    }
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    events = processor.reify(
+        [
+            make_focus_event(target=target, timestamp=1000.0).model_dump(),
+            make_keydown_event(target=target, timestamp=1001.0, key="s").model_dump(),
+            make_blur_event(target=target, timestamp=1002.0).model_dump(),
+        ]
+    )
+    actions = processor.events_to_actions(events)
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, ActionInputText)
+    assert action.input_value == ""
+    assert "sk_live_not_real" not in repr(action)
 
 
 def test_non_secret_empty_value_still_skipped() -> None:
@@ -1186,3 +1292,69 @@ async def test_otp_autocomplete_ingest_redacts_and_stamps_totp(
     assert len(steps) == 1
     assert steps[0].credential_kind == "totp"
     assert "654321" not in (steps[0].navigation_goal or "")
+
+
+@pytest.mark.asyncio
+async def test_api_key_ingest_stamps_secret_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_llm(*args: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:
+        raise RuntimeError("llm unavailable")
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", failing_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+    session.ingest_events(
+        make_streaming_console_input(
+            timestamp_ms=1000.0,
+            input_value="sk_live_secret",
+            target_id="api-key",
+            target_text="API Key",
+            input_type="password",
+            accessible_name="API Key",
+        )
+    )
+    steps = await session.flush()
+
+    assert len(steps) == 1
+    assert steps[0].credential_kind == "secret"
+    assert "sk_live_secret" not in (steps[0].navigation_goal or "")
+
+
+@pytest.mark.asyncio
+async def test_magic_link_click_stamps_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_llm(*args: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:
+        raise RuntimeError("llm unavailable")
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", failing_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+    session.ingest_events(
+        [
+            make_streaming_console_click(
+                1000.0,
+                target_text="Email me a magic link",
+                accessible_name="Email me a magic link",
+            )
+        ]
+    )
+    steps = await session.flush()
+
+    assert len(steps) == 1
+    assert steps[0].credential_kind == "magic_link"

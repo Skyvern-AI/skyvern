@@ -78,6 +78,8 @@ Action = ActionClick | ActionHover | ActionInputText | ActionUrlChange | ActionW
 
 ActionBlockable = ActionClick | ActionHover | ActionInputText
 
+CredentialKind = Literal["password", "totp", "credit_card", "secret", "magic_link"]
+
 
 class ActionTarget(BaseModel):
     class_name: str | None = None
@@ -134,7 +136,7 @@ class RecordingDraftStep(BaseModel):
     # locally-captured artifacts (e.g. stream screenshots) with each step.
     timestamp_start: float | None = None
     timestamp_end: float | None = None
-    credential_kind: Literal["password", "totp", "credit_card"] | None = None
+    credential_kind: CredentialKind | None = None
 
 
 class RecordingInterpretationUpdate(BaseModel):

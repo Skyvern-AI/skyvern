@@ -137,12 +137,51 @@ function StepScreenshot({ screenshot }: { screenshot: RecordingScreenshot }) {
   );
 }
 
-function credentialModalTypeForKind(
+function credentialPromptForKind(
   kind: NonNullable<RecordingDraftStep["credential_kind"]>,
-): CredentialModalType {
-  return kind === "credit_card"
-    ? CredentialModalTypes.CREDIT_CARD
-    : CredentialModalTypes.PASSWORD;
+): {
+  type: CredentialModalType;
+  defaultTotpType?: "authenticator" | "email";
+  heading: string;
+  buttonLabel: string;
+} {
+  switch (kind) {
+    case "credit_card":
+      return {
+        type: CredentialModalTypes.CREDIT_CARD,
+        heading: "Add Credit Card",
+        buttonLabel: "Add credit card",
+      };
+    case "secret":
+      return {
+        type: CredentialModalTypes.SECRET,
+        heading: "Add Secret",
+        buttonLabel: "Add secret",
+      };
+    case "totp":
+      return {
+        type: CredentialModalTypes.PASSWORD,
+        defaultTotpType: "authenticator",
+        heading: "Add Two-Factor Authentication",
+        buttonLabel: "Add two-factor authentication",
+      };
+    case "magic_link":
+      return {
+        type: CredentialModalTypes.PASSWORD,
+        defaultTotpType: "email",
+        heading: "Add Magic Link",
+        buttonLabel: "Add magic link",
+      };
+  }
+
+  // "password", plus any kind a backend one deploy ahead sends that this bundle has never
+  // seen. This runs during render, so falling off the end would throw on `.buttonLabel`
+  // and unmount the editor rather than degrade the single button.
+  return {
+    type: CredentialModalTypes.PASSWORD,
+    heading: "Add Password",
+    buttonLabel: "Add password",
+  };
 }
 
 function DraftStepCard({
@@ -153,6 +192,7 @@ function DraftStepCard({
   onDelete,
   onRename,
   showCredentialPrompt,
+  addCredentialLabel,
   onAddCredentials,
   onDismissCredential,
 }: {
@@ -163,6 +203,7 @@ function DraftStepCard({
   onDelete: () => void;
   onRename: (value: string) => void;
   showCredentialPrompt: boolean;
+  addCredentialLabel: string;
   onAddCredentials: () => void;
   onDismissCredential: () => void;
 }) {
@@ -294,7 +335,7 @@ function DraftStepCard({
             className="h-7"
             onClick={onAddCredentials}
           >
-            Add to credentials
+            {addCredentialLabel}
           </Button>
           <Button
             type="button"
@@ -380,6 +421,8 @@ function RecordingPanel({ browserSessionId }: Props) {
     testUrl: string | null;
     url: string | null;
     stepId: string;
+    defaultTotpType?: "authenticator" | "email";
+    heading: string;
   } | null>(null);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
   const committedRef = useRef(false);
@@ -605,12 +648,20 @@ function RecordingPanel({ browserSessionId }: Props) {
                 Boolean(step.credential_kind) &&
                 !dismissedCredentialStepIds.includes(step.step_id)
               }
+              addCredentialLabel={
+                step.credential_kind
+                  ? credentialPromptForKind(step.credential_kind).buttonLabel
+                  : "Add to credentials"
+              }
               onAddCredentials={() => {
                 if (!step.credential_kind) {
                   return;
                 }
+                const prompt = credentialPromptForKind(step.credential_kind);
                 setCredentialModal({
-                  type: credentialModalTypeForKind(step.credential_kind),
+                  type: prompt.type,
+                  defaultTotpType: prompt.defaultTotpType,
+                  heading: prompt.heading,
                   testUrl: step.url ?? null,
                   url: step.url ?? null,
                   stepId: step.step_id,
@@ -744,6 +795,8 @@ function RecordingPanel({ browserSessionId }: Props) {
           isOpen
           overrideType={credentialModal.type}
           defaultTestUrl={credentialModal.testUrl ?? undefined}
+          defaultTotpType={credentialModal.defaultTotpType}
+          heading={credentialModal.heading}
           onOpenChange={(open) => {
             if (!open) {
               setCredentialModal(null);
