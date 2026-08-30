@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,11 +26,13 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, Out
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.loop import LoopOutcome
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ActionType,
@@ -76,6 +79,8 @@ async def _run_execute_task_v3(
     completion_gate_vetoes: bool = False,
     initial_active_credential_parameter_key: str | None = None,
     context_overrides: dict[str, Any] | None = None,
+    own_block_row: WorkflowRunBlock | None = None,
+    own_block_lookup_raises: BaseException | None = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -123,6 +128,10 @@ async def _run_execute_task_v3(
     monkeypatch.setattr(
         "skyvern.forge.agent.app.DATABASE.workflow_params.create_action",
         AsyncMock(side_effect=lambda action: action),
+    )
+    get_own_block_mock = AsyncMock(return_value=own_block_row, side_effect=own_block_lookup_raises)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_block_by_task_id", get_own_block_mock
     )
     # _execute_task_v3 builds auth tools, whose credential-candidate gate reads the workflow-run
     # context; stub it out so executor tests (which don't exercise auth) don't hit that lookup.
@@ -183,6 +192,7 @@ async def _run_execute_task_v3(
 
     loop_mock.clean_up_kwargs = agent.clean_up_task.await_args.kwargs if agent.clean_up_task.await_args else {}
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
+    loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
 
 
@@ -1176,6 +1186,10 @@ async def _run_execute_task_v3_download(
     monkeypatch.setattr(
         "skyvern.forge.agent.app.DATABASE.workflow_params.create_action",
         AsyncMock(side_effect=lambda action: action),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_block_by_task_id",
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", AsyncMock())
@@ -2706,3 +2720,463 @@ async def test_execute_task_v3_redacts_registered_secrets_from_persisted_action_
     assert isinstance(persisted, InputTextAction)
     assert persisted.element_id == "#otp"
     assert "482913" not in persisted.model_dump_json()
+
+
+# ---------------------------------------------------------------------------
+# Cross-block handoff (TASK_V3_BLOCK_HANDOFF): predecessor context rendered
+# into the goal when the flag is on, and this block's own outcome persisted
+# for the next block's handoff on every terminal path.
+# ---------------------------------------------------------------------------
+
+
+def _make_predecessor_run_block(**overrides: Any) -> WorkflowRunBlock:
+    now = datetime.now(UTC)
+    base: dict[str, Any] = {
+        "workflow_run_block_id": "wrb_prev",
+        "workflow_run_id": "wr_handoff",
+        "organization_id": "org-123",
+        "block_type": BlockType.TASK,
+        "status": BlockStatus.failed,
+        "label": "checkout",
+        "finish_reason": "captcha never cleared",
+        "task_id": "task_prev",
+        "created_at": now - timedelta(minutes=5),
+        "modified_at": now - timedelta(minutes=5),
+    }
+    base.update(overrides)
+    return WorkflowRunBlock(**base)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_handoff_flag_on_renders_predecessor_into_goal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.settings.TASK_V3_BLOCK_HANDOFF", True)
+    # The mocked rows include the current block's own (running) row, to prove it's excluded from
+    # predecessor selection by task_id rather than accidentally winning as the "most recent" row.
+    own_running_row = _make_predecessor_run_block(
+        workflow_run_block_id="wrb_current",
+        task_id="task-123",
+        status=BlockStatus.running,
+        label="shipping",
+        finish_reason=None,
+        created_at=datetime.now(UTC),
+        modified_at=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks",
+        AsyncMock(return_value=[_make_predecessor_run_block(), own_running_row]),
+    )
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", AsyncMock())
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "Workflow context" in goal
+    assert "status: failed" in goal
+    assert "captcha never cleared" in goal
+    # The block-kind framing (mid-flow guidance) is still present, and precedes the handoff section.
+    framing_marker = "one block of a larger workflow"
+    assert framing_marker in goal
+    assert goal.index(framing_marker) < goal.index("Workflow context")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_handoff_flag_off_skips_lookup_and_goal_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    get_blocks_with_rows = AsyncMock(return_value=[_make_predecessor_run_block()])
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", get_blocks_with_rows)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", AsyncMock())
+    _step, _task, loop_mock_with_rows, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(TaskBlock, label="shipping"),
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    get_blocks_with_rows.assert_not_awaited()
+
+    get_blocks_no_rows = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", get_blocks_no_rows)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", AsyncMock())
+    _step2, _task2, loop_mock_no_rows, _post2 = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(TaskBlock, label="shipping"),
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    get_blocks_no_rows.assert_not_awaited()
+
+    assert loop_mock_with_rows.await_args.kwargs["goal"] == loop_mock_no_rows.await_args.kwargs["goal"]
+
+
+def _make_own_block_row(task_id: str = "task-123", **overrides: Any) -> WorkflowRunBlock:
+    now = datetime.now(UTC)
+    base: dict[str, Any] = {
+        "workflow_run_block_id": "wrb_current",
+        "workflow_run_id": "wr_handoff",
+        "organization_id": "org-123",
+        "block_type": BlockType.TASK,
+        "task_id": task_id,
+        "created_at": now,
+        "modified_at": now,
+    }
+    base.update(overrides)
+    return WorkflowRunBlock(**base)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_skips_persist_without_run_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Default helper state: no workflow run context has been registered in this process for any
+    # workflow_run_id, so has_workflow_run_context is False here without needing a monkeypatch.
+    # Masking needs the run's registered secrets, so with no run context the handoff must not
+    # persist at all — not even the own-block lookup should run.
+    assert agent_module.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context("wr_handoff") is False
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+
+    outcome = LoopOutcome(status="completed", reason="done here", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+    final_page = MagicMock()
+    final_page.url = "https://example.test/confirmation"
+    final_page.is_closed = MagicMock(return_value=False)
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_row=_make_own_block_row(),
+        workflow_run_id="wr_handoff",
+        get_working_page_side_effect=[final_page, final_page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    loop_mock.get_own_block_mock.assert_not_awaited()
+    update_block_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_finish_reason_and_final_url_with_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    workflow_run_context.mask_secrets_in_data = lambda v, **_k: v
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+
+    outcome = LoopOutcome(status="completed", reason="done here", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+    final_page = MagicMock()
+    final_page.url = "https://example.test/confirmation"
+    final_page.is_closed = MagicMock(return_value=False)
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_row=_make_own_block_row(),
+        workflow_run_id="wr_handoff",
+        # One call from the completion gate, one from the handoff-persist fingerprint.
+        get_working_page_side_effect=[final_page, final_page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    loop_mock.get_own_block_mock.assert_awaited_once_with(task_id="task-123", organization_id="org-123")
+    update_block_mock.assert_awaited_once()
+    assert update_block_mock.await_args.kwargs["workflow_run_block_id"] == "wrb_current"
+    assert update_block_mock.await_args.kwargs["finish_reason"] == "done here"
+    assert update_block_mock.await_args.kwargs["final_url"] == "https://example.test/confirmation"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_masked_final_url_when_workflow_run_context_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    workflow_run_context.mask_secrets_in_data.return_value = "https://example.test/confirmation?otp=*****"
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+
+    outcome = LoopOutcome(status="completed", reason="done here", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+    final_page = MagicMock()
+    final_page.url = "https://example.test/confirmation?otp=123456"
+    final_page.is_closed = MagicMock(return_value=False)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_row=_make_own_block_row(),
+        workflow_run_id="wr_handoff",
+        get_working_page_side_effect=[final_page, final_page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    update_block_mock.assert_awaited_once()
+    # Masking runs first (asserted above via the mock call), then the persist strips to the bare URL.
+    assert update_block_mock.await_args.kwargs["final_url"] == "https://example.test/confirmation"
+    # Masking is applied to both handoff fields, not just the URL.
+    assert update_block_mock.await_args.kwargs["finish_reason"] == "https://example.test/confirmation?otp=*****"
+    masked_inputs = [call.args[0] for call in workflow_run_context.mask_secrets_in_data.call_args_list]
+    unmasked_url = "https://example.test/confirmation?otp=123456"
+    assert unmasked_url in masked_inputs  # nosemgrep: incomplete-url-substring-sanitization
+    assert "done here" in masked_inputs
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_gate_rejection_reason_when_completion_vetoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    workflow_run_context.mask_secrets_in_data = lambda v, **_k: v
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+
+    # The loop itself reports completion; the deployment completion gate vetoes it, so the
+    # persisted handoff must carry the gate's rejection reason, not the loop's "done".
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_row=_make_own_block_row(),
+        workflow_run_id="wr_handoff",
+        completion_gate_vetoes=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.failed
+    update_block_mock.assert_awaited_once()
+    assert "completion gate rejected" in update_block_mock.await_args.kwargs["finish_reason"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_own_block_lookup_not_found_skips_persist_and_finalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+    # A run context must be present for this to exercise the real skip-on-not-found path rather
+    # than short-circuiting on the (also-valid) no-run-context skip.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    workflow_run_context.mask_secrets_in_data = lambda v, **_k: v
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+
+    outcome = LoopOutcome(status="completed", reason="done here", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_lookup_raises=NotFoundError(),
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    loop_mock.get_own_block_mock.assert_awaited_once_with(task_id="task-123", organization_id="org-123")
+    update_block_mock.assert_not_awaited()
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_bare_task_does_not_persist_block_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=None,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    update_block_mock.assert_not_awaited()
+    loop_mock.get_own_block_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_handoff_flag_on_reports_last_block_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.settings.TASK_V3_BLOCK_HANDOFF", True)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", AsyncMock())
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+
+    task_block = _make_block(TaskBlock, label="last_block")
+    other_block = _make_block(TaskBlock, label="other_block")
+    workflow_run_context = MagicMock()
+    workflow_run_context.workflow.workflow_definition.blocks = [other_block, task_block]
+    workflow_run_context.workflow.workflow_definition.finally_block_label = None
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=task_block,
+        workflow_run_id="wr_position",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert "last block of the workflow" in loop_mock.await_args.kwargs["goal"]
+
+    # Reversed order: the same block is now first, so other blocks run after it.
+    workflow_run_context.workflow.workflow_definition.blocks = [task_block, other_block]
+    _step2, _task2, loop_mock2, _post2 = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=task_block,
+        workflow_run_id="wr_position",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert "not the last block" in loop_mock2.await_args.kwargs["goal"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persist_failure_is_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A DB or page error while recording the handoff must never fail a run that finished cleanly.
+    # A run context must be present so the failing lookup is actually reached (without one, the
+    # persist is skipped before the lookup runs at all, and this would pass vacuously).
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    workflow_run_context.mask_secrets_in_data = lambda v, **_k: v
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(TaskBlock, label="shipping"),
+        own_block_lookup_raises=RuntimeError("db down"),
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_empty_reason_clears_stale_finish_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Retries reuse the block row: a successful attempt with an empty reason must clear (not keep)
+    # the failure text a prior attempt persisted, via the explicit "" clear.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    run_context = MagicMock()
+    run_context.mask_secrets_in_data = lambda value, **_kwargs: value
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context", lambda *_a, **_k: run_context
+    )
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+
+    outcome = LoopOutcome(status="completed", reason="", billable_actions=["click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(TaskBlock, label="shipping"),
+        workflow_run_id="wr_handoff",
+        own_block_row=_make_own_block_row(),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert update_block_mock.await_args.kwargs["finish_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persisted_final_url_is_stripped_to_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Persisted final_url must keep only scheme://host/path: an OAuth callback token in the query
+    # is server-minted, so secret-registry masking alone cannot catch it.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    run_context = MagicMock()
+    run_context.mask_secrets_in_data = lambda value, **_kwargs: value
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context", lambda *_a, **_k: run_context
+    )
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    final_page = MagicMock()
+    final_page.url = "https://user:pw@example.test/callback?code=oauth-code#frag"
+    final_page.is_closed = MagicMock(return_value=False)
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(TaskBlock, label="shipping"),
+        workflow_run_id="wr_handoff",
+        own_block_row=_make_own_block_row(),
+        get_working_page_side_effect=[final_page, final_page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert update_block_mock.await_args.kwargs["final_url"] == "https://example.test/callback"

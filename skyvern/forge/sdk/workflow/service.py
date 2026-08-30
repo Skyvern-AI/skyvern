@@ -613,6 +613,7 @@ UNBOUNDED_BLOCK_TEXT_LIST_FIELDS = (
 UNBOUNDED_BLOCK_TEXT_FIELDS = (
     "description",
     "failure_reason",
+    "finish_reason",
     "navigation_goal",
     "data_extraction_goal",
     "terminate_criterion",
@@ -5569,6 +5570,9 @@ class WorkflowService:
         workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
+        run_context_for_selection = skyvern_context.current()
+        if run_context_for_selection is not None:
+            run_context_for_selection.run_block_labels = block_labels
 
         # Load script blocks if script is provided
         script_blocks_by_label: dict[str, Any] = {}

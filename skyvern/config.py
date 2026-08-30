@@ -525,6 +525,11 @@ class Settings(BaseSettings):
     # Append a fresh observe digest to a page-changing action batch's tool result, so the model can act
     # from it without spending a separate perception turn.
     TASK_V3_AUTO_OBSERVE: bool = False
+    # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
+    # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
+    # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
+    # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
+    TASK_V3_BLOCK_HANDOFF: bool = False
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
