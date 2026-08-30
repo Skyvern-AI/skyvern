@@ -22,7 +22,7 @@ from openai.types.responses import Response, ResponseCompletedEvent, ResponseOut
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation, RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
@@ -2873,6 +2873,92 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
     assert captured["force_fresh_session"] is True
     assert captured["definition_unpersisted"] is True
     assert captured["provenance"] == "initial"
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_preserves_existing_code_block_association(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fake_process(**kwargs: Any) -> _FakeWorkflow:
+        return _FakeWorkflow(_wf_def())
+
+    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _fake_process)
+
+    ctx = _make_ctx()
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_original"}
+    workflow_yaml = """\
+workflow_definition:
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return {"rate": 0.5}
+"""
+
+    result = await run_workflow_end_to_end(ctx, workflow_yaml)
+
+    assert result == {"ok": False, "error": "This workflow has no blocks to run."}
+    assert ctx.runner_code_block_associations_by_label == {"collect_failure_rate": "cba_original"}
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_finalization_uses_the_exact_recorded_outcome_after_raw_result_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _wf_def(("collect_failure_rate", "code", {"code": "return {}"}))
+    recorded_outcome = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+        workflow_run_id="wr_recorded",
+        structural_failure_identity="browser-operation",
+        failed_operation=BuildTestFailedOperation(
+            kind="browser_operation_failed",
+            workflow_run_id="wr_recorded",
+            workflow_run_block_id="wrb_recorded",
+            block_label="collect_failure_rate",
+            failing_line=1,
+        ),
+    )
+
+    async def _fake_process(**kwargs: Any) -> _FakeWorkflow:
+        return _FakeWorkflow(definition)
+
+    async def _fake_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_recorded",
+                "overall_status": "failed",
+                "requested_block_labels": ["collect_failure_rate"],
+                "executed_block_labels": ["collect_failure_rate"],
+                "blocks": [
+                    {
+                        "label": "collect_failure_rate",
+                        "status": "failed",
+                        "workflow_run_block_id": "wrb_recorded",
+                        "error_codes": ["browser_operation_failed"],
+                    }
+                ],
+            },
+        }
+
+    async def _fake_verify(*args: Any, **kwargs: Any) -> RecordedBuildTestOutcome:
+        return recorded_outcome
+
+    real_finalize = run_execution_module.finalize_build_test_result
+
+    def _mutate_then_finalize(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = kwargs["result"]
+        result["data"]["blocks"][0]["workflow_run_block_id"] = "wrb_mutated"
+        return real_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _fake_process)
+    monkeypatch.setattr(run_execution_module, "_run_blocks_and_collect_debug", _fake_run)
+    monkeypatch.setattr(run_execution_module, "_verify_and_record_run_blocks_result", _fake_verify)
+    monkeypatch.setattr(run_execution_module, "finalize_build_test_result", _mutate_then_finalize)
+
+    result = await run_workflow_end_to_end(_make_ctx(), "workflow: yaml")
+
+    assert result["data"]["build_test_packet"]["failure"]["failed_operation"]["workflow_run_block_id"] == "wrb_recorded"
 
 
 @pytest.mark.asyncio

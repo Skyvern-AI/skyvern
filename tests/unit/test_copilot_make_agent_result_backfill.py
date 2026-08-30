@@ -7,9 +7,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _make_agent_result
+from skyvern.forge.sdk.copilot.agent import (
+    _finalize_result_with_blocker_override,
+    _make_agent_result,
+    _terminal_failed_operation,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, contains_internal_machinery_leak
-from skyvern.forge.sdk.copilot.build_test_outcome import record_build_test_outcome
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestFailedOperation,
+    RecordedBuildTestOutcome,
+    record_build_test_outcome,
+)
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CopilotContext,
@@ -151,6 +159,138 @@ def test_backfill_tolerates_ctx_none() -> None:
     result = _result(None, turn_outcome=_outcome(ResponseKind.REFUSE), narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert result.narrative_payload["responseKind"] == "refuse"
+
+
+def test_recorded_browser_operation_failure_overrides_success_prose_but_keeps_draft() -> None:
+    ctx = _ctx()
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_browser_operation",
+        workflow_run_block_id="wrb_capture_failure",
+        block_label="collect_failure_rate",
+        failing_line=11,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            attempted_block_label="collect_failure_rate",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_browser_operation",
+            block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+    draft = SimpleNamespace(name="untested draft")
+    assert _terminal_failed_operation(ctx) == failed_operation
+
+    result = _result(
+        ctx,
+        user_response="Destination write completed successfully.",
+        updated_workflow=draft,
+        workflow_yaml=two_page_login_yaml(),
+        proposal_disposition="auto_applicable",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(
+            terminalMessage="Destination write completed successfully.",
+            narrativeSummary="Destination write completed successfully.",
+        ),
+    )
+
+    assert result.updated_workflow == draft
+    assert result.proposal_disposition == "review_untested"
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["failed_operation"] == failed_operation.model_dump()
+    assert result.terminal_envelope["next_state"] == "stopped"
+    assert "browser operation failed" in result.user_response.lower()
+    assert "write completed" not in result.user_response.lower()
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["terminalMessage"] == result.user_response
+    assert result.narrative_payload["narrativeSummary"] == result.user_response
+    assert result.narrative_payload["turnFacts"]["terminalCause"] == "browser_operation_failed"
+    assert result.narrative_payload["turnFacts"]["ranCleanOnCurrentSource"] is False
+
+
+def test_recorded_browser_operation_failure_survives_later_non_clearing_outcome() -> None:
+    ctx = _ctx()
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_browser_operation",
+        workflow_run_block_id="wrb_capture_failure",
+        block_label="collect_failure_rate",
+        failing_line=11,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            attempted_block_label="collect_failure_rate",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_browser_operation",
+            requested_block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="scout_evaluate",
+            attempted_tool="inspect_page_for_composition",
+            verdict="progress_observed",
+            reason_code="verified_success",
+        ),
+    )
+
+    assert _terminal_failed_operation(ctx) == failed_operation
+
+
+def test_recorded_browser_operation_failure_survives_auto_applicable_question_precedence() -> None:
+    ctx = _ctx()
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_browser_operation",
+        block_label="collect_failure_rate",
+        failing_line=1,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_browser_operation",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    result = _result(
+        ctx,
+        response_type="ASK_QUESTION",
+        user_response="The destination write completed. Which account should I use?",
+        proposal_disposition="auto_applicable",
+        turn_outcome=_outcome(ResponseKind.CLARIFY),
+        narrative_payload=_payload(),
+    )
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["failed_operation"] == failed_operation.model_dump()
+    assert result.terminal_envelope["verified"] is False
+    assert result.terminal_envelope["workflow_applied"] is False
+    assert result.terminal_envelope["next_state"] == "awaiting_user_input"
+    assert result.terminal_envelope["response_kind"] == "question"
+    assert result.proposal_disposition == "no_proposal"
+    assert "browser operation failed" in result.user_response.lower()
+    assert "which account should i use?" in result.user_response.lower()
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["terminalMessage"] == result.user_response
+    assert result.narrative_payload["narrativeSummary"] == result.user_response
 
 
 def test_result_carries_exact_model_contract_deletion_to_auto_accept() -> None:

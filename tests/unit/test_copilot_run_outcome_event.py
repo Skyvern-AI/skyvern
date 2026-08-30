@@ -610,9 +610,75 @@ async def test_missing_run_id_does_not_reuse_prior_run_id() -> None:
 def test_both_consumers_route_through_single_producer() -> None:
     source = inspect.getsource(copilot_tools)
     assert source.count("await _verify_and_record_run_blocks_result(") == 2
+    assert source.count("recorded_outcome = await _verify_and_record_run_blocks_result(") == 2
+    assert source.count("recorded_outcome=recorded_outcome") == 2
     assert "_record_run_blocks_result(copilot_ctx, result, completion_verification" not in source
     assert "_record_run_blocks_result(copilot_ctx, run_result, completion_verification" not in source
     assert "await _maybe_run_completion_verification(copilot_ctx" not in source
+
+
+@pytest.mark.parametrize(
+    "result_name",
+    ["result", "run_result"],
+    ids=["run_blocks_tool", "run_updated_workflow_blocks"],
+)
+def test_each_current_run_consumer_passes_the_recorded_outcome_to_finalization(
+    result_name: str,
+) -> None:
+    source = inspect.getsource(copilot_tools)
+    producer = (
+        f"recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, {result_name}, handler_start)"
+    )
+    start = source.index(producer)
+    consumer = source[start : start + 700]
+    assert f"result={result_name}" in consumer
+    assert "recorded_outcome=recorded_outcome" in consumer
+
+
+@pytest.mark.asyncio
+async def test_same_run_recorded_operation_remains_packet_authority_after_raw_result_mutation() -> None:
+    result = _run_result(
+        [
+            {
+                "label": "collect_failure_rate",
+                "block_type": "CODE",
+                "status": "failed",
+                "workflow_run_block_id": "wrb_recorded",
+                "error_codes": ["browser_operation_failed"],
+                "failure_reason": "browser operation failed",
+            }
+        ],
+        ok=False,
+    )
+    result["data"]["requested_block_labels"] = ["collect_failure_rate"]
+    result["data"]["executed_block_labels"] = ["collect_failure_rate"]
+    result["data"]["failing_code_line"] = 1
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.workflow_yaml = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return await page.locator("canvas.failure-rate").inner_text()
+"""
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+
+    recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+    assert recorded_outcome is not None
+    assert recorded_outcome.failed_operation is not None
+    assert recorded_outcome.failed_operation.workflow_run_block_id == "wrb_recorded"
+
+    result["data"]["blocks"][0]["workflow_run_block_id"] = "wrb_mutated"
+    run_execution.finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+        recorded_outcome=recorded_outcome,
+    )
+
+    packet = result["data"]["build_test_packet"]
+    assert packet["failure"]["failed_operation"]["workflow_run_block_id"] == "wrb_recorded"
 
 
 def test_display_reason_collapses_whitespace_and_caps_length() -> None:

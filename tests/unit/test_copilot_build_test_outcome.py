@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -9,9 +10,16 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build_user_context, _prior_run_debug_text
+from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent import (
+    _build_dynamic_system_prompt,
+    _build_user_context,
+    _prior_run_debug_text,
+    _recorded_build_test_outcome_prompt,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestEvidencePacket,
+    BuildTestFailedOperation,
     BuildTestPacketDownload,
     BuildTestPacketFailure,
     BuildTestPacketLocatorObservation,
@@ -36,6 +44,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_fa
 from skyvern.forge.sdk.copilot.output_utils import project_build_test_packet_for_llm
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
+from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -47,6 +56,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _recorded_run_block_result,
     build_test_evidence_packet,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from tests.unit.copilot_test_helpers import (
     failed_second_factor_run,
@@ -2396,6 +2406,803 @@ def test_the_runners_typed_error_and_failing_line_reach_the_repair_turn() -> Non
     assert packet.failure is not None
     assert packet.failure.error_codes == ["user_code_error"]
     assert packet.failure.failing_line == 6
+
+
+def test_browser_operation_failure_projects_same_row_run_and_block_identity() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = "wr_browser_operation"
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_capture_failure",
+            "label": "collect_failure_rate",
+            "status": "failed",
+            "failure_reason": "browser operation failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    data["failing_code_line"] = 11
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert outcome.failed_operation.model_dump() == {
+        "kind": "browser_operation_failed",
+        "workflow_run_id": "wr_browser_operation",
+        "workflow_run_block_id": "wrb_capture_failure",
+        "block_label": "collect_failure_rate",
+        "failing_line": 11,
+    }
+    assert packet.failure is not None
+    assert packet.failure.failed_operation == outcome.failed_operation
+    projected = project_build_test_packet_for_llm(packet)
+    assert projected.failure is not None
+    assert projected.failure.failed_operation == outcome.failed_operation
+
+
+def test_browser_operation_packet_uses_same_run_recorded_outcome_as_its_authority() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = "wr_recorded_authority"
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_recorded_authority",
+            "label": "collect_failure_rate",
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    assert isinstance(blocks[0], dict)
+    blocks[0]["workflow_run_block_id"] = "wrb_raw_result_changed_after_recording"
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert packet.failure is not None
+    assert packet.failure.failed_operation == outcome.failed_operation
+    assert packet.failure.failed_operation.workflow_run_block_id == "wrb_recorded_authority"
+
+
+def test_browser_operation_producer_redacts_registered_block_label_secret() -> None:
+    session_id = "pbs_build_test_operation_redaction"
+    secret = "build-test-label-secret-value"
+    ctx = SimpleNamespace(browser_session_id=session_id, secret_scrub_values=[])
+    register_secret_scrub_value(ctx, secret)
+    try:
+        result = _failed_run_result(None)
+        data = result["data"]
+        assert isinstance(data, dict)
+        data["blocks"] = [
+            {
+                "label": f"collect_{secret}_rate",
+                "status": "failed",
+                "error_codes": ["browser_operation_failed"],
+            }
+        ]
+        outcome = recorded_outcome_from_run_blocks_result(result)
+    finally:
+        clear_session_scrub_values(session_id)
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert secret not in outcome.model_dump_json()
+    assert outcome.failed_operation.block_label == "collect_[REDACTED_SECRET]_rate"
+
+
+def test_browser_operation_structural_key_ignores_transient_run_and_block_ids() -> None:
+    first = _failed_run_result(None)
+    first_data = first["data"]
+    assert isinstance(first_data, dict)
+    first_data["workflow_run_id"] = "wr_first"
+    first_data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_first",
+            "label": "collect_failure_rate",
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    first_data["failing_code_line"] = 11
+    second = copy.deepcopy(first)
+    second_data = second["data"]
+    assert isinstance(second_data, dict)
+    second_data["workflow_run_id"] = "wr_second"
+    blocks = second_data["blocks"]
+    assert isinstance(blocks, list)
+    assert isinstance(blocks[0], dict)
+    blocks[0]["workflow_run_block_id"] = "wrb_second"
+
+    first_outcome = recorded_outcome_from_run_blocks_result(first)
+    second_outcome = recorded_outcome_from_run_blocks_result(second)
+
+    assert first_outcome is not None
+    assert second_outcome is not None
+    assert first_outcome.failed_operation is not None
+    assert second_outcome.failed_operation is not None
+    assert first_outcome.failed_operation.workflow_run_id != second_outcome.failed_operation.workflow_run_id
+    assert first_outcome.structural_key == second_outcome.structural_key
+
+
+def test_browser_operation_failure_survives_non_clearing_outcomes_until_changed_attempt_is_tested() -> None:
+    failed_workflow = """title: retain browser failure
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return {"failure_rate": await page.locator("canvas.failure-rate").inner_text()}
+"""
+    repaired_workflow = failed_workflow.replace("canvas.failure-rate", "[data-testid='failure-rate']")
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        workflow_run_block_id="wrb_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+        block_association="cba_collect_failure_rate",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="scout_evaluate",
+            attempted_tool="inspect_page_for_composition",
+            verdict="progress_observed",
+            reason_code="verified_success",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_unchanged",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            verified_progress_marker="run-completed",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+    ctx.workflow_yaml = repaired_workflow
+    ctx.persisted_workflow_yaml = repaired_workflow
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_changed_but_not_executed",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            executed_block_labels=[],
+            verified_progress_marker="run-completed",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_changed_and_tested",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=("cba_collect_failure_rate",),
+            verified_progress_marker="run-completed",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_existing_workflow_failure_and_retest_use_the_exact_unmasked_staged_snapshots() -> None:
+    turn_start_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return await page.locator("[data-testid='turn-start']").inner_text()
+"""
+    failed_snapshot = turn_start_workflow.replace("[data-testid='turn-start']", "canvas.failure-rate")
+    repaired_snapshot = turn_start_workflow.replace("[data-testid='turn-start']", "[data-testid='failure-rate']")
+    ctx = _locator_packet_ctx()
+    ctx.persisted_workflow_yaml = turn_start_workflow
+    ctx.workflow_yaml = failed_snapshot
+    ctx.staged_workflow_yaml = failed_snapshot
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+        block_association="cba_collect_failure_rate",
+    )
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+    ctx.workflow_yaml = repaired_snapshot
+    ctx.staged_workflow_yaml = repaired_snapshot
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_retested",
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=("cba_collect_failure_rate",),
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_verified_retest_clears_a_changed_outer_browser_operation_not_its_nested_locator() -> None:
+    failed_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: submit
+      code: |
+        await page.locator("#submit").click(timeout=1000)
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"submit": "cba_submit"}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_failed",
+                block_label="submit",
+                failing_line=1,
+                block_association="cba_submit",
+            ),
+        ),
+    )
+    ctx.workflow_yaml = failed_workflow.replace("timeout=1000", "timeout=5000")
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_retested",
+            executed_block_associations=("cba_submit",),
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_browser_operation_failure_is_not_cleared_when_full_replacement_copies_its_old_association() -> None:
+    failed_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_original
+      code: |
+        return await page.locator("canvas.failure-rate").inner_text()
+    - block_type: code
+      label: summarize
+      code: |
+        return {"summary": "ready"}
+"""
+    replacement_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: summarize
+      code: |
+        return {"summary": "ready"}
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_original
+      code: |
+        return {"unrelated": "replacement"}
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.staged_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_original"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+        block_association="cba_original",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    ctx.workflow_yaml = replacement_workflow
+    ctx.staged_workflow_yaml = replacement_workflow
+    ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+        replacement_workflow,
+        prior_associations=ctx.runner_code_block_associations_by_label,
+        preserve_existing=False,
+    )
+    replacement_association = ctx.runner_code_block_associations_by_label["collect_failure_rate"]
+    assert replacement_association != "cba_original"
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_replacement",
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=(replacement_association,),
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+def test_code_block_association_covers_conditional_blocks_without_entering_packet_projection() -> None:
+    workflow_yaml = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: conditional
+      label: inspect_state
+      branch_conditions:
+        - condition: "True"
+          blocks:
+            - block_type: code
+              label: read_failure_rate
+              code: |
+                return await page.locator("canvas.failure-rate").inner_text()
+"""
+    associations = runner_code_block_associations(workflow_yaml)
+
+    assert set(associations) == {"read_failure_rate"}
+    assert "copilot_block_association" not in workflow_yaml
+    outcome = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_conditional_failure",
+                "overall_status": "failed",
+                "failing_code_line": 1,
+                "blocks": [
+                    {
+                        "label": "read_failure_rate",
+                        "status": "failed",
+                        "error_codes": ["browser_operation_failed"],
+                    }
+                ],
+            },
+        },
+        block_associations_by_label=associations,
+    )
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert outcome.failed_operation.block_association == associations["read_failure_rate"]
+    assert "copilot_block_association" not in outcome.model_dump_json()
+
+
+def test_recorded_outcome_execution_receipts_come_from_block_status_not_requested_labels() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_receipts",
+            "overall_status": "failed",
+            "requested_block_labels": ["requested_only", "executed"],
+            "executed_block_labels": ["requested_only", "executed"],
+            "blocks": [
+                {"label": "requested_only", "status": "skipped"},
+                {
+                    "label": "executed",
+                    "status": "failed",
+                    "failure_reason": "browser operation failed",
+                    "error_codes": ["browser_operation_failed"],
+                },
+            ],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.requested_block_labels == ["requested_only", "executed"]
+    assert outcome.executed_block_labels == ["executed"]
+
+
+def test_browser_operation_failure_is_not_cleared_by_unrelated_edit_in_executed_block() -> None:
+    failed_workflow = """title: retain browser failure
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_collect_failure_rate
+      code: |
+        value = await page.locator("canvas.failure-rate").inner_text()
+        return {"failure_rate": value}
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    unrelated_edit = failed_workflow.replace(
+        'return {"failure_rate": value}',
+        'return {"failure_rate": value, "note": "unchanged locator"}',
+    )
+    ctx.workflow_yaml = unrelated_edit
+    ctx.persisted_workflow_yaml = unrelated_edit
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_unrelated_edit",
+            requested_block_labels=["collect_failure_rate"],
+            executed_block_labels=["collect_failure_rate"],
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+def test_browser_operation_failure_is_not_cleared_by_an_untested_persisted_edit() -> None:
+    failed_workflow = """title: retain browser failure
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return {"failure_rate": await page.locator("canvas.failure-rate").inner_text()}
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            requested_block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    ctx.workflow_yaml = failed_workflow.replace("canvas.failure-rate", "[data-testid='failure-rate']")
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+    record_build_test_outcome(ctx, None)
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+@pytest.mark.asyncio
+async def test_browser_operation_outcome_clears_after_server_composed_verified_retest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_workflow = """title: read the failure rate
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_collect_failure_rate
+      code: |
+        value = await page.locator("canvas.failure-rate").inner_text()
+        return {"failure_rate": value}
+"""
+    repaired_workflow = failed_workflow.replace(
+        'page.locator("canvas.failure-rate")',
+        "page.locator(\"[data-testid='failure-rate']\")",
+    )
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_browser_operation",
+            block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_browser_operation",
+                workflow_run_block_id="wrb_browser_operation",
+                block_label="collect_failure_rate",
+                failing_line=1,
+                block_association="cba_collect_failure_rate",
+            ),
+        ),
+    )
+
+    prompt = _recorded_build_test_outcome_prompt(ctx)
+    persisted_attempts = [failed_workflow]
+    tested_attempts: list[str] = []
+
+    async def persist_workflow(
+        payload: dict[str, object], copilot_ctx: CopilotContext, **_kwargs: object
+    ) -> dict[str, object]:
+        candidate = payload["workflow_yaml"]
+        assert isinstance(candidate, str)
+        assert payload["_preserve_code_block_associations"] is True
+        persisted_attempts.append(candidate)
+        copilot_ctx.workflow_yaml = candidate
+        copilot_ctx.persisted_workflow_yaml = candidate
+        code = candidate.split("code: |", 1)[1]
+        workflow = SimpleNamespace(
+            proxy_location=None,
+            workflow_definition=SimpleNamespace(
+                blocks=[
+                    SimpleNamespace(
+                        label="collect_failure_rate",
+                        block_type=SimpleNamespace(value="code"),
+                        code=code,
+                    )
+                ]
+            ),
+        )
+        return {"ok": True, "data": {"block_count": 1}, "_workflow": workflow}
+
+    async def test_persisted_workflow(
+        _params: dict[str, object], copilot_ctx: CopilotContext, **_kwargs: object
+    ) -> dict[str, object]:
+        persisted = copilot_ctx.persisted_workflow_yaml
+        assert isinstance(persisted, str)
+        tested_attempts.append(persisted)
+        repaired_selector_present = "[data-testid='failure-rate']" in persisted
+        return {
+            "ok": repaired_selector_present,
+            "data": {
+                "workflow_run_id": "wr_retested_repair",
+                "overall_status": "completed" if repaired_selector_present else "failed",
+                "requested_block_labels": ["collect_failure_rate"],
+                "executed_block_labels": ["collect_failure_rate"],
+                "blocks": [
+                    {
+                        "label": "collect_failure_rate",
+                        "status": "completed" if repaired_selector_present else "failed",
+                        "extracted_data": {"failure_rate": "16.67%"} if repaired_selector_present else None,
+                    }
+                ],
+            },
+        }
+
+    async def observe_test_result(
+        copilot_ctx: CopilotContext, result: dict[str, object], _handler_start: float
+    ) -> object:
+        record_build_test_outcome(
+            copilot_ctx,
+            RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="edit_block_and_run",
+                verdict="progress_observed",
+                reason_code="verified_success",
+                workflow_run_id="wr_retested_repair",
+                executed_block_associations=("cba_collect_failure_rate",),
+                verified_progress_marker="run-completed",
+            ),
+        )
+        return copilot_ctx.latest_recorded_build_test_outcome
+
+    monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        tools_module,
+        "_plan_frontier",
+        lambda *args: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
+    )
+    monkeypatch.setattr(tools_module, "_update_workflow", persist_workflow)
+    monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", test_persisted_workflow)
+    monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", observe_test_result)
+    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+    tool_result = await tools_module.edit_block_and_run_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
+        json.dumps(
+            {
+                "label": "collect_failure_rate",
+                "expected_code": 'value = await page.locator("canvas.failure-rate").inner_text()\nreturn {"failure_rate": value}',
+                "replacement_code": (
+                    "value = await page.locator(\"[data-testid='failure-rate']\").inner_text()\n"
+                    'return {"failure_rate": value}'
+                ),
+                "block_labels": ["collect_failure_rate"],
+                "parameters": {},
+            }
+        ),
+    )
+    parsed_result = json.loads(tool_result)
+
+    assert "browser_operation_failed" in prompt
+    assert "wrb_browser_operation" in prompt
+    assert "collect_failure_rate" in prompt
+    assert "failing_line=1" in prompt
+    assert persisted_attempts == [failed_workflow, repaired_workflow]
+    assert "canvas.failure-rate" in persisted_attempts[0]
+    assert "canvas.failure-rate" not in persisted_attempts[1]
+    assert tested_attempts == [repaired_workflow]
+    assert parsed_result["ok"] is True
+    assert parsed_result["data"]["workflow_run_id"] == "wr_retested_repair"
+    assert parsed_result["data"]["build_test_packet"]["run"] == {
+        "workflow_run_id": "wr_retested_repair",
+        "status": "completed",
+    }
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.workflow_run_id == "wr_retested_repair"
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_browser_operation_identity_is_bounded_by_the_shared_packet_projection() -> None:
+    long_identity = "x" * 200
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = long_identity
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": long_identity,
+            "label": long_identity,
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(_locator_packet_ctx(), result))
+
+    assert projected.failure is not None
+    assert projected.failure.failed_operation is not None
+    operation = projected.failure.failed_operation
+    assert len(operation.workflow_run_id or "") == 160
+    assert len(operation.workflow_run_block_id or "") == 160
+    assert len(operation.block_label or "") == 160
+    assert all(
+        value.endswith("...")
+        for value in (operation.workflow_run_id, operation.workflow_run_block_id, operation.block_label)
+        if value
+    )
+    assert any("failure.failed_operation.workflow_run_id shortened" in notice for notice in projected.omission_notices)
+    assert any(
+        "failure.failed_operation.workflow_run_block_id shortened" in notice for notice in projected.omission_notices
+    )
+    assert any("failure.failed_operation.block_label shortened" in notice for notice in projected.omission_notices)
+
+
+def test_browser_operation_packet_names_each_unavailable_operation_identity() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data.pop("workflow_run_id", None)
+    data["blocks"] = [
+        {
+            "label": None,
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    data.pop("failing_code_line", None)
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    assert packet.failure.failed_operation is not None
+    notices = packet.omission_notices
+    assert any("failure.failed_operation.workflow_run_id omitted" in notice for notice in notices)
+    assert any("failure.failed_operation.workflow_run_block_id omitted" in notice for notice in notices)
+    assert any("failure.failed_operation.block_label omitted" in notice for notice in notices)
+    assert any("failure.failed_operation.failing_line omitted" in notice for notice in notices)
 
 
 def test_a_failure_the_runner_did_not_type_carries_neither_field() -> None:

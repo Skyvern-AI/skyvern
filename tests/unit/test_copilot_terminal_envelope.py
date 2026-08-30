@@ -11,8 +11,10 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     MINIMAL_HONEST_STOP,
     TerminalOutcomeEnvelope,
@@ -92,6 +94,177 @@ def test_unknown_halt_kind_degrades_to_stopped_never_question() -> None:
     finalized = finalize_applied_state(envelope, applied=False)
     assert finalized.response_kind == "stopped"
     assert finalized.next_state == "stopped"
+
+
+def test_browser_operation_failure_is_a_typed_unverified_terminal() -> None:
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_browser_operation",
+        workflow_run_block_id="wrb_capture_failure",
+        block_label="collect_failure_rate",
+        failing_line=11,
+    )
+
+    envelope = _assemble(
+        verified=True,
+        workflow_applied=True,
+        proposal_disposition="review_untested",
+        failed_operation=failed_operation,
+        proposal_present=True,
+    )
+    message, replaced = render_terminal_message(
+        envelope,
+        "Destination write completed successfully.",
+        cancelled=False,
+    )
+
+    assert envelope.next_state == "stopped"
+    assert envelope.response_kind == "stopped"
+    assert envelope.verified is False
+    assert envelope.workflow_applied is False
+    assert envelope.terminal_cause == "browser_operation_failed"
+    assert envelope.failed_operation == failed_operation
+    finalized = finalize_applied_state(envelope, applied=True, proposal_present=True)
+    assert finalized.workflow_applied is False
+    assert finalized.next_state == "stopped"
+    assert replaced is True
+    assert "browser operation failed" in message.lower()
+    assert "draft" in message.lower()
+    assert "write completed" not in message.lower()
+
+
+def test_browser_operation_failure_without_proposal_does_not_claim_draft_available() -> None:
+    envelope = _assemble(
+        proposal_disposition="no_proposal",
+        failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+        proposal_present=False,
+    )
+
+    message, replaced = render_terminal_message(envelope, "Destination write completed.", cancelled=False)
+
+    assert replaced is True
+    assert "browser operation failed" in message.lower()
+    assert "draft" not in message.lower()
+    assert "requested work was not confirmed" in message.lower()
+
+
+def test_browser_operation_failure_preserves_required_question_precedence() -> None:
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_browser_operation",
+        workflow_run_block_id="wrb_capture_failure",
+    )
+
+    envelope = _assemble(
+        response_type="ASK_QUESTION",
+        verified=True,
+        workflow_applied=True,
+        proposal_disposition="auto_applicable",
+        failed_operation=failed_operation,
+    )
+    model_message = "The destination write completed. Which account should I use?"
+    message, replaced = render_terminal_message(envelope, model_message, cancelled=False)
+    finalized = finalize_applied_state(envelope, applied=False)
+
+    assert envelope.user_action_required is True
+    assert envelope.next_state == "awaiting_user_input"
+    assert envelope.response_kind == "question"
+    assert envelope.verified is False
+    assert envelope.workflow_applied is False
+    assert finalized.next_state == "awaiting_user_input"
+    assert finalized.response_kind == "question"
+    assert "browser operation failed" in message.lower()
+    assert "requested work was not confirmed" in message.lower()
+    assert model_message in message
+    assert replaced is True
+
+    rerendered, rerendered_replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert rerendered == message
+    assert rerendered_replaced is False
+
+
+def test_hydrated_question_with_failed_operation_normalizes_privileged_flags() -> None:
+    envelope = TerminalOutcomeEnvelope.model_validate(
+        {
+            "next_state": "completed",
+            "verified": True,
+            "workflow_applied": True,
+            "user_action_required": True,
+            "response_kind": "question",
+            "failed_operation": {
+                "kind": "browser_operation_failed",
+                "workflow_run_id": "wr_browser_operation",
+            },
+        }
+    )
+    finalized = finalize_applied_state(envelope, applied=True, proposal_present=True)
+
+    assert envelope.verified is False
+    assert envelope.workflow_applied is False
+    assert finalized.verified is False
+    assert finalized.workflow_applied is False
+    assert finalized.next_state == "awaiting_user_input"
+    assert finalized.response_kind == "question"
+
+
+def test_terminal_operation_serialization_and_logging_redact_registered_block_label_secret() -> None:
+    session_id = "pbs_terminal_operation_redaction"
+    secret = "terminal-label-secret-value"
+    ctx = SimpleNamespace(browser_session_id=session_id, secret_scrub_values=[])
+    register_secret_scrub_value(ctx, secret)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            payload = agent_module._assemble_terminal_envelope_safe(
+                response_type="REPLY",
+                verified=False,
+                workflow_applied=False,
+                proposal_disposition="review_untested",
+                run_outcomes=[],
+                blocker_reason=None,
+                halt_kind=None,
+                attempted=None,
+                workflow_mutated=True,
+                workflow_attempted=True,
+                final_message="I stopped.",
+                failed_operation=BuildTestFailedOperation(
+                    kind="browser_operation_failed",
+                    block_label=f"collect_{secret}_rate",
+                ),
+            )
+    finally:
+        clear_session_scrub_values(session_id)
+
+    assert payload is not None
+    terminal_log = next(log for log in logs if log["event"] == "copilot_terminal_envelope")
+    assert secret not in str(payload)
+    assert secret not in str(terminal_log)
+    assert payload["failed_operation"]["block_label"] == "collect_[REDACTED_SECRET]_rate"
+
+
+def test_terminal_operation_hydration_redacts_registered_block_label_secret() -> None:
+    session_id = "pbs_terminal_operation_hydration_redaction"
+    secret = "hydrated-label-secret-value"
+    ctx = SimpleNamespace(browser_session_id=session_id, secret_scrub_values=[])
+    register_secret_scrub_value(ctx, secret)
+    try:
+        envelope = TerminalOutcomeEnvelope.model_validate(
+            {
+                "next_state": "stopped",
+                "verified": False,
+                "response_kind": "stopped",
+                "failed_operation": {
+                    "kind": "browser_operation_failed",
+                    "block_label": f"collect_{secret}_rate",
+                },
+            }
+        )
+    finally:
+        clear_session_scrub_values(session_id)
+
+    assert secret not in envelope.model_dump_json()
+    assert envelope.failed_operation is not None
+    assert envelope.failed_operation.block_label == "collect_[REDACTED_SECRET]_rate"
 
 
 def test_anchor_uses_the_latest_final_run_fact() -> None:
