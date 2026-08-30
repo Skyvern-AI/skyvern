@@ -813,9 +813,33 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         failure = failure.model_copy(
             update={
                 "locator_observations": _bounded_locator_observations(failure.locator_observations, notices),
+                "workflow_run_block_id": _bounded_packet_string(
+                    failure.workflow_run_block_id,
+                    field_name="failure.workflow_run_block_id",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
+                "task_id": _bounded_packet_string(
+                    failure.task_id,
+                    field_name="failure.task_id",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
+                "step_id": _bounded_packet_string(
+                    failure.step_id,
+                    field_name="failure.step_id",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
                 "block_label": _bounded_packet_string(
                     failure.block_label,
                     field_name="failure.block_label",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
+                "block_type": _bounded_packet_string(
+                    failure.block_type,
+                    field_name="failure.block_type",
                     max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                     notices=notices,
                 ),
