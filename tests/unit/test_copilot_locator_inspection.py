@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -34,6 +35,8 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     inspect_locator_matches,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockType
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 STAR_BUTTON = 'button.pill:has-text("Star")'
@@ -766,13 +769,19 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         status="failed",
         failure_reason="click failed",
     )
-    block = SimpleNamespace(
+    now = datetime.now(UTC)
+    block = WorkflowRunBlock(
+        workflow_run_block_id="wrb_prior",
+        workflow_run_id="wr_prior",
+        organization_id=ctx.organization_id,
         label="click_submit",
-        block_type=SimpleNamespace(name="CODE"),
+        block_type=BlockType.CODE,
         status="failed",
         failure_reason="click failed",
         error_codes=["user_code_error"],
         output=None,
+        created_at=now,
+        modified_at=now,
     )
     workflow = SimpleNamespace(
         workflow_definition={
