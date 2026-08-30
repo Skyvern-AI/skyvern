@@ -52,6 +52,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     BuildTestEvidencePacket,
+    BuildTestFailedOperation,
     RecordedBuildTestOutcome,
     history_has_runtime_block_failure,
     observed_value_extraction_scaffold_lines,
@@ -180,8 +181,10 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalCause,
+    TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
     reason_in_reply_shadow,
+    render_terminal_message,
     select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
@@ -213,6 +216,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     redact_credentials_in_workflow_yaml,
+    runner_code_block_associations,
     stored_block_code,
     stored_workflow_yaml,
 )
@@ -1086,6 +1090,22 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
                 lines.append(f"- {'; '.join(fields)}")
     if outcome.workflow_run_id:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    failed_operation = outcome.failed_operation
+    if failed_operation is not None:
+        lines.append("failed_operation:")
+        lines.append(f"- kind={_clean_authoring_repair_prompt_atom(failed_operation.kind)}")
+        if failed_operation.workflow_run_block_id:
+            lines.append(
+                f"- workflow_run_block_id={_clean_authoring_repair_prompt_atom(failed_operation.workflow_run_block_id)}"
+            )
+        if failed_operation.block_label:
+            lines.append(f"- block_label={_clean_authoring_repair_prompt_atom(failed_operation.block_label)}")
+        if failed_operation.failing_line is not None:
+            lines.append(f"- failing_line={failed_operation.failing_line}")
+        lines.append(
+            "Repair the persisted code at this evidenced block/line, then test the changed attempt with "
+            "edit_block_and_run before reporting it."
+        )
     # Facts render for every outcome; the two post-run page-path directives bind the model's next
     # action, so they keep the authority check that gated this whole section before.
     page_path_failure = outcome.page_path_failure
@@ -1462,6 +1482,9 @@ def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
         return "deadline_expired"
     if ctx.copilot_max_turns_exceeded is True:
         return "max_turns_exceeded"
+    failed_operation = _terminal_failed_operation(ctx)
+    if failed_operation is not None:
+        return failed_operation.kind
     return None
 
 
@@ -1544,6 +1567,13 @@ def _turn_facts_for_context(ctx: CopilotContext, review: NarrativeReviewProjecti
     )
 
 
+def _terminal_failed_operation(
+    ctx: CopilotContext,
+) -> BuildTestFailedOperation | None:
+    outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    return outcome.failed_operation if isinstance(outcome, RecordedBuildTestOutcome) else None
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
@@ -1559,6 +1589,8 @@ def _assemble_terminal_envelope_safe(
     final_message: str,
     terminal_cause: TerminalCause | None = None,
     blocks_run_this_turn: int | None = None,
+    failed_operation: BuildTestFailedOperation | None = None,
+    proposal_present: bool = False,
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1574,6 +1606,8 @@ def _assemble_terminal_envelope_safe(
             workflow_attempted=workflow_attempted,
             terminal_cause=terminal_cause,
             blocks_run_this_turn=blocks_run_this_turn,
+            failed_operation=failed_operation,
+            proposal_present=proposal_present,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1679,6 +1713,10 @@ def _make_agent_result(
     result_has_workflow_attempt = bool(
         ctx is not None and (result_carries_workflow or ctx.has_genuine_workflow_attempt())
     )
+    failed_operation = _terminal_failed_operation(ctx) if ctx is not None else None
+    if failed_operation is not None and proposal_disposition == "auto_applicable":
+        proposal_disposition = "review_untested" if result_carries_workflow else "no_proposal"
+        kwargs["proposal_disposition"] = proposal_disposition
     if isinstance(narrative_payload, dict):
         payload_base = {
             key: value for key, value in narrative_payload.items() if key != "deliveredUnverifiedObservedOutputs"
@@ -1792,7 +1830,25 @@ def _make_agent_result(
             final_message=str(kwargs.get("user_response") or ""),
             terminal_cause=terminal_cause,
             blocks_run_this_turn=len(ctx.executed_block_labels),
+            failed_operation=failed_operation,
+            proposal_present=result_carries_workflow,
         )
+    if terminal_envelope is not None and terminal_envelope.get("failed_operation") is not None:
+        envelope = TerminalOutcomeEnvelope.model_validate(terminal_envelope)
+        terminal_message, replaced = render_terminal_message(
+            envelope,
+            str(kwargs.get("user_response") or ""),
+            bool(kwargs.get("cancelled")),
+        )
+        if replaced:
+            kwargs["user_response"] = terminal_message
+            narrative = kwargs.get("narrative_payload")
+            if isinstance(narrative, dict):
+                kwargs["narrative_payload"] = {
+                    **narrative,
+                    "terminalMessage": terminal_message,
+                    "narrativeSummary": terminal_message,
+                }
     kwargs["terminal_envelope"] = terminal_envelope
     if turn_facts is not None:
         payload = kwargs.get("narrative_payload")
@@ -2056,16 +2112,17 @@ async def _run_end_to_end_test_turn(
         setup_error_for_llm = "The end-to-end test could not be started."
         result = {"ok": False, "error": setup_error_for_llm}
     result_data = result.get("data")
-    if result.get("ok") is False and (not isinstance(result_data, dict) or not result_data.get("workflow_run_id")):
-        if not isinstance(result_data, dict):
-            result_data = {}
-            result["data"] = result_data
+    if not isinstance(result_data, dict):
+        result_data = {}
+        result["data"] = result_data
+    if result.get("ok") is False and not result_data.get("workflow_run_id"):
         result_data.setdefault("overall_status", "setup_failed")
-    finalize_build_test_result(
-        ctx,
-        source_tool="run_blocks_and_collect_debug",
-        result=result,
-    )
+    if BUILD_TEST_PACKET_KEY not in result_data:
+        finalize_build_test_result(
+            ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=result,
+        )
     raw_packet = result["data"].get(BUILD_TEST_PACKET_KEY)
     if isinstance(raw_packet, dict):
         try:
@@ -3062,8 +3119,8 @@ def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | 
     else:
         result = _build_cancel_exit_result(ctx, global_llm_context)
     result.cancellation_iteration = ctx.copilot_turn_cancelled_iteration
-    outcome = ctx.latest_recorded_build_test_outcome
-    result.cancellation_last_recorded_phase = outcome.phase if outcome is not None else None
+    outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    result.cancellation_last_recorded_phase = outcome.phase if isinstance(outcome, RecordedBuildTestOutcome) else None
     return result
 
 
@@ -3485,6 +3542,7 @@ async def _translate_to_agent_result(
     if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow and not blocker_active:
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
+        ctx.runner_code_block_associations_by_label = runner_code_block_associations(last_workflow_yaml or "")
         ctx.last_test_ok = None
         ctx.last_full_workflow_test_ok = False
         clear_active_run_evidence_on_workflow_edit(ctx)

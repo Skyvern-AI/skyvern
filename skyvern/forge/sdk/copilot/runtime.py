@@ -419,6 +419,9 @@ class AgentContext:
     staged_workflow_yaml: str | None = None
     staged_workflow: Any | None = None
     has_staged_proposal: bool = False
+    # Server-owned only: maps current raw code-block labels to opaque identities. It is never
+    # serialized into the workflow YAML or model-facing repair evidence.
+    runner_code_block_associations_by_label: dict[str, str] = field(default_factory=dict)
     # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
     prior_copilot_workflow_yaml: str | None = None
     canonical_was_persisted_due_to_param_change: bool = False

@@ -45,6 +45,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
+    failed_operation_from_run_blocks_result,
     post_run_page_capture_from_result,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
@@ -143,7 +144,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_pr
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
@@ -2299,6 +2300,11 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
     if authority_error:
         return {"ok": False, "error": authority_error}
 
+    ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+        workflow_yaml,
+        prior_associations=ctx.runner_code_block_associations_by_label,
+        preserve_existing=True,
+    )
     workflow = await _process_workflow_yaml(
         workflow_id=ctx.workflow_id,
         workflow_permanent_id=ctx.workflow_permanent_id,
@@ -2333,8 +2339,13 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
         force_fresh_session=True,
         definition_unpersisted=True,
     )
-    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
-    return result
+    recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+    return finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+        recorded_outcome=recorded_outcome,
+    )
 
 
 async def _run_blocks_and_collect_debug(
@@ -2347,6 +2358,13 @@ async def _run_blocks_and_collect_debug(
     force_fresh_session: bool = False,
     definition_unpersisted: bool = False,
 ) -> dict[str, Any]:
+    # Older drafts predate server-owned block associations. Associate their current raw snapshot
+    # once before outcome collection without adding anything to model-controlled YAML.
+    if not ctx.runner_code_block_associations_by_label:
+        ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+            ctx.staged_workflow_yaml or ctx.workflow_yaml
+        )
+
     # Read the planner's session choice before any exit path, so a run that bails cannot leave it
     # set for a later run whose frontier was never proven against that browser.
     resume_session_id = ctx.frontier_resume_session_id
@@ -4246,6 +4264,7 @@ def _build_recorded_build_test_outcome(
             code_artifact_metadata,
         ),
         block_shape_hashes=block_shape_hashes,
+        block_associations_by_label=getattr(copilot_ctx, "runner_code_block_associations_by_label", {}),
     )
 
 
@@ -4406,14 +4425,14 @@ def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, An
         "copilot run result unresolved-failure disposition",
         tool_name=tool_name,
         workflow_run_id=this_run_id,
-        retained_history=len(copilot_ctx.recorded_build_test_outcome_history),
+        retained_history=len(getattr(copilot_ctx, "recorded_build_test_outcome_history", [])),
         disposition=disposition,
         attached=unresolved is not None,
     )
     if unresolved is None:
         return
     failure_kind = ""
-    for entry in reversed(copilot_ctx.recorded_build_test_outcome_history):
+    for entry in reversed(getattr(copilot_ctx, "recorded_build_test_outcome_history", [])):
         if entry.get("workflow_run_id") == unresolved.workflow_run_id:
             failure_kind = _safe_reason_code(entry.get("reason_code"))
             break
@@ -4439,7 +4458,7 @@ def _safe_reason_code(value: object) -> str:
 
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], _handler_start: float
-) -> RecordedRunOutcome | None:
+) -> RecordedBuildTestOutcome | None:
     """Record and emit the run fact once; no authoring judge may rewrite it."""
     await _resolve_captcha_solver_availability(copilot_ctx)
     recorded = _record_run_blocks_result(copilot_ctx, result, completion_verification=None)
@@ -4455,7 +4474,12 @@ async def _verify_and_record_run_blocks_result(
         reason_code=recorded.reason_code,
         display_reason=recorded.display_reason,
     )
-    return recorded
+    build_test_outcome = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
+    result_data = result.get("data")
+    result_run_id = result_data.get("workflow_run_id") if isinstance(result_data, dict) else None
+    if isinstance(build_test_outcome, RecordedBuildTestOutcome) and build_test_outcome.workflow_run_id == result_run_id:
+        return build_test_outcome
+    return None
 
 
 def _record_diagnosis_repair_contract(
@@ -4750,7 +4774,8 @@ def _packet_unfinished_items(
     recorded_outcome: RecordedBuildTestOutcome | None,
     omission_notices: list[str],
 ) -> list[BuildTestPacketUnfinishedItem]:
-    outcome = recorded_outcome or copilot_ctx.latest_recorded_build_test_outcome
+    latest_outcome = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
+    outcome = recorded_outcome or (latest_outcome if isinstance(latest_outcome, RecordedBuildTestOutcome) else None)
     if run_id is None:
         if copilot_ctx.last_unverified_block_labels or outcome is not None:
             omission_notices.append("unfinished_items omitted: recorded unfinished evidence is not bound to this run.")
@@ -4825,6 +4850,30 @@ def build_test_evidence_packet(
         page_capture = recorded_outcome.page_capture
     failure: BuildTestPacketFailure | None = None
     if failed_block is not None or result.get("ok") is False:
+        if recorded_outcome is not None and recorded_outcome.workflow_run_id == run_id:
+            failed_operation = recorded_outcome.failed_operation
+            if failed_operation is not None and failed_operation.workflow_run_id != run_id:
+                failed_operation = None
+        else:
+            failed_operation = failed_operation_from_run_blocks_result(result)
+        if failed_operation is not None:
+            if failed_operation.workflow_run_id is None:
+                omission_notices.append(
+                    "failure.failed_operation.workflow_run_id omitted: no run identity was recorded for the operation."
+                )
+            if failed_operation.workflow_run_block_id is None:
+                omission_notices.append(
+                    "failure.failed_operation.workflow_run_block_id omitted: no run-block identity was recorded for "
+                    "the operation."
+                )
+            if failed_operation.block_label is None:
+                omission_notices.append(
+                    "failure.failed_operation.block_label omitted: no block label was recorded for the operation."
+                )
+            if failed_operation.failing_line is None:
+                omission_notices.append(
+                    "failure.failed_operation.failing_line omitted: no failing code line was recorded for the operation."
+                )
         failure = BuildTestPacketFailure(
             workflow_run_block_id=(
                 _packet_string(failed_block.get("workflow_run_block_id")) if failed_block is not None else None
@@ -4841,6 +4890,7 @@ def build_test_evidence_packet(
             ),
             error_codes=(_packet_string_list(failed_block.get("error_codes")) if failed_block is not None else []),
             failing_line=data.get("failing_code_line") if type(data.get("failing_code_line")) is int else None,
+            failed_operation=failed_operation,
             action_trace=action_trace,
             page_state=page_state,
             locator_observations=_packet_locator_observations(data, omission_notices),
@@ -4933,6 +4983,11 @@ def finalize_build_test_result(
     recorded_outcome: RecordedBuildTestOutcome | None = None,
 ) -> dict[str, Any]:
     """Finalize diagnosis state and attach the one shared factual packet."""
+    # Tool seams sometimes deliberately suppress collection and return no recorded outcome.
+    # Treat any non-record as absent rather than allowing a test double or failed observer to
+    # contaminate the model-facing packet.
+    if not isinstance(recorded_outcome, RecordedBuildTestOutcome):
+        recorded_outcome = None
     if diagnosis_shadow_eligible:
         _record_diagnosis_repair_contract(
             copilot_ctx,

@@ -350,7 +350,7 @@ async def _persist_block_scoped_edit(
     author-time check, so a block edit cannot slip past what a full submission must satisfy.
     """
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-    params: dict[str, Any] = {"workflow_yaml": workflow_yaml}
+    params: dict[str, Any] = {"workflow_yaml": workflow_yaml, "_preserve_code_block_associations": True}
     if code_artifact_metadata is not None:
         params["code_artifact_metadata"] = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
         params["raw_code_artifact_metadata"] = code_artifact_metadata
@@ -515,7 +515,7 @@ async def edit_block_and_run_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
         update_result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml},
+            {"workflow_yaml": workflow_yaml, "_preserve_code_block_associations": True},
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
             originating_call_id=_originating_call_id(ctx),
@@ -908,13 +908,14 @@ async def run_blocks_tool(
                 block_outputs_to_seed=block_outputs_to_seed,
                 frontier_start_label=frontier_start_label,
             )
-        await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
+        recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         _carry_unresolved_failure_into_result(copilot_ctx, result, "run_blocks_and_collect_debug")
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         finalize_build_test_result(
             copilot_ctx,
             source_tool="run_blocks_and_collect_debug",
             result=result,
+            recorded_outcome=recorded_outcome,
         )
         enqueue_screenshot_from_result(
             copilot_ctx,
@@ -1173,7 +1174,7 @@ async def _run_updated_workflow_blocks(
                 block_outputs_to_seed=block_outputs_to_seed,
                 frontier_start_label=frontier_start_label,
             )
-        await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
+        recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         carry_author_time_findings(update_result, run_result)
         _carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
@@ -1182,6 +1183,7 @@ async def _run_updated_workflow_blocks(
             source_tool=tool_name,
             result=run_result,
             workflow_updated=True,
+            recorded_outcome=recorded_outcome,
         )
         enqueue_screenshot_from_result(
             copilot_ctx,

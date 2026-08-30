@@ -439,7 +439,15 @@ def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None
     build never commits on the user's behalf; it lands as a pending proposal for
     the review gate.
     """
-    if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
+    terminal_envelope = getattr(agent_result, "terminal_envelope", None)
+    unresolved_failed_operation = (
+        isinstance(terminal_envelope, dict) and terminal_envelope.get("failed_operation") is not None
+    )
+    if (
+        getattr(agent_result, "cancelled", False) is True
+        or unresolved_failed_operation
+        or _proposal_disposition(agent_result) != "auto_applicable"
+    ):
         return False
     return auto_accept is True
 

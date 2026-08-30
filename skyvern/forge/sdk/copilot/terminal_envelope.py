@@ -3,15 +3,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
-TerminalCause = Literal["deadline_expired", "max_turns_exceeded"]
+TerminalCause = Literal["deadline_expired", "max_turns_exceeded", "browser_operation_failed"]
 _FINAL_RUN_VERDICTS = frozenset({"not_demonstrated", "not_evaluated"})
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
@@ -55,9 +56,18 @@ class TerminalOutcomeEnvelope(BaseModel):
     attempted: str | None = None
     response_kind: TerminalResponseKind
     terminal_cause: TerminalCause | None = None
+    failed_operation: BuildTestFailedOperation | None = None
+    proposal_present: bool = False
     interruption: InterruptedTurnFacts | None = None
     rendered_from_envelope: bool = False
     envelope_version: int = 1
+
+    @model_validator(mode="after")
+    def normalize_failed_operation_state(self) -> TerminalOutcomeEnvelope:
+        if self.failed_operation is not None:
+            self.verified = False
+            self.workflow_applied = False
+        return self
 
 
 def assemble_terminal_envelope(
@@ -74,6 +84,8 @@ def assemble_terminal_envelope(
     workflow_attempted: bool,
     terminal_cause: TerminalCause | None = None,
     blocks_run_this_turn: int | None = None,
+    failed_operation: BuildTestFailedOperation | None = None,
+    proposal_present: bool = False,
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = select_run_outcome_anchor(run_outcomes)
     run_verdict = run_outcome.verdict if run_outcome is not None else None
@@ -84,6 +96,9 @@ def assemble_terminal_envelope(
     run_display_reason = _clean_text(run_outcome.display_reason) if run_outcome is not None else None
     run_output_report = _safe_output_report(run_outcome.output_report) if run_outcome is not None else None
     user_action_required = response_type == "ASK_QUESTION"
+    if failed_operation is not None:
+        verified = False
+        workflow_applied = False
     next_state = _derive_next_state(
         user_action_required=user_action_required,
         verified=verified,
@@ -97,6 +112,11 @@ def assemble_terminal_envelope(
         workflow_attempted=workflow_attempted,
         explicit_stop=bool(run_outcome or blocker_reason or halt_kind or terminal_cause),
     )
+    if failed_operation is not None:
+        if not user_action_required:
+            next_state = "stopped"
+            response_kind = "stopped"
+        terminal_cause = terminal_cause or failed_operation.kind
     return TerminalOutcomeEnvelope(
         next_state=next_state,
         verified=verified,
@@ -113,12 +133,27 @@ def assemble_terminal_envelope(
         attempted=_clean_text(attempted),
         response_kind=response_kind,
         terminal_cause=terminal_cause,
+        failed_operation=failed_operation,
+        proposal_present=proposal_present,
     )
 
 
 def finalize_applied_state(
     envelope: TerminalOutcomeEnvelope, *, applied: bool, proposal_present: bool = False
 ) -> TerminalOutcomeEnvelope:
+    if envelope.failed_operation is not None:
+        if envelope.user_action_required:
+            return envelope.model_copy(
+                update={
+                    "verified": False,
+                    "workflow_applied": False,
+                    "next_state": "awaiting_user_input",
+                    "response_kind": "question",
+                }
+            )
+        return envelope.model_copy(
+            update={"verified": False, "workflow_applied": False, "next_state": "stopped", "response_kind": "stopped"}
+        )
     if envelope.user_action_required:
         next_state: TerminalNextState = "awaiting_user_input"
     elif envelope.verified and applied:
@@ -178,6 +213,27 @@ def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str
 
 def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:
     output_report = _safe_output_report(envelope.run_output_report)
+    if envelope.failed_operation is not None and not cancelled:
+        message = "I stopped after a browser operation failed while testing the workflow."
+        if envelope.proposal_present:
+            message = _append_sentence(
+                message,
+                "The untested draft is available for review, but the requested work was not confirmed.",
+            )
+        else:
+            message = _append_sentence(message, "The requested work was not confirmed.")
+        if envelope.user_action_required:
+            pending_question_intro = "The pending question is quoted below; its premise is not confirmed"
+            # The route may render an AgentResult again when envelope-authoritative copy is enabled.
+            # Preserve the first server-authored rendering instead of quoting that whole rendering as
+            # though it were the model's pending question.
+            if _text_contains(agent_message, message) and _text_contains(agent_message, pending_question_intro):
+                return agent_message, False
+            message = _append_sentence(
+                message,
+                f"{pending_question_intro}: {agent_message}",
+            )
+        return message, True
     # A deadline-expired turn already authored copy naming time and the draft's
     # state; replaced=True is what syncs it to the surfaces hydration prefers.
     # "completed" is excluded because replaced=True also overwrites a distinct

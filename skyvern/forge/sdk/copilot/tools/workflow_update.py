@@ -109,6 +109,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
+    runner_code_block_associations,
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
@@ -4094,6 +4095,11 @@ async def _update_workflow(
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
         if isinstance(ctx, CopilotContext):
+            ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+                workflow_yaml,
+                prior_associations=ctx.runner_code_block_associations_by_label,
+                preserve_existing=params.get("_preserve_code_block_associations") is True,
+            )
             current_google_connection_bindings = google_sheet_connection_bindings(workflow)
             turn_start_workflow = prior_workflow
             if ctx.google_connection_turn_start_bindings is None:
