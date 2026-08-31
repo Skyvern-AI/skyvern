@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _terminal_failed_operation,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, contains_internal_machinery_leak
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestFailedOperation,
     RecordedBuildTestOutcome,
@@ -212,6 +213,52 @@ def test_recorded_browser_operation_failure_overrides_success_prose_but_keeps_dr
     assert result.narrative_payload["narrativeSummary"] == result.user_response
     assert result.narrative_payload["turnFacts"]["terminalCause"] == "browser_operation_failed"
     assert result.narrative_payload["turnFacts"]["ranCleanOnCurrentSource"] is False
+
+
+def test_later_connect_failure_owns_terminal_copy_over_failed_operation() -> None:
+    ctx = _ctx()
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed_operation",
+        workflow_run_block_id="wrb_failed_operation",
+        block_label="collect_failure_rate",
+        failing_line=11,
+    )
+    connect_failure = BuildTestConnectFailure(
+        state="cdp_connect_failed",
+        browser_session_id="pbs_connect_failure",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            attempted_block_label="collect_failure_rate",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed_operation",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+            connect_failure=connect_failure,
+        ),
+    )
+
+    result = _result(
+        ctx,
+        user_response="The code run failed.",
+        updated_workflow=SimpleNamespace(name="untested draft"),
+        workflow_yaml=two_page_login_yaml(),
+        proposal_disposition="review_untested",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "cdp_connect_failed"
+    assert "cdp_connect_failed" in result.user_response
+    assert "fresh browser session" in result.user_response
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["turnFacts"]["terminalCause"] == "cdp_connect_failed"
 
 
 def test_recorded_browser_operation_failure_survives_later_non_clearing_outcome() -> None:

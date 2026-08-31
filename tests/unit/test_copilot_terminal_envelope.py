@@ -11,7 +11,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
-from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestConnectFailure, BuildTestFailedOperation
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
@@ -61,6 +61,84 @@ def test_run_anchor_reports_the_actual_latest_run() -> None:
 
     assert envelope.run_verdict == "not_evaluated"
     assert envelope.run_display_reason == "A later scout run completed."
+
+
+@pytest.mark.parametrize("state", ["already_closed", "provisioning_unavailable", "cdp_connect_failed"])
+def test_connect_failure_terminal_is_typed_preserves_identity_and_offers_fresh_retry(state: str) -> None:
+    failure = BuildTestConnectFailure(
+        state=state,
+        workflow_run_id="wr_1",
+        workflow_run_block_id="wrb_1",
+        task_id="tsk_1",
+        browser_session_id="pbs_1",
+    )
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        connect_failure=failure,
+        proposal_present=True,
+    )
+
+    message, replaced = render_terminal_message(envelope, "unsupported model copy", cancelled=False)
+
+    assert envelope.terminal_cause == state
+    assert envelope.connect_failure == failure
+    assert envelope.next_state == "stopped"
+    assert replaced is True
+    assert state in message
+    assert all(identity in message for identity in ("wr_1", "wrb_1", "tsk_1", "pbs_1"))
+    assert "untested draft was preserved" in message
+    assert "fresh browser session" in message
+    assert "high demand" not in message.lower()
+
+
+def test_connect_failure_terminal_preserves_pending_question() -> None:
+    failure = BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id="pbs_1")
+    envelope = _assemble(
+        response_type="ASK_QUESTION",
+        proposal_disposition="review_untested",
+        connect_failure=failure,
+        proposal_present=True,
+    )
+
+    message, replaced = render_terminal_message(envelope, "Which credential should I use?", cancelled=False)
+
+    assert envelope.next_state == "awaiting_user_input"
+    assert envelope.response_kind == "question"
+    assert "Which credential should I use?" in message
+    assert "premise is not confirmed" in message
+    assert replaced is True
+
+
+def test_connect_failure_owns_terminal_over_earlier_failed_operation() -> None:
+    failed_operation = BuildTestFailedOperation(kind="browser_operation_failed")
+    connect_failure = BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id="pbs_1")
+
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        failed_operation=failed_operation,
+        connect_failure=connect_failure,
+        proposal_present=True,
+    )
+    message, replaced = render_terminal_message(envelope, "The code run failed.", cancelled=False)
+
+    assert envelope.terminal_cause == "cdp_connect_failed"
+    assert replaced is True
+    assert "cdp_connect_failed" in message
+    assert "fresh browser session" in message
+
+
+@pytest.mark.parametrize("capacity_cause", ["deadline_expired", "max_turns_exceeded"])
+def test_connect_failure_does_not_overwrite_capacity_terminal_cause(capacity_cause: str) -> None:
+    failure = BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id="pbs_1")
+
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        terminal_cause=capacity_cause,
+        connect_failure=failure,
+        proposal_present=True,
+    )
+
+    assert envelope.terminal_cause == capacity_cause
 
 
 def test_run_anchor_falls_back_to_latest_final_verdict_when_no_not_demonstrated() -> None:
