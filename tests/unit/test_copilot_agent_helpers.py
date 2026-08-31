@@ -4317,7 +4317,7 @@ class TestRunBlocksCredentialApproval:
             SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
         )
         monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
-        monkeypatch.setattr(run_execution_module, "ensure_browser_session", never_mint)
+        monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", never_mint)
 
         ctx = _ctx(browser_session_id="pbs_chat")
         ctx.frontier_resume_session_id = "pbs_carried"
@@ -4362,7 +4362,7 @@ class TestRunBlocksCredentialApproval:
             SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
         )
         monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
-        monkeypatch.setattr(run_execution_module, "ensure_browser_session", never_mint)
+        monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", never_mint)
 
         ctx = _ctx(browser_session_id=None)
         ctx.frontier_resume_session_id = "pbs_carried"

@@ -248,9 +248,54 @@ def test_unresolved_failed_operation_rejects_auto_accept_even_with_auto_applicab
     assert workflow_copilot_route._effective_auto_accept(True, agent_result) is False
 
 
+def test_unresolved_connect_failure_rejects_auto_accept_even_with_auto_applicable_disposition() -> None:
+    agent_result = AgentResult(
+        user_response="Draft available.",
+        updated_workflow=SimpleNamespace(),
+        global_llm_context=None,
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope={
+            **_terminal_payload(verified=True, workflow_applied=True),
+            "connect_failure": {
+                "state": "already_closed",
+                "browser_session_id": "pbs_failed",
+                "retry_action": "test_end_to_end",
+            },
+        },
+    )
+
+    assert workflow_copilot_route._effective_auto_accept(True, agent_result) is False
+
+
 @pytest.mark.asyncio
-async def test_review_untested_draft_and_failed_operation_survive_persistence_and_hydration(
+@pytest.mark.parametrize(
+    ("terminal_key", "terminal_fact"),
+    [
+        (
+            "failed_operation",
+            {
+                "kind": "browser_operation_failed",
+                "workflow_run_id": "wr_browser_operation",
+                "workflow_run_block_id": "wrb_browser_operation",
+                "block_label": "collect_failure_rate",
+                "failing_line": 11,
+            },
+        ),
+        (
+            "connect_failure",
+            {
+                "state": "already_closed",
+                "browser_session_id": "pbs_failed",
+                "retry_action": "test_end_to_end",
+            },
+        ),
+    ],
+)
+async def test_review_untested_draft_and_terminal_fact_survive_persistence_and_hydration(
     monkeypatch: pytest.MonkeyPatch,
+    terminal_key: str,
+    terminal_fact: dict[str, object],
 ) -> None:
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -262,13 +307,6 @@ async def test_review_untested_draft_and_failed_operation_survive_persistence_an
     updated_workflow = MagicMock()
     updated_workflow.title = "Untested draft"
     updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft", "title": "Untested draft"}
-    failed_operation = {
-        "kind": "browser_operation_failed",
-        "workflow_run_id": "wr_browser_operation",
-        "workflow_run_block_id": "wrb_browser_operation",
-        "block_label": "collect_failure_rate",
-        "failing_line": 11,
-    }
     agent_result = AgentResult(
         user_response="I stopped after the test failure.",
         updated_workflow=updated_workflow,
@@ -278,7 +316,7 @@ async def test_review_untested_draft_and_failed_operation_survive_persistence_an
         narrative_payload=_narrative_payload(),
         terminal_envelope={
             **_terminal_payload(verified=True, workflow_applied=True),
-            "failed_operation": failed_operation,
+            terminal_key: terminal_fact,
         },
     )
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -324,8 +362,9 @@ async def test_review_untested_draft_and_failed_operation_survive_persistence_an
     assert served_payload is not None
     hydrated_envelope = TerminalOutcomeEnvelope.model_validate(served_payload["terminalEnvelope"])
     assert served_payload["proposalDisposition"] == "review_untested"
-    assert hydrated_envelope.failed_operation is not None
-    assert hydrated_envelope.failed_operation.model_dump(mode="json") == failed_operation
+    hydrated_fact = getattr(hydrated_envelope, terminal_key)
+    assert hydrated_fact is not None
+    assert hydrated_fact.model_dump(mode="json", exclude_none=True) == terminal_fact
     assert hydrated_envelope.verified is False
     assert hydrated_envelope.workflow_applied is False
 

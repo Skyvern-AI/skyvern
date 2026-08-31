@@ -189,6 +189,40 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
 describe("ReviewGateCard — Test end-to-end recourse", () => {
   const noop = () => {};
 
+  it("labels the typed connection-failure action as a fresh-session retry", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          proposalDisposition: "review_untested",
+          terminalEnvelope: {
+            runVerdict: null,
+            runDisplayReason: null,
+            connectFailure: {
+              state: "already_closed",
+              retryAction: "test_end_to_end",
+              workflowRunId: null,
+              workflowRunBlockId: null,
+              taskId: null,
+              browserSessionId: "pbs_1",
+            },
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={noop}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Retry in a fresh session" }),
+    ).not.toBeNull();
+  });
+
   it("keeps Accept working on an untested proposal that never ran end-to-end", () => {
     let accepted = 0;
     render(

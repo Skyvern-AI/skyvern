@@ -30,6 +30,7 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -43,6 +44,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
+from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
 from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
@@ -1072,15 +1074,32 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
     retire_browser_session_id(ctx, session_id)
 
 
-async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    """Create a browser session if the context holds none. Returns None on success, error dict on failure.
+def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": f"Build-test browser acquisition stopped: {failure.state}.",
+        "data": {
+            "overall_status": "setup_failed",
+            "failure_reason": f"Build-test browser acquisition stopped: {failure.state}.",
+            "browser_session_id": failure.browser_session_id,
+            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=True),
+            "blocks": [],
+        },
+    }
+
+
+async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailure | None:
+    """Create a browser session if the context holds none.
+
+    Returns an immutable acquisition fact on failure and ``None`` on success. Generic callers
+    translate that fact back to their established error shape; build-test callers retain it.
 
     An existing id is not probed here: the attach in mcp_browser_context is the oracle, and a
     session it finds gone is retired and replaced where that is discovered. The one thing the
     attach cannot see is a deadline landing mid-call, which is read from the manager instead.
 
     Exception: the self-heal path raises HealAdoptionFailed instead of returning an
-    error dict, so a failed adoption aborts the turn rather than degrading to a normal
+    failure fact, so a failed adoption aborts the turn rather than degrading to a normal
     tool-level error. Callers must let it propagate.
     """
     if ctx.turn_origin == TurnOrigin.runtime_self_heal:
@@ -1167,7 +1186,23 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
         # flows back through the tool/agent path and could end up in
         # LLM-visible or user-visible output, so strip raw exception text
         # that may carry internal URLs, paths, or backend identifiers.
-        return {"ok": False, "error": "Failed to create browser session"}
+        failed_session_id = session.persistent_browser_session_id if session is not None else installed_session_id
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=failed_session_id,
+        )
+
+
+async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
+    failure = await _provision_browser_session(ctx)
+    if failure is None:
+        return None
+    return {"ok": False, "error": "Failed to create browser session"}
+
+
+async def ensure_build_test_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
+    failure = await _provision_browser_session(ctx)
+    return None if failure is None else _build_test_connect_failure_result(failure)
 
 
 async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
@@ -1203,5 +1238,47 @@ async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, An
                 f"The browser session could not be verified: the attach raised {type(exc).__name__}. "
                 "An indeterminate attach is not evidence the browser is dead."
             ),
+            "probe_error_type": type(exc).__name__,
+        }
+
+
+async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
+    """Attach once for a build test; report supported acquisition state without replacing it."""
+    await _drop_browser_session_id_at_its_fixed_deadline(ctx)
+    if not ctx.browser_session_id:
+        return await ensure_build_test_browser_session(ctx)
+    examined_session_id = ctx.browser_session_id
+    try:
+        async with mcp_browser_context(ctx):
+            return None
+    except CopilotBrowserSessionUnavailable:
+        retire_browser_session_id(ctx, examined_session_id)
+        return _build_test_connect_failure_result(
+            BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
+        )
+    except BrowserTargetClosedError:
+        retire_browser_session_id(ctx, examined_session_id)
+        return _build_test_connect_failure_result(
+            BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
+        )
+    except BrowserCdpConnectionError:
+        # A failed attach does not prove the remote session is dead; keep its id as
+        # evidence and let the explicit fresh-session action choose replacement.
+        return _build_test_connect_failure_result(
+            BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id=examined_session_id)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        LOG.warning(
+            "Build-test browser attach could not be classified",
+            session_id=examined_session_id,
+            organization_id=ctx.organization_id,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "error": "The build-test browser attach could not be classified.",
             "probe_error_type": type(exc).__name__,
         }

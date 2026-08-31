@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _recorded_build_test_outcome_prompt,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestConnectFailure,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
     BuildTestPacketDownload,
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
     failed_second_factor_run,
+    make_copilot_ctx,
     make_stub_html_artifact,
     passing_run,
     straight_line_login_yaml,
@@ -115,6 +117,65 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
     assert outcome is not None
     assert outcome.requested_block_labels == ["open", "search", "extract"]
     assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
+
+
+def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
+    ctx = make_copilot_ctx()
+    ctx.workflow_yaml = "title: preserved draft"
+    ctx.staged_workflow_yaml = "title: preserved draft"
+    ctx.last_workflow_yaml = "title: preserved draft"
+    failure = BuildTestConnectFailure(
+        state="cdp_connect_failed",
+        workflow_run_id="wr_1",
+        workflow_run_block_id="wrb_1",
+        task_id="tsk_1",
+        browser_session_id="pbs_1",
+    )
+    result = {
+        "ok": False,
+        "error": "Build-test browser acquisition stopped: cdp_connect_failed.",
+        "data": {
+            "workflow_run_id": "wr_1",
+            "overall_status": "setup_failed",
+            "browser_session_id": "pbs_1",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": [],
+            "blocks": [],
+            "build_test_connect_failure": failure.model_dump(mode="json"),
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    assert outcome is not None
+    assert outcome.connect_failure == failure
+    packet = build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    assert packet.failure is not None
+    assert packet.failure.connect_failure == failure
+    assert packet.canonical_workflow_yaml == "title: preserved draft"
+
+
+def test_connect_failure_clears_when_a_later_real_run_records_recovery() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    connect_failure = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="not_authoritative",
+        reason_code="unrecoverable_tool_error",
+        workflow_run_id="wr_failed_connect",
+        structural_failure_identity="build_test_connect:cdp_connect_failed",
+        connect_failure=BuildTestConnectFailure(
+            state="cdp_connect_failed",
+            browser_session_id="pbs_failed_connect",
+        ),
+    )
+
+    record_build_test_outcome(ctx, connect_failure)
+    record_build_test_outcome(ctx, passing_run("wr_recovered", ["sign_in_and_read"]))
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.workflow_run_id == "wr_recovered"
+    assert ctx.latest_recorded_build_test_outcome.connect_failure is None
+    assert ctx.recorded_build_test_outcome_history[-1]["connect_failure"] is None
 
 
 def _failed_run_result_with_categories(categories: list[dict]) -> dict:
@@ -3464,6 +3525,39 @@ def test_browser_operation_identity_is_bounded_by_the_shared_packet_projection()
         "failure.failed_operation.workflow_run_block_id shortened" in notice for notice in projected.omission_notices
     )
     assert any("failure.failed_operation.block_label shortened" in notice for notice in projected.omission_notices)
+
+
+def test_connect_failure_identity_is_bounded_by_the_shared_packet_projection() -> None:
+    long_identity = "x" * 200
+    result = {
+        "ok": False,
+        "data": {
+            "overall_status": "setup_failed",
+            "blocks": [],
+            "build_test_connect_failure": BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                workflow_run_id=long_identity,
+                workflow_run_block_id=long_identity,
+                task_id=long_identity,
+                browser_session_id=long_identity,
+            ).model_dump(mode="json"),
+        },
+    }
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(_locator_packet_ctx(), result))
+
+    assert projected.failure is not None
+    assert projected.failure.connect_failure is not None
+    failure = projected.failure.connect_failure
+    identities = (
+        failure.workflow_run_id,
+        failure.workflow_run_block_id,
+        failure.task_id,
+        failure.browser_session_id,
+    )
+    assert all(len(identity or "") == 160 for identity in identities)
+    assert all((identity or "").endswith("...") for identity in identities)
+    assert sum("failure.connect_failure" in notice for notice in projected.omission_notices) == 4
 
 
 def test_browser_operation_packet_names_each_unavailable_operation_identity() -> None:

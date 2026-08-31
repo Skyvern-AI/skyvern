@@ -19,6 +19,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from structlog.testing import capture_logs
 
@@ -27,6 +29,7 @@ from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
+from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
 from tests.unit.test_copilot_secret_scrub import _make_server
 
 
@@ -891,3 +894,108 @@ async def test_the_verified_caller_attaches_once_and_reports_what_the_attach_sai
         assert result is not None and result["ok"] is False
         assert result["probe_error_type"] == expected_error_type
         assert "not evidence the browser is dead" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attach_effect", "expected_state"),
+    [
+        pytest.param(runtime.CopilotBrowserSessionUnavailable("bs_live"), "already_closed", id="closed"),
+        pytest.param(BrowserTargetClosedError("browser closed"), "already_closed", id="target-closed"),
+        pytest.param(BrowserCdpConnectionError("connect failed"), "cdp_connect_failed", id="cdp"),
+    ],
+)
+async def test_build_test_attach_records_typed_failure_without_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    attach_effect: BaseException,
+    expected_state: str,
+) -> None:
+    manager = MagicMock()
+    manager.create_session = AsyncMock(side_effect=AssertionError("must not replace automatically"))
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    @asynccontextmanager
+    async def _attach(ctx: AgentContext) -> AsyncIterator[None]:
+        if isinstance(attach_effect, runtime.CopilotBrowserSessionUnavailable):
+            runtime.retire_browser_session_id(ctx, ctx.browser_session_id)
+        raise attach_effect
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+
+    result = await runtime.verify_build_test_browser_session_by_attaching(ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"] == {
+        "state": expected_state,
+        "browser_session_id": "bs_live",
+        "retry_action": "test_end_to_end",
+    }
+    manager.create_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attach_effect",
+    [
+        pytest.param(ConnectionError("manager returned an untyped failure"), id="connection-error"),
+        pytest.param(ConnectionResetError("transport reset outside a normalized CDP boundary"), id="connection-reset"),
+        pytest.param(PlaywrightError("browser closed"), id="native-playwright-base"),
+        pytest.param(PlaywrightTimeoutError("attach timed out"), id="native-timeout"),
+    ],
+)
+async def test_build_test_attach_does_not_invent_a_typed_state_for_unknown_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    attach_effect: Exception,
+) -> None:
+    manager = MagicMock()
+    manager.create_session = AsyncMock(side_effect=AssertionError("must not replace automatically"))
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    @asynccontextmanager
+    async def _attach(_ctx: AgentContext) -> AsyncIterator[None]:
+        raise attach_effect
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+
+    result = await runtime.verify_build_test_browser_session_by_attaching(ctx)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert result["probe_error_type"] == type(attach_effect).__name__
+    assert "data" not in result
+    assert ctx.browser_session_id == "bs_live"
+    manager.create_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_test_provisioning_failure_retains_created_session_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(persistent_browser_session_id="bs_created")
+    manager = MagicMock()
+    manager.create_session = AsyncMock(return_value=session)
+    manager.get_browser_state = AsyncMock(side_effect=RuntimeError("boot unavailable"))
+    manager.close_session = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    result = await runtime.ensure_build_test_browser_session(_make_ctx())
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"] == {
+        "state": "provisioning_unavailable",
+        "browser_session_id": "bs_created",
+        "retry_action": "test_end_to_end",
+    }
+    manager.create_session.assert_awaited_once()
