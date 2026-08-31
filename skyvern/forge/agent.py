@@ -13,7 +13,7 @@ from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Literal, Tuple, cast
+from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -497,6 +497,30 @@ def _has_multi_field_totp_shape(observations: Iterable[tuple[str, Any]]) -> bool
     return False
 
 
+def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_run_id: str | None) -> list[str] | None:
+    """The originating block's linked credential parameter keys — the only credentials a task
+    created from that block may draw an OTP from (SKY-15181). None (no block, no run context, or a
+    script-mode run) means unrestricted: bare tasks and cached scripts keep the run-scoped legacy
+    behavior."""
+    if task_block is None or not workflow_run_id:
+        return None
+    context = skyvern_context.current()
+    if context is not None and context.script_mode:
+        # Script-built blocks are constructed without parameters=, so deriving from them would
+        # yield an empty scope that silently disables credential-TOTP for cached-script logins.
+        return None
+    if not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        # A block-originated task always executes inside a registered run context; if it is ever
+        # missing, fail closed (no credential-TOTP) rather than open to the whole run's credentials.
+        return []
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    return [
+        parameter.key
+        for parameter in task_block.parameters
+        if workflow_run_context.is_registered_credential_parameter_key(parameter.key)
+    ]
+
+
 def _first_plan_carries_consumable_totp(actions: list[Any], multi_field_secret_ready: bool) -> bool:
     """Whether the first-pass plan already carries a shape the existing runtime materializes into a
     credential TOTP at DOM-write time: a multi-field single-digit sequence backed by a runtime secret
@@ -518,9 +542,18 @@ def _first_plan_carries_consumable_totp(actions: list[Any], multi_field_secret_r
 
 
 def _first_plan_carries_single_field_credential_totp(
-    actions: list[Any], workflow_run_context: WorkflowRunContext | None, active_credential_parameter_key: str | None
+    actions: list[Any],
+    workflow_run_context: WorkflowRunContext | None,
+    active_credential_parameter_key: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> bool:
-    """Recognize the single-field credential placeholder consumed by the input handler at runtime."""
+    """Recognize the single-field credential placeholder consumed by the input handler at runtime.
+
+    ``allowed_credential_parameter_keys`` closes the SKY-15181 seam here too: the placeholder is
+    resolved against the whole run context, and the active-key gate alone is exactly the stale
+    cross-block key this restriction exists to ignore — so a plan whose credential is not linked
+    to the originating block must fall through to the deterministic resolver, which is scoped.
+    """
     if not workflow_run_context or not actions:
         return False
     if any(not isinstance(action, dict) for action in actions):
@@ -536,6 +569,8 @@ def _first_plan_carries_single_field_credential_totp(
         return False
     key = workflow_run_context.find_credential_parameter_key_for_secret(text)
     if not key or workflow_run_context.values.get(key, {}).get("totp") != text:
+        return False
+    if allowed_credential_parameter_keys is not None and key not in allowed_credential_parameter_keys:
         return False
     if active_credential_parameter_key is not None and active_credential_parameter_key != key:
         return False
@@ -1885,7 +1920,10 @@ class ForgeAgent:
             # structurally never touches the live DOM must not be offered it.
             verification_state = VerificationState()
             auth_tools, auth_guidance = build_auth_tools(
-                task, None if page_free_validation else _page_provider, state=verification_state
+                task,
+                None if page_free_validation else _page_provider,
+                state=verification_state,
+                allowed_credential_parameter_keys=block_credential_parameter_keys(task_block, task.workflow_run_id),
             )
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
@@ -3077,6 +3115,7 @@ class ForgeAgent:
                 reuse_speculative_llm_response=reuse_speculative_llm_response,
                 speculative_llm_metadata=speculative_llm_metadata,
                 context=context,
+                allowed_credential_parameter_keys=block_credential_parameter_keys(task_block, task.workflow_run_id),
             )
 
             detailed_agent_step_output.actions = actions
@@ -3634,6 +3673,7 @@ class ForgeAgent:
         reuse_speculative_llm_response: bool,
         speculative_llm_metadata: SpeculativeLLMMetadata | None,
         context: SkyvernContext | None,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> tuple[list[Action], str | None, bool]:
         pdf_auto_download_src: str | None = None
         pdf_auto_download_used_bytes = False
@@ -3660,6 +3700,7 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 previous_response=cua_response,
                 engine=engine,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
             detailed_agent_step_output.cua_response = new_cua_response
         elif engine == RunEngine.anthropic_cua:
@@ -3670,6 +3711,7 @@ class ForgeAgent:
                 step=step,
                 scraped_page=scraped_page,
                 llm_caller=llm_caller,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
         elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "DISABLE_UI_TARS_CUA",
@@ -3810,7 +3852,12 @@ class ForgeAgent:
                         pdf_auto_download_used_bytes = pdf_bytes is not None
                     else:
                         otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
-                            task, step, scraped_page, browser_state, json_response
+                            task,
+                            step,
+                            scraped_page,
+                            browser_state,
+                            json_response,
+                            allowed_credential_parameter_keys=allowed_credential_parameter_keys,
                         )
                         if otp_actions:
                             detailed_agent_step_output.llm_response = otp_json_response
@@ -3887,6 +3934,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         previous_response: OpenAIResponse | None = None,
         engine: RunEngine = RunEngine.openai_cua,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> tuple[list[Action], OpenAIResponse | None]:
         cua_model = app.OPENAI_CUA_MODEL
         # The CUA tool must declare the browser's real viewport so returned coordinates land in the
@@ -4078,7 +4126,9 @@ class ForgeAgent:
             incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
         )
 
-        return await parse_cua_actions(task, step, current_response), current_response
+        return await parse_cua_actions(
+            task, step, current_response, allowed_credential_parameter_keys
+        ), current_response
 
     async def _generate_anthropic_actions(
         self,
@@ -4086,6 +4136,7 @@ class ForgeAgent:
         step: Step,
         scraped_page: ScrapedPage,
         llm_caller: LLMCaller,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> list[Action]:
         LOG.info(
             "Anthropic CU call starts",
@@ -4180,6 +4231,7 @@ class ForgeAgent:
             assistant_content,
             window_dimension or llm_caller.browser_window_dimension,
             llm_caller.get_screenshot_resize_target_dimension(window_dimension),
+            allowed_credential_parameter_keys,
         )
         return actions
 
@@ -8134,6 +8186,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> tuple[dict[str, Any], list[Action]]:
         if not task.organization_id:
             return json_response, []
@@ -8181,6 +8234,10 @@ class ForgeAgent:
         workflow_run_context = None
         if workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
             workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        # The {task_id}_secret stash is populated only from this task's navigation payload, which is
+        # built from the originating block's own parameters — so the multi-field skip below cannot
+        # carry an out-of-scope credential's secret (SKY-15181 provenance; single write site is
+        # _process_totp over final_navigation_payload).
         multi_field_secret_ready = bool(runtime_context and runtime_context.totp_codes.get(f"{task.task_id}_secret"))
         first_plan_actions = json_response.get("actions")
         if (
@@ -8204,6 +8261,7 @@ class ForgeAgent:
                 first_plan_actions,
                 workflow_run_context,
                 getattr(runtime_context, "active_credential_parameter_key", None),
+                allowed_credential_parameter_keys,
             )
             and extract_totp_from_navigation_inputs(task.navigation_payload) is None
         ):
@@ -8212,7 +8270,12 @@ class ForgeAgent:
 
         if should_resolve_verification_code:
             json_response = await self.handle_potential_verification_code(
-                task, step, scraped_page, browser_state, json_response
+                task,
+                step,
+                scraped_page,
+                browser_state,
+                json_response,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
             actions = parse_actions(
                 task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
@@ -8280,6 +8343,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         # The caller decides when to resolve; place_to_enter_verification_code alone is sufficient.
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
@@ -8287,7 +8351,11 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
+        otp_value = await resolve_otp_value(
+            task,
+            expected_otp_type=OTPType.TOTP,
+            allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+        )
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response

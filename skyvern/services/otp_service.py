@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import structlog
 from pydantic import BaseModel, Field, ValidationError
@@ -503,13 +503,17 @@ def try_generate_totp_for_credential(
     return OTPValue(value=code, type=OTPType.TOTP)
 
 
-def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
+def has_credential_totp_candidate(
+    workflow_run_id: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
+) -> bool:
     """Return True when try_generate_totp_from_credential would have a credential to consult.
 
     Mirrors try_generate_totp_from_credential's selection: active-with-TOTP if an
     active credential is recorded, else exactly one TOTP-bearing candidate.
     Used to drive prompt gating and classifier branches without actually
-    generating a code.
+    generating a code. ``allowed_credential_parameter_keys`` restricts the candidates
+    to the originating block's linked credentials (SKY-15181); None means unrestricted.
     """
     if not workflow_run_id:
         return False
@@ -522,6 +526,14 @@ def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
 
     current_context = skyvern_context.current()
     active_credential_key = current_context.active_credential_parameter_key if current_context else None
+    if (
+        active_credential_key
+        and allowed_credential_parameter_keys is not None
+        and active_credential_key not in allowed_credential_parameter_keys
+    ):
+        # A credential typed by an earlier block must not answer this block's OTP prompt
+        # (SKY-15181); the scan below may still find a credential the block itself links.
+        active_credential_key = None
     if active_credential_key:
         if not workflow_run_context.is_registered_credential_parameter_key(active_credential_key):
             return False
@@ -534,14 +546,20 @@ def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
         if isinstance(value, dict)
         and isinstance(value.get("totp"), str)
         and workflow_run_context.is_registered_credential_parameter_key(key)
+        and (allowed_credential_parameter_keys is None or key in allowed_credential_parameter_keys)
     ]
     return len(candidate_keys) == 1
 
 
-def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue | None:
+def try_generate_totp_from_credential(
+    workflow_run_id: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
+) -> OTPValue | None:
     """Generate a TOTP only for the credential the agent is currently typing into.
 
     Falls back to single-credential heuristic when no active credential is recorded.
+    ``allowed_credential_parameter_keys`` restricts both paths to the originating block's
+    linked credentials (SKY-15181); None means unrestricted (bare tasks, cached scripts).
     """
     if not workflow_run_id:
         return None
@@ -555,6 +573,21 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     current_context = skyvern_context.current()
     active_credential_key = current_context.active_credential_parameter_key if current_context else None
 
+    if (
+        active_credential_key
+        and allowed_credential_parameter_keys is not None
+        and active_credential_key not in allowed_credential_parameter_keys
+    ):
+        # A credential typed by an earlier block must not answer this block's OTP prompt
+        # (SKY-15181); the scan below may still find a credential the block itself links.
+        LOG.info(
+            "Ignoring credential not linked to this task's block for OTP resolution",
+            workflow_run_id=workflow_run_id,
+            active_credential_parameter_key=active_credential_key,
+            allowed_credential_parameter_keys=list(allowed_credential_parameter_keys),
+        )
+        active_credential_key = None
+
     if active_credential_key:
         return try_generate_totp_for_credential(workflow_run_context, active_credential_key, workflow_run_id)
 
@@ -565,6 +598,16 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
         and isinstance(value.get("totp"), str)
         and workflow_run_context.is_registered_credential_parameter_key(key)
     ]
+    if allowed_credential_parameter_keys is not None:
+        excluded = [key for key in candidate_keys if key not in allowed_credential_parameter_keys]
+        if excluded:
+            LOG.info(
+                "Skipping credential-TOTP not linked to this task's block",
+                workflow_run_id=workflow_run_id,
+                excluded_credential_keys=excluded,
+                allowed_credential_parameter_keys=list(allowed_credential_parameter_keys),
+            )
+        candidate_keys = [key for key in candidate_keys if key in allowed_credential_parameter_keys]
     if len(candidate_keys) != 1:
         if len(candidate_keys) > 1:
             LOG.info(
@@ -576,7 +619,43 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     return try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
 
 
-def has_otp_source(task: "Task", expected_otp_type: OTPType | None = None) -> bool:
+# Facetable rollout sentinel for SKY-15181: fires only when block scoping flips a run from
+# worked-by-accident to no-OTP-source at all. Datadog queries key on the literal event string.
+SCOPE_SUPPRESSED_LEGACY_CREDENTIAL_EVENT = (
+    "Block-scoped credential-TOTP suppressed a cross-block credential with no fallback OTP source"
+)
+
+
+def _warn_if_scope_suppresses_legacy_credential(
+    task: "Task",
+    expected_otp_type: OTPType | None,
+    allowed_credential_parameter_keys: Sequence[str] | None,
+) -> None:
+    """Detect the SKY-15181 regression shape: the legacy run-scoped selection would have answered
+    this prompt with a cross-block credential, the block scope excludes it, and the task has no
+    polling fallback — so a run that used to pass by accident will now fail. Detection only; the
+    workflow's fix is linking the credential to the OTP-handling block."""
+    if allowed_credential_parameter_keys is None or expected_otp_type not in (None, OTPType.TOTP):
+        return
+    if task.totp_verification_url or task.totp_identifier:
+        return
+    if has_credential_totp_candidate(task.workflow_run_id, allowed_credential_parameter_keys):
+        return
+    if not has_credential_totp_candidate(task.workflow_run_id):
+        return
+    LOG.warning(
+        SCOPE_SUPPRESSED_LEGACY_CREDENTIAL_EVENT,
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        allowed_credential_parameter_keys=list(allowed_credential_parameter_keys),
+    )
+
+
+def has_otp_source(
+    task: "Task",
+    expected_otp_type: OTPType | None = None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
+) -> bool:
     """Return True when resolve_otp_value would consult at least one source for this task.
 
     Mirrors resolve_otp_value's waterfall (payload of the expected type -> credential TOTP ->
@@ -590,9 +669,15 @@ def has_otp_source(task: "Task", expected_otp_type: OTPType | None = None) -> bo
         return True
     # A credential-TOTP candidate can only ever yield a TOTP code, so it's a source only when the
     # caller isn't expecting some other OTP type (e.g. a magic link).
-    if expected_otp_type in (None, OTPType.TOTP) and has_credential_totp_candidate(task.workflow_run_id):
+    if expected_otp_type in (None, OTPType.TOTP) and has_credential_totp_candidate(
+        task.workflow_run_id, allowed_credential_parameter_keys
+    ):
         return True
-    return bool((task.totp_verification_url or task.totp_identifier) and task.organization_id)
+    has_polling_source = bool((task.totp_verification_url or task.totp_identifier) and task.organization_id)
+    if not has_polling_source:
+        # This False withholds the v3 code tool entirely, which is otherwise invisible in logs.
+        _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)
+    return has_polling_source
 
 
 async def resolve_otp_value(
@@ -600,6 +685,7 @@ async def resolve_otp_value(
     expected_otp_type: OTPType | None = None,
     max_wait_seconds: float | None = None,
     poll_started_at: datetime | None = None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
@@ -616,7 +702,7 @@ async def resolve_otp_value(
     if otp_value and (expected_otp_type is None or otp_value.get_otp_type() == expected_otp_type):
         return otp_value
 
-    otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+    otp_value = try_generate_totp_from_credential(task.workflow_run_id, allowed_credential_parameter_keys)
     # A credential TOTP can only ever be a TOTP, so it's a match only when the caller isn't
     # expecting some other OTP type (e.g. a magic link) -- mirrors has_otp_source's gate.
     if otp_value and expected_otp_type in (None, OTPType.TOTP):
@@ -649,6 +735,7 @@ async def resolve_otp_value(
             poll_started_at=poll_started_at,
         )
 
+    _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)
     return None
 
 
