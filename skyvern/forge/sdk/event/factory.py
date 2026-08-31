@@ -4,6 +4,7 @@ import structlog
 from opentelemetry import metrics
 from playwright.async_api import Locator, Page
 
+from skyvern.config import settings
 from skyvern.forge.sdk.event.base import CursorEventStrategy, InputEventStrategy, ScrollEventStrategy
 from skyvern.forge.sdk.event.default import DefaultCursorStrategy, DefaultInputStrategy, DefaultScrollStrategy
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -144,20 +145,60 @@ class EventStrategyFactory:
     # -- input convenience methods ----------------------------------------------
 
     @staticmethod
-    async def type_text(page: Page, locator: Locator | None, text: str) -> None:
-        """Type text using the active input strategy."""
+    async def type_text(
+        page: Page,
+        locator: Locator | None,
+        text: str,
+        *,
+        timeout: float | None = settings.BROWSER_ACTION_TIMEOUT_MS,
+        delay: float | None = None,
+        no_wait_after: bool | None = None,
+        allow_batched_playwright: bool = False,
+    ) -> None:
+        """Type text using the active input strategy under the caller's timeout contract."""
         start = time.perf_counter()
         try:
-            await EventStrategyFactory.get_input_strategy().type_text(page, locator, text)
+            strategy = EventStrategyFactory.get_input_strategy()
+            if delay is None and no_wait_after is None and not allow_batched_playwright:
+                await strategy.type_text(page, locator, text, timeout=timeout)
+            else:
+                await strategy.type_text(
+                    page,
+                    locator,
+                    text,
+                    timeout=timeout,
+                    delay=delay,
+                    no_wait_after=no_wait_after,
+                    allow_batched_playwright=allow_batched_playwright,
+                )
         finally:
             EventStrategyFactory.__metrics.record("type_text", time.perf_counter() - start)
 
     @staticmethod
-    async def clear_field(page: Page, locator: Locator, char_count: int) -> None:
-        """Clear field using the active input strategy."""
+    async def clear_field(
+        page: Page,
+        locator: Locator,
+        char_count: int,
+        *,
+        timeout: float | None = settings.BROWSER_ACTION_TIMEOUT_MS,
+        force: bool | None = None,
+        no_wait_after: bool | None = None,
+    ) -> None:
+        """Clear field using the active input strategy under the caller's timeout contract."""
         start = time.perf_counter()
         try:
-            await EventStrategyFactory.get_input_strategy().clear_field(page, locator, char_count)
+            strategy = EventStrategyFactory.get_input_strategy()
+            if force is None and no_wait_after is None:
+                await strategy.clear_field(page, locator, char_count, timeout=timeout)
+            else:
+                await strategy.clear_field(
+                    page,
+                    locator,
+                    char_count,
+                    timeout=timeout,
+                    force=force,
+                    no_wait_after=no_wait_after,
+                )
         finally:
             EventStrategyFactory.__metrics.record("clear_field", time.perf_counter() - start)
 

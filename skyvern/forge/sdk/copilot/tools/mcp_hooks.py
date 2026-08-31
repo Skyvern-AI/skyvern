@@ -1951,8 +1951,9 @@ def _build_skyvern_mcp_overlays(
         ),
         "type_text": SchemaOverlay(
             description=(
-                "Type text into an input element by CSS selector. The type is instant and "
-                "deterministic. Derive the selector from page evidence; if it does not resolve, "
+                "Type text into an input element with Skyvern's active input event strategy while "
+                "targeting the supplied CSS selector directly. Derive the selector from page evidence; "
+                "if it does not resolve, "
                 "inspect the page again and derive a better one. "
                 "Optionally clear the field first. Use this for form filling. "
                 "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
