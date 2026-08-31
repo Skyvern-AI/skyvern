@@ -174,7 +174,7 @@ from skyvern.webeye.actions.responses import (
     ActionSuccess,
     StaleActionAbort,
 )
-from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_artifacts import ActionDownloadObservation, DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
@@ -333,6 +333,9 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
+# Pre-click provider-download baseline is a single metadata listing; cap it well under the action's
+# own download budget so a slow provider cannot delay the click itself.
+PROVIDER_DOWNLOAD_BASELINE_TIMEOUT_SECONDS = 10.0
 # Cap the event-time blob read so a stalled read never consumes the whole download-wait budget;
 # on timeout the save_as + fan-out fallback still gets its chance.
 EAGER_BLOB_READ_TIMEOUT_SECONDS = 5.0
@@ -4205,6 +4208,31 @@ class ActionHandler:
                 )
             return files
 
+        # Provider-owned downloads (vendor remote sessions) are observed per action. The source is
+        # deliberately private/non-serialized on BrowserArtifacts; absent sources preserve existing
+        # PBS/CDP/local behavior unchanged.
+        action_download_observation: ActionDownloadObservation | None = None
+        provider_source = browser_state.browser_artifacts.get_action_download_source() if browser_state else None
+        if provider_source is not None:
+            baseline_budget_seconds = min(
+                PROVIDER_DOWNLOAD_BASELINE_TIMEOUT_SECONDS,
+                float(task.download_timeout) if task.download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT,
+            )
+            try:
+                action_download_observation = await provider_source.begin_observation(
+                    deadline=time.monotonic() + baseline_budget_seconds
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Same secret-leak guard as the poll catches: a provider list/schema error can embed the
+                # secret-bearing presigned URL, so log only its type -- never the exception/traceback. A
+                # missing baseline disables provider-diff for this action but leaves every download path intact.
+                LOG.warning(
+                    "Provider download baseline unavailable; continuing existing download paths",
+                    error_type=type(exc).__name__,
+                )
+
         async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str], timeout_seconds: float) -> bool:
             await xhr_capture.drain(timeout_seconds=timeout_seconds)
             if not staging_dir.exists():
@@ -4505,10 +4533,35 @@ class ActionHandler:
                                     break
 
                             list_files_after = await _list_download_signal_files()
-
-                            if {
+                            local_signal_delta = {
                                 _download_signal_identity(file) for file in list_files_after
-                            } - signal_file_identities_before:
+                            } - signal_file_identities_before
+
+                            # Only reach for the provider when no local artifact already accounts for this
+                            # action. An existing CDP/local/session file is authoritative, so polling the
+                            # provider would be pure duplication -- it could stall to the shared deadline or
+                            # materialize a collision-suffixed copy of a file already saved.
+                            if not local_signal_delta and action_download_observation is not None:
+                                try:
+                                    await action_download_observation.poll_and_materialize(
+                                        destination_dir=download_dir,
+                                        deadline=download_wait_deadline,
+                                    )
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:
+                                    # Provider-list schema/validation errors can embed the secret-bearing
+                                    # presigned URL; log only its type, never the exception/traceback.
+                                    LOG.debug(
+                                        "Provider download poll failed; continuing existing paths",
+                                        error_type=type(exc).__name__,
+                                    )
+                                list_files_after = await _list_download_signal_files()
+                                local_signal_delta = {
+                                    _download_signal_identity(file) for file in list_files_after
+                                } - signal_file_identities_before
+
+                            if local_signal_delta:
                                 _record_download_signal("download_file_detected")
                                 LOG.info(
                                     "Found new files in download directory after action",
@@ -4719,6 +4772,27 @@ class ActionHandler:
 
             async with asyncio.timeout(_download_completion_timeout):
                 async with settle_browser_downloads_for_context(page.context):
+                    if action_download_observation is not None:
+                        # Mirror the mid-wait rule at finalize: poll the provider only when no local
+                        # artifact already accounts for this action. A file the CDP/local/session path
+                        # already saved must not be duplicated by a second, collision-suffixed provider
+                        # copy here. The listing is done only when a provider is attached, so the
+                        # legacy no-provider path issues no extra directory read.
+                        local_signal_accounts_for_action = bool(
+                            {_download_signal_identity(file) for file in await _list_download_signal_files()}
+                            - signal_file_identities_before
+                        )
+                        if not local_signal_accounts_for_action:
+                            try:
+                                await action_download_observation.poll_and_materialize(
+                                    destination_dir=download_dir,
+                                    deadline=download_wait_deadline,
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                # Same secret-leak guard as the mid-poll catch: metadata only, no traceback.
+                                LOG.debug("Final provider download poll failed", error_type=type(exc).__name__)
                     downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
                         download_dir=download_dir,
                         task=task,
