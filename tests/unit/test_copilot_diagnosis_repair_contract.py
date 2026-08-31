@@ -3840,6 +3840,7 @@ def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> No
         "current_url",
         "current_title",
         "page_evidence_source",
+        "rendered_value_excerpt",
         "observed_after_workflow_run",
         "page_form_summaries",
         "page_result_summaries",
