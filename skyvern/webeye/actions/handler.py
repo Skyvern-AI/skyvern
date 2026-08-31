@@ -680,6 +680,148 @@ async def _verify_autocomplete_input_readback(
     return False
 
 
+def _is_boundary_fragment(fragment: str, whole: str) -> bool:
+    """Whether ``fragment`` occurs in ``whole`` as a word-boundary-delimited contiguous run.
+
+    Both are expected to already be normalized. A fragment carrying no alphanumeric character can
+    never anchor a meaningful boundary match, so it is rejected. Default Unicode ``\\w`` semantics
+    apply, so accented Latin behaves and unsegmented CJK interiors fail closed.
+    """
+    if not any(ch.isalnum() for ch in fragment):
+        return False
+    return re.search(rf"(?<!\w){re.escape(fragment)}(?!\w)", whole) is not None
+
+
+def _autocomplete_commit_evidence(
+    pre_value: str | None,
+    post_value: str | None,
+    option_label: str | None,
+) -> tuple[str, str] | None:
+    """Observational commit evidence for an autocomplete selection, or None.
+
+    Emits ``(committed_option, committed_value)`` — both truncated to the shared field cap — only
+    when the clicked option's label and both control read-backs are nonempty *after normalization*,
+    the normalized post-click value differs from the normalized pre-click value, and BOTH the
+    normalized pre and post are boundary-delimited fragments of the normalized option label. That
+    last relation is what makes the transition selection-specific: it rejects unrelated blur,
+    masking, formatting, validation, and restoration transforms whose output is not a fragment of
+    the clicked option. The relation runs on the full normalized strings before any truncation.
+    Whitespace-only fields normalize to empty and fail closed; equality (a no-op or highlight-only
+    click) yields None. Secret suppression is the caller's responsibility.
+    """
+    normalized_pre = _normalize_select_shadow_text(pre_value)
+    normalized_post = _normalize_select_shadow_text(post_value)
+    normalized_label = _normalize_select_shadow_text(option_label)
+    if not normalized_label or not normalized_pre or not normalized_post:
+        return None
+    if normalized_post == normalized_pre:
+        return None
+    if not _is_boundary_fragment(normalized_pre, normalized_label):
+        return None
+    if not _is_boundary_fragment(normalized_post, normalized_label):
+        return None
+    committed_option = _truncate_select_shadow_field(option_label)
+    committed_value = _truncate_select_shadow_field(post_value)
+    if not committed_option or not committed_value:
+        return None
+    return committed_option, committed_value
+
+
+async def _read_autocomplete_control_value(
+    skyvern_element: SkyvernElement,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> str | None:
+    try:
+        return await get_input_value(
+            skyvern_element.get_tag_name(),
+            skyvern_element.get_locator(),
+            engine_selection=engine_selection,
+            read_timeout_ms=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception:
+        LOG.info("Failed to read autocomplete control value for commit evidence", exc_info=True)
+        return None
+
+
+async def _read_clicked_option_label(
+    *,
+    skyvern_frame: SkyvernFrame,
+    option_locator: Locator,
+    option_static_element: dict | None,
+) -> str | None:
+    identity = await _read_autocomplete_option_identity(skyvern_frame=skyvern_frame, locator=option_locator)
+    label = identity.get("label") if identity else None
+    if not label and option_static_element:
+        # Fall back to the scraped node text; it is tied to this exact option by construction.
+        label = option_static_element.get("text")
+    label = (label or "").strip()
+    return label or None
+
+
+async def _click_autocomplete_option_with_commit_evidence(
+    *,
+    skyvern_element: SkyvernElement,
+    option_locator: Locator,
+    option_static_element: dict | None,
+    skyvern_frame: SkyvernFrame,
+    click: Callable[[], Awaitable[None]],
+    is_secret_value: bool,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> ActionResult:
+    """Click the LLM-selected option and return ``ActionSuccess``, enriched with commit evidence
+    only when the target control's read-back changes into a value that — like the pre-click value —
+    is a boundary-delimited fragment of the clicked option's label (see
+    ``_autocomplete_commit_evidence``) AND that transitioned value survives a single bounded settle
+    reread. The settle guards against an optimistic control that paints the selected label and then
+    reverts it after async validation/rerender, which would otherwise commit a transient value.
+
+    Evidence capture is best-effort and fail-closed: a failed read (before, after, or on the settle
+    reread), a missing label, an unchanged control, an unrelated transform, a value that drifts on
+    the settled reread, or a secret value all leave a bare ``ActionSuccess``. Only the click itself
+    can fail the action — every evidence read is exception-isolated so a successful click never
+    regresses to ``ActionFailure`` because capture failed.
+    """
+    option_label: str | None = None
+    pre_value: str | None = None
+    if not is_secret_value:
+        try:
+            option_label = await _read_clicked_option_label(
+                skyvern_frame=skyvern_frame,
+                option_locator=option_locator,
+                option_static_element=option_static_element,
+            )
+        except Exception:
+            LOG.info("Failed to read clicked autocomplete option label for commit evidence", exc_info=True)
+        pre_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
+
+    await click()
+
+    if is_secret_value:
+        return ActionSuccess()
+
+    try:
+        post_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
+        evidence = _autocomplete_commit_evidence(pre_value, post_value, option_label)
+        if evidence is None:
+            return ActionSuccess()
+        # The candidate transition passed, but an optimistic control can paint the selected label and
+        # then revert it after async validation/rerender. Settle once (no loop) and reconfirm the
+        # value; only record evidence when the settled reread still holds the first post value, so a
+        # transient paint cannot be committed as stale evidence.
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.commit")
+        confirm_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
+        if confirm_value is None or _normalize_select_shadow_text(confirm_value) != _normalize_select_shadow_text(
+            post_value
+        ):
+            return ActionSuccess()
+    except Exception:
+        LOG.info("Autocomplete commit-evidence capture failed after a successful click", exc_info=True)
+        return ActionSuccess()
+
+    committed_option, committed_value = evidence
+    return ActionSuccess(committed_option=committed_option, committed_value=committed_value)
+
+
 async def _reset_autocomplete_for_llm_fallback(
     *,
     current_incremental_scraped: IncrementalScrapePage,
@@ -7472,6 +7614,7 @@ async def _handle_input_text_action(
                     task=task,
                     action=action,
                     collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
+                    is_secret_value=is_secret_value,
                 ):
                     auto_complete_hacky_flag = False
                     return [result]
@@ -9912,6 +10055,8 @@ async def choose_auto_completion_dropdown(
     is_location_input: bool = False,
     collapse_autocomplete_fanout_enabled: bool = False,
     action: InputTextAction | None = None,
+    *,
+    is_secret_value: bool,
 ) -> AutoCompletionResult:
     preserved_elements = preserved_elements or []
     clear_input = True
@@ -10234,8 +10379,20 @@ async def choose_auto_completion_dropdown(
             static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
             engine_selection=engine_selection,
         )
-        await selected_element.scroll_into_view()
-        await selected_element.click(page=page, engine_selection=engine_selection)
+
+        async def _click_selected_option() -> None:
+            await selected_element.scroll_into_view()
+            await selected_element.click(page=page, engine_selection=engine_selection)
+
+        result.action_result = await _click_autocomplete_option_with_commit_evidence(
+            skyvern_element=skyvern_element,
+            option_locator=locator,
+            option_static_element=incremental_scraped.id_to_element_dict.get(element_id),
+            skyvern_frame=skyvern_frame,
+            click=_click_selected_option,
+            is_secret_value=is_secret_value,
+            engine_selection=engine_selection,
+        )
         clear_input = False
         return result
 
@@ -10288,6 +10445,8 @@ async def input_or_auto_complete_input(
     task: Task,
     action: InputTextAction | None = None,
     collapse_autocomplete_fanout_enabled: bool = False,
+    *,
+    is_secret_value: bool,
 ) -> ActionResult | None:
     LOG.info(
         "Trigger auto completion",
@@ -10329,9 +10488,10 @@ async def input_or_auto_complete_input(
             is_location_input=is_location,
             collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
             action=action,
+            is_secret_value=is_secret_value,
         )
         if isinstance(result.action_result, ActionSuccess):
-            return ActionSuccess()
+            return result.action_result
 
         if input_or_select_context.is_search_bar:
             LOG.info(
@@ -10397,9 +10557,10 @@ async def input_or_auto_complete_input(
                 is_location_input=is_location,
                 collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
                 action=action,
+                is_secret_value=is_secret_value,
             )
             if isinstance(result.action_result, ActionSuccess):
-                return ActionSuccess()
+                return result.action_result
 
             tried_values.append(value)
             whole_new_elements.extend(result.incremental_elements)
@@ -13828,20 +13989,25 @@ async def click_listbox_option(
 
 
 async def get_input_value(
-    tag_name: str, locator: Locator, engine_selection: BrowserEngineSelection | None = None
+    tag_name: str,
+    locator: Locator,
+    engine_selection: BrowserEngineSelection | None = None,
+    read_timeout_ms: float | None = None,
 ) -> str | None:
     # input_value() rejects non-<input>/<textarea>/<select> nodes and inner_text() rejects
     # non-HTMLElement nodes; the live node can disagree with the scraped tag_name after a
     # re-render. Treat an incompatible read as "value unknown" so the caller's own
     # element-type classification runs instead of a raw driver exception escaping here. The
     # incompatible-node identity is matched against THIS run's selected engine; missing selection
-    # keeps the stock Playwright identity (unchanged default).
+    # keeps the stock Playwright identity (unchanged default). read_timeout_ms is opt-in: when unset
+    # the read keeps Playwright's default wait; callers that must not stall pass an explicit bound.
+    read_kwargs = {} if read_timeout_ms is None else {"timeout": read_timeout_ms}
     try:
         if tag_name in COMMON_INPUT_TAGS:
-            return await locator.input_value()
+            return await locator.input_value(**read_kwargs)
         # for span, div, p or other tags:
         # we need to trim the unicode space for these tags
-        return (await locator.inner_text()).replace("\xa0", " ").strip()
+        return (await locator.inner_text(**read_kwargs)).replace("\xa0", " ").strip()
     except Exception as exc:
         if not _is_selected_engine_error(exc, engine_selection):
             raise

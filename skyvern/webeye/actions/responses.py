@@ -27,6 +27,12 @@ class ActionResult(BaseModel):
     # suppressed it because the control already held the desired state. Both shapes stop the raw
     # click, so callers mirroring the setup contract have no other way to tell them apart.
     setup_performed: bool = False
+    # Observational commit evidence for an autocomplete selection: the clicked option's label and
+    # the control value observed immediately afterward. Set together only when both are
+    # boundary-delimited fragments of the option label (a selection-specific transition); both stay
+    # None on a no-op, unrelated transform, ambiguous, failed, or secret selection.
+    committed_option: str | None = None
+    committed_value: str | None = None
 
     def __str__(self) -> str:
         results = [f"ActionResult(success={self.success}"]
@@ -55,6 +61,10 @@ class ActionResult(BaseModel):
             results.append(f"interacted_with_parent={self.interacted_with_parent}")
         if self.skip_remaining_actions is not None:
             results.append(f"skip_remaining_actions={self.skip_remaining_actions}")
+        if self.committed_option is not None:
+            results.append(f"committed_option={self.committed_option}")
+        if self.committed_value is not None:
+            results.append(f"committed_value={self.committed_value}")
 
         return ", ".join(results) + ")"
 
@@ -71,6 +81,8 @@ class ActionSuccess(ActionResult):
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
         setup_performed: bool = False,
+        committed_option: str | None = None,
+        committed_value: str | None = None,
     ):
         super().__init__(
             success=True,
@@ -80,6 +92,8 @@ class ActionSuccess(ActionResult):
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
             setup_performed=setup_performed,
+            committed_option=committed_option,
+            committed_value=committed_value,
         )
 
 
