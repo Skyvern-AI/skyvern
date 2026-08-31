@@ -18,25 +18,26 @@ To set it up manually:
 
 2. Open `chrome://extensions`, enable **Developer mode**, and click **Load unpacked**.
 3. Select the directory printed by the command.
-4. Start the local MCP server in extension mode:
+4. Open the extension's **Details** page and enable **Allow User Scripts**.
+5. Start the local MCP server in extension mode:
 
    ```bash
    skyvern run mcp --browser-extension
    ```
 
-5. Start explicit pairing:
+6. Start explicit pairing:
 
    ```bash
    skyvern browser extension-pair
    ```
 
-6. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
+7. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
    (the single approval step).
 
 The local pairing page checks that the extension is available before it claims the single-use offer. If pairing starts
 before the extension is loaded, keep the page open. It retains the offer and continues automatically after the
 extension becomes available.
-7. Add controllable tabs to the **Skyvern Controlled** group.
+8. Add controllable tabs to the **Skyvern Controlled** group.
 
 On POSIX, extension mode uses the persistent broker by default. The first broker start automatically validates or
 initializes its journal and copies an existing legacy credential into the owner-only broker run directory, or creates
@@ -73,8 +74,9 @@ The extension connects outbound to `ws://127.0.0.1:19777/extension/v1` by defaul
 In broker mode, `extension.secret` is daemon-owned and `skyvern browser extension-token` intentionally refuses to copy
 it. Use the explicit pairing command instead. The popup token-paste flow remains available only with the legacy opt-out.
 
-Chrome's debugger infobar remains visible while Skyvern controls a tab. Clicking **Cancel**, removing the tab with the
-popup, or dragging the tab out of **Skyvern Controlled** revokes access.
+Debugger-backed tools display Chrome's debugger infobar; direct `skyvern_evaluate` calls do not. Clicking **Cancel** in
+the infobar revokes debugger access. Removing a tab with the popup or dragging it out of **Skyvern Controlled** revokes
+all extension access to that tab.
 
 For the complete setup, security model, and limitations, see
 [Control Your Chrome with Skyvern Agent](../../../docs/developers/optimization/chrome-extension.mdx).

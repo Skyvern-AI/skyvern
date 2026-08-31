@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 from bs4 import BeautifulSoup
-from playwright.async_api import Route, async_playwright
+from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -33,6 +34,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     _STRUCTURED_EVIDENCE_BODY,
     COMPOSITION_STRIPPED_HTML_EXPRESSION,
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -64,6 +66,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
 from skyvern.forge.sdk.copilot.tools.composition_capture import _model_facing_inspect_result
@@ -79,7 +82,6 @@ class _Ctx:
     block_observation_refs: dict[str, object] = field(default_factory=dict)
     raw_block_observation_refs: object | None = None
     prior_observed_acted_pages: list[dict] = field(default_factory=list)
-    per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     post_run_page_observation_after_failed_test: bool = False
     last_failure_category_top: str | None = None
@@ -2058,6 +2060,33 @@ def test_normalize_block_observation_refs_warns_on_unexpected_container_type() -
     )
 
 
+def test_parse_structured_evidence_warns_on_unknown_size_compaction_category() -> None:
+    payload = {
+        "size_compaction": {
+            "original_char_count": 120_001,
+            "omissions": [
+                {"category": "future_category", "omitted_count": 1, "unit": "entries"},
+                {"category": "navigation_targets", "omitted_count": 2, "unit": "entries"},
+            ],
+        }
+    }
+
+    with patch("skyvern.forge.sdk.copilot.composition_evidence.LOG.warning") as warning:
+        parsed = parse_composition_structured(
+            payload, inspected_url="https://example.com", current_url="https://example.com"
+        )
+
+    assert parsed is not None
+    assert parsed["size_compaction"] == {
+        "original_char_count": 120_001,
+        "omissions": [{"category": "navigation_targets", "omitted_count": 2, "unit": "entries"}],
+    }
+    warning.assert_called_once_with(
+        "copilot_structured_size_compaction_unknown_category_ignored",
+        category="future_category",
+    )
+
+
 def test_composition_gate_reports_string_typed_observation_step_from_raw_refs() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
@@ -3517,7 +3546,12 @@ def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _capture_live_dom(
-    url: str, html: str, wait_selector: str, *, rendered_style_snapshot: bool = False
+    url: str,
+    html: str,
+    wait_selector: str,
+    *,
+    rendered_style_snapshot: bool = False,
+    interact: Callable[[Page], Awaitable[None]] | None = None,
 ) -> tuple[str, str]:
     async def _handle(route: Route) -> None:
         if route.request.url == url:
@@ -3532,6 +3566,8 @@ async def _capture_live_dom(
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_selector(wait_selector)
+        if interact is not None:
+            await interact(page)
         raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
         content = (
             await page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION)
@@ -3559,6 +3595,7 @@ async def test_structured_browser_packet_reports_collapsed_disclosure_relationsh
     )
 
     packet = json.loads(raw)
+    assert "size_compaction" not in packet
     assert packet["clickable_controls"][0]["expanded"] is False
     assert packet["clickable_controls"][0]["controls"] == "alternatives"
     assert packet["clickable_controls"][0]["controlled_region_visible"] is False
@@ -4617,6 +4654,71 @@ class _RecordingCompositionServer:
         return {"ok": False, "error": f"unexpected tool {tool_name}"}
 
 
+class _LiveCompositionServer:
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self.calls: list[str] = []
+        self.results: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name != "skyvern_evaluate":
+            raise AssertionError(f"unexpected tool {tool_name}")
+        expression = arguments.get("expression")
+        if not isinstance(expression, str):
+            raise TypeError("structured extraction requires a string expression")
+        self.calls.append(tool_name)
+        result = await self.page.evaluate(expression)
+        if isinstance(result, str):
+            self.results.append(result)
+        return {"ok": True, "data": {"result": result}}
+
+
+def _dense_oversized_structured_html() -> str:
+    forms: list[str] = []
+    for form_index in range(3):
+        fields: list[str] = []
+        for field_index in range(5):
+            options = "".join(
+                f'<option value="value-{form_index}-{field_index}-{option_index}-{"V" * 145}">'
+                f"Option {form_index}-{field_index}-{option_index} {'T' * 105}</option>"
+                for option_index in range(30)
+            )
+            fields.append(
+                f'<label for="field-{form_index}-{field_index}">Dense field {form_index}-{field_index}</label>'
+                f'<select id="field-{form_index}-{field_index}" name="field-{form_index}-{field_index}">'
+                f"{options}</select>"
+            )
+        forms.append(
+            f'<form id="form-{form_index}" action="/submit/{form_index}">{"".join(fields)}'
+            f'<button id="submit-{form_index}" type="submit">Submit {form_index}</button></form>'
+        )
+    return (
+        "<html><head><title>Dense comparison page</title></head><body>"
+        + "".join(forms)
+        + '<table id="results" class="results"><thead><tr><th>Plan</th><th>Price</th></tr></thead>'
+        "<tbody><tr><td>Starter</td><td>$10</td></tr></tbody></table></body></html>"
+    )
+
+
+def _dense_astral_structured_html(*, value_chars: int = 75, text_chars: int = 55) -> str:
+    forms: list[str] = []
+    for form_index in range(3):
+        fields: list[str] = []
+        for field_index in range(5):
+            options = "".join(
+                f'<option value="value-{form_index}-{field_index}-{option_index}-{"🚀" * value_chars}">'
+                f"Option {form_index}-{field_index}-{option_index} {'🌟' * text_chars}</option>"
+                for option_index in range(30)
+            )
+            fields.append(
+                f'<label for="astral-{form_index}-{field_index}">Astral field {form_index}-{field_index}</label>'
+                f'<select id="astral-{form_index}-{field_index}" name="astral-{form_index}-{field_index}">'
+                f"{options}</select>"
+            )
+        forms.append(f'<form id="astral-form-{form_index}">{"".join(fields)}</form>')
+    return "<html><head><title>Astral page</title></head><body>" + "".join(forms) + "</body></html>"
+
+
 _HTML_FORM_PAGE = (
     "<html><head><title>T</title></head><body>"
     "<form id='f'><input name='x'><button type='submit'>Go</button></form>"
@@ -4695,6 +4797,138 @@ async def test_capture_reports_oversize_structured_dict_without_calling_get_html
     assert server.calls.count("skyvern_get_html") == 0
 
 
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_capture_compacts_dense_live_structured_packet_before_the_python_bound() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(_dense_oversized_structured_html())
+        server = _LiveCompositionServer(page)
+        ctx = SimpleNamespace(discovery_mcp_server=server)
+        try:
+            evidence, error = await tools_module._capture_composition_evidence(
+                ctx,
+                inspected_url="https://example.com/compare",
+                current_url="https://example.com/compare",
+            )
+        finally:
+            await browser.close()
+
+    assert len(server.results) == 1
+    raw = server.results[0]
+    assert len(raw) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    payload = json.loads(raw)
+    compaction = payload["size_compaction"]
+    assert compaction["original_char_count"] > COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    assert [omission["category"] for omission in compaction["omissions"]] == [
+        "visible_text_excerpt",
+        "forms.fields.options",
+    ]
+    assert compaction["omissions"][0] == {
+        "category": "visible_text_excerpt",
+        "omitted_count": 6000,
+        "unit": "characters",
+    }
+    option_omission = next(
+        omission for omission in compaction["omissions"] if omission["category"] == "forms.fields.options"
+    )
+    retained_options = sum(
+        len(field.get("options") or []) for form in payload["forms"] for field in form.get("fields") or []
+    )
+    assert option_omission == {
+        "category": "forms.fields.options",
+        "omitted_count": 450 - retained_options,
+        "unit": "entries",
+    }
+    assert error is None
+    assert evidence is not None
+    assert evidence["page_title"] == "Dense comparison page"
+    assert [form["id"] for form in evidence["forms"]] == ["form-0", "form-1", "form-2"]
+    assert evidence["result_containers"][0]["id"] == "results"
+    assert evidence["size_compaction"] == compaction
+    assert evidence["inspection_warnings"] == []
+    model_visible = _model_facing_inspect_result({"ok": True, "data": evidence})
+    assert model_visible["data"]["size_compaction"] == compaction
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_capture_preserves_python_under_limit_astral_packet_byte_for_byte() -> None:
+    unbounded_expression = COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION.replace(
+        "return boundedStructuredEvidence(structuredEvidence);",
+        "return JSON.stringify(structuredEvidence);",
+    )
+    assert unbounded_expression != COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(_dense_astral_structured_html())
+        expected_raw = await page.evaluate(unbounded_expression)
+        server = _LiveCompositionServer(page)
+        ctx = SimpleNamespace(discovery_mcp_server=server)
+        try:
+            evidence, error = await tools_module._capture_composition_evidence(
+                ctx,
+                inspected_url="https://example.com/astral",
+                current_url="https://example.com/astral",
+            )
+        finally:
+            await browser.close()
+
+    assert isinstance(expected_raw, str)
+    assert len(expected_raw) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    assert len(expected_raw.encode("utf-16-le")) // 2 > COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    assert server.results == [expected_raw]
+    assert "size_compaction" not in json.loads(expected_raw)
+    assert error is None
+    assert evidence is not None
+    assert evidence["page_title"] == "Astral page"
+    assert "size_compaction" not in evidence
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_capture_reports_python_character_counts_for_compacted_astral_packet() -> None:
+    unbounded_expression = COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION.replace(
+        "return boundedStructuredEvidence(structuredEvidence);",
+        "return JSON.stringify(structuredEvidence);",
+    )
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(_dense_astral_structured_html(value_chars=145, text_chars=105))
+        expected_raw = await page.evaluate(unbounded_expression)
+        server = _LiveCompositionServer(page)
+        ctx = SimpleNamespace(discovery_mcp_server=server)
+        try:
+            evidence, error = await tools_module._capture_composition_evidence(
+                ctx,
+                inspected_url="https://example.com/astral",
+                current_url="https://example.com/astral",
+            )
+        finally:
+            await browser.close()
+
+    assert isinstance(expected_raw, str)
+    assert len(expected_raw) > COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    expected_payload = json.loads(expected_raw)
+    raw = server.results[0]
+    assert len(raw) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    compaction = json.loads(raw)["size_compaction"]
+    assert compaction["original_char_count"] == len(expected_raw)
+    assert compaction["omissions"][0] == {
+        "category": "visible_text_excerpt",
+        "omitted_count": len(expected_payload["visible_text_excerpt"]),
+        "unit": "characters",
+    }
+    assert error is None
+    assert evidence is not None
+    assert evidence["size_compaction"] == compaction
+
+
 @pytest.mark.asyncio
 async def test_capture_reports_structured_timeout_without_calling_get_html() -> None:
     server = _RecordingCompositionServer(
@@ -4709,7 +4943,7 @@ async def test_capture_reports_structured_timeout_without_calling_get_html() -> 
     )
 
     assert evidence is None
-    assert error == "skyvern_evaluate timed out after 20s while capturing structured page evidence"
+    assert error == "skyvern_evaluate timed out while capturing structured page evidence"
     assert server.calls.count("skyvern_get_html") == 0
 
 
@@ -4728,7 +4962,7 @@ async def test_inspect_tool_returns_the_structured_observation_timeout_to_copilo
     monkeypatch.setattr(tools_module.composition_capture, "_capture_composition_evidence", failed_capture)
 
     result = await tools_module.composition_capture._inspect_page_for_composition_impl(
-        SimpleNamespace(), "current_page"
+        SimpleNamespace(browser_session_id=None), "current_page"
     )
 
     assert result == {
@@ -5138,6 +5372,17 @@ def test_has_witnessed_value_content_true_on_table_cell_text() -> None:
 def test_has_witnessed_value_content_false_on_truncated_kv() -> None:
     packet = _kv_value_content_packet()
     packet["key_value_relations_truncated"] = True
+    assert has_witnessed_value_content(packet) is False
+
+
+def test_has_witnessed_value_content_false_on_size_compacted_kv_with_dom_cap_flag_clear() -> None:
+    packet = _kv_value_content_packet()
+    packet["size_compaction"] = {
+        "original_char_count": 130_000,
+        "omissions": [{"category": "key_value_relations", "omitted_count": 1, "unit": "entries"}],
+    }
+
+    assert packet["key_value_relations_truncated"] is False
     assert has_witnessed_value_content(packet) is False
 
 
@@ -6690,3 +6935,158 @@ def test_parsed_dismiss_controls_offer_selector_sources_in_the_browser_rung_orde
         "class_type",
         "structural",
     ]
+
+
+_OBSERVED_STATE_URL = "https://test.example.com/booking"
+_OBSERVED_STATE_HTML = """<!DOCTYPE html>
+<html><body>
+  <form id="booking">
+    <label for="depart">Depart date</label>
+    <input type="date" id="depart" name="depart" />
+    <label for="cabin">Cabin</label>
+    <select id="cabin" name="cabin">
+      <option value="economy" selected>Economy</option>
+      <option value="business">Business</option>
+    </select>
+    <label for="insured">Add insurance</label>
+    <input type="checkbox" id="insured" name="insured" />
+    <label for="pw">Password</label>
+    <input type="password" id="pw" name="pw" />
+    <label for="note">Notes</label>
+    <textarea type="date" id="note" name="note"></textarea>
+    <button type="submit">Book</button>
+  </form>
+</body></html>
+"""
+_OBSERVED_STATE_SECRET = "hunter2-not-a-real-secret"
+
+
+async def _fill_booking_form(page: Page) -> None:
+    await page.fill("#depart", "2026-09-14")
+    await page.select_option("#cabin", "business")
+    await page.check("#insured")
+    await page.fill("#pw", _OBSERVED_STATE_SECRET)
+    await page.fill("#note", _OBSERVED_STATE_SECRET)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_field_state_the_agent_produced_survives_capture_while_markup_attributes_do_not() -> None:
+    raw, _ = await _capture_live_dom(_OBSERVED_STATE_URL, _OBSERVED_STATE_HTML, "#depart", interact=_fill_booking_form)
+    captured = {entry["name"]: entry for entry in json.loads(raw)["forms"][0]["fields"]}
+    assert captured["depart"]["observed_value"] == "2026-09-14"
+    assert captured["note"]["type"] == "date"
+    assert "observed_value" not in captured["note"]
+
+    parsed = parse_composition_structured(
+        json.loads(raw), inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL
+    )
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert fields["depart"]["value"] == ""
+    assert fields["depart"]["observed_value"] == "2026-09-14"
+    assert fields["insured"]["checked"] is False
+    assert fields["insured"]["observed_checked"] is True
+    cabin_options = {option["value"]: option for option in fields["cabin"]["options"]}
+    assert cabin_options["economy"]["selected"] is True
+    assert cabin_options["economy"]["observed_selected"] is False
+    assert cabin_options["business"]["selected"] is False
+    assert cabin_options["business"]["observed_selected"] is True
+
+    assert "observed_value" not in fields["pw"]
+    assert "observed_checked" not in fields["pw"]
+    assert fields["note"]["type"] == "date"
+    assert "observed_value" not in fields["note"]
+    assert _OBSERVED_STATE_SECRET not in json.dumps(parsed)
+
+    assert _runtime_form_summaries(parsed["forms"]) == [
+        "Depart date date 2026-09-14",
+        "Cabin select Business",
+        "Add insurance checkbox checked",
+        "Password password",
+        "Notes date",
+    ]
+
+
+def test_a_structured_packet_claiming_an_observed_password_value_is_not_admitted() -> None:
+    payload = {
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "name": "pw",
+                        "type": "password",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "name": "note",
+                        "type": "textarea",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "liar",
+                        "type": "date",
+                        "observed_value": _OBSERVED_STATE_SECRET,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "checkliar",
+                        "type": "checkbox",
+                        "observed_checked": True,
+                        "identity": {"tag": "textarea"},
+                    },
+                    {
+                        "name": "depart",
+                        "type": "date",
+                        "observed_value": "2026-09-14",
+                        "identity": {"tag": "input"},
+                    },
+                ]
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL)
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert "observed_value" not in fields["pw"]
+    assert "observed_value" not in fields["note"]
+    assert "observed_value" not in fields["liar"]
+    assert "observed_checked" not in fields["checkliar"]
+    assert fields["depart"]["observed_value"] == "2026-09-14"
+    assert _OBSERVED_STATE_SECRET not in json.dumps(parsed)
+
+
+def test_a_structured_packet_claiming_an_observed_option_on_a_non_select_is_not_admitted() -> None:
+    payload = {
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "name": "liar",
+                        "type": "select",
+                        "identity": {"tag": "div"},
+                        "options": [{"text": _OBSERVED_STATE_SECRET, "observed_selected": True}],
+                    },
+                    {
+                        "name": "depart",
+                        "type": "select",
+                        "identity": {"tag": "select"},
+                        "options": [{"text": "2026-09-14", "observed_selected": True}],
+                    },
+                ]
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_OBSERVED_STATE_URL, current_url=_OBSERVED_STATE_URL)
+    assert parsed is not None
+    fields = {entry["name"]: entry for entry in parsed["forms"][0]["fields"]}
+
+    assert all("observed_selected" not in option for option in fields["liar"]["options"])
+    assert fields["depart"]["options"][0]["observed_selected"] is True
+    assert fields["liar"]["option_count"] == 1

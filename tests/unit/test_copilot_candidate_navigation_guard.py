@@ -546,7 +546,7 @@ async def test_real_adapter_internal_call_drains_candidate_network_before_return
         return _BrowserState(browser_context)
 
     @asynccontextmanager
-    async def browser_scope(_ctx):
+    async def browser_scope(_ctx, *, session_id_override=None):
         yield
 
     monkeypatch.setattr(mcp_adapter, "ensure_browser_session", ensure)

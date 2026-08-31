@@ -9,8 +9,6 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
-
 import type { WorkflowCopilotCredentialRequiredUpdate } from "./workflowCopilotTypes";
 
 type StreamBody = {
@@ -37,7 +35,6 @@ const {
   modalOverrideType,
   modalDefaultTestUrl,
   toastFn,
-  flagMap,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const streaming = vi.fn(
@@ -97,7 +94,6 @@ const {
     modalOverrideType: { current: undefined as string | undefined },
     modalDefaultTestUrl: { current: undefined as string | undefined },
     toastFn: vi.fn(),
-    flagMap: { current: {} as Record<string, boolean> },
   };
 });
 
@@ -235,10 +231,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
     }),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: (flag: string) => flagMap.current[flag] ?? false,
-}));
 
 const saveData = {
   title: "Test WF",
@@ -452,7 +444,6 @@ beforeEach(() => {
   credsFail.current = false;
   modalOverrideType.current = undefined;
   modalDefaultTestUrl.current = undefined;
-  flagMap.current = {};
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
@@ -488,16 +479,14 @@ const streamScoutTurn = async () => {
 
 describe("WorkflowCopilotChat — activity log", () => {
   it("renders the flat log, not the retired phase rail", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await streamScoutTurn();
     expect(screen.getByText("Opened the sign-in page")).toBeTruthy();
     expect(screen.queryByText("Explore site")).toBeNull();
   });
 });
 
-describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
+describe("WorkflowCopilotChat — credential card wiring", () => {
   it("sends supports_credential_pause on the request", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -505,7 +494,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("renders the inline-pause card when a credential_required frame arrives", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -522,7 +510,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("skip POSTs a credential-response with action skip", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -543,7 +530,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("connect with an existing matched credential POSTs the credential_id", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       {
         credential_id: "cred-hn",
@@ -598,7 +584,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("connect CTA opens the modal, then a created credential POSTs connected", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -627,7 +612,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("shows the full org credential list on a pause ask (not just the frame's candidates) and answers via the typed POST", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       { credential_id: "cred-abc", name: "abc", tested_url: null },
       { credential_id: "cred-spare", name: "spare-portal", tested_url: null },
@@ -665,7 +649,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("keeps the card actionable, toasts, and never logs the raw error (resume_token leak) when the resume POST fails", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     // AxiosError-shaped: config.data carries the one-time resume_token.
     sansApiPost.mockRejectedValueOnce(
@@ -698,7 +681,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("degrades a pause ask to the Connect-credential CTA when the credentials fetch fails", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     credsFail.current = true;
     await renderChat();
@@ -721,7 +703,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("renders no card when the pause resolved to declined (frame never shown)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("use my saved login");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -737,7 +718,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("terminal-mode connect/skip never hits the network", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("who am I signing in as?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -756,7 +736,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("clears the pause card on a terminal error — no dead actionable card", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -778,7 +757,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("terminal connect via the modal auto-continues once and morphs the receipt", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("who am I signing in as?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -808,7 +786,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("fetches the org credentials on a terminal ask and offers the picker", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       { credential_id: "cred_hn", name: "HN login", tested_url: null },
     ];
@@ -831,7 +808,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("restores the terminal picker when the auto-continue send fails", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       { credential_id: "cred_hn", name: "HN login", tested_url: null },
     ];
@@ -874,7 +850,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("restores the terminal picker when the auto-continue is cancelled", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       { credential_id: "cred_hn", name: "HN login", tested_url: null },
     ];
@@ -906,7 +881,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("hides a stale terminal ask once it is no longer the last message", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("who am I signing in as?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -929,7 +903,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("does not auto-continue while a turn is still in flight", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("who am I signing in as?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -955,7 +928,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("passes the pause frame's login URL to the modal as defaultTestUrl", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -975,7 +947,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("passes no defaultTestUrl for a terminal card (frame carries no URL)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("who am I signing in as?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -994,7 +965,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("renders the auto-bind receipt from the credentialAutoBound signal", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("sign in and grab my dashboard");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1009,7 +979,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("Change re-picks through the existing terminal-continue path (no third path)", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       { credential_id: "cred_work", name: "Work login", tested_url: null },
       {
@@ -1050,7 +1019,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
   });
 
   it("defers the auto-bind receipt to a co-occurring credential ask", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await submit("sign in to both sites");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1072,34 +1040,6 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     expect(
       screen.getByRole("button", { name: "Connect credential" }),
     ).toBeTruthy();
-  });
-});
-
-describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
-  it("omits supports_credential_pause and renders no card even if a frame arrives", async () => {
-    await renderChat();
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(streamCalls[0]!.body.supports_credential_pause).toBeUndefined();
-    await act(async () => {
-      streamCalls[0]!.onMessage(turnStart());
-      streamCalls[0]!.onMessage(credentialFrame());
-    });
-    expect(
-      screen.queryByRole("button", { name: "Connect credential" }),
-    ).toBeNull();
-  });
-
-  it("renders no auto-bind receipt with the flag off", async () => {
-    await renderChat();
-    await submit("sign in and grab my dashboard");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(turnStart("turn-9"));
-      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
-      streamCalls[0]!.resolve();
-    });
-    expect(screen.queryByText(/Using credential/)).toBeNull();
   });
 });
 
@@ -1160,7 +1100,6 @@ describe("WorkflowCopilotChat — auto-bound receipt chronology", () => {
   }
 
   it("keeps a repeated live receipt on the first turn", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await completeAutoBoundTurn(0, "turn-chronology-1", "First turn complete.");
     await completeAutoBoundTurn(
@@ -1186,7 +1125,6 @@ describe("WorkflowCopilotChat — auto-bound receipt chronology", () => {
   });
 
   it("keeps the surviving scrollback receipt read-only", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
     await completeAutoBoundTurn(0, "turn-readonly-1", "First turn complete.");
     expect(await screen.findByRole("button", { name: "Change" })).toBeTruthy();
@@ -1198,7 +1136,6 @@ describe("WorkflowCopilotChat — auto-bound receipt chronology", () => {
   });
 
   it("hydrates one receipt at the first persisted position", async () => {
-    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     historyResponse.data.chat_history = [
       historyMessage("turn-history-1", 0, "First persisted turn."),
       historyMessage("turn-history-2", 1, "Second persisted turn."),

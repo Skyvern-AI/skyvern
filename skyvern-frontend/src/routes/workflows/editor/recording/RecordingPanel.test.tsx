@@ -4,12 +4,21 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
+import {
+  useRecordingStore,
+  type RecordingDraftStep,
+} from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { RecordingPanel } from "./RecordingPanel";
 
 const mutateMock = vi.fn();
+const modalState = vi.hoisted(() => ({
+  overrideType: null as string | null,
+  defaultTestUrl: null as string | null,
+  defaultTotpType: null as string | null,
+  heading: null as string | null,
+}));
 
 vi.mock("@/routes/browserSessions/hooks/useProcessRecordingMutation", () => ({
   useProcessRecordingMutation: () => ({
@@ -19,14 +28,73 @@ vi.mock("@/routes/browserSessions/hooks/useProcessRecordingMutation", () => ({
   }),
 }));
 
+vi.mock("@/routes/credentials/CredentialsModal", () => ({
+  CredentialsModal: ({
+    isOpen,
+    onCredentialCreated,
+    overrideType,
+    defaultTestUrl,
+    defaultTotpType,
+    heading,
+  }: {
+    isOpen?: boolean;
+    onCredentialCreated?: (id: string, name?: string) => void;
+    overrideType?: string;
+    defaultTestUrl?: string;
+    defaultTotpType?: string;
+    heading?: string;
+  }) => {
+    modalState.overrideType = overrideType ?? null;
+    modalState.defaultTestUrl = defaultTestUrl ?? null;
+    modalState.defaultTotpType = defaultTotpType ?? null;
+    modalState.heading = heading ?? null;
+    return isOpen ? (
+      <button
+        type="button"
+        data-testid="mock-create-credential"
+        onClick={() => onCredentialCreated?.("new-cred-1")}
+      >
+        create credential
+      </button>
+    ) : null;
+  },
+}));
+
 const initialRecording = useRecordingStore.getState();
 const initialPanel = useWorkflowPanelStore.getState();
 const initialRecordedBlocks = useRecordedBlocksStore.getState();
+
+function inputDraft(
+  id: string,
+  opts: {
+    credential_kind?: RecordingDraftStep["credential_kind"];
+    url?: string;
+    title?: string;
+  } = {},
+): RecordingDraftStep {
+  return {
+    step_id: id,
+    action_kind: "input_text",
+    block_type: "action",
+    label: id,
+    title: opts.title ?? id,
+    status: "ready",
+    editable_fields: [],
+    parameters: [],
+    parameter_keys: [],
+    url: opts.url ?? "https://example.com/login",
+    credential_kind: opts.credential_kind,
+  };
+}
 
 describe("RecordingPanel", () => {
   beforeEach(() => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
     mutateMock.mockReset();
+    modalState.overrideType = null;
+    modalState.defaultTestUrl = null;
+    modalState.defaultTotpType = null;
+    modalState.heading = null;
     useRecordingStore.setState(initialRecording, true);
     useWorkflowPanelStore.setState(initialPanel, true);
     useRecordedBlocksStore.setState(initialRecordedBlocks, true);
@@ -113,4 +181,117 @@ describe("RecordingPanel", () => {
       vi.useRealTimers();
     }
   });
+
+  it("shows add and dismiss on a password draft, not on an email draft", () => {
+    useRecordingStore.setState({
+      draftSteps: [
+        inputDraft("email", { title: "Fill email" }),
+        inputDraft("pw", {
+          credential_kind: "password",
+          title: "Fill password",
+        }),
+      ],
+    });
+
+    render(<RecordingPanel browserSessionId="pbs_123" />);
+
+    expect(screen.getByText("Fill password")).toBeTruthy();
+    expect(screen.getByText("Fill email")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /add password/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^dismiss$/i })).toBeTruthy();
+  });
+
+  it("hides the credential prompt after dismiss", () => {
+    useRecordingStore.setState({
+      draftSteps: [
+        inputDraft("pw", {
+          credential_kind: "password",
+          title: "Fill password",
+        }),
+      ],
+    });
+
+    render(<RecordingPanel browserSessionId="pbs_123" />);
+    fireEvent.click(screen.getByRole("button", { name: /^dismiss$/i }));
+
+    expect(screen.queryByRole("button", { name: /add password/i })).toBeNull();
+    expect(screen.getByText("Fill password")).toBeTruthy();
+  });
+
+  it("opens the password credential modal and dismisses the prompt after create", () => {
+    useRecordingStore.setState({
+      draftSteps: [
+        inputDraft("pw", {
+          credential_kind: "password",
+          title: "Fill password",
+          url: "https://example.com/login",
+        }),
+      ],
+    });
+
+    render(<RecordingPanel browserSessionId="pbs_123" />);
+    fireEvent.click(screen.getByRole("button", { name: /add password/i }));
+
+    expect(modalState.overrideType).toBe("password");
+    expect(modalState.heading).toBe("Add Password");
+    expect(modalState.defaultTestUrl).toBe("https://example.com/login");
+    expect(screen.getByTestId("mock-create-credential")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("mock-create-credential"));
+
+    expect(screen.queryByRole("button", { name: /add password/i })).toBeNull();
+    expect(screen.queryByTestId("mock-create-credential")).toBeNull();
+  });
+
+  it.each([
+    {
+      kind: "credit_card" as const,
+      button: /add credit card/i,
+      overrideType: "credit-card",
+      heading: "Add Credit Card",
+      defaultTotpType: null,
+    },
+    {
+      kind: "secret" as const,
+      button: /add secret/i,
+      overrideType: "secret",
+      heading: "Add Secret",
+      defaultTotpType: null,
+    },
+    {
+      kind: "totp" as const,
+      button: /add two-factor authentication/i,
+      overrideType: "password",
+      heading: "Add Two-Factor Authentication",
+      defaultTotpType: "authenticator",
+    },
+    {
+      kind: "magic_link" as const,
+      button: /add magic link/i,
+      overrideType: "password",
+      heading: "Add Magic Link",
+      defaultTotpType: "email",
+    },
+  ])(
+    "opens the $heading popup for a $kind draft",
+    ({ kind, button, overrideType, heading, defaultTotpType }) => {
+      useRecordingStore.setState({
+        draftSteps: [
+          inputDraft("secret-step", {
+            credential_kind: kind,
+            title: `Fill ${kind}`,
+            url: "https://example.com/pay",
+          }),
+        ],
+      });
+
+      render(<RecordingPanel browserSessionId="pbs_123" />);
+      fireEvent.click(screen.getByRole("button", { name: button }));
+
+      expect(modalState.overrideType).toBe(overrideType);
+      expect(modalState.heading).toBe(heading);
+      expect(modalState.defaultTotpType).toBe(defaultTotpType);
+      expect(modalState.defaultTestUrl).toBe("https://example.com/pay");
+    },
+  );
 });

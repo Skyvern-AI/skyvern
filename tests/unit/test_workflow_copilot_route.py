@@ -16,7 +16,8 @@ real database -- all DB / LLM / agent surfaces are patched.
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -31,6 +32,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.context import AgentResult, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
@@ -38,6 +40,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_MESSAGE,
     INTERRUPTED_TERMINAL_REASON,
     InterruptedTurnFacts,
+    TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
@@ -112,6 +115,8 @@ def _make_chat_request(
     code_block: bool | None = None,
     keep_pending_proposal: bool = False,
     idempotency_key: str | None = None,
+    eval_entrypoint_url: str | None = None,
+    product_action: str | None = None,
 ) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
@@ -124,6 +129,8 @@ def _make_chat_request(
         code_block=code_block,
         keep_pending_proposal=keep_pending_proposal,
         idempotency_key=idempotency_key,
+        eval_entrypoint_url=eval_entrypoint_url,
+        product_action=product_action,
     )
 
 
@@ -133,6 +140,7 @@ def _terminal_payload(
     workflow_applied: bool,
     workflow_mutated: bool = True,
     workflow_attempted: bool = True,
+    blocks_run_this_turn: int = 0,
 ) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
@@ -145,6 +153,7 @@ def _terminal_payload(
         attempted="Attempted full run.",
         workflow_mutated=workflow_mutated,
         workflow_attempted=workflow_attempted,
+        blocks_run_this_turn=blocks_run_this_turn,
     )
     assert envelope is not None
     return envelope.model_dump(mode="json")
@@ -220,8 +229,109 @@ async def test_finalise_normal_turn_finalizes_terminal_envelope_without_auto_acc
     assert persisted_payload["terminalEnvelope"]["response_kind"] == "update"
 
 
+def test_unresolved_failed_operation_rejects_auto_accept_even_with_auto_applicable_disposition() -> None:
+    agent_result = AgentResult(
+        user_response="Draft available.",
+        updated_workflow=SimpleNamespace(),
+        global_llm_context=None,
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope={
+            **_terminal_payload(verified=True, workflow_applied=True),
+            "failed_operation": {
+                "kind": "browser_operation_failed",
+                "workflow_run_id": "wr_failed",
+            },
+        },
+    )
+
+    assert workflow_copilot_route._effective_auto_accept(True, agent_result) is False
+
+
 @pytest.mark.asyncio
-async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadata(
+async def test_review_untested_draft_and_failed_operation_survive_persistence_and_hydration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.title = "Untested draft"
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft", "title": "Untested draft"}
+    failed_operation = {
+        "kind": "browser_operation_failed",
+        "workflow_run_id": "wr_browser_operation",
+        "workflow_run_block_id": "wrb_browser_operation",
+        "block_label": "collect_failure_rate",
+        "failing_line": 11,
+    }
+    agent_result = AgentResult(
+        user_response="I stopped after the test failure.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="review_untested",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope={
+            **_terminal_payload(verified=True, workflow_applied=True),
+            "failed_operation": failed_operation,
+        },
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    proposal_write = next(
+        call.kwargs["proposed_workflow"]
+        for call in workflow_params.update_workflow_copilot_chat.await_args_list
+        if call.kwargs.get("proposed_workflow") is not None
+    )
+    hydrated_proposal = json.loads(json.dumps(proposal_write))
+    assert hydrated_proposal["workflow_id"] == "wf-draft"
+    assert hydrated_proposal["_copilot_unvalidated"] is True
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload is not None
+    now = datetime.now(UTC)
+    history = convert_to_history_messages(
+        [
+            WorkflowCopilotChatMessage(
+                workflow_copilot_chat_message_id="message-1",
+                workflow_copilot_chat_id="chat-1",
+                sender=WorkflowCopilotChatSender.AI,
+                content="I stopped after the test failure.",
+                narrative_payload=json.loads(json.dumps(persisted_payload)),
+                created_at=now,
+                modified_at=now,
+            )
+        ]
+    )
+    served_payload = history[0].narrative_payload
+    assert served_payload is not None
+    hydrated_envelope = TerminalOutcomeEnvelope.model_validate(served_payload["terminalEnvelope"])
+    assert served_payload["proposalDisposition"] == "review_untested"
+    assert hydrated_envelope.failed_operation is not None
+    assert hydrated_envelope.failed_operation.model_dump(mode="json") == failed_operation
+    assert hydrated_envelope.verified is False
+    assert hydrated_envelope.workflow_applied is False
+
+
+@pytest.mark.asyncio
+async def test_browser_ablation_timeout_response_preserves_model_terminal_cause_and_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chat = SimpleNamespace(
@@ -241,11 +351,28 @@ async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadat
         "tool_activity": [{"tool_name": "navigate_browser", "success": True}],
         "screenshot_frames": [{"capture_id": "frame-1", "image_b64": "encoded"}],
     }
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=False,
+        workflow_applied=False,
+        proposal_disposition="no_proposal",
+        run_outcomes=[],
+        blocker_reason=None,
+        halt_kind=None,
+        attempted=None,
+        workflow_mutated=False,
+        workflow_attempted=False,
+        terminal_cause="deadline_expired",
+    )
+    assert envelope is not None
     agent_result = AgentResult(
-        user_response="done",
+        user_response=agent_module._BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY,
         updated_workflow=None,
         global_llm_context=None,
         response_type="REPLY",
+        resolved_model="azure/gpt-5.6-terra",
+        proposal_disposition="no_proposal",
+        terminal_envelope=envelope.model_dump(mode="json"),
         browser_ablation_metadata=metadata,
     )
     setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -262,6 +389,10 @@ async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadat
 
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotBrowserAblationResponseUpdate)
+    assert response_frame.resolved_model == "azure/gpt-5.6-terra"
+    assert response_frame.message == agent_module._BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["terminal_cause"] == "deadline_expired"
     for key, value in metadata.items():
         assert getattr(response_frame, key) == value
 
@@ -657,7 +788,7 @@ async def test_finalise_normal_turn_logs_render_decision(
     decisions = [entry for entry in logs if entry["event"] == "copilot_terminal_render_decision"]
     assert len(decisions) == 1
     assert decisions[0]["flag_enabled"] is flag_enabled
-    # This fixture's envelope is a stopped/stopped shape, so flag-on replaces.
+    # This fixture's envelope is a stopped/stopped shape, so flag-on appends recorded facts.
     assert decisions[0]["replaced"] is flag_enabled
     assert decisions[0]["next_state"] == "stopped"
     assert decisions[0]["response_kind"] == "stopped"
@@ -702,7 +833,7 @@ async def test_finalise_normal_turn_flag_on_stopped_envelope_renders_terminal_te
         agent_result=agent_result,
     )
 
-    expected = "I stopped without confirming the goal was met."
+    expected = "done. 0 blocks ran this turn."
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
     assert response_frame.message == expected
@@ -720,6 +851,129 @@ async def test_finalise_normal_turn_flag_on_stopped_envelope_renders_terminal_te
     assert persisted_payload["terminalMessage"] == expected
     assert persisted_payload["narrativeSummary"] == expected
     assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_failed_operation_question_persists_truthful_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    model_message = "The destination write completed. Which account should I use?"
+    agent_result = AgentResult(
+        user_response=model_message,
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="ASK_QUESTION",
+        proposal_disposition="no_proposal",
+        narrative_payload={
+            **_narrative_payload(),
+            "terminalMessage": model_message,
+            "narrativeSummary": model_message,
+        },
+        narrative_summary=model_message,
+        terminal_envelope={
+            **_terminal_payload(verified=False, workflow_applied=False),
+            "user_action_required": True,
+            "response_kind": "question",
+            "next_state": "awaiting_user_input",
+            "failed_operation": {
+                "kind": "browser_operation_failed",
+                "workflow_run_id": "wr_failed",
+            },
+        },
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert "browser operation failed" in response_frame.message.lower()
+    assert "which account should i use?" in response_frame.message.lower()
+    assert response_frame.narrative_summary == response_frame.message
+    assert response_frame.narrative_payload is not None
+    assert response_frame.narrative_payload["terminalMessage"] == response_frame.message
+    assert response_frame.narrative_payload["narrativeSummary"] == response_frame.message
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert persisted["content"] == response_frame.message
+    assert persisted["narrative_payload"]["terminalMessage"] == response_frame.message
+    assert persisted["narrative_payload"]["narrativeSummary"] == response_frame.message
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_keeps_explicit_test_model_response_verbatim_with_envelope_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
+    scripted_response = "The run completed, but the recorded facts do not establish the requested outcome."
+    narrative_payload = {
+        **_narrative_payload(),
+        "terminalMessage": scripted_response,
+        "narrativeSummary": scripted_response,
+    }
+    agent_result = AgentResult(
+        user_response=scripted_response,
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="review_untested",
+        narrative_payload=narrative_payload,
+        narrative_summary=scripted_response,
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(product_action="test_end_to_end"),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.message == scripted_response
+    assert response_frame.narrative_summary == scripted_response
+    assert response_frame.narrative_payload is not None
+    assert response_frame.narrative_payload["terminalMessage"] == scripted_response
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope.get("rendered_from_envelope") in {None, False}
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert persisted["content"] == scripted_response
+    assert persisted["narrative_payload"]["terminalMessage"] == scripted_response
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1706,11 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
-    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request,
+        _make_chat_request(mode="build", code_block=False),
+        organization,
+    )
     assert response is captured["sentinel"]
 
     stream = MagicMock()
@@ -1464,6 +1722,12 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
     handler = captured["handler"]
     assert callable(handler)
     await handler(stream)
+
+    app.AGENT_FUNCTION.get_copilot_config_for_request.assert_awaited_once_with(
+        "org-1",
+        code_block_mode=False,
+        composer_mode="build",
+    )
 
     if expect_restore:
         restore_mock.assert_awaited_once()
@@ -4102,3 +4366,187 @@ def test_a_client_side_http_error_stays_the_products_own_answer() -> None:
     assert (
         workflow_copilot_route._http_exception_failure_kind(HTTPException(status_code=403, detail="forbidden")) is None
     )
+
+
+def _eval_header_request() -> MagicMock:
+    request = MagicMock()
+    request.headers = {"x-copilot-eval": "odysseys"}
+    return request
+
+
+def _install_v2_dispatch(
+    monkeypatch: pytest.MonkeyPatch, *, eval_inputs_enabled: bool, eval_organization_ids: list[str] | None = None
+) -> AsyncMock:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED", eval_inputs_enabled)
+    monkeypatch.setattr(
+        settings,
+        "WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS",
+        ["org-1"] if eval_organization_ids is None else eval_organization_ids,
+    )
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    new_copilot_mock = AsyncMock(return_value=object())
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+    return new_copilot_mock
+
+
+@pytest.mark.asyncio
+async def test_eval_entrypoint_url_is_rejected_when_the_eval_setting_is_off(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_eval_entrypoint_url_is_rejected_when_the_caller_org_is_not_allowlisted(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(
+        monkeypatch, eval_inputs_enabled=True, eval_organization_ids=["some-other-eval-org"]
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_eval_entrypoint_url_is_rejected_when_the_eval_header_is_absent(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            anon_request,
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "eval_entrypoint_url",
+    [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "https://",
+        "not a url",
+        "https://exa mple.com",
+        "https://example.com:bad/path",
+        "https://:443",
+        "https://example.com/a b",
+        "https://user:secret@example.com",
+        "  https://seed.example  ",
+        # A caller past all three gates still cannot aim the browser at cloud metadata or a
+        # private range; the navigation guard refuses these too, this is the earlier 400.
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/internal",
+        "http://metadata.google.internal/computeMetadata/v1/",
+    ],
+)
+async def test_a_non_http_eval_entrypoint_url_is_rejected_with_both_gates_open(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace, eval_entrypoint_url: str
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(eval_entrypoint_url=eval_entrypoint_url),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eval_mode", [None, CopilotEvalMode.BROWSER_ABLATION])
+async def test_an_admitted_eval_entrypoint_url_reaches_the_agent_path_byte_exact(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace, eval_mode: CopilotEvalMode | None
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
+    request = _eval_header_request()
+    if eval_mode is not None:
+        request.headers["x-copilot-eval-mode"] = eval_mode.value
+
+    await workflow_copilot_chat_post(
+        request,
+        _make_chat_request(eval_entrypoint_url="https://seed.example"),
+        organization,
+    )
+
+    assert new_copilot_mock.await_args.kwargs["eval_entrypoint_url"] == "https://seed.example"
+    assert new_copilot_mock.await_args.kwargs.get("eval_mode") == eval_mode
+
+
+@pytest.mark.asyncio
+async def test_the_entrypoint_gate_answers_before_the_eval_mode_gate(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+    request = _eval_header_request()
+    request.headers["x-copilot-eval-mode"] = CopilotEvalMode.BROWSER_ABLATION.value
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            request,
+            _make_chat_request(eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_eval_entrypoint_url_is_rejected_on_the_legacy_copilot_path(
+    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_chat_post(
+            _eval_header_request(),
+            _make_chat_request(mode="ask", eval_entrypoint_url="https://seed.example"),
+            organization,
+        )
+
+    assert excinfo.value.status_code == 400
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_request_without_an_eval_entrypoint_url_reaches_the_agent_path_unchanged(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
+
+    await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
+
+    assert new_copilot_mock.await_args.kwargs["eval_entrypoint_url"] is None

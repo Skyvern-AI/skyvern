@@ -26,12 +26,10 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-const { mockCopilotUxV1Enabled } = vi.hoisted(() => ({
-  mockCopilotUxV1Enabled: vi.fn(() => true),
-}));
-
 vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => mockCopilotUxV1Enabled(),
+  useFeatureFlagEnabled: () => {
+    throw new Error("WorkflowCopilotChat must not consult PostHog");
+  },
 }));
 
 const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
@@ -185,8 +183,6 @@ async function submit(value: string) {
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
-  mockCopilotUxV1Enabled.mockReset();
-  mockCopilotUxV1Enabled.mockReturnValue(true);
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
@@ -202,7 +198,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
+describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   it("defaults straight to Build with code when code-first is accessible", async () => {
     await renderChat({ copilotV2: true, codeBlockMode: true });
     await submit("build me a workflow");
@@ -382,46 +378,6 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
     // (it sits before it in the legacy flat row).
     expect(
       ta.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-  });
-});
-
-describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 off (parity)", () => {
-  it("keeps the legacy plain status line for a live-browser queue, with no bubble footer or chip", async () => {
-    mockCopilotUxV1Enabled.mockReturnValue(false);
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      requiresLiveBrowser: true,
-      isLiveBrowserReady: false,
-    });
-    await submit("build me a workflow");
-
-    expect(postStreaming).not.toHaveBeenCalled();
-    // Same wording, but via the legacy aria-live status line — the S4
-    // chip and the new bubble footer are both flag-gated on uxV1.
-    expect(
-      screen.getByText("Prompt queued. Waiting for live browser..."),
-    ).toBeTruthy();
-    expect(screen.queryByText("Queued")).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: "Edit queued message" }),
-    ).toBeNull();
-  });
-
-  it("keeps the legacy flat row: bordered textarea, legacy placeholder, mic before the input", async () => {
-    mockCopilotUxV1Enabled.mockReturnValue(false);
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    const ta = textarea();
-    const mic = screen.getByRole("button", { name: "Dictate message" });
-
-    expect(ta.getAttribute("placeholder")).toBe(
-      "Message Skyvern Copilot, or paste recorded steps…",
-    );
-    expect(ta.className).toContain("border-input");
-    // Legacy layout: the mic sits before the textarea, outside any embedded container.
-    expect(
-      ta.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_PRECEDING,
     ).toBeTruthy();
   });
 });

@@ -67,6 +67,7 @@ export type OnePasswordCredentialParameter = WorkflowParameterBase & {
   onepassword_credential_parameter_id: string;
   vault_id: string;
   item_id: string;
+  totp_field_name: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;

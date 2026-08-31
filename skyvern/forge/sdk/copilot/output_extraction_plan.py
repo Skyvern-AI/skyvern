@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeGuard
 
+from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 
 
@@ -737,9 +738,14 @@ def _intact_binding_channels(packet: dict[str, Any]) -> tuple[bool, bool]:
     binding whose own evidence is complete. Truncation still voids the channel it happened in,
     where an unseen duplicate could have made the bind ambiguous.
     """
+    key_values_omitted = size_compaction_omits(packet, {"key_value_relations"})
+    containers_omitted = size_compaction_omits(
+        packet,
+        {"result_containers", "result_containers.rows", "result_containers.sample_rows"},
+    )
     return (
-        packet.get("key_value_relations_truncated") is False,
-        packet.get("result_containers_truncated") is False,
+        packet.get("key_value_relations_truncated") is False and not key_values_omitted,
+        packet.get("result_containers_truncated") is False and not containers_omitted,
     )
 
 

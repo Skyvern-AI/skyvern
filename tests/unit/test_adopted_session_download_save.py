@@ -806,7 +806,7 @@ async def test_retention_teardown_runs_even_when_aclose_is_cancelled() -> None:
     with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
         with pytest.raises(asyncio.CancelledError):
             await _close_eager_capture_then_teardown_retention(
-                capture, page, browser_session_id="pbs-1", workflow_run_id="wr"
+                capture, page, retention_armed=True, workflow_run_id="wr"
             )
 
     teardown.assert_awaited_once()
@@ -828,15 +828,15 @@ async def test_retention_teardown_failure_does_not_replace_cancellation() -> Non
     ) as teardown:
         with pytest.raises(asyncio.CancelledError):
             await _close_eager_capture_then_teardown_retention(
-                capture, page, browser_session_id="pbs-1", workflow_run_id="wr"
+                capture, page, retention_armed=True, workflow_run_id="wr"
             )
 
     teardown.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_retention_teardown_skipped_without_browser_session() -> None:
-    """Non-adopted sessions never installed the retention wrapper, so teardown must not run."""
+async def test_retention_teardown_skipped_when_not_armed() -> None:
+    """When retention was never armed, no page-realm wrapper was installed, so teardown must not run."""
     from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
 
     capture = MagicMock()
@@ -844,9 +844,10 @@ async def test_retention_teardown_skipped_without_browser_session() -> None:
     page = MagicMock()
 
     with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
-        await _close_eager_capture_then_teardown_retention(capture, page, browser_session_id=None, workflow_run_id="wr")
+        await _close_eager_capture_then_teardown_retention(capture, page, retention_armed=False, workflow_run_id="wr")
 
     capture.aclose.assert_awaited_once()
+    teardown.assert_not_awaited()
     teardown.assert_not_awaited()
 
 

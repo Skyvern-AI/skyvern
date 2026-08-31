@@ -127,6 +127,13 @@ export interface RecordingDraftStep {
   parameter_keys: Array<string>;
   timestamp_start?: number | null;
   timestamp_end?: number | null;
+  credential_kind?:
+    | "password"
+    | "totp"
+    | "credit_card"
+    | "secret"
+    | "magic_link"
+    | null;
 }
 
 export interface RecordingInterpretationUpdate {
@@ -285,6 +292,7 @@ interface RecordingStore {
    */
   deletedStepIds: Array<string>;
   stepPatches: Record<string, RecordingDraftStepPatch>;
+  dismissedCredentialStepIds: Array<string>;
   /**
    * Nested count of in-progress live draft title edits. While > 0, capture is
    * paused alongside manualCapturePaused.
@@ -313,6 +321,8 @@ interface RecordingStore {
   addOptimisticStep: (step: OptimisticStep) => void;
   deleteDraftStep: (stepId: string) => void;
   patchDraftStep: (stepId: string, patch: RecordingDraftStepPatch) => void;
+  dismissCredentialPrompt: (stepId: string) => void;
+  dismissCredentialPromptsForUrl: (url: string | null | undefined) => void;
   beginDraftEdit: () => void;
   endDraftEdit: () => void;
   setManualCapturePaused: (paused: boolean) => void;
@@ -511,6 +521,7 @@ function emptyRecordingState() {
     interpretationFinalized: false,
     deletedStepIds: [] as Array<string>,
     stepPatches: {} as Record<string, RecordingDraftStepPatch>,
+    dismissedCredentialStepIds: [] as Array<string>,
     draftEditDepth: 0,
     manualCapturePaused: false,
     screenshots: [] as Array<RecordingScreenshot>,
@@ -537,6 +548,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   interpretationFinalized: false,
   deletedStepIds: [],
   stepPatches: {},
+  dismissedCredentialStepIds: [],
   draftEditDepth: 0,
   manualCapturePaused: false,
   screenshots: [],
@@ -595,7 +607,13 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       ...(clearOptimistic ? { optimisticSteps: [] } : {}),
       interpretationPending: update.pending,
       interpretationFinalized: update.finalized,
-      ...(sessionChanged ? { deletedStepIds: [], stepPatches: {} } : {}),
+      ...(sessionChanged
+        ? {
+            deletedStepIds: [],
+            stepPatches: {},
+            dismissedCredentialStepIds: [],
+          }
+        : {}),
     });
   },
 
@@ -633,6 +651,34 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       step_id: stepId,
       fields: Object.keys(patch),
     });
+  },
+
+  dismissCredentialPrompt: (stepId) => {
+    const state = get();
+    if (state.dismissedCredentialStepIds.includes(stepId)) {
+      return;
+    }
+    set({
+      dismissedCredentialStepIds: [...state.dismissedCredentialStepIds, stepId],
+    });
+  },
+
+  dismissCredentialPromptsForUrl: (url) => {
+    if (!url) {
+      return;
+    }
+    const state = get();
+    const dismissed = new Set(state.dismissedCredentialStepIds);
+    for (const step of state.draftSteps) {
+      if (!step.credential_kind || step.url !== url) {
+        continue;
+      }
+      dismissed.add(step.step_id);
+    }
+    if (dismissed.size === state.dismissedCredentialStepIds.length) {
+      return;
+    }
+    set({ dismissedCredentialStepIds: Array.from(dismissed) });
   },
 
   beginDraftEdit: () => {

@@ -181,6 +181,13 @@ class WorkflowCopilotChatRequest(BaseModel):
             "for that run."
         ),
     )
+    eval_entrypoint_url: str | None = Field(
+        None,
+        description=(
+            "Benchmark-only starting URL. Rejected unless the eval setting and the X-Copilot-Eval header "
+            "are both present; never sent by the product."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
@@ -286,7 +293,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     response_type: ResponseType = Field("REPLY", description="Agent response classification")
     resolved_model: str | None = Field(
         None,
-        description="Model name the attempt that produced this turn ran on (primary or fallback); None when unknown.",
+        description=(
+            "Model name for the terminal attempt (primary or fallback), including an interrupted attempt; "
+            "None when unknown."
+        ),
     )
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",

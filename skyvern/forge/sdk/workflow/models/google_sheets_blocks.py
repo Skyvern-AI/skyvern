@@ -11,6 +11,7 @@ from jinja2 import UndefinedError
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
 from skyvern.forge.sdk.workflow.models._jinja import (
@@ -120,6 +121,31 @@ def _disambiguate_header(header: list[str]) -> list[str]:
     return disambiguated
 
 
+@dataclass(frozen=True)
+class GoogleSheetsAccess:
+    access_token: str | None
+    failure_reason: str | None
+
+
+async def _google_sheets_access(organization_id: str, credential_id: str) -> GoogleSheetsAccess:
+    """Mint an access token for a block's ``credential_id``, diagnosing failure before reporting it.
+
+    A reference naming no connection and a connection whose token cannot be minted are different
+    problems: reporting both as "reconnect" sends someone round the reconnect loop instead of at
+    the wrong identifier.
+    """
+    access_token = await app.AGENT_FUNCTION.get_google_sheets_credentials(
+        organization_id=organization_id,
+        credential_id=credential_id,
+    )
+    if access_token:
+        return GoogleSheetsAccess(access_token=access_token, failure_reason=None)
+    return GoogleSheetsAccess(
+        access_token=None,
+        failure_reason=await google_oauth_service.describe_credential_failure(organization_id, credential_id),
+    )
+
+
 class GoogleSheetsReadBlock(Block):
     block_type: Literal[BlockType.GOOGLE_SHEETS_READ] = BlockType.GOOGLE_SHEETS_READ  # type: ignore
 
@@ -216,19 +242,17 @@ class GoogleSheetsReadBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        access_token = await app.AGENT_FUNCTION.get_google_sheets_credentials(
-            organization_id=effective_org_id,
-            credential_id=self.credential_id,
-        )
-        if not access_token:
+        access = await _google_sheets_access(effective_org_id, self.credential_id)
+        if not access.access_token:
             return await self.build_block_result(
                 success=False,
-                failure_reason="Reconnect the Google account: no valid access token",
+                failure_reason=access.failure_reason,
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        access_token = access.access_token
 
         fields = (
             "spreadsheetId,sheets("
@@ -724,19 +748,17 @@ class GoogleSheetsWriteBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        access_token = await app.AGENT_FUNCTION.get_google_sheets_credentials(
-            organization_id=effective_org_id,
-            credential_id=self.credential_id,
-        )
-        if not access_token:
+        access = await _google_sheets_access(effective_org_id, self.credential_id)
+        if not access.access_token:
             return await self.build_block_result(
                 success=False,
-                failure_reason="Reconnect the Google account: no valid access token",
+                failure_reason=access.failure_reason,
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        access_token = access.access_token
 
         created_sheet_id: int | None = None
         target_sheet_title = self.sheet_name or extract_a1_sheet_prefix(a1)

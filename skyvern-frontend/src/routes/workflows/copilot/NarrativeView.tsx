@@ -1,17 +1,12 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
-
-import {
+  REVEAL_MS_PER_CHAR,
   buildRevealOffsets,
   revealedCharsAt,
   revealedCountAt,
 } from "./actionReveal";
 import { humanizeBlockLabel } from "./blockLabel";
+import { CopilotMarkdown } from "./CopilotMarkdown";
 import {
   ACTIVITY_KIND_GLYPH,
   ACTIVITY_KIND_WORD,
@@ -25,13 +20,10 @@ import {
   BlockState,
   RecordedActionSummary,
   TurnNarrativeState,
-  TurnSummary,
-  computeTurnSummary,
   formatElapsed,
   humanizeJudgeText,
   isBlockOk,
   isInterimOutcome,
-  latestBlocksByLabel,
   notConfirmedOutcome,
   parseUtcIsoMs,
   toolActivityDisplayLabel,
@@ -43,6 +35,8 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+const TERMINAL_PROSE_GRADIENT_CHARS = 32;
+const TERMINAL_PROSE_GRADIENT_SETTLE_MS = 420;
 
 function normalizeOutcomeReason(
   reason: string | null | undefined,
@@ -53,18 +47,6 @@ function normalizeOutcomeReason(
   return humanized.length > 0 ? humanized : null;
 }
 
-function normalizeOutcomeReasonSearchText(
-  text: string | null | undefined,
-): string {
-  const normalized = normalizeOutcomeReason(text);
-  if (!normalized) return "";
-  return normalized
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[.,!?;:]+$/g, "")
-    .trim();
-}
-
 function truncateOutcomeReason(reason: string): string {
   if (reason.length <= OUTCOME_REASON_PREVIEW_LIMIT) return reason;
   const slice = reason.slice(0, OUTCOME_REASON_PREVIEW_LIMIT - 3).trimEnd();
@@ -73,6 +55,15 @@ function truncateOutcomeReason(reason: string): string {
 
 function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
   return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
+}
+
+function hasBlockOutcomeNotConfirmed(turn: TurnNarrativeState): boolean {
+  return turn.blocks.some(
+    (block) =>
+      block.state === "completed" &&
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole),
+  );
 }
 
 interface BlockPalette {
@@ -322,12 +313,18 @@ function entryLine(
     };
   }
   const ok = entry.success !== false;
+  const label =
+    title ?? entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
   return {
     content: (
       <>
-        <span className={ok ? undefined : "text-rose-700 dark:text-rose-200"}>
-          {ok ? (title ?? entry.text) : entry.text}
-        </span>
+        <span>{ok ? (title ?? entry.text) : label}</span>
+        {!ok ? (
+          <span className="text-muted-foreground dark:text-slate-500">
+            {" "}
+            · attempt failed
+          </span>
+        ) : null}
         <AttemptsBadge attempts={entry.attempts} />
       </>
     ),
@@ -403,7 +400,7 @@ function useTick(active: boolean, intervalMs = 1000): void {
 }
 
 // Both reveals advance faster than an interval coarse enough for status text:
-// narration moves a character every 14ms, and buildRevealOffsets scales a long
+// narration moves a character every REVEAL_MS_PER_CHAR, and buildRevealOffsets scales a long
 // block's steps under 150ms, so a timer samples them in visible jumps.
 function useFrameTick(active: boolean): void {
   const [, setTick] = useState(0);
@@ -478,11 +475,9 @@ interface FBlockRunProps {
   block: BlockState;
   turnEnded: boolean;
   onSelect?: (label: string) => void;
-  uxV1?: boolean;
   outcomeReasonFallback?: string | null;
-  // Narrator title for the row this card heads. The card's own status text and
-  // the rollup's block lists still name the block, so the title replaces only
-  // the label here.
+  // Narrator title for the row this card heads. The card's own status text
+  // still names the block, so the title replaces only the label here.
   rowTitle?: string | null;
   // Inside the activity log the card sheds its puck for the shared row grid,
   // so a block does not read as a different species from the steps around it.
@@ -492,26 +487,35 @@ interface FBlockRunProps {
   rowGlyph?: React.ReactNode;
   rowKindWord?: string;
   rowTrailing?: React.ReactNode;
+  rowDiffCounts?: { added: number; removed: number };
   // When the activity log owns this card's row, open/closed comes from there
   // so the row and the card never disagree about a single click.
   expansion?: { open: boolean; onToggle: () => void };
+  // Historical failed attempts stay quiet in the collapsed timeline. Their
+  // full failure treatment remains available in the expanded evidence.
+  quietFailure?: boolean;
+  // Activity-log context that should lead the block's own run evidence.
+  detailBeforeBlock?: React.ReactNode;
+  detailAfterBlock?: React.ReactNode;
 }
 
 function FBlockRun({
   block,
   turnEnded,
   onSelect,
-  uxV1,
   outcomeReasonFallback,
   rowTitle,
   flat,
   rowGlyph,
   rowKindWord,
   rowTrailing,
+  rowDiffCounts,
   expansion,
+  quietFailure,
+  detailBeforeBlock,
+  detailAfterBlock,
 }: FBlockRunProps) {
-  const displayLabel =
-    rowTitle ?? (uxV1 ? humanizeBlockLabel(block.label) : block.label);
+  const displayLabel = rowTitle ?? humanizeBlockLabel(block.label);
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
@@ -530,6 +534,7 @@ function FBlockRun({
     !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
+  const prominentFailure = isFail && !quietFailure;
   const isStopped = block.state === "stopped";
   const isDraft = block.state === "drafted";
 
@@ -539,7 +544,7 @@ function FBlockRun({
       ? "border-emerald-400/60"
       : isOutcomeNotShown
         ? "border-amber-400/60"
-        : isFail
+        : prominentFailure
           ? "border-rose-400/60"
           : "border-slate-500/60";
   const accentText = isRunning
@@ -548,7 +553,7 @@ function FBlockRun({
       ? "text-emerald-700 dark:text-emerald-300"
       : isOutcomeNotShown
         ? "text-amber-700 dark:text-amber-300"
-        : isFail
+        : prominentFailure
           ? "text-rose-700 dark:text-rose-300"
           : isVerifying || isRanNeutral
             ? "text-tertiary-foreground"
@@ -559,7 +564,7 @@ function FBlockRun({
       ? "bg-emerald-500/15"
       : isOutcomeNotShown
         ? "bg-amber-500/15"
-        : isFail
+        : prominentFailure
           ? "bg-rose-500/15"
           : "bg-slate-elevation3";
 
@@ -603,13 +608,23 @@ function FBlockRun({
   // stopped, so it should not demand attention the way a failure does. Under
   // the activity log `expansion` supplies the open state and none of this
   // applies — there, every finished row folds, a failure included.
+  const hasExpandableDetail =
+    detailBeforeBlock !== null && detailBeforeBlock !== undefined
+      ? true
+      : isRunning ||
+        block.activity.length > 0 ||
+        hasActions ||
+        isFail ||
+        isOutcomeNotShown ||
+        (detailAfterBlock !== null && detailAfterBlock !== undefined);
   const toggleable =
-    expansion !== undefined ||
-    isOk ||
-    isOutcomeNotShown ||
-    isVerifying ||
-    isRanNeutral ||
-    isStopped;
+    hasExpandableDetail &&
+    (expansion !== undefined ||
+      isOk ||
+      isOutcomeNotShown ||
+      isVerifying ||
+      isRanNeutral ||
+      isStopped);
   useTick(isRunning);
   useFrameTick(hasActions && (replayingAction || elapsedReveal < totalMs));
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
@@ -668,9 +683,10 @@ function FBlockRun({
 
   const onHeaderClick = () => {
     onSelect?.(block.label);
+    if (!toggleable) return;
     if (expansion) {
       expansion.onToggle();
-    } else if (toggleable) {
+    } else {
       setUserOpen((v) => !(v === null ? defaultOpen : v));
     }
   };
@@ -695,6 +711,7 @@ function FBlockRun({
 
   const blockDetail = (
     <div className="flex flex-col gap-1.5 border-l border-border/60 py-1.5 pl-3">
+      {detailBeforeBlock}
       {isRunning ? (
         <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-blue-400/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-blue-300">
           <span className="h-[5px] w-[5px] animate-pulse rounded-full bg-blue-400" />
@@ -749,6 +766,7 @@ function FBlockRun({
           </div>
         </div>
       ) : null}
+      {detailAfterBlock}
     </div>
   );
 
@@ -765,7 +783,7 @@ function FBlockRun({
             </>
           }
           onClick={onHeaderClick}
-          expanded={expansion ? open : undefined}
+          expanded={toggleable && expansion ? open : undefined}
           title={`Highlight ${block.label} on canvas`}
         >
           {displayLabel}
@@ -776,9 +794,18 @@ function FBlockRun({
             </span>
           )}
           <span className="sr-only">{` · ${stateWord}`}</span>
+          {rowDiffCounts === undefined ? null : (
+            <span className="font-mono tabular-nums text-muted-foreground dark:text-slate-500">
+              <span>{" · "}</span>
+              <span>{`+${rowDiffCounts.added}`}</span>
+              <span className="pl-1">{`−${rowDiffCounts.removed}`}</span>
+            </span>
+          )}
         </FLogLine>
         <div className="pl-[28px]">{collapsedExtras}</div>
-        {open ? <div className="pl-[28px]">{blockDetail}</div> : null}
+        {open && hasExpandableDetail ? (
+          <div className="pl-[28px]">{blockDetail}</div>
+        ) : null}
       </div>
     );
   }
@@ -790,7 +817,7 @@ function FBlockRun({
         className={`flex w-full items-start gap-3 px-1 py-1 text-left ${
           toggleable ? "cursor-pointer" : "cursor-default"
         }`}
-        aria-expanded={expansion ? expansion.open : undefined}
+        aria-expanded={toggleable && expansion ? expansion.open : undefined}
         onClick={onHeaderClick}
         title={`Highlight ${block.label} on canvas`}
       >
@@ -803,12 +830,8 @@ function FBlockRun({
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
             <span
-              className={
-                uxV1
-                  ? "text-[12.5px] font-semibold text-foreground"
-                  : "font-mono text-[12.5px] font-semibold text-foreground"
-              }
-              title={uxV1 ? block.label : undefined}
+              className="text-[12.5px] font-semibold text-foreground"
+              title={block.label}
             >
               {displayLabel}
             </span>
@@ -836,7 +859,9 @@ function FBlockRun({
         ) : null}
       </button>
 
-      {open ? <div className="ml-9">{blockDetail}</div> : null}
+      {open && hasExpandableDetail ? (
+        <div className="ml-9">{blockDetail}</div>
+      ) : null}
     </div>
   );
 }
@@ -845,10 +870,9 @@ interface FDesignRowProps {
   done: boolean;
   blockLabels: string[];
   activity: ActivityEntry[];
-  uxV1?: boolean;
 }
 
-function FDesignRow({ done, blockLabels, activity, uxV1 }: FDesignRowProps) {
+function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen === null ? !done : userOpen;
   const drafts = blockLabels.length;
@@ -913,32 +937,13 @@ function FDesignRow({ done, blockLabels, activity, uxV1 }: FDesignRowProps) {
               glyphClass="text-emerald-700 dark:text-emerald-300"
             >
               <span className="text-muted-foreground">Drafted </span>
-              <span
-                className={
-                  uxV1 ? "text-foreground" : "font-mono text-foreground"
-                }
-                title={uxV1 ? label : undefined}
-              >
-                {uxV1 ? humanizeBlockLabel(label) : label}
+              <span className="text-foreground" title={label}>
+                {humanizeBlockLabel(label)}
               </span>
             </FSubRow>
           ))}
         </div>
       ) : null}
-    </div>
-  );
-}
-
-function FWorkingHeader() {
-  return (
-    <div className="flex items-center gap-2 px-1 py-1">
-      <Spinner />
-      <span className="text-[12.5px] font-semibold text-foreground">
-        Working…
-      </span>
-      <span className="text-[11px] text-muted-foreground">
-        · building your workflow
-      </span>
     </div>
   );
 }
@@ -998,7 +1003,7 @@ interface FActivityLogProps {
   turn: TurnNarrativeState;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
-  uxV1?: boolean;
+  interactionRef?: { current: string | null };
 }
 
 // The kind gutter sits to the left of ActivityRow's own status column, so a
@@ -1008,22 +1013,45 @@ interface FActivityLogProps {
 function FCodeWriteDiff({
   diff,
   open,
+  peek,
   onToggle,
-  uxV1,
 }: {
   diff: CodeWriteDiff;
   open: boolean;
+  peek: boolean;
   onToggle: () => void;
-  uxV1?: boolean;
 }) {
+  const expandedToggleRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusAfterPeek = useRef(false);
+  useEffect(() => {
+    if (!open || !restoreFocusAfterPeek.current) return;
+    expandedToggleRef.current?.focus();
+    restoreFocusAfterPeek.current = false;
+  }, [open]);
+  const patchLines = diff.patch?.split("\n") ?? [];
+  const renderLine = (line: string, i: number, muted: boolean) => (
+    <span
+      key={`${i}-${line}`}
+      className={[
+        "block",
+        line.startsWith("+")
+          ? "text-emerald-700 dark:text-emerald-300"
+          : line.startsWith("-")
+            ? "text-rose-700 dark:text-rose-300"
+            : "text-muted-foreground",
+        muted ? "!text-muted-foreground" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      {line}
+    </span>
+  );
   return (
     <div className="flex flex-col">
       <FSubRow glyph="±" glyphClass="text-sky-700 dark:text-sky-300">
-        <span
-          className={uxV1 ? "text-foreground" : "font-mono text-foreground"}
-          title={diff.label}
-        >
-          {uxV1 ? humanizeBlockLabel(diff.label) : diff.label}
+        <span className="text-foreground" title={diff.label}>
+          {humanizeBlockLabel(diff.label)}
         </span>
         <span className="pl-1.5 font-mono text-emerald-700 dark:text-emerald-300">
           {`+${diff.added}`}
@@ -1031,43 +1059,53 @@ function FCodeWriteDiff({
         <span className="pl-1 font-mono text-rose-700 dark:text-rose-300">
           {`−${diff.removed}`}
         </span>
-        {/* A disabled control receives no pointer events, so the reason why it is
-            dead has to hang on something that does. */}
-        <span
-          title={
-            diff.patchDropped
-              ? "The diff was too large to keep, so only its line counts were saved."
-              : undefined
-          }
-        >
-          <button
-            type="button"
-            className="pl-2 text-muted-foreground underline-offset-2 hover:underline disabled:no-underline disabled:opacity-50"
-            disabled={diff.patch === undefined}
-            aria-expanded={open}
-            onClick={onToggle}
+        {peek ? null : (
+          /* A disabled control receives no pointer events, so the reason why it is
+             dead has to hang on something that does. */
+          <span
+            title={
+              diff.patchDropped
+                ? "The diff was too large to keep, so only its line counts were saved."
+                : undefined
+            }
           >
-            {open ? "hide diff" : "view diff"}
-          </button>
-        </span>
+            <button
+              ref={expandedToggleRef}
+              type="button"
+              className="pl-2 text-muted-foreground underline-offset-2 hover:underline disabled:no-underline disabled:opacity-50"
+              disabled={diff.patch === undefined}
+              aria-expanded={open}
+              onClick={onToggle}
+            >
+              {open ? "hide diff" : "view diff"}
+            </button>
+          </span>
+        )}
       </FSubRow>
       {open && diff.patch !== undefined ? (
         <pre className="ml-5 overflow-x-auto whitespace-pre rounded border border-border/60 bg-muted/40 p-2 text-[11px] leading-[1.5]">
-          {diff.patch.split("\n").map((line, i) => (
-            <div
-              key={`${i}-${line}`}
-              className={
-                line.startsWith("+")
-                  ? "text-emerald-700 dark:text-emerald-300"
-                  : line.startsWith("-")
-                    ? "text-rose-700 dark:text-rose-300"
-                    : "text-muted-foreground"
-              }
-            >
-              {line}
-            </div>
-          ))}
+          {patchLines.map((line, i) => renderLine(line, i, false))}
         </pre>
+      ) : peek && diff.patch !== undefined ? (
+        <button
+          type="button"
+          data-code-diff-peek="true"
+          aria-label={`Expand code changes for ${diff.label}`}
+          aria-expanded={false}
+          className="relative ml-5 max-h-[72px] cursor-pointer overflow-hidden rounded bg-muted/20 px-2 pb-6 pt-2 text-left text-[11px] leading-[1.5] transition-colors hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none"
+          onClick={() => {
+            restoreFocusAfterPeek.current = true;
+            onToggle();
+          }}
+        >
+          <code className="block whitespace-pre">
+            {patchLines.slice(0, 2).map((line, i) => renderLine(line, i, true))}
+          </code>
+          <span
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-5 bg-gradient-to-b from-transparent to-muted/80"
+          />
+        </button>
       ) : null}
     </div>
   );
@@ -1078,20 +1116,20 @@ function FActivityLogRow({
   open,
   onToggle,
   diffOpen,
+  diffPeek,
   onDiffToggle,
   turnEnded,
   onBlockSelect,
-  uxV1,
   outcomeReasonFallback,
 }: {
   row: ActivityRowModel;
   open: boolean;
   onToggle: () => void;
   diffOpen: (label: string) => boolean;
+  diffPeek: (label: string) => boolean;
   onDiffToggle: (label: string) => void;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
-  uxV1?: boolean;
   outcomeReasonFallback?: string | null;
 }) {
   const last = row.entries[row.entries.length - 1];
@@ -1104,22 +1142,34 @@ function FActivityLogRow({
     row.pending && only !== undefined && only.state !== "running"
       ? undefined
       : only;
+  const exactFailure =
+    last?.kind === "tool_result" && last.success === false ? last : null;
   const hasDetail =
     row.blocks.length > 0 ||
     row.entries.length > 1 ||
     row.codeDiffs.length > 0 ||
-    row.reason !== null;
+    row.reason !== null ||
+    exactFailure !== null;
   // Body content is whatever the line does not already show: a solo block's
-  // line is the card, so every entry is still unrendered; otherwise the line
-  // is the last entry and the body carries the ones before it.
-  const bodyEntries = soloBlock ? row.entries : row.entries.slice(0, -1);
+  // line is the card, so its tool entries stay represented by the block's own
+  // evidence; otherwise the line is the last entry and the body carries the
+  // ones before it.
+  const bodyEntries = soloBlock ? [] : row.entries.slice(0, -1);
+  const bodyFailures = bodyEntries.filter(
+    (entry) => entry.kind === "tool_result" && entry.success === false,
+  );
+  const bodySteps = bodyEntries.filter(
+    (entry) => entry.kind !== "tool_result" || entry.success !== false,
+  );
   // The reason is a body child too: a row whose only detail is its reason
   // would otherwise render an empty container and hide the prose entirely.
-  const bodyChildren =
-    bodyEntries.length +
-    (soloBlock ? 0 : row.blocks.length) +
-    row.codeDiffs.length +
-    (row.reason === null ? 0 : 1);
+  const bodyChildren = soloBlock
+    ? 0
+    : bodyEntries.length +
+      row.blocks.length +
+      row.codeDiffs.length +
+      (row.reason === null ? 0 : 1) +
+      (exactFailure === null ? 0 : 1);
   // The collapsed row carries the whole write's delta; per-block identity and
   // the patch itself live in the detail. A row folding two writes sums them,
   // since one line cannot name both blocks without becoming two.
@@ -1135,10 +1185,10 @@ function FActivityLogRow({
     row.reason !== null && reasonShown < row.reason.length;
   useFrameTick(open && reasonRevealing);
 
-  // Only a browse row accumulates entries, and only a run row carries blocks,
-  // so these two counts can never both apply to one row.
+  // A combined write/test row can carry both entries and blocks; prefer the
+  // step count when there are several tool transitions to summarize.
   const foldedSummary =
-    row.entries.length > 1
+    row.entries.length > 1 && (last?.attempts ?? 1) <= 1
       ? `\u00b7 ${row.entries.length} steps`
       : row.blocks.length > 0
         ? `\u00b7 ${row.blocks.length} ${row.blocks.length === 1 ? "block" : "blocks"}`
@@ -1166,25 +1216,90 @@ function FActivityLogRow({
   const mark =
     soloBlock || !settled
       ? null
-      : last.success === false
-        ? "✕"
-        : row.kind === "run"
-          ? "✓"
-          : null;
+      : last.success !== false && row.kind === "run"
+        ? "✓"
+        : null;
+
+  const reasonNode =
+    row.reason === null ? null : (
+      <FSubRow
+        glyph="✦"
+        glyphClass="text-sky-700 dark:text-sky-300"
+        italic
+        muted
+      >
+        <span
+          data-testid="copilot-reason"
+          className={[
+            "break-words [overflow-wrap:anywhere]",
+            // The tail keeps the full string in flow so the row never grows,
+            // while the cap prevents the reveal from moving later evidence.
+            reasonRevealing
+              ? "overflow-hidden [max-height:calc(4*1.55em)]"
+              : "line-clamp-4",
+          ].join(" ")}
+        >
+          {row.reason.slice(0, reasonShown)}
+          <span
+            aria-hidden="true"
+            className={reasonRevealing ? "animate-pulse" : "opacity-0"}
+          >
+            {"\u258c"}
+          </span>
+          <span className="text-transparent">
+            {row.reason.slice(reasonShown)}
+          </span>
+        </span>
+      </FSubRow>
+    );
+  const diffNodes = row.codeDiffs.map((diff) => (
+    <FCodeWriteDiff
+      key={diff.label}
+      diff={diff}
+      open={diffOpen(diff.label)}
+      peek={diffPeek(diff.label)}
+      onToggle={() => onDiffToggle(diff.label)}
+    />
+  ));
+  const rowFailures = row.entries.filter(
+    (entry) => entry.kind === "tool_result" && entry.success === false,
+  );
 
   const lineNode = soloBlock ? (
     <FBlockRun
       block={soloBlock}
       turnEnded={turnEnded}
       onSelect={onBlockSelect}
-      uxV1={uxV1}
       outcomeReasonFallback={outcomeReasonFallback}
       rowTitle={row.label}
       flat
       rowGlyph={kindGlyph}
       rowKindWord={kindWord}
       rowTrailing={rowElapsed}
+      rowDiffCounts={
+        row.codeDiffs.length === 0
+          ? undefined
+          : { added: rowAdded, removed: rowRemoved }
+      }
       expansion={{ open, onToggle }}
+      quietFailure
+      detailBeforeBlock={
+        row.reason !== null || diffNodes.length > 0 ? (
+          <>
+            {reasonNode}
+            {diffNodes}
+          </>
+        ) : undefined
+      }
+      detailAfterBlock={
+        rowFailures.length > 0 ? (
+          <>
+            {rowFailures.map((entry) => (
+              <ActivityRow key={entry.id} entry={entry} />
+            ))}
+          </>
+        ) : undefined
+      }
     />
   ) : (
     <FLogLine
@@ -1220,12 +1335,10 @@ function FActivityLogRow({
         </span>
       ) : null}
       {row.codeDiffs.length === 0 ? null : (
-        <span className="font-mono tabular-nums">
-          <span className="text-muted-foreground dark:text-slate-500">
-            {" \u00b7 "}
-          </span>
-          <span className="text-emerald-700 dark:text-emerald-300">{`+${rowAdded}`}</span>
-          <span className="pl-1 text-rose-700 dark:text-rose-300">{`\u2212${rowRemoved}`}</span>
+        <span className="font-mono tabular-nums text-muted-foreground dark:text-slate-500">
+          <span>{" \u00b7 "}</span>
+          <span>{`+${rowAdded}`}</span>
+          <span className="pl-1">{`\u2212${rowRemoved}`}</span>
         </span>
       )}
     </FLogLine>
@@ -1236,49 +1349,9 @@ function FActivityLogRow({
       {lineNode}
       {open && bodyChildren > 0 ? (
         <div className="ml-[28px] flex flex-col gap-1 border-l border-border/60 py-1 pl-3">
-          {row.codeDiffs.map((diff) => (
-            <FCodeWriteDiff
-              key={diff.label}
-              diff={diff}
-              open={diffOpen(diff.label)}
-              onToggle={() => onDiffToggle(diff.label)}
-              uxV1={uxV1}
-            />
-          ))}
-          {row.reason === null ? null : (
-            <FSubRow
-              glyph="✦"
-              glyphClass="text-sky-700 dark:text-sky-300"
-              italic
-              muted
-            >
-              <span
-                data-testid="copilot-reason"
-                className={[
-                  "break-words [overflow-wrap:anywhere]",
-                  // The tail keeps the full string in flow so the row never
-                  // grows, but that also makes the clamp paint its ellipsis on
-                  // line four from the first frame — stranded in the
-                  // transparent region while the reveal is still on line one.
-                  reasonRevealing
-                    ? "overflow-hidden [max-height:calc(4*1.55em)]"
-                    : "line-clamp-4",
-                ].join(" ")}
-              >
-                {row.reason.slice(0, reasonShown)}
-                <span
-                  aria-hidden="true"
-                  className={reasonRevealing ? "animate-pulse" : "opacity-0"}
-                >
-                  {"\u258c"}
-                </span>
-                <span className="text-transparent">
-                  {row.reason.slice(reasonShown)}
-                </span>
-              </span>
-            </FSubRow>
-          )}
-          {bodyEntries.map((entry) => (
+          {reasonNode}
+          {diffNodes}
+          {bodySteps.map((entry) => (
             <ActivityRow key={entry.id} entry={entry} />
           ))}
           {(soloBlock ? [] : row.blocks).map((b) => (
@@ -1287,29 +1360,26 @@ function FActivityLogRow({
               block={b}
               turnEnded={turnEnded}
               onSelect={onBlockSelect}
-              uxV1={uxV1}
               outcomeReasonFallback={outcomeReasonFallback}
               flat
+              quietFailure
             />
           ))}
+          {bodyFailures.map((entry) => (
+            <ActivityRow key={entry.id} entry={entry} />
+          ))}
+          {exactFailure === null ? null : <ActivityRow entry={exactFailure} />}
         </div>
       ) : null}
     </div>
   );
 }
 
-interface FActivityLogProps {
-  turn: TurnNarrativeState;
-  turnEnded: boolean;
-  onBlockSelect?: (label: string) => void;
-  uxV1?: boolean;
-}
-
 function FActivityLog({
   turn,
   turnEnded,
   onBlockSelect,
-  uxV1,
+  interactionRef,
 }: FActivityLogProps) {
   const outcomeReasonFallback = notConfirmedDisplayReason(turn);
   const { rows, focusIndex } = useMemo(() => deriveActivityLog(turn), [turn]);
@@ -1318,333 +1388,109 @@ function FActivityLog({
   const [override, setOverride] = useState<ReadonlyMap<string, boolean>>(
     () => new Map(),
   );
-  const toggle = useCallback((id: string, open: boolean) => {
-    setOverride((prev) => new Map(prev).set(id, !open));
-  }, []);
-  // Every write's patch stays open for the rest of the turn rather than closing when a
-  // newer write lands: a patch that vanishes mid-read is worse than a longer log. At Done
-  // they all collapse to their counts, with the body behind `view diff`.
-  const writeDiffsOpen = !turnEnded;
+  const logRef = useRef<HTMLDivElement>(null);
+  const ownInteractionRef = useRef<string | null>(null);
+  const lastInteractedRow = interactionRef ?? ownInteractionRef;
+  useEffect(() => {
+    const rowId = lastInteractedRow.current;
+    setOverride(new Map());
+    if (!turnEnded || rowId === null) return;
+    const timer = window.setTimeout(() => {
+      const row = Array.from(
+        logRef.current?.querySelectorAll<HTMLElement>(
+          "[data-activity-row-id]",
+        ) ?? [],
+      ).find((candidate) => candidate.dataset.activityRowId === rowId);
+      row?.querySelector<HTMLButtonElement>("button")?.focus();
+      lastInteractedRow.current = null;
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [lastInteractedRow, turn.turnId, turnEnded]);
+  const toggle = useCallback(
+    (id: string, open: boolean) => {
+      lastInteractedRow.current = id;
+      setOverride((prev) => new Map(prev).set(id, !open));
+    },
+    [lastInteractedRow],
+  );
+  const toggleDiff = useCallback(
+    (rowId: string, label: string, open: boolean) => {
+      lastInteractedRow.current = rowId;
+      setOverride((prev) => {
+        const next = new Map(prev);
+        next.set(`diff:${rowId}:${label}`, !open);
+        // Expanding evidence is also an explicit request to keep its parent
+        // visible when the automatic frontier advances.
+        if (!open) next.set(rowId, true);
+        return next;
+      });
+    },
+    [lastInteractedRow],
+  );
+
+  if (!turnEnded && rows.length === 0) {
+    return <InstantAckPlaceholder />;
+  }
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <div ref={logRef} className="flex flex-col gap-1.5">
       {rows.map((row, i) => {
-        const showsWriteDiff = writeDiffsOpen && row.codeDiffs.length > 0;
-        const open =
-          override.get(row.id) ?? (i === focusIndex || showsWriteDiff);
+        const focused = i === focusIndex;
+        const rowOverride = override.get(row.id);
+        const autoFocused = rowOverride === undefined && focused;
+        const open = rowOverride ?? focused;
         const diffOpen = (label: string) =>
-          override.get(`diff:${row.id}:${label}`) ?? showsWriteDiff;
+          override.get(`diff:${row.id}:${label}`) ?? false;
+        const diffPeek = (label: string) =>
+          autoFocused &&
+          !diffOpen(label) &&
+          row.codeDiffs.some(
+            (candidate) =>
+              candidate.label === label && candidate.patch !== undefined,
+          );
         return (
-          <FActivityLogRow
+          <div
             key={row.id}
-            row={row}
-            open={open}
-            onToggle={() => toggle(row.id, open)}
-            diffOpen={diffOpen}
-            onDiffToggle={(label) =>
-              toggle(`diff:${row.id}:${label}`, diffOpen(label))
-            }
-            turnEnded={turnEnded}
-            onBlockSelect={onBlockSelect}
-            uxV1={uxV1}
-            outcomeReasonFallback={outcomeReasonFallback}
-          />
+            data-activity-row-id={row.id}
+            onFocusCapture={() => {
+              lastInteractedRow.current = row.id;
+            }}
+          >
+            <FActivityLogRow
+              row={row}
+              open={open}
+              onToggle={() => toggle(row.id, open)}
+              diffOpen={diffOpen}
+              diffPeek={diffPeek}
+              onDiffToggle={(label) =>
+                toggleDiff(row.id, label, diffOpen(label))
+              }
+              turnEnded={turnEnded}
+              onBlockSelect={onBlockSelect}
+              outcomeReasonFallback={outcomeReasonFallback}
+            />
+          </div>
         );
       })}
     </div>
   );
 }
 
-function accentBg(accent: TurnSummary["accent"]): string {
-  if (accent === "fail") {
-    return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
-  }
-  if (accent === "warn") {
-    return "border-amber-400/60 bg-amber-500/15 text-amber-700 dark:text-amber-300";
-  }
-  if (accent === "qa") {
-    return "border-sky-400/60 bg-sky-500/15 text-sky-700 dark:text-sky-300";
-  }
-  return "border-emerald-400/60 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
-}
-
-interface TurnHeadProps {
-  summary: TurnSummary;
-  expanded: boolean;
-  onClick?: () => void;
-  subtitle?: ReactNode;
-}
-
-function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
-  const expandable = Boolean(onClick);
-  const headClass = "flex w-full items-start gap-3 px-3.5 py-3 text-left";
-  const body = (
-    <>
-      <span
-        className={`flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full border text-[12px] font-bold ${accentBg(
-          summary.accent,
-        )}`}
-        aria-hidden="true"
-      >
-        {summary.glyph}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="mb-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className="text-[14px] font-semibold tracking-tight text-foreground">
-            {summary.headline}
-          </span>
-          {summary.stats.length ? (
-            <span className="text-[11.5px] text-muted-foreground">
-              {summary.stats.join(" · ")}
-            </span>
-          ) : null}
-        </div>
-        {subtitle}
-      </div>
-      {expandable ? (
-        <span
-          className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
-            expanded ? "rotate-90" : ""
-          }`}
-          aria-hidden="true"
-        >
-          ›
-        </span>
-      ) : null}
-    </>
-  );
-
-  if (!expandable) {
-    return <div className={headClass}>{body}</div>;
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-expanded={expanded}
-      className={headClass}
-    >
-      {body}
-    </button>
-  );
-}
-
-interface RollupCardProps {
-  turn: TurnNarrativeState;
-  summary: TurnSummary;
-  onExpand: () => void;
-  onBlockSelect?: (label: string) => void;
-  uxV1?: boolean;
-}
-
-function RollupCard({
-  turn,
-  summary,
-  onExpand,
-  onBlockSelect,
-  uxV1,
-}: RollupCardProps) {
-  // The backend appends the judge's verdict to the closing message, so it needs the
-  // same display-layer rewrite the outcome reason gets.
-  const closing = humanizeJudgeText(
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
-  );
-  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
-  const truncatedOutcomeReason = collapsedOutcomeReason
-    ? truncateOutcomeReason(collapsedOutcomeReason)
-    : null;
-  const normalizedClosing = normalizeOutcomeReasonSearchText(closing);
-  // Normalizing the truncated preview (its trailing "..." strips as punctuation)
-  // makes the containment check a prefix match, so closings carrying either the
-  // full reason or a truncated form of it both suppress the appended segment.
-  const normalizedOutcomeReason = normalizeOutcomeReasonSearchText(
-    truncatedOutcomeReason,
-  );
-  const shouldAppendOutcomeReason =
-    normalizedOutcomeReason.length > 0 &&
-    !normalizedClosing.includes(normalizedOutcomeReason);
-  const outcomeReasonSubtitle = shouldAppendOutcomeReason
-    ? `Outcome not confirmed: ${truncatedOutcomeReason!}`
-    : "";
-  const subtitle = [closing, outcomeReasonSubtitle].filter(Boolean).join(" · ");
-  const rollupBlocks = latestBlocksByLabel(turn.blocks);
-  const completed = rollupBlocks.filter((b) => isBlockOk(b));
-  const failed = rollupBlocks.filter((b) => b.state === "failed");
-  const stopped = rollupBlocks.filter((b) => b.state === "stopped");
-  const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
-  // The log holds every block, but a non-solo run row renders its cards in the
-  // body, which is collapsed once the turn ends — so the log names a block on
-  // screen only in the one-block case. These lists stay until a run row carries
-  // its blocks' outcomes in the collapsed line.
-  const showCommit = !summary.isQA && completed.length > 0;
-  const showHalted = failed.length > 0;
-  // Expand only earns a chevron when DetailView adds content beyond the head's
-  // message — a pure ask (no scouting) re-renders the same text, so no chevron.
-  const hasExpandableDetail =
-    showChecklist ||
-    turn.blocks.length > 0 ||
-    (turn.designStarted && (turn.draft?.blockCount ?? 0) > 0) ||
-    turn.designActivity.some((e) => e.kind === "narration");
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-border/60 bg-slate-elevation2">
-      <TurnHead
-        summary={summary}
-        expanded={false}
-        onClick={hasExpandableDetail ? onExpand : undefined}
-        subtitle={
-          subtitle ? (
-            <div
-              className={`mt-0.5 text-[12.5px] leading-[1.5] ${
-                summary.isFail && !summary.isStoppedWithDraft
-                  ? "text-rose-700 dark:text-rose-200/90"
-                  : "text-muted-foreground"
-              }`}
-            >
-              {subtitle}
-            </div>
-          ) : null
-        }
-      />
-
-      {showChecklist ? (
-        <div className="border-t border-white/5 px-3.5 py-2">
-          <FActivityLog
-            key={turn.turnId ?? ""}
-            turn={turn}
-            turnEnded
-            onBlockSelect={onBlockSelect}
-            uxV1={uxV1}
-          />
-        </div>
-      ) : null}
-
-      {showCommit ? (
-        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground dark:text-slate-500">
-            What changed
-          </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {completed.map((b) => {
-              const palette = paletteFor(b.blockType);
-              return (
-                <li
-                  key={b.label}
-                  className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-foreground dark:text-slate-200"
-                >
-                  <span
-                    className={`w-3.5 shrink-0 text-center text-[11px] font-bold ${palette.fg}`}
-                    aria-hidden="true"
-                  >
-                    {palette.glyph}
-                  </span>
-                  <span
-                    className={
-                      uxV1
-                        ? "text-[11px] text-muted-foreground"
-                        : "font-mono text-[11px] text-muted-foreground"
-                    }
-                    title={uxV1 ? b.label : undefined}
-                  >
-                    {uxV1 ? humanizeBlockLabel(b.label) : b.label}
-                  </span>
-                  <span className="text-slate-600">·</span>
-                  <span className="text-[11.5px] text-foreground dark:text-slate-200">
-                    {b.blockType}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      ) : null}
-
-      {showHalted ? (
-        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-rose-700 dark:text-rose-400">
-            Halted
-          </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {failed.map((b) => (
-              <li
-                key={b.label}
-                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200"
-              >
-                <span
-                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-rose-700 dark:text-rose-300"
-                  aria-hidden="true"
-                >
-                  ✕
-                </span>
-                <span
-                  className={
-                    uxV1
-                      ? "text-[11px] text-rose-700 dark:text-rose-300/80"
-                      : "font-mono text-[11px] text-rose-700 dark:text-rose-300/80"
-                  }
-                  title={uxV1 ? b.label : undefined}
-                >
-                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {stopped.length > 0 ? (
-        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground">
-            Stopped
-          </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {stopped.map((b) => (
-              <li
-                key={b.label}
-                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-tertiary-foreground"
-              >
-                <span
-                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-muted-foreground"
-                  aria-hidden="true"
-                >
-                  ■
-                </span>
-                <span
-                  className={
-                    uxV1
-                      ? "text-[11px] text-muted-foreground"
-                      : "font-mono text-[11px] text-muted-foreground"
-                  }
-                  title={uxV1 ? b.label : undefined}
-                >
-                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 interface DetailViewProps {
   turn: TurnNarrativeState;
-  onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
-  uxV1?: boolean;
   workingRowActive?: boolean;
+  activityInteractionRef?: { current: string | null };
 }
 
 function DetailView({
   turn,
-  onCollapse,
   onBlockSelect,
-  uxV1,
   workingRowActive,
+  activityInteractionRef,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
+  const blockShowsOutcomeNotConfirmed = hasBlockOutcomeNotConfirmed(turn);
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -1654,79 +1500,73 @@ function DetailView({
   // long design phase isn't silently invisible.
   const hasDraft = (turn.draft?.blockCount ?? 0) > 0;
   const showDesign = designStarted && (hasDraft || hasBlocks || !turn.terminal);
-  const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
+  const showChecklist = showPhaseChecklist(turn);
   const preBlockNarration = turn.designActivity.filter(
     (e) => e.kind === "narration",
   );
 
   return (
     <div className="flex flex-col gap-2.5">
-      {onCollapse ? (
-        <button
-          type="button"
-          onClick={onCollapse}
-          aria-label="Collapse turn"
-          className="flex w-full items-center justify-end gap-1.5 px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground hover:text-tertiary-foreground dark:text-slate-500"
-        >
-          <span>Collapse</span>
-          <span aria-hidden="true" className="rotate-90 text-[13px]">
-            ›
-          </span>
-        </button>
-      ) : null}
-
-      {showChecklist ? (
-        <>
-          {turn.terminal === null ? <FWorkingHeader /> : null}
+      <div className="flex flex-col gap-2.5">
+        {showChecklist ? (
           <FActivityLog
             key={turn.turnId ?? ""}
             turn={turn}
             turnEnded={turn.terminal !== null}
             onBlockSelect={onBlockSelect}
-            uxV1={uxV1}
+            interactionRef={activityInteractionRef}
           />
-        </>
-      ) : showDesign ? (
-        <FDesignRow
-          done={!designOpen}
-          blockLabels={turn.draft?.blockLabels ?? []}
-          activity={turn.designActivity}
-          uxV1={uxV1}
-        />
-      ) : preBlockNarration.length > 0 ? (
-        preBlockNarration.map((e) => (
-          <FProse key={e.id} text={e.text} muted italic />
-        ))
-      ) : null}
+        ) : showDesign ? (
+          <FDesignRow
+            done={!designOpen}
+            blockLabels={turn.draft?.blockLabels ?? []}
+            activity={turn.designActivity}
+          />
+        ) : preBlockNarration.length > 0 ? (
+          preBlockNarration.map((e) => (
+            <FProse key={e.id} text={e.text} muted italic />
+          ))
+        ) : null}
 
-      {!showChecklist && hasBlocks ? (
-        <div className="flex flex-col gap-1">
-          {turn.blocks.map((b) => (
-            <FBlockRun
-              key={b.workflowRunBlockId || b.label}
-              block={b}
-              turnEnded={turn.terminal !== null}
-              onSelect={onBlockSelect}
-              uxV1={uxV1}
-              outcomeReasonFallback={collapsedOutcomeReason}
+        {!showChecklist && hasBlocks ? (
+          <div className="flex flex-col gap-1">
+            {turn.blocks.map((b) => (
+              <FBlockRun
+                key={b.workflowRunBlockId || b.label}
+                block={b}
+                turnEnded={turn.terminal !== null}
+                onSelect={onBlockSelect}
+                outcomeReasonFallback={collapsedOutcomeReason}
+              />
+            ))}
+          </div>
+        ) : null}
+
+        {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
+          <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
+            Working…
+          </div>
+        ) : null}
+
+        {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
+          <div className="text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
+            <CopilotMarkdown
+              text={humanizeJudgeText(
+                turn.narrativeSummary?.trim() ||
+                  turn.terminalMessage?.trim() ||
+                  "",
+              )}
             />
-          ))}
-        </div>
-      ) : null}
+          </div>
+        ) : null}
 
-      {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
-        <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
-          Working…
-        </div>
-      ) : null}
-
-      {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
-        <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-          {humanizeJudgeText(
-            turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
-          )}
-        </div>
-      ) : null}
+        {collapsedOutcomeReason && !blockShowsOutcomeNotConfirmed ? (
+          <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-300">
+            <span className="font-medium">Outcome not confirmed</span>
+            {` — ${truncateOutcomeReason(collapsedOutcomeReason)}`}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -1734,33 +1574,152 @@ function DetailView({
 interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
-  uxV1?: boolean;
   workingRowActive?: boolean;
+}
+
+type TerminalProseTone = "answer" | "question";
+
+function hasRecordedTerminalEvidence(turn: TurnNarrativeState): boolean {
+  return (
+    turn.blocks.length > 0 ||
+    (turn.draft?.blockCount ?? 0) > 0 ||
+    turn.lastRunOutcome !== null
+  );
+}
+
+function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
+  // This is intentionally driven only by the structured terminal outcome.
+  // Agent language is freeform, so parsing it to decide whether the user needs
+  // to respond would turn presentation into a brittle copy contract.
+  if (turn.terminal !== "response" || turn.cancelled) return null;
+  // A run whose outcome was not demonstrated needs its existing warning and
+  // expandable evidence. Freeform clarification prose cannot replace that
+  // inspection path.
+  if (notConfirmedOutcome(turn) !== null) return null;
+  if (
+    turn.proposalDisposition === "review_untested" ||
+    turn.proposalDisposition === "review_tested"
+  ) {
+    return null;
+  }
+  // A terminal question can follow a partial build or test. Keep recorded work
+  // on the expandable evidence path rather than losing it to prose-only chrome.
+  if (hasRecordedTerminalEvidence(turn)) return null;
+  if (turn.responseKind === "clarify" || turn.responseType === "ASK_QUESTION") {
+    return "question";
+  }
+  if (
+    turn.responseKind === "answer" ||
+    turn.responseKind === "diagnose" ||
+    turn.responseKind === "refuse" ||
+    turn.responseKind === "recover"
+  ) {
+    return "answer";
+  }
+  return null;
+}
+
+function TerminalProse({
+  text,
+  tone,
+  arrivedAt,
+}: {
+  text: string;
+  tone: TerminalProseTone;
+  arrivedAt: string | null;
+}) {
+  const visibleLengthRef = useRef({ text, length: text.length });
+  if (visibleLengthRef.current.text !== text) {
+    visibleLengthRef.current = { text, length: text.length };
+  }
+  const onCharacterCount = useCallback(
+    (count: number) => {
+      visibleLengthRef.current = { text, length: Math.max(1, count) };
+    },
+    [text],
+  );
+  const reducedMotion =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // A hydrated history row should never replay. The terminal timestamp is the
+  // recorded arrival time for a live response, while an absent timestamp means
+  // the browser cannot truthfully reconstruct the original reveal.
+  const arrivalMs = parseUtcIsoMs(arrivedAt);
+  const elapsedMs = arrivalMs === null ? null : Date.now() - arrivalMs;
+  const visibleLength = visibleLengthRef.current.length;
+  const shown =
+    reducedMotion || elapsedMs === null
+      ? visibleLength
+      : Math.min(
+          visibleLength,
+          Math.max(1, revealedCharsAt(visibleLength, elapsedMs)),
+        );
+  const revealing = shown < visibleLength;
+  const settleProgress =
+    !revealing && elapsedMs !== null
+      ? Math.min(
+          1,
+          Math.max(
+            0,
+            (elapsedMs - visibleLength * REVEAL_MS_PER_CHAR) /
+              TERMINAL_PROSE_GRADIENT_SETTLE_MS,
+          ),
+        )
+      : 0;
+  const settling =
+    !reducedMotion && elapsedMs !== null && !revealing && settleProgress < 1;
+  const gradientChars = revealing
+    ? TERMINAL_PROSE_GRADIENT_CHARS
+    : Math.ceil(TERMINAL_PROSE_GRADIENT_CHARS * (1 - settleProgress));
+  const gradientStart =
+    revealing || settling ? Math.max(0, shown - gradientChars) : shown;
+  useFrameTick(revealing || settling);
+
+  return (
+    <div
+      data-testid="copilot-terminal-prose"
+      className={[
+        "text-[13px] leading-[1.55]",
+        tone === "question"
+          ? "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]"
+          : "text-foreground dark:text-slate-200",
+      ].join(" ")}
+    >
+      <div className="sr-only">
+        <CopilotMarkdown text={text} />
+      </div>
+      <div data-testid="copilot-terminal-prose-visual" aria-hidden="true">
+        <CopilotMarkdown
+          text={text}
+          reveal={
+            revealing || settling
+              ? { shown, gradientStart, onCharacterCount }
+              : undefined
+          }
+        />
+      </div>
+    </div>
+  );
 }
 
 export function NarrativeView({
   turn,
   onBlockSelect,
-  uxV1,
   workingRowActive,
 }: NarrativeViewProps) {
-  const summary = useMemo(
-    () => computeTurnSummary(turn, { uxV1 }),
-    [turn, uxV1],
+  const proseTone = terminalProseTone(turn);
+  const proseText = humanizeJudgeText(
+    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
   );
-  const isInFlight = turn.terminal === null;
-  const isComplete = !isInFlight;
-  const [userRolled, setUserRolled] = useState<boolean | null>(null);
-  const rolled = userRolled === null ? isComplete : userRolled;
+  const activityInteractionRef = useRef<string | null>(null);
 
-  if (rolled && isComplete) {
+  if (proseTone !== null && proseText) {
     return (
-      <RollupCard
-        turn={turn}
-        summary={summary}
-        onExpand={() => setUserRolled(false)}
-        onBlockSelect={onBlockSelect}
-        uxV1={uxV1}
+      <TerminalProse
+        text={proseText}
+        tone={proseTone}
+        arrivedAt={turn.endedAt}
       />
     );
   }
@@ -1768,10 +1727,9 @@ export function NarrativeView({
   return (
     <DetailView
       turn={turn}
-      onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
-      uxV1={uxV1}
       workingRowActive={workingRowActive}
+      activityInteractionRef={activityInteractionRef}
     />
   );
 }

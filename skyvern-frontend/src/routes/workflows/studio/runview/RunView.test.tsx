@@ -1,11 +1,17 @@
 // @vitest-environment jsdom
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+} from "@tanstack/react-query";
+import {
+  act,
   cleanup,
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -18,8 +24,15 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
-import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import {
+  ActionTypes,
+  ArtifactType,
+  Status,
+  type ActionsApiResponse,
+} from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -28,6 +41,7 @@ import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
 import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneViewToggles } from "./RunPaneHeader";
 import { RunView } from "./RunView";
@@ -37,6 +51,16 @@ const mocks = vi.hoisted(() => ({
   timeline: undefined as unknown,
   codeGenerating: false,
   isPlaceholderData: false,
+  statusUnavailable: false,
+  refetchRunStatus: vi.fn(),
+}));
+const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: async () => ({ get: getSpy }),
+}));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => undefined,
 }));
 
 vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -44,6 +68,8 @@ vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
     data: mocks.workflowRun,
     isLoading: false,
     isPlaceholderData: mocks.isPlaceholderData,
+    isError: mocks.statusUnavailable,
+    refetch: mocks.refetchRunStatus,
   }),
 }));
 vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
@@ -77,6 +103,7 @@ vi.mock("@/components/ui/scroll-area", () => ({
 // The header's "…" menu (Radix DropdownMenu) scrolls its focused item into
 // view on open; jsdom implements neither that nor ResizeObserver.
 Element.prototype.scrollIntoView = () => {};
+Element.prototype.scrollTo = () => {};
 if (typeof globalThis.ResizeObserver === "undefined") {
   globalThis.ResizeObserver = class {
     observe() {}
@@ -221,6 +248,24 @@ function seedCompletedRun(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function sealedSavedRunReplayOverrides(): Record<string, unknown> {
+  const runId = process.env.SAVED_RUN_REPLAY_RUN_ID;
+  if (runId === undefined) {
+    return {};
+  }
+  expect(runId).toBe("wr_568303252034165152");
+  expect(process.env.SAVED_RUN_REPLAY_TERMINAL_STATUS).toBe(Status.Completed);
+  expect(process.env.SAVED_RUN_REPLAY_BLOCK_OUTPUT).toBe("null");
+  expect(process.env.SAVED_RUN_REPLAY_MISSING_FIELD).toBe(
+    "workflow_run_block_output",
+  );
+  return {
+    workflow_run_id: runId,
+    status: process.env.SAVED_RUN_REPLAY_TERMINAL_STATUS,
+    outputs: null,
+  };
+}
+
 function seedRunningRun() {
   mocks.timeline = [
     buildBlockItem(
@@ -252,6 +297,20 @@ function LocationSpy() {
   return <div data-testid="location-search">{location.search}</div>;
 }
 
+// Subscribes to the failure card's artifact query so a test can wait for its
+// result to reach the DOM instead of for the request to start.
+function ArtifactsQueryProbe({
+  workflowRunBlockId,
+}: {
+  workflowRunBlockId: string;
+}) {
+  const { status } = useQuery({
+    queryKey: ["workflowRunBlock", workflowRunBlockId, "artifacts"],
+    enabled: false,
+  });
+  return <div data-testid="artifacts-query">{status}</div>;
+}
+
 // Stands in for the editor canvas: selecting a block there mirrors the label
 // into ?selected-block= (useSelectedBlockUrlSync).
 function SelectBlockOnCanvas({ label }: { label: string }) {
@@ -274,6 +333,7 @@ function renderRunView(
   initialEntry = "/",
   compact = false,
   extra?: ReactNode,
+  pageSlots: PageSlots = {},
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -282,29 +342,31 @@ function renderRunView(
   // component instances (and the MemoryRouter's URL state) are preserved.
   const makeUi = () => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[initialEntry]}>
-        {/* The toggles live in the pane header (StudioShell); render them
-            alongside the body, under a TooltipProvider, the way the shell
-            composes them. Only headerExtras (the toggles) sit under the
-            compact context in production (StudioShell.tsx), not the body. */}
-        <TooltipProvider delayDuration={0}>
-          <StudioPaneCompactContext.Provider value={compact}>
-            <RunPaneViewToggles />
-          </StudioPaneCompactContext.Provider>
-          {initialEntry.startsWith("/runs/") ? (
-            <Routes>
-              <Route
-                path="/runs/:runId"
-                element={<RunView workflowRunId="wr_1" {...props} />}
-              />
-            </Routes>
-          ) : (
-            <RunView workflowRunId="wr_1" {...props} />
-          )}
-        </TooltipProvider>
-        <LocationSpy />
-        {extra}
-      </MemoryRouter>
+      <PageSlotsProvider value={pageSlots}>
+        <MemoryRouter initialEntries={[initialEntry]}>
+          {/* The toggles live in the pane header (StudioShell); render them
+              alongside the body, under a TooltipProvider, the way the shell
+              composes them. Only headerExtras (the toggles) sit under the
+              compact context in production (StudioShell.tsx), not the body. */}
+          <TooltipProvider delayDuration={0}>
+            <StudioPaneCompactContext.Provider value={compact}>
+              <RunPaneViewToggles />
+            </StudioPaneCompactContext.Provider>
+            {initialEntry.startsWith("/runs/") ? (
+              <Routes>
+                <Route
+                  path="/runs/:runId"
+                  element={<RunView workflowRunId="wr_1" {...props} />}
+                />
+              </Routes>
+            ) : (
+              <RunView workflowRunId="wr_1" {...props} />
+            )}
+          </TooltipProvider>
+          <LocationSpy />
+          {extra}
+        </MemoryRouter>
+      </PageSlotsProvider>
     </QueryClientProvider>
   );
   const view = render(makeUi());
@@ -317,14 +379,49 @@ afterEach(() => {
   mocks.timeline = undefined;
   mocks.codeGenerating = false;
   mocks.isPlaceholderData = false;
+  mocks.statusUnavailable = false;
+  mocks.refetchRunStatus.mockReset();
 });
 beforeEach(() => {
+  getSpy.mockReset();
+  getSpy.mockResolvedValue({ data: [] });
   useRunViewStore.getState().reset();
   useRunPaneViewStore.getState().reset();
   useStudioBrowserStore.setState({ view: "auto" });
 });
 
 describe("RunView view toggles", () => {
+  test("mounts the milestone slot throughout Overview but not the editor", () => {
+    seedCompletedRun();
+    const MilestoneCard = vi.fn(() => <div data-testid="milestone-card" />);
+    const pageSlots = { workflowRunMilestoneCard: MilestoneCard };
+
+    const editor = renderRunView(
+      {},
+      "/?panes=editor",
+      false,
+      undefined,
+      pageSlots,
+    );
+    expect(MilestoneCard).not.toHaveBeenCalled();
+    expect(editor.queryByTestId("milestone-card")).toBeNull();
+    cleanup();
+
+    const overview = renderRunView(
+      {},
+      "/?panes=overview",
+      false,
+      undefined,
+      pageSlots,
+    );
+    expect(overview.queryByTestId("milestone-card")).not.toBeNull();
+    for (const view of ["inputs", "outputs", "code"] as const) {
+      act(() => useRunPaneViewStore.getState().setView(view));
+      overview.rerenderRunView();
+      expect(overview.queryByTestId("milestone-card")).not.toBeNull();
+    }
+  });
+
   test("does not render run tags in Studio Overview", () => {
     seedCompletedRun();
     const { queryByTestId } = renderRunView();
@@ -1002,6 +1099,99 @@ describe("RunView failure banner", () => {
     ).not.toBeNull();
   });
 
+  test("opens the Browser pane and pins the failed block when a capture exists", async () => {
+    getSpy.mockResolvedValue({
+      data: [
+        {
+          artifact_id: "art_screenshot",
+          artifact_type: ArtifactType.ActionScreenshot,
+          created_at: "2026-08-27T00:00:00Z",
+          modified_at: "2026-08-27T00:00:00Z",
+          organization_id: "org_1",
+          task_id: "task_1",
+          step_id: "step_1",
+          uri: "s3://bucket/screenshot.png",
+        },
+      ],
+    });
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "code block failed. failure reason: CodeBlock failed because a browser operation failed at line 4.",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_failed",
+          block_type: "code",
+          status: Status.Failed,
+          error_codes: ["browser_operation_failed"],
+          failure_reason:
+            "CodeBlock failed because a browser operation failed at line 4.",
+        }),
+      ),
+    ];
+
+    const { container, getByTestId } = renderRunView();
+    const banner = within(within(container).getByRole("alert"));
+    fireEvent.click(
+      await banner.findByRole("button", { name: "View block screenshot" }),
+    );
+
+    await waitFor(() =>
+      expect(getByTestId("location-search").textContent).toContain("browser"),
+    );
+    // The pin drives ?active=, and the Browser pane's view machine lands a
+    // scrubbed/failed run on Screenshots (see browserPaneView.test.ts).
+    await waitFor(() =>
+      expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_failed"),
+    );
+  });
+
+  test("hides the screenshot link when the failed block has no capture", async () => {
+    getSpy.mockResolvedValue({ data: [] });
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "code block failed. failure reason: CodeBlock failed because a browser operation failed at line 4.",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_failed",
+          block_type: "code",
+          status: Status.Failed,
+          error_codes: ["browser_operation_failed"],
+          failure_reason:
+            "CodeBlock failed because a browser operation failed at line 4.",
+        }),
+      ),
+    ];
+
+    const { container, getByTestId } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/",
+      false,
+      <ArtifactsQueryProbe workflowRunBlockId="wrb_failed" />,
+    );
+    const banner = within(within(container).getByRole("alert"));
+    // The link is also absent while the artifact query is in flight, so wait
+    // for the empty result to reach the DOM, not just for the request to start.
+    await waitFor(() =>
+      expect(getByTestId("artifacts-query").textContent).toBe("success"),
+    );
+
+    // Absent from the a11y tree entirely, disabled included: a link into an
+    // empty Browser pane is worse than no link.
+    expect(
+      banner.queryByRole("button", {
+        name: "View block screenshot",
+        hidden: true,
+      }),
+    ).toBeNull();
+    expect(banner.getByRole("button", { name: "Retry" })).not.toBeNull();
+  });
+
   test("a sandbox fault offers a retry instead of a copilot fix", () => {
     seedCompletedRun({
       status: Status.Failed,
@@ -1081,6 +1271,23 @@ describe("RunView failure banner", () => {
 });
 
 describe("RunView live affordances", () => {
+  test("an unavailable status quietly removes live claims while polling recovers", () => {
+    seedRunningRun();
+    mocks.statusUnavailable = true;
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(scope.queryByText("Run status unavailable")).toBeNull();
+    expect(scope.queryByText("Status unavailable")).toBeNull();
+    expect(scope.queryByText("running", { exact: false })).toBeNull();
+    expect(
+      scope.queryByRole("button", { name: "Watch live in the Browser pane" }),
+    ).toBeNull();
+
+    expect(scope.queryByRole("button", { name: "Retry status" })).toBeNull();
+    expect(mocks.refetchRunStatus).not.toHaveBeenCalled();
+  });
+
   test("a running run shows the Live chip; clicking hands off to the Browser pane", () => {
     seedRunningRun();
     useRunViewStore.getState().pinFrame("act_1");
@@ -1332,6 +1539,7 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("No outputs for this run")).toBeNull();
     expect(scope.getByText("Run outputs")).not.toBeNull();
     expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
+    expect(scope.getByText("22600")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {
@@ -1348,8 +1556,8 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("Errors")).toBeNull();
   });
 
-  test("shows the Outputs empty state when run signals are absent", () => {
-    seedCompletedRun();
+  test("renders a genuinely omitted output as an empty Outputs state", () => {
+    seedCompletedRun(sealedSavedRunReplayOverrides());
 
     const { container } = renderRunView();
     const scope = within(container);
@@ -1358,5 +1566,53 @@ describe("RunView output signals", () => {
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
     expect(scope.queryByText("Errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
+  });
+
+  test("does not substitute persisted Copilot prose for a genuinely omitted output", async () => {
+    const corroboratingProse =
+      "Copilot found 22.9k stars, matching the value visible in the source.";
+    getSpy.mockImplementation((path: string) => {
+      if (path === "/workflow/copilot/chat-history") {
+        return Promise.resolve({
+          data: {
+            workflow_copilot_chat_id: "chat_1",
+            chat_history: [
+              {
+                sender: "ai",
+                content: corroboratingProse,
+                created_at: "2026-08-29T11:01:20Z",
+              },
+            ],
+            proposed_workflow: null,
+            auto_accept: false,
+          },
+        });
+      }
+      return Promise.resolve({ data: [] });
+    });
+    seedCompletedRun(sealedSavedRunReplayOverrides());
+    const copilotPortal = document.createElement("div");
+    document.body.appendChild(copilotPortal);
+
+    const { container } = renderRunView(
+      {},
+      "/",
+      false,
+      <WorkflowPermanentIdContext.Provider value="wpid_1">
+        <WorkflowCopilotChat docked portalTarget={copilotPortal} />
+      </WorkflowPermanentIdContext.Provider>,
+    );
+    const runView = within(container);
+
+    await waitFor(() =>
+      expect(screen.getByText(corroboratingProse)).not.toBeNull(),
+    );
+    fireEvent.click(runView.getByRole("button", { name: "Outputs" }));
+
+    expect(runView.getByText("No outputs for this run")).not.toBeNull();
+    expect(runView.queryByText(corroboratingProse)).toBeNull();
+    expect(runView.queryByText("22.9k")).toBeNull();
+
+    copilotPortal.remove();
   });
 });

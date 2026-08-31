@@ -26,57 +26,50 @@ type StreamCall = {
   resolve: () => void;
   reject: (error: unknown) => void;
 };
-const {
-  streamCalls,
-  postStreaming,
-  cancelPost,
-  historyResponse,
-  speechState,
-  copilotUxV1Enabled,
-} = vi.hoisted(() => {
-  const calls: StreamCall[] = [];
-  const post = vi.fn().mockResolvedValue({});
-  const streaming = vi.fn(
-    (
-      _path: string,
-      body: { message: string },
-      onMessage: (payload: unknown) => boolean,
-    ) =>
-      new Promise<void>((resolve, reject) => {
-        calls.push({ body, onMessage, resolve, reject });
-      }),
-  );
-  const history = {
-    data: {
-      workflow_copilot_chat_id: null as string | null,
-      chat_history: [] as {
-        sender: "user" | "ai";
-        content: string;
-        created_at: string;
-        narrative_payload?: Record<string, unknown> | null;
-      }[],
-      proposed_workflow: null as Record<string, unknown> | null,
-      auto_accept: false,
-    },
-  };
-  const speech = {
-    isSupported: false,
-    isListening: false,
-    isHearingSpeech: false,
-    start: vi.fn(),
-    stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
-    toggle: vi.fn(),
-    takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
-  };
-  return {
-    streamCalls: calls,
-    postStreaming: streaming,
-    cancelPost: post,
-    historyResponse: history,
-    speechState: speech,
-    copilotUxV1Enabled: { value: false },
-  };
-});
+const { streamCalls, postStreaming, cancelPost, historyResponse, speechState } =
+  vi.hoisted(() => {
+    const calls: StreamCall[] = [];
+    const post = vi.fn().mockResolvedValue({});
+    const streaming = vi.fn(
+      (
+        _path: string,
+        body: { message: string },
+        onMessage: (payload: unknown) => boolean,
+      ) =>
+        new Promise<void>((resolve, reject) => {
+          calls.push({ body, onMessage, resolve, reject });
+        }),
+    );
+    const history = {
+      data: {
+        workflow_copilot_chat_id: null as string | null,
+        chat_history: [] as {
+          sender: "user" | "ai";
+          content: string;
+          created_at: string;
+          narrative_payload?: Record<string, unknown> | null;
+        }[],
+        proposed_workflow: null as Record<string, unknown> | null,
+        auto_accept: false,
+      },
+    };
+    const speech = {
+      isSupported: false,
+      isListening: false,
+      isHearingSpeech: false,
+      start: vi.fn(),
+      stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
+      toggle: vi.fn(),
+      takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
+    };
+    return {
+      streamCalls: calls,
+      postStreaming: streaming,
+      cancelPost: post,
+      historyResponse: history,
+      speechState: speech,
+    };
+  });
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -118,15 +111,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
     }),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  // "copilot_ux_v1" stays off by default — this file's fixtures pin today's
-  // headline strings, not the disposition-first reorder behind that flag. The
-  // mode pill it introduces is the only ask/build control a user can reach
-  // mid-turn, so the test that needs one opts in.
-  useFeatureFlagEnabled: (flag: string) =>
-    flag !== "copilot_ux_v1" || copilotUxV1Enabled.value,
-}));
 
 const saveData = {
   title: "Test WF",
@@ -246,7 +230,6 @@ function renderChatWithCodeMode() {
 // The mode pill is the one ask/build control that stays mounted through an
 // in-flight turn. Code-block mode is off so switching mode moves only the mode.
 function renderChatWithModePill() {
-  copilotUxV1Enabled.value = true;
   return renderChatWithFlags(
     {
       ENABLE_WORKFLOW_COPILOT_V2: true,
@@ -305,7 +288,6 @@ beforeEach(() => {
     generatingBlockLabel: null,
     cancelNonce: 0,
   });
-  copilotUxV1Enabled.value = false;
 });
 
 afterEach(() => {
@@ -313,6 +295,33 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
+  it("reserves inline space for a user-message timestamp", async () => {
+    const content = "How would I loop the same block over a list of websites?";
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content,
+          created_at: "2026-05-25T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    const message = screen.getByText(content);
+    const row = message.parentElement!;
+    const timestamp = row.querySelector("span")!;
+    expect(message.className).toContain("min-w-0");
+    expect(message.className).toContain("flex-1");
+    expect(row.className).toContain("items-end");
+    expect(timestamp.className).toContain("shrink-0");
+    expect(timestamp.className).not.toContain("absolute");
+  });
+
   it("leaves the input enabled while a turn is in flight", async () => {
     await renderChat();
     await submit("build me a workflow");
@@ -625,7 +634,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Run halted")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(screen.getByText("Copilot hit an internal error.")).toBeTruthy();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -651,7 +661,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText(/Cancelled\. I have a draft workflow/),
+    ).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -688,7 +701,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(screen.getByText(/draft made progress/)).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -776,7 +790,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText(/Cancelled\. I have a draft workflow/),
+    ).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -960,7 +977,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Question")).toBeTruthy();
+    expect(screen.getByTestId("copilot-terminal-prose")).toBeTruthy();
+    expect(screen.queryByText("Needs your input")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -972,7 +990,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     const call = streamCalls[0];
     if (!call) throw new Error("no pending stream to complete");
     const longInputRequest =
-      "Please provide the exact BACB lookup/registry URL you want the workflow to use. I will build a general workflow with a person_name input after you provide it.";
+      "Please provide the **exact registry URL** you want the workflow to use. I will build a general workflow with a `person_name` input after you provide it.";
 
     await act(async () => {
       call.onMessage({
@@ -997,8 +1015,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Question")).toBeTruthy();
-    expect(screen.getByText(longInputRequest)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText("exact registry URL", { selector: "strong" }),
+    ).toBeTruthy();
+    expect(screen.getByText("person_name", { selector: "code" })).toBeTruthy();
     expect(screen.queryByText("Answered")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
@@ -1216,6 +1237,13 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
 
   it("drains an identical queued prompt when the composer left the code mode the turn opened in", async () => {
     await renderChatWithCodeMode();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Build"));
+    });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(

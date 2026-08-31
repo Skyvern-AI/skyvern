@@ -94,6 +94,13 @@ async def _revalidate_navigation_response(response: object) -> None:
     await revalidate_redirect_chain(response, validate_navigation_destination)
 
 
+def _navigation_status(response: object) -> int | None:
+    # Duck-typed like _navigation_hop_urls: whichever engine's navigation-response object this is, it
+    # exposes an int ``status``; anything else (None, a fake without it) yields None.
+    status = getattr(response, "status", None)
+    return status if isinstance(status, int) else None
+
+
 # Progressive wait_until degradation. Degrading to `domcontentloaded` and
 # then `commit` lets navigation succeed once the DOM or response is ready.
 _DEGRADATION_MAP: dict[str, list[str]] = {
@@ -138,7 +145,10 @@ async def navigate_with_retry(
     wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     sleep: SleepFunc | None = None,
     log_url: str | None = None,
-) -> None:
+) -> int | None:
+    # Returns the final navigation response's HTTP status when one is available (None when the
+    # navigation produced no response object). Additive: every caller today ignores the return; the
+    # value exists so the Task V3 loop can classify a dead/removed starting URL (a hard 404/410).
     # Late-bound so a test patching ``asyncio.sleep`` reaches the retry backoff.
     if sleep is None:
         sleep = asyncio.sleep
@@ -174,7 +184,9 @@ async def navigate_with_retry(
             LOG.info("Page loading time", loading_time=elapsed, url=display_url, wait_until=strategy)
             await settle()
             LOG.info("Successfully navigated to url", url=display_url, retry_time=attempt, wait_until=strategy)
-            return
+            # The status is what lets the Task V3 loop classify a dead/removed starting URL; a
+            # navigation with no response object (about:blank, some continuations) yields None.
+            return _navigation_status(response)
 
         except BlockedNavigationDestination as error:
             # Blocked destinations are permanent; retrying re-issues the same request.
@@ -223,3 +235,6 @@ async def navigate_with_retry(
                 error=safe_error_str,
             )
             await sleep(1)
+
+    # Reached only when retry_times <= 0 (the loop never ran); a real navigation returns or raises inside.
+    return None

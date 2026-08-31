@@ -22,6 +22,7 @@ type Props = {
   search?: string;
   tags?: string;
   workflowPermanentIds?: Array<string>;
+  failureCategory?: string;
 } & UseQueryOptions;
 
 function useRunsQuery({
@@ -32,6 +33,7 @@ function useRunsQuery({
   search,
   tags,
   workflowPermanentIds,
+  failureCategory,
   ...queryOptions
 }: Props) {
   const credentialGetter = useCredentialGetter();
@@ -41,7 +43,13 @@ function useRunsQuery({
     queryKey: getOrgScopedQueryKey(
       [
         "runs",
-        { statusFilters, runTypeFilters, tags, workflowPermanentIds },
+        {
+          statusFilters,
+          runTypeFilters,
+          tags,
+          workflowPermanentIds,
+          failureCategory,
+        },
         page,
         pageSize,
         search,
@@ -73,6 +81,9 @@ function useRunsQuery({
       }
       if (tags) {
         params.append("tags", tags);
+      }
+      if (failureCategory) {
+        params.append("failure_category", failureCategory);
       }
       return client.get("/runs", { params, signal }).then((res) => res.data);
     },

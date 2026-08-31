@@ -37,3 +37,13 @@ def test_prompt_does_not_encode_request_policy_credential_verdicts() -> None:
     assert "REQUEST POLICY: WORKFLOW CREDENTIAL INPUTS UNBOUND." not in rendered
     assert "`clarification_reason: workflow_credential_inputs_unbound`" not in rendered
     assert 'data.skip_reason="workflow_credential_inputs_unbound"' not in rendered
+
+
+def test_prompt_requires_display_ready_plain_text_responses() -> None:
+    rendered = _render_agent_prompt()
+
+    assert "`user_response` is rendered as Markdown." in rendered
+    assert "use Markdown lists when a sequence helps" in rendered
+    assert "fenced code blocks for JSON, code, templates" in rendered
+    assert "rather than flattening them" in rendered
+    assert "Do not output raw HTML" in rendered

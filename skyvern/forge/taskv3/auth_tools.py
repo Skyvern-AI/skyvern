@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import unquote_plus, urlsplit
 
 import structlog
@@ -269,7 +269,10 @@ class VerificationState:
 
 
 def build_auth_tools(
-    task: Task, page_provider: PageProvider | None = None, state: VerificationState | None = None
+    task: Task,
+    page_provider: PageProvider | None = None,
+    state: VerificationState | None = None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> tuple[list[ToolSpec], str]:
     """Return (tools, system-prompt guidance) for verification handling, or ([], "") when the task has
     no verification source configured (so the tools aren't offered needlessly). The link tool also needs
@@ -278,8 +281,12 @@ def build_auth_tools(
     verdict on it. A caller with no use for that gate can omit `state` entirely."""
     if state is None:
         state = VerificationState()
-    offer_code_tool = has_otp_source(task, expected_otp_type=OTPType.TOTP)
-    offer_link_tool = page_provider is not None and has_otp_source(task, expected_otp_type=OTPType.MAGIC_LINK)
+    offer_code_tool = has_otp_source(
+        task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=allowed_credential_parameter_keys
+    )
+    offer_link_tool = page_provider is not None and has_otp_source(
+        task, expected_otp_type=OTPType.MAGIC_LINK, allowed_credential_parameter_keys=allowed_credential_parameter_keys
+    )
     if not offer_code_tool and not offer_link_tool:
         return [], ""
 
@@ -351,6 +358,7 @@ def build_auth_tools(
                 expected_otp_type=expected_otp_type,
                 max_wait_seconds=min(remaining, _PER_CALL_WAIT_SECONDS),
                 poll_started_at=first_poll_started_at,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
             if otp_value is None:
                 if expected_otp_type == OTPType.MAGIC_LINK:

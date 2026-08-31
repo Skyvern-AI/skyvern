@@ -362,12 +362,29 @@ async def test_navigate_with_retry_allows_public_navigation_without_response() -
     navigate = AsyncMock(return_value=None)
     settle = AsyncMock()
 
-    await navigate_with_retry(
+    status = await navigate_with_retry(
         navigate=navigate, url="https://example.com/", retry_times=3, settle=settle, sleep=AsyncMock()
     )
 
     navigate.assert_awaited_once()
     settle.assert_awaited_once()
+    assert status is None  # no response object -> no status to carry
+
+
+@pytest.mark.parametrize("http_status", [200, 404, 410, 500])
+@pytest.mark.asyncio
+async def test_navigate_with_retry_returns_final_response_status(http_status: int) -> None:
+    # The status is what lets the Task V3 loop classify a dead/removed starting URL, so navigate_with_retry
+    # must surface the FINAL response's HTTP status (not swallow it as it did before).
+    response = _redirect_response("https://example.com/")
+    response.status = http_status  # type: ignore[attr-defined]
+    navigate = AsyncMock(return_value=response)
+
+    result = await navigate_with_retry(
+        navigate=navigate, url="https://example.com/", retry_times=3, settle=AsyncMock(), sleep=AsyncMock()
+    )
+
+    assert result == http_status
 
 
 # Empty and about:blank targets are non-egressing continuation/reconnect URLs that reach

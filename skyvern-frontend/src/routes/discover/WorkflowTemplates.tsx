@@ -35,7 +35,7 @@ function WorkflowTemplates() {
 
   return (
     <div className="space-y-5">
-      <h1 className="text-xl">Explore Agents</h1>
+      <h2 className="text-xl">Explore Agents</h2>
       <Carousel
         opts={{
           align: "start",

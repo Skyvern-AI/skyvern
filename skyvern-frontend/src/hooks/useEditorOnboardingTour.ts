@@ -6,7 +6,7 @@ import { useProductTourStore } from "@/store/ProductTourStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import type { OnboardingStatePatch } from "@/store/onboarding/types";
+import type { LegacyOnboardingStatePatch } from "@/store/onboarding/types";
 
 const SURFACE = "editor" as const;
 const LAYER = 1 as const;
@@ -81,13 +81,15 @@ function setNodeAdderNextVisible(visible: boolean): void {
   }
 }
 
-const SEEN_PATCHES: Record<(typeof STEP_NAMES)[number], OnboardingStatePatch> =
-  {
-    canvas: { seen_canvas: true },
-    node_adder: { seen_node_adder: true },
-    sidebar: { seen_sidebar: true },
-    save_run: { seen_save_run: true },
-  };
+const SEEN_PATCHES: Record<
+  (typeof STEP_NAMES)[number],
+  LegacyOnboardingStatePatch
+> = {
+  canvas: { seen_canvas: true },
+  node_adder: { seen_node_adder: true },
+  sidebar: { seen_sidebar: true },
+  save_run: { seen_save_run: true },
+};
 
 // driver.js hands callbacks a shallow clone of the active step, so match by element selector, never by object identity.
 function indexOfStep(steps: DriveStep[], step: DriveStep): number {

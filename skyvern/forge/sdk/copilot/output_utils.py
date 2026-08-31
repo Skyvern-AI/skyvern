@@ -14,6 +14,16 @@ import structlog
 
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    _TEXT_MAX,
+    BuildTestEvidencePacket,
+    BuildTestFailedOperation,
+    BuildTestPacketLocatorObservation,
+    BuildTestPacketPageState,
+    BuildTestPacketRegisteredOutput,
+    BuildTestPacketRequestedOutput,
+)
+from skyvern.forge.sdk.copilot.composition_evidence import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     PageObstruction,
@@ -21,15 +31,13 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstructionIdentity,
     PageObstructionSelectorCandidate,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    PER_TOOL_BUDGET_FAILURE_CATEGORY,
-)
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_in_object
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
-
-    from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestEvidencePacket, BuildTestPacketPageState
 
 LOG = structlog.get_logger()
 
@@ -53,6 +61,9 @@ _BUILD_TEST_PAGE_SUMMARY_MAX_CHARS = 300
 _BUILD_TEST_OBSTRUCTION_MAX_ITEMS = 5
 _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS = 6
 _BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS = 8
+_BUILD_TEST_LOCATOR_OBSERVATION_MAX_ITEMS = 4
+_BUILD_TEST_LOCATOR_CANDIDATE_MAX_ITEMS = 6
+_BUILD_TEST_LOCATOR_SELECTOR_MAX_CHARS = 240
 _BUILD_TEST_OBSTRUCTION_VALUE_MAX_CHARS = 240
 _BUILD_TEST_IDENTITY_LABEL_MAX_CHARS = 2_048
 
@@ -125,8 +136,7 @@ def _strip_markdown_code_fence(text: str) -> str:
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix) :]
             break
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
+    cleaned = cleaned.removesuffix("```")
     return cleaned.strip()
 
 
@@ -323,14 +333,45 @@ def _bounded_packet_strings(
     return rendered
 
 
+def _bounded_failed_operation(
+    operation: BuildTestFailedOperation | None,
+    notices: list[str],
+) -> BuildTestFailedOperation | None:
+    if operation is None:
+        return None
+    return operation.model_copy(
+        update={
+            "workflow_run_id": _bounded_packet_string(
+                operation.workflow_run_id,
+                field_name="failure.failed_operation.workflow_run_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "workflow_run_block_id": _bounded_packet_string(
+                operation.workflow_run_block_id,
+                field_name="failure.failed_operation.workflow_run_block_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "block_label": _bounded_packet_string(
+                operation.block_label,
+                field_name="failure.failed_operation.block_label",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+        }
+    )
+
+
 def _bounded_obstruction_control(
     control: PageObstructionControl,
     *,
     obstruction_index: int,
     control_index: int,
+    page_prefix: str,
     notices: list[str],
 ) -> PageObstructionControl:
-    field_prefix = f"failure.page_state.obstructions[{obstruction_index}].visible_controls[{control_index}]"
+    field_prefix = f"{page_prefix}.obstructions[{obstruction_index}].visible_controls[{control_index}]"
     candidates = control.selector_candidates[:_BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS]
     if len(control.selector_candidates) > _BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS:
         _append_omission(
@@ -398,17 +439,19 @@ def _bounded_obstruction_control(
     return PageObstructionControl.model_validate(values)
 
 
-def _bounded_page_obstructions(obstructions: list[PageObstruction], notices: list[str]) -> list[PageObstruction]:
+def _bounded_page_obstructions(
+    obstructions: list[PageObstruction], notices: list[str], *, page_prefix: str
+) -> list[PageObstruction]:
     bounded_obstructions = obstructions[:_BUILD_TEST_OBSTRUCTION_MAX_ITEMS]
     if len(obstructions) > _BUILD_TEST_OBSTRUCTION_MAX_ITEMS:
         _append_omission(
             notices,
-            "failure.page_state.obstructions shortened: "
+            f"{page_prefix}.obstructions shortened: "
             f"{len(obstructions) - _BUILD_TEST_OBSTRUCTION_MAX_ITEMS} item(s) omitted.",
         )
     projected: list[PageObstruction] = []
     for obstruction_index, obstruction in enumerate(bounded_obstructions):
-        field_prefix = f"failure.page_state.obstructions[{obstruction_index}]"
+        field_prefix = f"{page_prefix}.obstructions[{obstruction_index}]"
         controls = obstruction.visible_controls[:_BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS]
         if len(obstruction.visible_controls) > _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS:
             _append_omission(
@@ -434,6 +477,7 @@ def _bounded_page_obstructions(obstructions: list[PageObstruction], notices: lis
                 control,
                 obstruction_index=obstruction_index,
                 control_index=control_index,
+                page_prefix=page_prefix,
                 notices=notices,
             )
             for control_index, control in enumerate(controls)
@@ -442,72 +486,127 @@ def _bounded_page_obstructions(obstructions: list[PageObstruction], notices: lis
     return projected
 
 
+def _bounded_locator_observations(
+    observations: list[BuildTestPacketLocatorObservation], notices: list[str]
+) -> list[BuildTestPacketLocatorObservation]:
+    kept = observations[:_BUILD_TEST_LOCATOR_OBSERVATION_MAX_ITEMS]
+    if len(observations) > len(kept):
+        _append_omission(
+            notices,
+            f"failure.locator_observations shortened: {len(observations) - len(kept)} item(s) omitted.",
+        )
+    bounded = []
+    for observation in kept:
+        observed_candidates = observation.observed_candidates or []
+        candidates = observed_candidates[:_BUILD_TEST_LOCATOR_CANDIDATE_MAX_ITEMS]
+        if len(observed_candidates) > len(candidates):
+            _append_omission(
+                notices,
+                "failure.locator_observations[].observed_candidates shortened: "
+                f"{len(observed_candidates) - len(candidates)} item(s) omitted.",
+            )
+        bounded.append(
+            observation.model_copy(
+                update={
+                    # A silently clipped selector reads as an exact observed identity and gets
+                    # authored back as a broken locator, so truncation is announced.
+                    "authored_selector": _bounded_packet_string(
+                        observation.authored_selector,
+                        field_name="failure.locator_observations[].authored_selector",
+                        max_chars=_BUILD_TEST_LOCATOR_SELECTOR_MAX_CHARS,
+                        notices=notices,
+                    ),
+                    "observed_candidates": (
+                        [
+                            _bounded_packet_string(
+                                candidate,
+                                field_name="failure.locator_observations[].observed_candidates[]",
+                                max_chars=_BUILD_TEST_LOCATOR_SELECTOR_MAX_CHARS,
+                                notices=notices,
+                            )
+                            for candidate in candidates
+                        ]
+                        if observation.observed_candidates is not None
+                        else None
+                    ),
+                }
+            )
+        )
+    return bounded
+
+
 def _bounded_packet_page_state(
-    page_state: BuildTestPacketPageState | None, notices: list[str]
+    page_state: BuildTestPacketPageState | None, notices: list[str], *, field_prefix: str
 ) -> BuildTestPacketPageState | None:
     if page_state is None:
         return None
     updates = {
         "current_origin": _bounded_packet_string(
             page_state.current_origin,
-            field_name="failure.page_state.current_origin",
+            field_name=f"{field_prefix}.current_origin",
             max_chars=_BUILD_TEST_URL_MAX_CHARS,
             notices=notices,
         ),
         "current_url": _bounded_packet_string(
             page_state.current_url,
-            field_name="failure.page_state.current_url",
+            field_name=f"{field_prefix}.current_url",
             max_chars=_BUILD_TEST_URL_MAX_CHARS,
             notices=notices,
         ),
         "title": _bounded_packet_string(
             page_state.title,
-            field_name="failure.page_state.title",
+            field_name=f"{field_prefix}.title",
             max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
             notices=notices,
         ),
         "evidence_source": _bounded_packet_string(
             page_state.evidence_source,
-            field_name="failure.page_state.evidence_source",
+            field_name=f"{field_prefix}.evidence_source",
             max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+            notices=notices,
+        ),
+        "rendered_value_excerpt": _bounded_packet_string(
+            page_state.rendered_value_excerpt,
+            field_name=f"{field_prefix}.rendered_value_excerpt",
+            max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
         "form_summaries": _bounded_packet_strings(
             page_state.form_summaries,
-            field_name="failure.page_state.form_summaries",
+            field_name=f"{field_prefix}.form_summaries",
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
         "result_summaries": _bounded_packet_strings(
             page_state.result_summaries,
-            field_name="failure.page_state.result_summaries",
+            field_name=f"{field_prefix}.result_summaries",
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
         "action_summaries": _bounded_packet_strings(
             page_state.action_summaries,
-            field_name="failure.page_state.action_summaries",
+            field_name=f"{field_prefix}.action_summaries",
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
         "challenge_summaries": _bounded_packet_strings(
             page_state.challenge_summaries,
-            field_name="failure.page_state.challenge_summaries",
+            field_name=f"{field_prefix}.challenge_summaries",
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
         "obstruction_summaries": _bounded_packet_strings(
             page_state.obstruction_summaries,
-            field_name="failure.page_state.obstruction_summaries",
+            field_name=f"{field_prefix}.obstruction_summaries",
             max_items=_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
-        "obstructions": _bounded_page_obstructions(page_state.obstructions, notices),
+        "obstructions": _bounded_page_obstructions(page_state.obstructions, notices, page_prefix=field_prefix),
     }
     return page_state.model_copy(update=updates)
 
@@ -516,8 +615,6 @@ def _compact_packet_for_aggregate_limit(
     packet: BuildTestEvidencePacket,
     notices: list[str],
 ) -> BuildTestEvidencePacket:
-    from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestPacketRegisteredOutput
-
     _append_omission(
         notices,
         f"repeated packet facts shortened further to keep the packet under {_BUILD_TEST_PACKET_MAX_CHARS} characters.",
@@ -533,45 +630,62 @@ def _compact_packet_for_aggregate_limit(
                 }
             )
         )
+
+    def compact_page_state(
+        page_state: BuildTestPacketPageState | None, *, field_prefix: str
+    ) -> BuildTestPacketPageState | None:
+        if page_state is None:
+            return None
+        had_obstructions = bool(page_state.obstructions)
+
+        def compact_summaries(values: list[str]) -> list[str]:
+            return [value[:117] + "..." if len(value) > 120 else value for value in values[:2]]
+
+        compacted = page_state.model_copy(
+            update={
+                "form_summaries": compact_summaries(page_state.form_summaries),
+                "result_summaries": compact_summaries(page_state.result_summaries),
+                "action_summaries": compact_summaries(page_state.action_summaries),
+                "challenge_summaries": compact_summaries(page_state.challenge_summaries),
+                "obstruction_summaries": compact_summaries(page_state.obstruction_summaries),
+                "obstructions": [],
+            }
+        )
+        if had_obstructions:
+            _append_omission(notices, f"{field_prefix}.obstructions omitted at the aggregate packet limit.")
+        return compacted
+
     failure = packet.failure
     if failure is not None:
-        page_state = failure.page_state
-        if page_state is not None:
-            had_obstructions = bool(page_state.obstructions)
-
-            def compact_summaries(values: list[str]) -> list[str]:
-                return [value[:117] + "..." if len(value) > 120 else value for value in values[:2]]
-
-            page_state = page_state.model_copy(
-                update={
-                    "form_summaries": compact_summaries(page_state.form_summaries),
-                    "result_summaries": compact_summaries(page_state.result_summaries),
-                    "action_summaries": compact_summaries(page_state.action_summaries),
-                    "challenge_summaries": compact_summaries(page_state.challenge_summaries),
-                    "obstruction_summaries": compact_summaries(page_state.obstruction_summaries),
-                    "obstructions": [],
-                }
-            )
-            if had_obstructions:
-                _append_omission(
-                    notices,
-                    "failure.page_state.obstructions omitted at the aggregate packet limit.",
-                )
+        page_state = compact_page_state(failure.page_state, field_prefix="failure.page_state")
+        dropped_observations = max(len(failure.locator_observations) - 2, 0)
         failure = failure.model_copy(
             update={
                 "action_trace": [
                     value[:117] + "..." if len(value) > 120 else value for value in failure.action_trace[:2]
                 ],
                 "page_state": page_state,
+                "locator_observations": failure.locator_observations[:2],
             }
         )
+        if dropped_observations:
+            _append_omission(
+                notices,
+                f"failure.locator_observations shortened at the aggregate packet limit: "
+                f"{dropped_observations} item(s) omitted.",
+            )
     return packet.model_copy(
         update={
             "canonical_workflow_yaml": None,
             "canonical_workflow_yaml_complete": False,
             "attempted_block_labels": packet.attempted_block_labels[:12],
             "executed_block_labels": packet.executed_block_labels[:12],
+            "action_observations": [
+                value[:117] + "..." if len(value) > 120 else value for value in packet.action_observations[:2]
+            ],
             "failure": failure,
+            "page_state": compact_page_state(packet.page_state, field_prefix="page_state"),
+            "requested_outputs": packet.requested_outputs,
             "registered_outputs": outputs,
             "downloads": packet.downloads[:6],
             "unfinished_items": packet.unfinished_items[:12],
@@ -582,8 +696,6 @@ def _compact_packet_for_aggregate_limit(
 
 def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
     """Return the one bounded model projection of a factual build-test packet."""
-    from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestPacketRegisteredOutput
-
     notices = list(packet.omission_notices)
     workflow_yaml = packet.canonical_workflow_yaml
     workflow_complete = packet.canonical_workflow_yaml_complete
@@ -610,6 +722,64 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
         notices=notices,
     )
+    action_observations = _bounded_packet_strings(
+        packet.action_observations,
+        field_name="action_observations",
+        max_items=_BUILD_TEST_ACTION_TRACE_MAX_ITEMS,
+        max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
+        notices=notices,
+    )
+
+    requested_outputs: list[BuildTestPacketRequestedOutput] = []
+    for output in packet.requested_outputs[:_BUILD_TEST_OUTPUT_MAX_ITEMS]:
+        requested_outputs.append(
+            output.model_copy(
+                update={
+                    "workflow_run_id": _bounded_packet_string(
+                        output.workflow_run_id,
+                        field_name="requested_outputs[].workflow_run_id",
+                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                        notices=notices,
+                    ),
+                    "output_parameter_id": _bounded_packet_string(
+                        output.output_parameter_id,
+                        field_name="requested_outputs[].output_parameter_id",
+                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                        notices=notices,
+                    ),
+                    "output_parameter_key": _bounded_packet_string(
+                        output.output_parameter_key,
+                        field_name="requested_outputs[].output_parameter_key",
+                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                        notices=notices,
+                    ),
+                    "description": _bounded_packet_string(
+                        output.description,
+                        field_name="requested_outputs[].description",
+                        max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
+                        notices=notices,
+                    ),
+                    "block_label": _bounded_packet_string(
+                        output.block_label,
+                        field_name="requested_outputs[].block_label",
+                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                        notices=notices,
+                    ),
+                    "block_type": _bounded_packet_string(
+                        output.block_type,
+                        field_name="requested_outputs[].block_type",
+                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                        notices=notices,
+                    ),
+                }
+            )
+        )
+    if len(packet.requested_outputs) > _BUILD_TEST_OUTPUT_MAX_ITEMS:
+        _append_omission(
+            notices,
+            "requested_outputs shortened: "
+            f"{len(packet.requested_outputs) - _BUILD_TEST_OUTPUT_MAX_ITEMS} item(s) omitted.",
+        )
 
     registered_outputs: list[BuildTestPacketRegisteredOutput] = []
     for output in packet.registered_outputs[:_BUILD_TEST_OUTPUT_MAX_ITEMS]:
@@ -680,9 +850,34 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         )
         failure = failure.model_copy(
             update={
+                "locator_observations": _bounded_locator_observations(failure.locator_observations, notices),
+                "workflow_run_block_id": _bounded_packet_string(
+                    failure.workflow_run_block_id,
+                    field_name="failure.workflow_run_block_id",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
+                "task_id": _bounded_packet_string(
+                    failure.task_id,
+                    field_name="failure.task_id",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
+                "step_id": _bounded_packet_string(
+                    failure.step_id,
+                    field_name="failure.step_id",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
                 "block_label": _bounded_packet_string(
                     failure.block_label,
                     field_name="failure.block_label",
+                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    notices=notices,
+                ),
+                "block_type": _bounded_packet_string(
+                    failure.block_type,
+                    field_name="failure.block_type",
                     max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                     notices=notices,
                 ),
@@ -698,8 +893,11 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     max_chars=_BUILD_TEST_FAILURE_REASON_MAX_CHARS,
                     notices=notices,
                 ),
+                "failed_operation": _bounded_failed_operation(failure.failed_operation, notices),
                 "action_trace": action_trace,
-                "page_state": _bounded_packet_page_state(failure.page_state, notices),
+                "page_state": _bounded_packet_page_state(
+                    failure.page_state, notices, field_prefix="failure.page_state"
+                ),
             }
         )
 
@@ -736,10 +934,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                     notices=notices,
                 ),
+                # A declared goal path is copied back verbatim by the model, so it is bounded at
+                # the ceiling the facts carry rather than the shorter identifier one.
                 "output_path": _bounded_packet_string(
                     item.output_path,
                     field_name="unfinished_items[].output_path",
-                    max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                    max_chars=max(_BUILD_TEST_IDENTIFIER_MAX_CHARS, _TEXT_MAX),
                     notices=notices,
                 ),
                 "reason_code": _bounded_packet_string(
@@ -771,7 +971,10 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
             "canonical_workflow_yaml_complete": workflow_complete,
             "attempted_block_labels": attempted,
             "executed_block_labels": executed,
+            "action_observations": action_observations,
             "failure": failure,
+            "page_state": _bounded_packet_page_state(packet.page_state, notices, field_prefix="page_state"),
+            "requested_outputs": requested_outputs,
             "registered_outputs": registered_outputs,
             "downloads": downloads,
             "unfinished_items": unfinished,
@@ -783,6 +986,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
             "workflow_run_id": _bounded_packet_string(
                 projected.run.workflow_run_id,
                 field_name="run.workflow_run_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "browser_session_id": _bounded_packet_string(
+                projected.run.browser_session_id,
+                field_name="run.browser_session_id",
                 max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                 notices=notices,
             ),
@@ -827,7 +1036,134 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
         projected = _compact_packet_for_aggregate_limit(projected, notices)
-    return projected
+    # Every consumer of this projection renders it to a model, so the packet leaves here already
+    # safe. Redacting the parsed structure keeps the typed facts; the text redactor, run over
+    # serialized JSON, can consume a delimiter and take the whole document with it (SKY-13986).
+    # Keep None-valued fields: several are required, so dropping them fails revalidation.
+    redacted = redact_raw_secrets_in_object(projected.model_dump(mode="json"))
+    return BuildTestEvidencePacket.model_validate(redacted)
+
+
+def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
+    notices: list[str] = []
+    if packet.canonical_workflow_yaml is None:
+        notices.append("canonical_workflow_yaml omitted: no persisted workflow readback was recorded.")
+    if packet.run.workflow_run_id is None:
+        notices.append("run.workflow_run_id omitted: no workflow run was recorded for this result.")
+    if packet.run.status is None:
+        notices.append("run.status omitted: no recorded run status exists for this result.")
+    if not packet.attempted_block_labels:
+        notices.append("attempted_block_labels omitted: no block run attempt was recorded.")
+    if not packet.executed_block_labels:
+        notices.append("executed_block_labels omitted: no block execution was recorded.")
+    if not packet.action_observations:
+        notices.append("action_observations empty: no same-run typed action observation was recorded.")
+    if not packet.registered_outputs:
+        notices.append("registered_outputs empty: no output parameter value was recorded.")
+    redacted_output_count = sum(
+        REDACTED_SECRET_PLACEHOLDER in json.dumps(output.value, ensure_ascii=False)
+        for output in packet.registered_outputs
+    )
+    if redacted_output_count:
+        notices.append(
+            f"registered_outputs redacted {redacted_output_count} item(s) containing registered secret values."
+        )
+    if not packet.downloads:
+        notices.append("downloads empty: no registered download artifact was recorded.")
+    if not packet.screenshot.present:
+        notices.append("screenshot omitted: no final or failed-block screenshot was recorded.")
+    if not packet.unfinished_items:
+        notices.append("unfinished_items empty: recorded outcome and workflow evidence identify none.")
+
+    failure = packet.failure
+    if failure is None:
+        notices.append("failure omitted: no failed run or failed block was recorded.")
+    else:
+        source_page_state = failure.page_state
+        page_state = None
+        if source_page_state is not None:
+            current_origin = safe_page_origin(source_page_state.current_origin) or safe_page_origin(
+                source_page_state.current_url
+            )
+            if current_origin is not None or source_page_state.observed_after_workflow_run:
+                page_state = source_page_state.model_copy(
+                    update={
+                        "current_origin": current_origin,
+                        "current_url": None,
+                        "title": None,
+                        "evidence_source": None,
+                        "rendered_value_excerpt": None,
+                        "form_summaries": [],
+                        "result_summaries": [],
+                        "action_summaries": [],
+                        "challenge_summaries": [],
+                        "obstruction_summaries": [],
+                        "obstructions": [],
+                    }
+                )
+        notices.append(
+            "failure diagnostic prose omitted from the direct test handoff; typed status, labels, counts, "
+            "failing line, and URL-reduced origin remain when recorded."
+        )
+        failure = failure.model_copy(
+            update={
+                "reason": None,
+                "error_codes": [],
+                "action_trace": [],
+                "page_state": page_state,
+                "locator_observations": [],
+            }
+        )
+
+    return project_build_test_packet_for_llm(
+        packet.model_copy(
+            update={
+                "failure": failure,
+                "omission_notices": notices,
+            }
+        )
+    )
+
+
+def _remove_registered_output_copies(data: dict[str, Any]) -> dict[str, Any]:
+    """Keep the projected packet as the sole provider-visible registered-output surface."""
+
+    registered_output_locations: set[tuple[str, str]] = set()
+    for field_name in ("registered_output_parameter_values", "workflow_run_output_parameters"):
+        raw_outputs = data.pop(field_name, None)
+        if not isinstance(raw_outputs, list):
+            continue
+        for output in raw_outputs:
+            if not isinstance(output, dict):
+                continue
+            block_label = output.get("block_label")
+            output_key = output.get("output_parameter_key")
+            if isinstance(block_label, str) and isinstance(output_key, str):
+                registered_output_locations.add((block_label, output_key))
+
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list) or not registered_output_locations:
+        return data
+    sanitized_blocks: list[Any] = []
+    for raw_block in blocks:
+        if not isinstance(raw_block, dict):
+            sanitized_blocks.append(raw_block)
+            continue
+        block = dict(raw_block)
+        block_label = block.get("label")
+        extracted_data = block.get("extracted_data")
+        if isinstance(block_label, str) and isinstance(extracted_data, dict):
+            registered_keys = {
+                output_key
+                for registered_label, output_key in registered_output_locations
+                if registered_label == block_label
+            }
+            block["extracted_data"] = {
+                key: value for key, value in extracted_data.items() if key not in registered_keys
+            }
+        sanitized_blocks.append(block)
+    data["blocks"] = sanitized_blocks
+    return data
 
 
 def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -843,20 +1179,25 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             "_workflow",
             _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
         ),
-        drop_data_keys=("sdk_equivalent",),
+        drop_data_keys=("sdk_equivalent", "authored_locator_observations"),
         replacement_fields={"screenshot_base64": _BASE64_IMAGE_OMITTED_MESSAGE},
     )
 
     data = sanitized.get("data")
     if isinstance(data, dict):
         data = dict(data)
-        packet_projected = False
+        had_build_test_packet = isinstance(data.get(BUILD_TEST_PACKET_KEY), dict)
+        if had_build_test_packet:
+            data = _remove_registered_output_copies(data)
         if "schema" in data and isinstance(data["schema"], dict):
             schema_str = json.dumps(data["schema"])
             # 2000 chars ~= 500 LLM tokens — enough for the model to see the
             # overall shape without consuming a meaningful slice of the prompt
             # budget. Over this, point the model at get_block_schema instead.
-            if len(schema_str) > 2000:
+            # get_block_schema is exempt: the schema is what it was called for, and the steering
+            # message names the call that produced it, so truncating here leaves the model no route
+            # to the fields it asked for.
+            if len(schema_str) > 2000 and tool_name != "get_block_schema":
                 data["schema"] = {
                     "_truncated": True,
                     "message": (
@@ -882,8 +1223,15 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
-                    {**block, "screenshot_b64": _BASE64_IMAGE_OMITTED_MESSAGE}
-                    if isinstance(block, dict) and "screenshot_b64" in block
+                    {
+                        **{
+                            key: value
+                            for key, value in block.items()
+                            if key not in {"action_trace", "reasoning", "element"}
+                        },
+                        **({"screenshot_b64": _BASE64_IMAGE_OMITTED_MESSAGE} if "screenshot_b64" in block else {}),
+                    }
+                    if isinstance(block, dict)
                     else block
                     for block in blocks
                 ]
@@ -895,8 +1243,6 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             data["authoring_repair_context"] = repair_context
         raw_packet = data.get(BUILD_TEST_PACKET_KEY)
         if isinstance(raw_packet, dict):
-            from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestEvidencePacket
-
             try:
                 packet = BuildTestEvidencePacket.model_validate(raw_packet)
             except ValueError:
@@ -916,8 +1262,25 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                         BUILD_TEST_PACKET_KEY: projected_packet,
                         **{key: value for key, value in data.items() if key != BUILD_TEST_PACKET_KEY},
                     }
-                    packet_projected = True
-        if packet_projected:
+        if had_build_test_packet:
+            # The bounded typed packet is the sole provider-visible action-observation
+            # surface. If projection fails, omit the raw copies along with the invalid
+            # packet: they can contain target-derived responses, descriptions, elements,
+            # and values registered for secret scrubbing during finalization.
+            data.pop("action_observations", None)
+            data.pop("action_trace_summary", None)
+            blocks = data.get("blocks")
+            if isinstance(blocks, list):
+                data["blocks"] = [
+                    {
+                        key: value
+                        for key, value in block.items()
+                        if key not in {"action_trace", "reasoning", "element", "response", "description"}
+                    }
+                    if isinstance(block, dict)
+                    else block
+                    for block in blocks
+                ]
             sanitized = {"data": data, **{key: value for key, value in sanitized.items() if key != "data"}}
         else:
             sanitized["data"] = data
@@ -989,19 +1352,6 @@ def _blocker_signal_matches_result(signal: CopilotToolBlockerSignal, result: dic
     return False
 
 
-def _failure_categories(result: dict[str, Any]) -> list[Any]:
-    data = _result_data(result)
-    categories = data.get("failure_categories")
-    return categories if isinstance(categories, list) else []
-
-
-def _has_failure_category(result: dict[str, Any], category: str) -> bool:
-    for item in _failure_categories(result):
-        if isinstance(item, dict) and item.get("category") == category:
-            return True
-    return False
-
-
 def _iter_blocker_signals(
     blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None,
 ) -> Iterator[CopilotToolBlockerSignal]:
@@ -1046,14 +1396,6 @@ def _structured_failure_summary_for_user(
                 return summary
     if saw_structured_summary:
         return _STRUCTURED_UNSAFE_FALLBACK
-
-    if _has_failure_category(result, PER_TOOL_BUDGET_FAILURE_CATEGORY):
-        # An explicit but empty failure_reason still means the structured
-        # watchdog path fired; use the generic safe copy rather than raw error
-        # fallback.
-        return _clean_structured_user_facing_text(data.get("failure_reason"), blocked_tool=blocked_tool) or (
-            _STRUCTURED_UNSAFE_FALLBACK if isinstance(data.get("failure_reason"), str) else None
-        )
 
     return None
 
@@ -1327,7 +1669,6 @@ _USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.
 # import this constant rather than hand-typing the prefix, so a future validator can't
 # silently bypass the leak-suppression below by phrasing its reject text differently.
 # The full text is written for the agent to self-correct, never for the user.
-INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
 _INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PREFIX.strip(": ").lower(),)
 
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."

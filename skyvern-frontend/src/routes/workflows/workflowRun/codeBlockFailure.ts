@@ -31,6 +31,16 @@ export type CodeBlockFailure = {
   recovery: CodeBlockRecovery;
 };
 
+export type RunCodeBlockFailure = CodeBlockFailure & {
+  workflowRunBlockId: string;
+};
+
+// Only code and browser faults are claims about the page; infrastructure, limit, and cancelled
+// failures have no page state worth showing.
+export function failureSupportsScreenshot(failure: CodeBlockFailure): boolean {
+  return failure.kind === "user-code" || failure.kind === "browser";
+}
+
 type CodeBlockFailureTemplate = Omit<CodeBlockFailure, "code" | "line">;
 
 const INFRASTRUCTURE: CodeBlockFailureTemplate = {
@@ -382,7 +392,7 @@ export function findRunCodeBlockFailure(
   runFailureReason: string | null | undefined,
   timeline: Array<WorkflowRunTimelineItem> | null | undefined,
   finallyBlockLabel?: string | null,
-): CodeBlockFailure | null {
+): RunCodeBlockFailure | null {
   const runReason = runFailureReason?.trim();
   if (!runReason || !timeline) {
     return null;
@@ -410,5 +420,11 @@ export function findRunCodeBlockFailure(
     return null;
   };
   const culprit = findCulprit(timeline, false) ?? findCulprit(timeline, true);
-  return culprit === null ? null : describeCodeBlockFailure(culprit);
+  if (culprit === null) {
+    return null;
+  }
+  const failure = describeCodeBlockFailure(culprit);
+  return failure === null
+    ? null
+    : { ...failure, workflowRunBlockId: culprit.workflow_run_block_id };
 }

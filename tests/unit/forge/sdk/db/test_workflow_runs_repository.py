@@ -116,6 +116,7 @@ def _workflow_run_model(
     status: str = WorkflowRunStatus.queued.value,
     organization_id: str = "org_test",
     sequential_credential_id: str | None = None,
+    failure_category: list[dict[str, Any]] | None = None,
 ) -> WorkflowRunModel:
     return WorkflowRunModel(
         workflow_run_id=workflow_run_id,
@@ -130,6 +131,7 @@ def _workflow_run_model(
         created_at=queued_at,
         modified_at=queued_at,
         queued_at=queued_at,
+        failure_category=failure_category,
     )
 
 
@@ -816,6 +818,67 @@ async def test_get_all_runs_v2_workflow_filter_composes_with_status(sqlite_db: A
     )
 
     assert {row["run_id"] for row in rows} == {"wr_agent_a_completed"}
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_failure_category_filter_matches_top_category_and_excludes_canceled(
+    sqlite_db: AgentDB,
+) -> None:
+    """SKY-14821: filtering by failure_category matches only the classifier's top category, and
+    never returns a canceled run even if it happens to carry a matching category."""
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    matching_category = [{"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "reasoning": "blocked"}]
+    other_category = [{"category": "AUTH_FAILURE", "confidence_float": 0.9, "reasoning": "bad login"}]
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_matches",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.failed.value,
+                    failure_category=matching_category,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_other_category",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.failed.value,
+                    failure_category=other_category,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_canceled_but_matches",
+                    queued_at=created_at,
+                    status=WorkflowRunStatus.canceled.value,
+                    failure_category=matching_category,
+                ),
+                _task_run_model(
+                    run_id="wr_matches",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_test",
+                    status=WorkflowRunStatus.failed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_other_category",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_test",
+                    status=WorkflowRunStatus.failed.value,
+                ),
+                _task_run_model(
+                    run_id="wr_canceled_but_matches",
+                    created_at=created_at,
+                    workflow_permanent_id="wpid_test",
+                    status=WorkflowRunStatus.canceled.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(
+        organization_id="org_test",
+        failure_category="ANTI_BOT_DETECTION",
+    )
+
+    assert {row["run_id"] for row in rows} == {"wr_matches"}
 
 
 @pytest.mark.asyncio

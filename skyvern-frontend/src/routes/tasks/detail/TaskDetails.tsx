@@ -206,22 +206,6 @@ function TaskDetails() {
     </div>
   ) : null;
 
-  const browserConsoleLog = task?.browser_console_log_url ? (
-    <div className="space-y-1">
-      <Label>Browser Console Log</Label>
-      <div>
-        <a
-          href={task.browser_console_log_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-sm underline underline-offset-4"
-        >
-          Download console log
-        </a>
-      </div>
-    </div>
-  ) : null;
-
   return (
     <div className="flex flex-col gap-8">
       <header className="space-y-3">
@@ -362,7 +346,6 @@ function TaskDetails() {
           {extractedInformation}
           {failureReason}
           {webhookFailureReason}
-          {browserConsoleLog}
         </>
       )}
       <SwitchBarNavigation

@@ -129,6 +129,7 @@ async def test_location_single_option_skips_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -173,6 +174,7 @@ async def test_location_whitespace_normalized_still_matches() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -223,6 +225,7 @@ async def test_location_multiple_options_calls_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -272,6 +275,7 @@ async def test_non_location_single_option_calls_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=False,
         )
 
@@ -308,6 +312,7 @@ async def test_location_fast_path_returns_action_success() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -358,6 +363,7 @@ async def test_location_fast_path_element_not_in_dom_falls_through() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -395,6 +401,7 @@ async def test_dropdown_cleanup_clear_failure_does_not_clobber_result() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
         )
 
     skyvern_el.input_clear.assert_awaited_once()
@@ -426,6 +433,7 @@ async def test_input_or_auto_complete_passes_is_location_input() -> None:
             skyvern_element=_mock_skyvern_element(),
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
         )
 
         assert isinstance(result, ActionSuccess)
@@ -452,6 +460,7 @@ async def test_input_or_auto_complete_passes_false_for_non_location() -> None:
             skyvern_element=_mock_skyvern_element(),
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
         )
 
         assert isinstance(result, ActionSuccess)
@@ -544,6 +553,7 @@ async def test_location_no_results_option_falls_through_to_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -593,6 +603,7 @@ async def test_location_unrelated_option_falls_through_to_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             is_location_input=True,
         )
 
@@ -628,6 +639,7 @@ async def test_collapse_autocomplete_exact_match_skips_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 
@@ -667,6 +679,7 @@ async def test_collapse_autocomplete_stem_match_skips_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 
@@ -717,6 +730,7 @@ async def test_collapse_autocomplete_search_bar_exact_match_uses_llm() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 
@@ -766,6 +780,7 @@ async def test_collapse_autocomplete_ambiguous_exact_match_falls_back_to_llm() -
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 
@@ -832,6 +847,7 @@ async def test_collapse_autocomplete_identity_mismatch_resets_before_llm() -> No
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 
@@ -904,6 +920,7 @@ async def test_collapse_autocomplete_readback_mismatch_falls_back_to_llm() -> No
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 
@@ -976,6 +993,7 @@ async def test_collapse_autocomplete_detached_option_resets_before_llm() -> None
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
             collapse_autocomplete_fanout_enabled=True,
         )
 

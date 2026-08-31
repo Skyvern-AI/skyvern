@@ -2,6 +2,7 @@ import {
   CalendarIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  InputIcon,
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
@@ -30,10 +31,12 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { cn } from "@/util/utils";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
+import { InputsCountBadge } from "./WorkflowInputs";
 import { useIsGeneratingCode } from "./hooks/useIsGeneratingCode";
 import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
@@ -133,6 +136,7 @@ type PanelToggleButtonProps = {
   label: string;
   leadingIcon?: ReactNode;
   iconOnly?: boolean;
+  count?: number;
 };
 
 function PanelToggleButton({
@@ -140,6 +144,7 @@ function PanelToggleButton({
   label,
   leadingIcon,
   iconOnly = false,
+  count,
 }: PanelToggleButtonProps) {
   const isRecording = useRecordingStore().isRecording;
   const workflowPanelState = useWorkflowPanelStore((s) => s.workflowPanelState);
@@ -186,9 +191,13 @@ function PanelToggleButton({
       variant="tertiary"
       size="lg"
       onClick={handleClick}
+      aria-label={count && count > 0 ? `${label} (${count})` : label}
     >
       {leadingIcon}
       <span className="mr-2">{label}</span>
+      {count === undefined ? null : (
+        <InputsCountBadge count={count} className="mr-2" />
+      )}
       {isOpen ? (
         <ChevronUpIcon className="h-6 w-6" />
       ) : (
@@ -217,6 +226,20 @@ function RunButton() {
   );
 }
 
+// Icon-led and count-carrying so the header says whether the agent takes any
+// inputs at all, matching the studio top bar's control (SKY-14866).
+function InputsToggleButton() {
+  const count = useWorkflowParametersStore((s) => s.parameters.length);
+  return (
+    <PanelToggleButton
+      content="parameters"
+      label="Inputs"
+      leadingIcon={<InputIcon className="mr-2 h-5 w-5" aria-hidden />}
+      count={count}
+    />
+  );
+}
+
 function EditorActionToolbar() {
   return (
     <div data-tour="editor-actions" className="flex items-center gap-2">
@@ -233,7 +256,7 @@ function EditorActionToolbar() {
         className="mx-1 h-6 w-px bg-muted dark:bg-slate-700"
         aria-hidden="true"
       />
-      <PanelToggleButton content="parameters" label="Inputs" />
+      <InputsToggleButton />
       <RunButton />
     </div>
   );

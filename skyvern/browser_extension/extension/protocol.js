@@ -20,6 +20,7 @@ export const OPS = Object.freeze({
   DEBUGGER_ATTACH: "debugger.attach",
   DEBUGGER_DETACH: "debugger.detach",
   DEBUGGER_SEND: "debugger.send",
+  DOM_EVALUATE: "dom.evaluate",
   SHARE_TAB: "shareTab",
   UNSHARE_TAB: "unshareTab",
   TABS_CREATE: "tabs.create",

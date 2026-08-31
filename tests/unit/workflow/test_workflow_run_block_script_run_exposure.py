@@ -33,6 +33,7 @@ def _fake_block_model(script_run_value: dict | None, prompt_value: str | None = 
     model.continue_on_failure = False
     model.failure_reason = None
     model.final_url = None
+    model.finish_reason = None
     model.error_codes = None
     model.engine = None
     model.task_id = None

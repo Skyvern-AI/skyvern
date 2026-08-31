@@ -3,6 +3,7 @@
 from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import structlog
 import yaml
@@ -35,6 +36,50 @@ LOG = structlog.get_logger()
 
 # Wide enough that safe_dump never folds a title onto a second line.
 _YAML_NO_FOLD_WIDTH = 1 << 30
+
+
+def runner_code_block_associations(
+    workflow_yaml: str,
+    *,
+    prior_associations: dict[str, str] | None = None,
+    preserve_existing: bool = False,
+) -> dict[str, str]:
+    """Assign opaque server-owned identities to code blocks without changing model-owned YAML.
+
+    A server-composed block edit can explicitly retain a label's prior identity. A complete model
+    replacement always receives fresh identities, even if it reproduces a prior label or source.
+    """
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return {}
+    blocks = _workflow_blocks(parsed)
+    if blocks is None:
+        return {}
+    associations: dict[str, str] = {}
+    prior_associations = prior_associations or {}
+
+    def walk(value: object) -> None:
+        if not isinstance(value, list):
+            return
+        for block in value:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            if block.get("block_type") == "code" and isinstance(label, str) and label:
+                associations[label] = (
+                    prior_associations[label]
+                    if preserve_existing and label in prior_associations
+                    else f"cba_{uuid4().hex}"
+                )
+            walk(block.get("blocks"))
+            walk(block.get("loop_blocks"))
+            for branch in block.get("branch_conditions", []):
+                if isinstance(branch, dict):
+                    walk(branch.get("blocks"))
+
+    walk(blocks)
+    return associations
 
 
 def reconcile_workflow_completion_contract(

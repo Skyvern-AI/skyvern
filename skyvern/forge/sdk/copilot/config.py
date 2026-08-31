@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Literal
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation
@@ -12,6 +13,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation
 class BlockAuthoringPolicy(StrEnum):
     STANDARD = "standard"
     CODE_ONLY_BROWSER = "code_only_browser"
+    TASK_V3_PURE = "task_v3_pure"
 
 
 def normalize_block_authoring_policy(value: object) -> BlockAuthoringPolicy:
@@ -27,6 +29,21 @@ def normalize_block_authoring_policy(value: object) -> BlockAuthoringPolicy:
 
 def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringPolicy:
     return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
+
+
+def block_authoring_policy_for_request(
+    code_block_mode: bool | None,
+    composer_mode: Literal["ask", "build"] | None,
+    *,
+    fallback_code_block_mode: bool,
+) -> BlockAuthoringPolicy:
+    if code_block_mode is True:
+        return BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    if composer_mode == "build":
+        return BlockAuthoringPolicy.TASK_V3_PURE
+    if code_block_mode is False:
+        return BlockAuthoringPolicy.STANDARD
+    return block_authoring_policy_from_code_only_mode(fallback_code_block_mode)
 
 
 def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:

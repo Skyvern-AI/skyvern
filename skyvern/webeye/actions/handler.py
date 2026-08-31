@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -106,7 +107,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
@@ -165,19 +166,28 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
     WebAction,
 )
-from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.actions.responses import (
+    STALE_TARGET_TOOL_RESULT,
+    ActionAbort,
+    ActionFailure,
+    ActionResult,
+    ActionSuccess,
+    StaleActionAbort,
+)
+from skyvern.webeye.browser_artifacts import ActionDownloadObservation, DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
+    BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     begin_requested_download_for_context,
     download_filename_from_suffix,
     extract_filename,
     finish_requested_download_for_context,
+    has_download_interceptor_for_context,
     is_download_response,
     normalize_download_filename,
     publish_download_bytes_for_context,
@@ -203,6 +213,7 @@ from skyvern.webeye.transient_page_observer import (
     TransientPageTextObserver,
     match_user_defined_errors_from_transient_text,
 )
+from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.dom import (
     COMMON_INPUT_TAGS,
     DomUtil,
@@ -219,6 +230,7 @@ from skyvern.webeye.utils.page import (
     _all_page_frames,
     _blob_url_origin,
     apply_secret_visual_mask_to_active_element,
+    install_blob_url_retention,
     probe_blob_action_freshness,
     take_element_screenshot,
     teardown_blob_url_retention,
@@ -253,6 +265,12 @@ DOWNLOAD_ABORTED_FAILURE_MESSAGE = (
     "The browser started this download but aborted it before any file was saved. "
     "The download link may have expired; regenerate it before trying the download again."
 )
+DOWNLOAD_OBSERVED_BUT_EMPTY_FOLLOWUP_MESSAGE = (
+    "A file download was observed but no file could be saved from it. "
+    "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+)
+# Arming/tearing down blob URL retention is best-effort and must never stall a download action.
+_BLOB_RETENTION_ARMING_TIMEOUT_SECONDS = 5.0
 SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
     "The sensitive paste completed, but the clipboard could not be cleared. "
     "Do not repeat the paste; stop and report the clipboard safety failure."
@@ -315,6 +333,9 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
+# Pre-click provider-download baseline is a single metadata listing; cap it well under the action's
+# own download budget so a slow provider cannot delay the click itself.
+PROVIDER_DOWNLOAD_BASELINE_TIMEOUT_SECONDS = 10.0
 # Cap the event-time blob read so a stalled read never consumes the whole download-wait budget;
 # on timeout the save_as + fan-out fallback still gets its chance.
 EAGER_BLOB_READ_TIMEOUT_SECONDS = 5.0
@@ -662,6 +683,150 @@ async def _verify_autocomplete_input_readback(
     return False
 
 
+def _is_boundary_fragment(fragment: str, whole: str) -> bool:
+    """Whether ``fragment`` occurs in ``whole`` as a word-boundary-delimited contiguous run.
+
+    Both are expected to already be normalized. A fragment carrying no alphanumeric character can
+    never anchor a meaningful boundary match, so it is rejected. Default Unicode ``\\w`` semantics
+    apply, so accented Latin behaves and unsegmented CJK interiors fail closed.
+    """
+    if not any(ch.isalnum() for ch in fragment):
+        return False
+    return re.search(rf"(?<!\w){re.escape(fragment)}(?!\w)", whole) is not None
+
+
+def _autocomplete_commit_evidence(
+    pre_value: str | None,
+    post_value: str | None,
+    option_label: str | None,
+) -> tuple[str, str] | None:
+    """Observational commit evidence for an autocomplete selection, or None.
+
+    Emits ``(committed_option, committed_value)`` — both truncated to the shared field cap — only
+    when the clicked option's label and both control read-backs are nonempty *after normalization*,
+    the normalized post-click value differs from the normalized pre-click value, and BOTH the
+    normalized pre and post are boundary-delimited fragments of the normalized option label. That
+    last relation is what makes the transition selection-specific: it rejects unrelated blur,
+    masking, formatting, validation, and restoration transforms whose output is not a fragment of
+    the clicked option. The relation runs on the full normalized strings before any truncation.
+    Whitespace-only fields normalize to empty and fail closed; equality (a no-op or highlight-only
+    click) yields None. Secret suppression is the caller's responsibility.
+    """
+    normalized_pre = _normalize_select_shadow_text(pre_value)
+    normalized_post = _normalize_select_shadow_text(post_value)
+    normalized_label = _normalize_select_shadow_text(option_label)
+    if not normalized_label or not normalized_pre or not normalized_post:
+        return None
+    if normalized_post == normalized_pre:
+        return None
+    if not _is_boundary_fragment(normalized_pre, normalized_label):
+        return None
+    if not _is_boundary_fragment(normalized_post, normalized_label):
+        return None
+    committed_option = _truncate_select_shadow_field(option_label)
+    committed_value = _truncate_select_shadow_field(post_value)
+    if not committed_option or not committed_value:
+        return None
+    return committed_option, committed_value
+
+
+async def _read_autocomplete_control_value(
+    skyvern_element: SkyvernElement,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> str | None:
+    try:
+        return await get_input_value(
+            skyvern_element.get_tag_name(),
+            skyvern_element.get_locator(),
+            engine_selection=engine_selection,
+            read_timeout_ms=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception:
+        LOG.info("Failed to read autocomplete control value for commit evidence", exc_info=True)
+        return None
+
+
+async def _read_clicked_option_label(
+    *,
+    skyvern_frame: SkyvernFrame,
+    option_locator: Locator,
+    option_static_element: dict | None,
+) -> str | None:
+    identity = await _read_autocomplete_option_identity(skyvern_frame=skyvern_frame, locator=option_locator)
+    label = identity.get("label") if identity else None
+    if not label and option_static_element:
+        # Fall back to the scraped node text; it is tied to this exact option by construction.
+        label = option_static_element.get("text")
+    label = (label or "").strip()
+    return label or None
+
+
+async def _click_autocomplete_option_with_commit_evidence(
+    *,
+    skyvern_element: SkyvernElement,
+    option_locator: Locator,
+    option_static_element: dict | None,
+    skyvern_frame: SkyvernFrame,
+    click: Callable[[], Awaitable[None]],
+    is_secret_value: bool,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> ActionResult:
+    """Click the LLM-selected option and return ``ActionSuccess``, enriched with commit evidence
+    only when the target control's read-back changes into a value that — like the pre-click value —
+    is a boundary-delimited fragment of the clicked option's label (see
+    ``_autocomplete_commit_evidence``) AND that transitioned value survives a next-render settle
+    reread. The render-driven settle guards against an optimistic control that paints the selected
+    label and then reverts it after async validation/rerender, which would otherwise commit a
+    transient value.
+
+    Evidence capture is best-effort and fail-closed: a failed read (before, after, or on the settle
+    reread), a missing label, an unchanged control, an unrelated transform, a value that drifts on
+    the settled reread, or a secret value all leave a bare ``ActionSuccess``. Only the click itself
+    can fail the action — every evidence read is exception-isolated so a successful click never
+    regresses to ``ActionFailure`` because capture failed.
+    """
+    option_label: str | None = None
+    pre_value: str | None = None
+    if not is_secret_value:
+        try:
+            option_label = await _read_clicked_option_label(
+                skyvern_frame=skyvern_frame,
+                option_locator=option_locator,
+                option_static_element=option_static_element,
+            )
+        except Exception:
+            LOG.info("Failed to read clicked autocomplete option label for commit evidence", exc_info=True)
+        pre_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
+
+    await click()
+
+    if is_secret_value:
+        return ActionSuccess()
+
+    try:
+        post_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
+        evidence = _autocomplete_commit_evidence(pre_value, post_value, option_label)
+        if evidence is None:
+            return ActionSuccess()
+        # The candidate transition passed, but an optimistic control can paint the selected label and
+        # then revert it after async validation/rerender. Reconcile on the next render turn via the
+        # existing render-settle helper (double-rAF, with a 250ms liveness cap) and reread once; only
+        # record evidence when the next-render reread still holds the first post value, so a transient
+        # paint cannot be committed as stale evidence.
+        await _wait_custom_select_render_settle(skyvern_element)
+        confirm_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
+        if confirm_value is None or _normalize_select_shadow_text(confirm_value) != _normalize_select_shadow_text(
+            post_value
+        ):
+            return ActionSuccess()
+    except Exception:
+        LOG.info("Autocomplete commit-evidence capture failed after a successful click", exc_info=True)
+        return ActionSuccess()
+
+    committed_option, committed_value = evidence
+    return ActionSuccess(committed_option=committed_option, committed_value=committed_value)
+
+
 async def _reset_autocomplete_for_llm_fallback(
     *,
     current_incremental_scraped: IncrementalScrapePage,
@@ -981,19 +1146,21 @@ async def _close_eager_capture_then_teardown_retention(
     eager_blob_capture: _EagerAdoptedBlobCapture,
     page: Page,
     *,
-    browser_session_id: str | None,
+    retention_armed: bool,
     workflow_run_id: str | None,
 ) -> None:
     # aclose() can re-raise CancelledError when the enclosing action is cancelled; the retention
     # wrapper patches page-realm URL.createObjectURL/revokeObjectURL and must be torn down anyway, or
-    # a cancelled adopted session leaks the patched globals. The original cancellation still
-    # propagates after the finally, and a teardown failure stays fail-open/debug-only.
+    # a cancelled session leaks the patched globals. Teardown runs whenever arming was attempted
+    # (a partial install still patches the globals). The original cancellation still propagates after
+    # the finally, and a teardown failure stays fail-open/debug-only.
     try:
         await eager_blob_capture.aclose()
     finally:
-        if browser_session_id:
+        if retention_armed:
             try:
-                await teardown_blob_url_retention(page, workflow_run_id=workflow_run_id)
+                async with asyncio.timeout(_BLOB_RETENTION_ARMING_TIMEOUT_SECONDS):
+                    await teardown_blob_url_retention(page, workflow_run_id=workflow_run_id)
             except Exception:
                 LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
 
@@ -1201,6 +1368,12 @@ async def _save_adopted_session_download(
         return None
 
 
+# Set for the duration of a file-download block's non-download click that is authorized as a
+# false-click candidate. Read by handle_click_action to enable the same-action download bypass of
+# the expensive dropdown/custom-select rescrape; never gates persistence or task finalization.
+_false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_download_eligible", default=False)
+
+
 def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
     off = getattr(page, "off", None)
     if callable(off):
@@ -1213,6 +1386,36 @@ def _remove_download_listener(page: Page, callback: Callable[[Download], None]) 
         return
 
     LOG.warning("Page does not support removing download listeners")
+
+
+def _register_false_click_download_probe(page: Page, observed: asyncio.Event) -> Callable[[], None]:
+    """Flag ``observed`` when a download is minted on the clicked page or a popup it spawns
+    during the click window. Returns a cleanup that removes every listener it installed."""
+    download_handles: list[tuple[Page, Callable[[Download], None]]] = []
+
+    def _flag_download(_download: Download) -> None:
+        observed.set()
+
+    def _on_popup(popup_page: Page) -> None:
+        popup_page.on("download", _flag_download)
+        download_handles.append((popup_page, _flag_download))
+
+    page.on("download", _flag_download)
+    download_handles.append((page, _flag_download))
+    page.on("popup", _on_popup)
+
+    def _cleanup() -> None:
+        try:
+            _remove_popup_listener(page, _on_popup)
+        except Exception:
+            LOG.warning("Failed to remove false-click download popup listener", exc_info=True)
+        for observed_page, callback in download_handles:
+            try:
+                _remove_download_listener(observed_page, callback)
+            except Exception:
+                LOG.warning("Failed to remove false-click download listener", exc_info=True)
+
+    return _cleanup
 
 
 def _remove_popup_listener(page: Page, callback: Callable[[Page], None]) -> None:
@@ -2613,6 +2816,112 @@ def _exact_value_input_type(input_type: str | None) -> str:
     return (input_type or "").strip().lower()
 
 
+_DATE_VALUE_SEPARATORS = re.compile(r"[^0-9]+")
+_DATE_MASK_SEPARATORS = re.compile(r"[^a-z]+")
+
+
+def _strict_date_mask_order(placeholder: str | None) -> tuple[str, ...] | None:
+    # The day/month/year order a strict placeholder mask declares ("mm/dd/yyyy" -> ("m","d","y")), or None
+    # when it is not a fully-specified mask: each separator-delimited token must be a pure run of one date
+    # letter (d/dd, m/mm, yyyy), so prose, first-letter lookalikes, and partial years never define an order.
+    if not placeholder:
+        return None
+    tokens = [token for token in _DATE_MASK_SEPARATORS.split(placeholder.strip().lower()) if token]
+    if len(tokens) != 3:
+        return None
+    order: list[str] = []
+    for token in tokens:
+        if re.fullmatch(r"d{1,2}", token):
+            order.append("d")
+        elif re.fullmatch(r"m{1,2}", token):
+            order.append("m")
+        elif re.fullmatch(r"y{4}", token):
+            order.append("y")
+        else:
+            return None
+    if sorted(order) != ["d", "m", "y"]:
+        return None
+    return tuple(order)
+
+
+def _canonical_iso_date(text: str, placeholder: str | None) -> str | None:
+    # ``text`` as the YYYY-MM-DD an <input type=date> accepts, or None when it is not a date or the order
+    # cannot be trusted. Order comes from the field's own strict mask; without a mask only an unambiguous
+    # reading (four-digit year first, or a component above 12 pinning the day) is taken, and datetime()
+    # rejects impossible calendar dates -- so an ambiguous value is refused, never written as a wrong date.
+    parts = [part for part in _DATE_VALUE_SEPARATORS.split(text.strip()) if part]
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    order = _strict_date_mask_order(placeholder)
+    if order is None:
+        if len(parts[0]) == 4:
+            order = ("y", "m", "d")
+        elif len(parts[2]) == 4 and int(parts[0]) > 12:
+            order = ("d", "m", "y")
+        elif len(parts[2]) == 4 and int(parts[1]) > 12:
+            order = ("m", "d", "y")
+        else:
+            return None
+    fields = dict(zip(order, parts))
+    if len(fields) != 3 or len(fields["y"]) != 4:
+        return None
+    try:
+        return datetime(int(fields["y"]), int(fields["m"]), int(fields["d"])).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _is_malformed_value_error(exc: BaseException) -> bool:
+    # locator.fill() raises "Malformed value" when the live node is a structured input (a date input takes
+    # only YYYY-MM-DD) and the value is not canonical; it validates before committing, so the field is left
+    # untouched and the write can be retried in canonical form.
+    return "malformed value" in str(exc).lower()
+
+
+async def _live_date_input_canonical_value(
+    skyvern_element: SkyvernElement,
+    text: str,
+    fill_error: BaseException,
+    engine_selection: BrowserEngineSelection | None,
+) -> str | None:
+    # The canonical YYYY-MM-DD to re-fill after locator.fill() rejected ``text`` as malformed, or None when
+    # the failure is not a live date input rejecting a recoverable value. The LIVE type and placeholder --
+    # not the stale scraped type -- decide recovery, so a non-date field or an unrelated error yields None
+    # and the caller re-raises unchanged.
+    if not (_is_selected_engine_error(fill_error, engine_selection) and _is_malformed_value_error(fill_error)):
+        return None
+    try:
+        if _exact_value_input_type(await skyvern_element.get_attr("type", mode="dynamic")) != "date":
+            return None
+        placeholder = await skyvern_element.get_attr("placeholder", mode="dynamic")
+    except Exception:
+        # A live read can itself fail when a navigation/DOM race destroys the node; without recovery
+        # evidence return None so the caller re-raises the original malformed-value failure rather than
+        # letting this secondary read error mask it (and be tolerated elsewhere as a false success).
+        return None
+    return _canonical_iso_date(text, placeholder)
+
+
+async def _recover_atomic_fill_as_live_date(
+    skyvern_element: SkyvernElement,
+    text: str,
+    fill_error: BaseException,
+    engine_selection: BrowserEngineSelection | None,
+) -> str | None:
+    # Single owner of the malformed-value recovery shared by every path that atomically fills a native
+    # exact-value input: the ordinary branch and the secret read-back branch. After an atomic fill raised,
+    # a field scraped as text but live type=date rejects a displayed locale value as malformed, so re-fill
+    # in canonical YYYY-MM-DD read from the live DOM. Returns the committed canonical value -- the field then
+    # holds the ISO value, not ``text``, so the caller reads that value back, not ``text``. Returns None for an
+    # ambiguous, non-date, or unrelated failure so the caller re-raises it unchanged and keeps its existing
+    # semantics. No value is logged.
+    canonical = await _live_date_input_canonical_value(skyvern_element, text, fill_error, engine_selection)
+    if canonical is None:
+        return None
+    await skyvern_element.input_fill(text=canonical)
+    return canonical
+
+
 def _secret_readback_is_unreadable_mask(actual_value: str | None, *, is_password: bool) -> bool:
     # Unreadable only when the read-back is ENTIRELY mask glyphs (optionally separator-grouped, e.g.
     # "•••• ••••" / "****-****"): a custom reveal/mask widget is rendering only bullets, not the real
@@ -2699,13 +3008,31 @@ async def _fill_secret_with_readback(
 
     # Parity with the ordinary atomic-fill branch: re-resolve a locator that went stale between scrape and
     # write so a re-mounted controlled input is filled instead of timing out on a zero-match cached target.
+    # The value the field is expected to hold after the first write and the transport the retry uses. Both stay
+    # the intended secret unless a stale-scraped date recovered to canonical ISO below, in which case the field
+    # holds YYYY-MM-DD and the retry must re-fill that ISO atomically (never the locale text, never the
+    # per-character seam, which corrupts a structured date value).
+    readback_expected = text
+    date_recovered = False
     await skyvern_element.refresh_locator_if_stale()
     if sequential_first:
         await skyvern_element.input_sequentially(text=text)
     else:
-        await skyvern_element.input_fill(text=text)
+        try:
+            await skyvern_element.input_fill(text=text)
+        except Exception as fill_error:
+            # A stale-scraped text field that is live type=date rejects the displayed locale value as
+            # malformed; recover in canonical ISO form. It then holds YYYY-MM-DD, not ``text`` -- but a
+            # controlled date node can still accept that fill and asynchronously clear/rewrite it, so the
+            # read-back below verifies the canonical value rather than trusting the accepted write. A
+            # non-date/ambiguous failure re-raises unchanged.
+            canonical = await _recover_atomic_fill_as_live_date(skyvern_element, text, fill_error, engine_selection)
+            if canonical is None:
+                raise
+            readback_expected = canonical
+            date_recovered = True
 
-    if _secret_input_cannot_round_trip(text, maxlength=maxlength):
+    if _secret_input_cannot_round_trip(readback_expected, maxlength=maxlength):
         LOG.info(
             "Leaving credential as filled: field cannot round-trip the value by its declared contract",
             element_id=skyvern_element.get_id(),
@@ -2731,7 +3058,7 @@ async def _fill_secret_with_readback(
         return None
     # Exact equality first: a value that round-trips exactly is confirmed, even one made only of mask-like
     # characters -- so an all-"*" secret is a match, never misclassified as an unreadable mask.
-    if not _secret_readback_is_mismatch(text, actual_value):
+    if not _secret_readback_is_mismatch(readback_expected, actual_value):
         return None
 
     if _secret_readback_is_unreadable_mask(actual_value, is_password=is_password):
@@ -2745,10 +3072,15 @@ async def _fill_secret_with_readback(
     # attr, so it stayed atomic-fill eligible): repeating the same atomic fill can never emit the key events
     # that advance through the sibling boxes. Re-resolve a possibly re-mounted locator, then retry with the
     # sequential transport instead of another identical fill. The read-back below still verifies the target and
-    # fails closed -- a sequential write that merely did not raise is not success (SKY-13821).
+    # fails closed -- a sequential write that merely did not raise is not success (SKY-13821). A recovered date
+    # instead re-fills the canonical ISO atomically: the per-character seam hard-throws on a structured date
+    # input and the locale text is not what the field accepts.
     await skyvern_element.refresh_locator_if_stale()
     await skyvern_element.input_clear()
-    await skyvern_element.input_sequentially(text=text)
+    if date_recovered:
+        await skyvern_element.input_fill(text=readback_expected)
+    else:
+        await skyvern_element.input_sequentially(text=text)
     actual_value, navigated = await _read_back()
     if navigated:
         LOG.info(
@@ -2756,7 +3088,7 @@ async def _fill_secret_with_readback(
             element_id=skyvern_element.get_id(),
         )
         return None
-    if _secret_readback_matches(text, actual_value):
+    if _secret_readback_matches(readback_expected, actual_value):
         return None
 
     LOG.warning(
@@ -3661,24 +3993,37 @@ class ActionHandler:
         _action_span.set_attribute("triggers_download", trigger_download_action)
         _tracer = otel_trace.get_tracer("skyvern")
         if not trigger_download_action:
+            # Authorizes the same-action download bypass in handle_click_action. This is decoupled
+            # from popup grace: the bypass only skips the dead dropdown rescrape and never persists,
+            # so a FileDownloadBlock false-click candidate arms it regardless of the grace setting.
+            false_click_bypass_eligible = (
+                file_download_false_click_eligible and isinstance(action, ClickAction) and action.download is False
+            )
+            # The popup-grace persistence wrapper stays separately gated: it captures/persists a
+            # download the click mints on a popup, which is only worth its cost when grace > 0.
             observe_false_click = (
-                file_download_false_click_eligible
-                and isinstance(action, ClickAction)
-                and action.download is False
+                false_click_bypass_eligible
                 and browser_state is not None
                 and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0
             )
             if not observe_false_click:
-                with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
-                    apply_context_attrs(_hi_span)
-                    results = await ActionHandler._handle_action(
-                        scraped_page=scraped_page,
-                        task=task,
-                        step=step,
-                        page=page,
-                        action=action,
-                        allow_stale_refresh=allow_stale_refresh,
-                    )
+                false_click_eligible_token = (
+                    _false_click_download_eligible.set(True) if false_click_bypass_eligible else None
+                )
+                try:
+                    with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
+                        apply_context_attrs(_hi_span)
+                        results = await ActionHandler._handle_action(
+                            scraped_page=scraped_page,
+                            task=task,
+                            step=step,
+                            page=page,
+                            action=action,
+                            allow_stale_refresh=allow_stale_refresh,
+                        )
+                finally:
+                    if false_click_eligible_token is not None:
+                        _false_click_download_eligible.reset(false_click_eligible_token)
             else:
                 assert browser_state is not None
                 page_url_before_download = page.url
@@ -3773,6 +4118,7 @@ class ActionHandler:
                                 download_popup, browser_state, page, page_url_before_download
                             )
 
+                    false_click_eligible_token = _false_click_download_eligible.set(True)
                     try:
                         with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
                             apply_context_attrs(_hi_span)
@@ -3800,6 +4146,7 @@ class ActionHandler:
                                 raise
                         await process_captured_download(results)
                     finally:
+                        _false_click_download_eligible.reset(false_click_eligible_token)
                         try:
                             _remove_popup_listener(page, on_popup)
                         except Exception:
@@ -3862,6 +4209,31 @@ class ActionHandler:
                     organization_id=task.organization_id, browser_session_id=task.browser_session_id
                 )
             return files
+
+        # Provider-owned downloads (vendor remote sessions) are observed per action. The source is
+        # deliberately private/non-serialized on BrowserArtifacts; absent sources preserve existing
+        # PBS/CDP/local behavior unchanged.
+        action_download_observation: ActionDownloadObservation | None = None
+        provider_source = browser_state.browser_artifacts.get_action_download_source() if browser_state else None
+        if provider_source is not None:
+            baseline_budget_seconds = min(
+                PROVIDER_DOWNLOAD_BASELINE_TIMEOUT_SECONDS,
+                float(task.download_timeout) if task.download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT,
+            )
+            try:
+                action_download_observation = await provider_source.begin_observation(
+                    deadline=time.monotonic() + baseline_budget_seconds
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Same secret-leak guard as the poll catches: a provider list/schema error can embed the
+                # secret-bearing presigned URL, so log only its type -- never the exception/traceback. A
+                # missing baseline disables provider-diff for this action but leaves every download path intact.
+                LOG.warning(
+                    "Provider download baseline unavailable; continuing existing download paths",
+                    error_type=type(exc).__name__,
+                )
 
         async def _drain_and_move_staged_xhr(xhr_fallback_moved_paths: set[str], timeout_seconds: float) -> bool:
             await xhr_capture.drain(timeout_seconds=timeout_seconds)
@@ -3940,7 +4312,24 @@ class ActionHandler:
         if task.browser_session_id:
             page.on("popup", _register_download_popup)
         requested_download_token = begin_requested_download_for_context(page.context)
+        # Arm blob URL retention for every structurally download-capturing context: adopted/persistent
+        # sessions and any context bound to a CDPDownloadInterceptor (which includes pooled sessions).
+        # A page that mints a PDF blob and synchronously revokes it drops the object URL before the
+        # interceptor's post-event in-page read; retention defers the revoke so the read can recover it.
+        retention_armed = bool(task.browser_session_id) or has_download_interceptor_for_context(page.context)
         try:
+            if retention_armed:
+                # Install before the interaction so the createObjectURL/revokeObjectURL patch is in place
+                # when the click/select mints the blob. Fail-open and time-bounded: retention is a
+                # recovery aid, never a gate on the action itself.
+                try:
+                    async with asyncio.timeout(_BLOB_RETENTION_ARMING_TIMEOUT_SECONDS):
+                        await install_blob_url_retention(page, workflow_run_id=task.workflow_run_id)
+                except Exception:
+                    LOG.debug(
+                        "Failed to install blob URL retention before download action",
+                        workflow_run_id=task.workflow_run_id,
+                    )
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
             with traced_span(_tracer, "skyvern.agent.action.handle_inner") as _hi_span:
@@ -3958,6 +4347,8 @@ class ActionHandler:
             # the cached-script writer's semantics.
             action.finished_at = naive_utc_now()
             if not results:
+                return results
+            if isinstance(results[-1], ActionAbort) and results[-1].skip_remaining_actions:
                 return results
             # Let request events already queued by the action enter before closing admission.
             await asyncio.sleep(0)
@@ -4144,10 +4535,35 @@ class ActionHandler:
                                     break
 
                             list_files_after = await _list_download_signal_files()
-
-                            if {
+                            local_signal_delta = {
                                 _download_signal_identity(file) for file in list_files_after
-                            } - signal_file_identities_before:
+                            } - signal_file_identities_before
+
+                            # Only reach for the provider when no local artifact already accounts for this
+                            # action. An existing CDP/local/session file is authoritative, so polling the
+                            # provider would be pure duplication -- it could stall to the shared deadline or
+                            # materialize a collision-suffixed copy of a file already saved.
+                            if not local_signal_delta and action_download_observation is not None:
+                                try:
+                                    await action_download_observation.poll_and_materialize(
+                                        destination_dir=download_dir,
+                                        deadline=download_wait_deadline,
+                                    )
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:
+                                    # Provider-list schema/validation errors can embed the secret-bearing
+                                    # presigned URL; log only its type, never the exception/traceback.
+                                    LOG.debug(
+                                        "Provider download poll failed; continuing existing paths",
+                                        error_type=type(exc).__name__,
+                                    )
+                                list_files_after = await _list_download_signal_files()
+                                local_signal_delta = {
+                                    _download_signal_identity(file) for file in list_files_after
+                                } - signal_file_identities_before
+
+                            if local_signal_delta:
                                 _record_download_signal("download_file_detected")
                                 LOG.info(
                                     "Found new files in download directory after action",
@@ -4358,6 +4774,27 @@ class ActionHandler:
 
             async with asyncio.timeout(_download_completion_timeout):
                 async with settle_browser_downloads_for_context(page.context):
+                    if action_download_observation is not None:
+                        # Mirror the mid-wait rule at finalize: poll the provider only when no local
+                        # artifact already accounts for this action. A file the CDP/local/session path
+                        # already saved must not be duplicated by a second, collision-suffixed provider
+                        # copy here. The listing is done only when a provider is attached, so the
+                        # legacy no-provider path issues no extra directory read.
+                        local_signal_accounts_for_action = bool(
+                            {_download_signal_identity(file) for file in await _list_download_signal_files()}
+                            - signal_file_identities_before
+                        )
+                        if not local_signal_accounts_for_action:
+                            try:
+                                await action_download_observation.poll_and_materialize(
+                                    destination_dir=download_dir,
+                                    deadline=download_wait_deadline,
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                # Same secret-leak guard as the mid-poll catch: metadata only, no traceback.
+                                LOG.debug("Final provider download poll failed", error_type=type(exc).__name__)
                     downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
                         download_dir=download_dir,
                         task=task,
@@ -4384,6 +4821,13 @@ class ActionHandler:
                     Exception(f"{DOWNLOAD_ABORTED_FAILURE_MESSAGE} (browser reported: {aborted_reason})"),
                     download_triggered=True,
                 )
+            elif isinstance(results[-1], ActionSuccess):
+                # A download was observed/credited but finalization produced no artifact and the
+                # browser reported no abort reason. Returning a plain success implies a file exists;
+                # flag needs_followup so the agent keeps trying rather than treating a missing file as
+                # a completed download.
+                results[-1].needs_followup = True
+                results[-1].followup_message = DOWNLOAD_OBSERVED_BUT_EMPTY_FOLLOWUP_MESSAGE
             if xhr_fallback_moved_paths:
                 post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
                 if post_settle_extra_paths:
@@ -4406,7 +4850,7 @@ class ActionHandler:
             await _close_eager_capture_then_teardown_retention(
                 eager_blob_capture,
                 page,
-                browser_session_id=task.browser_session_id,
+                retention_armed=retention_armed,
                 workflow_run_id=task.workflow_run_id,
             )
             for observed_popup, popup_callback in download_popup_callbacks:
@@ -4525,6 +4969,21 @@ class ActionHandler:
                                 action_type=action.action_type,
                                 fresh_element_id=action.element_id,
                             )
+                        elif await _batched_target_stale_beyond_remap(scraped_page, page, action):
+                            # The target was remounted by a preceding action in this same batch and could
+                            # not be safely remapped (anchorless / ambiguous / volatile identity).
+                            # Dispatching the stale pre-batch binding would act on a positional look-alike
+                            # or a dead stub, and a later Save in the same batch would then serialize a
+                            # form this batch never fully applied. Stop the batch instead so the next step
+                            # re-plans and re-dispatches the remaining actions against a fresh scrape.
+                            LOG.info(
+                                "Stale batched action could not be safely remapped; stopping the batch to re-plan",
+                                action_type=action.action_type,
+                            )
+                            stop_result = StaleActionAbort()
+                            stop_result.skip_remaining_actions = True
+                            actions_result.append(stop_result)
+                            return actions_result
 
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
@@ -4613,7 +5072,12 @@ class ActionHandler:
                 tool_result_content = "Tool executed successfully"
             elif actions_result and isinstance(actions_result[-1], ActionAbort):
                 action.status = ActionStatus.skipped
-                tool_result_content = "Tool executed successfully"
+                if isinstance(actions_result[-1], StaleActionAbort):
+                    # The action did NOT run (its target went stale). Tell the tool caller the truth so
+                    # the next planning turn re-observes, rather than reporting a false success.
+                    tool_result_content = STALE_TARGET_TOOL_RESULT
+                else:
+                    tool_result_content = "Tool executed successfully"
             else:
                 tool_result_content = "Tool execution failed"
                 # either actions_result is empty or the last action is a failure
@@ -4706,6 +5170,45 @@ def _has_identity_anchor(element: dict) -> bool:
     return any(_has_identity_anchor(child) for child in (element.get("children") or []) if isinstance(child, dict))
 
 
+async def _batched_target_stale_beyond_remap(
+    scraped_page: ScrapedPage,
+    page: Page,
+    action: Action,
+) -> bool:
+    """Fail-closed probe: ``True`` only when a non-first batched WebAction's target was remounted away by
+    a preceding action in the SAME batch (its injected ``unique_id`` marker is gone) on the SAME, intact
+    document, so dispatching its pre-batch binding would act on a positional look-alike / dead stub
+    rather than the live control. It is consulted only after ``_refresh_stale_web_action_before_dispatch``
+    has already declined to remap, and it never re-scrapes or mutates anything. It returns ``False`` for
+    anything it cannot positively confirm -- a coordinate click, a non-main-frame or missing target, a
+    navigated / wholly-replaced document, a still-live node, or an indeterminate probe -- so the legacy
+    dispatch path stays authoritative in every ambiguous case.
+
+    A separate probe (rather than a richer return from the remap) is deliberate: the remap declines
+    anchorless / ambiguous targets BEFORE it probes liveness, yet those are exactly the targets this must
+    catch. The precondition set (coordinate / URL-continuity / main-frame / liveness / marker-survival) is
+    intentionally identical to the remap's; keep the two in sync -- widening one without the other would
+    desync "can we remap?" from "must we stop the batch?".
+    """
+    if not isinstance(action, WebAction) or not action.element_id:
+        return False
+    if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
+        return False
+    if await _document_continuity(scraped_page, page) is not True:
+        return False
+    css = scraped_page.id_to_css_dict.get(action.element_id)
+    frame = scraped_page.id_to_frame_dict.get(action.element_id)
+    if not css or frame != "main.frame":
+        return False  # only the main frame has a scrape-stable identity to reason about
+    try:
+        locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
+        if await locator.count() == 1:
+            return False  # the exact injected node is still live -> not stale
+    except Exception:
+        return False  # cannot confirm staleness -> decline; legacy dispatch stays authoritative
+    return True
+
+
 async def _refresh_stale_web_action_before_dispatch(
     scraped_page: ScrapedPage,
     page: Page,
@@ -4745,9 +5248,7 @@ async def _refresh_stale_web_action_before_dispatch(
     # batch navigated / switched document, the planned action does not belong to the live page -- so
     # decline (before spending a re-scrape) rather than remap it onto an identically-structured control
     # on the destination page.
-    planned_url = getattr(scraped_page, "url", None)
-    live_url = getattr(page, "url", None)
-    if isinstance(planned_url, str) and isinstance(live_url, str) and planned_url != live_url:
+    if await _document_continuity(scraped_page, page) is not True:
         return None
 
     css = scraped_page.id_to_css_dict.get(action.element_id)
@@ -4765,13 +5266,6 @@ async def _refresh_stale_web_action_before_dispatch(
         locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
         if await locator.count() == 1:
             return None  # the exact injected node is still live -> not stale -> dispatch unchanged
-        # The exact node is gone. Before spending a re-scrape, require at least one injected marker to
-        # survive in the planned element's frame. Zero markers means the whole document was replaced --
-        # a same-URL reload / postback the URL guard cannot see. Re-scraping it would re-inject markers
-        # on scan-order strangers and can recycle a later sibling's planned id onto the wrong element,
-        # so decline (without scraping) and leave the legacy path authoritative.
-        if await frame_content.locator(f"[{SKYVERN_ID_ATTR}]").count() == 0:
-            return None
     except Exception:
         return None  # cannot confirm liveness / marker survival -> decline; legacy path authoritative
 
@@ -4816,7 +5310,7 @@ async def _refresh_stale_web_action_before_dispatch(
 
     # The refresh re-scrapes the current page; if that landed on a different document than the batch was
     # planned on, the destination's identically-structured control is not our target -- decline.
-    if isinstance(planned_url, str) and getattr(fresh_scraped_page, "url", None) != planned_url:
+    if await _document_continuity(scraped_page, page) is not True:
         return None
 
     if not fresh_element_id or fresh_element_id == action.element_id:
@@ -4842,6 +5336,19 @@ async def _refresh_stale_web_action_before_dispatch(
         {**fresh_element, "page_url": fresh_url} if isinstance(fresh_element, dict) else {"page_url": fresh_url}
     )
     return fresh_scraped_page, action
+
+
+async def _document_continuity(scraped_page: ScrapedPage, page: Page) -> bool | None:
+    """Return whether the live page still has the batch's original document.
+
+    ``None`` is deliberately indeterminate: destroyed execution contexts and failed probes must
+    fall through to the legacy dispatch path rather than being treated as continuity.
+    """
+    stored_loader_id = getattr(scraped_page, "_document_loader_id", None)
+    if stored_loader_id is None:
+        return None
+    current_loader_id = await get_main_document_loader_id(page)
+    return current_loader_id == stored_loader_id if current_loader_id is not None else None
 
 
 @traced(name="skyvern.agent.action.solve_captcha")
@@ -5709,6 +6216,13 @@ async def handle_click_action(
         return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
         incremental_scraped: IncrementalScrapePage | None = None
+        # Inside a file-download block, a non-download click authorized as a false-click candidate can
+        # still mint the file. If it does, the post-click dropdown/custom-select rescrape below is dead
+        # work that costs ~90-120s; observing the download lets us skip straight to the click result.
+        false_click_download_observed: asyncio.Event | None = (
+            asyncio.Event() if _false_click_download_eligible.get() else None
+        )
+        remove_download_probe: Callable[[], None] | None = None
         try:
             engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
             skyvern_frame = await SkyvernFrame.create_instance(
@@ -5719,6 +6233,8 @@ async def handle_click_action(
                 engine_selection=engine_selection,
             )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+            if false_click_download_observed is not None:
+                remove_download_probe = _register_false_click_download_probe(page, false_click_download_observed)
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
             results = await chain_click(
@@ -5738,11 +6254,36 @@ async def handle_click_action(
                 return results
 
             try:
+                if false_click_download_observed is not None and false_click_download_observed.is_set():
+                    LOG.info(
+                        "Same-action download observed for a file-download click; bypassing dropdown rescrape",
+                        element_id=skyvern_element.get_id(),
+                    )
+                    return results
+
                 if has_onclick_attr:
                     LOG.info(
                         "The element has onclick attribute, waiting for 1 second to load new elements", action=action
                     )
                     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="click.onclick")
+
+                if false_click_download_observed is not None:
+                    # Browser.downloadWillBegin can arrive on a later loop turn, just after the
+                    # click await resolves; give the real probe event a narrow admission window
+                    # before paying for the sequential rescrape.
+                    try:
+                        await asyncio.wait_for(
+                            false_click_download_observed.wait(),
+                            timeout=BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    if false_click_download_observed.is_set():
+                        LOG.info(
+                            "Late same-action download observed for a file-download click; bypassing dropdown rescrape",
+                            element_id=skyvern_element.get_id(),
+                        )
+                        return results
 
                 if sequential_click_result := await handle_sequential_click_with_submit_bypass(
                     action=action,
@@ -5773,6 +6314,8 @@ async def handle_click_action(
                 return results
 
         finally:
+            if remove_download_probe is not None:
+                remove_download_probe()
             if incremental_scraped:
                 try:
                     await incremental_scraped.stop_listen_dom_increment()
@@ -7147,6 +7690,7 @@ async def _handle_input_text_action(
                     task=task,
                     action=action,
                     collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
+                    is_secret_value=is_secret_value,
                 ):
                     auto_complete_hacky_flag = False
                     return [result]
@@ -7271,7 +7815,18 @@ async def _handle_input_text_action(
                 )
                 if fill_atomically:
                     await skyvern_element.refresh_locator_if_stale()
-                    await skyvern_element.input_fill(text)
+                    try:
+                        await skyvern_element.input_fill(text)
+                    except Exception as fill_error:
+                        # A field scraped as text but live type=date rejects a locale value here; recover in
+                        # canonical form from the live DOM, else re-raise so an ambiguous or non-date failure
+                        # keeps its existing semantics.
+                        if (
+                            await _recover_atomic_fill_as_live_date(skyvern_element, text, fill_error, engine_selection)
+                            is None
+                        ):
+                            raise
+                        return [ActionSuccess()]
                 else:
                     await skyvern_element.input_sequentially(text=text)
                     # The residual per-character seam can still lose a leading prefix on a caret-resetting
@@ -9576,6 +10131,8 @@ async def choose_auto_completion_dropdown(
     is_location_input: bool = False,
     collapse_autocomplete_fanout_enabled: bool = False,
     action: InputTextAction | None = None,
+    *,
+    is_secret_value: bool,
 ) -> AutoCompletionResult:
     preserved_elements = preserved_elements or []
     clear_input = True
@@ -9898,8 +10455,20 @@ async def choose_auto_completion_dropdown(
             static_element=incremental_scraped.id_to_element_dict.get(element_id, {}),
             engine_selection=engine_selection,
         )
-        await selected_element.scroll_into_view()
-        await selected_element.click(page=page, engine_selection=engine_selection)
+
+        async def _click_selected_option() -> None:
+            await selected_element.scroll_into_view()
+            await selected_element.click(page=page, engine_selection=engine_selection)
+
+        result.action_result = await _click_autocomplete_option_with_commit_evidence(
+            skyvern_element=skyvern_element,
+            option_locator=locator,
+            option_static_element=incremental_scraped.id_to_element_dict.get(element_id),
+            skyvern_frame=skyvern_frame,
+            click=_click_selected_option,
+            is_secret_value=is_secret_value,
+            engine_selection=engine_selection,
+        )
         clear_input = False
         return result
 
@@ -9952,6 +10521,8 @@ async def input_or_auto_complete_input(
     task: Task,
     action: InputTextAction | None = None,
     collapse_autocomplete_fanout_enabled: bool = False,
+    *,
+    is_secret_value: bool,
 ) -> ActionResult | None:
     LOG.info(
         "Trigger auto completion",
@@ -9993,9 +10564,10 @@ async def input_or_auto_complete_input(
             is_location_input=is_location,
             collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
             action=action,
+            is_secret_value=is_secret_value,
         )
         if isinstance(result.action_result, ActionSuccess):
-            return ActionSuccess()
+            return result.action_result
 
         if input_or_select_context.is_search_bar:
             LOG.info(
@@ -10061,9 +10633,10 @@ async def input_or_auto_complete_input(
                 is_location_input=is_location,
                 collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
                 action=action,
+                is_secret_value=is_secret_value,
             )
             if isinstance(result.action_result, ActionSuccess):
-                return ActionSuccess()
+                return result.action_result
 
             tried_values.append(value)
             whole_new_elements.extend(result.incremental_elements)
@@ -10743,7 +11316,7 @@ _SELECTED_LABEL_PREFIXES = ("selected ", "selected:")
 
 _CUSTOM_SELECT_MATCHED_STATE_JS = r"""
 (el) => {
-    const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const label = [
         el.textContent,
         el.getAttribute("aria-label"),
@@ -10781,7 +11354,7 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
     const anchorIsComboboxInput = args.anchorIsComboboxInput;
     const allowAriaSelectedOptionTokens = args.allowAriaSelectedOptionTokens !== false;
     const allowSingleValueScope = args.allowSingleValueScope === true;
-    const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const splitValues = (value) => {
         const normalized = normalize(value);
         if (!normalized) return [];
@@ -10969,6 +11542,20 @@ def _custom_select_matched_state_confirms_pre_click(state: dict | None, expected
     if str(state.get("role") or "").lower() == "option" and not bool(state.get("inMultiselectable")):
         return False
     return bool(state.get("ariaSelected"))
+
+
+async def _custom_select_committed_readback_confirms(
+    selected_element: SkyvernElement, requested_value: str | None
+) -> bool:
+    # A strict scope read can miss a commit the chosen option itself reflects, so re-read the option's
+    # own matched state before ownership recovery. Exact normalized label plus a committed signal only:
+    # a bare single-select highlight, a mismatch, or an unreadable state is never success (SKY-14909).
+    expected_label = _normalize_select_shadow_text(requested_value)
+    if not expected_label:
+        return False
+    return _custom_select_matched_state_confirms_pre_click(
+        await _read_custom_select_matched_state(selected_element), expected_label
+    )
 
 
 async def _custom_select_scope_confirms_committed(
@@ -11623,6 +12210,42 @@ def _matching_custom_select_anchor_ids(
     ]
 
 
+def _collect_subtree_element_ids(subtrees: list[dict]) -> list[str]:
+    ids: list[str] = []
+    stack = list(subtrees)
+    while stack:
+        node = stack.pop()
+        node_id = node.get("id")
+        if node_id:
+            ids.append(str(node_id))
+        stack.extend(node.get("children", []) or [])
+    return ids
+
+
+def _resolve_already_open_owned_listbox(
+    *,
+    current_element_id: str,
+    scraped_page_after_open: ScrapedPage,
+) -> tuple[str, list[dict]] | None:
+    """Resolve the anchor's single aria-owned listbox when the strict new-element diff is empty
+    because the combobox was already open.
+
+    Returns ``(anchor_id, owned_subtrees)`` only when the anchor is a ``role=combobox`` that is
+    currently ``aria-expanded=true`` and uniquely owns exactly one listbox subtree; otherwise
+    ``None`` so the caller stays fail-closed and raises no-incremental.
+    """
+    original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
+    if original_anchor is None:
+        return None
+    attributes = original_anchor.get("attributes") or {}
+    if str(attributes.get("aria-expanded") or "").lower() != "true":
+        return None
+    return _resolve_owned_custom_select_recovery(
+        original_anchor=original_anchor,
+        refreshed_page=scraped_page_after_open,
+    )
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -11656,7 +12279,26 @@ async def select_from_emerging_elements(
     ]
 
     if len(new_interactable_element_ids) == 0:
-        raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+        already_open = _resolve_already_open_owned_listbox(
+            current_element_id=current_element_id,
+            scraped_page_after_open=scraped_page_after_open,
+        )
+        if already_open is None:
+            raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+        _anchor_id, owned_subtrees = already_open
+        new_element_ids = set(_collect_subtree_element_ids(owned_subtrees))
+        new_interactable_element_ids = [
+            element_id
+            for element_id in new_element_ids
+            if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+        ]
+        if len(new_interactable_element_ids) == 0:
+            raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+        LOG.info(
+            "Custom-select combobox already open; selecting from its aria-owned listbox",
+            current_element_id=current_element_id,
+            owned_option_count=len(new_interactable_element_ids),
+        )
 
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
@@ -11840,7 +12482,11 @@ async def select_from_emerging_elements(
 
     original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
     await selected_element.scroll_into_view()
-    await selected_element.click(page=page, engine_selection=engine_selection)
+    await selected_element.click(
+        page=page,
+        engine_selection=engine_selection,
+        intercept_js_fallback_label=requested_value,
+    )
     readback_scope_element = await _resolve_custom_select_readback_scope_element(
         get_readback_scope_element=get_readback_scope_element,
         target_value=options.target_value or "",
@@ -11901,6 +12547,21 @@ async def select_from_emerging_elements(
     try:
         refreshed_page = await scraped_page_after_open.generate_scraped_page_without_screenshots()
         refreshed_dom = DomUtil(scraped_page=refreshed_page, page=page, engine_selection=engine_selection)
+        # A strict scope verify can read not-committed while the chosen option itself reflects the commit;
+        # honor that BEFORE any ownership-dependent branch (missing, ambiguous, or no owned listbox) so a
+        # set field is not failed just because recovery ownership cannot be resolved.
+        if await _custom_select_committed_readback_confirms(selected_element, requested_value):
+            _log_custom_select_verification_outcome(
+                "Custom-select committed readback outcome",
+                phase="committed_readback",
+                settles=recovery_settles,
+                committed=True,
+                verification_branch="matched_state",
+                verification_reason="committed_readback",
+                recovery_attempted=False,
+                recovery_succeeded=False,
+            )
+            return ActionSuccess()
         ownership = _custom_select_anchor_ownership(original_anchor)
         if ownership is None:
             raise ValueError("Custom-select recovery ownership is missing")
@@ -12935,7 +13596,7 @@ def _schedule_extraction_shadow_check_for_hit(
         )
         # Apply the same post-processing the miss path applies so the
         # comparison is apples-to-apples against the cached value.
-        if shadow_schema:
+        if shadow_schema and extraction_shape_matches(fresh, shadow_schema):
             fresh = validate_and_fill_extraction_result(
                 extraction_result=fresh,
                 schema=shadow_schema,
@@ -13298,8 +13959,11 @@ async def extract_information_for_navigation_goal(
         system_prompt=task.workflow_system_prompt,
     )
 
-    # Validate and fill missing fields based on schema
-    if task.extracted_information_schema:
+    # Fill fields only after the model has produced the schema's root shape.
+    # Otherwise `fill_missing_fields` replaces a populated but mismatched
+    # response with an all-default stub (for example, `{"records": []}`),
+    # which makes an extraction failure look like authoritative empty data.
+    if task.extracted_information_schema and extraction_shape_matches(json_response, task.extracted_information_schema):
         json_response = validate_and_fill_extraction_result(
             extraction_result=json_response,
             schema=task.extracted_information_schema,
@@ -13401,20 +14065,25 @@ async def click_listbox_option(
 
 
 async def get_input_value(
-    tag_name: str, locator: Locator, engine_selection: BrowserEngineSelection | None = None
+    tag_name: str,
+    locator: Locator,
+    engine_selection: BrowserEngineSelection | None = None,
+    read_timeout_ms: float | None = None,
 ) -> str | None:
     # input_value() rejects non-<input>/<textarea>/<select> nodes and inner_text() rejects
     # non-HTMLElement nodes; the live node can disagree with the scraped tag_name after a
     # re-render. Treat an incompatible read as "value unknown" so the caller's own
     # element-type classification runs instead of a raw driver exception escaping here. The
     # incompatible-node identity is matched against THIS run's selected engine; missing selection
-    # keeps the stock Playwright identity (unchanged default).
+    # keeps the stock Playwright identity (unchanged default). read_timeout_ms is opt-in: when unset
+    # the read keeps Playwright's default wait; callers that must not stall pass an explicit bound.
+    read_kwargs = {} if read_timeout_ms is None else {"timeout": read_timeout_ms}
     try:
         if tag_name in COMMON_INPUT_TAGS:
-            return await locator.input_value()
+            return await locator.input_value(**read_kwargs)
         # for span, div, p or other tags:
         # we need to trim the unicode space for these tags
-        return (await locator.inner_text()).replace("\xa0", " ").strip()
+        return (await locator.inner_text(**read_kwargs)).replace("\xa0", " ").strip()
     except Exception as exc:
         if not _is_selected_engine_error(exc, engine_selection):
             raise

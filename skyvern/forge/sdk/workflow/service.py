@@ -54,7 +54,6 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
-    BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
     InProcessScriptExecutionDenied,
@@ -152,7 +151,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     compute_conditional_scopes,
     get_all_blocks,
     resolve_conditional_merge_edges,
-    run_is_eligible_for_v3_ab,
+    v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -480,17 +479,6 @@ _WORKFLOW_RUN_ESCAPED_EXCEPTION_FAILURE_CATEGORY = [
     }
 ]
 
-# Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
-# run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
-CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
-# Wall clock, not an attempt count: a waiting run holds a whole worker pod
-# (max_concurrent_activities=1), so what has to stay bounded is the time pinned, whatever the
-# per-attempt startup deadline happens to be.
-CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS = 90.0
-# Bounds the run-end close of an auto-provisioned CodeBlock session so a slow close cannot pin
-# the worker pod; on timeout the session timeout above still reaps the session.
-CODE_BLOCK_SESSION_CLOSE_TIMEOUT_SECONDS = 30.0
-
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
 # dashboards key on these strings — do not rename without updating monitors.
@@ -625,6 +613,7 @@ UNBOUNDED_BLOCK_TEXT_LIST_FIELDS = (
 UNBOUNDED_BLOCK_TEXT_FIELDS = (
     "description",
     "failure_reason",
+    "finish_reason",
     "navigation_goal",
     "data_extraction_goal",
     "terminate_criterion",
@@ -937,17 +926,18 @@ def truncate_oversized_response_value(
 
 @dataclass(frozen=True)
 class DebugSessionProfileDecision:
-    """Asymmetric decision for LoginBlock credential-profile flow.
+    """Decision for LoginBlock credential-profile flow.
 
     attach_browser_session_id: the PBS id to thread into
-        BROWSER_MANAGER.get_or_create_for_workflow_run so the visible browser
-        is the one the agent acts on. None for non-debug runs (preserve
-        existing behavior — credential-profile launches a fresh browser).
+        BROWSER_MANAGER.get_or_create_for_workflow_run so the visible/supplied
+        browser is the one the agent acts on. None when the run has no explicit
+        browser_session_id (preserve existing behavior — credential-profile
+        launches a fresh browser).
 
-    incompatible_reason: None when compatible / non-debug; otherwise the
-        structured reason for the warning emit. Callers branch on this:
+    incompatible_reason: None when compatible / no explicit session; otherwise
+        the structured reason for the warning emit. Callers branch on this:
         None → take the existing skip-login fast path, set → emit the
-        structured warning, attach the PBS, fall through to ordinary login.
+        structured warning, attach the session, fall through to ordinary login.
     """
 
     attach_browser_session_id: str | None
@@ -1687,35 +1677,34 @@ class WorkflowService:
         self,
         *,
         organization_id: str,
-        candidates: Sequence[WorkflowScript],
+        workflow_permanent_id: str,
         block_labels_to_disable: Sequence[str],
     ) -> tuple[list[CachedScriptBlocks], list[CachedScriptBlocks]]:
-        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared."""
+        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared.
+
+        Looks up matching blocks by label directly in SQL (``get_cached_block_groups_by_labels``)
+        rather than loading every cached script for the workflow — some workflows accumulate tens
+        of thousands of cached scripts, and loading them all to filter in Python made saves time
+        out (SKY-15102).
+        """
         cached_groups: list[CachedScriptBlocks] = []
         published_groups: list[CachedScriptBlocks] = []
-        target_labels = set(block_labels_to_disable)
         seen_group_keys: set[tuple[ScriptStatus | str, str, tuple[str, ...]]] = set()
 
-        scripts_by_id = await app.DATABASE.scripts.get_latest_scripts_by_ids(
+        rows = await app.DATABASE.scripts.get_cached_block_groups_by_labels(
             organization_id=organization_id,
-            script_ids=[candidate.script_id for candidate in candidates],
-        )
-        blocks_by_revision = await app.DATABASE.scripts.get_script_blocks_by_script_revision_ids(
-            organization_id=organization_id,
-            script_revision_ids=[script.script_revision_id for script in scripts_by_id.values()],
+            workflow_permanent_id=workflow_permanent_id,
+            block_labels=block_labels_to_disable,
         )
 
-        for candidate in candidates:
-            script = scripts_by_id.get(candidate.script_id)
-            if not script:
-                continue
+        blocks_by_candidate: dict[str, list[Any]] = {}
+        candidate_by_id: dict[str, tuple[Any, Any]] = {}
+        for workflow_script, script, script_block in rows:
+            blocks_by_candidate.setdefault(workflow_script.workflow_script_id, []).append(script_block)
+            candidate_by_id[workflow_script.workflow_script_id] = (workflow_script, script)
 
-            script_blocks = blocks_by_revision.get(script.script_revision_id, [])
-            blocks_to_clear = [
-                block for block in script_blocks if block.script_block_label in target_labels and block.run_signature
-            ]
-            if not blocks_to_clear:
-                continue
+        for workflow_script_id, (candidate, script) in candidate_by_id.items():
+            blocks_to_clear = blocks_by_candidate[workflow_script_id]
 
             group_key = (
                 candidate.status,
@@ -2201,6 +2190,38 @@ class WorkflowService:
             if isinstance(parameter, CredentialParameter)
             and (bool(parameter.credential_ids) or bool(parameter.fallback_credential_ids))
         ]
+
+    def _rotating_credential_profile_segment(self, workflow: Workflow, parameter_values: dict[str, Any]) -> str | None:
+        """Segment folded into a managed browser profile's key so each credential in a rotation pool
+        gets its own profile automatically, even when browser_profile_key doesn't reference it or
+        isn't set (SKY-15192). Reads the resolved selection already in parameter_values; a parameter
+        with no resolved selection (fail-open legacy pool) is skipped, not guessed. Joining multiple
+        selections with "," is unambiguous because a resolved value is always a generate_credential_id
+        row (cred_<int>), never free text that could itself contain a comma."""
+        segments = [
+            selected
+            for parameter in self._get_rotating_credential_parameters(workflow)
+            if isinstance(selected := parameter_values.get(parameter.key), str) and selected
+        ]
+        return ",".join(segments) or None
+
+    def _managed_browser_profile_digest_key(
+        self, workflow: Workflow, parameter_values: dict[str, Any], rendered_key: str | None
+    ) -> tuple[str | None, str | None]:
+        """(digest_key, credential_segment) for a managed browser profile. rendered_key is an
+        unrestricted Jinja render of workflow-parameter values (browser_profile_key.py) — it can
+        contain any character, so joining it with credential_segment by a plain delimiter would let
+        two different (key, credential) pairs collide onto the same digest (e.g. key renders
+        "acct|1" with no credential vs. key "acct" with credential "1"). Collapse rendered_key to its
+        fixed-width digest before combining, so the split point is never ambiguous. When the two are
+        already identical (the customer's key already IS the credential value), skip combining
+        entirely and keep today's exact digest rather than gratuitously reseeding."""
+        credential_segment = self._rotating_credential_profile_segment(workflow, parameter_values)
+        if not credential_segment or rendered_key == credential_segment:
+            return rendered_key or credential_segment, credential_segment
+        if not rendered_key:
+            return credential_segment, credential_segment
+        return f"{build_browser_profile_key_digest(rendered_key)}:{credential_segment}", credential_segment
 
     def _get_run_credential_parameter_overrides(
         self,
@@ -3320,14 +3341,21 @@ class WorkflowService:
                 browser_profile_key=workflow.browser_profile_key,
             )
             rendered_key = None
-        digest = build_browser_profile_key_digest(rendered_key)
+        digest_key, credential_segment = self._managed_browser_profile_digest_key(
+            workflow, parameter_values, rendered_key
+        )
+        digest = build_browser_profile_key_digest(digest_key)
         profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
             organization_id=workflow_run.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             browser_profile_key_digest=digest,
-            name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+            name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
         )
-        if created:
+        # A credential-segmented profile has no legacy counterpart (the wpid_ archive predates
+        # per-credential rotation and was never scoped to one credential) — seeding it would risk
+        # loading a different credential's saved state onto this one, the exact bug this segment
+        # exists to prevent. Skip seeding; the profile just starts empty and accumulates normally.
+        if created and not credential_segment:
             try:
                 await self._seed_managed_browser_profile_from_legacy_session(
                     workflow=workflow,
@@ -3523,23 +3551,30 @@ class WorkflowService:
             if not workflow.persist_browser_session or workflow_request.browser_profile_id:
                 return None
 
+            parameter_values = self._profile_key_render_values(workflow, workflow_request)
+            if extra_parameter_values:
+                parameter_values.update(extra_parameter_values)
+
             rendered_key = None
             if workflow.browser_profile_key:
-                parameter_values = self._profile_key_render_values(workflow, workflow_request)
-                if extra_parameter_values:
-                    parameter_values.update(extra_parameter_values)
                 rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
                 if not rendered_key:
                     return None
 
-            digest = build_browser_profile_key_digest(rendered_key)
+            digest_key, credential_segment = self._managed_browser_profile_digest_key(
+                workflow, parameter_values, rendered_key
+            )
+            digest = build_browser_profile_key_digest(digest_key)
             profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 browser_profile_key_digest=digest,
-                name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+                name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
             )
-            if created:
+            # See _ensure_managed_browser_profile: a credential-segmented profile has no legacy
+            # counterpart, so seeding it from the un-credentialed archive would risk leaking a
+            # different credential's saved state onto it.
+            if created and not credential_segment:
                 try:
                     await self._seed_managed_browser_profile_from_legacy_session(
                         workflow=workflow,
@@ -3802,123 +3837,6 @@ class WorkflowService:
             organization_id=organization_id,
         )
         return bool(profile and profile.is_managed)
-
-    async def auto_create_browser_session_for_code_block_if_needed(
-        self,
-        organization_id: str,
-        workflow: Workflow,
-        *,
-        workflow_run_id: str,
-        browser_session_id: str | None = None,
-        browser_profile_id: str | None = None,
-        proxy_location: ProxyLocationInput = None,
-    ) -> PersistentBrowserSession | None:
-        """Auto-provision a persistent browser session for runs that contain a CodeBlock.
-
-        The secure CodeBlock runner brokers page operations against a live persistent browser
-        session, so a CodeBlock with no caller-supplied session would otherwise fall back to
-        the legacy in-process executor. When the org is enabled for the secure runner, provision
-        a session here so the CodeBlock routes to the runner. A run's browser_profile_id is loaded
-        into the session so profile-backed CodeBlock workflows still reach the runner. Returns None
-        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, or a
-        session was already supplied. Session-creation failure propagates: an enrolled run must fail
-        closed rather than silently downgrade its code to in-process execution.
-        """
-        if browser_session_id:  # the caller supplied a session; respect it unchanged
-            return None
-
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        if not any(block.block_type == BlockType.CODE for block in all_blocks):
-            return None
-
-        should_create = await app.AGENT_FUNCTION.should_auto_create_browser_session_for_code_block(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            workflow_id=workflow.workflow_id,
-        )
-        if not should_create:
-            return None
-
-        try:
-            browser_session = await self._create_code_block_browser_session(
-                organization_id=organization_id,
-                browser_profile_id=browser_profile_id,
-                proxy_location=proxy_location,
-                workflow_run_id=workflow_run_id,
-            )
-        except Exception:
-            LOG.error(
-                "Failed to auto-create browser session for CodeBlock run; failing the run closed",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                exc_info=True,
-            )
-            raise
-
-        LOG.info(
-            "Auto-created browser session for CodeBlock run",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            browser_session_id=browser_session.persistent_browser_session_id,
-        )
-        return browser_session
-
-    async def _create_code_block_browser_session(
-        self,
-        *,
-        organization_id: str,
-        browser_profile_id: str | None,
-        proxy_location: ProxyLocationInput,
-        workflow_run_id: str,
-    ) -> PersistentBrowserSession:
-        """Create the CodeBlock session, retrying only a startup timeout.
-
-        A startup timeout means the session fleet had no free capacity inside the deadline,
-        not that the request was invalid — the fleet scales on demand, so a fresh attempt
-        often lands on pods that came up just after the previous deadline expired. Every
-        other failure is deterministic, so retrying it only delays the run.
-
-        Retrying is bounded by wall clock rather than by attempts because the waiting run
-        occupies a whole worker pod, and it does so during exactly the capacity crunch that
-        causes the timeout — so the cost to bound is time held, not requests made.
-        """
-        deadline = time.monotonic() + CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                    organization_id=organization_id,
-                    timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
-                    browser_profile_id=browser_profile_id,
-                    proxy_location=proxy_location,
-                    inherit_profile_proxy=True,
-                    workflow_run_id=workflow_run_id,
-                )
-            except BrowserSessionStartupTimeout:
-                if time.monotonic() >= deadline:
-                    raise
-                # A cancel can land while we wait. Provisioning another billed session for a
-                # run that already finished helps nobody and deepens the shortage.
-                workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
-                if workflow_run.status.is_final():
-                    LOG.info(
-                        "Workflow run reached a final state while its CodeBlock session was starting; not retrying",
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                        workflow_status=workflow_run.status,
-                    )
-                    raise
-                LOG.warning(
-                    "Browser session for CodeBlock run timed out starting; retrying",
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    attempt=attempt,
-                    budget_seconds=CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS,
-                )
 
     @staticmethod
     async def _close_reused_session_best_effort(*, organization_id: str, session_id: str) -> None:
@@ -5022,7 +4940,6 @@ class WorkflowService:
                 return workflow_run
 
         browser_session = None
-        code_block_browser_session_id: str | None = None
         using_managed_browser_profile = await self._browser_profile_is_managed(
             organization_id=organization.organization_id,
             browser_profile_id=browser_profile_id,
@@ -5035,49 +4952,6 @@ class WorkflowService:
                 browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
                 proxy_location=workflow_run.proxy_location,
             )
-
-        # The CodeBlock auto-PBS path is intentionally NOT gated on browser_profile_id: a
-        # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
-        # profile is loaded into the auto-created session instead of skipping it.
-        if browser_session is None and browser_session_id is None:
-            # The helper raises only for a secure-runner-enrolled run whose session could not be
-            # created; letting that run continue would silently execute its code in-process instead
-            # of the sandbox, so fail closed like the sidecar-absent posture.
-            try:
-                browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
-                    organization.organization_id,
-                    workflow,
-                    workflow_run_id=workflow_run_id,
-                    browser_session_id=browser_session_id,
-                    browser_profile_id=browser_profile_id,
-                    proxy_location=workflow_run.proxy_location,
-                )
-            except Exception as e:
-                failure_reason = (
-                    "Failed to create the browser session required for secure code execution: "
-                    f"{get_user_facing_exception_message(e)}"
-                )
-                # Conditional: a cancel can land while the session is still starting, and an
-                # unconditional write would overwrite that terminal status with ``failed``.
-                workflow_run = (
-                    await self.mark_workflow_run_as_failed_if_not_final(
-                        workflow_run_id=workflow_run_id, failure_reason=failure_reason
-                    )
-                    or workflow_run
-                )
-                await self.clean_up_workflow(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    api_key=api_key,
-                    browser_session_id=browser_session_id,
-                    close_browser_on_completion=close_browser_on_completion,
-                    need_call_webhook=need_call_webhook,
-                )
-                return workflow_run
-            # A session set here came from the CodeBlock helper — the one session this run owns
-            # and must close at cleanup.
-            if browser_session is not None:
-                code_block_browser_session_id = browser_session.persistent_browser_session_id
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -5103,11 +4977,20 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                 )
             except Exception as e:
-                LOG.exception(
-                    "Failed to begin browser session for workflow run",
-                    browser_session_id=browser_session_id,
-                    workflow_run_id=workflow_run_id,
-                )
+                # An expired session is the caller's to resolve, and the run record already carries
+                # the same message as failure_reason. Every other lease failure keeps its traceback.
+                if isinstance(e, BrowserSessionClosed):
+                    LOG.warning(
+                        "Browser session expired before the workflow run could lease it",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                else:
+                    LOG.exception(
+                        "Failed to begin browser session for workflow run",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                    )
                 failure_reason = (
                     f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
                 )
@@ -5122,7 +5005,6 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=close_browser_on_completion,
                     need_call_webhook=need_call_webhook,
-                    code_block_browser_session_id=code_block_browser_session_id,
                 )
                 return workflow_run
             # Start background task to periodically renew the browser session
@@ -5620,7 +5502,6 @@ class WorkflowService:
                 browser_persistence_status=browser_persistence_status,
                 skip_browser_session_write_back=browser_write_back_exhausted,
                 schedule_credential_fallback_retry=not finally_block_set_terminal_outcome,
-                code_block_browser_session_id=code_block_browser_session_id,
             )
 
         return workflow_run
@@ -5689,6 +5570,9 @@ class WorkflowService:
         workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
+        run_context_for_selection = skyvern_context.current()
+        if run_context_for_selection is not None:
+            run_context_for_selection.run_block_labels = block_labels
 
         # Load script blocks if script is provided
         script_blocks_by_label: dict[str, Any] = {}
@@ -5699,7 +5583,7 @@ class WorkflowService:
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
         # Resolve the workflow-block engine A/B once, before any block runs: eligibility is a
-        # property of the whole run (see run_is_eligible_for_v3_ab), and every block of a run must
+        # property of the whole run (see v3_ab_ineligibility_reason), and every block of a run must
         # share an arm. Covers the DAG executor too, which this method delegates to.
         current_context = skyvern_context.current()
         if current_context:
@@ -5708,7 +5592,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
-                run_is_eligible=run_is_eligible_for_v3_ab(all_blocks, is_script_run=is_script_run),
+                ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
             )
         else:
             LOG.warning(
@@ -7256,14 +7140,14 @@ class WorkflowService:
             )
 
             if decision.incompatible_reason is not None:
-                # Debug session whose visible PBS is profile-incompatible.
-                # Stream fidelity wins: attach the visible PBS so the user
-                # can watch the action, but DO NOT write
+                # The run's explicit browser session is profile-incompatible.
+                # Live-session fidelity wins: attach that session so the run (or
+                # the user watching a debug session) sees it, but DO NOT write
                 # workflow_run.browser_profile_id, DO NOT rewrite the
                 # navigation_goal, and DO NOT emit "skipping login agent".
                 # Fall through to ordinary LoginBlock execution below.
                 LOG.warning(
-                    "Debug session profile incompatible with LoginBlock credential",
+                    "Explicit browser session profile incompatible with LoginBlock credential",
                     code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
                     reason=decision.incompatible_reason,
                     workflow_run_id=workflow_run_id,
@@ -7758,16 +7642,13 @@ class WorkflowService:
         resolved_browser_profile_id: str,
         organization_id: str,
     ) -> DebugSessionProfileDecision:
-        """Asymmetric LoginBlock credential-profile decision: debug-session runs
-        attach the visible PBS only when its saved profile matches the credential
-        profile; mismatches surface a reason for downstream warning + fall-through."""
-        is_debug_run = workflow_run.is_debug_session
-        if not is_debug_run:
-            return DebugSessionProfileDecision(
-                attach_browser_session_id=None,
-                incompatible_reason=None,
-            )
-
+        """LoginBlock credential-profile decision: a run with an explicit
+        browser_session_id (a debug session, or one supplied by a caller such as
+        MCP's skyvern_login) attaches that live session and only skips the
+        login agent when its saved profile matches the credential profile;
+        mismatches surface a reason for downstream warning + fall-through. A
+        run with no explicit session keeps the legacy behavior: the credential
+        profile boots a fresh browser."""
         if not browser_session_id:
             return DebugSessionProfileDecision(
                 attach_browser_session_id=None,
@@ -8874,15 +8755,11 @@ class WorkflowService:
                 previous_blocks=current_definition.get("blocks", []),
                 new_blocks=new_definition.get("blocks", []),
             )
-            candidates = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
-                organization_id=organization_id,
-                workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-            )
 
             if plan.has_targets:
                 cached_groups, published_groups = await self._partition_cached_blocks(
                     organization_id=organization_id,
-                    candidates=candidates,
+                    workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
                     block_labels_to_disable=plan.block_labels_to_disable,
                 )
 
@@ -8943,7 +8820,10 @@ class WorkflowService:
                 )
                 return
 
-            to_delete = candidates
+            to_delete = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
+                organization_id=organization_id,
+                workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+            )
 
             if len(to_delete) > 0:
                 try:
@@ -10245,6 +10125,7 @@ class WorkflowService:
     async def get_output_parameter_workflow_run_output_parameter_tuples(
         workflow_id: str,
         workflow_run_id: str,
+        workflow: Workflow | None = None,
     ) -> list[tuple[OutputParameter, WorkflowRunOutputParameter]]:
         workflow_run_output_parameters = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
             workflow_run_id=workflow_run_id
@@ -10256,11 +10137,18 @@ class WorkflowService:
             ]
         )
 
+        output_parameters_by_id = {
+            output_parameter.output_parameter_id: output_parameter for output_parameter in output_parameters
+        }
+        if workflow is not None:
+            for parameter in workflow.workflow_definition.parameters:
+                if isinstance(parameter, OutputParameter):
+                    output_parameters_by_id.setdefault(parameter.output_parameter_id, parameter)
+
         return [
-            (output_parameter, workflow_run_output_parameter)
+            (output_parameters_by_id[workflow_run_output_parameter.output_parameter_id], workflow_run_output_parameter)
             for workflow_run_output_parameter in workflow_run_output_parameters
-            for output_parameter in output_parameters
-            if output_parameter.output_parameter_id == workflow_run_output_parameter.output_parameter_id
+            if workflow_run_output_parameter.output_parameter_id in output_parameters_by_id
         ]
 
     async def get_last_task_for_workflow_run(self, workflow_run_id: str) -> Task | None:
@@ -10649,7 +10537,9 @@ class WorkflowService:
                 workflow_run_tasks=workflow_run_tasks,
             ),
             self.get_output_parameter_workflow_run_output_parameter_tuples(
-                workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+                workflow_id=workflow_run.workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow=workflow,
             ),
             self._fetch_recording_urls(workflow_run, task_v2, organization_id),
             self._fetch_downloaded_files(workflow_run, task_v2),
@@ -11213,7 +11103,6 @@ class WorkflowService:
         browser_persistence_status: WorkflowRunStatus | None = None,
         skip_browser_session_write_back: bool = False,
         schedule_credential_fallback_retry: bool = True,
-        code_block_browser_session_id: str | None = None,
     ) -> None:
         # Direct cleanup callers can enter with a terminal row. When browser cleanup is still
         # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
@@ -11335,42 +11224,6 @@ class WorkflowService:
             # suppress it because replaying the workflow cannot repair post-run cleanup.
             if schedule_credential_fallback_retry:
                 self._schedule_credential_fallback_retry(workflow_run)
-
-            # A session this run auto-created for its CodeBlock has no owner once the run ends;
-            # caller-supplied sessions are deliberately left open. Positional args: the cloud
-            # manager and the OSS protocol disagree on the second parameter's name.
-            if code_block_browser_session_id:
-                try:
-                    has_active_child_run = False
-                    if child_workflow_run_ids:
-                        child_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
-                            parent_workflow_run_id=workflow_run.workflow_run_id,
-                            organization_id=workflow_run.organization_id,
-                        )
-                        has_active_child_run = any(not child.status.is_final() for child in child_runs)
-                    if has_active_child_run:
-                        # A fire-and-forget child (use_parent_browser_session) may have inherited this
-                        # session; leave it to the session timeout instead of closing it mid-child-run.
-                        LOG.info(
-                            "Skipping CodeBlock browser session close while child workflow runs are active",
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            browser_session_id=code_block_browser_session_id,
-                        )
-                    else:
-                        await asyncio.wait_for(
-                            app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                                workflow_run.organization_id,
-                                code_block_browser_session_id,
-                            ),
-                            timeout=CODE_BLOCK_SESSION_CLOSE_TIMEOUT_SECONDS,
-                        )
-                except Exception:
-                    LOG.warning(
-                        "Failed to close the auto-created CodeBlock browser session",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        browser_session_id=code_block_browser_session_id,
-                        exc_info=True,
-                    )
 
     async def prepare_workflow_webhook(
         self,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,14 +21,22 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     grade_fallback_floor_reached_end_state_criteria,
 )
-from skyvern.forge.sdk.copilot.request_policy import _classifier_fallback_policy, build_classifier_fallback_floor
+from skyvern.forge.sdk.copilot.request_policy import (
+    _classifier_fallback_policy,
+    build_classifier_fallback_floor,
+)
 from skyvern.forge.sdk.copilot.runtime import (
+    OriginRunRedactionRegistry,
     PreRunPageReference,
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
 )
 from skyvern.forge.sdk.copilot.tools import completion as completion_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _extract_credential_ids_from_workflow_definition,
+)
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
     make_completion_criterion,
@@ -518,6 +528,10 @@ def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> S
         pre_run_page_reference=None,
         workflow_verification_evidence=SimpleNamespace(),
         browser_session_id=None,
+        codeblock_redaction_parameters={},
+        origin_run_redaction_registry=None,
+        scouted_credential_field_inventory_by_credential_id={},
+        last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[])),
     )
 
 
@@ -530,6 +544,213 @@ def _snapshot_from_ctx(ctx: SimpleNamespace, run_id: str) -> RunEvidenceSnapshot
         block_output_sources=block_output_sources,
         pre_run_page_reference_text=completion_module._pre_run_page_reference_text(ctx.pre_run_page_reference, run_id),
     )
+
+
+@pytest.mark.asyncio
+async def test_track_a_binds_serialized_redaction_registry_to_origin_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _producer_ctx()
+
+    def serialize(values: dict[str, object]) -> dict[str, object]:
+        return {"account": values["account"]}
+
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(AGENT_FUNCTION=SimpleNamespace(serialize_codeblock_parameters=serialize)),
+    )
+
+    registry = await run_execution_module._bind_origin_run_redaction_registry(
+        ctx,
+        workflow_run_id="wr_origin",
+        parameter_values={"account": "private-value"},
+        credential_ids=[],
+        sensitive_parameter_keys=[],
+    )
+
+    assert registry == OriginRunRedactionRegistry(
+        "wr_origin",
+        {
+            "account": "private-value",
+        },
+        contains_sensitive_values=False,
+        contains_all_sensitive_values=True,
+    )
+    assert ctx.origin_run_redaction_registry is registry
+    assert ctx.codeblock_redaction_parameters == {}
+
+
+def test_origin_run_redaction_registry_defensively_copies_and_exposes_parameters_immutably() -> None:
+    mutable = {"password": "origin-secret", "credential": {"fields": ["username", "password"]}}
+    registry = OriginRunRedactionRegistry(
+        "wr_origin", mutable, contains_sensitive_values=True, contains_all_sensitive_values=True
+    )
+
+    mutable["password"] = "replacement-secret"
+    assert registry.parameters["password"] == "origin-secret"
+    with pytest.raises(TypeError):
+        registry.parameters["password"] = "replacement-secret"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        registry.parameters["credential"]["fields"] = ()  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        registry.parameters["credential"]["fields"].append("otp")  # type: ignore[union-attr]
+    with pytest.raises(FrozenInstanceError):
+        registry.parameters = {}  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_track_a_registry_refuses_credential_run_even_when_scout_values_are_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _producer_ctx()
+    ctx.organization_id = "o_1"
+    ctx.secret_scrub_values = ["scouted-value"]
+    ctx.scouted_credential_field_inventory_by_credential_id = {"cred_origin": frozenset({"password"})}
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(serialize_codeblock_parameters=dict),
+            DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=None))),
+        ),
+    )
+
+    registry = await run_execution_module._bind_origin_run_redaction_registry(
+        ctx,
+        workflow_run_id="wr_origin",
+        parameter_values={"login_credential": "cred_origin"},
+        credential_ids=["cred_origin"],
+        sensitive_parameter_keys=[],
+    )
+
+    assert registry.workflow_run_id == "wr_origin"
+    assert registry.contains_all_sensitive_values is False
+    assert "scouted-value" not in registry.parameters.values()
+    artifacts = [_html_artifact("art_sensitive", ArtifactType.HTML_ACTION)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_sensitive": b"scouted-value"})
+    monkeypatch.setattr(run_execution_module, "_workflow_requires_terminal_artifact_redaction", lambda _: True)
+
+    evidence = await run_execution_module._fetch_dispatched_terminal_page_evidence(
+        run_id="wr_origin",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=registry,
+    )
+
+    assert evidence is None
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_track_a_registry_admits_complete_run_bound_static_credential_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _producer_ctx()
+    ctx.organization_id = "o_1"
+    db_credential = SimpleNamespace(vault_type=None, totp_identifier=None)
+    credential = PasswordCredential(username="private-user", password="private-pass")
+    credential_item = SimpleNamespace(credential=credential)
+    service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
+    process = AsyncMock(return_value=credential_item)
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(
+                serialize_codeblock_parameters=lambda values: values,
+                process_registered_credential_item=process,
+            ),
+            DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=db_credential))),
+            CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: service},
+        ),
+    )
+
+    registry = await run_execution_module._bind_origin_run_redaction_registry(
+        ctx,
+        workflow_run_id="wr_origin",
+        parameter_values={"login_credential": "cred_origin"},
+        credential_ids=["cred_origin"],
+        sensitive_parameter_keys=[],
+    )
+
+    assert registry.contains_all_sensitive_values is True
+    assert registry.parameters["copilot_run_credential_0"]["username"] == "private-user"
+    assert registry.parameters["copilot_run_credential_0"]["password"] == "private-pass"
+    process.assert_awaited_once_with(
+        workflow_run_id="wr_origin",
+        db_credential=db_credential,
+        credential_item=credential_item,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sensitive_terminal_artifact_rejected_when_noncredential_secret_value_is_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _producer_ctx()
+    registry = await run_execution_module._bind_origin_run_redaction_registry(
+        ctx,
+        workflow_run_id="wr_origin",
+        parameter_values={"ordinary": "visible"},
+        credential_ids=[],
+        sensitive_parameter_keys=["aws_secret"],
+    )
+    artifacts = [_html_artifact("art_secret", ArtifactType.HTML_ACTION)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_secret": b"unregistered-origin-secret"})
+    monkeypatch.setattr(run_execution_module, "_workflow_requires_terminal_artifact_redaction", lambda _: True)
+
+    result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
+        run_id="wr_origin",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=registry,
+    )
+
+    assert registry.contains_all_sensitive_values is False
+    assert result is None
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_origin_registry_is_incomplete_when_serializer_omits_resolved_sensitive_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _producer_ctx()
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(AGENT_FUNCTION=SimpleNamespace(serialize_codeblock_parameters=lambda _values: {})),
+    )
+
+    registry = await run_execution_module._bind_origin_run_redaction_registry(
+        ctx,
+        workflow_run_id="wr_origin",
+        parameter_values={"aws_secret": "resolved-secret"},
+        credential_ids=[],
+        sensitive_parameter_keys=["aws_secret"],
+    )
+
+    assert registry.parameters == {}
+    assert registry.contains_all_sensitive_values is False
+
+
+def test_origin_registry_candidate_scan_includes_fallback_credentials() -> None:
+    credential_ids = _extract_credential_ids_from_workflow_definition(
+        {
+            "parameters": [
+                {
+                    "parameter_type": "credential",
+                    "credential_id": "cred_primary",
+                    "credential_ids": ["cred_rotating"],
+                    "fallback_credential_ids": ["cred_fallback"],
+                }
+            ],
+            "blocks": [],
+        }
+    )
+
+    assert credential_ids == ["cred_primary", "cred_rotating", "cred_fallback"]
 
 
 def test_independent_post_run_snapshot_removes_singular_selector_recommendation() -> None:
@@ -583,8 +804,18 @@ def test_pre_run_baseline_provenance_rejects_non_mapping() -> None:
 @pytest.mark.asyncio
 async def test_dispatched_fetch_returns_none_without_artifacts(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_app(monkeypatch, artifacts=[], retrieved={})
+    ctx = _producer_ctx()
     result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
-        run_id="wr_disp", organization_id="o_1", current_url=""
+        run_id="wr_disp",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_disp",
+            ctx.codeblock_redaction_parameters,
+            contains_sensitive_values=False,
+            contains_all_sensitive_values=True,
+        ),
     )
     assert result is None
 
@@ -594,8 +825,18 @@ async def test_dispatched_fetch_skips_oversize_before_retrieval(monkeypatch: pyt
     oversize = run_execution_module._MAX_REGISTERED_ARTIFACT_BYTES + 1
     artifacts = [_html_artifact("art_big", ArtifactType.HTML_ACTION, file_size=oversize)]
     retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_big": _HTML_WITH_VALUE.encode()})
+    ctx = _producer_ctx()
     result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
-        run_id="wr_disp", organization_id="o_1", current_url=""
+        run_id="wr_disp",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_disp",
+            ctx.codeblock_redaction_parameters,
+            contains_sensitive_values=False,
+            contains_all_sensitive_values=True,
+        ),
     )
     assert result is None
     assert retrieved_ids == []
@@ -605,8 +846,15 @@ async def test_dispatched_fetch_skips_oversize_before_retrieval(monkeypatch: pyt
 async def test_dispatched_fetch_rejects_bundled_zip_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_html_artifact("art_zip", ArtifactType.HTML_ACTION)]
     _stub_app(monkeypatch, artifacts, {"art_zip": b"PK\x03\x04 whole zip archive bytes"})
+    ctx = _producer_ctx()
     result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
-        run_id="wr_disp", organization_id="o_1", current_url=""
+        run_id="wr_disp",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_disp", ctx.codeblock_redaction_parameters, False, True
+        ),
     )
     assert result is None
 
@@ -615,8 +863,15 @@ async def test_dispatched_fetch_rejects_bundled_zip_bytes(monkeypatch: pytest.Mo
 async def test_dispatched_fetch_rejects_empty_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_html_artifact("art_empty", ArtifactType.HTML_ACTION)]
     _stub_app(monkeypatch, artifacts, {"art_empty": b""})
+    ctx = _producer_ctx()
     result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
-        run_id="wr_disp", organization_id="o_1", current_url=""
+        run_id="wr_disp",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_disp", ctx.codeblock_redaction_parameters, False, True
+        ),
     )
     assert result is None
 
@@ -625,11 +880,140 @@ async def test_dispatched_fetch_rejects_empty_bytes(monkeypatch: pytest.MonkeyPa
 async def test_dispatched_fetch_parses_terminal_html(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_html_artifact("art_action", ArtifactType.HTML_ACTION)]
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
+    ctx = _producer_ctx()
     result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
-        run_id="wr_disp", organization_id="o_1", current_url=""
+        run_id="wr_disp",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_disp", ctx.codeblock_redaction_parameters, False, True
+        ),
     )
     assert result is not None
     assert "WTR-1842-DEMO" in page_evidence_prose_text(result)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_fetch_scrubs_persisted_terminal_html_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "credential-secret-from-persisted-html"
+    html = f'<html><body><input value="{secret}"><p>{secret}</p></body></html>'
+    artifacts = [_html_artifact("art_secret", ArtifactType.HTML_ACTION)]
+    _stub_app(monkeypatch, artifacts, {"art_secret": html.encode()})
+    seen: list[object] = []
+
+    def scrub(value: object, redaction_parameters: object) -> object:
+        seen.append(value)
+        assert redaction_parameters == {"password": secret}
+        return value.replace(secret, "[REDACTED]") if isinstance(value, str) else value
+
+    ctx = _producer_ctx()
+    ctx.codeblock_redaction_parameters = {"password": secret}
+    run_execution_module.app.AGENT_FUNCTION = SimpleNamespace(redact_codeblock_parameter_values=scrub)
+    monkeypatch.setattr(run_execution_module, "_workflow_requires_terminal_artifact_redaction", lambda _: True)
+
+    result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
+        run_id="wr_disp",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_disp",
+            ctx.codeblock_redaction_parameters,
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=True,
+        ),
+    )
+
+    assert result is not None
+    assert seen == [html]
+    assert secret not in page_evidence_prose_text(result)
+    assert secret not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_fetch_rejects_sensitive_artifact_with_foreign_run_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "credential-secret-from-persisted-html"
+    artifacts = [_html_artifact("art_secret", ArtifactType.HTML_ACTION)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_secret": secret.encode()})
+    ctx = _producer_ctx()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(parameters=[SimpleNamespace(workflow_parameter_type="credential_id")])
+    )
+    monkeypatch.setattr(run_execution_module, "_workflow_requires_terminal_artifact_redaction", lambda _: True)
+
+    result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
+        run_id="wr_origin",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry("wr_foreign", {"password": secret}, True, True),
+    )
+
+    assert result is None
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_dispatched_fetch_rejects_sensitive_artifact_without_registered_secret_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = [_html_artifact("art_secret", ArtifactType.HTML_ACTION)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_secret": b"sensitive page"})
+    ctx = _producer_ctx()
+    monkeypatch.setattr(run_execution_module, "_workflow_requires_terminal_artifact_redaction", lambda _: True)
+
+    result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
+        run_id="wr_origin",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_origin",
+            {"login_credential": "cred_id_only"},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=False,
+        ),
+    )
+
+    assert result is None
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_dispatched_capture_does_not_license_artifact_from_mutable_context_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "origin-secret"
+    artifacts = [_html_artifact("art_secret", ArtifactType.HTML_ACTION)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_secret": secret.encode()})
+    ctx = _producer_ctx(pre_run_prose=None)
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_origin", {"password": secret}, contains_sensitive_values=True, contains_all_sensitive_values=True
+    )
+    monkeypatch.setattr(run_execution_module, "_workflow_requires_terminal_artifact_redaction", lambda _: True)
+
+    async def no_session_evidence(*_: object, **__: object) -> tuple[None, None, None, None]:
+        return None, None, None, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", no_session_evidence)
+
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx,
+        workflow=ctx.last_workflow,
+        run_id="wr_origin",
+        run_session_id="pbs_origin",
+        organization_id="o_1",
+        current_url="",
+        origin_redaction_registry=None,
+    )
+
+    assert retrieved_ids == []
+    assert ctx.composition_page_evidence is None
 
 
 @pytest.mark.asyncio

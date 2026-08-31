@@ -381,10 +381,10 @@ function BrowserSessionStream({
         return;
       }
 
+      const url = `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}${forceCdp ? "&force_cdp=true" : ""}`;
+
       socketRef.current?.close();
-      const socket = new WebSocket(
-        `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}${forceCdp ? "&force_cdp=true" : ""}`,
-      );
+      const socket = new WebSocket(url);
       socketRef.current = socket;
 
       const isCurrentSocket = () => !cancelled && socketRef.current === socket;

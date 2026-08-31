@@ -82,6 +82,9 @@ _OBSERVATION_TOOLS = {
     "select_option",
     "press_key",
     "wait_for_either_state",
+    "skyvern_frame_list",
+    "skyvern_frame_switch",
+    "skyvern_frame_main",
 }
 
 _AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "update_workflow"})

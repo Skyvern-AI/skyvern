@@ -8,18 +8,25 @@ existing ``handle_sequential_click_for_dropdown`` path.
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Callable
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import skyvern.webeye.actions.handler as handler_module
+from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ClickAction
 from skyvern.webeye.actions.handler import (
+    ActionHandler,
     handle_click_action,
     handle_sequential_click_with_submit_bypass,
 )
 from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.utils.dom import SkyvernElement
+from tests.unit.helpers import make_organization, make_step, make_task
 
 
 def _el(*, element_id: str, tag_name: str, attributes: dict | None = None) -> SkyvernElement:
@@ -283,3 +290,327 @@ class TestHandleClickActionIntegration:
         sequential_mock.assert_awaited_once()
         incremental.stop_listen_dom_increment.assert_awaited_once()
         assert isinstance(results[-1], ActionSuccess)
+
+
+class _FakePage:
+    """Minimal Playwright-page stand-in that records event listeners and can emit
+    to them, so a synthesized download during the click window is observable and
+    listener-leak assertions are exact."""
+
+    def __init__(self, url: str = "https://example.com/form") -> None:
+        self.url = url
+        self._listeners: dict[str, list[Callable]] = defaultdict(list)
+
+    def on(self, event: str, callback: Callable) -> None:
+        self._listeners[event].append(callback)
+
+    def off(self, event: str, callback: Callable) -> None:
+        if callback in self._listeners[event]:
+            self._listeners[event].remove(callback)
+
+    remove_listener = off
+
+    async def evaluate(self, *args: object, **kwargs: object) -> bool:
+        return False
+
+    def emit(self, event: str, arg: object) -> None:
+        for callback in list(self._listeners[event]):
+            callback(arg)
+
+    def listener_count(self, event: str) -> int:
+        return len(self._listeners[event])
+
+
+@pytest.fixture
+def false_click_eligible() -> object:
+    token = handler_module._false_click_download_eligible.set(True)
+    yield
+    handler_module._false_click_download_eligible.reset(token)
+
+
+class TestFileDownloadFalseClickBypass:
+    """A file-download block observing a same-action download should skip the expensive
+    post-click dropdown/custom-select rescrape, gated by the ``file_download_false_click_eligible``
+    authority. It must not fabricate download registration and must leak no listeners."""
+
+    def _clickable_element(self) -> SkyvernElement:
+        static = {"id": "E1", "tagName": "button", "attributes": {}}
+        el = SkyvernElement(MagicMock(), MagicMock(), static)
+        el.is_disabled = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        el.scroll_into_view = AsyncMock()  # type: ignore[method-assign]
+        el.get_frame = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+        el.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+        return el
+
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, element: SkyvernElement) -> tuple[AsyncMock, AsyncMock, MagicMock]:
+        dom_mock = MagicMock()
+        dom_mock.get_skyvern_element_by_id = AsyncMock(return_value=element)
+        monkeypatch.setattr(handler_module, "DomUtil", MagicMock(return_value=dom_mock))
+        monkeypatch.setattr(handler_module, "get_or_create_wait_config", AsyncMock(return_value=MagicMock()))
+        monkeypatch.setattr(handler_module, "get_wait_time", MagicMock(return_value=0))
+        monkeypatch.setattr(handler_module.SkyvernFrame, "create_instance", AsyncMock(return_value=MagicMock()))
+
+        incremental = MagicMock()
+        incremental.start_listen_dom_increment = AsyncMock()
+        incremental.stop_listen_dom_increment = AsyncMock()
+        monkeypatch.setattr(handler_module, "IncrementalScrapePage", MagicMock(return_value=incremental))
+
+        chain_click_mock = AsyncMock(return_value=[ActionSuccess()])
+        monkeypatch.setattr(handler_module, "chain_click", chain_click_mock)
+        sequential_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(handler_module, "handle_sequential_click_for_dropdown", sequential_mock)
+        return chain_click_mock, sequential_mock, incremental
+
+    async def _run(self, page: _FakePage) -> list:
+        return await handle_click_action(ClickAction(element_id="E1"), page, MagicMock(), MagicMock(), MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_same_page_download_bypasses_sequential(
+        self, monkeypatch: pytest.MonkeyPatch, false_click_eligible: object
+    ) -> None:
+        page = _FakePage()
+        chain_click_mock, sequential_mock, incremental = self._wire(monkeypatch, self._clickable_element())
+
+        async def emit_download(*args: object, **kwargs: object) -> list:
+            page.emit("download", MagicMock(name="download"))
+            return [ActionSuccess()]
+
+        chain_click_mock.side_effect = emit_download
+
+        results = await self._run(page)
+
+        chain_click_mock.assert_awaited_once()
+        sequential_mock.assert_not_called()
+        incremental.stop_listen_dom_increment.assert_awaited_once()
+        assert results == chain_click_mock.return_value
+        assert results[-1].download_triggered is None
+        assert results[-1].downloaded_files is None
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+
+    @pytest.mark.asyncio
+    async def test_popup_download_bypasses_sequential(
+        self, monkeypatch: pytest.MonkeyPatch, false_click_eligible: object
+    ) -> None:
+        page = _FakePage()
+        popup = _FakePage("https://example.com/popup")
+        chain_click_mock, sequential_mock, _ = self._wire(monkeypatch, self._clickable_element())
+
+        async def emit_popup_download(*args: object, **kwargs: object) -> list:
+            page.emit("popup", popup)
+            popup.emit("download", MagicMock(name="download"))
+            return [ActionSuccess()]
+
+        chain_click_mock.side_effect = emit_popup_download
+
+        results = await self._run(page)
+
+        sequential_mock.assert_not_called()
+        assert results == chain_click_mock.return_value
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+        assert popup.listener_count("download") == 0
+
+    @pytest.mark.asyncio
+    async def test_no_download_runs_sequential(
+        self, monkeypatch: pytest.MonkeyPatch, false_click_eligible: object
+    ) -> None:
+        page = _FakePage()
+        chain_click_mock, sequential_mock, _ = self._wire(monkeypatch, self._clickable_element())
+
+        results = await self._run(page)
+
+        chain_click_mock.assert_awaited_once()
+        sequential_mock.assert_awaited_once()
+        assert isinstance(results[-1], ActionSuccess)
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+
+    @pytest.mark.asyncio
+    async def test_not_eligible_ignores_download(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No ``false_click_eligible`` fixture: an ordinary (non-file-download) click that happens
+        # to emit a download must still run the standard sequential path — the bypass is gated.
+        page = _FakePage()
+        chain_click_mock, sequential_mock, _ = self._wire(monkeypatch, self._clickable_element())
+
+        async def emit_download(*args: object, **kwargs: object) -> list:
+            page.emit("download", MagicMock(name="download"))
+            return [ActionSuccess()]
+
+        chain_click_mock.side_effect = emit_download
+
+        await self._run(page)
+
+        sequential_mock.assert_awaited_once()
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+
+    @pytest.mark.asyncio
+    async def test_download_queued_after_click_bypasses_sequential(
+        self, monkeypatch: pytest.MonkeyPatch, false_click_eligible: object
+    ) -> None:
+        # Real Playwright delivers the ``download`` event on a later event-loop turn, after the
+        # click await resolves — the common case for a dynamically-registered handler with no
+        # static ``onclick`` attribute (``has_onclick_attr`` False, so no 1s animation wait yields
+        # between the two bypass checks). Schedule the emit via ``call_soon`` instead of emitting
+        # synchronously inside the click, and the bypass must still fire.
+        import asyncio
+
+        page = _FakePage()
+        chain_click_mock, sequential_mock, incremental = self._wire(monkeypatch, self._clickable_element())
+
+        async def emit_download_next_turn(*args: object, **kwargs: object) -> list:
+            asyncio.get_running_loop().call_soon(page.emit, "download", MagicMock(name="download"))
+            return [ActionSuccess()]
+
+        chain_click_mock.side_effect = emit_download_next_turn
+
+        results = await self._run(page)
+
+        chain_click_mock.assert_awaited_once()
+        sequential_mock.assert_not_called()
+        incremental.stop_listen_dom_increment.assert_awaited_once()
+        assert results == chain_click_mock.return_value
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+
+    @pytest.mark.asyncio
+    async def test_listeners_removed_on_exception(
+        self, monkeypatch: pytest.MonkeyPatch, false_click_eligible: object
+    ) -> None:
+        page = _FakePage()
+        chain_click_mock, _, incremental = self._wire(monkeypatch, self._clickable_element())
+        chain_click_mock.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            await self._run(page)
+
+        incremental.stop_listen_dom_increment.assert_awaited_once()
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+
+
+class TestHandleActionPublicPathFalseClickBypass:
+    """Drive the real public ``ActionHandler.handle_action`` entry point with the popup-grace
+    setting at its production default of 0. The fixture-based tests above preset the ContextVar
+    directly, so they cannot catch a wiring regression where ``handle_action`` only arms the
+    bypass probe under grace > 0 — the activation defect the reviewer flagged. Here the probe
+    must be armed purely from ``file_download_false_click_eligible``, independent of grace."""
+
+    def _clickable_element(self) -> SkyvernElement:
+        static = {"id": "E1", "tagName": "button", "attributes": {}}
+        el = SkyvernElement(MagicMock(), MagicMock(), static)
+        el.is_disabled = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        el.scroll_into_view = AsyncMock()  # type: ignore[method-assign]
+        el.get_frame = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+        el.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+        return el
+
+    def _wire_click_internals(
+        self, monkeypatch: pytest.MonkeyPatch, element: SkyvernElement
+    ) -> tuple[AsyncMock, AsyncMock, MagicMock]:
+        dom_mock = MagicMock()
+        dom_mock.get_skyvern_element_by_id = AsyncMock(return_value=element)
+        monkeypatch.setattr(handler_module, "DomUtil", MagicMock(return_value=dom_mock))
+        monkeypatch.setattr(handler_module, "get_or_create_wait_config", AsyncMock(return_value=MagicMock()))
+        monkeypatch.setattr(handler_module, "get_wait_time", MagicMock(return_value=0))
+        monkeypatch.setattr(handler_module.SkyvernFrame, "create_instance", AsyncMock(return_value=MagicMock()))
+
+        incremental = MagicMock()
+        incremental.start_listen_dom_increment = AsyncMock()
+        incremental.stop_listen_dom_increment = AsyncMock()
+        monkeypatch.setattr(handler_module, "IncrementalScrapePage", MagicMock(return_value=incremental))
+
+        chain_click_mock = AsyncMock(return_value=[ActionSuccess()])
+        monkeypatch.setattr(handler_module, "chain_click", chain_click_mock)
+        sequential_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(handler_module, "handle_sequential_click_for_dropdown", sequential_mock)
+        return chain_click_mock, sequential_mock, incremental
+
+    def _wire_action_wrapper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Importing ``cloud`` (e.g. via a tests/cloud file collected earlier in the shard)
+        # registers CLICK setup/teardown hooks on these class-level dicts, which would
+        # short-circuit ``_handle_action`` before the real click handler. Isolate the
+        # public-path tests from that global registration, matching the idiom in
+        # test_action_execution_timeout.py / test_input_text_tel_card_routing.py.
+        monkeypatch.setattr(ActionHandler, "_setup_action_types", {})
+        monkeypatch.setattr(ActionHandler, "_teardown_action_types", {})
+        app_mock = MagicMock()
+        app_mock.BROWSER_MANAGER.get_for_task.return_value = MagicMock()
+        app_mock.AGENT_FUNCTION.wait_for_challenge_solver = AsyncMock()
+        app_mock.DATABASE.workflow_params.create_action = AsyncMock(return_value=SimpleNamespace(action_id="a-1"))
+        monkeypatch.setattr(handler_module, "app", app_mock)
+        monkeypatch.setattr(handler_module, "preflight_action", MagicMock(return_value=None))
+        # Pin the production default explicitly so the test proves the bypass no longer depends on grace.
+        monkeypatch.setattr(handler_module.settings, "FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS", 0)
+
+    def _context(self) -> tuple:
+        now = datetime.now(UTC)
+        organization = make_organization(now)
+        task = make_task(now, organization)
+        step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+        return task, step
+
+    def _scraped_page(self) -> MagicMock:
+        scraped_page = MagicMock()
+        scraped_page.id_to_element_dict = {"E1": {"id": "E1"}}
+        return scraped_page
+
+    @pytest.mark.asyncio
+    async def test_grace_zero_same_page_download_bypasses_sequential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        task, step = self._context()
+        action = ClickAction(element_id="E1", download=False)
+        chain_click_mock, sequential_mock, incremental = self._wire_click_internals(
+            monkeypatch, self._clickable_element()
+        )
+        self._wire_action_wrapper(monkeypatch)
+        page = _FakePage()
+
+        async def emit_download(*args: object, **kwargs: object) -> list:
+            page.emit("download", MagicMock(name="download"))
+            return [ActionSuccess()]
+
+        chain_click_mock.side_effect = emit_download
+
+        results = await ActionHandler.handle_action(
+            self._scraped_page(), task, step, page, action, file_download_false_click_eligible=True
+        )
+
+        chain_click_mock.assert_awaited_once()
+        # The expensive dropdown/custom-select rescrape was skipped because the same-action download
+        # was observed — reachable through the public path even with grace at its default of 0.
+        sequential_mock.assert_not_called()
+        incremental.stop_listen_dom_increment.assert_awaited_once()
+        assert results == chain_click_mock.return_value
+        # No download registration was fabricated; persistence stays owned by the download path.
+        assert results[-1].download_triggered is None
+        assert results[-1].downloaded_files is None
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+        # ContextVar was reset on exit — no leak into the next action in this task.
+        assert handler_module._false_click_download_eligible.get() is False
+
+    @pytest.mark.asyncio
+    async def test_grace_zero_not_eligible_runs_sequential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Control: without the file-download false-click authority, an ordinary click that happens to
+        # emit a download must still run the standard sequential path, and the probe stays disarmed.
+        task, step = self._context()
+        action = ClickAction(element_id="E1", download=False)
+        chain_click_mock, sequential_mock, _ = self._wire_click_internals(monkeypatch, self._clickable_element())
+        self._wire_action_wrapper(monkeypatch)
+        page = _FakePage()
+
+        async def emit_download(*args: object, **kwargs: object) -> list:
+            page.emit("download", MagicMock(name="download"))
+            return [ActionSuccess()]
+
+        chain_click_mock.side_effect = emit_download
+
+        await ActionHandler.handle_action(
+            self._scraped_page(), task, step, page, action, file_download_false_click_eligible=False
+        )
+
+        sequential_mock.assert_awaited_once()
+        assert page.listener_count("download") == 0
+        assert page.listener_count("popup") == 0
+        assert handler_module._false_click_download_eligible.get() is False

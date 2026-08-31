@@ -5,9 +5,11 @@ by the connection *target*, not by SQLAlchemy's pool class. Regression cover for
 the pooler `unsupported startup parameter: options` and `SSL required` failures.
 """
 
+import sqlite3
 from collections.abc import Callable
 from typing import Any, cast
 
+import psycopg.errors
 import pytest
 from sqlalchemy import pool
 from sqlalchemy.engine import make_url
@@ -468,3 +470,83 @@ def test_pooler_logs_when_overriding_non_enforcing_ssl(
             "required_ssl_mode": "require",
         }
     ]
+
+
+# ---------------------------------------------------------------------------------------------
+# Error-tracking fingerprint on connection-level failures
+# ---------------------------------------------------------------------------------------------
+
+
+class _RecordingSpan:
+    def __init__(self) -> None:
+        self.attributes: dict[str, Any] = {}
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+
+def _error_context(exc: BaseException, dialect_name: str | None) -> Any:
+    dialect = None if dialect_name is None else type("D", (), {"name": dialect_name})()
+    return type("Ctx", (), {"original_exception": exc, "dialect": dialect, "engine": None})()
+
+
+@pytest.mark.asyncio
+async def test_refused_connect_tags_the_current_span_with_one_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    if agent_db.trace is None:
+        pytest.skip("opentelemetry-api not installed")
+    span = _RecordingSpan()
+    monkeypatch.setattr(agent_db.trace, "get_current_span", lambda: span)
+    monkeypatch.setattr(settings, "DISABLE_CONNECTION_POOL", False)
+    engine = agent_db._build_engine("postgresql+psycopg://user:pass@127.0.0.1:1/postgres")
+    try:
+        with pytest.raises(OperationalError):
+            async with engine.connect():
+                pass
+    finally:
+        await engine.dispose()
+
+    assert span.attributes["error.fingerprint"] == agent_db.DB_CONNECTION_ERROR_FINGERPRINT
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        psycopg.errors.CannotConnectNow("the database system is starting up"),
+        psycopg.errors.ConnectionFailure("server closed the connection unexpectedly"),
+        psycopg.errors.TooManyConnections("FATAL: too many connections for role"),
+    ],
+    ids=["57P03", "08006", "53300"],
+)
+def test_server_side_connection_failures_share_the_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, exc: psycopg.OperationalError
+) -> None:
+    if agent_db.trace is None:
+        pytest.skip("opentelemetry-api not installed")
+    span = _RecordingSpan()
+    monkeypatch.setattr(agent_db.trace, "get_current_span", lambda: span)
+
+    agent_db._fingerprint_connection_error(_error_context(exc, "postgresql"))
+
+    assert span.attributes["error.fingerprint"] == agent_db.DB_CONNECTION_ERROR_FINGERPRINT
+
+
+def test_server_raised_and_non_postgres_errors_keep_their_own_grouping(monkeypatch: pytest.MonkeyPatch) -> None:
+    if agent_db.trace is None:
+        pytest.skip("opentelemetry-api not installed")
+    span = _RecordingSpan()
+    monkeypatch.setattr(agent_db.trace, "get_current_span", lambda: span)
+
+    statement_timeout = psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+    agent_db._fingerprint_connection_error(_error_context(statement_timeout, "postgresql"))
+    agent_db._fingerprint_connection_error(
+        _error_context(psycopg.errors.LockNotAvailable("lock timeout"), "postgresql")
+    )
+    agent_db._fingerprint_connection_error(_error_context(sqlite3.OperationalError("no such table: tasks"), "sqlite"))
+    agent_db._fingerprint_connection_error(_error_context(Exception("connect failed"), None))
+
+    agent_db._fingerprint_connection_error(
+        _error_context(psycopg.DataError("PostgreSQL text fields cannot contain NUL"), "postgresql")
+    )
+    assert "error.fingerprint" not in span.attributes

@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import pytest
 
+from skyvern.forge.sdk.core.skyvern_context import opaque_url_echo_forms, opaque_url_echo_window
 from skyvern.forge.taskv3.opaque_refs import is_signed_url, mask_opaque_urls
 
 SIGNED = (
@@ -542,3 +543,215 @@ def test_malformed_url_like_prose_does_not_raise() -> None:
     refs = mask_opaque_urls({"task_data": prose, "u": "http://[invalid?token=abcdefghijklmnop"})
     assert refs.masked == {"task_data": prose, "u": "http://[invalid?token=abcdefghijklmnop"}
     assert refs.refs == {}
+
+
+# OpaqueUrlRefs.mask masks free-text emit surfaces by PROVENANCE, not URL shape: only a URL the
+# payload masker minted is rewritten. A benign live-page URL is never touched — even one that is
+# itself signing-shaped (an ?token=<high-entropy> ATS landing page), which is exactly the false
+# positive the shape-only masker produced on the model's navigational anchor.
+FP_SIGNING_SHAPED_BENIGN_URL = "https://jobs.example.test/apply?token=abcdefABCDEF0123456789ghijklMNOPqrstuvwx"
+
+
+def test_mask_rewrites_known_payload_ref_in_prose() -> None:
+    refs = mask_opaque_urls({"file": SIGNED})
+    token = next(iter(refs.refs))
+    masked = refs.mask(f"could not download {SIGNED} — retry?")
+    assert "token=eyJhbGciOiJIUzI1NiJ9" not in masked
+    assert token in masked
+
+
+def test_mask_rewrites_whole_string_ref_to_its_payload_token() -> None:
+    refs = mask_opaque_urls({"file": SIGNED})
+    # Same token the payload masker minted for this URL, so an output surface and the payload agree.
+    assert refs.mask(SIGNED) == refs.masked["file"]
+
+
+def test_mask_leaves_signing_shaped_benign_url_untouched() -> None:
+    # The centerpiece false-positive guard: is_signed_url() flags this benign ATS URL, but it was
+    # never in the payload, so provenance masking must leave the model's live-page anchor intact.
+    assert is_signed_url(FP_SIGNING_SHAPED_BENIGN_URL) is True
+    refs = mask_opaque_urls({"file": SIGNED})
+    prose = f"you are on {FP_SIGNING_SHAPED_BENIGN_URL} now"
+    assert refs.mask(prose) == prose
+
+
+def test_mask_is_identity_without_refs() -> None:
+    empty = mask_opaque_urls(None)
+    assert empty.mask(f"download {SIGNED}") == f"download {SIGNED}"
+
+
+def test_mask_matches_html_entity_escaped_multiparam_ref() -> None:
+    # A multi-parameter presigned URL (the dominant signed-payload shape) is entity-escaped inside
+    # HTML (& -> &amp;), so the raw substring never appears in get_html output. The masker must still
+    # catch it via the escaped form, or the signing artifact leaks through get_html.
+    import html as html_mod
+
+    refs = mask_opaque_urls({"file": S3_STYLE_SIGNED})
+    token = next(iter(refs.refs))
+    page_html = f'<a href="{html_mod.escape(S3_STYLE_SIGNED, quote=False)}">download</a>'
+    assert "&amp;" in page_html
+    masked = refs.mask(page_html)
+    assert "X-Amz-Signature=" not in masked
+    assert token in masked
+
+
+@pytest.mark.parametrize(
+    ("payload_url", "browser_form"),
+    [
+        # page.url inserts the "/" path a pathless payload URL omitted.
+        ("https://example.test?token=abcdefghijklmnop0123", "https://example.test/?token=abcdefghijklmnop0123"),
+        # Default port dropped, host lower-cased.
+        ("https://Example.test:443/f?token=abcdefghijklmnop0123", "https://example.test/f?token=abcdefghijklmnop0123"),
+        # Percent-escapes re-cased and a raw space encoded on the way through the browser.
+        (
+            "https://example.test/a%2fb/c d?X-Amz-Signature=abcdef0123456789abcdef0123456789",
+            "https://example.test/a%2Fb/c%20d?X-Amz-Signature=abcdef0123456789abcdef0123456789",
+        ),
+        # Dot segments, raw and percent-encoded, resolved by the URL validator before the browser sees them.
+        ("https://example.test/a/../f?token=abcdefghijklmnop0123", "https://example.test/f?token=abcdefghijklmnop0123"),
+        (
+            "https://example.test/a/%2e%2e/f?token=abcdefghijklmnop0123",
+            "https://example.test/f?token=abcdefghijklmnop0123",
+        ),
+        # An internationalized host is punycoded by the URL validator before the browser sees it.
+        (
+            "https://Bücher.example/f?token=abcdefghijklmnop0123",
+            "https://xn--bcher-kva.example/f?token=abcdefghijklmnop0123",
+        ),
+        # An IPv6 literal host is compressed by the URL validator before the browser sees it.
+        (
+            "https://[2606:4700:4700:0:0:0:0:1111]:443/f?token=abcdefghijklmnop0123",
+            "https://[2606:4700:4700::1111]/f?token=abcdefghijklmnop0123",
+        ),
+        # A query name that is also a legacy HTML entity (&copy) must not be entity-decoded in the raw ref.
+        (
+            "https://Example.test:443/f?token=abcdefghijklmnop0123&copy=x",
+            "https://example.test/f?token=abcdefghijklmnop0123&copy=x",
+        ),
+        # A literal apostrophe is legal in a path and survives the browser unchanged.
+        (
+            "https://Example.test:443/a'b?token=abcdefghijklmnop0123",
+            "https://example.test/a'b?token=abcdefghijklmnop0123",
+        ),
+        # A non-BMP path character is echoed as a 12-character escape: the echo is far longer than the ref.
+        (
+            "https://example.test/" + "\U0001f600" * 50 + "?token=abcdefghijklmnop0123",
+            "https://example.test/" + "%F0%9F%98%80" * 50 + "?token=abcdefghijklmnop0123",
+        ),
+        # Chromium percent-encodes ^ and | in a path where the URL validator keeps them raw.
+        (
+            "https://example.test/a^b|c?token=abcdefghijklmnop0123",
+            "https://example.test/a%5Eb%7Cc?token=abcdefghijklmnop0123",
+        ),
+        # A payload URL that legitimately ends in a punctuation character keeps it through the browser.
+        (
+            "https://Example.test:443/f?token=abcdefghijklmnop0123&name=foo)",
+            "https://example.test/f?token=abcdefghijklmnop0123&name=foo)",
+        ),
+    ],
+)
+def test_mask_matches_browser_normalized_form_of_payload_ref(payload_url: str, browser_form: str) -> None:
+    refs = mask_opaque_urls({"file": payload_url})
+    token = next(iter(refs.refs))
+    assert browser_form != payload_url
+    # Prose read-back with trailing punctuation, as a navigate echo renders it.
+    masked = refs.mask(f"navigated to {browser_form}.")
+    assert masked == f"navigated to {token}."
+    # And inside entity-escaped HTML.
+    assert refs.mask(f'<a href="{browser_form.replace("&", "&amp;")}">x</a>') == f'<a href="{token}">x</a>'
+    # Quoted and possessive prose around the URL is not part of it.
+    assert refs.mask(f"'{browser_form}' then {browser_form}'s page") == f"'{token}' then {token}'s page"
+
+
+def test_echo_window_covers_every_form_the_masker_matches() -> None:
+    url = "https://Example.test:443/\U0001f4c4?token=abcdefghijklmnop0123&x=1"
+    forms = opaque_url_echo_forms(url)
+    canonical = "https://example.test/%F0%9F%93%84?token=abcdefghijklmnop0123&x=1"
+    assert set(forms) == {url, url.replace("&", "&amp;"), canonical, canonical.replace("&", "&amp;")}
+    # Every form is masked whole, and the window is at least as wide as the widest of them.
+    refs = mask_opaque_urls({"file": url})
+    token = next(iter(refs.refs))
+    assert all(refs.mask(f"see {form} now") == f"see {token} now" for form in forms)
+    assert opaque_url_echo_window([url]) >= max(len(form) for form in forms)
+    assert opaque_url_echo_window([]) == 16
+
+
+def test_mask_canonical_match_prefers_the_longer_of_two_refs_that_meet_at_an_apostrophe() -> None:
+    short = "https://Example.test:443/0123456789abcdef0123456789abcdef"
+    refs = mask_opaque_urls({"a": short, "b": short + "'foo?token=abcdefghijklmnop0123"})
+    long_token = refs.masked["b"]
+    echoed = "https://example.test/0123456789abcdef0123456789abcdef'foo?token=abcdefghijklmnop0123"
+    assert refs.mask(f"at {echoed}.") == f"at {long_token}."
+
+
+def test_mask_canonical_match_finds_the_boundary_after_many_apostrophes_inside_a_ref() -> None:
+    refs = mask_opaque_urls({"file": "https://Example.test:443/" + "a'" * 12 + "b?token=abcdefghijklmnop0123"})
+    token = next(iter(refs.refs))
+    browser_form = "https://example.test/" + "a'" * 12 + "b?token=abcdefghijklmnop0123"
+    assert refs.mask(f"{browser_form}'s page") == f"{token}'s page"
+
+
+def test_mask_canonical_match_covers_every_ref_in_one_apostrophe_joined_span() -> None:
+    refs = mask_opaque_urls(
+        {
+            "a": "https://Example.test:443/p1?token=abcdefghijklmnop0123",
+            "b": "https://Example.test:443/p2?token=abcdefghijklmnop0124",
+        }
+    )
+    token_a, token_b = (
+        (t for t, u in refs.refs.items() if u.endswith("0123")),
+        (t for t, u in refs.refs.items() if u.endswith("0124")),
+    )
+    token_a, token_b = next(token_a), next(token_b)
+    a, b = "https://example.test/p1?token=abcdefghijklmnop0123", "https://example.test/p2?token=abcdefghijklmnop0124"
+    # Two refs joined by a bare quote are still each masked.
+    assert refs.mask(f"'{a}','{b}'") == f"'{token_a}','{token_b}'"
+
+
+def test_mask_canonical_match_is_bounded_on_long_punctuation_runs() -> None:
+    refs = mask_opaque_urls({"file": "https://Example.test:443/f?token=abcdefghijklmnop0123"})
+    token = next(iter(refs.refs))
+    run = "." * 50_000
+    started = time.perf_counter()
+    assert refs.mask(f"at https://example.test/f?token=abcdefghijklmnop0123{run}") == f"at {token}{run}"
+    assert time.perf_counter() - started < 2.0
+
+
+def test_mask_canonical_match_handles_thousands_of_quote_glued_copies_iteratively() -> None:
+    refs = mask_opaque_urls({"file": "https://Example.test:443/f?token=abcdefghijklmnop0123"})
+    token = next(iter(refs.refs))
+    echoed = "https://example.test/f?token=abcdefghijklmnop0123"
+
+    def timed(copies: int) -> float:
+        started = time.perf_counter()
+        assert refs.mask("'".join([echoed] * copies)) == "'".join([token] * copies)
+        return time.perf_counter() - started
+
+    # Linear, not quadratic: four times the copies costs well under sixteen times the work.
+    assert timed(4000) < 6 * max(timed(1000), 0.005)
+
+
+def test_mask_canonical_match_is_still_by_membership() -> None:
+    refs = mask_opaque_urls({"file": "https://example.test?token=abcdefghijklmnop0123"})
+    # Same host and shape, different credential: not ours, so not masked.
+    prose = "now at https://example.test/?token=abcdefghijklmnop0124"
+    assert refs.mask(prose) == prose
+    # A ref that ends in punctuation is not the same resource as the live URL without it.
+    refs = mask_opaque_urls({"file": "https://example.test/f?token=abcdefghijklmnop0123&n=foo)"})
+    prose = "now at https://example.test/f?token=abcdefghijklmnop0123&n=foo."
+    assert refs.mask(prose) == prose
+
+
+def test_mask_canonical_match_keeps_path_delimiter_escapes_distinct() -> None:
+    # A browser never decodes %2F in a path (it is a structural delimiter there), so a payload ref
+    # with an escaped slash and a live URL with a real slash are different resources.
+    refs = mask_opaque_urls({"file": "https://example.test/files%2Fsecret/x?token=abcdefghijklmnop0123"})
+    prose = "at https://example.test/files/secret/x?token=abcdefghijklmnop0123."
+    assert refs.mask(prose) == prose
+    # Case of the escape is still canonical.
+    token = next(iter(refs.refs))
+    assert refs.mask("at https://example.test/files%2fsecret/x?token=abcdefghijklmnop0123.") == f"at {token}."
+    # A query value the browser keeps encoded is a different URL from its decoded spelling.
+    refs = mask_opaque_urls({"file": "https://example.test/f?token=abcdefghijklmnop0123&next=a%2Fb"})
+    prose = "at https://example.test/f?token=abcdefghijklmnop0123&next=a/b."
+    assert refs.mask(prose) == prose

@@ -872,3 +872,148 @@ async def test_wait_for_in_flight_downloads_completes_normally_when_should_cance
 
     assert completed is True
     assert cancelled is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_path) -> None:
+    # A persistent-session blob: download lands in BOTH the session downloads dir and the run dir
+    # (the eager blob carve-out). Finalization must not materialize a second physical copy of
+    # identical bytes, or FileUploadBlock uploads the same statement twice and the customer's
+    # second signed S3 upload URL 403s (SKY-14276).
+    agent = ForgeAgent()
+    task = _make_task(workflow_run_id="wr-dedupe")
+    task.browser_session_id = "pbs-1"
+
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    statement_bytes = b"STATEMENT-BYTES-A"
+    (download_dir / "run-copy.pdf").write_bytes(statement_bytes)  # the eager blob carve-out copy
+
+    session_uri = "s3://bucket/browser_sessions/pbs-1/downloads/Statement.pdf"
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(return_value=statement_bytes)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[session_uri])
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=None,
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    remaining = sorted(p.name for p in download_dir.iterdir())
+    assert remaining == ["run-copy.pdf"], f"session copy should be deduped by content, got {remaining}"
+    assert (download_dir / "run-copy.pdf").read_bytes() == statement_bytes
+
+
+@pytest.mark.asyncio
+async def test_finalize_materializes_session_download_when_run_dir_empty(tmp_path) -> None:
+    # Load-bearing: on a non-blob persistent session the run dir is empty (SESSION_DIR suppression),
+    # so finalization MUST still materialize the one session download — otherwise FileUploadBlock
+    # fails the block with an empty run dir. Content dedupe must not regress this.
+    agent = ForgeAgent()
+    task = _make_task(workflow_run_id="wr-materialize")
+    task.browser_session_id = "pbs-2"
+
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    session_uri = "s3://bucket/browser_sessions/pbs-2/downloads/OnlyStatement.pdf"
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(return_value=b"ONLY-STATEMENT-BYTES")
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[session_uri])
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=None,
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    remaining = sorted(p.name for p in download_dir.iterdir())
+    assert remaining == ["OnlyStatement.pdf"], f"the single session download must be materialized, got {remaining}"
+
+
+@pytest.mark.asyncio
+async def test_finalize_local_only_skips_checksum_snapshot(tmp_path) -> None:
+    # Only s3://, gs:// session candidates consult the run-dir checksum snapshot. A local-only
+    # finalization has no such candidate, so finalize must not hash the run dir at all (SKY-14276).
+    agent = ForgeAgent()
+    task = _make_task()  # browser_session_id = None -> no session-storage candidate
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    checksum_spy = MagicMock(return_value="deadbeef")
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_files_in_directory", return_value=["uuid-file.zip"]),
+        patch("skyvern.forge.agent.rename_file", MagicMock()),
+        patch("skyvern.forge.agent.calculate_sha256_for_file", checksum_spy),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    checksum_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_materializes_session_download_matching_baseline_before(tmp_path) -> None:
+    # A genuinely-new persistent-session download can happen to share bytes with a baseline file that
+    # was already in the run dir before this task (an earlier task's download or a staged input). That
+    # baseline sits in list_files_before, so it is NOT this task's eager carve-out duplicate. Finalization
+    # must still materialize the new session object (and apply its distinct download_suffix), not skip it
+    # by hashing the whole run dir against the baseline (SKY-14276).
+    agent = ForgeAgent()
+    task = _make_task(workflow_run_id="wr-baseline-collision")
+    task.browser_session_id = "pbs-3"
+
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    shared_bytes = b"SHARED-BYTES-BASELINE-AND-SESSION"
+    baseline_path = download_dir / "baseline-from-earlier-task.pdf"
+    baseline_path.write_bytes(shared_bytes)
+
+    session_uri = "s3://bucket/browser_sessions/pbs-3/downloads/NewStatement.pdf"
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(return_value=shared_bytes)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[session_uri])
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-999",
+            list_files_before=[str(baseline_path)],
+            randomize_if_missing=False,
+        )
+
+    remaining = sorted(p.name for p in download_dir.iterdir())
+    assert remaining == ["baseline-from-earlier-task.pdf", "req-999.pdf"], (
+        f"new session download must be materialized under its suffix, not deduped against the baseline, got {remaining}"
+    )
+    assert (download_dir / "req-999.pdf").read_bytes() == shared_bytes

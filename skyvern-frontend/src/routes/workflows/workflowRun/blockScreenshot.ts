@@ -5,8 +5,9 @@ import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 // valid block-level screenshot for the run Overview.
 function isBlockScreenshot(artifact: ArtifactApiResponse): boolean {
   return (
-    artifact.artifact_type === ArtifactType.LLMScreenshot ||
-    artifact.artifact_type === ArtifactType.ActionScreenshot
+    !artifact.archived &&
+    (artifact.artifact_type === ArtifactType.LLMScreenshot ||
+      artifact.artifact_type === ArtifactType.ActionScreenshot)
   );
 }
 
@@ -19,7 +20,9 @@ function selectBlockScreenshot(
   blockType?: string,
 ): ArtifactApiResponse | undefined {
   const findType = (type: ArtifactType) =>
-    artifacts?.find((artifact) => artifact.artifact_type === type);
+    artifacts?.find(
+      (artifact) => artifact.artifact_type === type && !artifact.archived,
+    );
   const [primary, fallback] =
     blockType === WorkflowBlockTypes.Code
       ? [ArtifactType.ActionScreenshot, ArtifactType.LLMScreenshot]

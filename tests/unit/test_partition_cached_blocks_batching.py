@@ -1,14 +1,21 @@
-"""Regression tests for the cache-invalidation batching on workflow save.
+"""Regression tests for cache-invalidation-on-save scaling with cached-script volume.
 
-Saving a large workflow timed out because cache invalidation walked every cached
-``WorkflowScript`` for the wpid issuing two sequential DB queries per candidate
-(an N+1). These tests pin three guarantees:
+Workflow saves that change a block trigger cache invalidation, which must find the
+cached script blocks matching the changed block's label. An earlier fix batched what
+was an N+1 (two DB queries per cached script) into two queries total — but that batch
+still loaded *every* cached script for the workflow before filtering by label in
+Python. A workflow can accumulate tens of thousands of cached scripts, and loading
+them all made saves time out (SKY-15102).
 
-- the partitioning result (published vs draft buckets, and which blocks get
-  cleared) is unchanged,
-- the number of DB round-trips is constant, independent of candidate count, and
-- the dedup/chunking helper behind the batch repository queries splits inputs
-  correctly so no single ``IN (...)`` clause grows unbounded.
+The fix pushes the label filter into SQL (``get_cached_block_groups_by_labels``), so
+the query returns only matching rows regardless of total cache size. These tests pin:
+
+- the partitioning result (published vs draft buckets, and which blocks get cleared)
+  is unchanged,
+- exactly one query is issued regardless of how many cached scripts exist for the
+  workflow, and
+- the dedup/chunking helper behind the other batched repository queries still splits
+  inputs correctly so no single ``IN (...)`` clause grows unbounded.
 """
 
 from __future__ import annotations
@@ -26,53 +33,44 @@ WPID = "wpid_test_partition"
 
 
 class FakeScriptsDB:
-    """Stand-in for ``app.DATABASE.scripts`` that records every round-trip.
+    """Stand-in for ``app.DATABASE.scripts`` for cache-invalidation-on-save tests.
 
-    Implements both the legacy per-item methods and the batch methods so the
-    same fixture works against the N+1 code path and the batched fix.
+    ``get_cached_block_groups_by_labels`` simulates the SQL join+filter the real
+    repository method performs: it returns only rows whose block label matches,
+    regardless of how many other cached scripts exist for the workflow.
     """
 
-    def __init__(self, scripts_by_id: dict[str, Script], blocks_by_revision: dict[str, list[ScriptBlock]]) -> None:
+    def __init__(
+        self,
+        candidates: list[WorkflowScript],
+        scripts_by_id: dict[str, Script],
+        blocks_by_revision: dict[str, list[ScriptBlock]],
+    ) -> None:
+        self._candidates = candidates
         self._scripts_by_id = scripts_by_id
         self._blocks_by_revision = blocks_by_revision
         self.call_log: list[str] = []
         self.cleared_script_block_ids: list[str] = []
-        self.update_script_block_calls: list[str] = []
 
-    async def get_script(self, script_id: str, organization_id: str, version: int | None = None) -> Script | None:
-        self.call_log.append("get_script")
-        return self._scripts_by_id.get(script_id)
-
-    async def get_script_blocks_by_script_revision_id(
-        self, script_revision_id: str, organization_id: str
-    ) -> list[ScriptBlock]:
-        self.call_log.append("get_script_blocks_by_script_revision_id")
-        return self._blocks_by_revision.get(script_revision_id, [])
-
-    async def get_latest_scripts_by_ids(self, organization_id: str, script_ids: list[str]) -> dict[str, Script]:
-        self.call_log.append("get_latest_scripts_by_ids")
-        return {sid: self._scripts_by_id[sid] for sid in script_ids if sid in self._scripts_by_id}
-
-    async def get_script_blocks_by_script_revision_ids(
-        self, organization_id: str, script_revision_ids: list[str]
-    ) -> dict[str, list[ScriptBlock]]:
-        self.call_log.append("get_script_blocks_by_script_revision_ids")
-        # Mirror the real contract: revisions with no blocks are absent from the result.
-        return {
-            rid: self._blocks_by_revision[rid]
-            for rid in dict.fromkeys(script_revision_ids)
-            if self._blocks_by_revision.get(rid)
-        }
-
-    async def update_script_block(
+    async def get_cached_block_groups_by_labels(
         self,
-        script_block_id: str,
         organization_id: str,
-        clear_run_signature: bool = False,
-    ) -> ScriptBlock | None:
-        self.call_log.append("update_script_block")
-        self.update_script_block_calls.append(script_block_id)
-        return None
+        workflow_permanent_id: str,
+        block_labels: list[str],
+    ) -> list[tuple[WorkflowScript, Script, ScriptBlock]]:
+        self.call_log.append("get_cached_block_groups_by_labels")
+        labels = set(block_labels)
+        rows: list[tuple[WorkflowScript, Script, ScriptBlock]] = []
+        for candidate in self._candidates:
+            if candidate.organization_id != organization_id or candidate.workflow_permanent_id != workflow_permanent_id:
+                continue
+            script = self._scripts_by_id.get(candidate.script_id)
+            if not script:
+                continue
+            for block in self._blocks_by_revision.get(script.script_revision_id, []):
+                if block.script_block_label in labels and block.run_signature:
+                    rows.append((candidate, script, block))
+        return rows
 
     async def clear_script_block_run_signatures(
         self,
@@ -89,12 +87,12 @@ def _now() -> datetime:
     return datetime(2026, 6, 18, 0, 0, 0)
 
 
-def _candidate(script_id: str, status: ScriptStatus) -> WorkflowScript:
+def _candidate(script_id: str, status: ScriptStatus, workflow_permanent_id: str = WPID) -> WorkflowScript:
     return WorkflowScript(
         workflow_script_id=f"ws_{script_id}",
         organization_id=ORG_ID,
         script_id=script_id,
-        workflow_permanent_id=WPID,
+        workflow_permanent_id=workflow_permanent_id,
         cache_key="default",
         cache_key_value=f"default-{script_id}",
         status=status,
@@ -127,7 +125,7 @@ def _block(revision_id: str, label: str, run_signature: str | None) -> ScriptBlo
     )
 
 
-def _build_fixture() -> tuple[list[WorkflowScript], FakeScriptsDB]:
+def _build_fixture() -> FakeScriptsDB:
     # c1: published, has a target block with a run_signature -> cleared (published bucket)
     # c2: pending, target block but no run_signature -> nothing to clear, skipped
     # c3: pending, has a different target block -> cleared (draft bucket)
@@ -156,20 +154,20 @@ def _build_fixture() -> tuple[list[WorkflowScript], FakeScriptsDB]:
         "r3": [_block("r3", "block_b", "sig_b")],  # target + signature -> clear
         "r4": [],
     }
-    return candidates, FakeScriptsDB(scripts_by_id, blocks_by_revision)
+    return FakeScriptsDB(candidates, scripts_by_id, blocks_by_revision)
 
 
 @pytest.mark.asyncio
 async def test_partition_cached_blocks_preserves_partitioning(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
-    candidates, fake = _build_fixture()
+    fake = _build_fixture()
     monkeypatch.setattr(app.DATABASE, "scripts", fake)
 
     svc = WorkflowService()
     cached_groups, published_groups = await svc._partition_cached_blocks(
         organization_id=ORG_ID,
-        candidates=candidates,
+        workflow_permanent_id=WPID,
         block_labels_to_disable=["block_a", "block_b"],
     )
 
@@ -186,54 +184,91 @@ async def test_partition_cached_blocks_preserves_partitioning(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_partition_cached_blocks_uses_constant_query_count(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_partition_cached_blocks_uses_a_single_query(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
-    candidates, fake = _build_fixture()
+    fake = _build_fixture()
     monkeypatch.setattr(app.DATABASE, "scripts", fake)
 
     svc = WorkflowService()
     await svc._partition_cached_blocks(
         organization_id=ORG_ID,
-        candidates=candidates,
+        workflow_permanent_id=WPID,
         block_labels_to_disable=["block_a", "block_b"],
     )
 
-    # Five candidates must not produce a per-candidate fan-out of queries.
-    # The batched implementation makes at most one scripts query + one blocks query.
-    assert len(fake.call_log) <= 2, f"expected constant query budget, got {fake.call_log}"
+    assert fake.call_log == ["get_cached_block_groups_by_labels"]
+
+
+@pytest.mark.asyncio
+async def test_partition_cached_blocks_query_count_independent_of_cache_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SKY-15102: a workflow with a large cached-script footprint must not blow up the
+    save-time query cost. Simulates ~10k unrelated cached scripts alongside the one
+    that actually matches the changed block's label."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    candidates: list[WorkflowScript] = []
+    scripts_by_id: dict[str, Script] = {}
+    blocks_by_revision: dict[str, list[ScriptBlock]] = {}
+    for i in range(10_000):
+        script_id = f"noise_{i}"
+        revision_id = f"rev_noise_{i}"
+        candidates.append(_candidate(script_id, ScriptStatus.published))
+        scripts_by_id[script_id] = _script(script_id, revision_id)
+        blocks_by_revision[revision_id] = [_block(revision_id, "unrelated_block", "sig")]
+
+    candidates.append(_candidate("target", ScriptStatus.published))
+    scripts_by_id["target"] = _script("target", "rev_target")
+    blocks_by_revision["rev_target"] = [_block("rev_target", "block_a", "sig_a")]
+
+    fake = FakeScriptsDB(candidates, scripts_by_id, blocks_by_revision)
+    monkeypatch.setattr(app.DATABASE, "scripts", fake)
+
+    svc = WorkflowService()
+    cached_groups, published_groups = await svc._partition_cached_blocks(
+        organization_id=ORG_ID,
+        workflow_permanent_id=WPID,
+        block_labels_to_disable=["block_a"],
+    )
+
+    assert fake.call_log == ["get_cached_block_groups_by_labels"]
+    assert [g.workflow_script.script_id for g in published_groups] == ["target"]
+    assert cached_groups == []
 
 
 @pytest.mark.asyncio
 async def test_partition_cached_blocks_dedupes_duplicate_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
-    _, fake = _build_fixture()
+    base = _build_fixture()
     candidates = [
         _candidate("s1", ScriptStatus.published),
         _candidate("s1", ScriptStatus.published),
         _candidate("s3", ScriptStatus.pending),
         _candidate("s3", ScriptStatus.pending),
     ]
+    fake = FakeScriptsDB(candidates, base._scripts_by_id, base._blocks_by_revision)
     monkeypatch.setattr(app.DATABASE, "scripts", fake)
 
     svc = WorkflowService()
     cached_groups, published_groups = await svc._partition_cached_blocks(
         organization_id=ORG_ID,
-        candidates=candidates,
+        workflow_permanent_id=WPID,
         block_labels_to_disable=["block_a", "block_b"],
     )
 
     assert [group.workflow_script.script_id for group in published_groups] == ["s1"]
     assert [group.workflow_script.script_id for group in cached_groups] == ["s3"]
-    assert len(fake.call_log) <= 2, f"expected constant query budget, got {fake.call_log}"
+    assert fake.call_log == ["get_cached_block_groups_by_labels"]
 
 
 @pytest.mark.asyncio
 async def test_clear_cached_block_groups_bulk_clears_deduped_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.workflow.service import CachedScriptBlocks, CacheInvalidationPlan, WorkflowService
 
-    _, fake = _build_fixture()
+    fake = _build_fixture()
     monkeypatch.setattr(app.DATABASE, "scripts", fake)
 
     script = fake._scripts_by_id["s1"]
@@ -278,7 +313,6 @@ async def test_clear_cached_block_groups_bulk_clears_deduped_blocks(monkeypatch:
 
     assert fake.call_log == ["clear_script_block_run_signatures"]
     assert fake.cleared_script_block_ids == [block.script_block_id]
-    assert fake.update_script_block_calls == []
 
 
 def test_dedup_into_chunks_preserves_order_and_dedups() -> None:

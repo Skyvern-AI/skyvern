@@ -13,6 +13,7 @@ from urllib.parse import unquote, unquote_plus, urlsplit
 
 import structlog
 
+from skyvern.forge.sdk.core.skyvern_context import mask_opaque_urls_in_text
 from skyvern.forge.taskv3.auth_tools import _MIN_REDACTED_QUERY_VALUE_CHARS, _OPAQUE_QUERY_VALUE_RE
 
 LOG = structlog.get_logger()
@@ -203,6 +204,25 @@ class OpaqueUrlRefs:
             if token in resolved:
                 resolved = resolved.replace(token, url)
         return resolved
+
+    def derive(self, url: str) -> str:
+        """Give ``url`` the provenance of a payload ref — a redirect target reached through one — so the
+        boundary masks it and a later tool call can resolve it. Returns its token."""
+        token = _token_for(url)
+        self.refs[token] = url
+        return token
+
+    def mask(self, text: str) -> str:
+        """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token —
+        the inverse of resolve(). Masking is by PROVENANCE, not URL shape: only a URL we minted from
+        the payload is rewritten, so a live-page URL the model must reason about is never touched, even
+        when it is itself signing-shaped (a ``?gclid=``/``?token=`` landing page). Output-only surfaces
+        never resolve the token back; the token is the same one the payload masker minted for that URL.
+
+        Shares one implementation with the model-facing boundary (SkyvernContext.hide_from_model), so
+        the pre-truncation surfaces (observe/get_html) and the universal tool-result boundary can never
+        diverge."""
+        return mask_opaque_urls_in_text(text, self.refs)
 
     def resolve_deep(self, value: Any) -> Any:
         if isinstance(value, str):
