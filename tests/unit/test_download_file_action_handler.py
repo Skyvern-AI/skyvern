@@ -1,15 +1,20 @@
 import asyncio
+import contextlib
+import io
+import logging
 import os
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+import structlog
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import BaseModel, ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
@@ -810,6 +815,9 @@ def _make_download_click_context(
     page.is_closed.return_value = False
     page.context.browser = None
     browser_state = MagicMock()
+    # A real browser attaches no vendor download source unless a cloud factory did; mirror that default
+    # so the provider-observation seam stays inert for the local/PBS/event paths these cases exercise.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
     scraped_page = ScrapedPage(
         elements=[],
@@ -2312,6 +2320,8 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
     page.url = original_url
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     # Same page count before and after (no extra tab opened by the print action)
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
     browser_state.navigate_to_url = AsyncMock()
@@ -3332,6 +3342,8 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     scraped_page = ScrapedPage(
@@ -3437,6 +3449,8 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     scraped_page = ScrapedPage(
@@ -3548,6 +3562,8 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     scraped_page = ScrapedPage(
@@ -6624,3 +6640,366 @@ async def test_retention_torn_down_on_cancelled() -> None:
     assert isinstance(result["exc"], asyncio.CancelledError)
     result["install"].assert_awaited_once()
     result["teardown"].assert_awaited_once()
+
+
+class _FakeActionDownloadObservation:
+    """Neutral provider observation: drops completed remote files into the run dir on its first poll,
+    honoring the ``deadline`` (monotonic) contract strictly (a handler passing per-call ``timeout_seconds``
+    materializes nothing -- the anti-terminal-cleanup RED)."""
+
+    def __init__(self, files: list[tuple[str, bytes]]) -> None:
+        self._pending = list(files)
+        self.poll_deadlines: list[float] = []
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
+        self.poll_deadlines.append(deadline)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for name, data in self._pending:
+            (destination_dir / name).write_bytes(data)
+        self._pending = []
+
+
+class _RaisingActionDownloadObservation:
+    """Provider observation whose poll raises a schema/validation error embedding a presigned URL, mirroring
+    the real leak surface (the vendor list body is parsed into typed rows). When ``materialize_first`` is
+    set, the first poll drops a completed file (so the handler reaches its final poll) and a later poll raises."""
+
+    def __init__(self, error: Exception, *, materialize_first: tuple[str, bytes] | None = None) -> None:
+        self._error = error
+        self._materialize_first = materialize_first
+        self.calls = 0
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
+        self.calls += 1
+        if self._materialize_first is not None and self.calls == 1:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            name, data = self._materialize_first
+            (destination_dir / name).write_bytes(data)
+            return
+        raise self._error
+
+
+class _StallingActionDownloadObservation:
+    """Provider observation whose poll never returns on its own -- only the handler's deadline can end it, so
+    if the handler polls it once a local artifact already accounts for the action the stalled provider would
+    consume the whole download deadline; the fix must never poll it in that case."""
+
+    def __init__(self) -> None:
+        self.poll_calls = 0
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
+        self.poll_calls += 1
+        await asyncio.Event().wait()
+
+
+class _ActionDownloadSource:
+    """Neutral provider source: hands back a fixed observation and records begin bookkeeping."""
+
+    def __init__(self, observation: object, *, begin_error: Exception | None = None) -> None:
+        self._observation = observation
+        self._begin_error = begin_error
+        self.begin_calls = 0
+        self.begin_deadline: float | None = None
+
+    async def begin_observation(self, *, deadline: float) -> object:
+        self.begin_calls += 1
+        self.begin_deadline = deadline
+        if self._begin_error is not None:
+            raise self._begin_error
+        return self._observation
+
+
+def _secret_bearing_validation_error(presigned_url: str) -> ValidationError:
+    class _Row(BaseModel):
+        size: int
+
+    try:
+        _Row.model_validate({"size": presigned_url})
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+@contextlib.contextmanager
+def _capture_handler_logs() -> Iterator[io.StringIO]:
+    import skyvern.webeye.actions.handler as handler_module
+
+    buf = io.StringIO()
+    previous_config = structlog.get_config()
+    structlog.configure(
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+        logger_factory=structlog.PrintLoggerFactory(file=buf),
+        cache_logger_on_first_use=False,
+    )
+    saved_log = handler_module.LOG
+    handler_module.LOG = structlog.get_logger()
+    try:
+        yield buf
+    finally:
+        handler_module.LOG = saved_log
+        structlog.configure(**previous_config)
+
+
+async def _run_download_action_with_provider_source(
+    source: _ActionDownloadSource, *, inner: Callable[[Path], None] | None = None
+) -> tuple[list[object], object]:
+    """Drive ``handle_action`` with ``source`` wired as the vendor download seam.
+
+    ``inner`` (given the run dir) simulates whatever the click itself produces locally before the
+    provider poll runs; by default the click yields no local file and no download event.
+    """
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    task.download_timeout = 0.2
+
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    browser_state.browser_artifacts.get_action_download_source = MagicMock(return_value=source)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            if inner is not None:
+                inner(Path(temp_dir))
+            return [ActionSuccess()]
+
+        settle = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.get_run_temp_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=settle,
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await asyncio.wait_for(
+                ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                ),
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+            )
+    return results, action
+
+
+# Short enough that pydantic embeds it verbatim (long inputs are truncated), so the full presigned URL is
+# present in the exception the handler catches.
+_PRESIGNED_URL = "https://s3.aws/f?sig=SECRETSIGMARKER"
+
+
+@pytest.mark.asyncio
+async def test_handle_action_credits_provider_download_materialized_during_poll() -> None:
+    # PBS-like timing for a provider-owned download: with a pre-click baseline frozen, a completed remote file
+    # appears only during the post-action poll (no download event, no cleanup), and the SAME action is credited.
+    observation = _FakeActionDownloadObservation([("report.pdf", b"ready")])
+    source = _ActionDownloadSource(observation)
+    results, action = await _run_download_action_with_provider_source(source)
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["report.pdf"]
+    # Baseline was frozen exactly once before the click.
+    assert source.begin_calls == 1
+    assert source.begin_deadline is not None
+    # Every provider poll shared one monotonic deadline (no fresh per-call full timeout).
+    assert observation.poll_deadlines
+    assert all(isinstance(d, float) for d in observation.poll_deadlines)
+    assert len(set(observation.poll_deadlines)) == 1
+
+
+@pytest.mark.asyncio
+async def test_baseline_failure_never_logs_secret_bearing_url_and_stays_fail_open() -> None:
+    # begin_observation parses the vendor list into typed rows; a schema error there carries the raw presigned
+    # URL. The baseline catch must log only error_type and stay fail-open (provider-diff off, local download counts).
+    error = _secret_bearing_validation_error(_PRESIGNED_URL)
+    assert "SECRETSIGMARKER" in str(error)  # the exception itself carries the secret
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]), begin_error=error)
+
+    with _capture_handler_logs() as buf:
+        results, action = await _run_download_action_with_provider_source(
+            source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+        )
+
+    rendered = buf.getvalue()
+    assert source.begin_calls == 1
+    assert "Provider download baseline unavailable" in rendered  # the failure is still surfaced
+    assert "ValidationError" in rendered  # as non-secret metadata (error_type)
+    assert _PRESIGNED_URL not in rendered
+    assert "SECRETSIGMARKER" not in rendered
+    assert "s3.aws" not in rendered
+    # Fail-open: the failed baseline never disturbs the existing local download path.
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["local.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_baseline_cancellation_propagates() -> None:
+    # A CancelledError from begin_observation must propagate unchanged, never be swallowed by the catch.
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]), begin_error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _run_download_action_with_provider_source(source)
+
+
+@pytest.mark.asyncio
+async def test_mid_poll_failure_never_logs_secret_bearing_url() -> None:
+    # A schema/validation error while paging the provider list embeds the raw presigned URL. The mid-poll
+    # catch must record only non-secret metadata (error_type), never the exception/traceback, so it can't leak.
+    error = _secret_bearing_validation_error(_PRESIGNED_URL)
+    assert "SECRETSIGMARKER" in str(error)  # the exception itself carries the secret
+    observation = _RaisingActionDownloadObservation(error)
+    source = _ActionDownloadSource(observation)
+
+    with _capture_handler_logs() as buf:
+        await _run_download_action_with_provider_source(source)
+
+    rendered = buf.getvalue()
+    assert observation.calls >= 1
+    assert "Provider download poll failed" in rendered  # the failure is still surfaced
+    assert "ValidationError" in rendered  # as non-secret metadata (error_type)
+    assert _PRESIGNED_URL not in rendered
+    assert "SECRETSIGMARKER" not in rendered
+    assert "s3.aws" not in rendered
+
+
+class _RampingMonotonic:
+    """A monotonic clock that advances a fixed step on every read, so the download-event grace elapses
+    deterministically without real sleeps. Non-monotonic attributes defer to the real ``time`` module."""
+
+    def __init__(self, step: float) -> None:
+        self._t = 0.0
+        self._step = step
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        current = self._t
+        self._t += self._step
+        return current
+
+
+@pytest.mark.asyncio
+async def test_final_poll_failure_never_logs_secret_bearing_url() -> None:
+    # download_triggered arrives with NO local artifact: a download event fires but persists empty, so the run
+    # dir stays empty -- the "signal but no artifact" case the finalize poll must service. Here it raises the secret.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    # Keep the hard timeout far above the event grace (min(60, timeout)) so the empty-persist path fires.
+    task.download_timeout = 3600.0
+
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+
+    error = _secret_bearing_validation_error(_PRESIGNED_URL)
+    observation = _RaisingActionDownloadObservation(error)
+    source = _ActionDownloadSource(observation)
+    browser_state.browser_artifacts.get_action_download_source = MagicMock(return_value=source)
+
+    clock = _RampingMonotonic(step=100.0)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            # Fire the browser download event the handler registered before the inner action, so a
+            # download signal exists without any file landing in the run directory.
+            for call in page.on.call_args_list:
+                if call.args and call.args[0] == "download":
+                    call.args[1](_download())
+                    break
+            return [ActionSuccess()]
+
+        settle = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        with _capture_handler_logs() as buf:
+            with (
+                patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+                patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+                patch("skyvern.webeye.actions.handler.get_run_temp_dir", return_value=temp_dir),
+                patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+                patch("skyvern.webeye.actions.handler.time", clock),
+                patch(
+                    "skyvern.webeye.actions.handler._persist_captured_download",
+                    new=AsyncMock(return_value=SimpleNamespace(path=None, outcome="empty")),
+                ),
+                patch(
+                    "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                    new=settle,
+                ),
+                patch("skyvern.webeye.actions.handler.app", mock_app),
+            ):
+                results = await asyncio.wait_for(
+                    ActionHandler.handle_action(
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                        page=page,
+                        action=action,
+                    ),
+                    timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+                )
+
+    rendered = buf.getvalue()
+    assert results[-1].download_triggered is True  # a signal existed with no local artifact
+    assert observation.calls >= 2  # the mid-wait poll and the finalize poll both ran and raised
+    assert "Final provider download poll failed" in rendered
+    assert "ValidationError" in rendered
+    assert _PRESIGNED_URL not in rendered
+    assert "SECRETSIGMARKER" not in rendered
+    assert "s3.aws" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_local_signal_skips_provider_poll_and_stalled_provider_cannot_consume_deadline() -> None:
+    # The existing CDP/local path saves the file before the wait loop runs. The handler must evaluate that local
+    # delta first and never poll the provider (a stalled one cannot consume the deadline); the local file is credited.
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+    results, action = await _run_download_action_with_provider_source(
+        source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+    )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["local.pdf"]
+    assert observation.poll_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_local_artifact_skips_provider_at_finalization_without_duplicate() -> None:
+    # A local artifact already accounts for the action before finalization, so the finalize-time provider poll
+    # must be skipped -- else a second materialization credits an extra, collision-suffixed copy (a distinct file).
+    observation = _FakeActionDownloadObservation([("provider_extra.pdf", b"provider")])
+    source = _ActionDownloadSource(observation)
+    results, action = await _run_download_action_with_provider_source(
+        source, inner=lambda run_dir: (run_dir / "report.pdf").write_bytes(b"local")
+    )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["report.pdf"]
+    assert observation.poll_deadlines == []
