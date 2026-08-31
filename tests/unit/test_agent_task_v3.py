@@ -45,7 +45,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -81,6 +81,7 @@ async def _run_execute_task_v3(
     context_overrides: dict[str, Any] | None = None,
     own_block_row: WorkflowRunBlock | None = None,
     own_block_lookup_raises: BaseException | None = None,
+    workflow_permanent_id: str | None = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -186,6 +187,7 @@ async def _run_execute_task_v3(
             close_browser_on_completion=True,
             browser_session_id=None,
             task_block=task_block,
+            workflow_permanent_id=workflow_permanent_id,
         )
     finally:
         skyvern_context.reset()
@@ -226,6 +228,18 @@ async def test_execute_task_v3_bills_per_browser_action(monkeypatch: pytest.Monk
     billed_step = post_step_mock.await_args.args[1]
     assert billed_step.step_id == step.step_id
     assert len(billed_step.output.actions_and_results) == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_threads_workflow_permanent_id_to_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Task.workflow_permanent_id is never populated on the execution path (get_task builds Task
+    # without it), so the executor must receive the workflow run's wpid explicitly and hand it to
+    # the loop for per-workflow flag targeting.
+    outcome = LoopOutcome(status="completed", reason="ok", extracted_output={"k": "v"})
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, workflow_permanent_id="wpid_from_workflow_run"
+    )
+    assert loop_mock.await_args.kwargs["workflow_permanent_id"] == "wpid_from_workflow_run"
 
 
 @pytest.mark.asyncio
@@ -982,6 +996,7 @@ async def _run_execute_step_gate(
     engine: agent_module.RunEngine,
     task_block: BaseTaskBlock | None,
     experimentation_provider: BaseExperimentationProvider | None = None,
+    workflow_run: Any = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate.
@@ -1012,7 +1027,7 @@ async def _run_execute_step_gate(
         ):
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock()
-            mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+            mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=workflow_run)
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             if experimentation_provider is not None:
                 mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
@@ -1035,6 +1050,31 @@ async def _run_execute_step_gate(
     finally:
         skyvern_context.reset()
     return v3_mock, step_engine_mock
+
+
+@pytest.mark.asyncio
+async def test_execute_step_sources_wpid_from_the_workflow_run_row() -> None:
+    # Task.workflow_permanent_id is never populated on the execution path, so the dispatch site
+    # must source the wpid from the WorkflowRun row it already fetched.
+    block = _make_block(TaskBlock)
+    now = datetime.now(UTC)
+    workflow_run = WorkflowRun(
+        workflow_run_id="wr_gate",
+        workflow_id="w_gate",
+        workflow_permanent_id="wpid_from_row",
+        organization_id="o_1",
+        status=WorkflowRunStatus.running,
+        created_at=now,
+        modified_at=now,
+    )
+    v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=block,
+        workflow_run=workflow_run,
+        workflow_run_id="wr_gate",
+    )
+    v3_mock.assert_awaited_once()
+    assert v3_mock.await_args.kwargs["workflow_permanent_id"] == "wpid_from_row"
 
 
 @pytest.mark.asyncio
