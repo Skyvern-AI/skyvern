@@ -71,6 +71,16 @@ MAX_TOOL_CALLS_PER_ACTION_STEP = 25
 # 24 is the lowest cap with a measured success rate, and it clears the p95 of rounds that successful
 # runs actually consume (15-18) with margin for the runs a lower cap silently suppressed.
 MIN_ACTION_STEPS = 24
+# Token need grows with the action-step budget (every extra round re-sends the transcript), so the
+# token backstop scales like the turn/tool-call guards. Anchored to the action-step floor: a budget
+# at or below MIN_ACTION_STEPS keeps exactly DEFAULT_MAX_TOKENS; only larger budgets rise, so a long
+# block's raised step cap isn't silently nullified by the flat token ceiling.
+MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
+# The scaling clamps here: the token guard is a runaway backstop, not a budget, and a caller's step
+# cap is not bounded at the route layer, so an extreme value must not carry the ceiling away with
+# it. 4x covers every observed legitimate long-block need (~2x) with margin. Deliberately asymmetric:
+# turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
+MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
@@ -109,16 +119,17 @@ AUTO_OBSERVE_GUIDANCE = """
 When an action result already ends with an auto-observe block, act from that snapshot instead of calling observe again. If an action changes only styling or focus (hover menus, toggles), the result may say no markup change was detected — observe if you expect something new to be visible. If the next action on the same page does not depend on seeing this one's result, put it in the same turn (the button that advances the form included); type a whole value or key sequence in one `type`/`press_key`, never one character per turn."""
 
 
-def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int]:
-    """Return (max_turns, max_tool_calls) anti-runaway guards for an action-step budget.
+def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
+    """Return (max_turns, max_tool_calls, max_tokens) anti-runaway guards for an action-step budget.
 
     Generous enough that a productive run is bounded by max_action_steps, not by these guards; with
     no action-step budget, fall back to the engine's fixed defaults."""
     if not max_action_steps:
-        return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS
+        return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOKENS
     return (
         max(DEFAULT_MAX_TURNS, max_action_steps * MAX_TURNS_PER_ACTION_STEP),
         max(DEFAULT_MAX_TOOL_CALLS, max_action_steps * MAX_TOOL_CALLS_PER_ACTION_STEP),
+        min(MAX_TOKENS_CEILING, max(DEFAULT_MAX_TOKENS, max_action_steps * MAX_TOKENS_PER_ACTION_STEP)),
     )
 
 
