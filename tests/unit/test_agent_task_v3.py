@@ -354,6 +354,39 @@ async def test_execute_task_v3_honors_explicit_step_cap_above_floor(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_scales_token_backstop_with_step_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A long block's token need grows with its action-step budget: a high explicit cap must raise
+    # the loop's token backstop proportionally, or the run dies at the flat ceiling mid-progress
+    # while well inside its step budget.
+    from skyvern.forge.taskv3.engine import DEFAULT_MAX_TOKENS
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        max_steps_per_run=2 * MIN_ACTION_STEPS,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 2 * MIN_ACTION_STEPS
+    assert loop_mock.await_args.kwargs["max_tokens"] == 2 * DEFAULT_MAX_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_token_backstop_unchanged_at_or_below_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    # At or below the action-step floor the token backstop stays at its historical default — the
+    # scaling only ever raises the ceiling for budgets above the floor, never changes small blocks.
+    from skyvern.forge.taskv3.engine import DEFAULT_MAX_TOKENS
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, max_steps_per_run=7, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+    assert loop_mock.await_args.kwargs["max_tokens"] == DEFAULT_MAX_TOKENS
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_surfaces_criteria_in_goal(monkeypatch: pytest.MonkeyPatch) -> None:
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
