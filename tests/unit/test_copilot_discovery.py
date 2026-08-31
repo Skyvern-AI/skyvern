@@ -692,9 +692,9 @@ async def test_dense_inspect_packet_sheds_only_select_options_before_recent_tool
 
     forms = result["data"]["forms"]
     assert [form["id"] for form in forms] == ["dense_form_0", "dense_form_1"]
-    assert [form["submit_controls"][0]["selector"] for form in forms] == ["#submit_0", "#submit_1"]
+    assert all("selector" not in form["submit_controls"][0] for form in forms)
     fields = [field for form in forms for field in form["fields"]]
-    assert [field["selector"] for field in fields] == [f"#select_{index}" for index in range(10)]
+    assert all("selector" not in field for field in fields)
     omitted = [field for field in fields if field["options_omitted"]]
     retained = [field for field in fields if not field["options_omitted"]]
     assert omitted
@@ -1008,6 +1008,39 @@ class _StrippedHtmlServer:
             assert expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION
             return {"ok": True, "data": {"result": []}}
         raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _RenderedStyleHtmlServer:
+    def __init__(self) -> None:
+        self.tools: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.tools.append(tool_name)
+        assert tool_name == "skyvern_evaluate"
+        assert arguments["expression"] == COMPOSITION_STRIPPED_HTML_EXPRESSION
+        return {
+            "ok": True,
+            "data": {
+                "result": (
+                    '<body><div id="veil" data-page-evidence-rendered-style="true" '
+                    'style="position:fixed;inset:0;z-index:1200"></div></body>'
+                )
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_composition_get_html_prefers_rendered_style_snapshot() -> None:
+    from skyvern.forge.sdk.copilot.tools import _composition_get_html
+
+    server = _RenderedStyleHtmlServer()
+    html, error, truncated, used_stripped = await _composition_get_html(_Ctx(server), rendered_style_snapshot=True)
+
+    assert error is None
+    assert truncated is False
+    assert used_stripped is True
+    assert "data-page-evidence-rendered-style" in html
+    assert server.tools == ["skyvern_evaluate"]
 
 
 @pytest.mark.asyncio

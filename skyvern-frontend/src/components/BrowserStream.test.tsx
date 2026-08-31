@@ -624,6 +624,45 @@ describe("BrowserStream", () => {
     });
   });
 
+  it("backs off VNC reconnects and stops after the cap", async () => {
+    vi.useFakeTimers();
+    try {
+      renderBrowserStream();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mocks.rfbInstances).toHaveLength(1);
+      mocks.autoConnect.value = false;
+
+      // Each disconnect schedules exactly one delayed redial, up to the cap.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const instanceCount = mocks.rfbInstances.length;
+        const rfb = mocks.rfbInstances[
+          mocks.rfbInstances.length - 1
+        ] as unknown as {
+          emit: (type: string, detail?: unknown) => void;
+        };
+        rfb.emit("disconnect", { clean: false });
+        // No immediate redial: the retry waits out its backoff delay.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mocks.rfbInstances).toHaveLength(instanceCount);
+        // Max delay 15s plus up to 50% jitter.
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(mocks.rfbInstances).toHaveLength(instanceCount + 1);
+      }
+
+      const instanceCount = mocks.rfbInstances.length;
+      const rfb = mocks.rfbInstances[
+        mocks.rfbInstances.length - 1
+      ] as unknown as {
+        emit: (type: string, detail?: unknown) => void;
+      };
+      rfb.emit("disconnect", { clean: false });
+      await vi.advanceTimersByTimeAsync(120000);
+      expect(mocks.rfbInstances).toHaveLength(instanceCount);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows a two-sentence message on an unclean VNC disconnect", async () => {
     renderBrowserStream();
 

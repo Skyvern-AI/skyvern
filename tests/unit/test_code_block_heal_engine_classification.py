@@ -99,6 +99,7 @@ async def test_live_legacy_path_uses_run_pinned_engine_as_authority(monkeypatch:
     )
     context = SimpleNamespace(
         organization_id="o_test",
+        workflow=None,
         get_value=MagicMock(),
         mask_secrets_in_data=lambda value: value,
     )

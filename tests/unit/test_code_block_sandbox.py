@@ -858,6 +858,7 @@ async def wrapper({default_args}):
             workflow_run_id = "wrid_test"
             browser_session_id = None
             workflow_run_outputs: list[object] = []
+            workflow = None
 
             def get_block_metadata(self, label: str | None) -> dict[str, object]:
                 return {}
@@ -940,6 +941,7 @@ async def wrapper({default_args}):
             workflow_run_id = "wrid_test"
             browser_session_id = "pbs_test"
             workflow_run_outputs: list[object] = []
+            workflow = None
 
             def get_block_metadata(self, label: str | None) -> dict[str, object]:
                 return {}
@@ -1623,6 +1625,50 @@ class TestCodeBlockOtpNoSource:
             lambda *args, **kwargs: None,
         )
         with pytest.raises(CodeBlockOTPError, match="context"):
+            await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+
+
+def _rebind_as_workflow_parameter(wrc, parameter_type: WorkflowParameterType, key: str = _CREDENTIAL_KEY) -> None:
+    now = datetime.now(timezone.utc)
+    wrc.parameters[key] = WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=parameter_type,
+        workflow_id="w",
+        default_value="cred_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+class TestCodeBlockOtpCredentialIdWorkflowParameter:
+    """A credential bound as a ``credential_id`` workflow parameter — the shape code-first
+    authoring emits — owns its TOTP seed just as a CredentialParameter does."""
+
+    @pytest.mark.asyncio
+    async def test_credential_id_workflow_parameter_mints_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import pyotp
+
+        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+
+        wrc = _build_wrc_with_totp_seed()
+        _rebind_as_workflow_parameter(wrc, WorkflowParameterType.CREDENTIAL_ID)
+        _patch_context_resolution(monkeypatch, wrc)
+
+        code = await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+
+        assert code == pyotp.TOTP(_RFC_TOTP_SEED).now()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_workflow_parameter_is_still_excluded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A run input that merely carries a ``totp``-shaped dict must not reach the seed."""
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _resolve_code_block_otp
+
+        wrc = _build_wrc_with_totp_seed()
+        _rebind_as_workflow_parameter(wrc, WorkflowParameterType.JSON)
+        _patch_context_resolution(monkeypatch, wrc)
+
+        with pytest.raises(CodeBlockOTPError, match="No OTP source"):
             await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
 
 

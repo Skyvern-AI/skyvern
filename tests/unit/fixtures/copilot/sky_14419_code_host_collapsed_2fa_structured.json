@@ -2,8 +2,8 @@
   "capture_contract": {
     "ticket": "SKY-14419",
     "fixture": "site_fixtures/code_host/index.html",
-    "fixture_git_blob": "ac9c9a0a100e010b448e1683c09f053e8a75d8f5",
-    "fixture_sha256": "4254cbe4ed44c1cfc691763cac6b0f122d3bbc9d3d9595432918037948594ffb",
+    "fixture_git_blob": "923c2c597349ac10c057c9cf4425e889691b7ae6",
+    "fixture_sha256": "81406781bc426e991905af5ab59a667d8d3672ca64933bb63752fb20700c42dd",
     "fixture_url": "http://localhost:8900/code_host/skyvern-cloud/",
     "capture_state": "signed in, passkey-first two-factor page, More options not expanded",
     "extractor": "COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION"

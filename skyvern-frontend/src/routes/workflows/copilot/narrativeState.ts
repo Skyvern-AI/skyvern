@@ -17,6 +17,7 @@ import {
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
+  CodeWriteDiff,
   WorkflowCopilotToolResultUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
@@ -149,12 +150,66 @@ export function humanizeJudgeText(text: string): string {
   return stripJudgeInstruction(rewritten).replace(/ {2,}/g, " ").trim();
 }
 
+type BuildTestConnectFailureState =
+  | "already_closed"
+  | "provisioning_unavailable"
+  | "cdp_connect_failed";
+
+function isBuildTestConnectFailureState(
+  value: unknown,
+): value is BuildTestConnectFailureState {
+  return (
+    value === "already_closed" ||
+    value === "provisioning_unavailable" ||
+    value === "cdp_connect_failed"
+  );
+}
+
 export interface TerminalEnvelopeFacts {
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
+  connectFailure?: {
+    state: BuildTestConnectFailureState;
+    retryAction: "test_end_to_end";
+    workflowRunId: string | null;
+    workflowRunBlockId: string | null;
+    taskId: string | null;
+    browserSessionId: string | null;
+  } | null;
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type BlockCoverage =
+  | "current_source"
+  | "different_source"
+  | "never_run"
+  | "unknown";
+
+const BLOCK_COVERAGE: readonly BlockCoverage[] = [
+  "current_source",
+  "different_source",
+  "never_run",
+  "unknown",
+];
+
+// The canonical per-turn facts the backend publishes; card, pill and prose each
+// render a projection of this bundle rather than deriving their own verdict.
+export interface TurnFacts {
+  factsAvailable: boolean;
+  authoredBlockCount: number | null;
+  matchingSourceBlockCount: number | null;
+  evaluationState: BlockOutcome | null;
+  runId: string | null;
+  runCompleted: boolean | null;
+  terminalCause: string | null;
+  blocksRunThisTurn: number | null;
+  ranCleanOnCurrentSource: boolean;
+}
+
+// The backend decides the tested claim and publishes it here; no surface recomputes it.
+export function ranCleanOnCurrentSource(facts: TurnFacts | null): boolean {
+  return facts?.ranCleanOnCurrentSource === true;
+}
 
 export interface ReviewProjection {
   blocks: Array<{
@@ -162,6 +217,7 @@ export interface ReviewProjection {
     blockType: string;
     change: ReviewChange;
     neverTested?: boolean;
+    coverage?: BlockCoverage;
   }>;
   duplicateWrites: Array<{
     blockType: string;
@@ -178,6 +234,29 @@ export function parseTerminalEnvelope(
   if (!raw || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
   const v = obj.run_verdict;
+  const rawConnectFailure = obj.connect_failure;
+  const connectFailure = (() => {
+    if (!rawConnectFailure || typeof rawConnectFailure !== "object")
+      return null;
+    const failure = rawConnectFailure as Record<string, unknown>;
+    const state = failure.state;
+    if (
+      !isBuildTestConnectFailureState(state) ||
+      failure.retry_action !== "test_end_to_end"
+    ) {
+      return null;
+    }
+    const text = (key: string) =>
+      typeof failure[key] === "string" ? (failure[key] as string) : null;
+    return {
+      state,
+      retryAction: "test_end_to_end" as const,
+      workflowRunId: text("workflow_run_id"),
+      workflowRunBlockId: text("workflow_run_block_id"),
+      taskId: text("task_id"),
+      browserSessionId: text("browser_session_id"),
+    };
+  })();
   return {
     runVerdict:
       v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
@@ -187,6 +266,7 @@ export function parseTerminalEnvelope(
       typeof obj.run_display_reason === "string"
         ? obj.run_display_reason
         : null,
+    connectFailure,
   };
 }
 
@@ -227,16 +307,36 @@ export interface ActivityEntry {
   toolName?: string;
   // Product-safe label for rendering tool activity to users.
   displayLabel?: string;
+  // activeLabel reads while the step runs; outcomeLabel replaces it once
+  // finished. Absent when the narrator did not speak for this step.
+  activeLabel?: string;
+  outcomeLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
+  // Server-computed line delta per code block this write changed. Absent on
+  // every other row and on payloads from a backend that predates it.
+  codeDiffs?: CodeWriteDiff[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
   // condenseActivityEntries. Unset outside that transform.
   attempts?: number;
+  // First-attempt identity for the reader-visible retry row. The current
+  // entry keeps its real event id for correlation.
+  retryRootId?: string;
+  // Exact failed attempts hidden by retry condensation, retained for the
+  // expanded evidence view.
+  priorFailures?: ActivityEntry[];
+  // Server timestamp of the first call represented by this condensed entry.
+  // A settled tool_result otherwise retains only its completion timestamp,
+  // which makes real multi-second work render as 0:00.
+  activityStartedAt?: string;
   // Server clock read for this event, persisted so a hydrated turn reports the
   // same elapsed as the live one. Undefined against a backend that does not stamp.
   timestamp?: string;
+  // Epoch ms this entry arrived on the live stream. Absent on hydrate, which
+  // is what makes a reloaded narration render complete instead of replaying.
+  receivedAtMs?: number;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -314,6 +414,7 @@ export interface TurnNarrativeState {
   connectedAccountChoices: ConnectedAccountChoice[];
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
+  turnFacts: TurnFacts | null;
 }
 
 export interface GoogleConnectionNotice {
@@ -352,6 +453,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   connectedAccountChoices: [],
   googleConnectionNotices: [],
   review: null,
+  turnFacts: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -408,6 +510,30 @@ export function parseCredentialPause(
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
   };
+}
+
+export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const diffs: CodeWriteDiff[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (
+      typeof row.label !== "string" ||
+      typeof row.added !== "number" ||
+      typeof row.removed !== "number"
+    ) {
+      continue;
+    }
+    diffs.push({
+      label: row.label,
+      added: row.added,
+      removed: row.removed,
+      patch: typeof row.patch === "string" ? row.patch : undefined,
+      patchDropped: row.patchDropped === true,
+    });
+  }
+  return diffs.length > 0 ? diffs : undefined;
 }
 
 export function parseConnectedAccountChoices(
@@ -520,6 +646,9 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   press_key: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
+  skyvern_frame_list: "Finding embedded pages",
+  skyvern_frame_switch: "Opening embedded page",
+  skyvern_frame_main: "Returning to main page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
@@ -580,6 +709,7 @@ function buildActivityFromToolResult(
     toolName: event.tool_name,
     displayLabel,
     success: event.success,
+    codeDiffs: parseCodeDiffs(event.code_diffs),
     id: `tr-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
   };
@@ -587,22 +717,40 @@ function buildActivityFromToolResult(
 
 function buildActivityFromNarration(
   event: WorkflowCopilotNarrationUpdate,
+  receivedAtMs: number,
 ): ActivityEntry {
   return {
     kind: "narration",
     text: event.narration,
     iteration: event.iteration,
+    activeLabel: event.active_label ?? undefined,
+    outcomeLabel: event.outcome_label ?? undefined,
     id: `n-${event.iteration}-${event.timestamp}`,
     timestamp: event.timestamp,
+    receivedAtMs,
   };
 }
 
-// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention —
-// also used by copilotPhases.ts's hasPendingToolCall.
+// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention.
 export function toolCallIdOf(entry: ActivityEntry): string | undefined {
   return entry.kind === "tool_call" || entry.kind === "tool_result"
     ? entry.id.slice(3)
     : undefined;
+}
+
+// A tool_call still has no matching tool_result — the narrator can emit a
+// TOOL_STARTED progress narration mid-flight (streaming_adapter.py), so
+// checking only the LAST entry's kind isn't enough; match ids instead.
+export function hasPendingToolCall(designActivity: ActivityEntry[]): boolean {
+  const pending = new Set<string>();
+  for (const entry of designActivity) {
+    if (entry.kind === "tool_call") {
+      pending.add(toolCallIdOf(entry) ?? "");
+    } else if (entry.kind === "tool_result") {
+      pending.delete(toolCallIdOf(entry) ?? "");
+    }
+  }
+  return pending.size > 0;
 }
 
 // Folds each tool_call/tool_result pair into one row (pending while
@@ -676,11 +824,19 @@ export function condenseActivityEntries(
       const idx = id !== undefined ? callIndexById.get(id) : undefined;
       if (idx !== undefined) {
         callIndexById.delete(id!);
+        const call = paired[idx];
+        const settled =
+          call?.timestamp === undefined
+            ? entry
+            : {
+                ...entry,
+                activityStartedAt: call.activityStartedAt ?? call.timestamp,
+              };
         if (idx === paired.length - 1) {
-          paired[idx] = entry;
+          paired[idx] = settled;
         } else {
           paired[idx] = null;
-          paired.push(entry);
+          paired.push(settled);
         }
       } else {
         // Its tool_call was evicted past the activity cap — keep the
@@ -697,6 +853,14 @@ export function condenseActivityEntries(
   let lastToolIdx = -1;
   for (const entry of ordered) {
     const prevTool = lastToolIdx >= 0 ? condensed[lastToolIdx] : undefined;
+    const previousEndedMs = parseUtcIsoMs(prevTool?.timestamp);
+    const currentStartedMs = parseUtcIsoMs(
+      entry.activityStartedAt ?? entry.timestamp,
+    );
+    const followsPreviousAttempt =
+      previousEndedMs === null ||
+      currentStartedMs === null ||
+      currentStartedMs >= previousEndedMs;
     if (
       prevTool &&
       entry.toolName !== undefined &&
@@ -704,13 +868,24 @@ export function condenseActivityEntries(
       (prevTool.displayLabel === undefined ||
         entry.displayLabel === undefined ||
         prevTool.displayLabel === entry.displayLabel) &&
-      prevTool.success === false
+      prevTool.success === false &&
+      followsPreviousAttempt
     ) {
+      const { priorFailures: earlierFailures, ...previousAttempt } = prevTool;
       condensed[lastToolIdx] = null;
       lastToolIdx =
         condensed.push({
           ...entry,
+          retryRootId: prevTool.retryRootId ?? prevTool.id,
+          priorFailures: [
+            ...(earlierFailures ?? []),
+            previousAttempt as ActivityEntry,
+          ],
           attempts: (prevTool.attempts ?? 1) + 1,
+          activityStartedAt:
+            prevTool.activityStartedAt ??
+            prevTool.timestamp ??
+            entry.activityStartedAt,
         }) - 1;
       continue;
     }
@@ -729,11 +904,29 @@ function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
+function findActivityBlockIndex(blocks: BlockState[], entryId: string): number {
+  return blocks.findIndex((block) =>
+    block.activity.some((entry) => entry.id === entryId),
+  );
+}
+
 function appendActivity(
   blocks: BlockState[],
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  // Mirrors NarratorState._activity_bucket_label: narration renders inside the
+  // design step it explains, so it stays in design activity even mid-run.
+  if (entry.kind === "narration") {
+    return {
+      blocks,
+      designActivity: appendCapped(
+        designActivity,
+        entry,
+        MAX_DESIGN_ACTIVITY_ENTRIES,
+      ),
+    };
+  }
   // A run tool's result must rejoin its call's bucket. The run flips the active
   // block between the call and the result, so routing the result to the live
   // active block would split the call/result pair across buckets and it could
@@ -754,9 +947,7 @@ function appendActivity(
         ),
       };
     }
-    const callBlockIdx = blocks.findIndex((b) =>
-      b.activity.some((e) => e.id === callId),
-    );
+    const callBlockIdx = findActivityBlockIndex(blocks, callId);
     if (callBlockIdx !== -1) {
       const nextBlocks = blocks.slice();
       const callBlock = nextBlocks[callBlockIdx]!;
@@ -784,6 +975,38 @@ function appendActivity(
     ...active,
     activity: appendCapped(active.activity, entry, MAX_ACTIVITY_ENTRIES),
   };
+  return { blocks: nextBlocks, designActivity };
+}
+
+function attachCodeDiffsToActivity(
+  blocks: BlockState[],
+  designActivity: ActivityEntry[],
+  targetId: string,
+  codeDiffs: CodeWriteDiff[],
+): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  const designIndex = designActivity.findIndex(
+    (entry) => entry.id === targetId,
+  );
+  if (designIndex !== -1) {
+    const nextDesignActivity = designActivity.slice();
+    nextDesignActivity[designIndex] = {
+      ...nextDesignActivity[designIndex]!,
+      codeDiffs,
+    };
+    return { blocks, designActivity: nextDesignActivity };
+  }
+
+  const blockIndex = findActivityBlockIndex(blocks, targetId);
+  if (blockIndex === -1) return { blocks, designActivity };
+
+  const nextBlocks = blocks.slice();
+  const block = nextBlocks[blockIndex]!;
+  const activityIndex = block.activity.findIndex(
+    (entry) => entry.id === targetId,
+  );
+  const activity = block.activity.slice();
+  activity[activityIndex] = { ...activity[activityIndex]!, codeDiffs };
+  nextBlocks[blockIndex] = { ...block, activity };
   return { blocks: nextBlocks, designActivity };
 }
 
@@ -883,6 +1106,22 @@ export function applyNarrativeEvent(
       // Preserve any prior block whose label was dropped from the draft (rare
       // — happens if the agent renames a block mid-turn). Drop those that no
       // longer exist; they no longer participate in the proposal.
+      // The write's patch arrives here rather than on the tool_result, because a write and its
+      // test share one tool call and that result lands only after the run. Attach it to the
+      // call's own entry so the row shows the code as soon as it is written.
+      const draftDiffs = parseCodeDiffs(event.code_diffs);
+      const diffTarget =
+        event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
+      const withDiffs =
+        draftDiffs === undefined || diffTarget === null
+          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          : attachCodeDiffsToActivity(
+              nextBlocks,
+              prev.designActivity,
+              diffTarget,
+              draftDiffs,
+            );
+
       return {
         ...prev,
         draft: {
@@ -890,7 +1129,8 @@ export function applyNarrativeEvent(
           blockLabels: event.block_labels,
           summary: event.summary,
         },
-        blocks: nextBlocks,
+        blocks: withDiffs.blocks,
+        designActivity: withDiffs.designActivity,
       };
     }
 
@@ -1062,7 +1302,7 @@ export function applyNarrativeEvent(
     }
 
     case "narration": {
-      const entry = buildActivityFromNarration(event);
+      const entry = buildActivityFromNarration(event, nowMs);
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1235,12 +1475,45 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       toolName: typeof o.toolName === "string" ? o.toolName : undefined,
       displayLabel:
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
+      activeLabel:
+        typeof o.activeLabel === "string" ? o.activeLabel : undefined,
+      outcomeLabel:
+        typeof o.outcomeLabel === "string" ? o.outcomeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
+      codeDiffs: parseCodeDiffs(o.codeDiffs),
       id: o.id,
       timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
     });
   }
   return out;
+}
+
+function parseTurnFacts(raw: unknown): TurnFacts | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.factsAvailable !== "boolean") return null;
+  const count = (key: string): number | null =>
+    typeof value[key] === "number" ? (value[key] as number) : null;
+  const text = (key: string): string | null =>
+    typeof value[key] === "string" ? (value[key] as string) : null;
+  const evaluationState = value.evaluationState;
+  return {
+    factsAvailable: value.factsAvailable,
+    authoredBlockCount: count("authoredBlockCount"),
+    matchingSourceBlockCount: count("matchingSourceBlockCount"),
+    evaluationState:
+      evaluationState === "demonstrated" ||
+      evaluationState === "not_demonstrated" ||
+      evaluationState === "not_evaluated"
+        ? evaluationState
+        : null,
+    runId: text("runId"),
+    runCompleted:
+      typeof value.runCompleted === "boolean" ? value.runCompleted : null,
+    terminalCause: text("terminalCause"),
+    blocksRunThisTurn: count("blocksRunThisTurn"),
+    ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
+  };
 }
 
 function parseReviewProjection(raw: unknown): ReviewProjection | null {
@@ -1265,11 +1538,14 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
     ) {
       return null;
     }
+    // An unrecognised coverage value drops off this block rather than voiding the
+    // whole projection, so a newer backend vocabulary cannot blank the review.
     blocks.push({
       label: block.label,
       blockType: block.blockType,
       change: block.change,
       neverTested: block.neverTested,
+      coverage: BLOCK_COVERAGE.find((known) => known === block.coverage),
     });
   }
   const duplicateWrites: ReviewProjection["duplicateWrites"] = [];
@@ -1406,12 +1682,16 @@ export function hydrateNarrativeFromPayload(
   const endedAtIso =
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
+  const turnFacts = parseTurnFacts(payload.turnFacts);
+  // A deadline cuts a running block off; that is a stop, so it must not be swept
+  // to failed and then read back as the turn having failed.
+  const halted = cancelled || turnFacts?.terminalCause === "deadline_expired";
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: cancelled
+              state: halted
                 ? "stopped"
                 : terminal === "error"
                   ? "failed"
@@ -1477,6 +1757,7 @@ export function hydrateNarrativeFromPayload(
       payload.googleConnectionNotices,
     ),
     review: parseReviewProjection(payload.review),
+    turnFacts,
   };
 }
 
@@ -1648,17 +1929,15 @@ function adjudicatedSummaryParts(
     needsTestedProposalReview: boolean;
     hasEdited: boolean;
     hasDrafts: boolean;
-    hasCleanCompletedBuild: boolean;
   },
-  uxV1 = false,
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
   // Disposition-first (rule A): a pending draft review outranks why the turn
   // ended, regardless of responseKind (including non-build/clarify turns).
-  if (uxV1 && flags.needsUntestedProposalReview) {
+  if (flags.needsUntestedProposalReview) {
     return { headline: "Draft needs review", accent: "qa", glyph: "!" };
   }
-  if (uxV1 && flags.needsTestedProposalReview) {
+  if (flags.needsTestedProposalReview) {
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (turn.responseKind !== "build") {
@@ -1675,7 +1954,7 @@ function adjudicatedSummaryParts(
       return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
     }
     return {
-      headline: uxV1 ? "Needs your input" : "Question",
+      headline: "Needs your input",
       accent: "qa",
       glyph: "✦",
     };
@@ -1688,7 +1967,7 @@ function adjudicatedSummaryParts(
   }
   if (turn.responseType === "ASK_QUESTION") {
     return {
-      headline: uxV1 ? "Needs your input" : "Question",
+      headline: "Needs your input",
       accent: "qa",
       glyph: "✦",
     };
@@ -1696,25 +1975,35 @@ function adjudicatedSummaryParts(
   return null;
 }
 
-export function computeTurnSummary(
-  turn: TurnNarrativeState,
-  opts: { uxV1?: boolean } = {},
-): TurnSummary {
-  const uxV1 = opts.uxV1 ?? false;
+// A deadline exit stamps terminal="error" for budget reasons; that is a halt,
+// not a block failure, so no surface may give it failure's treatment.
+export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" &&
+    !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
+export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   // A cancelled turn's terminal is "error" purely because the user stopped it,
   // so that arm must not brand their own stop a failure.
+  const anyBlockFailed = rollupBlocks.some((b) => b.state === "failed");
+  const facts = turn.turnFacts;
+  const deadlineHalt = isDeadlineHalt(turn);
   const isFail =
     !turn.cancelled &&
-    (turn.terminal === "error" ||
-      rollupBlocks.some((b) => b.state === "failed"));
+    !deadlineHalt &&
+    (turn.terminal === "error" || anyBlockFailed);
   // A stop halts the turn without failing it — a user cancel, or a budget halt
   // that cancels a block mid-run. It suppresses a success verdict exactly like
   // a failure, but never wears failure's treatment. `turn.cancelled` is load
   // bearing on its own: a stop during the thinking phase, or on a QA turn,
   // touches no block at all and would otherwise read as a clean success.
   const isStopped =
-    turn.cancelled || rollupBlocks.some((b) => b.state === "stopped");
+    turn.cancelled ||
+    deadlineHalt ||
+    rollupBlocks.some((b) => b.state === "stopped");
   const mode = effectiveMode(turn);
   const needsInput = asksUserForInput(turn);
   const isQA =
@@ -1723,15 +2012,26 @@ export function computeTurnSummary(
     mode === "clarify" ||
     mode === "refuse";
   const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
+  const cleanFullCurrentSourceCoverage = ranCleanOnCurrentSource(facts);
   const needsUntestedProposalReview =
     hasDrafts && turn.proposalDisposition === "review_untested";
+  // The tested framing is a claim like any other, so it reads the published verdict
+  // rather than the disposition alone.
   const needsTestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_tested";
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-  const hasCleanCompletedBuild =
     hasDrafts &&
-    rollupBlocks.length > 0 &&
-    rollupBlocks.every((block) => isBlockOk(block));
+    turn.proposalDisposition === "review_tested" &&
+    cleanFullCurrentSourceCoverage;
+  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
+  const authoredBlockCount = facts?.factsAvailable
+    ? facts.authoredBlockCount
+    : null;
+  const matchingSourceBlockCount = facts?.factsAvailable
+    ? facts.matchingSourceBlockCount
+    : null;
+  const coverageKnown =
+    authoredBlockCount !== null &&
+    authoredBlockCount > 0 &&
+    matchingSourceBlockCount !== null;
   const hasReviewableDraft =
     hasDrafts &&
     (turn.proposalDisposition === "review_untested" ||
@@ -1743,17 +2043,12 @@ export function computeTurnSummary(
   const adjudicated =
     isStoppedWithDraft || isFail || isStopped
       ? null
-      : adjudicatedSummaryParts(
-          turn,
-          {
-            needsUntestedProposalReview,
-            needsTestedProposalReview,
-            hasEdited,
-            hasDrafts,
-            hasCleanCompletedBuild,
-          },
-          uxV1,
-        );
+      : adjudicatedSummaryParts(turn, {
+          needsUntestedProposalReview,
+          needsTestedProposalReview,
+          hasEdited,
+          hasDrafts,
+        });
 
   const headline = adjudicated
     ? adjudicated.headline
@@ -1763,40 +2058,24 @@ export function computeTurnSummary(
         ? "Run halted"
         : isStopped
           ? "Stopped"
-          : uxV1
-            ? needsUntestedProposalReview
-              ? "Draft needs review"
-              : needsTestedProposalReview
-                ? "Workflow ready for review"
-                : needsInput
-                  ? "Needs your input"
-                  : isQA
-                    ? mode === "refuse"
-                      ? "Declined"
-                      : mode === "clarify"
-                        ? "Needs your input"
-                        : "Answered"
+          : needsUntestedProposalReview
+            ? "Draft needs review"
+            : needsTestedProposalReview
+              ? "Workflow ready for review"
+              : needsInput
+                ? "Needs your input"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Needs your input"
+                      : "Answered"
+                  : cleanFullCurrentSourceCoverage
+                    ? "Every block ran clean on the current draft"
                     : hasEdited
-                      ? "Applied edits and re-tested"
+                      ? "Applied edits"
                       : hasDrafts
-                        ? "Built and tested the workflow"
-                        : "Completed the run"
-            : needsInput
-              ? "Question"
-              : needsUntestedProposalReview
-                ? "Draft needs review"
-                : needsTestedProposalReview
-                  ? "Workflow ready for review"
-                  : isQA
-                    ? mode === "refuse"
-                      ? "Declined"
-                      : mode === "clarify"
-                        ? "Question"
-                        : "Answered"
-                    : hasEdited
-                      ? "Applied edits and re-tested"
-                      : hasDrafts
-                        ? "Built and tested the workflow"
+                        ? "Built the workflow"
                         : "Completed the run";
 
   const stats: string[] = [];
@@ -1807,8 +2086,30 @@ export function computeTurnSummary(
     const failed = rollupBlocks.filter((b) => b.state === "failed").length;
     const stopped = rollupBlocks.filter((b) => b.state === "stopped").length;
     const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-    if (newBlocks) stats.push(`${newBlocks} new`);
+    if (coverageKnown) {
+      stats.push(
+        `${authoredBlockCount} block${authoredBlockCount === 1 ? "" : "s"} authored`,
+      );
+      stats.push(
+        `${matchingSourceBlockCount}/${authoredBlockCount} ran on current source`,
+      );
+      if (facts?.runCompleted === true) {
+        stats.push("run completed");
+      } else if (facts?.runCompleted === false) {
+        stats.push("run did not complete");
+      }
+      if (facts?.evaluationState === "not_evaluated") {
+        stats.push("outcome not evaluated");
+      } else if (facts?.evaluationState === "not_demonstrated") {
+        stats.push("outcome not confirmed");
+      }
+      if (facts?.terminalCause === "deadline_expired") {
+        stats.push("time limit reached");
+      }
+    } else {
+      if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
+      if (newBlocks) stats.push(`${newBlocks} new`);
+    }
     if (failed) stats.push(`${failed} failed`);
     if (stopped) stats.push(`${stopped} stopped`);
   }
@@ -1822,7 +2123,8 @@ export function computeTurnSummary(
         : isStopped ||
             needsUntestedProposalReview ||
             needsTestedProposalReview ||
-            isQA
+            isQA ||
+            (hasDrafts && !cleanFullCurrentSourceCoverage)
           ? "qa"
           : "ok";
   return {
@@ -1833,7 +2135,10 @@ export function computeTurnSummary(
       ? adjudicated.glyph
       : isStoppedWithDraft ||
           needsUntestedProposalReview ||
-          needsTestedProposalReview
+          needsTestedProposalReview ||
+          // A draft still awaiting review never wears a success tick, whether or not
+          // facts back its tested framing.
+          (hasDrafts && turn.proposalDisposition === "review_tested")
         ? "!"
         : isFail
           ? "✕"

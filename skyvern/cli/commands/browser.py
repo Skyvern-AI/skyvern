@@ -645,11 +645,12 @@ def extension_install() -> None:
         console.print("1. Enable Developer mode.")
         console.print("2. Click Load unpacked.")
         console.print(f"3. Select {extension_dir}.", markup=False, soft_wrap=True)
+        console.print("4. Open Skyvern Agent details and enable Allow User Scripts.")
         console.print(
-            "4. Start your extension-mode MCP server; its first broker start enables broker state automatically."
+            "5. Start your extension-mode MCP server; its first broker start enables broker state automatically."
         )
-        console.print("5. Run skyvern browser extension-pair to start explicit pairing.")
-        console.print('6. Add tabs to the "Skyvern Controlled" group.')
+        console.print("6. Run skyvern browser extension-pair to start explicit pairing.")
+        console.print('7. Add tabs to the "Skyvern Controlled" group.')
         return
 
     try:
@@ -674,17 +675,18 @@ def extension_install() -> None:
     console.print("1. Enable Developer mode.")
     console.print("2. Click Load unpacked.")
     console.print(f"3. Select {extension_dir}.", markup=False, soft_wrap=True)
+    console.print("4. Open Skyvern Agent details and enable Allow User Scripts.")
     if bridge_listening and port is not None:
-        console.print("4. Approve pairing in the Skyvern Agent confirmation tab (one click).")
-        console.print('5. Add tabs to the "Skyvern Controlled" group.')
+        console.print("5. Approve pairing in the Skyvern Agent confirmation tab (one click).")
+        console.print('6. Add tabs to the "Skyvern Controlled" group.')
         try:
             _launch_extension_pairing(port)
         except BrowserExtensionError:
             console.print("Automatic pairing could not start. Run skyvern browser extension-pair after setup.")
     else:
-        console.print("4. Open the Skyvern Agent popup.")
-        console.print("5. Paste the pairing token and click Connect.")
-        console.print('6. Add tabs to the "Skyvern Controlled" group.')
+        console.print("5. Open the Skyvern Agent popup.")
+        console.print("6. Paste the pairing token and click Connect.")
+        console.print('7. Add tabs to the "Skyvern Controlled" group.')
         console.print("When your MCP server is running, pair with: skyvern browser extension-pair")
 
 

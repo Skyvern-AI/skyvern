@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
+    CodeSafetyRejectionFact,
     RecordedBuildTestOutcome,
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
+from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
 from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
@@ -97,7 +99,7 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
     render_schema_incompatibility_agent_steer,
     render_schema_incompatibility_user_reason,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
+from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
@@ -108,6 +110,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
+    runner_code_block_associations,
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
@@ -130,6 +133,8 @@ from .banned_blocks import (
     _copilot_block_authoring_policy,
     _detect_new_banned_blocks,
     _record_banned_block_reject_span,
+    _task_v3_pure_policy_violations,
+    _task_v3_pure_reject_message,
 )
 from .credentials import _credential_id_misbinding_findings, _credential_reference_validation_error
 from .frontier import (
@@ -870,6 +875,7 @@ def _record_author_time_reject_outcome(
     authored_structure_signature: str | None = None,
     block_labels: list[str] | None = None,
     missing_requested_output_facts: list[dict[str, object]] | None = None,
+    code_safety_rejection_facts: list[CodeSafetyRejectionFact] | None = None,
 ) -> None:
     record_build_test_outcome(
         ctx,
@@ -881,6 +887,7 @@ def _record_author_time_reject_outcome(
             authored_structure_signature=authored_structure_signature,
             block_labels=block_labels,
             missing_requested_output_facts=missing_requested_output_facts,
+            code_safety_rejection_facts=code_safety_rejection_facts,
         ),
     )
 
@@ -894,6 +901,7 @@ def _build_author_time_reject_outcome(
     authored_structure_signature: str | None = None,
     block_labels: list[str] | None = None,
     missing_requested_output_facts: list[dict[str, object]] | None = None,
+    code_safety_rejection_facts: list[CodeSafetyRejectionFact] | None = None,
 ) -> RecordedBuildTestOutcome:
     prior_outcome = ctx.latest_recorded_build_test_outcome
     observed_page_value_excerpt = (
@@ -907,23 +915,42 @@ def _build_author_time_reject_outcome(
         observed_evidence_summary=summary,
         observed_page_value_excerpt=observed_page_value_excerpt,
         missing_requested_output_facts=missing_requested_output_facts or [],
+        code_safety_rejection_facts=code_safety_rejection_facts or [],
     )
 
 
-def _code_safety_reject_payload(errors: list[str | CodeBlockSecurityError]) -> Mapping[str, object] | None:
-    entries: list[dict[str, object]] = []
+def _code_safety_rejection_facts(
+    errors: list[str | CodeBlockSecurityError],
+    *,
+    submission_ref: str | None,
+) -> list[CodeSafetyRejectionFact]:
+    facts: list[CodeSafetyRejectionFact] = []
     for error in errors:
         if isinstance(error, CodeBlockSecurityError):
-            entries.append(
-                {
-                    "block_label": error.block_label,
-                    "reason_code": error.reason_code,
-                    "surface": error.surface,
-                }
+            facts.append(
+                CodeSafetyRejectionFact(
+                    block_label=error.block_label,
+                    reason_code=error.reason_code,
+                    surface=error.surface,
+                    submission_ref=submission_ref or "",
+                )
             )
-    if not entries:
+    return facts
+
+
+def _code_safety_reject_payload(facts: list[CodeSafetyRejectionFact]) -> dict[str, list[dict[str, str]]] | None:
+    if not facts:
         return None
-    return {"code_safety_errors": entries}
+    return {
+        "code_safety_errors": [
+            {
+                "block_label": fact.block_label,
+                "reason_code": fact.reason_code,
+                "surface": fact.surface,
+            }
+            for fact in facts
+        ]
+    }
 
 
 def _metadata_item_extraction_schema_paths(item: Mapping[str, Any]) -> set[str]:
@@ -3832,6 +3859,7 @@ async def _update_workflow(
     ctx: AgentContext,
     *,
     allow_missing_credentials: bool | None = None,
+    originating_call_id: str | None = None,
 ) -> dict[str, Any]:
     def _blocked(block: AuthorTimeBlock) -> dict[str, Any]:
         _clear_code_authoring_repair_context(ctx)
@@ -3878,13 +3906,21 @@ async def _update_workflow(
     existing_metadata = ctx.code_artifact_metadata
     previous_metadata_contract = contract_from_code_artifact_metadata(existing_metadata)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
+    code_safety_rejection_facts: list[CodeSafetyRejectionFact] = []
     if code_safety_errors:
         _clear_code_authoring_repair_context(ctx)
+        code_safety_rejection_facts = _code_safety_rejection_facts(
+            code_safety_errors,
+            submission_ref=originating_call_id,
+        )
+        rejected_labels = list(dict.fromkeys(fact.block_label for fact in code_safety_rejection_facts))
         _record_author_time_reject_outcome(
             ctx,
             reason_code="code_safety_reject",
             summary="Code authoring guardrail rejected the submitted code block.",
-            structural_payload=_code_safety_reject_payload(code_safety_errors),
+            structural_payload=_code_safety_reject_payload(code_safety_rejection_facts),
+            block_labels=rejected_labels,
+            code_safety_rejection_facts=code_safety_rejection_facts,
         )
     # Per-label salvage keeps conforming metadata across a rejection; a
     # rejected code block keeps nothing, since its yaml never becomes the
@@ -3921,7 +3957,12 @@ async def _update_workflow(
                     metadata_rejected=False,
                     code_rejected=True,
                 ),
-                data=_code_repair_progress_data(None),
+                data={
+                    **_code_repair_progress_data(None),
+                    "code_safety_rejection_facts": [
+                        fact.model_dump(mode="json") for fact in code_safety_rejection_facts
+                    ],
+                },
             ),
         )
     if allow_missing_credentials is None:
@@ -3975,6 +4016,19 @@ async def _update_workflow(
     # LLM actually saw, not the turn-start persisted state.
     last_yaml = ctx.last_workflow_yaml
     prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
+        task_v3_pure_violations = _task_v3_pure_policy_violations(workflow_yaml)
+        if task_v3_pure_violations:
+            violation_items = [(violation.label, violation.block_type) for violation in task_v3_pure_violations]
+            _record_banned_block_reject_span("_update_workflow", violation_items)
+            return _blocked(
+                AuthorTimeBlock(
+                    block_id=BANNED_BLOCKS_BLOCK_ID,
+                    error=_task_v3_pure_reject_message(task_v3_pure_violations),
+                    data={"violations": [violation.as_dict() for violation in task_v3_pure_violations]},
+                )
+            )
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -4077,6 +4131,11 @@ async def _update_workflow(
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
         if isinstance(ctx, CopilotContext):
+            ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+                workflow_yaml,
+                prior_associations=ctx.runner_code_block_associations_by_label,
+                preserve_existing=params.get("_preserve_code_block_associations") is True,
+            )
             current_google_connection_bindings = google_sheet_connection_bindings(workflow)
             turn_start_workflow = prior_workflow
             if ctx.google_connection_turn_start_bindings is None:
@@ -4141,17 +4200,44 @@ async def _update_workflow(
         # otherwise-successful update_workflow tool call. ``isinstance``
         # narrows the parameter's declared ``AgentContext`` to the
         # envelope-aware ``CopilotContext`` for mypy.
+        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
+        written_diffs: list[CodeWriteDiff] = []
+        if isinstance(ctx, CopilotContext):
+            # Best-effort — the workflow is already persisted, so a narrative detail must never
+            # turn a successful write into a failed turn.
+            try:
+                # Keyed by the call that produced it, and extended rather than assigned: parallel
+                # tool calls are the provider default, so a second write can land before the first
+                # one's result drains, and one call can write more than one block.
+                written_diffs, ctx.code_write_patch_budget = build_code_write_diffs(
+                    _workflow_yaml_code_blocks_by_label(prior_workflow_yaml),
+                    changed_code_blocks,
+                    scrub=lambda text: scrub_secrets_from_text(ctx, text),
+                    budget=ctx.code_write_patch_budget,
+                )
+                if written_diffs and originating_call_id is not None:
+                    stashed = ctx.pending_code_write_diffs.get(originating_call_id, [])
+                    ctx.pending_code_write_diffs[originating_call_id] = [*stashed, *written_diffs]
+            except Exception as diff_err:
+                LOG.warning("copilot_code_write_diff_failed", error=str(diff_err))
         if isinstance(ctx, CopilotContext) and ctx.stream is not None:
             try:
                 await maybe_emit_design_end(ctx.stream, ctx)
-                await emit_workflow_draft(ctx.stream, ctx, workflow)
+                # The diffs ride the draft, which fires now, rather than the tool_result: a write
+                # and its test share one tool call, so the result lands only after the run.
+                await emit_workflow_draft(
+                    ctx.stream,
+                    ctx,
+                    workflow,
+                    code_diffs=written_diffs or None,
+                    tool_call_id=originating_call_id,
+                )
             except Exception as emit_err:
                 LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
         data: dict[str, Any] = {
             "message": "Workflow updated successfully.",
             "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
         }
-        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
         stored_code, stored_code_withheld = _accepted_code_delta(changed_code_blocks)
         if stored_code:
             data["stored_code"] = stored_code

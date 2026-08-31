@@ -13,6 +13,7 @@ from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
 
+from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
 from skyvern.forge.sdk.copilot.enforcement import (
     gate_decision_trace_fields,
     outcome_fully_verified,
@@ -85,6 +86,8 @@ class CopilotRunHooks(RunHooksBase):
     ) -> None:
         try:
             self._ctx.model_calls_this_turn += 1
+            if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
+                self._ctx.eval_prompt_sha256 = prompt_sha256(system_prompt)
         except Exception:
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",
@@ -140,6 +143,27 @@ class CopilotRunHooks(RunHooksBase):
                 ]
                 if resolved:
                     activity_entry["credentials"] = resolved
+
+            if tool_name == "list_integrations" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                listed = data.get("integrations", []) if isinstance(data, dict) else []
+                if not isinstance(listed, list):
+                    listed = []
+                integrations = [
+                    {
+                        "connection_id": integration.get("connection_id"),
+                        "provider": integration.get("provider"),
+                        "state": integration.get("state"),
+                        "scopes_granted": integration.get("scopes_granted"),
+                    }
+                    for integration in listed
+                    if isinstance(integration, dict)
+                    and isinstance(integration.get("connection_id"), str)
+                    and isinstance(integration.get("provider"), str)
+                    and isinstance(integration.get("state"), str)
+                    and isinstance(integration.get("scopes_granted"), list)
+                ]
+                activity_entry["integrations"] = integrations
 
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}

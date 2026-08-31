@@ -9,7 +9,20 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeGuard
 
+from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
+
+
+def requested_output_designation_capability(output_paths: list[str]) -> dict[str, Any]:
+    """Describe the existing model-citation surface for task-linked rendered values."""
+    return {
+        "tool": "inspect_page_for_composition",
+        "argument": "requested_output_reads",
+        "page_reference": "current_page",
+        "requested_output_paths": sorted(output_paths),
+        "citation_fields": ["output_path", "value_text", "label"],
+        "effect": "browser verifies the cited rendered value and returns selector candidates",
+    }
 
 
 class LiveReadKind(StrEnum):
@@ -725,9 +738,14 @@ def _intact_binding_channels(packet: dict[str, Any]) -> tuple[bool, bool]:
     binding whose own evidence is complete. Truncation still voids the channel it happened in,
     where an unseen duplicate could have made the bind ambiguous.
     """
+    key_values_omitted = size_compaction_omits(packet, {"key_value_relations"})
+    containers_omitted = size_compaction_omits(
+        packet,
+        {"result_containers", "result_containers.rows", "result_containers.sample_rows"},
+    )
     return (
-        packet.get("key_value_relations_truncated") is False,
-        packet.get("result_containers_truncated") is False,
+        packet.get("key_value_relations_truncated") is False and not key_values_omitted,
+        packet.get("result_containers_truncated") is False and not containers_omitted,
     )
 
 
@@ -833,6 +851,7 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " if ((el.innerText || '').trim() !== target) return false;"
         " return !Array.from(el.children).some((c) => (c.innerText || '').trim() === target); });"
         " if (!matches.length) return { error: 'text-not-found' };"
+        " let labelAssociation = label ? 'not_found' : 'not_provided';"
         " if (label) { const labelNodes = Array.from(document.querySelectorAll('body *')).filter((el) => {"
         " if (!visible(el) || (el.innerText || '').trim() !== label) return false;"
         " return !Array.from(el.children).some((c) => (c.innerText || '').trim() === label); });"
@@ -840,8 +859,7 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " let node = el.parentElement, hops = 0;"
         " while (node && node !== document.body && hops < 4) {"
         " if (node.contains(labelNode)) return true; node = node.parentElement; hops++; } return false; }));"
-        " if (!scoped.length) return { error: 'label-not-associated', text: target, url: location.href };"
-        " matches = scoped; }"
+        " if (scoped.length) { matches = scoped; labelAssociation = 'verified'; } }"
         " if (matches.length > 1) return { error: 'text-ambiguous', visible_count: matches.length,"
         " text: target, url: location.href };"
         " const chosen = matches[0];"
@@ -851,15 +869,15 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " return found.length === 1 && found[0] === chosen; } catch (e) { return false; } };"
         " const tag = chosen.tagName.toLowerCase();"
         " const proposed = [];"
-        " if (chosen.id) proposed.push('#' + CSS.escape(chosen.id));"
+        " if (chosen.id) proposed.push({ selector: '#' + CSS.escape(chosen.id), source: 'id' });"
         " for (const name of ['data-testid', 'data-test', 'data-attr', 'aria-label']) {"
-        " const value = chosen.getAttribute(name); if (value) proposed.push(tag + '[' + name + '='"
-        " + JSON.stringify(value) + ']'); }"
+        " const value = chosen.getAttribute(name); if (value) proposed.push({ selector: tag + '[' + name + '='"
+        " + JSON.stringify(value) + ']', source: name.replaceAll('-', '_') }); }"
         " const classes = Array.from(chosen.classList || []).slice(0, 3)"
         ".map((c) => '.' + CSS.escape(c)).join('');"
-        " if (classes) proposed.push(tag + classes);"
+        " if (classes) proposed.push({ selector: tag + classes, source: 'class' });"
         " let selector = '';"
-        " for (const candidate of proposed) { if (unique(candidate)) { selector = candidate; break; } }"
+        " for (const candidate of proposed) { if (unique(candidate.selector)) { selector = candidate.selector; break; } }"
         " const parts = []; let cur = chosen;"
         " while (cur && cur.nodeType === 1 && cur !== document.body) {"
         " const parent = cur.parentElement; if (!parent) break;"
@@ -869,13 +887,13 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " cur = null; break; } cur = parent; }"
         " const structural = parts[0] && parts[0].charAt(0) === '#'"
         " ? parts.join(' > ') : 'body > ' + parts.join(' > ');"
-        " if (structural) proposed.push(structural);"
+        " if (structural) proposed.push({ selector: structural, source: 'structural' });"
         " const selectorCandidates = [];"
         " for (const candidate of proposed) {"
-        " if (!candidate || selectorCandidates.some((item) => item.selector === candidate)) continue;"
-        " let found = []; try { found = Array.from(document.querySelectorAll(candidate)); } catch (e) { continue; }"
+        " if (!candidate.selector || selectorCandidates.some((item) => item.selector === candidate.selector)) continue;"
+        " let found = []; try { found = Array.from(document.querySelectorAll(candidate.selector)); } catch (e) { continue; }"
         " const candidatePosition = found.indexOf(chosen);"
-        " if (candidatePosition >= 0) selectorCandidates.push({ selector: candidate,"
+        " if (candidatePosition >= 0) selectorCandidates.push({ selector: candidate.selector, source: candidate.source,"
         " match_count: found.length, position: candidatePosition }); }"
         " if (!selectorCandidates.length) return { error: 'path-unstable', text: target, url: location.href };"
         " if (!selector) selector = selectorCandidates[selectorCandidates.length - 1].selector;"
@@ -883,6 +901,7 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " const position = all.indexOf(chosen);"
         " if (position < 0) return { error: 'path-unstable', text: target, url: location.href };"
         " return { selector: selector, match_count: all.length, position: position, text: target,"
+        " label_association: labelAssociation,"
         " selector_candidates: selectorCandidates, url: location.href }; })()"
     )
 

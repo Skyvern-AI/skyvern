@@ -9,7 +9,7 @@ import {
   whenRuntimeCredentialReady,
 } from "@/util/env";
 import { useAuthIssueStore } from "@/store/AuthIssueStore";
-import axios, { type InternalAxiosRequestConfig } from "axios";
+import axios, { AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
 
 type ApiVersion = "sans-api-v1" | "v1" | "v2";
 
@@ -330,24 +330,24 @@ export function removeApiKeyHeader({
   removeHeaderForAllClients("X-API-Key");
 }
 
+function getClientForVersion(version: ApiVersion) {
+  switch (version) {
+    case "sans-api-v1":
+      return clientSansApiV1;
+    case "v1":
+      return client;
+    case "v2":
+      return v2Client;
+    default: {
+      throw new Error(`Unknown version: ${version}`);
+    }
+  }
+}
+
 async function getClient(
   credentialGetter: CredentialGetter | null,
   version: ApiVersion = "v1",
 ) {
-  const get = () => {
-    switch (version) {
-      case "sans-api-v1":
-        return clientSansApiV1;
-      case "v1":
-        return client;
-      case "v2":
-        return v2Client;
-      default: {
-        throw new Error(`Unknown version: ${version}`);
-      }
-    }
-  };
-
   // Both auth headers are sent intentionally: Authorization (Bearer token from
   // the credential getter, e.g. Clerk) is used for user-session auth, while
   // X-API-Key is used for org-level API key auth. The backend accepts either
@@ -371,9 +371,24 @@ async function getClient(
     removeApiKeyHeader({ clearStoredKey: false });
   }
 
-  return get();
+  return getClientForVersion(version);
+}
+
+async function getClientWithRequestHeaders(
+  credentialGetter: CredentialGetter | null,
+  version: ApiVersion = "v1",
+) {
+  const credential = credentialGetter ? await credentialGetter() : null;
+  if (!credential) {
+    await whenRuntimeCredentialReady();
+  }
+  const apiKey = getRuntimeApiKey();
+  const headers = new AxiosHeaders();
+  headers.set("Authorization", credential ? `Bearer ${credential}` : null);
+  headers.set("X-API-Key", apiKey ?? null);
+  return { client: getClientForVersion(version), headers };
 }
 
 export type CredentialGetter = () => Promise<string | null>;
 
-export { getClient, artifactApiClient };
+export { artifactApiClient, getClient, getClientWithRequestHeaders };

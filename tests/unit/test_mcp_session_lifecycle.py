@@ -313,6 +313,21 @@ def test_get_current_session_stateless_mode_ignores_global_state() -> None:
     assert recovered.context is None
 
 
+def test_get_current_session_stateless_mode_does_not_mark_an_org_request_persistent() -> None:
+    session_manager._organization_sessions.pop("org_unregistered", None)
+    session_manager._current_session.set(None)
+
+    session_manager.set_stateless_http_mode(True)
+    try:
+        with session_manager.request_session_scope("org_unregistered"):
+            state = session_manager.get_current_session()
+    finally:
+        session_manager.set_stateless_http_mode(False)
+
+    assert state.tab_state_persists is False
+    assert "org_unregistered" not in session_manager._organization_sessions
+
+
 def test_set_current_session_stateless_mode_does_not_override_global_state() -> None:
     global_state = session_manager.SessionState(
         browser=MagicMock(),

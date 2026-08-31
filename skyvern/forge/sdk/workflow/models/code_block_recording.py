@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -15,12 +16,14 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     PendingAction,
+    PlaywrightInputDefaults,
     RecordingPage,
     recorded_action_from_payload,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.browser_diagnostics import schedule_control_endpoint_diagnostics
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -32,6 +35,12 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
 LOG = structlog.get_logger()
+
+# Bounds on control-endpoint probing: enough to catch a wedge that develops after an
+# early benign failure, few enough that a sustained wedge cannot pile attaches onto the
+# browser under suspicion.
+MAX_CONTROL_ENDPOINT_PROBES = 3
+CONTROL_ENDPOINT_PROBE_INTERVAL_SECONDS = 30.0
 
 _RECORDER_OWNED_ACTION_FIELDS = (
     "action_id",
@@ -87,6 +96,8 @@ class CodeBlockActionRecording:
         workflow_run_context: WorkflowRunContext,
         redaction_parameters: dict[str, object] | None = None,
         credential_release_guard: CredentialReleaseGuard | None = None,
+        strategy_aware_typing: bool = False,
+        playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self._code_block = code_block
         self._page = page
@@ -99,6 +110,8 @@ class CodeBlockActionRecording:
         self._step: Step | None = None
         self._workflow_run_block: WorkflowRunBlock | None = None
         self._screenshot_tasks: list[asyncio.Task[None]] = []
+        self._control_endpoint_probes = 0
+        self._last_control_endpoint_probe: float | None = None
         self._recorded_action_metadata: dict[int, dict[str, object]] = {}
         self._recording_enabled = False
         self._finalized = False
@@ -107,6 +120,8 @@ class CodeBlockActionRecording:
             on_action=self._recorded_action_sink,
             on_pending_action=self._page_call_still_pending,
             credential_release_guard=credential_release_guard,
+            strategy_aware_typing=strategy_aware_typing,
+            playwright_input_defaults=playwright_input_defaults,
         )
 
     def set_redaction_parameters(self, parameters: dict[str, object]) -> None:
@@ -122,7 +137,7 @@ class CodeBlockActionRecording:
     def last_recorded_exception(self) -> BaseException | None:
         return self.recording_page.last_recorded_exception()
 
-    async def _page_call_still_pending(self, pending_action: PendingAction) -> None:
+    def _page_call_still_pending(self, pending_action: PendingAction) -> None:
         LOG.warning(
             "codeblock.page_call_still_pending",
             workflow_run_id=self._workflow_run_id,
@@ -133,6 +148,32 @@ class CodeBlockActionRecording:
             code_line=pending_action.code_line,
             call_name=pending_action.call_name,
             threshold_seconds=pending_action.threshold_seconds,
+        )
+        # The other way the browser invariant fails: a page call that never returns. The
+        # recorded-action sink runs in the caller's finally, so it never fires here, and
+        # this is the only signal on that path. Shares the probe budget with the sink.
+        self._probe_control_endpoint("Code block browser control endpoint probed while a page call was pending")
+
+    def _probe_control_endpoint(self, message: str) -> None:
+        """Probe under a cap and a minimum interval, shared across both trigger paths.
+
+        A hard one-shot is spent by whichever failure comes first, and the pending-call
+        watchdog fires for any call outstanding at PENDING_CALL_DELAY_SECONDS -- so one
+        benign slow navigation would consume the budget and leave a later wedge unprobed.
+        """
+        if self._control_endpoint_probes >= MAX_CONTROL_ENDPOINT_PROBES:
+            return
+        now = time.monotonic()
+        if self._last_control_endpoint_probe is not None:
+            if now - self._last_control_endpoint_probe < CONTROL_ENDPOINT_PROBE_INTERVAL_SECONDS:
+                return
+        self._control_endpoint_probes += 1
+        self._last_control_endpoint_probe = now
+        schedule_control_endpoint_diagnostics(
+            self._page,
+            message,
+            workflow_run_block_id=self._workflow_run_block_id,
+            probe_sequence=self._control_endpoint_probes,
         )
 
     def _remember_action_metadata(self, action: Action) -> dict[str, object]:
@@ -190,12 +231,14 @@ class CodeBlockActionRecording:
         # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
         # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
         # only the page-free S3 upload is deferred off the critical path.
+        capture_started = False
         try:
             if self._workflow_run_block is None:
                 self._workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
                     workflow_run_block_id=self._workflow_run_block_id, organization_id=self._organization_id
                 )
             run_block = self._workflow_run_block
+            capture_started = True
             screenshot = await self._page.screenshot(timeout=settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS)
         except Exception:
             LOG.warning(
@@ -203,6 +246,10 @@ class CodeBlockActionRecording:
                 workflow_run_block_id=self._workflow_run_block_id,
                 page_closed=_page_closed(self._page),
             )
+            # Only a failed capture says anything about the browser; a database error above
+            # would otherwise emit probe fields describing a browser that is perfectly fine.
+            if capture_started:
+                self._probe_control_endpoint("Code block browser control endpoint probed after screenshot failure")
         else:
 
             async def _upload() -> None:

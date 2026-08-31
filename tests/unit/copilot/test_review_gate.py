@@ -63,9 +63,22 @@ def test_projection_classifies_all_changes_and_uses_cumulative_execution_evidenc
             "blockType": "task",
             "change": "unchanged",
             "neverTested": False,
+            "coverage": "current_source",
         },
-        {"label": "changed_step", "blockType": "task", "change": "changed", "neverTested": False},
-        {"label": "added_step", "blockType": "task", "change": "added", "neverTested": True},
+        {
+            "label": "changed_step",
+            "blockType": "task",
+            "change": "changed",
+            "neverTested": False,
+            "coverage": "current_source",
+        },
+        {
+            "label": "added_step",
+            "blockType": "task",
+            "change": "added",
+            "neverTested": True,
+            "coverage": "never_run",
+        },
         {"label": "removed_step", "blockType": "task", "change": "removed"},
     ]
 
@@ -204,8 +217,20 @@ def test_a_drafted_sheets_append_is_never_tested_until_it_actually_runs() -> Non
 
     assert projection is not None
     assert projection["blocks"] == [
-        {"label": "count_posts", "blockType": "task", "change": "unchanged", "neverTested": False},
-        {"label": "append_count", "blockType": "google_sheets_write", "change": "added", "neverTested": True},
+        {
+            "label": "count_posts",
+            "blockType": "task",
+            "change": "unchanged",
+            "neverTested": False,
+            "coverage": "current_source",
+        },
+        {
+            "label": "append_count",
+            "blockType": "google_sheets_write",
+            "change": "added",
+            "neverTested": True,
+            "coverage": "never_run",
+        },
     ]
 
 
@@ -227,6 +252,7 @@ def test_parameter_default_change_invalidates_change_and_execution_identity() ->
         "blockType": "task",
         "change": "changed",
         "neverTested": True,
+        "coverage": "different_source",
     }
 
 
@@ -278,6 +304,7 @@ def test_nested_block_label_change_invalidates_parent_tested_version() -> None:
         "blockType": "for_loop",
         "change": "changed",
         "neverTested": True,
+        "coverage": "different_source",
     }
 
 
@@ -733,3 +760,71 @@ def test_run_scoped_write_outputs_abstain_from_duplicate_claims() -> None:
 
     assert projection is not None
     assert projection["duplicateWrites"] == []
+
+
+def test_a_comment_only_edit_reports_the_prior_receipt_as_a_different_source() -> None:
+    tested = _workflow("""    - block_type: code
+      label: sign_in
+      code: |
+        await page.click("#submit")
+""")
+    edited = _workflow("""    - block_type: code
+      label: sign_in
+      code: |
+        # retry the submit button
+        await page.click("#submit")
+""")
+
+    projection = build_review_projection(tested, edited, workflow_block_fingerprints(tested))
+
+    assert projection is not None
+    assert projection["blocks"][0]["coverage"] == "different_source"
+    assert projection["blocks"][0]["change"] == "changed"
+
+
+def test_a_renamed_block_loses_its_receipt_while_siblings_keep_theirs() -> None:
+    tested = _workflow("""    - block_type: task
+      label: sign_in
+      next_block_label: read_metric
+      prompt: Sign in
+    - block_type: task
+      label: read_metric
+      prompt: Read it
+""")
+    renamed = _workflow("""    - block_type: task
+      label: sign_in_v2
+      next_block_label: read_metric
+      prompt: Sign in
+    - block_type: task
+      label: read_metric
+      prompt: Read it
+""")
+
+    projection = build_review_projection(tested, renamed, workflow_block_fingerprints(tested))
+
+    assert projection is not None
+    assert [(row["label"], row.get("coverage")) for row in projection["blocks"]] == [
+        ("sign_in_v2", "unknown"),
+        ("read_metric", "current_source"),
+        ("sign_in", None),
+    ]
+
+
+def test_editing_one_of_two_blocks_leaves_the_untouched_block_current() -> None:
+    tested = _workflow("""    - block_type: task
+      label: sign_in
+      next_block_label: read_metric
+      prompt: Sign in
+    - block_type: task
+      label: read_metric
+      prompt: Read it
+""")
+    edited = tested.replace("prompt: Read it", "prompt: Read it twice")
+
+    projection = build_review_projection(tested, edited, workflow_block_fingerprints(tested))
+
+    assert projection is not None
+    assert [(row["label"], row["coverage"]) for row in projection["blocks"]] == [
+        ("sign_in", "current_source"),
+        ("read_metric", "different_source"),
+    ]

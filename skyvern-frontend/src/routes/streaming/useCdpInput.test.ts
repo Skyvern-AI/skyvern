@@ -33,6 +33,7 @@ class MockWebSocket {
   static instances: MockWebSocket[] = [];
 
   readonly readyState = MockWebSocket.OPEN;
+  bufferedAmount = 0;
   readonly send = vi.fn();
   readonly close = vi.fn();
 
@@ -162,21 +163,28 @@ function fakeKeyboardEvent(
   } as unknown as React.KeyboardEvent;
 }
 
-function fakeMouseEvent({
-  button = 0,
-  buttons = 0,
-  detail = 1,
-}: {
+type FakeMouseEventOptions = {
+  clientX?: number;
+  clientY?: number;
   button?: number;
   buttons?: number;
   detail?: number;
-}): React.MouseEvent<HTMLImageElement> {
+};
+
+function fakeMouseEvent(
+  xOrOptions: number | FakeMouseEventOptions = {},
+  y?: number,
+): React.MouseEvent<HTMLImageElement> {
+  const options =
+    typeof xOrOptions === "number"
+      ? { clientX: xOrOptions, clientY: y }
+      : xOrOptions;
   return {
-    button,
-    buttons,
-    detail,
-    clientX: 640,
-    clientY: 360,
+    button: options.button ?? 0,
+    buttons: options.buttons ?? 0,
+    detail: options.detail ?? 1,
+    clientX: options.clientX ?? 640,
+    clientY: options.clientY ?? 360,
     altKey: false,
     ctrlKey: false,
     metaKey: false,
@@ -397,6 +405,128 @@ describe("useCdpInput wheel handling", () => {
     unmount();
 
     expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
+  });
+});
+
+describe("useCdpInput mouse move handling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    vi.clearAllMocks();
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("forwards uncongested mouse moves at native event rate", async () => {
+    const result = await renderControllingInputHook();
+    const send = latestSocketSend();
+    send.mockClear();
+
+    for (const [x, y] of [
+      [100, 200],
+      [300, 400],
+      [500, 600],
+    ] as const) {
+      act(() => {
+        result.current.handlers.handleMouseMove(fakeMouseEvent(x, y));
+        vi.advanceTimersByTime(5);
+      });
+    }
+
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it("coalesces congested mouse moves to the latest move per frame", async () => {
+    let animationFrameCallback: FrameRequestCallback | undefined;
+    const requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      animationFrameCallback = callback;
+      return 1;
+    });
+    vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
+    const result = await renderControllingInputHook();
+    const socket = MockWebSocket.instances[0]!;
+    socket.bufferedAmount = 64 * 1024 + 1;
+    socket.send.mockClear();
+
+    act(() => {
+      result.current.handlers.handleMouseMove(fakeMouseEvent(100, 200));
+      result.current.handlers.handleMouseMove(fakeMouseEvent(300, 400));
+      result.current.handlers.handleMouseMove(fakeMouseEvent(500, 600));
+    });
+
+    expect(requestAnimationFrame).toHaveBeenCalledOnce();
+    expect(socket.send).not.toHaveBeenCalled();
+
+    act(() => {
+      animationFrameCallback?.(16);
+    });
+
+    expect(socket.send).toHaveBeenCalledOnce();
+    expect(socket.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "mouseEvent",
+        eventType: "mouseMoved",
+        x: 500,
+        y: 600,
+        button: "none",
+        buttons: 0,
+        clickCount: 0,
+        modifiers: 0,
+      }),
+    );
+
+    socket.bufferedAmount = 0;
+    act(() => {
+      result.current.handlers.handleMouseMove(fakeMouseEvent(700, 650));
+    });
+
+    expect(socket.send).toHaveBeenCalledTimes(2);
+    expect(socket.send).toHaveBeenLastCalledWith(
+      JSON.stringify({
+        type: "mouseEvent",
+        eventType: "mouseMoved",
+        x: 700,
+        y: 650,
+        button: "none",
+        buttons: 0,
+        clickCount: 0,
+        modifiers: 0,
+      }),
+    );
+    expect(requestAnimationFrame).toHaveBeenCalledOnce();
+
+    socket.bufferedAmount = 64 * 1024 + 1;
+    act(() => {
+      result.current.handlers.handleMouseMove(fakeMouseEvent(800, 700));
+      result.current.handlers.handleMouseDown(
+        fakeMouseEvent({ clientX: 900, clientY: 700, buttons: 1 }),
+      );
+    });
+
+    expect(socket.send).toHaveBeenCalledTimes(3);
+    expect(socket.send).toHaveBeenLastCalledWith(
+      JSON.stringify({
+        type: "mouseEvent",
+        eventType: "mousePressed",
+        x: 900,
+        y: 700,
+        button: "left",
+        buttons: 1,
+        clickCount: 1,
+        modifiers: 0,
+      }),
+    );
+
+    act(() => {
+      animationFrameCallback?.(32);
+    });
+
+    expect(socket.send).toHaveBeenCalledTimes(3);
   });
 });
 

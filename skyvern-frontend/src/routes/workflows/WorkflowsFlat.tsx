@@ -1,8 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { GetStartedModal } from "@/components/onboarding/GetStartedModal";
-import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
-import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingErrorBoundary";
-import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { Button } from "@/components/ui/button";
 import {
   SelectionCheckboxCell,
@@ -342,24 +338,6 @@ function WorkflowsFlat() {
     },
     placeholderData: (previousData) => previousData,
   });
-
-  // unfiltered "owns any workflow" check; the filtered/paginated list above can read empty for a user who has workflows
-  const { data: ownedWorkflows = [], isLoading: ownedWorkflowsLoading } =
-    useQuery<Array<WorkflowApiResponse>>({
-      queryKey: ["workflows", "exists"],
-      queryFn: async () => {
-        const client = await getClient(credentialGetter);
-        const params = new URLSearchParams();
-        params.append("page", "1");
-        params.append("page_size", "1");
-        params.append("only_workflows", "true");
-        return client
-          .get(`/workflows`, { params })
-          .then((response) => response.data);
-      },
-    });
-
-  const onboarding = useOnboardingStateOptional();
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
     queryKey: [
@@ -1352,17 +1330,6 @@ function WorkflowsFlat() {
         <div data-hint="start-template">
           <WorkflowTemplates />
         </div>
-
-        {onboarding ? (
-          <OnboardingErrorBoundary
-            onError={() => OnboardingTelemetry.modalRenderError("dashboard")}
-          >
-            <GetStartedModal
-              hasWorkflows={ownedWorkflows.length > 0}
-              isLoading={ownedWorkflowsLoading}
-            />
-          </OnboardingErrorBoundary>
-        ) : null}
       </div>
     </div>
   );

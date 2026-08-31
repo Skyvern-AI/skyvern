@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 
+import skyvern.forge.sdk.copilot.agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -45,7 +46,7 @@ def _session(
 ) -> PersistentBrowserSession:
     """The real model rather than a stand-in: whether a session is usable is decided by its
     upstream endpoint, which the session worker writes together with the address."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return PersistentBrowserSession(
         persistent_browser_session_id="pbs_test",
         organization_id="org-1",
@@ -306,10 +307,9 @@ async def test_db_exception_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If `_resolve_live_browser_session_id` returns an id whose DB row is
-    healthy but whose chromium has died, `ensure_browser_session` must
-    auto-create a fresh session rather than short-circuit and let
-    `mcp_browser_context` raise on the first browser tool call."""
+    """A supplied id whose chromium has died must be replaced before the caller hands it onward.
+    The attach is what discovers that: it retires the dead id and the create path mints a fresh
+    session, so `mcp_browser_context` never raises on the first browser tool call."""
     from skyvern.forge.sdk.copilot import runtime as runtime_module
     from skyvern.forge.sdk.copilot.context import CopilotContext
 
@@ -344,7 +344,7 @@ async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatc
         workflow_copilot_chat_id="chat-1",
     )
 
-    result = await runtime_module.ensure_browser_session(ctx)
+    result = await runtime_module.verify_browser_session_by_attaching(ctx)
 
     assert result is None
     assert ctx.browser_session_id == "pbs_fresh"
@@ -417,3 +417,47 @@ async def test_unavailable_health_signal_keeps_the_session_at_the_first_gate(
     result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
 
     assert result == "pbs_live"
+
+
+def test_a_session_row_carries_the_relays_unreachable_mark() -> None:
+    now = datetime.now(UTC)
+    row = PersistentBrowserSession.model_validate(
+        SimpleNamespace(
+            persistent_browser_session_id="pbs_x",
+            organization_id="org-1",
+            status="running",
+            browser_address=None,
+            upstream_cdp_url=None,
+            cdp_unreachable_at=now,
+            created_at=now,
+            modified_at=now,
+        )
+    )
+    assert row.cdp_unreachable_at == now
+    assert (
+        PersistentBrowserSession(
+            persistent_browser_session_id="pbs_y", organization_id="org-1", created_at=now, modified_at=now
+        ).cdp_unreachable_at
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_the_relay_declared_unreachable_is_not_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    dead = _session()
+    dead.cdp_unreachable_at = datetime.now(UTC)
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_session", AsyncMock(return_value=dead))
+    monkeypatch.setattr(agent_module, "_manager_can_probe_registered_browser_state", lambda: False)
+
+    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_test"), organization_id="org-1")
+
+    assert result is None

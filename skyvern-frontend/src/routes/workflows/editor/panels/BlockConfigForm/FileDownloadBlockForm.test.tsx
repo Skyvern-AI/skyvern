@@ -554,6 +554,7 @@ describe("file download serialization", () => {
       "aws_access_key_id",
       "aws_secret_access_key",
       "region_name",
+      "endpoint_url",
       "azure_storage_account_name",
       "azure_storage_account_key",
       "azure_blob_container_name",
@@ -608,6 +609,27 @@ describe("file download serialization", () => {
       expect(exportedBlock).not.toHaveProperty(field);
     }
   });
+
+  test.each<[string | null | undefined]>([[""], [null], [undefined]])(
+    "serializes an unset s3 endpoint (%j) as null, never an empty string",
+    async (endpointUrl) => {
+      const { getWorkflowBlocks } = await vi.importActual<
+        typeof WorkflowEditorUtilsModule
+      >("../../workflowEditorUtils");
+
+      setFileDownloadNode("d1", {
+        downloadTarget: "s3",
+        s3Bucket: "bucket",
+        endpointUrl,
+      });
+      const node = mockNodes.get("d1") as FileDownloadNode;
+      const [savedBlock] = getWorkflowBlocks([node], []);
+
+      // botocore raises "Invalid endpoint:" on "", so an unset endpoint must round-trip
+      // as null and let the backend fall back to AWS S3.
+      expect(savedBlock).toHaveProperty("endpoint_url", null);
+    },
+  );
 
   test.each(["s3", "azure", "sftp"] as const)(
     "preserves a Google Drive source credential for %s delivery",

@@ -22,6 +22,11 @@ import {
 } from "@/components/ui/dialog";
 import { useRecordingElapsedSeconds } from "@/hooks/useRecordingElapsedSeconds";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
+import {
+  CredentialModalTypes,
+  type CredentialModalType,
+} from "@/routes/credentials/useCredentialModalState";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
@@ -132,6 +137,53 @@ function StepScreenshot({ screenshot }: { screenshot: RecordingScreenshot }) {
   );
 }
 
+function credentialPromptForKind(
+  kind: NonNullable<RecordingDraftStep["credential_kind"]>,
+): {
+  type: CredentialModalType;
+  defaultTotpType?: "authenticator" | "email";
+  heading: string;
+  buttonLabel: string;
+} {
+  switch (kind) {
+    case "credit_card":
+      return {
+        type: CredentialModalTypes.CREDIT_CARD,
+        heading: "Add Credit Card",
+        buttonLabel: "Add credit card",
+      };
+    case "secret":
+      return {
+        type: CredentialModalTypes.SECRET,
+        heading: "Add Secret",
+        buttonLabel: "Add secret",
+      };
+    case "totp":
+      return {
+        type: CredentialModalTypes.PASSWORD,
+        defaultTotpType: "authenticator",
+        heading: "Add Two-Factor Authentication",
+        buttonLabel: "Add two-factor authentication",
+      };
+    case "magic_link":
+      return {
+        type: CredentialModalTypes.PASSWORD,
+        defaultTotpType: "email",
+        heading: "Add Magic Link",
+        buttonLabel: "Add magic link",
+      };
+  }
+
+  // "password", plus any kind a backend one deploy ahead sends that this bundle has never
+  // seen. This runs during render, so falling off the end would throw on `.buttonLabel`
+  // and unmount the editor rather than degrade the single button.
+  return {
+    type: CredentialModalTypes.PASSWORD,
+    heading: "Add Password",
+    buttonLabel: "Add password",
+  };
+}
+
 function DraftStepCard({
   step,
   index,
@@ -139,6 +191,10 @@ function DraftStepCard({
   screenshot,
   onDelete,
   onRename,
+  showCredentialPrompt,
+  addCredentialLabel,
+  onAddCredentials,
+  onDismissCredential,
 }: {
   step: RecordingDraftStep;
   index: number;
@@ -146,6 +202,10 @@ function DraftStepCard({
   screenshot: RecordingScreenshot | null;
   onDelete: () => void;
   onRename: (value: string) => void;
+  showCredentialPrompt: boolean;
+  addCredentialLabel: string;
+  onAddCredentials: () => void;
+  onDismissCredential: () => void;
 }) {
   const beginDraftEdit = useRecordingStore((state) => state.beginDraftEdit);
   const endDraftEdit = useRecordingStore((state) => state.endDraftEdit);
@@ -267,6 +327,27 @@ function DraftStepCard({
           <StepScreenshot screenshot={screenshot} />
         </div>
       )}
+      {showCredentialPrompt && (
+        <div className="flex flex-wrap items-center gap-2 pl-8">
+          <Button
+            type="button"
+            size="sm"
+            className="h-7"
+            onClick={onAddCredentials}
+          >
+            {addCredentialLabel}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7"
+            onClick={onDismissCredential}
+          >
+            Dismiss
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -335,6 +416,14 @@ function RecordingPanel({ browserSessionId }: Props) {
   // the mutation guard throw.
   const browserSessionMissing = !browserSessionId;
   const [confirmDiscardOpen, setConfirmDiscardOpen] = useState(false);
+  const [credentialModal, setCredentialModal] = useState<{
+    type: CredentialModalType;
+    testUrl: string | null;
+    url: string | null;
+    stepId: string;
+    defaultTotpType?: "authenticator" | "email";
+    heading: string;
+  } | null>(null);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
   const committedRef = useRef(false);
 
@@ -345,6 +434,7 @@ function RecordingPanel({ browserSessionId }: Props) {
     draftSteps,
     deletedStepIds,
     stepPatches,
+    dismissedCredentialStepIds,
     screenshots,
     sessionRevision,
     optimisticSteps: rawOptimisticSteps,
@@ -360,6 +450,7 @@ function RecordingPanel({ browserSessionId }: Props) {
       draftSteps: state.draftSteps,
       deletedStepIds: state.deletedStepIds,
       stepPatches: state.stepPatches,
+      dismissedCredentialStepIds: state.dismissedCredentialStepIds,
       screenshots: state.screenshots,
       sessionRevision: state.sessionRevision,
       optimisticSteps: state.optimisticSteps,
@@ -553,6 +644,34 @@ function RecordingPanel({ browserSessionId }: Props) {
               index={index}
               baselineMs={baselineMs}
               screenshot={findScreenshotForStep(step, screenshots)}
+              showCredentialPrompt={
+                Boolean(step.credential_kind) &&
+                !dismissedCredentialStepIds.includes(step.step_id)
+              }
+              addCredentialLabel={
+                step.credential_kind
+                  ? credentialPromptForKind(step.credential_kind).buttonLabel
+                  : "Add to credentials"
+              }
+              onAddCredentials={() => {
+                if (!step.credential_kind) {
+                  return;
+                }
+                const prompt = credentialPromptForKind(step.credential_kind);
+                setCredentialModal({
+                  type: prompt.type,
+                  defaultTotpType: prompt.defaultTotpType,
+                  heading: prompt.heading,
+                  testUrl: step.url ?? null,
+                  url: step.url ?? null,
+                  stepId: step.step_id,
+                });
+              }}
+              onDismissCredential={() =>
+                useRecordingStore
+                  .getState()
+                  .dismissCredentialPrompt(step.step_id)
+              }
               onDelete={() =>
                 useRecordingStore.getState().deleteDraftStep(step.step_id)
               }
@@ -671,6 +790,29 @@ function RecordingPanel({ browserSessionId }: Props) {
           </DialogContent>
         </Dialog>
       )}
+      {credentialModal ? (
+        <CredentialsModal
+          isOpen
+          overrideType={credentialModal.type}
+          defaultTestUrl={credentialModal.testUrl ?? undefined}
+          defaultTotpType={credentialModal.defaultTotpType}
+          heading={credentialModal.heading}
+          onOpenChange={(open) => {
+            if (!open) {
+              setCredentialModal(null);
+            }
+          }}
+          onCredentialCreated={() => {
+            const store = useRecordingStore.getState();
+            if (credentialModal.url) {
+              store.dismissCredentialPromptsForUrl(credentialModal.url);
+            } else {
+              store.dismissCredentialPrompt(credentialModal.stepId);
+            }
+            setCredentialModal(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

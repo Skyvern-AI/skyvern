@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import json
 import mimetypes
 import os
 import re
@@ -10,7 +11,7 @@ import zipfile
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
 import aiohttp
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.core.aiohttp_helper import (
     validate_and_pin_fetch_url,
     validate_and_pin_redirect_url,
 )
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
     RedirectHopAuthorization,
     RedirectHopAuthorizer,
@@ -724,10 +726,159 @@ def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
     return Path(get_download_dir(run_id=run_id))
 
 
+def download_dir_path_for_run(run_id: str | None) -> Path:
+    return Path(settings.DOWNLOAD_PATH) / str(run_id)
+
+
 def get_download_dir(run_id: str | None) -> str:
-    download_dir = os.path.join(settings.DOWNLOAD_PATH, str(run_id))
+    download_dir = str(download_dir_path_for_run(run_id))
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
+
+
+MAX_OBSERVED_DOWNLOAD_ENTRY_FINGERPRINTS = 10
+DOWNLOAD_VISIBILITY_DUMP_ENV = "SKYVERN_DOWNLOAD_VISIBILITY_DUMP"
+
+DownloadVisibilityFields: TypeAlias = dict[str, int | bool | str | list[str] | None]
+
+
+class DownloadDirObservation(NamedTuple):
+    entry_count: int
+    total_bytes: int
+    in_flight_count: int
+    newest_mtime_ns: int
+    entry_fps: tuple[str, ...]
+    entry_fps_truncated: bool
+    dir_missing: bool
+    read_failed: bool
+
+
+def observe_download_dir(path: Path) -> DownloadDirObservation:
+    """Privacy-safe snapshot of a download directory for diagnostics.
+
+    Never raises and never carries an entry name or an OS error message: a failed read is reported
+    as a flag so a logged zero is not mistaken for an empty directory.
+    """
+    entry_count = 0
+    total_bytes = 0
+    in_flight_count = 0
+    newest_mtime_ns = 0
+    entry_fps: list[str] = []
+    read_failed = False
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry.name.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                    in_flight_count += 1
+                if len(entry_fps) < MAX_OBSERVED_DOWNLOAD_ENTRY_FINGERPRINTS:
+                    entry_fps.append(diagnostic_fingerprint(entry.name))
+                try:
+                    entry_stat = entry.stat()
+                except OSError:
+                    read_failed = True
+                else:
+                    total_bytes += entry_stat.st_size
+                    newest_mtime_ns = max(newest_mtime_ns, entry_stat.st_mtime_ns)
+    except FileNotFoundError:
+        return DownloadDirObservation(0, 0, 0, 0, (), False, True, False)
+    except (OSError, ValueError):
+        # scandir raises ValueError, not OSError, on a path holding an embedded null byte.
+        return DownloadDirObservation(0, 0, 0, 0, (), False, False, True)
+    return DownloadDirObservation(
+        entry_count=entry_count,
+        total_bytes=total_bytes,
+        in_flight_count=in_flight_count,
+        newest_mtime_ns=newest_mtime_ns,
+        entry_fps=tuple(entry_fps),
+        entry_fps_truncated=entry_count > len(entry_fps),
+        dir_missing=False,
+        read_failed=read_failed,
+    )
+
+
+def _observation_fields(prefix: str, observation: DownloadDirObservation | None) -> DownloadVisibilityFields:
+    names = DownloadDirObservation._fields
+    if observation is None:
+        return {f"{prefix}_{name}": None for name in names}
+    fields: DownloadVisibilityFields = {}
+    for name in names:
+        value = getattr(observation, name)
+        fields[f"{prefix}_{name}"] = list(value) if isinstance(value, tuple) else value
+    return fields
+
+
+def _observation_advanced(before: DownloadDirObservation, after: DownloadDirObservation) -> bool | None:
+    """None when either side could not be read: its counters are partial, so a comparison would invent movement."""
+    if before.read_failed or after.read_failed:
+        return None
+    return (
+        after.entry_count > before.entry_count
+        or after.total_bytes > before.total_bytes
+        or after.newest_mtime_ns > before.newest_mtime_ns
+    )
+
+
+def classify_download_visibility(
+    *,
+    pre: DownloadDirObservation,
+    settled: DownloadDirObservation | None,
+    post: DownloadDirObservation,
+    alt_pre: DownloadDirObservation | None,
+    alt_post: DownloadDirObservation | None,
+    listed_run_id: str,
+    workflow_run_id: str,
+    download_binding_kind: str | None,
+) -> DownloadVisibilityFields:
+    """Emitted fields for one registration boundary: when bytes landed, and whether they landed elsewhere.
+
+    Movement is read from newest_mtime_ns as well as counts and bytes so a same-name same-size
+    overwrite still registers, and the alternate directory is read as a pre-to-post delta so files
+    a sibling block left behind cannot look like a location mismatch.
+    """
+    alt_entry_delta: int | None = None
+    alt_bytes_delta: int | None = None
+    alt_moved: bool | None = None
+    if alt_pre is not None and alt_post is not None and not (alt_pre.read_failed or alt_post.read_failed):
+        alt_entry_delta = alt_post.entry_count - alt_pre.entry_count
+        alt_bytes_delta = alt_post.total_bytes - alt_pre.total_bytes
+        alt_moved = _observation_advanced(alt_pre, alt_post)
+    fields: DownloadVisibilityFields = {
+        "listed_run_id": listed_run_id,
+        "download_run_id_differs": listed_run_id != workflow_run_id,
+        "download_binding_kind": download_binding_kind,
+        "landed_between_snapshots": _observation_advanced(pre, post),
+        "landed_during_settle": _observation_advanced(pre, settled) if settled is not None else None,
+        "landed_after_settle": _observation_advanced(settled, post) if settled is not None else None,
+        "alt_entry_delta": alt_entry_delta,
+        "alt_bytes_delta": alt_bytes_delta,
+        "alt_moved": alt_moved,
+    }
+    for prefix, observation in (
+        ("pre", pre),
+        ("settled", settled),
+        ("post", post),
+        ("alt_pre", alt_pre),
+        ("alt_post", alt_post),
+    ):
+        fields.update(_observation_fields(prefix, observation))
+    return fields
+
+
+def dump_download_visibility_inputs(name: str, payload: dict[str, Any]) -> None:
+    """Append classifier inputs as JSONL under DOWNLOAD_VISIBILITY_DUMP_ENV, for offline replay.
+
+    Inert unless that env var names a directory.
+    """
+    dump_dir = os.environ.get(DOWNLOAD_VISIBILITY_DUMP_ENV)
+    if not dump_dir:
+        return
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        with open(os.path.join(dump_dir, f"{name}.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except (OSError, TypeError, ValueError):
+        LOG.warning("Failed to append download visibility dump", dump_name=name)
 
 
 RUN_TEMP_NAMESPACE = "runs"

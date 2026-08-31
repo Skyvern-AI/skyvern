@@ -1,0 +1,170 @@
+{
+  "schema": "native-browser-task-max-step-v1",
+  "provenance": {
+    "source_root": "fixture://retained/native-browser-task-max-step",
+    "source_files": {
+      "ids/ids.json": "f5c9a3995c05e80f1970f6661b6e2ce9d99b44355ce823e6338aa7beb5a90c78",
+      "logs/journey.log": "2c299bb64132dd8ec35c1f643ecd44123fac5668997f1a48eb5c42aa447dcd79",
+      "manifest.json": "d787453d636b0dcc0725af7a036b4d515a2b1069b211a1ec75e30a5473c6f4ef"
+    },
+    "workflow_run_id": "wr_568309678132841130",
+    "workflow_run_block_id": "wrb_568309726669713002",
+    "task_id": "tsk_568309743849582206",
+    "step_id": "stp_568309748144549504",
+    "action_custody": "journey.log workflow_run_terminal_readback records selected action #33 as Click/completed with the cited task_id and step_id; no other persisted action row is claimed",
+    "page_evidence_custody": "No canonical page-evidence packet was retained; the fixture records the typed omission."
+  },
+  "workflow": {
+    "workflow_id": "wf_native_replay",
+    "organization_id": "org_replay",
+    "title": "Native browser task repair replay",
+    "workflow_permanent_id": "wpid_568309345960041294",
+    "version": 1,
+    "is_saved_task": false,
+    "created_at": "2026-08-29T11:31:06Z",
+    "modified_at": "2026-08-29T11:39:07Z",
+    "workflow_definition": {
+      "parameters": [
+        {
+          "parameter_type": "output",
+          "key": "open_target_output",
+          "output_parameter_id": "out_open_native_replay",
+          "workflow_id": "wf_native_replay",
+          "created_at": "2026-08-29T11:31:06Z",
+          "modified_at": "2026-08-29T11:39:07Z"
+        },
+        {
+          "parameter_type": "output",
+          "key": "records",
+          "output_parameter_id": "out_native_replay",
+          "workflow_id": "wf_native_replay",
+          "created_at": "2026-08-29T11:31:06Z",
+          "modified_at": "2026-08-29T11:39:07Z"
+        }
+      ],
+      "blocks": [
+        {
+          "block_type": "goto_url",
+          "label": "open_target",
+          "url": "https://example.test/",
+          "output_parameter": {
+            "parameter_type": "output",
+            "key": "open_target_output",
+            "output_parameter_id": "out_open_native_replay",
+            "workflow_id": "wf_native_replay",
+            "created_at": "2026-08-29T11:31:06Z",
+            "modified_at": "2026-08-29T11:39:07Z"
+          }
+        },
+        {
+          "block_type": "task",
+          "label": "inspect_target_record",
+          "navigation_goal": "Find the requested record using the visible form.",
+          "output_parameter": {
+            "parameter_type": "output",
+            "key": "records",
+            "output_parameter_id": "out_native_replay",
+            "workflow_id": "wf_native_replay",
+            "created_at": "2026-08-29T11:31:06Z",
+            "modified_at": "2026-08-29T11:39:07Z"
+          }
+        }
+      ]
+    }
+  },
+  "result": {
+    "ok": false,
+    "error": "Reached the maximum steps (30)",
+    "data": {
+      "workflow_run_id": "wr_568309678132841130",
+      "overall_status": "failed",
+      "requested_block_labels": [
+        "inspect_target_record"
+      ],
+      "executed_block_labels": [
+        "inspect_target_record"
+      ],
+      "failure_reason": "Reached the maximum steps (30)",
+      "failure_type": "max_steps_exceeded",
+      "blocks": [
+        {
+          "workflow_run_block_id": "wrb_568309683720040034",
+          "label": "open_target",
+          "block_type": "GOTO_URL",
+          "status": "completed"
+        },
+        {
+          "workflow_run_block_id": "wrb_568309726669713002",
+          "task_id": "tsk_568309743849582206",
+          "step_id": "stp_568309748144549504",
+          "label": "inspect_target_record",
+          "block_type": "TASK",
+          "status": "failed",
+          "failure_reason": "Reached the maximum steps (30)",
+          "error_codes": [
+            "max_steps_exceeded"
+          ]
+        }
+      ],
+      "action_trace_summary": [
+        "click completed"
+      ],
+      "action_observations": [
+        "click completed"
+      ],
+      "terminal_page_evidence_omission": "no persisted terminal page artifact was available"
+    }
+  },
+  "persisted": {
+    "run": {
+      "workflow_run_id": "wr_568309678132841130",
+      "workflow_permanent_id": "wpid_568309345960041294",
+      "organization_id": "org_replay",
+      "browser_session_id": null,
+      "status": "failed",
+      "failure_reason": "Reached the maximum steps (30)",
+      "workflow_id": "wf_native_replay"
+    },
+    "blocks": [
+      {
+        "workflow_run_block_id": "wrb_568309683720040034",
+        "workflow_run_id": "wr_568309678132841130",
+        "organization_id": "org_replay",
+        "label": "open_target",
+        "block_type": "GOTO_URL",
+        "status": "completed",
+        "task_id": null,
+        "failure_reason": null,
+        "error_codes": [],
+        "output": null,
+        "final_url": null
+      },
+      {
+        "workflow_run_block_id": "wrb_568309726669713002",
+        "workflow_run_id": "wr_568309678132841130",
+        "organization_id": "org_replay",
+        "label": "inspect_target_record",
+        "block_type": "TASK",
+        "status": "failed",
+        "task_id": "tsk_568309743849582206",
+        "failure_reason": "Reached the maximum steps (30)",
+        "error_codes": [
+          "max_steps_exceeded"
+        ],
+        "output": null,
+        "final_url": null
+      }
+    ],
+    "actions_newest_first": [
+      {
+        "action_type": "click",
+        "status": "completed",
+        "task_id": "tsk_568309743849582206",
+        "step_id": "stp_568309748144549504"
+      }
+    ],
+    "registered_outputs": [],
+    "terminal_artifact_omission": "no persisted terminal page artifact was available"
+  },
+  "page_evidence": null
+}

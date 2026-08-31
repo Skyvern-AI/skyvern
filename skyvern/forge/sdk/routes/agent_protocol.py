@@ -4266,7 +4266,7 @@ async def _parse_and_gate_tag_filter_terms(
     summary="List runs",
     description=(
         "List the organization's task and agent runs, newest first, filterable by status, run type, agent, "
-        "and a free-text search term. Returns a paginated array of run summaries."
+        "a free-text search term, and failure category. Returns a paginated array of run summaries."
     ),
     openapi_extra={
         "x-hidden": True,
@@ -4312,6 +4312,17 @@ async def get_runs_v2(
             examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
         ),
     ] = None,
+    failure_category: str | None = Query(
+        None,
+        max_length=100,
+        description=(
+            "Exact-match filter on a workflow run's top classifier failure category "
+            "(`failure_category[0].category`). Only failed, terminated, and timed_out runs are "
+            "eligible; canceled runs are never returned by this filter. Applies to "
+            "`run_type=workflow_run` only — combined with a task run_type it matches nothing."
+        ),
+        examples=["ANTI_BOT_DETECTION", "AUTH_FAILURE"],
+    ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
     if (search_key or workflow_permanent_id) and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
@@ -4331,6 +4342,7 @@ async def get_runs_v2(
         run_type=[r.value for r in run_type] if run_type else None,
         workflow_permanent_ids=workflow_permanent_id,
         run_tags=run_tags or None,
+        failure_category=failure_category,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
     return ORJSONResponse([item.model_dump(mode="json") for item in items])

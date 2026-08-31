@@ -15,6 +15,8 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
+from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata, CopilotEvalMode
+from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.google_connection_notice import (
     GoogleConnectionNotice,
@@ -67,6 +69,11 @@ class NarrativeActivityEntry(TypedDict):
     toolName: NotRequired[str]
     displayLabel: NotRequired[str]
     success: NotRequired[bool]
+    # activeLabel reads while the step runs; outcomeLabel replaces it once
+    # finished. Absent when the narrator did not speak, leaving displayLabel.
+    activeLabel: NotRequired[str]
+    outcomeLabel: NotRequired[str]
+    codeDiffs: NotRequired[list[CodeWriteDiff]]
     id: str
     # Server clock read for the event this entry describes, shared with the SSE
     # update so a rehydrated row renders the same elapsed the live row did.
@@ -97,6 +104,19 @@ class NarrativeConnectedAccountChoice(TypedDict):
     name: str
     state: str
     email_address: str | None
+
+
+class NarrativeTurnFacts(TypedDict):
+    factsAvailable: bool
+    evaluationState: str | None
+    runId: str | None
+    runCompleted: bool | None
+    terminalCause: str | None
+    blocksRunThisTurn: int | None
+    authoredBlockCount: NotRequired[int]
+    matchingSourceBlockCount: NotRequired[int]
+    # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
+    ranCleanOnCurrentSource: bool
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
@@ -132,6 +152,7 @@ class TurnNarrativePayload(TypedDict):
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
     testedBlockFingerprints: NotRequired[dict[str, list[str]]]
+    turnFacts: NotRequired[NarrativeTurnFacts]
 
 
 if TYPE_CHECKING:
@@ -185,18 +206,63 @@ class ObservedPage(BaseModel):
     reached_via: str = ""
 
 
-# The two fields ScoutedInteraction declares turn-ephemeral. Everything else on an
+# The fields ScoutedInteraction declares turn-ephemeral. Everything else on an
 # interaction crosses the turn boundary as captured: the turn boundary is not a
 # disclosure boundary, so there is no field roster here to keep in step with the record.
 # ``input_value`` is the private same-turn literal; the model sees ``input_id``, which does
 # cross. ``typed_value`` is absent because the record no longer has one — it was retired
 # with the literal, and is discarded when a legacy payload is migrated below.
-_TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_value"})
+_TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_value", "selector_match_count"})
 # Held by chats persisted before the record exposed secret-safe input identities.
 _RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
 
 
 OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
+
+
+class PageObstructionSelectorCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    selector: str
+    source: str
+
+
+class PageObstructionIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tag: str
+    role: str
+    label_context: str
+
+
+class PageObstructionControl(BaseModel):
+    """A producer-bounded control plus scalar capture extensions not known to this consumer."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    __pydantic_extra__: dict[str, str | bool | int | float] = Field(init=False)
+    tag: str | None = None
+    text: str | None = None
+    aria_label: str | None = None
+    title: str | None = None
+    selector: str | None = None
+    type: str | None = None
+    selector_candidates: list[PageObstructionSelectorCandidate] = Field(default_factory=list)
+    identity: PageObstructionIdentity | None = None
+
+
+class PageObstruction(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str | None = None
+    source: str | None = None
+    selector: str | None = None
+    selector_candidates: list[PageObstructionSelectorCandidate] = Field(default_factory=list)
+    identity: PageObstructionIdentity | None = None
+    text: str | None = None
+    visual_location: str | None = None
+    underlying_page_blocked: bool | None = None
+    visible_controls: list[PageObstructionControl] = Field(default_factory=list)
 
 
 class CodeAuthoringRepairContext(BaseModel):
@@ -228,11 +294,14 @@ class CodeAuthoringRepairContext(BaseModel):
     current_title: str | None = None
     page_evidence_source: str | None = None
     observed_after_workflow_run: bool = False
+    rendered_value_excerpt: str | None = None
     page_form_summaries: list[str] = Field(default_factory=list)
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
     page_obstruction_summaries: list[str] = Field(default_factory=list)
+    page_obstructions: list[PageObstruction] = Field(default_factory=list)
+    page_obstruction_omission_notices: list[str] = Field(default_factory=list)
     required_block_structure: str = ""
     spine_stage_count: int | None = None
     spine_split_blockers: list[str] = Field(default_factory=list)
@@ -279,7 +348,12 @@ class StructuredContext(BaseModel):
             return value
         dropped = _RETIRED_INTERACTION_FIELDS | _TURN_EPHEMERAL_INTERACTION_FIELDS
         return [
-            {key: item for key, item in entry.items() if key not in dropped} if isinstance(entry, dict) else entry
+            {
+                **({"executed_selector": entry["selector"]} if isinstance(entry.get("selector"), str) else {}),
+                **{key: item for key, item in entry.items() if key not in dropped and key != "selector"},
+            }
+            if isinstance(entry, dict)
+            else entry
             for entry in value
         ]
 
@@ -423,7 +497,14 @@ def _carried_trajectory_from_scout_trajectory(
     for interaction in trajectory:
         if not str(interaction.get("tool_name") or "").strip():
             continue
-        entry = {key: value for key, value in interaction.items() if key not in _TURN_EPHEMERAL_INTERACTION_FIELDS}
+        entry = {
+            key: value
+            for key, value in interaction.items()
+            if key not in _TURN_EPHEMERAL_INTERACTION_FIELDS and key != "selector"
+        }
+        selector = interaction.get("selector")
+        if isinstance(selector, str) and selector:
+            entry.setdefault("executed_selector", selector)
         credential_id = entry.get("credential_id")
         inventory = (credential_field_inventory or {}).get(credential_id) if isinstance(credential_id, str) else None
         if inventory:
@@ -637,6 +718,9 @@ class AgentResult:
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
     # silently passing as cheap.
     total_tokens: int | None = None
+    # Model name for the terminal attempt (primary or fallback), including an interrupted attempt.
+    # None when the turn never reached an attempt; telemetry only.
+    resolved_model: str | None = None
     # Set when the agent absorbed an asyncio cancellation initiated by an
     # explicit user Stop. Lets the route route to a cancel-specific
     # persistence path (rollback + ``Cancelled by user.`` chat row) without
@@ -670,6 +754,8 @@ class AgentResult:
     # Criteria lifecycle decision + adjudication counters the route persists
     # after the turn; None when persisted criteria are disabled.
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
+    # Internal eval-only metadata. The normal response schema never serializes this field.
+    browser_ablation_metadata: BrowserAblationMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -700,6 +786,13 @@ class CopilotContext(AgentContext):
 
     workflow_copilot_chat_id: str | None = None
     eval_capture_case_id: str | None = None
+    eval_mode: CopilotEvalMode | None = None
+    eval_prompt_sha256: str | None = None
+    eval_tool_surface_sha256: str | None = None
+    eval_native_tool_names: tuple[str, ...] = ()
+    eval_mcp_tool_names: tuple[str, ...] = ()
+    eval_tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    eval_screenshot_frames: list[dict[str, Any]] = field(default_factory=list)
 
     # Enforcement state
     navigate_called: bool = False
@@ -751,6 +844,12 @@ class CopilotContext(AgentContext):
     in_flight_stream_tool_call: InFlightStreamToolCall | None = None
     goal_satisfied_tool_name: str | None = None
     goal_satisfied_tool_output: dict[str, Any] | None = None
+    # Stashed by the write seam under the id of the tool call that produced it, and drained by
+    # that same call's result: parallel tool calls are the provider default, so an arrival-ordered
+    # stash would show a write's patch on a sibling's row. The budget is a dataclass default, so a
+    # new turn's context starts with the full allowance.
+    pending_code_write_diffs: dict[str, list[CodeWriteDiff]] = field(default_factory=dict)
+    code_write_patch_budget: int = TURN_PATCH_CHAR_BUDGET
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
@@ -760,6 +859,7 @@ class CopilotContext(AgentContext):
     total_tokens_used: int | None = None
     input_tokens_used: int | None = None
     output_tokens_used: int | None = None
+    resolved_model: str | None = None
 
     # Workflow state
     persisted_workflow_yaml: str | None = None

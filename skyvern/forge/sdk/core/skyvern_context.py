@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import html
+import re
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Callable, Iterator, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
+from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from skyvern.config import settings
 from skyvern.schemas.run_enums import RunEngine
@@ -37,6 +41,124 @@ MAX_DIALOG_MESSAGE_CHARS = 500
 
 # Visible stand-in for a value scrubbed from the model's view via hide_from_model.
 MODEL_HIDDEN_PLACEHOLDER = "[withheld: sign-in link]"
+
+
+# An apostrophe is legal inside a URL, so it is part of the span; a prose quote is trimmed with the
+# other trailing punctuation below.
+URL_IN_TEXT = re.compile(r"https?://[^\s<>\"`]+", re.IGNORECASE)
+_URL_START = re.compile(r"https?://", re.IGNORECASE)
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
+# Upper bound on prose punctuation or quotes tried around one URL span, so a page-controlled run of
+# punctuation cannot make the pass quadratic.
+_MAX_SPAN_CUTS = 8
+# The same WHATWG parser validate_fetch_url runs before page.goto, so an echoed URL is compared in the
+# exact shape the browser was handed (host case/IDN/IP literal, default port, dot segments, path chars).
+_BROWSER_URL = TypeAdapter(AnyHttpUrl)
+# Chromium additionally percent-encodes these two path characters that the spec parser keeps raw.
+_CHROMIUM_PATH_ESCAPES = str.maketrans({"^": "%5E", "|": "%7C"})
+_URL_PATH_RE = re.compile(r"^(?P<prefix>[a-z][a-z0-9+.-]*://[^/?#]*)(?P<path>[^?#]*)", re.IGNORECASE)
+
+
+def canonical_url(url: str) -> str:
+    """The identity of a URL as the browser reports it back: WHATWG-normalized, Chromium path escapes
+    applied, percent-escape case folded. Comparison-only; a string the parser rejects is compared as
+    written."""
+    try:
+        normalized = str(_BROWSER_URL.validate_python(url))
+    except ValidationError:
+        normalized = url
+    normalized = _URL_PATH_RE.sub(
+        lambda m: m.group("prefix") + m.group("path").translate(_CHROMIUM_PATH_ESCAPES), normalized, count=1
+    )
+    return _PERCENT_ESCAPE_RE.sub(lambda m: m.group(0).upper(), normalized)
+
+
+def opaque_url_echo_forms(url: str) -> tuple[str, ...]:
+    """Every shape a surface can hand back a payload URL in, and so every shape the masker matches: as
+    minted, as the browser canonicalises it, and either one entity-escaped for HTML."""
+    canonical = canonical_url(url)
+    return tuple(dict.fromkeys((url, html.escape(url, quote=False), canonical, html.escape(canonical, quote=False))))
+
+
+def opaque_url_echo_window(urls: Iterable[str]) -> int:
+    """The longest text the masker recognises as one payload URL, in UTF-16 code units so a JS slice()
+    measures it the same way; the slack covers the punctuation a span search trims around it."""
+    return (
+        max((len(form.encode("utf-16-le")) // 2 for url in urls for form in opaque_url_echo_forms(url)), default=0) + 16
+    )
+
+
+def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
+    """Rewrite every payload ref inside one URL-shaped span. Iterative and window-bounded, so a page
+    that glues thousands of refs with quotes costs linear time and no stack."""
+    quotes = [i for i, ch in enumerate(raw) if ch == "'"]
+    out: list[str] = []
+    pos = 0
+    # Scheme-only search: matching the greedy span regex from each offset would rescan the tail.
+    while (match := _URL_START.search(raw, pos)) is not None:
+        start = match.start()
+        out.append(raw[pos:start])
+        # Candidate ends, longest first: the window edge and each quote in it (a ref that extends past a
+        # quote wins over a ref that is its prefix; a ref whose own path holds many quotes is found from
+        # the last few), each with a bounded amount of trailing punctuation trimmed.
+        limit = min(len(raw), start + window)
+        first, last = bisect_left(quotes, start), bisect_right(quotes, limit)
+        stops = {*quotes[first : first + _MAX_SPAN_CUTS], *quotes[max(first, last - _MAX_SPAN_CUTS) : last], limit}
+        ends: builtins.set[int] = builtins.set()
+        for stop in stops:
+            floor = stop
+            while floor > start and raw[floor - 1] in _URL_TRAILING_PUNCTUATION:
+                floor -= 1
+            ends.update((stop, *range(floor, min(stop, floor + _MAX_SPAN_CUTS))))
+        token = None
+        for stop in sorted(ends, reverse=True):
+            if stop <= start:
+                continue
+            span = raw[start:stop]
+            # A span lifted out of HTML carries entity-escaped separators (&amp;); a ref never does, so
+            # only the text side is decoded, and only after the raw span failed to match.
+            for candidate in dict.fromkeys((span, html.unescape(span) if "&" in span else span)):
+                token = canonical.get(canonical_url(candidate))
+                if token is not None:
+                    break
+            if token is not None:
+                out.append(token)
+                pos = stop
+                break
+        else:
+            out.append(raw[start])
+            pos = start + 1
+    out.append(raw[pos:])
+    return "".join(out)
+
+
+def mask_opaque_urls_in_text(text: str, refs: dict[str, str]) -> str:
+    """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token — the
+    inverse of resolving that token. Masking is by PROVENANCE (membership in ``refs``), never URL
+    shape, so a live-page URL the model must reason about is untouched even when it is itself
+    signing-shaped (a ``?gclid=``/``?token=`` landing page). ``refs`` maps token -> real URL (the
+    OpaqueUrlRefs.refs shape). Same object when nothing matches."""
+    if not refs:
+        return text
+    masked = text
+    # Longest URL first so a payload URL that is a prefix of another is not partially rewritten.
+    for token, url in sorted(refs.items(), key=lambda item: len(item[1]), reverse=True):
+        # A URL rendered inside HTML (get_html) has its query separators entity-encoded (& -> &amp;),
+        # so a multi-parameter presigned URL never matches its raw form there; match the escaped form
+        # too. Plain-text surfaces carry only the raw form, where html.escape is a no-op.
+        for variant in dict.fromkeys((url, html.escape(url, quote=False))):
+            if variant in masked:
+                masked = masked.replace(variant, token)
+    # The browser reports a payload URL back in canonical form (page.url adds the "/" path, drops a
+    # default port, punycodes a host), which no exact substring pass can anticipate; compare each
+    # URL-shaped span of the text by canonical identity, still membership-only.
+    if not URL_IN_TEXT.search(masked):
+        return masked
+    canonical = {canonical_url(url): token for token, url in refs.items()}
+    window = opaque_url_echo_window(refs.values())
+    rewritten = URL_IN_TEXT.sub(lambda m: _mask_url_span(m.group(0), canonical, window), masked)
+    return masked if rewritten == masked else rewritten
 
 
 def _unwired_authority() -> RuntimeOriginAuthority:
@@ -125,6 +247,11 @@ class SkyvernContext:
     # run's context is rebuilt on the worker and never carries it, so runner selection can tell the
     # two apart instead of inferring it from a process-wide capability.
     copilot_inline_execution: bool = False
+    # The CodeBlock arm the rollout assigned this run to ("secure_runner" / "legacy_in_process"),
+    # stamped only on an authoritative flag/pin verdict so log lines can be grouped by arm for an
+    # unbiased secure-vs-legacy comparison. Left None when no genuine assignment was made (no browser
+    # session, provider unreachable) so a degraded provider never biases the legacy arm.
+    codeblock_execution_path: str | None = None
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
@@ -144,6 +271,12 @@ class SkyvernContext:
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.
     model_hidden_values: set[str] = field(default_factory=builtins.set)
+    # Signed payload URLs the v3 loop minted opaque tokens for (token -> real URL, mirroring
+    # OpaqueUrlRefs.refs). Applied to every model-facing tool result by hide_from_model so a resolved
+    # ref never re-enters the transcript verbatim. Keyed by membership, never URL shape. Replaced whole
+    # per task on the assumption blocks run sequentially; a parallel block type must single-flight
+    # this like workflow_block_engine_lock or one task's refs stomp another's mid-flight.
+    opaque_url_refs: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -229,6 +362,8 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
+    # Caller-selected block labels for a partial workflow run; None/empty = full run.
+    run_block_labels: list[str] | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None
@@ -405,16 +540,14 @@ class SkyvernContext:
                 self.model_hidden_values.add(value)
 
     def hide_from_model(self, text: str) -> str:
-        """Exact-match replace every model_hidden_values entry with MODEL_HIDDEN_PLACEHOLDER, longest
-        value first so a substring value can't fragment a longer one. Same object when nothing matches."""
-        if not self.model_hidden_values:
-            return text
+        """Return ``text`` with everything that must not reach the model's view of tool output replaced
+        by a model-safe surrogate: first each model_hidden_values entry by MODEL_HIDDEN_PLACEHOLDER
+        (longest value first so a substring value can't fragment a longer one), then each known payload
+        signed-URL by its opaque token (by PROVENANCE, not shape). Same object when nothing matches."""
         for value in sorted(self.model_hidden_values, key=len, reverse=True):
-            if not value:
-                continue
-            if value in text:
+            if value and value in text:
                 text = text.replace(value, MODEL_HIDDEN_PLACEHOLDER)
-        return text
+        return mask_opaque_urls_in_text(text, self.opaque_url_refs)
 
     def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
         """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""

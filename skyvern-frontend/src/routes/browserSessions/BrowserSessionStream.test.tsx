@@ -27,10 +27,19 @@ const cdpInputState = vi.hoisted(() => ({
   userIsControlling: false,
   inputReady: false,
   setUserIsControlling: undefined as ((value: boolean) => void) | undefined,
+  onInput: undefined as (() => void) | undefined,
 }));
 
 const telemetry = vi.hoisted(() => ({
   captureRecordBrowser: vi.fn(),
+}));
+
+const api = vi.hoisted(() => ({
+  get: vi.fn(async () => ({ data: {} })),
+}));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: async () => ({ get: api.get }),
 }));
 
 vi.mock("@/util/env", () => ({
@@ -62,6 +71,7 @@ vi.mock("@/routes/streaming/useCdpInput", async (importOriginal) => {
       cdpInputState.viewportHeight = viewportHeight;
       cdpInputState.clipboardPasteEnabled = Boolean(options.onClipboardPaste);
       cdpInputState.clipboardCopyEnabled = Boolean(options.onClipboardCopy);
+      cdpInputState.onInput = options.onInput;
       const result = actual.useCdpInput(options);
       cdpInputState.userIsControlling = result.userIsControlling;
       cdpInputState.inputReady = result.inputReady;

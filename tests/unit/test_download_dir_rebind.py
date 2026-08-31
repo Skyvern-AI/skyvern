@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
@@ -495,6 +496,61 @@ async def test_listener_falls_back_to_kwargs_without_context(tmp_path: Path) -> 
 
     assert captured.get("workflow_run_id") == "wr_kwarg"
     assert captured.get("task_id") == "task_kwarg"
+
+
+_SENTINEL_STEM = "zz-sentinel-suggested-stem"
+_SENTINEL_QUERY_NAME = "zz-sentinel-query-stem"
+
+
+async def _run_listener(download: MagicMock) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+
+    def capture(_msg: str, **kwargs: object) -> None:
+        events.append(kwargs)
+
+    captured_handler: dict[str, object] = {}
+    browser_context = MagicMock()
+    browser_context.on = lambda _event, handler: captured_handler.setdefault("handler", handler)
+    browser_context.pages = []
+    set_download_file_listener(browser_context, workflow_run_id="wr_priv", task_id="task_priv")
+
+    page = MagicMock()
+    page_handlers: dict[str, object] = {}
+    page.on = lambda _event, handler: page_handlers.setdefault("download", handler)
+    captured_handler["handler"](page)
+
+    with (
+        patch("skyvern.webeye.browser_factory.current", return_value=None),
+        patch("skyvern.webeye.browser_factory.LOG.info", side_effect=capture),
+        patch("skyvern.webeye.browser_factory.LOG.debug", side_effect=capture),
+    ):
+        await page_handlers["download"](download)
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_kind", ["absent_on_connection", "extensionless_suggestion", "url_query_filename"])
+async def test_listener_never_logs_a_raw_download_filename(tmp_path: Path, path_kind: str) -> None:
+    download = MagicMock()
+    download.suggested_filename = _SENTINEL_STEM
+    download.url = "https://example.com/d"
+    if path_kind == "absent_on_connection":
+        download.path = AsyncMock(return_value=tmp_path / "never-written")
+    else:
+        landed = tmp_path / "landed"
+        landed.write_bytes(b"data")
+        download.path = AsyncMock(return_value=landed)
+    if path_kind == "url_query_filename":
+        download.url = f"https://example.com/d?filename={_SENTINEL_QUERY_NAME}.pdf"
+
+    events = await _run_listener(download)
+
+    assert events, "the listener emitted no row for this path"
+    logged = " ".join(f"{key}={value}" for event in events for key, value in event.items())
+    assert _SENTINEL_STEM not in logged
+    assert _SENTINEL_QUERY_NAME not in logged
+    expected_field = "filename_fp" if path_kind == "url_query_filename" else "suggested_filename_fp"
+    assert any(expected_field in event for event in events)
 
 
 @pytest.mark.asyncio
@@ -1421,6 +1477,52 @@ async def test_block_non_adoption_reused_browser_rebinds_to_second_run() -> None
 
 
 @pytest.mark.asyncio
+async def test_register_downloaded_files_reports_visibility_for_a_non_secure_engine(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row is emitted from the shared registration seam, so engines are comparable.
+
+    Emitting only from the secure-runner dispatch would make the population engine-biased,
+    the same defect the unregistered-intent signal avoids by firing from every engine.
+    """
+    sentinel = "quarterly-policy-summary-sentinel.pdf"
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path))
+    monkeypatch.setattr("skyvern.forge.sdk.core.hashing.settings.SECRET_KEY", "download-observation-fingerprint-key")
+    run_dir = tmp_path / "wr_block"
+    run_dir.mkdir()
+    (run_dir / sentinel).write_bytes(b"%PDF-1.4 sentinel")
+
+    block = CodeBlock.__new__(CodeBlock)
+    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+
+        with capture_logs() as logs:
+            await block._register_downloaded_files(
+                engine="inline",
+                organization_id="org_1",
+                workflow_run_id="wr_block",
+                workflow_run_block_id="wrb_x",
+            )
+
+    rows = [entry for entry in logs if entry.get("event") == "codeblock.download_registration_visibility"]
+    assert len(rows) == 1
+    row = rows[0]
+    # The seam row is a separate emission site from the secure wrapper, so AC2 is asserted here too.
+    assert row["post_entry_count"] == 1
+    assert row["post_entry_fps"]
+    rendered = repr(row)
+    assert sentinel not in rendered
+    assert "policy-summary" not in rendered
+    assert ".pdf" not in rendered
+    assert row["engine"] == "inline"
+    assert row["boundary"] == "register"
+    assert row["landed_during_settle"] is None
+    # The engine-neutral row still has to answer AC1's timing question on its own.
+    assert row["landed_between_snapshots"] is False
+
+
+@pytest.mark.asyncio
 async def test_register_downloaded_files_uses_download_run_id_as_storage_key() -> None:
     """_register_downloaded_files keys storage on download_run_id, not the raw workflow_run_id."""
 
@@ -1431,6 +1533,7 @@ async def test_register_downloaded_files_uses_download_run_id_as_storage_key() -
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
 
         await block._register_downloaded_files(
+            engine="inline",
             organization_id="org_1",
             workflow_run_id="wr_block",
             workflow_run_block_id="wrb_x",
@@ -1452,6 +1555,7 @@ async def test_register_downloaded_files_defaults_to_workflow_run_id() -> None:
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
 
         await block._register_downloaded_files(
+            engine="inline",
             organization_id="org_1",
             workflow_run_id="wr_block",
             workflow_run_block_id="wrb_x",

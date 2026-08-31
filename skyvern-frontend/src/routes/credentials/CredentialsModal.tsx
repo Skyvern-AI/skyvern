@@ -258,6 +258,8 @@ type Props = {
   // tested_url and matches later hostname-keyed asks. Create mode only; leaving
   // it undefined (every non-copilot caller) keeps the field empty as before.
   defaultTestUrl?: string;
+  defaultTotpType?: PasswordCredential["totp_type"];
+  heading?: string;
   /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
   onStartBackgroundTest?: (
     credentialId: string,
@@ -295,6 +297,8 @@ function CredentialsModal({
   editingCredential,
   overrideType,
   defaultTestUrl,
+  defaultTotpType,
+  heading,
   onStartBackgroundTest,
 }: Props) {
   const credentialGetter = useCredentialGetter();
@@ -336,6 +340,7 @@ function CredentialsModal({
     name: false,
     values: false,
   });
+  const [noPassword, setNoPassword] = useState(false);
   // Inline authenticator setup error returned by the backend when it rejects a
   // decoded QR value or pasted key. Cleared whenever the user edits the key.
   const [authenticatorSaveError, setAuthenticatorSaveError] =
@@ -353,11 +358,28 @@ function CredentialsModal({
         if (next.totp !== prev.totp || next.totp_type !== prev.totp_type) {
           setAuthenticatorSaveError(null);
         }
+        if (next.password !== "") {
+          setNoPassword(false);
+        }
         return next;
       });
     },
     [],
   );
+
+  const handleNoPasswordChange = useCallback((checked: boolean) => {
+    setNoPassword(checked);
+    if (checked) {
+      setPasswordCredentialValues((prev) => ({ ...prev, password: "" }));
+    }
+  }, []);
+
+  // Edit mode never prefills the stored password, so a blank field means "keep what is stored" and
+  // the payload omits password entirely; only the no-password checkbox sends "" to blank it.
+  const preservesStoredPassword =
+    isEditMode &&
+    !noPassword &&
+    passwordCredentialValues.password.trim() === "";
 
   const editingPasswordCredentialData =
     editingCredential && isPasswordCredential(editingCredential.credential)
@@ -685,6 +707,7 @@ function CredentialsModal({
       setPasswordCredentialValues((prev) => ({
         ...prev,
         name: defaultName,
+        totp_type: defaultTotpType ?? prev.totp_type,
       }));
       setCreditCardCredentialValues((prev) => ({
         ...prev,
@@ -699,7 +722,14 @@ function CredentialsModal({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- ref-guarded one-time init; reset and the setters are intentionally omitted so a background refetch can't re-run it
-  }, [isOpen, credentials, isEditMode, editingCredential, defaultTestUrl]);
+  }, [
+    isOpen,
+    credentials,
+    isEditMode,
+    editingCredential,
+    defaultTestUrl,
+    defaultTotpType,
+  ]);
 
   function reset() {
     setVaultType("default");
@@ -710,6 +740,7 @@ function CredentialsModal({
     setCreditCardCredentialValues(createCreditCardCredentialInitialValues());
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
     setEditingGroups({ name: false, values: false });
+    setNoPassword(false);
     setAuthenticatorSaveError(null);
     setRemovalConfirmationMessage(null);
     removalConfirmedRef.current = false;
@@ -1317,10 +1348,10 @@ function CredentialsModal({
       const totp = passwordCredentialValues.totp.trim();
       const totpIdentifier = passwordCredentialValues.totp_identifier.trim();
 
-      if (username === "" || password === "") {
+      if (username === "") {
         toast({
           title: "Error",
-          description: "Username and password are required",
+          description: "Username is required",
           variant: "destructive",
         });
         return;
@@ -1456,7 +1487,7 @@ function CredentialsModal({
         credential_type: "password",
         credential: {
           username,
-          password,
+          ...(preservesStoredPassword ? {} : { password }),
           totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
           // When newly selecting an additional method, stage "none" so the dedicated endpoint sets type
           // and material atomically; a rejection then can't leave a 2FA type with no material behind.
@@ -1903,7 +1934,20 @@ function CredentialsModal({
           authenticatorSaveError={authenticatorSaveError}
           beforeCredentialFields={customVaultCheckbox}
           afterPassword={
-            browserMemoryEnabled ? browserProfileModalSection : null
+            <>
+              {isEditMode && editingGroups.values && (
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <Checkbox
+                    checked={noPassword}
+                    onCheckedChange={(checked) =>
+                      handleNoPasswordChange(checked === true)
+                    }
+                  />
+                  <span>This login has no password</span>
+                </label>
+              )}
+              {browserMemoryEnabled ? browserProfileModalSection : null}
+            </>
           }
           afterUrl={
             browserMemoryEnabled ? null : (
@@ -2066,11 +2110,19 @@ function CredentialsModal({
     }
 
     const username = passwordCredentialValues.username.trim();
-    const password = passwordCredentialValues.password.trim();
-    if (username === "" || password === "") {
+    if (username === "") {
       toast({
         title: "Error",
-        description: "Username and password are required to test",
+        description: "Username is required to test",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (preservesStoredPassword) {
+      toast({
+        title: "Error",
+        description:
+          'Enter the password, or check "This login has no password", to run a test',
         variant: "destructive",
       });
       return;
@@ -2138,7 +2190,7 @@ function CredentialsModal({
     showTestButton &&
     testUrl.trim() !== "" &&
     passwordCredentialValues.username.trim() !== "" &&
-    passwordCredentialValues.password.trim() !== "" &&
+    !preservesStoredPassword &&
     !authenticatorKeyError &&
     !additionalTwoFactorError &&
     !isTestInProgress;
@@ -2182,16 +2234,16 @@ function CredentialsModal({
         <DialogContent className="max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
           <DialogHeader>
             <DialogTitle className="font-bold">
-              {isEditMode ? "Edit Credential" : "Add Credential"}
+              {isEditMode ? "Edit Credential" : (heading ?? "Add Credential")}
             </DialogTitle>
           </DialogHeader>
           {isEditMode && editingGroups.values && (
             <Alert variant="warning">
               <ExclamationTriangleIcon className="size-4" />
               <AlertDescription>
-                For security, saved values are never retrieved. Changing any
-                field other than the credential name requires re-entering all
-                fields, including passwords and 2FA settings.
+                For security, saved values are never retrieved. Leave the
+                password blank to keep the saved one; every other field,
+                including 2FA settings, must be re-entered.
               </AlertDescription>
             </Alert>
           )}

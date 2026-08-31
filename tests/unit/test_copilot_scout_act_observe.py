@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
     composition_challenge_carrier,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import _locator_expr
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
 )
@@ -42,10 +43,13 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.enforcement import (
     record_scouted_output_coverage,
 )
+from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
+from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.result_evidence import scout_observation_bound_paths
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, bound_call_browser_session
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
@@ -60,7 +64,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _safe_page_evidence_url,
     _scout_act_observe_page_evidence,
 )
-from tests.unit.copilot_test_helpers import carried_interaction
+from tests.unit.copilot_test_helpers import carried_interaction, make_copilot_ctx
 
 _SOURCE_URL = "https://example.com/product"
 _LANDING_URL = "https://example.com/results"
@@ -82,26 +86,32 @@ _SCHEMA_LESS_PACKET_KEYS = {
 
 
 def _bounded_extractor_payload() -> dict[str, Any]:
+    def element(selector: str, **facts: Any) -> dict[str, Any]:
+        return {
+            **facts,
+            "selector": selector,
+            "selector_candidates": [{"selector": selector, "source": "test_fixture", "match_count": 1}],
+            "identity": {"tag": facts.get("tag", "div"), "role": "", "label_context": facts.get("text", "")},
+        }
+
     return {
         "page_title": "Results",
         "forms": [
             {
                 "fields": [
-                    {"name": "npi", "label": "NPI number", "type": "text", "selector": "#npi"},
-                    {"name": "state", "label": "State", "type": "select", "selector": "#state"},
+                    element("#npi", name="npi", label="NPI number", type="text", tag="input"),
+                    element("#state", name="state", label="State", type="select", tag="select"),
                 ],
-                "submit_controls": [{"text": "Search", "type": "submit", "selector": "#go"}],
+                "submit_controls": [element("#go", text="Search", type="submit", tag="button")],
             }
         ],
-        "navigation_targets": [
-            {"text": "Provider details", "href": f"{_LANDING_URL}/details", "selector": "a.details"}
-        ],
-        "result_containers": [{"tag": "table", "id": "results", "selector": "#results"}],
+        "navigation_targets": [element("a.details", text="Provider details", href=f"{_LANDING_URL}/details", tag="a")],
+        "result_containers": [element("#results", tag="table", id="results")],
         "modal_overlays": [
             {
                 "role": "dialog",
                 "selector": ".cookie-banner",
-                "dismiss_controls": [{"tag": "button", "text": "Accept", "selector": ".cookie-accept"}],
+                "dismiss_controls": [element(".cookie-accept", tag="button", text="Accept")],
             }
         ],
     }
@@ -227,6 +237,356 @@ def _flow_by_step(ctx: SimpleNamespace) -> dict[int, tuple[dict[str, Any], str]]
     return {entry["step"]: (entry["evidence"], entry["reached_via"]) for entry in ctx.flow_evidence}
 
 
+async def _failed_click_through_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resulting_url: str,
+    page_payload: dict[str, Any] | None,
+    source_url: str = _SOURCE_URL,
+    browser_title: str = "Current options",
+    selector: str = "#continue",
+    accessible_name: str = "Continue",
+    error_message: str = "element not interactable",
+    error_hint: str = "Target remained covered",
+    selector_candidate_count: int = 1,
+    registered_secrets: list[str] | None = None,
+    codeblock_redaction_parameters: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Any, AgentContext]:
+    async def call_internal_tool(_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if "REQUESTED_TARGETS" in str(arguments.get("expression", "")):
+            if page_payload is None:
+                return {"ok": False, "error": "page evidence unavailable"}
+            return {"ok": True, "data": {"result": page_payload}}
+        return {
+            "ok": True,
+            "data": {
+                "result": {
+                    "role_name": {"role": "button", "accessible_name": accessible_name},
+                    "role_name_match_count": 1,
+                    "selector_match_count": 1,
+                    "selector_candidates": [
+                        {
+                            "selector": selector
+                            if selector_candidate_count == 1
+                            else f"{selector}-{index}-{'x' * 200}",
+                            "source": "id",
+                            "match_count": 1,
+                        }
+                        for index in range(selector_candidate_count)
+                    ],
+                }
+            },
+        }
+
+    ctx = make_copilot_ctx()
+    ctx.secret_scrub_values = registered_secrets or []
+    ctx.codeblock_redaction_parameters = codeblock_redaction_parameters or {}
+    ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=AsyncMock(side_effect=call_internal_tool))
+    monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=source_url))
+
+    raw_result = SimpleNamespace(
+        structured_content={
+            "ok": False,
+            "error": {
+                "code": "ELEMENT_NOT_INTERACTABLE",
+                "message": error_message,
+                "hint": error_hint,
+            },
+            "browser_context": {"url": resulting_url, "title": browser_title},
+        },
+        is_error=True,
+        content=[],
+    )
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={"click": SchemaOverlay(pre_hook=tools_module._click_pre_hook, post_hook=_click_post_hook)},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    server._client = SimpleNamespace(call_tool=AsyncMock(return_value=raw_result))
+
+    wrapped = await server.call_tool("click", {"selector": selector})
+    return json.loads(wrapped.content[0].text), wrapped, ctx
+
+
+def _failed_page_payload() -> dict[str, Any]:
+    return {
+        "page_title": "Current options",
+        "forms": [
+            {
+                "fields": [],
+                "submit_controls": [
+                    {
+                        "text": "Try another option",
+                        "type": "button",
+                        "selector": "#try-another",
+                        "selector_candidates": [{"selector": "#try-another", "source": "id", "match_count": 1}],
+                    }
+                ],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "resulting_url",
+    [
+        _SOURCE_URL,
+        "https://example.net/wrong-target?token=not-model-visible",
+    ],
+)
+@pytest.mark.asyncio
+async def test_failed_click_wrapper_carries_attempt_and_current_page_without_success_credit(
+    monkeypatch: pytest.MonkeyPatch,
+    resulting_url: str,
+) -> None:
+    projected, wrapped, ctx = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=resulting_url,
+        page_payload=_failed_page_payload(),
+    )
+
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error"] == "element not interactable. Target remained covered"
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert projected[MCP_RESULT_PROVENANCE_KEY] == MCP_RESULT_PROVENANCE_VALUE
+    assert projected["data"]["attempted_control"] == {
+        "selector": "#continue",
+        "effective_target": "button Continue",
+        "selector_candidates": [{"selector": "#continue", "source": "id", "match_count": 1}],
+        "selector_match_count": 1,
+        "role": "button",
+        "accessible_name": "Continue",
+        "role_name_match_count": 1,
+    }
+    assert projected["data"]["url"] == safe_page_origin(resulting_url)
+    assert projected["data"]["current_url_location_fingerprint"] == _page_evidence_location_fingerprint(resulting_url)
+    assert "title" not in projected["data"]
+    assert projected["data"]["page"]["forms"][0]["submit_controls"][0]["text"] == "Try another option"
+    assert "not-model-visible" not in json.dumps(projected)
+    assert len(json.dumps(projected)) <= _SCOUT_RESULT_CHAR_CAP
+    assert ctx.scouted_interactions == []
+    assert ctx.scout_trajectory == []
+    assert ctx.flow_evidence == []
+
+
+@pytest.mark.asyncio
+async def test_failed_click_page_evidence_ablation_preserves_attempt_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with_page, _, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=_failed_page_payload(),
+    )
+    without_page, _, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=None,
+    )
+
+    assert "page" not in without_page["data"]
+    assert with_page["data"].pop("page")
+    assert with_page == without_page
+
+
+@pytest.mark.asyncio
+async def test_failed_click_without_page_evidence_sheds_oversized_candidates_but_keeps_failure_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projected, wrapped, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=None,
+        selector_candidate_count=20,
+    )
+
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error"] == "element not interactable. Target remained covered"
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert projected["data"]["attempted_control"]["selector"] == "#continue"
+    assert projected["data"]["attempted_control"]["effective_target"] == "button Continue"
+    assert "selector_candidates" not in projected["data"]["attempted_control"]
+    assert len(json.dumps(projected)) <= _SCOUT_RESULT_CHAR_CAP
+
+
+@pytest.mark.asyncio
+async def test_failed_click_without_page_evidence_preserves_typed_failure_while_bounding_control_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector = "#oversized-required-control-" + "s" * (_SCOUT_RESULT_CHAR_CAP * 2)
+    accessible_name = "Oversized required control " + "n" * (_SCOUT_RESULT_CHAR_CAP * 2)
+    error_message = "oversized typed click failure " + "e" * 500
+    projected, wrapped, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=None,
+        selector=selector,
+        accessible_name=accessible_name,
+        error_message=error_message,
+        error_hint="",
+    )
+
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error"] == error_message
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert "#oversized-required-control-" in projected["data"]["attempted_control"]["selector"]
+    assert "Oversized required control" in projected["data"]["attempted_control"]["effective_target"]
+    assert len(json.dumps(projected)) <= _SCOUT_RESULT_CHAR_CAP
+
+
+@pytest.mark.asyncio
+async def test_failed_click_wrapper_reuses_registered_and_codeblock_redaction_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_secret = "registered-password-5ac091"
+    parameter_secret = "codeblock-parameter-26bc18"
+    location_value = "location-only-value-7fe2b7"
+    page_payload = _failed_page_payload()
+    page_payload["page_title"] = f"Account for {credential_secret}"
+    page_payload["forms"][0]["submit_controls"][0]["text"] = f"Continue with {credential_secret} and {parameter_secret}"
+
+    def redact_codeblock_parameters(value: Any, parameters: dict[str, Any]) -> Any:
+        assert parameters == {"account": parameter_secret}
+        return value.replace(parameter_secret, "[REDACTED_PARAMETER]") if isinstance(value, str) else value
+
+    codeblock_scrubber = MagicMock(side_effect=redact_codeblock_parameters)
+    monkeypatch.setattr(tools_module.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", codeblock_scrubber)
+
+    projected, wrapped, ctx = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=f"https://example.com/checkout?state={location_value}",
+        page_payload=page_payload,
+        registered_secrets=[credential_secret],
+        codeblock_redaction_parameters={"account": parameter_secret},
+    )
+
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert projected["data"]["attempted_control"]["selector"] == "#continue"
+    serialized = json.dumps(projected)
+    assert projected["data"]["url"] == "https://example.com/"
+    assert projected["data"]["current_url_location_fingerprint"] == _page_evidence_location_fingerprint(
+        f"https://example.com/checkout?state={location_value}"
+    )
+    assert credential_secret not in serialized
+    assert parameter_secret not in serialized
+    assert location_value not in serialized
+    assert projected["data"]["page"]["page_title"] == "Account for [REDACTED_SECRET]"
+    assert (
+        projected["data"]["page"]["forms"][0]["submit_controls"][0]["text"]
+        == "Continue with [REDACTED_SECRET] and [REDACTED_PARAMETER]"
+    )
+    assert codeblock_scrubber.called
+    assert len(serialized) <= _SCOUT_RESULT_CHAR_CAP
+    assert ctx.scouted_interactions == []
+    assert ctx.scout_trajectory == []
+    assert ctx.flow_evidence == []
+
+
+@pytest.mark.asyncio
+async def test_failed_click_preserves_ordinary_page_facts_matching_short_url_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resulting_url = "https://example.net/go?state=on#tab"
+    page_payload = _failed_page_payload()
+    page_payload["page_title"] = "Go on"
+    page_payload["forms"][0]["submit_controls"][0]["text"] = "Open tab"
+
+    projected, wrapped, ctx = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=resulting_url,
+        page_payload=page_payload,
+    )
+
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert projected["data"]["attempted_control"]["selector"] == "#continue"
+    assert projected["data"]["url"] == "https://example.net/"
+    assert projected["data"]["current_url_location_fingerprint"] == _page_evidence_location_fingerprint(resulting_url)
+    serialized = json.dumps(projected)
+    assert projected["data"]["page"]["page_title"] == "Go on"
+    assert projected["data"]["page"]["forms"][0]["submit_controls"][0]["text"] == "Open tab"
+    assert len(serialized) <= _SCOUT_RESULT_CHAR_CAP
+    assert ctx.scouted_interactions == []
+    assert ctx.scout_trajectory == []
+    assert ctx.flow_evidence == []
+
+
+@pytest.mark.asyncio
+async def test_failed_click_cap_is_enforced_after_registered_short_secret_scrub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered_secret = "654321"
+    reflected_secret = " ".join([registered_secret] * 20)
+    page_payload = _failed_page_payload()
+    page_payload["forms"] = [
+        {
+            "fields": [],
+            "submit_controls": [
+                {"text": reflected_secret, "type": "button", "selector": f"#choice-{form_index}-{index}"}
+                for index in range(4)
+            ],
+        }
+        for form_index in range(4)
+    ]
+
+    projected, wrapped, ctx = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=page_payload,
+        registered_secrets=[registered_secret],
+    )
+
+    serialized = json.dumps(projected)
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert projected["data"]["attempted_control"]["selector"] == "#continue"
+    assert projected["data"]["attempted_control"]["effective_target"] == "button Continue"
+    assert projected["data"]["url"] == safe_page_origin(_SOURCE_URL)
+    assert projected["data"]["current_url_location_fingerprint"] == _page_evidence_location_fingerprint(_SOURCE_URL)
+    assert registered_secret not in serialized
+    assert len(serialized) <= _SCOUT_RESULT_CHAR_CAP
+    assert ctx.scouted_interactions == []
+    assert ctx.scout_trajectory == []
+    assert ctx.flow_evidence == []
+
+
+@pytest.mark.asyncio
+async def test_failed_click_resulting_location_ablation_changes_only_safe_location_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    same_page, _, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=_failed_page_payload(),
+    )
+    redirected, _, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url="https://example.net/wrong-target?token=second",
+        page_payload=_failed_page_payload(),
+    )
+
+    assert same_page["data"]["url"] != redirected["data"]["url"]
+    assert (
+        same_page["data"]["current_url_location_fingerprint"] != redirected["data"]["current_url_location_fingerprint"]
+    )
+    assert same_page["data"]["page"]["page_title"] == "Current options"
+    assert redirected["data"]["page"]["page_title"] == "Current options"
+    same_page["data"]["url"] = redirected["data"]["url"]
+    same_page["data"]["current_url_location_fingerprint"] = redirected["data"]["current_url_location_fingerprint"]
+    assert same_page == redirected
+
+
 def test_safe_page_evidence_url_keeps_only_origin_and_fingerprints_location() -> None:
     assert (
         _safe_page_evidence_url("https://user:password@example.com/callback?code=secret#access_token=secret")
@@ -282,6 +642,36 @@ def test_control_readiness_uses_secret_safe_location_identity() -> None:
     assert _observed_control_readiness(ctx, "#npi", "https://example.com/search?q=second") == (False, False)
 
 
+def test_control_readiness_does_not_transfer_state_through_a_non_unique_candidate() -> None:
+    page_url = "https://example.com/actions"
+    evidence = {
+        "current_url": page_url,
+        "current_url_location_fingerprint": _page_evidence_location_fingerprint(page_url),
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "selector": "#enabled",
+                        "selector_candidates": [{"selector": ".primary", "source": "class", "match_count": 2}],
+                        "visible": True,
+                        "disabled": False,
+                    },
+                    {
+                        "selector": "#disabled",
+                        "selector_candidates": [{"selector": ".primary", "source": "class", "match_count": 2}],
+                        "visible": True,
+                        "disabled": True,
+                    },
+                ]
+            }
+        ],
+    }
+    ctx = _ctx()
+    ctx.composition_page_evidence = evidence
+
+    assert _observed_control_readiness(ctx, ".primary", page_url) == (False, False)
+
+
 def test_page_identity_uses_process_key_when_secret_key_is_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "SECRET_KEY", type(settings).model_fields["SECRET_KEY"].default)
     page_url = "https://example.com/search?q=first"
@@ -333,11 +723,35 @@ def test_page_evidence_freshness_compares_dom_state_not_visual_augmentation() ->
         "kind": "visual_challenge",
         "evidence_source": "vision",
     }
-    prior["page_obstructions"] = [{"kind": "loading_overlay", "source": "vision"}]
+    prior["page_obstructions"] = [
+        *prior.get("page_obstructions", []),
+        {"kind": "loading_overlay", "source": "vision"},
+    ]
     prior["observed_empty_page"] = True
     prior["empty_page_visual_state"] = "settled_empty"
 
     assert _page_evidence_is_unchanged(prior, current) is True
+
+
+def test_page_evidence_freshness_includes_dom_page_obstructions() -> None:
+    prior = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
+    )
+    current = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+    )
+    assert prior is not None and current is not None
+    current["page_obstructions"] = [
+        {
+            "kind": "interaction_blocking_layer",
+            "source": "dom_html",
+            "selector": "#veil",
+            "visible_controls": [{"selector": "#continue", "text": "Continue"}],
+            "visible_controls_omitted": 0,
+        }
+    ]
+
+    assert _page_evidence_is_unchanged(prior, current) is False
 
 
 @pytest.mark.parametrize("candidate_on_prior", [False, True])
@@ -416,16 +830,13 @@ class TestActObserveSuccess:
         assert result["data"]["observation_step"] == ctx.flow_evidence[0]["step"]
         page = result["data"]["page"]
         assert page["page_title"] == "Results"
-        assert page["forms"] == [
-            {
-                "field_count": 2,
-                "fields": [
-                    {"text": "NPI number", "selector": "#npi"},
-                    {"text": "State", "selector": "#state"},
-                ],
-                "submit_controls": [{"text": "Search", "selector": "#go"}],
-            }
+        assert page["forms"][0]["field_count"] == 2
+        assert [field["text"] for field in page["forms"][0]["fields"]] == ["NPI number", "State"]
+        assert [field["selector_candidates"][0]["selector"] for field in page["forms"][0]["fields"]] == [
+            "#npi",
+            "#state",
         ]
+        assert page["forms"][0]["submit_controls"][0]["selector_candidates"][0]["selector"] == "#go"
         assert page["navigation_target_count"] == 1
         assert [target["text"] for target in page["navigation_targets"]] == ["Provider details"]
         assert page["result_container_count"] == 1
@@ -434,12 +845,30 @@ class TestActObserveSuccess:
         assert len(json.dumps(result)) <= _SCOUT_RESULT_CHAR_CAP
 
     @pytest.mark.asyncio
+    async def test_result_summary_carries_structured_size_omissions_to_the_authoring_model(self) -> None:
+        payload = _bounded_extractor_payload()
+        payload["size_compaction"] = {
+            "original_char_count": 132_400,
+            "omissions": [
+                {"category": "forms.fields.options", "omitted_count": 180, "unit": "entries"},
+                {"category": "visible_text_excerpt", "omitted_count": 6000, "unit": "characters"},
+            ],
+        }
+        ctx = _ctx(server=_server_returning(payload))
+
+        result = await _run_click(ctx)
+
+        assert result["data"]["page"]["size_compaction"] == payload["size_compaction"]
+        assert ctx.flow_evidence[0]["evidence"]["inspection_warnings"] == []
+
+    @pytest.mark.asyncio
     async def test_result_summary_carries_disclosure_controls_to_the_authoring_model(self) -> None:
         payload = _bounded_extractor_payload()
         payload["clickable_controls"] = [
             {
                 "text": "More options",
                 "selector": "#more",
+                "selector_candidates": [{"selector": "#more", "source": "id", "match_count": 1}],
                 "tag": "button",
                 "expanded": False,
                 "controls": "alternatives",
@@ -452,17 +881,11 @@ class TestActObserveSuccess:
 
         result = await _run_click(ctx)
 
-        assert result["data"]["page"]["disclosure_controls"] == [
-            {
-                "text": "More options",
-                "selector": "#more",
-                "expanded": False,
-                "controls": "alternatives",
-                "controlled_region_visible": False,
-                "disabled": True,
-                "visible": False,
-            }
-        ]
+        disclosure = result["data"]["page"]["disclosure_controls"][0]
+        assert "selector" not in disclosure
+        assert disclosure["selector_candidates"][0]["selector"] == "#more"
+        assert disclosure["disabled"] is True
+        assert disclosure["visible"] is False
 
     @pytest.mark.asyncio
     async def test_result_summary_carries_in_form_disclosure_controls_to_the_authoring_model(self) -> None:
@@ -471,6 +894,7 @@ class TestActObserveSuccess:
             {
                 "text": "More options",
                 "selector": "#more",
+                "selector_candidates": [{"selector": "#more", "source": "id", "match_count": 1}],
                 "tag": "button",
                 "expanded": False,
                 "controls": "alternatives",
@@ -481,15 +905,9 @@ class TestActObserveSuccess:
 
         result = await _run_click(ctx)
 
-        assert result["data"]["page"]["disclosure_controls"] == [
-            {
-                "text": "More options",
-                "selector": "#more",
-                "expanded": False,
-                "controls": "alternatives",
-                "controlled_region_visible": False,
-            }
-        ]
+        disclosure = result["data"]["page"]["disclosure_controls"][0]
+        assert "selector" not in disclosure
+        assert disclosure["selector_candidates"][0]["selector"] == "#more"
 
     @pytest.mark.asyncio
     async def test_result_summary_does_not_widen_to_unrelated_clickable_controls(self) -> None:
@@ -554,22 +972,27 @@ class TestActObserveSuccess:
                 await browser.close()
 
         assert "page" in result["data"]
-        assert result["data"]["page"]["disclosure_controls"] == [
-            {
-                "text": "More options",
-                "selector": "#more",
-                "expanded": False,
-                "controls": "alternatives",
-                "controlled_region_visible": False,
-            }
-        ]
+        disclosure = result["data"]["page"]["disclosure_controls"][0]
+        assert "selector" not in disclosure
+        assert disclosure["text"] == "More options"
+        assert disclosure["expanded"] is False
+        assert disclosure["controls"] == "alternatives"
+        assert disclosure["controlled_region_visible"] is False
+        assert any(candidate["selector"] == "#more" for candidate in disclosure["selector_candidates"])
         parsed_controls = ctx.flow_evidence[0]["evidence"]["clickable_controls"]
-        parsed_disclosure = next(control for control in parsed_controls if control["selector"] == "#more")
+        parsed_disclosure = next(
+            control
+            for control in parsed_controls
+            if any(candidate["selector"] == "#more" for candidate in control["selector_candidates"])
+        )
         assert parsed_disclosure["expanded"] is False
         assert parsed_disclosure["controls"] == "alternatives"
         assert parsed_disclosure["controlled_region_visible"] is False
-        assert any(control.get("selector") == "#refresh" for control in parsed_controls)
-        assert all(control.get("selector") != "#refresh" for control in result["data"]["page"]["disclosure_controls"])
+        assert any(
+            candidate["selector"] == "#refresh"
+            for control in parsed_controls
+            for candidate in control["selector_candidates"]
+        )
 
     def test_captured_code_host_disclosure_replays_to_the_authoring_model_without_a_browser(self) -> None:
         capture_path = Path(__file__).parent / "fixtures/copilot/sky_14419_code_host_collapsed_2fa_structured.json"
@@ -598,26 +1021,29 @@ class TestActObserveSuccess:
         assert parsed is not None
         parsed_controls = parsed["clickable_controls"]
         parsed_disclosure = next(control for control in parsed_controls if control["text"].startswith("More options"))
-        assert parsed_disclosure["selector"] == raw_disclosure["selector"]
+        assert any(
+            candidate["selector"] == raw_disclosure["selector"]
+            for candidate in parsed_disclosure["selector_candidates"]
+        )
         assert parsed_disclosure["expanded"] is False
         assert parsed_disclosure["controls"] == "two-factor-alternatives-body"
         assert parsed_disclosure["controlled_region_visible"] is False
-        assert any(control.get("selector") == "button.primary" for control in parsed_controls)
+        assert any(
+            candidate["selector"] == "button.primary"
+            for control in parsed_controls
+            for candidate in control["selector_candidates"]
+        )
 
         model_facing_result: dict[str, Any] = {"ok": True, "data": {}}
         scouting_module._attach_scout_page_summary(
             SimpleNamespace(codeblock_redaction_parameters={}), model_facing_result, parsed
         )
 
-        assert model_facing_result["data"]["page"]["disclosure_controls"] == [
-            {
-                "text": "More options ▾",
-                "selector": "button.secondary",
-                "expanded": False,
-                "controls": "two-factor-alternatives-body",
-                "controlled_region_visible": False,
-            }
-        ]
+        disclosure = model_facing_result["data"]["page"]["disclosure_controls"][0]
+        assert "selector" not in disclosure
+        assert disclosure["text"] == "More options ▾"
+        assert disclosure["selector_candidates"][0]["selector"] == "button.secondary"
+        assert disclosure["controls"] == "two-factor-alternatives-body"
         assert all(
             control.get("selector") != "button.primary"
             for control in model_facing_result["data"]["page"]["disclosure_controls"]
@@ -890,7 +1316,7 @@ class TestActObserveDegrade:
 
         assert result["ok"] is True
         assert result["data"] == {
-            "selector": "#open-details",
+            "executed_selector": "#open-details",
             "effective_target": "#open-details",
             "url": "https://example.com/",
             "title": "Results",
@@ -1676,6 +2102,37 @@ class TestTerminalActionObservationStampSeam:
         assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
         assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
 
+    def test_an_interaction_records_the_browser_it_was_demonstrated_in(self) -> None:
+        # Untagged, a commit demonstrated on the page a run failed on is indistinguishable from one
+        # the chat drove itself. The tag is provenance the model reads; it withholds no credit.
+        ctx = self._ctx_with(self._terminal_action_criterion())
+
+        with bound_call_browser_session("pbs_run"):
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="click",
+                selector="#find-address",
+                source_url=self._BUSINESS_URL,
+                role="button",
+                accessible_name="Find Address",
+            )
+
+        assert ctx.scout_trajectory[-1]["demonstrated_browser_session_id"] == "pbs_run"
+
+    def test_an_interaction_in_the_chats_own_browser_carries_no_browser_tag(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector="#find-address",
+            source_url=self._BUSINESS_URL,
+            role="button",
+            accessible_name="Find Address",
+        )
+
+        assert "demonstrated_browser_session_id" not in ctx.scout_trajectory[-1]
+
     def test_matching_prior_page_observation_marks_demonstrated_control_readiness(self) -> None:
         ctx = self._ctx_with()
         ctx.scout_trajectory = []
@@ -1840,6 +2297,19 @@ class TestCarriedTrajectoryHydration:
         ]
         assert [item["carried"] for item in carried] == [True, True]
         assert carried[0]["typed_value"] == "ABC123"
+
+    def test_hydrated_executed_selector_remains_available_to_internal_locator_consumers(self) -> None:
+        ctx = _ctx()
+        ctx.prior_carried_trajectory = [
+            {"tool_name": "click", "executed_selector": "#signin", "source_url": _LANDING_URL}
+        ]
+        ctx.carried_trajectory_rebound_done = False
+
+        assert scouting_module.hydrate_prior_carried_trajectory(ctx) is True
+
+        interaction = ctx.scout_trajectory[0]
+        assert interaction["executed_selector"] == "#signin"
+        assert _locator_expr(interaction, []) == 'page.locator("#signin")'
 
     def test_hydration_carries_the_submit_click_the_fill_carry_could_not(self) -> None:
         ctx = _ctx()

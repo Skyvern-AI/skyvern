@@ -180,7 +180,6 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   recording_archived?: boolean;
-  browser_console_log_url?: string | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
@@ -1112,7 +1111,8 @@ export type CreateCredentialRequest = {
 
 export type PasswordCredential = {
   username: string;
-  password: string;
+  /** Omit on an overwrite to keep the stored password; "" blanks it. */
+  password?: string;
   totp: string | null;
   totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;

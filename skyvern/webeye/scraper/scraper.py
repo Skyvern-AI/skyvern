@@ -44,6 +44,7 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapeExcludeFunc,
     json_to_html,
 )
+from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
 
 if TYPE_CHECKING:
@@ -233,6 +234,29 @@ def hash_element(element: dict) -> str:
     element_string = json.dumps(hash_ready_element, sort_keys=True)
 
     return calculate_sha256(element_string)
+
+
+def structural_identity(element: dict) -> str:
+    """Position-independent structural signature of an element: what it IS (tag, attributes, text,
+    descendant shape), not WHERE it is. Unlike ``hash_element`` it also drops ``xpath`` and ``frame``
+    recursively, so a control that a preceding action remounted at a new DOM position -- losing its
+    injected ``unique_id`` and shifting its tag-name xpath -- still matches its pre-remount identity
+    when its semantic content is unchanged. Genuinely volatile identity (e.g. an auto-generated
+    ``rc_select_<n>`` id) is deliberately NOT normalized away: a control whose only distinguishing
+    signal is volatile has no stable identity and must fail closed rather than be guessed at.
+    """
+
+    def strip(node: dict) -> dict:
+        cleaned = {
+            key: value for key, value in node.items() if key not in {"id", "rect", "frame_index", "xpath", "frame"}
+        }
+        if "attributes" in node:
+            cleaned["attributes"] = {key: value for key, value in node["attributes"].items() if key != SKYVERN_ID_ATTR}
+        if "children" in node:
+            cleaned["children"] = [strip(child) for child in node["children"] if isinstance(child, dict)]
+        return cleaned
+
+    return calculate_sha256(json.dumps(strip(element), sort_keys=True))
 
 
 def build_element_dict(
@@ -550,6 +574,8 @@ async def scrape_web_unsafe(
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
         await asyncio.sleep(wait_seconds)
 
+    document_loader_id_before = await get_main_document_loader_id(page)
+
     elements, element_tree, destinations = await get_interactable_element_tree(
         page,
         scrape_exclude,
@@ -690,24 +716,34 @@ async def scrape_web_unsafe(
         page, main_frame_url=page.main_frame.url, element_hashes=id_to_element_hash, destinations=destinations
     )
 
-    return ScrapedPage(
-        elements=elements,
-        id_to_css_dict=id_to_css_dict,
-        id_to_element_dict=id_to_element_dict,
-        id_to_frame_dict=id_to_frame_dict,
-        id_to_element_hash=id_to_element_hash,
-        hash_to_element_ids=hash_to_element_ids,
-        element_tree=element_tree,
-        element_tree_trimmed=element_tree_trimmed,
-        screenshots=screenshots,
-        url=url,
-        html=html,
-        extracted_text=text_content,
-        window_dimension=window_dimension,
-        _browser_state=browser_state,
-        _clean_up_func=cleanup_element_tree,
-        _scrape_exclude=scrape_exclude,
-    )
+    try:
+        document_loader_id_after = await get_main_document_loader_id(page)
+        document_loader_id = (
+            document_loader_id_before
+            if document_loader_id_before is not None and document_loader_id_before == document_loader_id_after
+            else None
+        )
+        return ScrapedPage(
+            elements=elements,
+            id_to_css_dict=id_to_css_dict,
+            id_to_element_dict=id_to_element_dict,
+            id_to_frame_dict=id_to_frame_dict,
+            id_to_element_hash=id_to_element_hash,
+            hash_to_element_ids=hash_to_element_ids,
+            element_tree=element_tree,
+            element_tree_trimmed=element_tree_trimmed,
+            screenshots=screenshots,
+            url=url,
+            html=html,
+            extracted_text=text_content,
+            window_dimension=window_dimension,
+            _browser_state=browser_state,
+            _clean_up_func=cleanup_element_tree,
+            _scrape_exclude=scrape_exclude,
+            _document_loader_id=document_loader_id,
+        )
+    except Exception:
+        raise
 
 
 async def get_all_children_frames(page: Page) -> list[Frame]:

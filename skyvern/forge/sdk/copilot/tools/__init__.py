@@ -8,11 +8,13 @@ import time
 from typing import Any
 
 import structlog
-from agents import function_tool
+from agents import FunctionTool, function_tool
 from agents.run_context import RunContextWrapper
+from agents.tool_context import ToolContext
 from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
+from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -22,8 +24,12 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    requested_output_designation_capability,
+    value_designation_probe_expression,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
 )
@@ -31,12 +37,24 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
+from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_PAGE_ERROR,
+    bound_call_browser_session,
+    resolve_browser_state_for_context,
+    sensitive_origin_page_is_tainted,
+)
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
     enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
+from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
+from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_SCHEMA as LOCATOR_INSPECTION_TOOL_SCHEMA
+from skyvern.forge.sdk.copilot.tools.locator_inspection import (
+    inspect_locator_matches,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     BlockEditError,
@@ -53,11 +71,7 @@ from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPP
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
-from ._shared import COPILOT_FINAL_REPLY_RESERVE_SECONDS as COPILOT_FINAL_REPLY_RESERVE_SECONDS
-from ._shared import PER_TOOL_CALL_BUDGET_SECONDS as PER_TOOL_CALL_BUDGET_SECONDS
-from ._shared import (
-    RUN_BLOCKS_SAFETY_CEILING_SECONDS,
-)
+from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEILING_SECONDS
 from ._shared import _composition_get_html as _composition_get_html
 from ._shared import _current_workflow_has_evidence_block as _current_workflow_has_evidence_block
 from ._shared import _fallback_page_info as _fallback_page_info
@@ -70,7 +84,6 @@ from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
 from .banned_blocks import _record_banned_block_reject_span as _record_banned_block_reject_span
-from .blockers import _active_block_run_budget_seconds as _active_block_run_budget_seconds
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
 from .blockers import _run_blocks_structured_blocker_message as _run_blocks_structured_blocker_message
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
@@ -172,6 +185,9 @@ from .run_execution import _any_quiet_block_requested as _any_quiet_block_reques
 from .run_execution import _attach_action_traces as _attach_action_traces
 from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
+from .run_execution import (
+    _carry_unresolved_failure_into_result,
+)
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
 from .run_execution import (
@@ -224,6 +240,13 @@ _CREDENTIAL_DEFERRED_DRAFT_MESSAGE = (
     "I can save this as a draft without running it because the credentials aren't set up yet. "
     "Add them in the Credentials UI and ask me to test the workflow."
 )
+
+
+def _originating_call_id(ctx: RunContextWrapper) -> str | None:
+    """The id of the tool call currently executing, so a write's diff can be handed back to that
+    call's result rather than to whichever code-write result arrives first. The SDK passes a
+    ``ToolContext`` at call time; the annotation is its base class, so narrow before reading."""
+    return ctx.tool_call_id if isinstance(ctx, ToolContext) else None
 
 
 def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
@@ -294,6 +317,7 @@ async def update_workflow_tool(
             copilot_ctx,
             allow_missing_credentials=credential_deferred_draft
             or getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
+            originating_call_id=_originating_call_id(ctx),
         )
         if credential_deferred_draft and result.get("ok"):
             _mark_credential_deferred_draft(copilot_ctx, result)
@@ -316,6 +340,7 @@ async def _persist_block_scoped_edit(
     workflow_yaml: str,
     arguments: dict,
     *,
+    originating_call_id: str | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     block_observation_refs: list[BlockObservationRef] | None = None,
 ) -> str:
@@ -325,7 +350,7 @@ async def _persist_block_scoped_edit(
     author-time check, so a block edit cannot slip past what a full submission must satisfy.
     """
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-    params: dict[str, Any] = {"workflow_yaml": workflow_yaml}
+    params: dict[str, Any] = {"workflow_yaml": workflow_yaml, "_preserve_code_block_associations": True}
     if code_artifact_metadata is not None:
         params["code_artifact_metadata"] = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
         params["raw_code_artifact_metadata"] = code_artifact_metadata
@@ -333,7 +358,7 @@ async def _persist_block_scoped_edit(
         params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
         params["raw_block_observation_refs"] = block_observation_refs
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow(params, copilot_ctx)
+        result = await _update_workflow(params, copilot_ctx, originating_call_id=originating_call_id)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
         finalize_build_test_result(
@@ -402,7 +427,9 @@ async def edit_block_tool(
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
-    return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
+    return await _persist_block_scoped_edit(
+        copilot_ctx, "edit_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+    )
 
 
 @function_tool(
@@ -453,6 +480,7 @@ async def edit_block_and_run_tool(
             "ok": False,
             "error": f"block_labels must include the edited block {label!r} so this call tests the persisted repair.",
         }
+        _carry_unresolved_failure_into_result(copilot_ctx, result, "edit_block_and_run")
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
         finalize_build_test_result(
             copilot_ctx,
@@ -475,6 +503,7 @@ async def edit_block_and_run_tool(
         )
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
+        _carry_unresolved_failure_into_result(copilot_ctx, result, "edit_block_and_run")
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
         finalize_build_test_result(
             copilot_ctx,
@@ -486,12 +515,14 @@ async def edit_block_and_run_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
         update_result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml},
+            {"workflow_yaml": workflow_yaml, "_preserve_code_block_associations": True},
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
+            originating_call_id=_originating_call_id(ctx),
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
     if not update_result.get("ok"):
+        _carry_unresolved_failure_into_result(copilot_ctx, update_result, "edit_block_and_run")
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, update_result)
         finalize_build_test_result(
             copilot_ctx,
@@ -585,6 +616,7 @@ async def add_block_tool(
         arguments,
         code_artifact_metadata=code_artifact_metadata,
         block_observation_refs=block_observation_refs,
+        originating_call_id=_originating_call_id(ctx),
     )
 
 
@@ -619,7 +651,9 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
-    return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
+    return await _persist_block_scoped_edit(
+        copilot_ctx, "delete_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+    )
 
 
 class RequestedOutputRead(TypedDict):
@@ -685,11 +719,14 @@ async def _verify_requested_output_reads(
         if isinstance(raw_candidates, list):
             for candidate in raw_candidates:
                 if isinstance(candidate, str) and candidate:
-                    candidates.append({"selector": candidate, "match_count": None, "position": None})
+                    candidates.append(
+                        {"selector": candidate, "source": "unknown", "match_count": None, "position": None}
+                    )
                 elif isinstance(candidate, dict) and isinstance(candidate.get("selector"), str):
                     candidates.append(
                         {
                             "selector": candidate["selector"],
+                            "source": str(candidate.get("source") or "unknown"),
                             "match_count": candidate.get("match_count"),
                             "position": candidate.get("position"),
                         }
@@ -697,15 +734,17 @@ async def _verify_requested_output_reads(
         if not candidates:
             unverified.append({"output_path": output_path, "reason": "no-stable-selector"})
             continue
-        verified.append(
-            {
-                "output_path": output_path,
-                "label": label,
-                "rendered_value": payload["text"],
-                "selector_candidates": candidates,
-                "page_url": str(payload.get("url") or ""),
-            }
-        )
+        label_association = str(payload.get("label_association") or "")
+        fact = {
+            "output_path": output_path,
+            "label": label if label_association != "not_found" else "",
+            "rendered_value": payload["text"],
+            "selector_candidates": candidates,
+            "page_url": str(payload.get("url") or ""),
+        }
+        if label_association:
+            fact["label_association"] = label_association
+        verified.append(fact)
     LOG.info(
         "copilot_requested_output_designation_facts",
         verified_paths=[fact["output_path"] for fact in verified],
@@ -770,6 +809,15 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     fails at run time. A connection whose `state` is `active` can mint an access token.
     A connection whose `state` is `error` remains listed but cannot mint one until it
     is authorized again.
+
+    When the current request identifies one active, scope-compatible row, bind its
+    exact `connection_id` as the native block's `credential_id` and continue.
+    For a build-and-test request, pass the completed workflow and the bound block
+    label to `update_and_run_blocks` in the same turn; do not stop at
+    `update_workflow`.
+    Never require an opaque ID already present in this tool result to be repeated.
+    If the requested account remains ambiguous or no compatible active row exists,
+    use a grounded ordinary-language clarification instead.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -860,12 +908,14 @@ async def run_blocks_tool(
                 block_outputs_to_seed=block_outputs_to_seed,
                 frontier_start_label=frontier_start_label,
             )
-        await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
+        recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
+        _carry_unresolved_failure_into_result(copilot_ctx, result, "run_blocks_and_collect_debug")
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         finalize_build_test_result(
             copilot_ctx,
             source_tool="run_blocks_and_collect_debug",
             result=result,
+            recorded_outcome=recorded_outcome,
         )
         enqueue_screenshot_from_result(
             copilot_ctx,
@@ -1012,10 +1062,12 @@ async def update_and_run_blocks_tool(
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
+            originating_call_id=_originating_call_id(ctx),
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
 
     if not update_result.get("ok"):
+        _carry_unresolved_failure_into_result(copilot_ctx, update_result, "update_and_run_blocks")
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         finalize_build_test_result(
             copilot_ctx,
@@ -1122,14 +1174,16 @@ async def _run_updated_workflow_blocks(
                 block_outputs_to_seed=block_outputs_to_seed,
                 frontier_start_label=frontier_start_label,
             )
-        await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
+        recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         carry_author_time_findings(update_result, run_result)
+        _carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
         finalize_build_test_result(
             copilot_ctx,
             source_tool=tool_name,
             result=run_result,
             workflow_updated=True,
+            recorded_outcome=recorded_outcome,
         )
         enqueue_screenshot_from_result(
             copilot_ctx,
@@ -1255,6 +1309,18 @@ async def inspect_page_for_composition_tool(
             data["requested_output_designations"] = verified
             if unverified:
                 data["unverified_output_designations"] = unverified
+                retry_paths = [item["output_path"] for item in unverified if item.get("output_path")]
+                if retry_paths:
+                    data["requested_output_designation_capability"] = requested_output_designation_capability(
+                        retry_paths
+                    )
+    elif result.get("ok"):
+        requested_paths = requested_output_paths_for_derivation(ctx.context)
+        data = result.get("data")
+        if requested_paths and isinstance(data, dict):
+            data["requested_output_designation_capability"] = requested_output_designation_capability(
+                list(requested_paths)
+            )
     scrubbed_result = scrub_secrets_from_structure(ctx.context, result)
     return json.dumps(_model_facing_inspect_result(scrubbed_result))
 
@@ -1330,6 +1396,82 @@ async def fill_credential_field_tool(
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
+async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str) -> str:
+    """Serve one locator inspection against the browser the call named.
+
+    The advertised contract is the tested one: ``TOOL_DESCRIPTION`` and ``TOOL_SCHEMA`` are the
+    constants the ablation ran against, not a docstring or a schema derived from this signature.
+    """
+    copilot_ctx = ctx.context
+
+    def finish(result: dict[str, Any]) -> str:
+        # Scrub once, then record and return that same structure, so nothing downstream retains an
+        # unsanitized copy of page text.
+        scrubbed = scrub_secrets_from_structure(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, LOCATOR_INSPECTION_TOOL_NAME, parsed, scrubbed)
+        return json.dumps(scrubbed)
+
+    try:
+        parsed = json.loads(arguments) if arguments else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    target = parsed.get("target")
+    raw_selectors = parsed.get("selectors")
+
+    authority_error = _authority_tool_error(copilot_ctx, LOCATOR_INSPECTION_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, LOCATOR_INSPECTION_TOOL_NAME, authority_error)
+
+    binding = resolve_browser_session_binding(copilot_ctx, {"target": target})
+    if binding.unavailable_reason:
+        # Never fall back to the chat's browser: a locator inspected there answers a different
+        # question than the one the model asked.
+        return finish({"ok": False, "error": binding.unavailable_reason, **binding.provenance()})
+
+    selectors = [s for s in (raw_selectors or []) if isinstance(s, str) and s.strip()]
+    if not selectors:
+        return finish({"ok": False, "error": "No selectors supplied.", **binding.provenance()})
+
+    with bound_call_browser_session(binding.session_id_override):
+        if sensitive_origin_page_is_tainted(copilot_ctx):
+            return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR, **binding.provenance()})
+        browser_state = await resolve_browser_state_for_context(copilot_ctx)
+        if browser_state is None:
+            return finish(
+                {
+                    "ok": False,
+                    "error": "That browser is no longer available, so its page cannot be inspected.",
+                    **binding.provenance(),
+                }
+            )
+        page = await browser_state.get_working_page()
+        if page is None:
+            # Creating one would both mutate browser state and report from a page the run never
+            # reached, which is the opposite of what this tool is for.
+            return finish(
+                {
+                    "ok": False,
+                    "error": "That browser has no open page to inspect.",
+                    **binding.provenance(),
+                }
+            )
+        facts = await inspect_locator_matches(page, selectors)
+        if sensitive_origin_page_is_tainted(copilot_ctx):
+            return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR, **binding.provenance()})
+        return finish({"ok": True, "current_url": page.url, **binding.provenance(), "data": facts})
+
+
+inspect_locator_matches_tool = FunctionTool(
+    name=LOCATOR_INSPECTION_TOOL_NAME,
+    description=LOCATOR_INSPECTION_TOOL_DESCRIPTION,
+    params_json_schema=LOCATOR_INSPECTION_TOOL_SCHEMA,
+    on_invoke_tool=_inspect_locator_matches_invoke,
+    strict_json_schema=False,
+)
+
+
 NATIVE_TOOLS = [
     update_workflow_tool,
     edit_block_tool,
@@ -1343,5 +1485,6 @@ NATIVE_TOOLS = [
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,
     inspect_page_for_composition_tool,
+    inspect_locator_matches_tool,
     fill_credential_field_tool,
 ]

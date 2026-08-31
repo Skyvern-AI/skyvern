@@ -41,8 +41,13 @@ import {
   Outlet,
   useLocation,
   useNavigate,
+  useParams,
   useSearchParams,
 } from "react-router-dom";
+import {
+  runOverviewScreenshotLocation,
+  runViewTabBasePath,
+} from "@/routes/runs/runViewTabBasePath";
 import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
@@ -74,6 +79,7 @@ import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowR
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
+import { usePageSlots } from "@/store/PageSlots";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
@@ -89,7 +95,7 @@ import {
   type RecoveryGuidanceTelemetryContext,
 } from "@/util/onboarding/recoveryGuidanceTelemetry";
 import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
-import { shouldPollForGeneratedCode } from "./utils";
+import { getRerunNavigationState, shouldPollForGeneratedCode } from "./utils";
 
 const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
   "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
@@ -101,6 +107,7 @@ function WorkflowRunRightColumn({
   timelineReady,
   onSetActiveItem,
   onSetActiveIteration,
+  onViewScreenshot,
 }: {
   activeItem: ReturnType<typeof findActiveItem>;
   activeIteration: number | null;
@@ -108,6 +115,7 @@ function WorkflowRunRightColumn({
   timelineReady: boolean;
   onSetActiveItem: (id: string) => void;
   onSetActiveIteration: (loopBlockId: string, iterationIndex: number) => void;
+  onViewScreenshot: (workflowRunBlockId: string) => void;
 }) {
   return (
     <ResizableTimelineSplit
@@ -145,6 +153,7 @@ function WorkflowRunRightColumn({
             activeIteration={activeIteration}
             timeline={timeline}
             timelineReady={timelineReady}
+            onViewScreenshot={onViewScreenshot}
             onThoughtSelect={(thought) => {
               onSetActiveItem(thought.thought_id);
             }}
@@ -165,6 +174,8 @@ function WorkflowRun() {
   const iterationParam = searchParams.get("iteration");
   const activeIteration = parseActiveIterationParam(iterationParam);
   const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const runBasePath =
+    runViewTabBasePath(useParams()) ?? `/runs/${workflowRunId}`;
   const workflowPermanentIdParam = useFirstParam("workflowPermanentId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
@@ -173,10 +184,12 @@ function WorkflowRun() {
   const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const onboarding = useOnboardingStateOptional();
+  const { workflowRunMilestoneCard: WorkflowRunMilestoneCard } = usePageSlots();
 
   const {
     data: workflowRun,
     isLoading: workflowRunIsLoading,
+    isPlaceholderData: workflowRunIsPlaceholder,
     isFetched,
     error,
   } = useWorkflowRunWithWorkflowQuery();
@@ -295,8 +308,9 @@ function WorkflowRun() {
     },
   });
 
+  const statusUnavailable = Boolean(error);
   const workflowRunIsCancellable =
-    workflowRun && statusIsCancellable(workflowRun);
+    !statusUnavailable && workflowRun && statusIsCancellable(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
 
@@ -494,6 +508,19 @@ function WorkflowRun() {
     });
   }
 
+  const handleViewScreenshot = useCallback(
+    (workflowRunBlockId: string) => {
+      const destination = runOverviewScreenshotLocation(
+        runBasePath,
+        searchParamsRef.current.toString(),
+        workflowRunBlockId,
+      );
+      searchParamsRef.current = new URLSearchParams(destination.search);
+      navigate(destination, { replace: true });
+    },
+    [navigate, runBasePath],
+  );
+
   function handleSetActiveIteration(
     loopBlockId: string,
     iterationIndex: number,
@@ -566,23 +593,23 @@ function WorkflowRun() {
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {
       label: "Overview",
-      to: "overview",
+      to: `${runBasePath}/overview`,
     },
     {
       label: "Output",
-      to: "output",
+      to: `${runBasePath}/output`,
     },
     {
       label: "Inputs",
-      to: "parameters",
+      to: `${runBasePath}/parameters`,
     },
     {
       label: "Recording",
-      to: "recording",
+      to: `${runBasePath}/recording`,
     },
     {
       label: "Code",
-      to: "code",
+      to: `${runBasePath}/code`,
       icon: !isGeneratingCode ? (
         <CodeIcon className="inline-block size-5" />
       ) : (
@@ -624,7 +651,7 @@ function WorkflowRun() {
               {title}
               {workflowRunIsLoading ? (
                 <Skeleton className="h-8 w-28" />
-              ) : workflowRun ? (
+              ) : workflowRun && !statusUnavailable ? (
                 <div className="mt-[0.27rem] flex items-center gap-2">
                   <StatusBadge status={workflowRun?.status} />
                   <CredentialFallbackRetryBadge
@@ -813,6 +840,26 @@ function WorkflowRun() {
           </div>
         </header>
       )}
+      {WorkflowRunMilestoneCard &&
+      workflowRun &&
+      !workflowRunIsPlaceholder &&
+      workflowRun.workflow_run_id === workflowRunId &&
+      workflowRun.status === Status.Completed ? (
+        <WorkflowRunMilestoneCard
+          workflowRunId={workflowRun.workflow_run_id}
+          rerun={
+            !isEmbedded &&
+            !isTaskv2Run &&
+            !isWorkflowDeleted &&
+            workflowPermanentId
+              ? {
+                  to: `/agents/${workflowPermanentId}/run`,
+                  state: getRerunNavigationState(workflowRun),
+                }
+              : undefined
+          }
+        />
+      ) : null}
       {/* 2FA Verification Code Form - shown when workflow is waiting for a code */}
       <WorkflowRunVerificationCodeForm />
       {showOutputSection && (
@@ -885,7 +932,7 @@ function WorkflowRun() {
             <WorkflowRunStatusAlert
               status={workflowRun.status}
               title={workflow?.title}
-              visible={workflowRun && !isFinalized}
+              visible={!statusUnavailable && !isFinalized}
             />
           )}
         </div>
@@ -902,6 +949,7 @@ function WorkflowRun() {
           timelineReady={workflowRunTimeline !== undefined}
           onSetActiveItem={handleSetActiveItem}
           onSetActiveIteration={handleSetActiveIteration}
+          onViewScreenshot={handleViewScreenshot}
         />
       </div>
     </div>

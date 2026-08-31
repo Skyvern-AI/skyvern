@@ -55,6 +55,8 @@ async def get_action_history(
                     "upload_file_triggered",
                     "needs_followup",
                     "followup_message",
+                    "committed_option",
+                    "committed_value",
                 },
             ),
         }

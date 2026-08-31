@@ -20,7 +20,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, bound_call_browser_session
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_pre_action,
     _click_post_hook,
@@ -37,7 +37,6 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _scout_type_landing_failure,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import (
-    _PAGE_SUMMARY_SELECTOR_CAP,
     _build_scout_page_summary,
     _page_evidence_names_obstruction,
     _summary_disclosure_control,
@@ -239,6 +238,52 @@ async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
     await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
 
     assert "credentials" not in ctx.tool_activity[0]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_integrations_records_server_owned_binding_evidence() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "integrations": [
+                    {
+                        "connection_id": "goac_sheets",
+                        "provider": "google",
+                        "name": "Sheets account",
+                        "state": "active",
+                        "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+                    },
+                    {
+                        "connection_id": "msoac_mail",
+                        "provider": "microsoft",
+                        "name": "Mail account",
+                        "state": "active",
+                        "scopes_granted": [],
+                    },
+                ]
+            },
+        }
+    )
+
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_integrations"), output)
+
+    assert ctx.tool_activity[0]["integrations"] == [
+        {
+            "connection_id": "goac_sheets",
+            "provider": "google",
+            "state": "active",
+            "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+        },
+        {
+            "connection_id": "msoac_mail",
+            "provider": "microsoft",
+            "state": "active",
+            "scopes_granted": [],
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -537,12 +582,11 @@ class TestMCPFailedStepLoopDetection:
                 calls.append((name, args, in_context))
                 return FakeRawResult()
 
-        async def fake_ensure_browser_session(ctx: Any, *, require_verified_session: bool = False) -> None:
+        async def fake_ensure_browser_session(ctx: Any) -> None:
             ctx.browser_session_id = "pbs_copilot"
-            return None
 
         @asynccontextmanager
-        async def fake_mcp_browser_context(ctx: Any) -> Any:
+        async def fake_mcp_browser_context(ctx: Any, *, session_id_override: str | None = None) -> Any:
             nonlocal in_context
             in_context = True
             try:
@@ -724,6 +768,9 @@ class TestMCPToolOverlayCompleteness:
             "select_option",
             "press_key",
             "wait_for_either_state",
+            "skyvern_frame_list",
+            "skyvern_frame_switch",
+            "skyvern_frame_main",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
@@ -801,7 +848,18 @@ class TestNewToolOverlayConfigs:
         overlay = _build_skyvern_mcp_overlays()["console_messages"]
         assert overlay.hide_params == frozenset({"session_id", "cdp_url"})
         assert overlay.requires_browser is True
-        assert overlay.post_hook is None
+        assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
+        assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
+
+    def test_frame_control_overlays_refuse_sensitive_origin_pages(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+
+        for name in ("skyvern_frame_list", "skyvern_frame_switch", "skyvern_frame_main"):
+            overlay = overlays[name]
+            assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
+            assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
 
     def test_select_option_overlay(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
@@ -1054,7 +1112,7 @@ class TestBrowserInteractionObservationHooks:
         )
 
         assert result["data"] == {
-            "selector": "#add-to-cart",
+            "executed_selector": "#add-to-cart",
             "effective_target": "#add-to-cart",
             "url": "https://example.com/",
             "title": "Results",
@@ -1206,16 +1264,16 @@ class TestScoutedInteractionCapture:
                 "selector": "#submit",
                 "resolved_selector": "button.primary",
                 "selector_candidates": [
-                    {"selector": "form#login button[type=submit]", "source": "structural_path"},
-                    {"selector": "button[aria-label=Continue]", "source": "aria_label"},
-                    {"selector": "#submit", "source": "id"},
+                    {"selector": "form#login button[type=submit]", "source": "structural_path", "match_count": 1},
+                    {"selector": "button[aria-label=Continue]", "source": "aria_label", "match_count": 2},
+                    {"selector": "#submit", "source": "id", "match_count": 1},
                 ],
             }
         ) == [
-            {"selector": "form#login button[type=submit]", "source": "structural_path"},
-            {"selector": "button[aria-label=Continue]", "source": "aria_label"},
-            {"selector": "#submit", "source": "id"},
-            {"selector": "button.primary", "source": "resolved"},
+            {"selector": "form#login button[type=submit]", "source": "structural_path", "match_count": 1},
+            {"selector": "button[aria-label=Continue]", "source": "aria_label", "match_count": 2},
+            {"selector": "#submit", "source": "id", "match_count": 1},
+            {"selector": "button.primary", "source": "resolved", "match_count": None},
         ]
 
     def test_role_name_count_expression_counts_every_observed_match(self) -> None:
@@ -1236,9 +1294,13 @@ class TestScoutedInteractionCapture:
                     "ok": True,
                     "data": {
                         "result": [
-                            {"selector": "#email", "source": "id"},
-                            {"selector": 'input[name="email"]', "source": "name"},
-                            {"selector": "form#login input:nth-of-type(1)", "source": "structural_path"},
+                            {"selector": "#email", "source": "id", "match_count": 1},
+                            {"selector": 'input[name="email"]', "source": "name", "match_count": 2},
+                            {
+                                "selector": "form#login input:nth-of-type(1)",
+                                "source": "structural_path",
+                                "match_count": 1,
+                            },
                         ]
                     },
                 }
@@ -1249,9 +1311,9 @@ class TestScoutedInteractionCapture:
         await _capture_scout_selector_candidates(ctx, "#email")
 
         assert ctx.pending_scout_selector_candidates == [
-            {"selector": "#email", "source": "id"},
-            {"selector": 'input[name="email"]', "source": "name"},
-            {"selector": "form#login input:nth-of-type(1)", "source": "structural_path"},
+            {"selector": "#email", "source": "id", "match_count": 1},
+            {"selector": 'input[name="email"]', "source": "name", "match_count": 2},
+            {"selector": "form#login input:nth-of-type(1)", "source": "structural_path", "match_count": 1},
         ]
 
     def test_record_requires_concrete_selector(self) -> None:
@@ -1293,8 +1355,8 @@ class TestScoutedInteractionCapture:
             tool_name="click",
             selector="#submit",
             selector_candidates=[
-                {"selector": "#submit", "source": "requested"},
-                {"selector": "xpath=//button[@type='submit']", "source": "resolved"},
+                {"selector": "#submit", "source": "requested", "match_count": 1},
+                {"selector": "xpath=//button[@type='submit']", "source": "resolved", "match_count": None},
             ],
             selector_match_count=1,
             role="button",
@@ -1308,9 +1370,10 @@ class TestScoutedInteractionCapture:
             {
                 "tool_name": "click",
                 "selector": "#submit",
+                "executed_selector": "#submit",
                 "selector_candidates": [
-                    {"selector": "#submit", "source": "requested"},
-                    {"selector": "xpath=//button[@type='submit']", "source": "resolved"},
+                    {"selector": "#submit", "source": "requested", "match_count": 1},
+                    {"selector": "xpath=//button[@type='submit']", "source": "resolved", "match_count": None},
                 ],
                 "selector_match_count": 1,
                 "role": "button",
@@ -1352,8 +1415,8 @@ class TestScoutedInteractionCapture:
             ctx,
             tool_name="wait_for_either_state",
             selector_candidates=[
-                {"selector": "#token", "source": "selector_a"},
-                {"selector": "#dashboard", "source": "selector_b"},
+                {"selector": "#token", "source": "selector_a", "match_count": None},
+                {"selector": "#dashboard", "source": "selector_b", "match_count": None},
             ],
             source_url="https://example.com/two-factor",
             result_url="https://example.com/two-factor",
@@ -1364,8 +1427,8 @@ class TestScoutedInteractionCapture:
             {
                 "tool_name": "wait_for_either_state",
                 "selector_candidates": [
-                    {"selector": "#token", "source": "selector_a"},
-                    {"selector": "#dashboard", "source": "selector_b"},
+                    {"selector": "#token", "source": "selector_a", "match_count": None},
+                    {"selector": "#dashboard", "source": "selector_b", "match_count": None},
                 ],
                 "source_url": "https://example.com/two-factor",
                 "result_url": "https://example.com/two-factor",
@@ -1459,6 +1522,95 @@ class TestScoutedInteractionCapture:
         assert "next_step" not in result
 
     @pytest.mark.asyncio
+    async def test_sensitive_origin_page_refuses_screenshot_before_dispatch(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.codeblock_redaction_parameters = {}
+
+        assert await mcp_hooks._screenshot_pre_hook({}, ctx) is None
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._screenshot_pre_hook({}, ctx)
+
+        assert result is not None
+        assert result["ok"] is False
+        assert "specific named URL" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_page_refuses_evaluate_without_stashing_expression(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.pending_scout_read_expression = "stale"
+        ctx.pending_scout_read_output_path = "output.stale"
+
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._evaluate_pre_hook(
+                {"expression": "document.body.innerText", "output_path": "output.private"},
+                ctx,
+            )
+
+        assert result is not None
+        assert result["ok"] is False
+        assert ctx.pending_scout_read_expression is None
+        assert ctx.pending_scout_read_output_path is None
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_page_suppresses_an_in_flight_evaluate_result(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.pending_scout_read_expression = "document.body.innerText"
+        ctx.pending_scout_read_output_path = "output.private"
+        ctx.scout_observation_contract = {"kind": "stale"}
+
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._evaluate_post_hook(
+                {
+                    "ok": True,
+                    "data": {
+                        "result": "private page contents",
+                        "url": "https://private.example.test/account",
+                    },
+                },
+                {},
+                ctx,
+            )
+
+        assert result["ok"] is False
+        assert "data" not in result
+        assert ctx.pending_scout_read_expression is None
+        assert ctx.pending_scout_read_output_path is None
+        assert ctx.scout_observation_contract is None
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_successful_navigation_clears_taint_and_permits_inspection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+        ctx = self._ctx(source_url="https://private.example.test/account")
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-run"}
+        ctx.codeblock_redaction_parameters = {}
+
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._navigate_post_hook(
+                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
+                {},
+                ctx,
+            )
+
+        assert result["ok"] is True
+        assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug"}
+        assert "source_url" not in ctx.scout_trajectory[0]
+        capture.assert_awaited_once()
+        assert await mcp_hooks._screenshot_pre_hook({}, ctx) is not None
+        with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._evaluate_pre_hook({"expression": "document.title"}, ctx) is None
+
+    @pytest.mark.asyncio
     async def _click_with_attached_evidence(
         self, monkeypatch: pytest.MonkeyPatch, evidence: dict[str, Any]
     ) -> AsyncMock:
@@ -1539,7 +1691,7 @@ class TestScoutedInteractionCapture:
             {
                 "tool_name": "fill_credential_field",
                 "selector": "#password",
-                "selector_candidates": [{"selector": "#password", "source": "requested"}],
+                "selector_candidates": [{"selector": "#password", "source": "requested", "match_count": 1}],
                 "selector_match_count": 1,
                 "role": "textbox",
                 "accessible_name": "Password",
@@ -1587,11 +1739,10 @@ class TestScoutedInteractionCapture:
         assert _demonstrated_step_facts(ctx) == [
             {
                 "tool_name": "click",
-                "selector": "#submit",
+                "executed_selector": "#submit",
                 "source_url": "https://example.com/",
                 "result_url": "https://example.com/",
                 "selector_candidates": None,
-                "selector_match_count": None,
                 "role": None,
                 "accessible_name": None,
                 "role_name_match_count": None,
@@ -1611,9 +1762,8 @@ class TestScoutedInteractionCapture:
         ctx.scout_trajectory = [
             {
                 "tool_name": "click",
-                "selector": "#submit",
+                "executed_selector": "#submit",
                 "selector_candidates": None,
-                "selector_match_count": 1,
                 "role": None,
                 "accessible_name": None,
                 "role_name_match_count": None,
@@ -1631,9 +1781,8 @@ class TestScoutedInteractionCapture:
         assert result["data"]["demonstrated_steps"] == [
             {
                 "tool_name": "click",
-                "selector": "#submit",
+                "executed_selector": "#submit",
                 "selector_candidates": None,
-                "selector_match_count": 1,
                 "role": None,
                 "accessible_name": None,
                 "role_name_match_count": None,
@@ -1663,8 +1812,8 @@ class TestScoutedInteractionCapture:
         _record_scouted_interaction(ctx, tool_name="click", selector="#x", source_url="https://e.com/a")
         _record_scouted_interaction(ctx, tool_name="click", selector="#y", source_url="https://e.com/a")
         assert ctx.scouted_interactions == [
-            {"tool_name": "click", "selector": "#x", "source_url": "https://e.com/a"},
-            {"tool_name": "click", "selector": "#y", "source_url": "https://e.com/a"},
+            {"tool_name": "click", "selector": "#x", "executed_selector": "#x", "source_url": "https://e.com/a"},
+            {"tool_name": "click", "selector": "#y", "executed_selector": "#y", "source_url": "https://e.com/a"},
         ]
 
     def test_record_drops_zero_typed_length(self) -> None:
@@ -1672,7 +1821,7 @@ class TestScoutedInteractionCapture:
 
         ctx = self._ctx()
         _record_scouted_interaction(ctx, tool_name="type_text", selector="#q", typed_length=0)
-        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q"}]
+        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q", "executed_selector": "#q"}]
 
     def test_record_omits_empty_extras_and_caps_history(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _MAX_SCOUTED_INTERACTIONS, _record_scouted_interaction
@@ -1928,8 +2077,8 @@ class TestScoutedInteractionCapture:
 
         recorded = ctx.scout_trajectory[-1]
         assert recorded["selector_candidates"] == [
-            {"selector": "#q", "source": "id"},
-            {"selector": 'input[name="q"]', "source": "name"},
+            {"selector": "#q", "source": "id", "match_count": None},
+            {"selector": 'input[name="q"]', "source": "name", "match_count": None},
         ]
         assert recorded["selector_match_count"] == 2
         assert recorded["role"] == "textbox"
@@ -2147,7 +2296,7 @@ class TestScoutedInteractionCapture:
         )
 
         assert result["ok"] is True
-        assert result["data"]["selector"] == "xpath=//button[2]"
+        assert result["data"]["executed_selector"] == "xpath=//button[2]"
         assert result["data"]["effective_target"] == "xpath=//button[2]"
         recorded = ctx.scouted_interactions[0]
         assert (recorded["tool_name"], recorded["selector"], recorded["source_url"]) == (
@@ -2191,15 +2340,15 @@ class TestScoutedInteractionCapture:
 
         recorded = ctx.scout_trajectory[-1]
         assert recorded["selector_candidates"] == [
-            {"selector": "#submit", "source": "requested"},
-            {"selector": "xpath=//button[@type='submit']", "source": "resolved"},
+            {"selector": "#submit", "source": "requested", "match_count": None},
+            {"selector": "xpath=//button[@type='submit']", "source": "resolved", "match_count": None},
         ]
         assert recorded["selector_match_count"] == 1
         assert recorded["role_name_match_count"] == 1
         assert recorded["source_url"] == "https://example.com/form"
         assert recorded["result_url"] == "https://example.com/thanks"
         assert recorded["observed_effects"] == {"url_changed": True}
-        assert result["data"]["selector"] == "#submit"
+        assert result["data"]["executed_selector"] == "#submit"
 
     @pytest.mark.asyncio
     async def test_click_post_hook_prefers_accessible_label_for_effective_target(
@@ -2219,7 +2368,7 @@ class TestScoutedInteractionCapture:
             ctx,
         )
 
-        assert result["data"]["selector"] == "xpath=//button[2]"
+        assert result["data"]["executed_selector"] == "xpath=//button[2]"
         assert result["data"]["effective_target"] == "button Accept"
 
     @pytest.mark.asyncio
@@ -2277,11 +2426,11 @@ class TestScoutedInteractionCapture:
         )
 
         assert type_result["ok"] is True
-        assert type_result["data"]["selector"] == ""
+        assert type_result["data"]["executed_selector"] == ""
         assert select_result["ok"] is True
-        assert select_result["data"]["selector"] == ""
+        assert select_result["data"]["executed_selector"] == ""
         assert press_result["ok"] is True
-        assert press_result["data"]["selector"] == ""
+        assert press_result["data"]["executed_selector"] == ""
         assert ctx.scouted_interactions[0]["tool_name"] == "press_key"
         assert ctx.scouted_interactions[0]["key"] == "Enter"
 
@@ -2448,20 +2597,29 @@ class TestScoutedInteractionCapture:
         assert self._census(ctx) == {"skyvern_evaluate": 2}
         assert ctx.last_scout_act_observe_recapture_attempted is True
 
-    def test_page_summary_drops_an_oversized_selector_instead_of_truncating_it(self) -> None:
+    def test_page_summary_never_reconstructs_a_singular_selector(self) -> None:
         long_selector = "div.wrapper > " + " > ".join(f"section.level-{n}" for n in range(12))
-        assert len(long_selector) > _PAGE_SUMMARY_SELECTOR_CAP
 
         entry = _summary_entry("Close", {"selector": long_selector})
 
         assert entry == {"text": "Close"}
-        assert _summary_entry("Close", {"selector": "#close"}) == {"text": "Close", "selector": "#close"}
+        assert _summary_entry(
+            "Close",
+            {"selector_candidates": [{"selector": "#close", "source": "id", "match_count": 1}]},
+        ) == {
+            "text": "Close",
+            "selector_candidates": [{"selector": "#close", "source": "id"}],
+        }
 
-        # the disclosure summary carries selectors too and holds the same invariant
+        # The disclosure summary obeys the same no-singular-recommendation invariant.
         oversized = {"expanded": True, "text": "Show options", "selector": long_selector}
         assert "selector" not in _summary_disclosure_control(oversized)
-        sized = {"expanded": True, "text": "Show options", "selector": "#opts"}
-        assert _summary_disclosure_control(sized)["selector"] == "#opts"
+        sized = {
+            "expanded": True,
+            "text": "Show options",
+            "selector_candidates": [{"selector": "#opts", "source": "id", "match_count": 1}],
+        }
+        assert _summary_disclosure_control(sized)["selector_candidates"] == [{"selector": "#opts", "source": "id"}]
 
     @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
     @pytest.mark.asyncio
@@ -2469,7 +2627,7 @@ class TestScoutedInteractionCapture:
         self, hook_name: str, extra_params: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
-        candidates = [{"selector": "#order-docs", "source": "id"}]
+        candidates = [{"selector": "#order-docs", "source": "id", "match_count": None}]
         ctx = self._ctx_with_scripted_reads(
             selector_count=2, role_name=("button", "Order"), match_count=1, candidates=candidates
         )
@@ -2502,9 +2660,9 @@ class TestScoutedInteractionCapture:
     @pytest.mark.asyncio
     async def test_pre_action_packet_keeps_every_candidate_and_the_ambiguity_flag(self) -> None:
         candidates = [
-            {"selector": "button[data-action='order']", "source": "requested"},
-            {"selector": "#order-docs", "source": "id"},
-            {"selector": "button.order", "source": "class_list"},
+            {"selector": "button[data-action='order']", "source": "requested", "match_count": None},
+            {"selector": "#order-docs", "source": "id", "match_count": None},
+            {"selector": "button.order", "source": "class_list", "match_count": None},
         ]
         ctx = self._ctx_with_scripted_reads(
             selector_count=3, role_name=("button", "Order documents"), match_count=3, candidates=candidates
@@ -2529,31 +2687,60 @@ class TestScoutedInteractionCapture:
 class TestScoutPageSummary:
     @staticmethod
     def _evidence(field_count: int) -> dict[str, Any]:
+        def element(selector: str, **facts: Any) -> dict[str, Any]:
+            return {
+                **facts,
+                "selector_candidates": [{"selector": selector, "source": "test_fixture", "match_count": 1}],
+            }
+
         return {
             "page_title": "Checkout",
             "forms": [
                 {
                     "fields": [
-                        {"label": f"Field {index} with a fairly long visible label", "selector": f"#field-{index}"}
+                        element(f"#field-{index}", label=f"Field {index} with a fairly long visible label")
                         for index in range(field_count)
                     ],
-                    "submit_controls": [{"text": "Place order", "selector": "#place-order"}],
+                    "submit_controls": [element("#place-order", text="Place order")],
                 }
             ],
             "navigation_targets": [
-                {"text": f"Section {index} of the site navigation", "selector": f"a.nav-{index}"} for index in range(8)
+                element(f"a.nav-{index}", text=f"Section {index} of the site navigation") for index in range(8)
             ],
-            "modal_overlays": [{"dismiss_controls": [{"text": "No thanks", "selector": "#promo-close"}]}],
+            "modal_overlays": [{"dismiss_controls": [element("#promo-close", text="No thanks")]}],
+            "page_obstructions": [
+                {
+                    "kind": "interaction_blocking_layer",
+                    **element("#checkpoint"),
+                    "intercepts_outside_control": True,
+                    "visible_controls": [element("#continue", text="Continue")],
+                    "visible_controls_omitted": 2,
+                }
+            ],
             "challenge_state": {"detected": False},
         }
 
-    def test_summary_carries_the_selector_for_each_control(self) -> None:
+    def test_summary_carries_unranked_candidates_for_each_control(self) -> None:
         summary = _build_scout_page_summary(self._evidence(2))
 
-        assert summary["forms"][0]["fields"][0]["selector"] == "#field-0"
-        assert summary["forms"][0]["submit_controls"][0] == {"text": "Place order", "selector": "#place-order"}
-        assert summary["navigation_targets"][0]["selector"] == "a.nav-0"
-        assert summary["modal_dismiss_controls"][0]["selector"] == "#promo-close"
+        assert summary["forms"][0]["fields"][0]["selector_candidates"][0]["selector"] == "#field-0"
+        assert summary["forms"][0]["submit_controls"][0]["selector_candidates"][0]["selector"] == "#place-order"
+        assert summary["navigation_targets"][0]["selector_candidates"][0]["selector"] == "a.nav-0"
+        assert summary["modal_dismiss_controls"][0]["selector_candidates"][0]["selector"] == "#promo-close"
+        assert summary["interaction_blocking_layers"] == [
+            {
+                "selector_candidates": [{"selector": "#checkpoint", "source": "test_fixture"}],
+                "intercepts_outside_control": True,
+                "visible_controls": [
+                    {
+                        "text": "Continue",
+                        "selector_candidates": [{"selector": "#continue", "source": "test_fixture"}],
+                    }
+                ],
+                "visible_controls_omitted": 2,
+            }
+        ]
+        assert "match_count" not in summary["forms"][0]["fields"][0]["selector_candidates"][0]
 
     def test_summary_names_every_section_it_sheds(self) -> None:
         result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * (scouting_module._SCOUT_RESULT_CHAR_CAP - 800)}}
@@ -2566,13 +2753,20 @@ class TestScoutPageSummary:
 
     def test_selectors_are_shed_before_any_control_the_baseline_carried(self) -> None:
         evidence = self._evidence(8)
-        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * 900}}
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * 600}}
         scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, evidence)
 
         page = result["data"]["page"]
         assert page["shed"] == ["control_selectors"]
         assert page["navigation_targets"] == [target["text"] for target in evidence["navigation_targets"]]
         assert page["forms"][0]["fields"] == [field["label"] for field in evidence["forms"][0]["fields"]]
+        assert page["interaction_blocking_layers"] == [
+            {
+                "intercepts_outside_control": True,
+                "visible_controls": ["Continue"],
+                "visible_controls_omitted": 2,
+            }
+        ]
 
     def test_a_summary_too_large_to_shed_still_leaves_its_shed_record(self) -> None:
         result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * scouting_module._SCOUT_RESULT_CHAR_CAP}}
@@ -2591,17 +2785,34 @@ class TestScoutPageSummary:
                 "forms": [
                     {
                         "fields": [
-                            {"label": "Password", "type": "password", "value": secret, "selector": "#pw"},
-                            {"label": "Username", "value": "operator", "selector": "#user"},
+                            {
+                                "label": "Password",
+                                "type": "password",
+                                "value": secret,
+                                "selector_candidates": [{"selector": "#pw", "source": "id", "match_count": 1}],
+                            },
+                            {
+                                "label": "Username",
+                                "value": "operator",
+                                "selector_candidates": [{"selector": "#user", "source": "id", "match_count": 1}],
+                            },
                         ],
-                        "submit_controls": [{"text": "Sign in", "selector": "#signin"}],
+                        "submit_controls": [
+                            {
+                                "text": "Sign in",
+                                "selector_candidates": [{"selector": "#signin", "source": "id", "match_count": 1}],
+                            }
+                        ],
                     }
                 ],
             }
         )
 
         assert secret not in json.dumps(summary)
-        assert summary["forms"][0]["fields"][0] == {"text": "Password", "selector": "#pw"}
+        assert summary["forms"][0]["fields"][0] == {
+            "text": "Password",
+            "selector_candidates": [{"selector": "#pw", "source": "id"}],
+        }
 
     def test_obstruction_predicate_ignores_visual_candidates(self) -> None:
         assert not _page_evidence_names_obstruction(
@@ -2613,6 +2824,17 @@ class TestScoutPageSummary:
             }
         )
         assert not _page_evidence_names_obstruction({"modal_overlays": [{"selector": "#promo"}]})
+        assert not _page_evidence_names_obstruction(
+            {
+                "page_obstructions": [
+                    {
+                        "kind": "interaction_blocking_layer",
+                        "intercepts_outside_control": True,
+                        "visible_controls": [{"text": "Continue", "selector": "#continue"}],
+                    }
+                ]
+            }
+        )
         assert _page_evidence_names_obstruction(
             {"modal_overlays": [{"selector": "#promo", "dismiss_controls": [{"text": "Close", "selector": ".x"}]}]}
         )

@@ -44,15 +44,45 @@ class DefaultCursorStrategy(CursorEventStrategy):
 class DefaultInputStrategy(InputEventStrategy):
     """Input strategy that uses plain Playwright typing."""
 
-    async def type_text(self, page: Page, locator: Locator | None, text: str) -> None:
+    async def type_text(
+        self,
+        page: Page,
+        locator: Locator | None,
+        text: str,
+        *,
+        timeout: float | None = settings.BROWSER_ACTION_TIMEOUT_MS,
+        delay: float | None = None,
+        no_wait_after: bool | None = None,
+        allow_batched_playwright: bool = False,
+    ) -> None:
         if locator is not None:
+            type_options = {"timeout": timeout, "delay": TEXT_INPUT_DELAY if delay is None else delay}
+            if no_wait_after is not None:
+                type_options["no_wait_after"] = no_wait_after
+            if allow_batched_playwright:
+                await locator.type(text, **type_options)
+                return
             for char in text:
-                await locator.type(char, delay=TEXT_INPUT_DELAY, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                await locator.type(char, **type_options)
         else:
             await page.keyboard.type(text)
 
-    async def clear_field(self, page: Page, locator: Locator, char_count: int) -> None:
-        await locator.clear(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    async def clear_field(
+        self,
+        page: Page,
+        locator: Locator,
+        char_count: int,
+        *,
+        timeout: float | None = settings.BROWSER_ACTION_TIMEOUT_MS,
+        force: bool | None = None,
+        no_wait_after: bool | None = None,
+    ) -> None:
+        clear_options: dict[str, float | bool | None] = {"timeout": timeout}
+        if force is not None:
+            clear_options["force"] = force
+        if no_wait_after is not None:
+            clear_options["no_wait_after"] = no_wait_after
+        await locator.clear(**clear_options)
 
 
 class DefaultScrollStrategy(ScrollEventStrategy):

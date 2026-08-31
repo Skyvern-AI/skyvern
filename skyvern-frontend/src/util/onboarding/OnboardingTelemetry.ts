@@ -1,14 +1,69 @@
-import posthog from "posthog-js";
+import posthog, { type Properties } from "posthog-js";
+import type {
+  QuestionnaireAnswersV1,
+  QuestionnaireStatusV1,
+  QuestionnaireUserIntentV1,
+} from "@/store/onboarding/types";
 
-type Surface = "dashboard" | "editor" | "runs" | "settings" | "api_docs";
+type Surface =
+  | "dashboard"
+  | "discover"
+  | "editor"
+  | "runs"
+  | "settings"
+  | "api_docs";
 
 type TourLayer = 1 | 2;
 
-function capture(event: string, properties: Record<string, unknown>): void {
+type QuestionnaireShownInput = {
+  primaryIntent: QuestionnaireUserIntentV1 | null;
+  promptReason: "initial";
+};
+
+type QuestionnaireResponseInput = {
+  responseId: string;
+  revision: number;
+};
+
+type QuestionnaireAnswerInput = QuestionnaireResponseInput & {
+  primaryIntent: QuestionnaireUserIntentV1;
+  answers: QuestionnaireAnswersV1;
+};
+
+type QuestionnaireSkippedInput = QuestionnaireResponseInput & {
+  disposition: "skip";
+  statusAfter: "skipped";
+};
+
+type QuestionnaireUpdatedInput = QuestionnaireAnswerInput & {
+  previousStatus: QuestionnaireStatusV1;
+};
+
+const ONBOARDING_STEP_VERSION = "v1";
+
+function capture(event: string, properties: Properties): boolean {
+  let organizationId: string | undefined;
   try {
-    posthog.capture(event, properties);
+    const groupId = posthog.getGroups().organization;
+    if (typeof groupId === "string" && groupId.length > 0) {
+      organizationId = groupId;
+    }
+  } catch {
+    organizationId = undefined;
+  }
+
+  try {
+    const stepName =
+      typeof properties.step === "string" ? properties.step : event;
+    const captureResult = posthog.capture(event, {
+      ...properties,
+      organization_id: organizationId,
+      step_id: `${stepName}:${ONBOARDING_STEP_VERSION}`,
+    });
+    return captureResult !== undefined;
   } catch {
     // PostHog may be unavailable in tests or before init.
+    return false;
   }
 }
 
@@ -97,6 +152,60 @@ function modalSkipped(surface: Surface): void {
   capture("onboarding.modal_skipped", { surface });
 }
 
+function questionnaireResponseProperties(input: QuestionnaireResponseInput) {
+  return {
+    questionnaire_version: 1,
+    "$feature/onboarding_questionnaire_v1": true,
+    surface: "get_started_modal",
+    response_id: input.responseId,
+    revision: input.revision,
+  };
+}
+
+function questionnaireAnswerProperties(answers: QuestionnaireAnswersV1) {
+  return {
+    role: answers.role,
+    company_context: answers.company_context,
+    scale_intent: answers.scale_intent,
+    referral_source: answers.referral_source,
+  };
+}
+
+function questionnaireShown(input: QuestionnaireShownInput): boolean {
+  return capture("onboarding_questionnaire_shown", {
+    questionnaire_version: 1,
+    "$feature/onboarding_questionnaire_v1": true,
+    surface: "get_started_modal",
+    primary_intent: input.primaryIntent,
+    prompt_reason: input.promptReason,
+  });
+}
+
+function questionnaireCompleted(input: QuestionnaireAnswerInput): void {
+  capture("onboarding_questionnaire_completed", {
+    ...questionnaireResponseProperties(input),
+    primary_intent: input.primaryIntent,
+    ...questionnaireAnswerProperties(input.answers),
+  });
+}
+
+function questionnaireSkipped(input: QuestionnaireSkippedInput): void {
+  capture("onboarding_questionnaire_skipped", {
+    ...questionnaireResponseProperties(input),
+    disposition: input.disposition,
+    status_after: input.statusAfter,
+  });
+}
+
+function questionnaireUpdated(input: QuestionnaireUpdatedInput): void {
+  capture("onboarding_questionnaire_updated", {
+    ...questionnaireResponseProperties(input),
+    primary_intent: input.primaryIntent,
+    previous_status: input.previousStatus,
+    ...questionnaireAnswerProperties(input.answers),
+  });
+}
+
 // -- Activation milestones --
 
 function firstWorkflowCreated(surface: Surface): void {
@@ -178,6 +287,10 @@ export const OnboardingTelemetry = {
   modalTemplateSelected,
   modalCopilotClicked,
   modalSkipped,
+  questionnaireShown,
+  questionnaireCompleted,
+  questionnaireSkipped,
+  questionnaireUpdated,
   emptyStateViewed,
   emptyStateCTAClicked,
   firstWorkflowCreated,

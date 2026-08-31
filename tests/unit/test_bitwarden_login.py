@@ -195,6 +195,7 @@ def test_retry_backoff_is_full_jitter_with_doubling_cap(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bitwarden_module, "_cli_sessions", bitwarden_module._CliSessionCache())
     budgets: dict[str, int] = {}
 
     async def fake_run_command(command: list[str], additional_env=None, timeout: int = 60) -> RunCommandResult:
@@ -224,12 +225,13 @@ async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.Mo
         timeout=37,
     )
 
+    # Establishing the session and reading the item all run on the attempt's budget. No `bw logout`:
+    # the session is kept for the next run rather than torn down (SKY-14751).
     assert budgets == {
         "bw login": 37,
-        "bw sync": 37,
         "bw unlock": 37,
+        "bw sync": 37,
         "bw get": 37,
-        "bw logout": bitwarden_module.settings.BITWARDEN_TIMEOUT_SECONDS,
     }
 
 
@@ -251,7 +253,7 @@ async def test_secret_fetch_retries_after_a_jittered_backoff_with_a_constant_ste
 ) -> None:
     monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MAX_JITTER_SECONDS", 0)
     attempt_budgets: list[int] = []
-    outcomes: list = [asyncio.TimeoutError(), {"username": "u", "password": "p", "totp": ""}]
+    outcomes: list = [TimeoutError(), {"username": "u", "password": "p", "totp": ""}]
 
     async def fake_inner(**kwargs) -> dict[str, str]:
         attempt_budgets.append(kwargs["timeout"])
@@ -281,7 +283,7 @@ async def test_secret_fetch_gives_up_after_max_retries_with_every_reason(monkeyp
     monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MAX_JITTER_SECONDS", 0)
 
     async def always_times_out(**kwargs) -> dict[str, str]:
-        raise asyncio.TimeoutError()
+        raise TimeoutError()
 
     slept: list[float] = []
 
@@ -320,7 +322,7 @@ async def test_secret_fetch_does_not_retry_access_denied(monkeypatch: pytest.Mon
 @pytest.mark.asyncio
 async def test_identity_fetch_backs_off_before_its_recursive_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MAX_JITTER_SECONDS", 0)
-    outcomes: list = [asyncio.TimeoutError(), {"first_name": "A"}]
+    outcomes: list = [TimeoutError(), {"first_name": "A"}]
 
     async def fake_inner(**kwargs) -> dict[str, str]:
         outcome = outcomes.pop(0)

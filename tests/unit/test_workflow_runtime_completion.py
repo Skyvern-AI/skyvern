@@ -97,6 +97,14 @@ _DERIVED_CONTRACT = {
 }
 
 
+def _downloaded_file(name: str, *, artifact_id: str | None = None):
+    """What ``get_downloaded_files`` actually returns: a FileInfo, never a bare filename.
+
+    A bare string makes the grader raise on ``.artifact_id``, and the raise is swallowed into an
+    ungraded ``completed`` — a green that proves nothing about delivery."""
+    return SimpleNamespace(artifact_id=artifact_id, filename=name, checksum=None, file_size=None)
+
+
 def _wire_finalize(monkeypatch, *, contract, downloaded):
     """A WorkflowService with just enough wired to exercise the finalize status decision."""
     from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -126,7 +134,14 @@ def _wire_finalize(monkeypatch, *, contract, downloaded):
     monkeypatch.setattr(
         service_module.app,
         "STORAGE",
-        SimpleNamespace(get_downloaded_files=AsyncMock(return_value=list(downloaded))),
+        SimpleNamespace(
+            get_downloaded_files=AsyncMock(
+                return_value=[
+                    entry if hasattr(entry, "artifact_id") else _downloaded_file(entry, artifact_id=f"a_{index}")
+                    for index, entry in enumerate(downloaded)
+                ]
+            )
+        ),
     )
     return service, run, statuses
 
@@ -195,6 +210,31 @@ async def test_finalize_completes_a_run_that_produced_its_declared_file(monkeypa
     )
 
     assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_delivered_fewer_files_than_declared_is_terminated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves the grader actually ran rather than raising its way to `completed`.
+
+    The neighbouring completes-on-delivery case cannot tell those apart: a grader that raises is
+    swallowed and leaves the run completed, which is the same status a satisfied contract writes.
+    A shortfall is only reachable when grading really executed."""
+    contract = {
+        "schema_version": 1,
+        "criteria": [{"id": "declared_download", "kind": "registered_download", "min_count": 2}],
+    }
+    service, run, statuses = _wire_finalize(monkeypatch, contract=contract, downloaded=["invoice.pdf"])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+    )
+
+    assert statuses == [WorkflowRunStatus.terminated]
 
 
 @pytest.mark.asyncio

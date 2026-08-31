@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, stamp_page_evidence_provenance
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    effective_browser_session_id,
+)
 
 from ._shared import (
     _DISCOVERY_ANTI_BOT_PATTERNS,
@@ -300,7 +303,7 @@ def _disabled_submit_controls(observed_data: object) -> list[dict[str, Any]]:
 
 
 def _evaluate_anti_bot_indicators(observed_data: dict[str, Any], text: str) -> list[str]:
-    key_text = " ".join(str(key) for key in observed_data.keys()).lower()
+    key_text = " ".join(str(key) for key in observed_data).lower()
     nested_text = _nested_observation_text(observed_data).lower()
     combined = f"{text} {key_text} {nested_text}"[:5000]
     return [pattern for pattern in _DISCOVERY_ANTI_BOT_PATTERNS if pattern in combined]
@@ -380,7 +383,7 @@ def _record_composition_page_observation(
     run_id = ctx.last_run_blocks_workflow_run_id
     evidence = stamp_page_evidence_provenance(
         evidence,
-        source_browser_session_id=ctx.browser_session_id,
+        source_browser_session_id=effective_browser_session_id(ctx),
         run_id=run_id,
         run_browser_session_id=ctx.last_run_blocks_browser_session_id,
     )
@@ -389,7 +392,7 @@ def _record_composition_page_observation(
         source_tool=source_tool,
         url=url,
         page_evidence=evidence if has_bounded_page_schema(evidence) else None,
-        source_browser_session_id=ctx.browser_session_id,
+        source_browser_session_id=effective_browser_session_id(ctx),
     )
 
     observation_step: int | None = None

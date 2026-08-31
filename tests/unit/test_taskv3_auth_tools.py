@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import BlockedHost, InvalidUrl, NoTOTPVerificationCodeFound, UnresolvableHost
+from skyvern.exceptions import (
+    BlockedHost,
+    FailedToGetTOTPVerificationCode,
+    InvalidUrl,
+    NoTOTPVerificationCodeFound,
+    UnresolvableHost,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
@@ -109,11 +115,13 @@ async def test_build_auth_tools_offered_iff_resolve_otp_value_has_a_source(
     task = _task(**overrides)
     has_credential = case == "credential"
     credential_value = OTPValue(value="424242", type=OTPType.TOTP)
-    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda run_id: has_credential and bool(run_id))
+    monkeypatch.setattr(
+        otp_service, "has_credential_totp_candidate", lambda run_id, *a, **k: has_credential and bool(run_id)
+    )
     monkeypatch.setattr(
         otp_service,
         "try_generate_totp_from_credential",
-        lambda run_id: credential_value if has_credential and run_id else None,
+        lambda run_id, *a, **k: credential_value if has_credential and run_id else None,
     )
     poll = AsyncMock(return_value=OTPValue(value="111111", type=OTPType.TOTP))
     monkeypatch.setattr(otp_service, "poll_otp_value", poll)
@@ -175,6 +183,282 @@ async def test_get_verification_code_polling_budget_bounds_a_never_answering_sou
 
 
 @pytest.mark.asyncio
+async def test_verification_state_blocks_completion_only_when_the_budget_ran_dry_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A budget exhaustion that delivered nothing must block a completed verdict; a code delivered
+    # first (even from an otherwise-exhausted source) must not.
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=1 / 60))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.0)
+
+    async def _never_answers(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
+        await asyncio.sleep(max_wait_seconds)
+        raise NoTOTPVerificationCodeFound(task_id="tsk_1")
+
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", _never_answers)
+    state = auth_tools.VerificationState()
+    tools, _ = auth_tools.build_auth_tools(_task(totp_verification_url="https://totp.example"), state=state)
+    handler = tools[0].handler
+
+    result = None
+    for _ in range(30):
+        result = await handler({})
+        if "budget exhausted" in result.content:
+            break
+    assert result is not None and "budget exhausted" in result.content
+    assert await state.block_completion() == auth_tools._COMPLETION_BLOCKED
+
+    delivered_state = auth_tools.VerificationState()
+    monkeypatch.setattr(
+        auth_tools, "resolve_otp_value", AsyncMock(return_value=OTPValue(value="123456", type=OTPType.TOTP))
+    )
+    delivered_tools, _ = auth_tools.build_auth_tools(_task(totp_identifier="user@example.com"), state=delivered_state)
+    ctx = SkyvernContext(task_id="tsk_1")
+    skyvern_context.set(ctx)
+    try:
+        delivered_result = await delivered_tools[0].handler({})
+    finally:
+        skyvern_context.reset()
+    assert delivered_result.status == "ok"
+    delivered_state.source_failed = True
+    assert await delivered_state.block_completion() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "lookup_error_streak",
+        "no_code_streak",
+        "no_link_streak",
+        "page_unavailable",
+        "link_rejected",
+        "link_refused",
+        "link_unvalidatable",
+        "link_unreachable",
+        "link_unreachable_while_origin_page_keeps_fetching",
+        "webhook_failing_streak",
+    ],
+)
+async def test_verification_state_blocks_completion_after_a_refused_or_errored_source(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    # Every terminal non-delivery answer must arm the finish gate, not only budget exhaustion: a source
+    # that keeps erroring or returning nothing, or hands over a link the browser could not be sent to,
+    # has delivered nothing, so a completed verdict after it is the same false completion.
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    state = auth_tools.VerificationState()
+    task = _task(totp_verification_url="https://totp.example")
+    if case == "lookup_error_streak":
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(side_effect=RuntimeError("boom")))
+        tools, _ = auth_tools.build_auth_tools(task, state=state)
+    elif case == "no_code_streak":
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=None))
+        tools, _ = auth_tools.build_auth_tools(task, state=state)
+    elif case == "webhook_failing_streak":
+        failing = FailedToGetTOTPVerificationCode(task_id="tsk_1", reason="HTTP 500")
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(side_effect=failing))
+        tools, _ = auth_tools.build_auth_tools(task, state=state)
+    else:
+        link = OTPValue(value="https://example.test/magic?token=abc", type=OTPType.MAGIC_LINK)
+        monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=link))
+        monkeypatch.setattr(auth_tools, "validate_fetch_url", lambda url: url)
+        monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+        if case == "no_link_streak":
+            monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=None))
+            provider = _provider(_FakePage())
+        elif case == "page_unavailable":
+            provider = AsyncMock(side_effect=RuntimeError("no page"))
+        elif case == "link_rejected":
+            provider = _provider(_FakePage(status=410))
+        elif case == "link_unreachable":
+            provider = _provider(_FakePage(goto_error=RuntimeError("net::ERR_CONNECTION_REFUSED")))
+        elif case == "link_unreachable_while_origin_page_keeps_fetching":
+            # The origin document's own beacons answer during a hanging navigation; they are not a
+            # response from the link.
+            page = _FakePage(goto_error=TimeoutError("navigation"))
+            page.subresource_on_goto_error = True
+            provider = _provider(page)
+        else:
+            provider = _provider(_FakePage())
+            validator_error: Exception = (
+                BlockedHost("example.test") if case == "link_refused" else RuntimeError("validator down")
+            )
+
+            def _reject(url: str) -> str:
+                raise validator_error
+
+            monkeypatch.setattr(auth_tools, "validate_fetch_url", _reject)
+        tools, _ = auth_tools.build_auth_tools(task, provider, state=state)
+    handlers = {t.name: t.handler for t in tools}
+    code_tool = case in {"lookup_error_streak", "no_code_streak", "webhook_failing_streak"}
+    handler = handlers["get_verification_code" if code_tool else "open_verification_link"]
+    expected = {
+        "lookup_error_streak": "lookup failed: RuntimeError repeatedly",
+        "no_code_streak": auth_tools._NO_CODE_AVAILABLE,
+        "no_link_streak": auth_tools._NO_LINK_AVAILABLE,
+        "page_unavailable": auth_tools._PAGE_UNAVAILABLE,
+        "link_rejected": "rejected the sign-in link (HTTP 410)",
+        "link_refused": auth_tools._LINK_REFUSED,
+        "link_unvalidatable": "nothing was signed in",
+        "link_unreachable": "nothing was signed in",
+        "link_unreachable_while_origin_page_keeps_fetching": "nothing was signed in",
+        "webhook_failing_streak": "kept failing (FailedToGetTOTPVerificationCode: HTTP 500)",
+    }[case]
+
+    assert await state.block_completion() is None
+    result = await handler({})
+    assert result.status == "error"
+    if case.endswith("_streak"):
+        # A single empty answer is a blip, not a verdict on the source; the second in a row is.
+        assert "again" in result.content and "trigger it first" not in result.content
+        assert await state.block_completion() is None
+        result = await handler({})
+        assert result.status == "error"
+    assert expected in result.content
+    assert await state.block_completion() == auth_tools._COMPLETION_BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_verification_state_does_not_block_after_a_retryable_not_yet(monkeypatch: pytest.MonkeyPatch) -> None:
+    # "Not yet" and a lone lookup error are retryable, not a source failure: a speculative poll on a
+    # page that never ends up asking for a code must not turn a legitimate completion into a failure.
+    # A later delivery also disarms a gate an error streak had armed.
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    state = auth_tools.VerificationState()
+    task = _task(totp_verification_url="https://totp.example")
+    answers: list[Any] = [
+        NoTOTPVerificationCodeFound(task_id="tsk_1"),
+        RuntimeError("boom"),
+        NoTOTPVerificationCodeFound(task_id="tsk_1"),
+        RuntimeError("boom"),
+        RuntimeError("boom"),
+        OTPValue(value="123456", type=OTPType.TOTP),
+    ]
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(side_effect=answers))
+    tools, _ = auth_tools.build_auth_tools(task, state=state)
+    handler = tools[0].handler
+
+    assert "available yet" in (await handler({})).content
+    assert await state.block_completion() is None
+    assert "lookup failed" in (await handler({})).content
+    assert await state.block_completion() is None
+    # A healthy answer in between resets the streak.
+    assert "available yet" in (await handler({})).content
+    assert "lookup failed" in (await handler({})).content
+    assert await state.block_completion() is None
+    assert "lookup failed" in (await handler({})).content
+    assert await state.block_completion() == auth_tools._COMPLETION_BLOCKED
+    assert (await handler({})).status == "ok"
+    assert await state.block_completion() is None
+
+
+@pytest.mark.asyncio
+async def test_lookup_error_streak_resets_on_a_usable_answer_that_is_not_a_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A source that answers usably between two errors is alive; the two errors are separate blips,
+    # not a streak, even though neither answer delivered a value.
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    monkeypatch.setattr(auth_tools, "validate_fetch_url", lambda url: url)
+    monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+    link = OTPValue(value="https://example.test/magic?token=abc", type=OTPType.MAGIC_LINK)
+    monkeypatch.setattr(
+        auth_tools, "resolve_otp_value", AsyncMock(side_effect=[RuntimeError("boom"), link, RuntimeError("boom")])
+    )
+    state = auth_tools.VerificationState()
+    tools, _ = auth_tools.build_auth_tools(
+        _task(totp_verification_url="https://totp.example"),
+        _provider(_FakePage(goto_error=TimeoutError("load"), cookie_on_goto_error=True)),
+        state=state,
+    )
+    handlers = {t.name: t.handler for t in tools}
+
+    assert "lookup failed" in (await handlers["get_verification_code"]({})).content
+    assert (await handlers["get_verification_code"]({})).content == auth_tools._MAGIC_LINK_REDIRECT
+    assert "failed to open" in (await handlers["open_verification_link"]({})).content
+    assert "lookup failed" in (await handlers["get_verification_code"]({})).content
+    assert await state.block_completion() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "goto_error_after_cookie",
+        "url_moved_no_cookie",
+        "response_seen_same_url",
+        "later_hop_refused",
+        "cookies_unreadable",
+    ],
+)
+async def test_open_verification_link_failure_after_a_possible_sign_in_keeps_completion_open(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    # A goto that raised after a cookie landed (a load timeout, a download-triggering landing, a later
+    # hop refused) may already have signed in; the model is told to observe, so the gate must not
+    # pre-empt the completed verdict it may find. An unreadable jar fails open the same way.
+    monkeypatch.setattr(
+        auth_tools,
+        "settings",
+        SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=5, BROWSER_LOADING_TIMEOUT_MS=1000),
+    )
+    link = OTPValue(value="https://example.test/magic?token=abc", type=OTPType.MAGIC_LINK)
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=link))
+    monkeypatch.setattr(auth_tools, "validate_fetch_url", lambda url: url)
+    if failure == "goto_error_after_cookie":
+        monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+        page = _FakePage(goto_error=RuntimeError("Download is starting"), cookie_on_goto_error=True)
+        expected = "if it did not sign in"
+    elif failure == "url_moved_no_cookie":
+        # A fragment-token SPA sign-in keeps its session in storage, not a cookie.
+        monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+        page = _FakePage(goto_error=TimeoutError("load"), url_after_goto_error="https://app.test/home#token=abc")
+        expected = "if it did not sign in"
+    elif failure == "response_seen_same_url":
+        # The link redirected back to the page it came from and refreshed the existing server session.
+        monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+        page = _FakePage(goto_error=TimeoutError("load"))
+        page.response_on_goto_error = True
+        expected = "if it did not sign in"
+    elif failure == "cookies_unreadable":
+        monkeypatch.setattr(auth_tools, "revalidate_redirect_chain", AsyncMock())
+        page = _FakePage(goto_error=RuntimeError("net::ERR_CONNECTION_REFUSED"))
+        page.context = SimpleNamespace(cookies=AsyncMock(side_effect=RuntimeError("page closed")))
+        expected = "if it did not sign in"
+    else:
+        monkeypatch.setattr(
+            auth_tools, "revalidate_redirect_chain", AsyncMock(side_effect=BlockedHost("tracker.example"))
+        )
+        page = _FakePage()
+        expected = auth_tools._LATER_HOP_REFUSED
+    state = auth_tools.VerificationState()
+    tools, _ = auth_tools.build_auth_tools(
+        _task(totp_verification_url="https://totp.example"), _provider(page), state=state
+    )
+    handler = {t.name: t.handler for t in tools}["open_verification_link"]
+
+    result = await handler({})
+    assert result.status == "error" and expected in result.content
+    assert await state.block_completion() is None
+
+
+@pytest.mark.asyncio
 async def test_get_verification_code_tail_shorter_than_a_poll_interval_counts_as_spent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,7 +507,7 @@ async def test_get_verification_code_slices_share_the_first_polls_email_anchor(
 @pytest.mark.asyncio
 async def test_get_verification_code_inner_timeout_does_not_spend_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     # A timeout raised inside the resolver (DB, HTTP) reads as a lookup failure, not as this tool's
-    # wait cap or budget exhaustion, so it neither spends the budget nor stops the model.
+    # wait cap or budget exhaustion: the first invites a retry, the second in a row is terminal.
     async def _inner_timeout(*_a: Any, **_k: Any) -> OTPValue | None:
         raise TimeoutError("pool acquire")
 
@@ -231,8 +515,8 @@ async def test_get_verification_code_inner_timeout_does_not_spend_the_budget(mon
     tools, _ = auth_tools.build_auth_tools(_task(totp_verification_url="https://totp.example"))
     first = await tools[0].handler({})
     second = await tools[0].handler({})
-    assert "lookup failed: TimeoutError" in first.content
-    assert "lookup failed: TimeoutError" in second.content
+    assert "lookup failed: TimeoutError" in first.content and "call get_verification_code again" in first.content
+    assert "lookup failed: TimeoutError repeatedly" in second.content
 
 
 def test_build_auth_tools_present_with_totp_identifier() -> None:
@@ -454,6 +738,7 @@ class _FakePage:
         body_text: str = "you are signed in",
         goto_error: Exception | None = None,
         url_after_goto_error: str | None = None,
+        cookie_on_goto_error: bool = False,
     ) -> None:
         self.url = url
         self.origin_url = url
@@ -461,8 +746,31 @@ class _FakePage:
         self.body_text = body_text
         self.goto_error = goto_error
         self.url_after_goto_error = url_after_goto_error
+        self.cookie_on_goto_error = cookie_on_goto_error
         self.goto_calls: list[str] = []
         self.goto_timeouts: list[float | None] = []
+        self.cookies: list[dict[str, str]] = [{"domain": "app.test", "path": "/", "name": "csrf", "value": "1"}]
+        self.context = SimpleNamespace(cookies=self._cookies)
+        self.response_on_goto_error = False
+        self.subresource_on_goto_error = False
+        self.main_frame = object()
+        self._listeners: list[Any] = []
+
+    def _fire(self, status: int, navigation: bool, main_frame: bool = True) -> None:
+        request = SimpleNamespace(
+            is_navigation_request=lambda: navigation, frame=self.main_frame if main_frame else object()
+        )
+        for listener in self._listeners:
+            listener(SimpleNamespace(status=status, request=request))
+
+    def on(self, event: str, handler: Any) -> None:
+        self._listeners.append(handler)
+
+    def remove_listener(self, event: str, handler: Any) -> None:
+        self._listeners.remove(handler)
+
+    async def _cookies(self) -> list[dict[str, str]]:
+        return list(self.cookies)
 
     async def goto(self, url: str, timeout: float | None = None) -> Any:
         # ``goto_error`` models a link that fails to open; navigating back to the page the run came
@@ -472,8 +780,17 @@ class _FakePage:
         if self.goto_error is not None and url != self.origin_url:
             if self.url_after_goto_error is not None:
                 self.url = self.url_after_goto_error
+            if self.cookie_on_goto_error:
+                self.cookies.append({"domain": "app.test", "path": "/", "name": "sess", "value": "abc"})
+            if self.subresource_on_goto_error:
+                self._fire(200, navigation=False)
+            if self.response_on_goto_error:
+                self._fire(302, navigation=True)
             raise self.goto_error
         self.url = url
+        self._fire(self.status, navigation=True)
+        if url != self.origin_url:
+            self.cookies.append({"domain": "app.test", "path": "/", "name": "sess", "value": "abc"})
         return SimpleNamespace(status=self.status)
 
     async def inner_text(self, selector: str, timeout: float | None = None) -> str:
@@ -879,3 +1196,22 @@ async def test_verification_tools_share_one_polling_budget(monkeypatch: pytest.M
     code_result = await handlers["get_verification_code"]({})
     assert code_result.status == "error" and "budget exhausted" in code_result.content
     assert resolver_calls == calls_after_link_tool
+
+
+def test_block_credential_parameter_keys_script_mode_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-15181 review: script-built blocks carry no parameters=, so deriving scope from them would
+    silently disable credential-TOTP for cached-script logins; script-mode runs stay legacy (None)."""
+    from types import SimpleNamespace as NS
+
+    from skyvern.forge import agent as agent_module
+
+    block = NS(parameters=[])
+    monkeypatch.setattr(
+        agent_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        NS(has_workflow_run_context=lambda _id: True, get_workflow_run_context=lambda _id: NS()),
+    )
+    with skyvern_context.scoped(SkyvernContext(script_mode=True)):
+        assert agent_module.block_credential_parameter_keys(block, "wr_test") is None
+    with skyvern_context.scoped(SkyvernContext()):
+        assert agent_module.block_credential_parameter_keys(NS(parameters=[]), "wr_test") == []

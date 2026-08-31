@@ -23,7 +23,7 @@ from skyvern.forge.sdk.copilot.narration import (
     NarratorState,
     TransitionKind,
     _build_narrator_prompt,
-    _extract_narration_text,
+    _extract_narration_draft,
     _NarratorPromptContext,
     _sanitize_narration,
     cancel_in_flight,
@@ -193,34 +193,54 @@ def test_sanitize_collapses_whitespace() -> None:
     assert _sanitize_narration("Checking   the\n  login\tform") == "Checking the login form"
 
 
-def test_sanitize_truncates_over_cap() -> None:
-    out = _sanitize_narration("x" * 500)
+def test_sanitize_truncates_on_word_boundary() -> None:
+    source = " ".join(f"word{index}" for index in range(100))
+    out = _sanitize_narration(source)
     assert out.endswith("...")
-    assert len(out) <= narration._MAX_NARRATION_CHARS + len("...")
+    assert len(out.split()) == narration._MAX_NARRATION_WORDS
+    assert out[: -len("...")].split() == source.split()[: narration._MAX_NARRATION_WORDS]
 
 
 # ---------------------------------------------------------------------------
-# _extract_narration_text
+# _extract_narration_draft
 # ---------------------------------------------------------------------------
 
 
 def test_extract_narration_from_str() -> None:
-    assert _extract_narration_text("  hello  ") == "hello"
-    assert _extract_narration_text("") is None
+    assert _extract_narration_draft("  hello  ") == narration.NarrationDraft(reasoning="hello")
+    assert _extract_narration_draft("") is None
 
 
 def test_extract_narration_from_dict_priority_keys() -> None:
-    assert _extract_narration_text({"narration": "a"}) == "a"
-    assert _extract_narration_text({"sentence": "b"}) == "b"
-    assert _extract_narration_text({"user_response": "c"}) == "c"
-    assert _extract_narration_text({"content": "d"}) == "d"
-    assert _extract_narration_text({"text": "e"}) == "e"
+    # A model that ignores the label contract still yields usable reasoning.
+    for key in ("why", "narration", "sentence", "user_response", "content", "text"):
+        assert _extract_narration_draft({key: "a"}) == narration.NarrationDraft(reasoning="a")
+
+
+def test_extract_narration_draft_reads_both_label_tenses() -> None:
+    draft = _extract_narration_draft(
+        {
+            "doing": "Looking for the invoices",
+            "done": "Found them under Billing History",
+            "why": "Because they gate the run",
+        }
+    )
+    assert draft == narration.NarrationDraft(
+        reasoning="Because they gate the run",
+        active_label="Looking for the invoices",
+        outcome_label="Found them under Billing History",
+    )
+
+
+def test_extract_narration_draft_without_reasoning_is_dropped() -> None:
+    # Labels alone are not worth an emission: the row already has a fallback title.
+    assert _extract_narration_draft({"doing": "Looking", "done": "Looked"}) is None
 
 
 def test_extract_narration_unknown_shape_returns_none() -> None:
-    assert _extract_narration_text({"unrelated": "x"}) is None
-    assert _extract_narration_text(42) is None
-    assert _extract_narration_text(None) is None
+    assert _extract_narration_draft({"unrelated": "x"}) is None
+    assert _extract_narration_draft(42) is None
+    assert _extract_narration_draft(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +292,14 @@ def test_leak_guard_accepts_clean_sentences() -> None:
 # ---------------------------------------------------------------------------
 # extract_tool_details — no identifier-looking tokens leave this function
 # ---------------------------------------------------------------------------
+
+
+def test_extract_tool_details_reports_no_credential_count() -> None:
+    parsed = {
+        "ok": True,
+        "data": {"count": 4, "credentials": [{"credential_id": "cred_384430212391591428"}]},
+    }
+    assert narration.extract_tool_details("list_credentials", parsed) == ""
 
 
 def test_extract_tool_details_update_workflow_excludes_block_names() -> None:
@@ -453,7 +481,7 @@ async def _install_handler(monkeypatch: pytest.MonkeyPatch, handler: Any) -> Non
 async def test_schedule_narration_no_op_when_no_transition() -> None:
     state = NarratorState()
     stream = _FakeStream()
-    schedule_narration(state, stream, iteration=0)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is None
     assert stream.sent == []
 
@@ -467,11 +495,12 @@ async def test_schedule_narration_emits_on_happy_path(monkeypatch: pytest.Monkey
     await _install_handler(monkeypatch, _handler)
 
     state = NarratorState()
+    state.current_iteration = 3
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     stream = _FakeStream()
 
     assert state.last_emitted_at is None
-    schedule_narration(state, stream, iteration=3)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
     await state.in_flight_task
 
@@ -487,25 +516,6 @@ async def test_schedule_narration_emits_on_happy_path(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-async def test_narration_entry_shares_the_clock_read_of_its_sse_update(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
-        return "Revising the workflow draft."
-
-    await _install_handler(monkeypatch, _handler)
-
-    state = NarratorState()
-    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
-
-    schedule_narration(state, stream, iteration=3)  # type: ignore[arg-type]
-    assert state.in_flight_task is not None
-    await state.in_flight_task
-
-    entry = state.design_activity[0]
-    assert entry["timestamp"] == stream.sent[0].timestamp.isoformat()
-
-
-@pytest.mark.asyncio
 async def test_schedule_narration_keeps_clock_frozen_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed narration must not advance ``last_emitted_at``. Advancing would
     silence the next ``MIN_NARRATION_GAP_SECONDS`` of valid transitions even
@@ -517,10 +527,11 @@ async def test_schedule_narration_keeps_clock_frozen_on_failure(monkeypatch: pyt
     await _install_handler(monkeypatch, _raising_handler)
 
     state = NarratorState()
+    state.current_iteration = 1
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=1)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
     await state.in_flight_task
 
@@ -576,10 +587,11 @@ async def test_schedule_narration_drops_on_failure(
     await configure(monkeypatch)
 
     state = NarratorState()
+    state.current_iteration = 1
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=1)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
     # Awaiting the task must not raise -- every failure mode is swallowed inside.
     await state.in_flight_task
@@ -601,16 +613,18 @@ async def test_schedule_narration_skips_when_in_flight(monkeypatch: pytest.Monke
     await _install_handler(monkeypatch, _gated_handler)
 
     state = NarratorState()
+    state.current_iteration = 0
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=0)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     first_task = state.in_flight_task
     assert first_task is not None
 
     # Second transition arrives while first is running.
+    state.current_iteration = 1
     state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
-    schedule_narration(state, stream, iteration=1)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     # Same task -- no new task spawned.
     assert state.in_flight_task is first_task
 
@@ -797,6 +811,45 @@ def test_tool_in_progress_priority_above_tool_started_below_block_started() -> N
     assert state2.pending_transition == TransitionKind.BLOCK_STARTED
 
 
+def test_a_steps_completion_does_not_displace_its_own_intent() -> None:
+    state = NarratorState()
+    state.current_iteration = 3
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+
+    # Without the guard BLOCK_COMPLETED outranks TOOL_STARTED, so the narrator
+    # would only ever explain the step after it had already finished.
+    assert state.pending_transition == TransitionKind.TOOL_STARTED
+    assert state.deferred_transition == TransitionKind.BLOCK_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_the_displaced_completion_takes_the_slot_the_intent_frees() -> None:
+    state = NarratorState()
+    state.current_iteration = 3
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+
+    schedule_narration(state, _StubStream())
+    await cancel_in_flight(state)
+
+    # Banked, not dropped: the step is still narrated a second time once its
+    # intent has been sent.
+    assert state.pending_transition == TransitionKind.BLOCK_COMPLETED
+    assert state.deferred_transition is None
+
+
+def test_intent_is_protected_only_for_the_step_that_is_running() -> None:
+    state = NarratorState()
+    state.current_iteration = 3
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.current_iteration = 4
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+
+    # A stale intent from the previous step has no claim on this one.
+    assert state.pending_transition == TransitionKind.BLOCK_COMPLETED
+
+
 # ---------------------------------------------------------------------------
 # should_emit attempt-bounded gate
 # ---------------------------------------------------------------------------
@@ -905,38 +958,6 @@ async def test_poll_tick_block_ts_change_triggers_fetch_and_records_transition()
 
 
 @pytest.mark.asyncio
-async def test_poll_tick_records_block_run_identity_alongside_started_at() -> None:
-    state = NarratorState(current_iteration=4)
-    stream = _StubStream()
-    started_at: dict[str, str] = {}
-    identities: dict[str, narration.BlockRunIdentity] = {}
-
-    async def fetch() -> list[_StubBlock]:
-        return [_StubBlock("b7", "running")]
-
-    await narrator_poll_tick(
-        state,
-        current_block_ts=_ts(2.0),
-        prior_block_ts=_ts(1.0),
-        last_block_fetch_monotonic=0.0,
-        seen_block_states={},
-        fetch_block_statuses=fetch,
-        stream=stream,  # type: ignore[arg-type]
-        block_started_at_map=started_at,
-        block_run_identity_map=identities,
-    )
-
-    assert "label_b7" in started_at
-    assert identities["label_b7"] == narration.BlockRunIdentity(workflow_run_block_id="b7", iteration=4)
-    if state.in_flight_task is not None:
-        state.in_flight_task.cancel()
-        try:
-            await state.in_flight_task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-
-@pytest.mark.asyncio
 async def test_poll_tick_block_unchanged_does_not_fetch_or_record() -> None:
     state = NarratorState(last_attempted_at=time.monotonic())
     stream = _StubStream()
@@ -967,7 +988,7 @@ async def test_poll_tick_block_unchanged_does_not_fetch_or_record() -> None:
 async def test_poll_tick_no_change_still_calls_schedule_narration() -> None:
     """Pending transitions latched while the gate was closed must drain on
     subsequent ticks even when no fresh block/step signal arrives."""
-    state = NarratorState(pending_transition=TransitionKind.BLOCK_COMPLETED)
+    state = NarratorState(pending_transition=TransitionKind.BLOCK_COMPLETED, pending_transition_iteration=0)
     stream = _StubStream()
 
     async def fetch() -> list[_StubBlock]:
@@ -1393,53 +1414,26 @@ async def test_poll_tick_block_ended_at_overwritten_by_latest_terminal_and_clear
             pass
 
 
-def _armed_state(iteration: int) -> NarratorState:
+def test_should_emit_true_for_an_iteration_carrying_typed_tool_activity() -> None:
     state = NarratorState()
+    state.current_iteration = 2
     state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
-    state.record_activity(
-        narration.build_tool_call_activity("edit_block", iteration, f"c{iteration}", timestamp=_ACTIVITY_TS)
-    )
-    return state
+    state.record_activity(narration.build_tool_call_activity("edit_block", 2, "c2", timestamp=_ACTIVITY_TS))
+    assert should_emit(state, now=100.0) is True
 
 
-def test_should_emit_false_for_an_iteration_carrying_typed_tool_activity() -> None:
-    state = _armed_state(2)
-    assert state.iterations_with_tool_activity == {2}
-    assert should_emit(state, now=100.0, iteration=2) is False
-
-
-def test_should_emit_true_for_a_clean_iteration_alongside_an_armed_one() -> None:
-    state = _armed_state(2)
-    assert should_emit(state, now=100.0, iteration=3) is True
-
-
-def test_should_emit_true_when_the_iterations_only_tool_is_denylisted() -> None:
+def test_narration_activity_stays_in_design_while_a_block_runs() -> None:
     state = NarratorState()
-    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
-    state.record_activity(narration.build_tool_call_activity("get_run_results", 0, "c0", timestamp=_ACTIVITY_TS))
-    assert state.iterations_with_tool_activity == set()
-    assert should_emit(state, now=100.0, iteration=0) is True
-
-
-def test_tool_result_alone_arms_the_iteration() -> None:
-    state = NarratorState()
-    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.running_block_label = "log_in"
     state.record_activity(
-        narration.build_tool_result_activity("edit_block", "done", True, 5, "c5", timestamp=_ACTIVITY_TS)
+        narration.build_narration_activity("Confirming the login sticks", 1, datetime(2026, 1, 1, tzinfo=timezone.utc))
     )
-    assert should_emit(state, now=100.0, iteration=5) is False
-
-
-def test_narration_activity_does_not_arm_its_own_iteration() -> None:
-    state = NarratorState()
-    state.record_activity(
-        narration.build_narration_activity("Refining the workflow's code", 1, datetime(2026, 1, 1, tzinfo=timezone.utc))
-    )
-    assert state.iterations_with_tool_activity == set()
+    assert state.block_activity == {}
+    assert [e["kind"] for e in state.design_activity] == ["narration"]
 
 
 @pytest.mark.asyncio
-async def test_narration_dropped_when_the_iteration_arms_while_the_narrator_is_in_flight(
+async def test_narration_still_emits_when_the_iteration_gains_a_typed_row_mid_flight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = NarratorState()
@@ -1450,117 +1444,174 @@ async def test_narration_dropped_when_the_iteration_arms_while_the_narrator_is_i
         return "Working on your goal."
 
     await _install_handler(monkeypatch, _handler)
+    state.current_iteration = 4
     state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
     stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=4)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
     state.record_activity(narration.build_tool_call_activity("edit_block", 4, "c4", timestamp=_ACTIVITY_TS))
     released.set()
     await state.in_flight_task
 
-    assert stream.sent == []
-    assert [e for e in state.design_activity if e["kind"] == "narration"] == []
-    assert state.last_emitted_at is None
+    assert [p.iteration for p in stream.sent] == [4]
+    assert [e["iteration"] for e in state.design_activity if e["kind"] == "narration"] == [4]
 
 
 @pytest.mark.asyncio
-async def test_narration_emits_for_a_clean_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_narration_tags_the_transitions_iteration_not_the_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gap window can hold a transition past its own iteration; the prose
+    still belongs to the step that caused it, not to whatever step is current."""
+
     async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
-        return "Reading the page before editing."
+        return "Checking whether the invoices need a login."
 
     await _install_handler(monkeypatch, _handler)
     state = NarratorState()
-    state.record_activity(narration.build_tool_call_activity("edit_block", 4, "c4", timestamp=_ACTIVITY_TS))
+    state.current_iteration = 2
     state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.current_iteration = 9
     stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=5)  # type: ignore[arg-type]
+    schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
     await state.in_flight_task
 
-    assert [p.narration for p in stream.sent] == ["Reading the page before editing."]
+    assert [p.iteration for p in stream.sent] == [2]
 
 
-def test_extract_tool_details_reports_no_credential_count() -> None:
-    parsed = {
-        "ok": True,
-        "data": {"count": 4, "credentials": [{"credential_id": "cred_384430212391591428"}]},
-    }
-    assert narration.extract_tool_details("list_credentials", parsed) == ""
+@pytest.mark.asyncio
+async def test_untagged_transition_anchors_to_the_step_running_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Anchoring and dropping used to race here, so the same banked transition
+    # resolved differently depending on whether a poll or a tool event arrived
+    # first. Anchoring is now the only outcome.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved the workflow", "why": "So the run has steps"}
 
-
-def test_suppressed_iteration_consumes_its_transition_instead_of_banking_it() -> None:
+    await _install_handler(monkeypatch, _handler)
     state = NarratorState()
-    stream = _StubStream()
-    # streaming_adapter sets current_iteration before recording the transition.
+    stream = _FakeStream()
     state.current_iteration = 3
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    state.record_activity(narration.build_tool_call_activity("update_workflow", 3, "c3", timestamp=_ACTIVITY_TS))
+    # streaming_adapter clears the tag on each enforcement pass; the transition survives it.
+    state.pending_transition_iteration = None
+    state.current_iteration = 0
 
-    schedule_narration(state, stream, 3)
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
 
-    assert state.pending_transition is None
-    assert state.in_flight_task is None
-
-    # A later unarmed iteration must not inherit the earlier transition.
-    state.record_activity(narration.build_tool_call_activity("get_browser_screenshot", 7, "c7", timestamp=_ACTIVITY_TS))
-    assert should_emit(state, 300.0, 7) is False
+    assert stream.sent[0].iteration == 0
+    assert state.design_activity[0]["iteration"] == 0
 
 
-def test_suppression_keeps_a_transition_banked_by_an_earlier_clean_iteration() -> None:
+def test_a_transition_banked_by_an_earlier_iteration_keeps_its_own_tag() -> None:
     state = NarratorState()
-    stream = _StubStream()
-
-    # Iteration 5's only tool is denylisted, so nothing typed describes it.
     state.current_iteration = 5
     state.record_transition(TransitionKind.TOOL_STARTED)
-    state.record_activity(narration.build_tool_call_activity("get_browser_screenshot", 5, "c5", timestamp=_ACTIVITY_TS))
 
-    # Iteration 6 carries a typed row and is suppressed; it must not consume
-    # iteration 5's transition.
     state.current_iteration = 6
     state.record_activity(narration.build_tool_call_activity("click", 6, "c6", timestamp=_ACTIVITY_TS))
-    schedule_narration(state, stream, 6)
 
-    assert state.pending_transition is TransitionKind.TOOL_STARTED
+    assert state.pending_transition_iteration == 5
 
 
-def test_workflow_edit_reset_clears_the_block_run_identity_map() -> None:
-    from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
+def test_transition_banked_across_a_pass_reset_re_anchors_to_the_new_pass() -> None:
+    state = NarratorState()
+    state.current_iteration = 4
+    state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
+    # stream_to_sse clears the tag on pass entry but keeps the transition.
+    state.pending_transition_iteration = None
 
-    ctx = SimpleNamespace(
-        last_run_blocks_workflow_run_id="wr_1",
-        last_successful_run_blocks_workflow_run_id=None,
-        last_run_blocks_browser_session_id=None,
-        recorded_persisted_block_run_workflow_run_id=None,
-        last_run_blocks_block_ids=["b1"],
-        last_run_blocks_block_labels=["log_in"],
-        last_run_outcome=None,
-        last_run_outcome_block_labels=["log_in"],
-        last_test_anti_bot=None,
-        completion_verification_result=None,
-        outcome_verification_trace_snapshot={"a": 1},
-        pre_run_page_reference=None,
-        registered_artifact_evidence=None,
-        post_run_page_observation_tool=None,
-        post_run_page_observation_url=None,
-        post_run_page_observation_workflow_run_id=None,
-        post_run_page_observation_after_failed_test=False,
-        post_run_page_observation_generation=0,
-        post_run_current_page_inspection_workflow_run_id=None,
-        block_state_map={"log_in": "failed"},
-        block_started_at_map={"log_in": "2026-01-01T00:00:00+00:00"},
-        block_ended_at_map={"log_in": "2026-01-01T00:00:05+00:00"},
-        block_run_identity_map={"log_in": narration.BlockRunIdentity("wrb_A", 3)},
+    state.current_iteration = 0
+    state.record_transition(TransitionKind.TOOL_STARTED)
+
+    assert state.pending_transition is TransitionKind.ENFORCEMENT_RETRY
+    assert state.pending_transition_iteration == 0
+
+
+def test_build_narration_activity_carries_both_label_tenses() -> None:
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    entry = narration.build_narration_activity(
+        "Because the invoices gate the run",
+        3,
+        ts,
+        active_label="Looking for the invoice list",
+        outcome_label="Found them under Billing History",
     )
 
-    clear_active_run_evidence_on_workflow_edit(ctx)
+    assert entry["activeLabel"] == "Looking for the invoice list"
+    assert entry["outcomeLabel"] == "Found them under Billing History"
+    assert entry["text"] == "Because the invoices gate the run"
 
-    # A re-authored block must not persist the detached run's identity: the next
-    # payload would otherwise attribute it to the run the edit just replaced.
-    assert ctx.block_run_identity_map == {}
-    assert ctx.block_state_map == {}
+
+def test_build_narration_activity_omits_absent_labels() -> None:
+    # A narrator that returned only a sentence must not persist empty titles;
+    # the row falls back to its tool-derived label on the key being absent.
+    entry = narration.build_narration_activity("Why", 1, datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    assert "activeLabel" not in entry
+    assert "outcomeLabel" not in entry
+
+
+def test_a_leaking_label_is_dropped_without_losing_the_reasoning() -> None:
+    assert narration._clean_label("Running update_and_run_blocks") is None
+    assert narration._clean_label("Testing the saved steps") == "Testing the saved steps"
+    assert narration._clean_label(None) is None
+
+
+@pytest.mark.asyncio
+async def test_narration_entry_shares_the_clock_read_of_its_sse_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
+        return "Revising the workflow draft."
+
+    await _install_handler(monkeypatch, _handler)
+
+    # The transition now carries its own iteration tag, so the narration pairs
+    # to the step without schedule_narration being told which one.
+    state = NarratorState(current_iteration=3)
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    stream = _FakeStream()
+
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    entry = state.design_activity[0]
+    assert entry["iteration"] == 3
+    assert entry["timestamp"] == stream.sent[0].timestamp.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_records_block_run_identity_alongside_started_at() -> None:
+    state = NarratorState(current_iteration=4)
+    stream = _StubStream()
+    started_at: dict[str, str] = {}
+    identities: dict[str, narration.BlockRunIdentity] = {}
+
+    async def fetch() -> list[_StubBlock]:
+        return [_StubBlock("b7", "running")]
+
+    await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        prior_block_ts=_ts(1.0),
+        last_block_fetch_monotonic=0.0,
+        seen_block_states={},
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+        block_started_at_map=started_at,
+        block_run_identity_map=identities,
+    )
+
+    assert "label_b7" in started_at
+    assert identities["label_b7"] == narration.BlockRunIdentity(workflow_run_block_id="b7", iteration=4)
+    if state.in_flight_task is not None:
+        state.in_flight_task.cancel()
+        try:
+            await state.in_flight_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 @pytest.mark.asyncio
@@ -1609,3 +1660,177 @@ async def test_poll_tick_keeps_the_last_run_identity_for_a_repeated_label() -> N
             await state.in_flight_task
         except (asyncio.CancelledError, Exception):
             pass
+
+
+def test_workflow_edit_reset_clears_the_block_run_identity_map() -> None:
+    from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
+
+    ctx = SimpleNamespace(
+        last_run_blocks_workflow_run_id="wr_1",
+        last_successful_run_blocks_workflow_run_id=None,
+        last_run_blocks_browser_session_id=None,
+        recorded_persisted_block_run_workflow_run_id=None,
+        last_run_blocks_block_ids=["b1"],
+        last_run_blocks_block_labels=["log_in"],
+        last_run_outcome=None,
+        last_run_outcome_block_labels=["log_in"],
+        last_test_anti_bot=None,
+        completion_verification_result=None,
+        outcome_verification_trace_snapshot={"a": 1},
+        pre_run_page_reference=None,
+        registered_artifact_evidence=None,
+        post_run_page_observation_tool=None,
+        post_run_page_observation_url=None,
+        post_run_page_observation_workflow_run_id=None,
+        post_run_page_observation_after_failed_test=False,
+        post_run_page_observation_generation=0,
+        post_run_current_page_inspection_workflow_run_id=None,
+        block_state_map={"log_in": "failed"},
+        block_started_at_map={"log_in": "2026-01-01T00:00:00+00:00"},
+        block_ended_at_map={"log_in": "2026-01-01T00:00:05+00:00"},
+        block_run_identity_map={"log_in": narration.BlockRunIdentity("wrb_A", 3)},
+    )
+
+    clear_active_run_evidence_on_workflow_edit(ctx)
+
+    # A re-authored block must not persist the detached run's identity: the next
+    # payload would otherwise attribute it to the run the edit just replaced.
+    assert ctx.block_run_identity_map == {}
+    assert ctx.block_state_map == {}
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_that_sanitizes_to_nothing_is_not_emitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A NamedTuple is always truthy, so the draft itself cannot stand in for the
+    # old "did the model say anything" check.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"why": '""', "doing": "Looking", "done": "Looked"}
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=1)
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    stream = _FakeStream()
+
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    if state.in_flight_task is not None:
+        await state.in_flight_task
+
+    assert stream.sent == []
+    assert state.design_activity == []
+
+
+@pytest.mark.asyncio
+async def test_an_outcome_title_is_dropped_when_the_step_has_not_finished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Narration is scheduled at tool_started, before the tool returns, so any
+    # outcome the model names there is a guess.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {
+            "doing": "Looking for the invoices",
+            "done": "Found the invoices under Billing History",
+            "why": "They gate the run",
+        }
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=1)
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    stream = _FakeStream()
+
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    sent = stream.sent[0]
+    assert sent.active_label == "Looking for the invoices"
+    assert sent.outcome_label is None
+    assert "outcomeLabel" not in state.design_activity[0]
+
+
+@pytest.mark.asyncio
+async def test_an_outcome_title_survives_once_the_step_has_finished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=1)
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    stream = _FakeStream()
+
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert stream.sent[0].outcome_label == "Saved 2 blocks"
+    assert state.design_activity[0]["outcomeLabel"] == "Saved 2 blocks"
+
+
+@pytest.mark.asyncio
+async def test_a_reanchored_transition_loses_its_outcome_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    # WORKFLOW_UPDATED is outcome-known, but banked across a pass reset it now
+    # points at a different, still-running step; its outcome describes work that
+    # step never did.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=4)
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    state.pending_transition_iteration = None
+    state.current_iteration = 9
+    stream = _FakeStream()
+
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    sent = stream.sent[0]
+    assert sent.iteration == 9
+    assert sent.active_label == "Saving"
+    assert sent.outcome_label is None
+
+
+def test_outcome_known_transitions_cover_every_post_result_kind() -> None:
+    # detect_transitions runs only in the tool_output branch, so everything it
+    # raises follows a returned tool. A post-result kind left out of the set
+    # would strip the finished title from any completion it outranks.
+    post_result = {
+        TransitionKind.WORKFLOW_UPDATED,
+        TransitionKind.TEST_COMPLETED,
+        TransitionKind.NAVIGATION_COMPLETED,
+        TransitionKind.NEW_TOOL_CLUSTER,
+    }
+    assert post_result <= narration._OUTCOME_KNOWN_TRANSITIONS
+    assert TransitionKind.TOOL_STARTED not in narration._OUTCOME_KNOWN_TRANSITIONS
+    assert TransitionKind.BLOCK_STARTED not in narration._OUTCOME_KNOWN_TRANSITIONS
+
+
+@pytest.mark.asyncio
+async def test_a_lower_priority_transition_does_not_launder_a_reanchored_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # record_transition fills the tag of a surviving high-priority transition
+    # without replacing it, so the re-anchor has to be remembered on the state
+    # rather than inferred from a missing tag at schedule time.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=5)
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    state.pending_transition_iteration = None
+    state.current_iteration = 0
+    state.record_transition(TransitionKind.TOOL_STARTED)
+
+    assert state.pending_transition is TransitionKind.WORKFLOW_UPDATED
+    assert state.pending_transition_iteration == 0
+    assert state.pending_transition_reanchored is True
+
+    stream = _FakeStream()
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert stream.sent[0].outcome_label is None

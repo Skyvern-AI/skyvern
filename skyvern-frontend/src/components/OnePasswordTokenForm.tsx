@@ -13,7 +13,9 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { ClearCredentialDialog } from "@/components/ClearCredentialDialog";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useOnePasswordToken } from "@/hooks/useOnePasswordToken";
+import { OnePasswordSetupGuide } from "@/components/OnePasswordSetupGuide";
 import { EyeOpenIcon, EyeClosedIcon } from "@radix-ui/react-icons";
 
 const formSchema = z.object({
@@ -67,8 +69,7 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
             1Password Service Account Token
           </h3>
           <p className="text-sm text-muted-foreground">
-            Configure your 1Password service account token for credential
-            management.
+            Skyvern reads login items from the vaults this token can access.
           </p>
         </div>
         {onePasswordToken && (
@@ -83,6 +84,19 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
         )}
       </div>
 
+      {/* Mounted only once the token query settles, and remounted when the org
+          flips between configured and not, so defaultOpen reads a settled value
+          rather than the always-undefined first render. The placeholder holds
+          the collapsed height meanwhile so the panel does not jump. */}
+      {isLoading ? (
+        <Skeleton className="h-[38px] w-full rounded-md" />
+      ) : (
+        <OnePasswordSetupGuide
+          key={onePasswordToken ? "configured" : "unconfigured"}
+          defaultOpen={!onePasswordToken}
+        />
+      )}
+
       <Form {...form}>
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
           <FormField
@@ -96,7 +110,7 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
                     <Input
                       {...field}
                       type={showToken ? "text" : "password"}
-                      placeholder="op_1234567890abcdef"
+                      placeholder="ops_eyJlbWFpbCI6..."
                       disabled={isLoading || isMutating}
                     />
                   </FormControl>

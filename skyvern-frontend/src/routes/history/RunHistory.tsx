@@ -205,6 +205,10 @@ function RunHistory() {
     () => parseStatusParam(searchParams.get("status")),
     [searchParams],
   );
+  // Deep-linked from elsewhere (e.g. a future failure-category ranking surface); an
+  // empty/missing value is simply "no filter", same as every other param here.
+  const failureCategory =
+    searchParams.get("failure_category")?.trim() || undefined;
   const runTypeGroups = useMemo(
     () => parseRunTypeParam(searchParams.get("run_type")),
     [searchParams],
@@ -240,6 +244,7 @@ function RunHistory() {
     search: textSearch,
     tags: effectiveTagsParam,
     workflowPermanentIds,
+    failureCategory,
   });
   const navigate = useNavigate();
 
@@ -251,6 +256,7 @@ function RunHistory() {
     search: textSearch,
     tags: effectiveTagsParam,
     workflowPermanentIds,
+    failureCategory,
     enabled: runs?.length === itemsPerPage,
   });
 
@@ -323,6 +329,7 @@ function RunHistory() {
       agentFilters,
       textSearch,
       taggingEnabled,
+      failureCategory,
     ]),
     anchorResetKey: itemsPerPage,
   });
@@ -590,7 +597,8 @@ function RunHistory() {
     runTypeGroups.length > 0 ||
     tagTerms.length > 0 ||
     !!textSearch ||
-    agentFilters.length > 0;
+    agentFilters.length > 0 ||
+    !!failureCategory;
   const showOnboardingEmpty =
     !isFetching &&
     runs?.length === 0 &&

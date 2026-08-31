@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
+from skyvern.forge.sdk.copilot.code_write_diff import (
+    PER_PATCH_CHAR_CAP,
+    TURN_PATCH_CHAR_BUDGET,
+    build_code_write_diffs,
+)
 from skyvern.forge.sdk.copilot.context import BlockRunIdentity, CopilotContext
 from skyvern.forge.sdk.copilot.narration import (
     MAX_BLOCK_ACTIVITY_ENTRIES,
@@ -192,6 +197,9 @@ def test_record_activity_non_run_tool_result_routes_live_not_pinned() -> None:
 def test_tool_activity_display_label_covers_discovery_tools() -> None:
     assert tool_activity_display_label("discover_workflow_entrypoint") == "Finding the entry page"
     assert tool_activity_display_label("inspect_page_for_composition") == "Inspecting the page"
+    assert tool_activity_display_label("skyvern_frame_list") == "Finding embedded pages"
+    assert tool_activity_display_label("skyvern_frame_switch") == "Opening embedded page"
+    assert tool_activity_display_label("skyvern_frame_main") == "Returning to main page"
 
 
 def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
@@ -298,8 +306,20 @@ workflow_definition:
 
     assert payload["review"] == {
         "blocks": [
-            {"label": "existing", "blockType": "task", "change": "changed", "neverTested": False},
-            {"label": "added", "blockType": "task", "change": "added", "neverTested": True},
+            {
+                "label": "existing",
+                "blockType": "task",
+                "change": "changed",
+                "neverTested": False,
+                "coverage": "current_source",
+            },
+            {
+                "label": "added",
+                "blockType": "task",
+                "change": "added",
+                "neverTested": True,
+                "coverage": "never_run",
+            },
         ],
         "duplicateWrites": [],
     }
@@ -336,7 +356,13 @@ workflow_definition:
 
     assert payload["review"] == {
         "blocks": [
-            {"label": "first_draft", "blockType": "task", "change": "added", "neverTested": True},
+            {
+                "label": "first_draft",
+                "blockType": "task",
+                "change": "added",
+                "neverTested": True,
+                "coverage": "never_run",
+            },
         ],
         "duplicateWrites": [],
     }
@@ -487,3 +513,163 @@ def test_credential_fill_row_names_the_action_without_leaking_material() -> None
     assert len(rows) == 2
     assert all("Working" not in row["text"] for row in rows)
     assert all("cred_" not in row["text"] for row in rows)
+
+
+_PRIOR_CODE = "\n".join(
+    [
+        "async def run(page):",
+        "    await page.goto(URL)",
+        "    await page.click('#download')",
+        "    return {'ok': True}",
+    ]
+)
+
+
+def _no_scrub(text: str) -> str:
+    return text
+
+
+def test_counts_are_the_real_line_delta_for_an_anchored_edit() -> None:
+    rewritten = _PRIOR_CODE.replace("await page.click('#download')", "await page.click('#download-invoice')")
+    diffs, _ = build_code_write_diffs(
+        {"download_step": {"code": _PRIOR_CODE}},
+        {"download_step": rewritten},
+        scrub=_no_scrub,
+        budget=TURN_PATCH_CHAR_BUDGET,
+    )
+
+    assert [(d["label"], d["added"], d["removed"]) for d in diffs] == [("download_step", 1, 1)]
+    assert "#download-invoice" in diffs[0]["patch"]
+
+
+def test_the_patch_carries_only_hunks_so_no_line_renders_as_a_phantom_change() -> None:
+    rewritten = _PRIOR_CODE.replace("await page.click('#download')", "await page.click('#download-invoice')")
+    diffs, _ = build_code_write_diffs(
+        {"download_step": {"code": _PRIOR_CODE}},
+        {"download_step": rewritten},
+        scrub=_no_scrub,
+        budget=TURN_PATCH_CHAR_BUDGET,
+    )
+
+    patch_lines = diffs[0]["patch"].split("\n")
+    assert patch_lines[0].startswith("@@")
+    # The renderer colours by leading +/-, so difflib's empty ``---``/``+++`` headers would
+    # paint a removed and an added line that no count accounts for.
+    signed = [line for line in patch_lines if line.startswith(("+", "-"))]
+    assert len(signed) == diffs[0]["added"] + diffs[0]["removed"]
+
+
+def test_counts_cover_pure_add_and_pure_delete() -> None:
+    added_line = _PRIOR_CODE.replace(
+        "    return {'ok': True}", "    await page.wait_for_timeout(500)\n    return {'ok': True}"
+    )
+    grown, _ = build_code_write_diffs(
+        {"step": {"code": _PRIOR_CODE}}, {"step": added_line}, scrub=_no_scrub, budget=TURN_PATCH_CHAR_BUDGET
+    )
+    assert (grown[0]["added"], grown[0]["removed"]) == (1, 0)
+
+    shrunk, _ = build_code_write_diffs(
+        {"step": {"code": added_line}}, {"step": _PRIOR_CODE}, scrub=_no_scrub, budget=TURN_PATCH_CHAR_BUDGET
+    )
+    assert (shrunk[0]["added"], shrunk[0]["removed"]) == (0, 1)
+
+
+def test_a_new_block_is_a_whole_file_add() -> None:
+    diffs, _ = build_code_write_diffs({}, {"fresh": _PRIOR_CODE}, scrub=_no_scrub, budget=TURN_PATCH_CHAR_BUDGET)
+
+    assert diffs[0]["added"] == len(_PRIOR_CODE.splitlines())
+    assert diffs[0]["removed"] == 0
+
+
+def test_an_accepted_but_unchanged_block_emits_no_row() -> None:
+    diffs, budget = build_code_write_diffs(
+        {"step": {"code": _PRIOR_CODE}}, {"step": _PRIOR_CODE}, scrub=_no_scrub, budget=TURN_PATCH_CHAR_BUDGET
+    )
+
+    assert diffs == []
+    assert budget == TURN_PATCH_CHAR_BUDGET
+
+
+def test_an_oversized_patch_is_dropped_with_its_counts_intact() -> None:
+    huge = "\n".join(f"    value_{i} = {i}" for i in range(PER_PATCH_CHAR_CAP))
+    capped, budget = build_code_write_diffs({}, {"big": huge}, scrub=_no_scrub, budget=TURN_PATCH_CHAR_BUDGET)
+
+    assert "patch" not in capped[0]
+    assert capped[0]["patchDropped"] is True
+    assert (capped[0]["added"], capped[0]["removed"]) == (len(huge.splitlines()), 0)
+    assert budget == TURN_PATCH_CHAR_BUDGET
+
+
+def test_a_one_line_edit_to_a_very_large_block_reports_the_real_delta() -> None:
+    # 20k lines, ~500KB across the pair: a size that used to skip the diff entirely and report
+    # whole-replace counts, so the row claimed thousands of changed lines for a one-line edit.
+    prior = "\n".join(f"    value_{i} = {i}" for i in range(20_000))
+    rewritten = prior.replace("    value_0 = 0", "    value_0 = 1")
+
+    diffs, budget = build_code_write_diffs(
+        {"big": {"code": prior}}, {"big": rewritten}, scrub=_no_scrub, budget=TURN_PATCH_CHAR_BUDGET
+    )
+
+    assert (diffs[0]["added"], diffs[0]["removed"]) == (1, 1)
+    # The change is one line, so its patch is small enough to survive the per-patch cap: size is
+    # decided by the diff, not by how big the file it came from happens to be.
+    assert "+    value_0 = 1" in diffs[0]["patch"]
+    assert budget < TURN_PATCH_CHAR_BUDGET
+
+
+def test_a_later_write_is_capped_by_the_budget_the_first_one_spent() -> None:
+    first, remaining = build_code_write_diffs({}, {"one": _PRIOR_CODE}, scrub=_no_scrub, budget=200)
+    second, _ = build_code_write_diffs({}, {"two": _PRIOR_CODE}, scrub=_no_scrub, budget=remaining)
+
+    assert "patch" in first[0]
+    assert remaining < 200
+    assert "patch" not in second[0]
+    assert second[0]["patchDropped"] is True
+    assert (second[0]["added"], second[0]["removed"]) == (first[0]["added"], first[0]["removed"])
+
+
+def test_the_patch_is_scrubbed_before_it_leaves_the_producer() -> None:
+    diffs, _ = build_code_write_diffs(
+        {},
+        {"login": "password = 'hunter2-live'"},
+        scrub=lambda text: text.replace("hunter2-live", "****"),
+        budget=TURN_PATCH_CHAR_BUDGET,
+    )
+
+    assert "hunter2-live" not in diffs[0]["patch"]
+
+
+def test_a_registered_value_spanning_lines_never_reaches_the_patch() -> None:
+    secret = "alpha-line\nbeta-line"
+    diffs, _ = build_code_write_diffs(
+        {},
+        {"login": f"x = 1\n{secret}\ny = 2"},
+        scrub=lambda text: text.replace(secret, "[REDACTED_SECRET]"),
+        budget=TURN_PATCH_CHAR_BUDGET,
+    )
+
+    patch = diffs[0]["patch"]
+    assert "alpha-line" not in patch
+    assert "beta-line" not in patch
+    assert "[REDACTED_SECRET]" in patch
+    # The counts describe the redacted text the patch shows, so a reader never sees a total that
+    # the hunk below it contradicts.
+    assert diffs[0]["added"] == sum(1 for line in patch.splitlines() if line.startswith("+"))
+
+
+def test_a_tool_result_without_diffs_carries_no_code_diffs_key() -> None:
+    entry = build_tool_result_activity("update_workflow", "Updated", True, 0, "c0", timestamp=_TS)
+    assert entry is not None
+    assert "codeDiffs" not in entry
+
+    with_diffs = build_tool_result_activity(
+        "update_workflow",
+        "Updated",
+        True,
+        0,
+        "c1",
+        timestamp=_TS,
+        code_diffs=[{"label": "step", "added": 2, "removed": 1}],
+    )
+    assert with_diffs is not None
+    assert with_diffs["codeDiffs"] == [{"label": "step", "added": 2, "removed": 1}]

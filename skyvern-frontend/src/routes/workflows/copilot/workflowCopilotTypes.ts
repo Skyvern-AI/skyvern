@@ -191,6 +191,10 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   summary: string | null;
   timestamp: string;
   workflow?: WorkflowApiResponse | null;
+  // A write and its test share one tool call, so the tool_result arrives only after the run.
+  // These carry the patch at write time and name the call whose row it belongs to.
+  code_diffs?: unknown;
+  tool_call_id?: string | null;
 }
 
 // Emitted once the backend has persisted a derived agent name, before any block
@@ -230,6 +234,16 @@ export interface WorkflowCopilotToolCallUpdate {
   timestamp?: string | null;
 }
 
+// One changed code block's line delta. `patch` is absent when the server dropped
+// it for size; the counts are always the full change and never the patch's.
+export interface CodeWriteDiff {
+  label: string;
+  added: number;
+  removed: number;
+  patch?: string;
+  patchDropped?: boolean;
+}
+
 export interface WorkflowCopilotToolResultUpdate {
   type: "tool_result";
   tool_name: string;
@@ -238,6 +252,7 @@ export interface WorkflowCopilotToolResultUpdate {
   summary: string;
   iteration: number;
   tool_call_id: string;
+  code_diffs?: CodeWriteDiff[] | null;
   detail?: string | null;
   timestamp?: string | null;
 }
@@ -250,6 +265,10 @@ export interface WorkflowCopilotCondensingUpdate {
 export interface WorkflowCopilotNarrationUpdate {
   type: "narration";
   narration: string;
+  // Narrator-authored row titles. Absent against a backend that predates them,
+  // so the row falls back to its tool-derived label.
+  active_label?: string | null;
+  outcome_label?: string | null;
   iteration: number;
   timestamp: string;
 }

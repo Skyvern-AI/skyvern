@@ -128,6 +128,16 @@ class ClickContext(BaseModel):
     desired_state: bool | None = None
 
 
+# Stamp on Task V3-persisted action rows. Their `reasoning` is the whole TURN's text, shared by
+# every action of the round — readers that assume per-action reasoning (cached-script prompt
+# inference) must key off this stamp and skip it.
+TASK_V3_ACTION_DESCRIPTION_PREFIX = "task_v3 "
+
+
+def reasoning_is_turn_scoped(description: str | None) -> bool:
+    return bool(description) and str(description).startswith(TASK_V3_ACTION_DESCRIPTION_PREFIX)
+
+
 class Action(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

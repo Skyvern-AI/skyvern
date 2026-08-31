@@ -23,10 +23,16 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_SELECT_OPTIONS,
     _MAX_SELECTOR_CHARS,
     _MAX_TABLE_HEADERS,
+    _MAX_VISIBLE_CONTROLS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
     _MODAL_IDENTITY_PATTERNS,
     _MODAL_ROLE_VALUES,
+    _RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR,
+    _RENDERED_STYLE_SNAPSHOT_ATTR,
     _RESULT_CONTAINER_HINTS,
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+    OBSERVED_CHECKED_FIELD_TYPES,
+    OBSERVED_VALUE_FIELD_TYPES,
 )
 
 # Keep stripped-body evaluate results under the shared MCP response cap while
@@ -36,10 +42,107 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
     "(() => {"
     "  const b = document.body; if (!b) return '';"
     "  const c = b.cloneNode(true);"
+    "  const sourceNodes = [b, ...b.querySelectorAll('*')];"
+    "  const cloneNodes = [c, ...c.querySelectorAll('*')];"
+    "  const cloneBySource = new Map(sourceNodes.map((source, index) => [source, cloneNodes[index]]));"
+    f"  for (const clone of cloneNodes) {{ clone.removeAttribute('{_RENDERED_STYLE_SNAPSHOT_ATTR}');"
+    f"    clone.removeAttribute('{_RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR}'); }}"
+    "  const vw = window.innerWidth || document.documentElement.clientWidth || 0;"
+    "  const vh = window.innerHeight || document.documentElement.clientHeight || 0;"
+    f"  const modalRoles = {json.dumps(sorted(_MODAL_ROLE_VALUES))};"
+    f"  const modalPatterns = {json.dumps(sorted(_MODAL_IDENTITY_PATTERNS))};"
+    "  const effectiveOpacity = (node) => {"
+    "    let opacity = 1;"
+    "    for (let current = node; current && current.nodeType === 1; current = current.parentElement) {"
+    "      let currentStyle; try { currentStyle = window.getComputedStyle(current); } catch (e) { return 0; }"
+    "      const value = Number.parseFloat(currentStyle.opacity || '1');"
+    "      if (!Number.isFinite(value)) return 0;"
+    "      opacity *= value;"
+    "    }"
+    "    return opacity;"
+    "  };"
+    "  const controlVisible = (node) => {"
+    "    let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }"
+    "    const rect = node.getBoundingClientRect();"
+    "    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;"
+    "  };"
+    "  const interceptsOutsideControl = (root) => {"
+    "    for (const control of document.querySelectorAll('button,a,input,select,textarea,[role=\"button\" i]')) {"
+    "      if (root.contains(control) || !controlVisible(control)) continue;"
+    "      const rect = control.getBoundingClientRect();"
+    "      if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= vw || rect.top >= vh) continue;"
+    "      const x = Math.max(0, Math.min(vw - 1, rect.left + rect.width / 2));"
+    "      const y = Math.max(0, Math.min(vh - 1, rect.top + rect.height / 2));"
+    "      const top = document.elementFromPoint(x, y);"
+    "      if (top && root.contains(top)) return true;"
+    "    }"
+    "    return false;"
+    "  };"
+    "  const stampVisibility = (source, clone) => {"
+    "    if (!clone) return;"
+    "    let style; try { style = window.getComputedStyle(source); } catch (e) { return; }"
+    "    clone.style.setProperty('display', style.display);"
+    "    clone.style.setProperty('visibility', style.visibility);"
+    "  };"
+    "  const stamp = (source, clone, root) => {"
+    "    if (!clone) return;"
+    "    let style; try { style = window.getComputedStyle(source); } catch (e) { return; }"
+    "    const rect = source.getBoundingClientRect();"
+    f"    clone.setAttribute('{_RENDERED_STYLE_SNAPSHOT_ATTR}', 'true');"
+    "    for (const property of ['display', 'visibility', 'pointer-events'])"
+    "      clone.style.setProperty(property, style.getPropertyValue(property));"
+    "    clone.style.setProperty('width', String(rect.width) + 'px');"
+    "    clone.style.setProperty('height', String(rect.height) + 'px');"
+    "    if (!root) return;"
+    "    clone.style.setProperty('position', style.position);"
+    "    clone.style.setProperty('z-index', style.zIndex);"
+    "    const opacity = effectiveOpacity(source);"
+    "    clone.style.setProperty('opacity', String(opacity));"
+    "    const covers = vw > 0 && vh > 0 && rect.width > 0 && rect.height > 0 &&"
+    "      rect.left <= vw * 0.05 && rect.top <= vh * 0.05 &&"
+    "      rect.right >= vw * 0.95 && rect.bottom >= vh * 0.95;"
+    "    const zIndex = Number.parseFloat(style.zIndex);"
+    "    const canBlockInteraction = covers && ['fixed', 'sticky'].includes(style.position) &&"
+    "      Number.isFinite(zIndex) && zIndex >= 10 && style.display !== 'none' &&"
+    "      style.visibility !== 'hidden' && style.pointerEvents !== 'none' && opacity > 0.05;"
+    f"    if (canBlockInteraction && interceptsOutsideControl(source)) clone.setAttribute('{_RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR}', 'true');"
+    "    if (covers) {"
+    "      clone.style.setProperty('inset', '0px');"
+    "      clone.style.setProperty('width', '100vw');"
+    "      clone.style.setProperty('height', '100vh');"
+    "    } else {"
+    "      clone.style.setProperty('inset', 'auto');"
+    "      clone.style.setProperty('top', String(rect.top) + 'px');"
+    "      clone.style.setProperty('right', 'auto');"
+    "      clone.style.setProperty('bottom', 'auto');"
+    "      clone.style.setProperty('left', String(rect.left) + 'px');"
+    "    }"
+    "  };"
+    "  const computedVisibility = new Map();"
+    "  for (let i = 0; i < sourceNodes.length; i++) {"
+    "    const source = sourceNodes[i]; const clone = cloneNodes[i];"
+    "    let style; try { style = window.getComputedStyle(source); } catch (e) { continue; }"
+    "    const parentVisibility = computedVisibility.get(source.parentElement) || '';"
+    "    computedVisibility.set(source, style.visibility);"
+    "    if (style.visibility === 'hidden' || parentVisibility === 'hidden') stampVisibility(source, clone);"
+    "    const attr = (name) => String(source.getAttribute(name) || '');"
+    "    const identity = [source.tagName, attr('id'), attr('class'), attr('role'), attr('aria-label'),"
+    "      attr('title'), attr('data-testid'), attr('data-test'), attr('data-dismiss')].join(' ').toLowerCase();"
+    "    const semanticallyModal = modalRoles.includes(attr('role').trim().toLowerCase()) ||"
+    "      attr('aria-modal').trim().toLowerCase() === 'true' || modalPatterns.some((p) => identity.includes(p));"
+    "    if (!['fixed', 'sticky'].includes(style.position) && !semanticallyModal) continue;"
+    "    stamp(source, clone, true);"
+    "    for (let ancestor = source.parentElement; ancestor; ancestor = ancestor.parentElement) {"
+    "      stampVisibility(ancestor, cloneBySource.get(ancestor));"
+    "    }"
+    "    for (const control of source.querySelectorAll('button,a,input,[role=\"button\" i]')) {"
+    "      stamp(control, cloneBySource.get(control), false);"
+    "    }"
+    "  }"
     "  c.querySelectorAll('script,style,noscript,svg,template,iframe,canvas,link').forEach(n => n.remove());"
     "  const w = document.createTreeWalker(c, NodeFilter.SHOW_COMMENT, null);"
     "  const comments = []; while (w.nextNode()) comments.push(w.currentNode); comments.forEach(n => n.remove());"
-    "  const h = c.innerHTML.replace(/>\\s+</g, '><').replace(/\\s{2,}/g, ' ');"
+    "  const h = c.outerHTML.replace(/>\\s+</g, '><').replace(/\\s{2,}/g, ' ');"
     f"  return h.length > {COMPOSITION_STRIPPED_HTML_MAX_CHARS} ? "
     f"h.slice(0, {COMPOSITION_STRIPPED_HTML_MAX_CHARS}) : h;"
     "})()"
@@ -183,15 +286,17 @@ _JS_SELECTOR_CANDIDATES_HELPER = (
     "  const add = (selector, source) => {"
     "    if (!selector || candidates.some((item) => item.selector === selector)) return;"
     "    let matches = []; try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { return; }"
-    "    if (matches.includes(el)) candidates.push({selector: selector, source: source});"
+    "    if (matches.includes(el)) candidates.push({selector: selector, source: source, match_count: matches.length});"
     "  };"
     "  add(requested, 'requested');"
     "  const id = attr(el, 'id'); if (id) add('#' + esc(id), 'id');"
+    "  const dataAction = attr(el, 'data-action'); if (dataAction) add(tag + '[data-action=\"' + dataAction.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'data_action');"
     "  const name = attr(el, 'name'); if (name) add(tag + '[name=\"' + name.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'name');"
     "  const aria = attr(el, 'aria-label'); if (aria) add(tag + '[aria-label=\"' + aria.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'aria_label');"
     "  const type = attr(el, 'type'); if (type) add(tag + '[type=\"' + type.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'type');"
     "  const classes = Array.from(el.classList || []).filter(Boolean);"
     "  if (classes.length) add(tag + classes.map((value) => '.' + esc(value)).join(''), 'class_list');"
+    "  add(tag, 'tag');"
     "  return candidates;"
     "};"
 )
@@ -212,6 +317,18 @@ def selector_candidates_expression(css_selector: str) -> str:
         f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
         "  return collectCandidates(el, requested);"
         "})()"
+    )
+
+
+def resolved_locator_selector_candidates_expression(requested_selector: str) -> str:
+    """Collect CSS identities from the exact element Playwright resolved at match index zero."""
+    requested = json.dumps(requested_selector)
+    return (
+        "(el) => {"
+        f"  const requested = {requested};"
+        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        "  return collectCandidates(el, requested);"
+        "}"
     )
 
 
@@ -279,23 +396,17 @@ def enclosing_form_submit_controls_expression(css_selector: str) -> str:
     return (
         "(() => {"
         "  try {"
+        f"    {_JS_SELECTOR_CANDIDATES_HELPER}"
         f"    const el = document.querySelector({sel});"
         "    const form = el && el.closest ? el.closest('form') : null;"
         "    if (!form) return [];"
-        "    const uniq = (s) => { try { return s && document.querySelectorAll(s).length === 1; } catch (e) { return false; } };"
-        "    const esc = (v) => String(v).split('\\\\').join('\\\\\\\\').split('\"').join('\\\\\"');"
         "    const out = [];"
         "    for (const c of form.querySelectorAll('button, input[type=submit]')) {"
         "      if (out.length >= 5) break;"
         "      const aria = c.getAttribute('aria-label') || '';"
         "      const label = (String(c.textContent || '').replace(/\\s+/g, ' ').trim()"
         "        || aria || c.getAttribute('title') || c.getAttribute('value') || '').slice(0, 80);"
-        "      const tag = (c.tagName || '').toLowerCase();"
-        "      const id = c.getAttribute('id');"
-        "      let s = '';"
-        "      if (id && uniq('#' + id)) s = '#' + id;"
-        "      else if (aria && uniq(tag + '[aria-label=\"' + esc(aria) + '\"]')) s = tag + '[aria-label=\"' + esc(aria) + '\"]';"
-        "      out.push({ label: label, selector: s });"
+        "      out.push({ label: label, selector_candidates: collectCandidates(c, '') });"
         "    }"
         "    return out;"
         "  } catch (e) { return []; }"
@@ -378,15 +489,14 @@ COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
     "})()"
 )
 
-# Safety bound; an over-cap payload is returned as a typed structured-extraction failure.
-COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS = 120_000
-
 # Injected from composition_evidence so the JS matches the parser's caps/vocabulary (single source of truth).
 _STRUCTURED_CONST_HEADER = (
     f"const ANTI_BOT_PATTERNS={json.dumps(list(_ANTI_BOT_PATTERNS))};"
     f"const MODAL_IDENTITY_PATTERNS={json.dumps(sorted(_MODAL_IDENTITY_PATTERNS))};"
     f"const MODAL_ROLE_VALUES={json.dumps(sorted(_MODAL_ROLE_VALUES))};"
     f"const RESULT_CONTAINER_HINTS={json.dumps(sorted(_RESULT_CONTAINER_HINTS))};"
+    f"const OBSERVED_VALUE_TYPES=new Set({json.dumps(sorted(OBSERVED_VALUE_FIELD_TYPES))});"
+    f"const OBSERVED_CHECKED_TYPES=new Set({json.dumps(sorted(OBSERVED_CHECKED_FIELD_TYPES))});"
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
@@ -403,8 +513,11 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_MODAL_OVERLAYS={int(_MAX_MODAL_OVERLAYS)};"
     f"const MAX_MODAL_DISMISS_CONTROLS={int(_MAX_MODAL_DISMISS_CONTROLS)};"
     f"const MAX_PAGE_OBSTRUCTIONS={int(_MAX_PAGE_OBSTRUCTIONS)};"
+    f"const MAX_VISIBLE_CONTROLS={int(_MAX_VISIBLE_CONTROLS)};"
     f"const MAX_VISIBLE_TEXT_EXCERPT_CHARS={int(_MAX_VISIBLE_TEXT_EXCERPT_CHARS)};"
-    f"const ANTI_BOT_SCAN_BYTES={int(_ANTI_BOT_SCAN_BYTES)};" + _JS_IMPLICIT_ROLE_HELPER
+    f"const ANTI_BOT_SCAN_BYTES={int(_ANTI_BOT_SCAN_BYTES)};"
+    + _JS_IMPLICIT_ROLE_HELPER
+    + f"const STRUCTURED_EVIDENCE_MAX_CHARS={int(COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS)};"
 )
 
 # Mirrors parse_composition_html's structural extraction; Python re-bounds the values to the exact caps.
@@ -432,18 +545,24 @@ const classesFor = (el) => Array.from((el && el.classList) || []).map((c) => Str
 const cssAttr = (v) => String(v).split('\\').join('\\\\').split('"').join('\\"');
 const simpleIdent = (v) => { if (!v) return false; if (!/[A-Za-z_-]/.test(v[0])) return false; for (let i = 1; i < v.length; i++) { if (!/[A-Za-z0-9_-]/.test(v[i])) return false; } return true; };
 const classSelector = (classes) => { const parts = []; for (const c of classes.slice(0, 3)) { parts.push(simpleIdent(c) ? '.' + c : '[class~="' + cssAttr(c) + '"]'); } return parts.join(''); };
+const cssSelectorMatchCache = new Map();
+const cssMatchesFor = (selector) => {
+  if (cssSelectorMatchCache.has(selector)) return cssSelectorMatchCache.get(selector);
+  let matches = null;
+  try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { matches = null; }
+  cssSelectorMatchCache.set(selector, matches);
+  return matches;
+};
 const resolvesUniquely = (sel, el) => {
   if (!sel) return false;
-  try { const m = document.querySelectorAll(sel); return m.length === 1 && m[0] === el; } catch (e) { return false; }
+  const matches = cssMatchesFor(sel);
+  return matches !== null && matches.length === 1 && matches[0] === el;
 };
 const TEXT_ANCHOR_MAX_HOPS = 4;
 const TEXT_ANCHOR_MAX_LABELS = 4;
 const TEXT_ANCHOR_MAX_LABEL_CHARS = 60;
-const TEXT_ANCHOR_MAX_VALUE_ANCHORS = 2;
 const labelLike = (text) => text.length >= 2 && text.indexOf('{') < 0;
-// Page data ("9.42K", "+13.4%", "1,284") renames itself on the next refresh, so it anchors a node only
-// when no wordy leaf in the same ancestor does. A digit alone does not make a name unstable — "Q3
-// revenue" is as durable as any label — so a word carries the text back to the label side.
+// Identity labels distinguish names from volatile page data; this never selects or orders a locator.
 const valueLike = (text) => /\d/.test(text) && !/[A-Za-z]{3}/.test(text);
 // Playwright resolves :has-text() itself and document.querySelectorAll throws on it, so the rung that
 // emits a text anchor owns its own uniqueness check and the CSS filter must skip what it emitted.
@@ -505,8 +624,8 @@ const anchorLeavesFor = (el) => {
       let node = leaf.parentElement;
       for (let hops = 0; node && hops < TEXT_ANCHOR_MAX_HOPS; hops++, node = node.parentElement) {
         const bucket = anchorLeafIndex.get(node);
-        // Every leaf is kept: dropping by document order would decide which labels are even
-        // considered before any of them is ranked, and the best label is often not the first.
+        // Every leaf is kept in document order so capture order is reproducible without choosing
+        // which label representation should be authored.
         if (!bucket) { anchorLeafIndex.set(node, [{ el: leaf, text: leafText }]); continue; }
         bucket.push({ el: leaf, text: leafText });
       }
@@ -523,14 +642,13 @@ const textAnchorCandidateFor = (base, label, anchor, inner, el) => {
     let within; try { within = Array.from(anchor.querySelectorAll(inner)); } catch (e) { return null; }
     if (within.length !== 1 || within[0] !== el) return null;
   }
-  return { selector: selector, source: 'text_anchor' };
+  return { selector: selector, source: 'text_anchor', match_count: 1 };
 };
 const textAnchorCandidatesFor = (el) => {
   const out = [];
   const ownText = nodeText(el);
   const shape = shapeSelector(el);
-  // A control usually names itself ("Export", "Sign in"); anchoring it on a neighbour's text when its
-  // own text is unique offers a weaker selector than the one a person would write.
+  // Capture the control's own text anchor and nearby text anchors without preferring one source.
   if (ownText && readsAsOneLeaf(el) && ownText.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && labelLike(ownText)) {
     const candidate = textAnchorCandidateFor(shape, ownText, el, '', el);
     if (candidate) out.push(candidate);
@@ -541,15 +659,9 @@ const textAnchorCandidatesFor = (el) => {
     if (!base) continue;
     const inner = node === el ? '' : shape;
     const leaves = anchorLeavesFor(node).filter((leaf) => leaf.el !== el && leaf.text !== ownText);
-    leaves.sort((a, b) => (valueLike(a.text) ? 1 : 0) - (valueLike(b.text) ? 1 : 0) || a.text.length - b.text.length);
     for (const leaf of leaves.slice(0, TEXT_ANCHOR_MAX_LABELS)) {
       const candidate = textAnchorCandidateFor(base, leaf.text, node, inner, el);
-      if (!candidate) continue;
-      // A stable label is the anchor worth having, so it ends the climb. Anchors built from page data
-      // never do: a card whose figure and delta sit beside each other would otherwise stop the walk on
-      // two volatile anchors and never reach the label one level up that actually names it.
-      if (!valueLike(leaf.text)) { out.unshift(candidate); return out; }
-      if (out.length < TEXT_ANCHOR_MAX_VALUE_ANCHORS) out.push(candidate);
+      if (candidate) out.push(candidate);
     }
   }
   return out;
@@ -561,7 +673,6 @@ const textAnchorCandidatesFor = (el) => {
 // flat form is a sibling field's label rather than this one's.
 const NAMING_SELECTOR = 'label,h1,h2,h3,h4,[aria-label]';
 const CONTROL_SELECTOR = 'input,select,textarea,button,[role="textbox"],[role="combobox"]';
-const VALUE_DEPENDENT_SOURCES = new Set(['name_value', 'class_value']);
 const NAMED_BY_OWN_TEXT_ROLES = new Set(['button', 'link', 'menuitem', 'tab', 'option', 'checkbox', 'radio']);
 const namingTextOf = (node) => attr(node, 'aria-label') || nodeText(node);
 const labelContextFor = (el) => {
@@ -652,21 +763,36 @@ const structuralPath = (el) => {
   }
   return full;
 };
-// The selector is a contract: the model clicks it and authors it into submitted blocks, so an
-// ambiguous or unresolvable guess costs a failed run rather than a retry. Every candidate is
-// verified to match this exact node and nothing else before it is handed out.
-const selectorCandidatesFor = (el) => {
+// Candidate order is deterministic capture order only. Each candidate is verified to match this
+// exact node and carries its observed cardinality; the acting model owns locator choice.
+const selectorCandidateCache = new WeakMap();
+const selectorCandidatesFor = (
+  el,
+  includeNonActionInputValue = true,
+  includeActionValue = true,
+  includeHref = true,
+) => {
+  const cacheKey = [includeNonActionInputValue, includeActionValue, includeHref].join(':');
+  let cachedByOptions = selectorCandidateCache.get(el);
+  if (cachedByOptions && cachedByOptions.has(cacheKey)) return cachedByOptions.get(cacheKey);
   const tag = (el.tagName || '*').toLowerCase();
+  const type = lower(attr(el, 'type')).trim();
+  const valueCanNameAction = tag !== 'input' || ['button', 'submit', 'reset', 'image'].includes(type);
   const candidates = [];
   // Same bound the parser applies, enforced before the payload is measured: an over-length selector is
   // dropped either way, so shipping it only spends the packet's size budget — and an oversized packet
   // is discarded whole, costing every other carrier on the page.
   const offer = (selector, source) => {
-    if (selector && selector.length <= MAX_SELECTOR_CHARS) candidates.push({ selector: selector, source: source });
+    if (!selector || selector.length > MAX_SELECTOR_CHARS) return;
+    const matches = cssMatchesFor(selector);
+    candidates.push({ selector: selector, source: source, match_count: matches === null ? null : matches.length });
   };
   const id = attr(el, 'id');
   if (id) offer(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]', 'id');
-  const name = attr(el, 'name'); const value = attr(el, 'value');
+  const name = attr(el, 'name');
+  const value = (valueCanNameAction ? includeActionValue : includeNonActionInputValue) ? attr(el, 'value') : '';
+  const dataAction = attr(el, 'data-action');
+  if (dataAction) offer(tag + '[data-action="' + cssAttr(dataAction) + '"]', 'data_action');
   if (name && value) offer(tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]', 'name_value');
   const classes = classesFor(el); const cs = classSelector(classes);
   if (cs && value) offer(tag + cs + '[value="' + cssAttr(value) + '"]', 'class_value');
@@ -674,17 +800,10 @@ const selectorCandidatesFor = (el) => {
   const ariaLabel = attr(el, 'aria-label');
   if (ariaLabel) offer(tag + '[aria-label="' + cssAttr(ariaLabel) + '"]', 'aria_label');
   const href = attr(el, 'href');
-  if (tag === 'a' && href) offer('a[href="' + cssAttr(href) + '"]', 'href');
+  if (tag === 'a' && href && includeHref) offer('a[href="' + cssAttr(href) + '"]', 'href');
   if (cs) offer(tag + cs, 'class');
-  const type = attr(el, 'type');
   if (cs && type) offer(tag + cs + '[type="' + cssAttr(type) + '"]', 'class_type');
-  // The text rung costs a document walk, so it is paid for only when no attribute rung already names
-  // this node alone; it is offered above the positional path and below any unique attribute. A rung
-  // that is unique only because of a current value does not count as naming it: the value is what
-  // changes on the next render, which is the failure this rung exists to avoid.
-  if (!candidates.some((candidate) => !VALUE_DEPENDENT_SOURCES.has(candidate.source) && resolvesUniquely(candidate.selector, el))) {
-    for (const candidate of textAnchorCandidatesFor(el)) candidates.push(candidate);
-  }
+  for (const candidate of textAnchorCandidatesFor(el)) candidates.push(candidate);
   offer(structuralPath(el), 'structural');
   const seen = new Set();
   const offered = [];
@@ -694,26 +813,33 @@ const selectorCandidatesFor = (el) => {
     // querySelectorAll throws on :has-text(), so re-verifying a text anchor here would drop every one
     // it emitted; the rung already proved this selector resolves to this node alone.
     if (candidate.source === 'text_anchor') { offered.push(candidate); continue; }
-    try { if (!Array.from(document.querySelectorAll(candidate.selector)).includes(el)) continue; } catch (e) { continue; }
+    const matches = cssMatchesFor(candidate.selector);
+    if (matches === null || !matches.includes(el)) continue;
     offered.push(candidate);
   }
+  if (!cachedByOptions) {
+    cachedByOptions = new Map();
+    selectorCandidateCache.set(el, cachedByOptions);
+  }
+  cachedByOptions.set(cacheKey, offered);
   return offered;
 };
-// A relation's key is the label the page itself prints beside the value, so it is the anchor the
-// carrier is offered under before any shape the generic ladder happens to pick.
+// A relation's key can provide one additional factual representation. It is appended after the
+// generic capture so its presence does not reorder or privilege another source.
 const relationCandidatesFor = (carrier, keyText) => {
   const label = String(keyText || '').trim();
   const base = shapeSelector(carrier);
   const keyed = label && labelLike(label) && label.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && base
     ? textAnchorCandidateFor(base, label, carrier, '', carrier)
     : null;
-  const rest = selectorCandidatesFor(carrier).filter((candidate) => !keyed || candidate.selector !== keyed.selector);
-  return keyed ? [keyed].concat(rest) : rest;
+  const captured = selectorCandidatesFor(carrier);
+  return keyed && !captured.some((candidate) => candidate.selector === keyed.selector)
+    ? captured.concat([keyed])
+    : captured;
 };
-// The primary selector feeds CSS APIs (match counts, position lookups), so it stays CSS-only even
-// when a text anchor is the sturdier offer.
-const selectorFor = (el) => {
-  const candidates = selectorCandidatesFor(el).filter((item) => item.source !== 'text_anchor').map((item) => item.selector);
+// Internal CSS lookup used only to measure and join page facts. It is not a model-visible choice.
+const selectorFor = (el, includeNonActionInputValue = true, includeActionValue = true, includeHref = true) => {
+  const candidates = selectorCandidatesFor(el, includeNonActionInputValue, includeActionValue, includeHref).filter((item) => item.source !== 'text_anchor').map((item) => item.selector);
   for (let i = 0; i < candidates.length; i++) {
     if (resolvesUniquely(candidates[i], el)) return candidates[i];
   }
@@ -722,13 +848,17 @@ const selectorFor = (el) => {
 // A submit control with no text still has an identity in title/aria-label/alt (an icon-only
 // "Sign in with Google" is the common shape). Reporting it as an empty string offers the model an
 // anonymous control alongside the named one it actually wants.
-const controlLabel = (el) => {
-  const own = nodeText(el) || attr(el, 'value');
+const controlLabel = (el, includeNonActionInputValue = true, includeActionValue = true) => {
+  const tag = (el.tagName || '').toLowerCase();
+  const type = lower(attr(el, 'type')).trim();
+  const valueCanNameAction = tag !== 'input' || ['button', 'submit', 'reset', 'image'].includes(type);
+  const own = nodeText(el) || ((valueCanNameAction ? includeActionValue : includeNonActionInputValue) ? attr(el, 'value') : '');
   if (own) return own;
   const img = el.querySelector && el.querySelector('img[alt], [aria-label]');
   return (
     attr(el, 'aria-label') ||
     attr(el, 'title') ||
+    attr(el, 'alt') ||
     (img ? attr(img, 'alt') || attr(img, 'aria-label') : '') ||
     ''
   );
@@ -739,6 +869,21 @@ const controlLabel = (el) => {
 const isFilled = (el) => {
   try {
     return typeof el.value === 'string' && el.value.length > 0;
+  } catch (e) {
+    return false;
+  }
+};
+// Live DOM property state, which diverges from the markup attribute once the agent interacts.
+const observedValue = (el) => {
+  try {
+    return typeof el.value === 'string' ? cap(el.value.trim()) : '';
+  } catch (e) {
+    return '';
+  }
+};
+const observedChecked = (el) => {
+  try {
+    return el.checked === true;
   } catch (e) {
     return false;
   }
@@ -793,7 +938,7 @@ const selectOptions = (el) => {
   const out = [];
   const opts = el.querySelectorAll('option');
   for (let i = 0; i < opts.length && out.length < MAX_SELECT_OPTIONS; i++) {
-    out.push({ text: nodeText(opts[i]), value: attr(opts[i], 'value'), selected: opts[i].hasAttribute('selected') });
+    out.push({ text: nodeText(opts[i]), value: attr(opts[i], 'value'), selected: opts[i].hasAttribute('selected'), observed_selected: opts[i].selected === true });
   }
   return out;
 };
@@ -815,7 +960,15 @@ const isHiddenModal = (el) => {
     if (lower(attr(cur, 'aria-hidden')).trim() === 'true') return true;
     if (cur.hasAttribute && cur.hasAttribute('hidden')) return true;
     const style = lower(attr(cur, 'style')).split(' ').join('');
-    if (style.includes('display:none') || style.includes('visibility:hidden')) return true;
+    if (style.includes('display:none') || (cur === el && style.includes('visibility:hidden'))) return true;
+    let computed; try { computed = window.getComputedStyle(cur); } catch (e) { return true; }
+    // visibility is inherited but may be explicitly restored by a descendant. The protected node's
+    // computed value already includes that cascade; an ancestor's value alone is not a blocker.
+    if (computed.display === 'none' || (cur === el && computed.visibility === 'hidden')) return true;
+    if (cur === el) {
+      const rect = cur.getBoundingClientRect();
+      if (!(rect.width > 0 && rect.height > 0)) return true;
+    }
     cur = cur.parentElement;
   }
   return false;
@@ -826,6 +979,63 @@ const controlVisible = (node) => {
   const rect = node.getBoundingClientRect();
   // Match Playwright for form-control readiness: opacity alone does not make a control hidden.
   return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+};
+const layerControlActionable = (control) => {
+  const tag = (control.tagName || '').toLowerCase();
+  const role = lower(attr(control, 'role')).trim();
+  const type = lower(attr(control, 'type')).trim();
+  if (!['button', 'a', 'input'].includes(tag) && role !== 'button') return false;
+  if (tag === 'input' && !['button', 'submit', 'reset', 'image'].includes(type)) return false;
+  if (controlDisabled(control) || isHiddenModal(control) || !controlVisible(control)) return false;
+  let style; try { style = window.getComputedStyle(control); } catch (e) { return false; }
+  return style.pointerEvents !== 'none';
+};
+const layerControlHasActionableEvidence = (control) => {
+  if (!layerControlActionable(control)) return false;
+  const text = controlLabel(control, false, false);
+  if (!(text || attr(control, 'aria-label') || attr(control, 'title'))) return false;
+  return !!selectorFor(control, false, false, false) && selectorCandidatesFor(control, false, false, false).length > 0 && !!identityFor(control);
+};
+const firstActionableLayerControl = (node) =>
+  Array.from(node.querySelectorAll('button,a,input,[role="button" i]')).find((control) => layerControlHasActionableEvidence(control)) || null;
+const interceptsOutsideControl = (root) => {
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  for (const control of document.querySelectorAll('button,a,input,select,textarea,[role="button" i]')) {
+    if (root.contains(control) || !controlVisible(control)) continue;
+    const rect = control.getBoundingClientRect();
+    if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= viewportWidth || rect.top >= viewportHeight) continue;
+    const x = Math.max(0, Math.min(viewportWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(0, Math.min(viewportHeight - 1, rect.top + rect.height / 2));
+    const top = document.elementFromPoint(x, y);
+    if (top && root.contains(top)) return true;
+  }
+  return false;
+};
+const effectiveOpacity = (node) => {
+  let opacity = 1;
+  for (let current = node; current && current.nodeType === 1; current = current.parentElement) {
+    let style; try { style = window.getComputedStyle(current); } catch (e) { return 0; }
+    const value = Number.parseFloat(style.opacity || '1');
+    if (!Number.isFinite(value)) return 0;
+    opacity *= value;
+  }
+  return opacity;
+};
+const isInteractionBlockingLayerCandidate = (node) => {
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  if (!['fixed', 'sticky'].includes(style.position)) return false;
+  const zIndex = Number.parseFloat(style.zIndex);
+  if (!Number.isFinite(zIndex) || zIndex < 10) return false;
+  const opacity = effectiveOpacity(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
+  if (!Number.isFinite(opacity) || opacity <= 0.05) return false;
+  const rect = node.getBoundingClientRect();
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  if (!(viewportWidth > 0 && viewportHeight > 0 && rect.width > 0 && rect.height > 0)) return false;
+  if (!(rect.left <= viewportWidth * 0.05 && rect.top <= viewportHeight * 0.05 && rect.right >= viewportWidth * 0.95 && rect.bottom >= viewportHeight * 0.95)) return false;
+  return interceptsOutsideControl(node) && firstActionableLayerControl(node) !== null;
 };
 const disclosureFacts = (el) => {
   const expanded = lower(attr(el, 'aria-expanded')).trim();
@@ -846,16 +1056,31 @@ const modalDismissControls = (node) => {
   const seen = new Set();
   for (const c of node.querySelectorAll('button,a,input')) {
     if (out.length >= MAX_MODAL_DISMISS_CONTROLS) break;
-    const selector = selectorFor(c);
+    const selector = selectorFor(c, false);
     if (seen.has(selector)) continue;
     // Every control the dialog offers is reported. A keyword list cannot name every way a dialog
     // closes ("No, keep ...", an icon-only glyph), and filtering on one leaves the agent looking at
     // a modal it has no way to clear.
-    const text = controlLabel(c);
+    const text = controlLabel(c, false);
     seen.add(selector);
-    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, selector_candidates: selectorCandidatesFor(c), identity: identityFor(c), type: attr(c, 'type') });
+    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, selector_candidates: selectorCandidatesFor(c, false), identity: identityFor(c), type: attr(c, 'type') });
   }
   return out;
+};
+const interactionBlockingLayerControls = (node) => {
+  const offered = Array.from(node.querySelectorAll('button,a,input,[role="button" i]')).filter((control) =>
+    layerControlHasActionableEvidence(control));
+  const visibleControls = offered.slice(0, MAX_VISIBLE_CONTROLS).map((c) => ({
+    tag: (c.tagName || '').toLowerCase(),
+    text: controlLabel(c, false, false),
+    aria_label: attr(c, 'aria-label'),
+    title: attr(c, 'title'),
+    selector: selectorFor(c, false, false, false),
+    selector_candidates: selectorCandidatesFor(c, false, false, false),
+    identity: identityFor(c),
+    type: attr(c, 'type'),
+  }));
+  return { visible_controls: visibleControls, visible_controls_omitted: Math.max(offered.length - MAX_VISIBLE_CONTROLS, 0) };
 };
 
 const all = document.querySelectorAll('*');
@@ -864,9 +1089,11 @@ const SKIP_TAGS = new Set(['script', 'style', 'noscript']);
 const forms = [];
 for (const form of document.querySelectorAll('form')) {
   if (forms.length >= MAX_FORMS) break;
+  const formVisible = controlVisible(form);
   const fields = [];
   const submitControls = [];
   for (const node of form.querySelectorAll('input,select,textarea,button')) {
+    if (!controlVisible(node)) continue;
     const tag = (node.tagName || '').toLowerCase();
     const declaredType = lower(attr(node, 'type'));
     const fieldType = tag === 'button'
@@ -880,12 +1107,19 @@ for (const form of document.querySelectorAll('form')) {
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
     const options = tag === 'select' ? selectOptions(node) : [];
     const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
+    // Observed state needs both a real <input> tag here and the reported attribute type at the
+    // Python and replay re-gates; the pair is deliberately an AND so a page that declares
+    // type="date" on a textarea mirroring a password acquires no observed value.
+    const observedType = tag === 'input' ? lower(node.type) : '';
+    if (OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
+    if (OBSERVED_CHECKED_TYPES.has(observedType)) field.observed_checked = observedChecked(node);
     if (tag === 'select') {
       field.option_count = node.querySelectorAll('option').length;
       field.options_omitted = field.option_count > options.length;
     }
     fields.push(field);
   }
+  if (!formVisible && !fields.length && !submitControls.length) continue;
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }
 
@@ -964,7 +1198,7 @@ for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.select
 for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
 const clickableControls = [];
 const seenClickableText = new Set();
-for (const el of document.querySelectorAll('button,[role="button"],[data-action]')) {
+for (const el of document.querySelectorAll('button,[role="button" i],[data-action]')) {
   if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
   const tag = (el.tagName || '').toLowerCase();
   if (SKIP_TAGS.has(tag)) continue;
@@ -989,7 +1223,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
 
 const resultContainers = [];
 let resultContainersTruncated = false;
-const selectorMatchCount = (selector) => { if (!selector) return 0; try { return document.querySelectorAll(selector).length; } catch (e) { return 0; } };
+const selectorMatchCount = (selector) => { if (!selector) return 0; const matches = cssMatchesFor(selector); return matches === null ? 0 : matches.length; };
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
   return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
@@ -1252,6 +1486,8 @@ for (const node of all) {
     const v = attr(node, k);
     if (v) entry[k.split('-').join('_')] = v;
   }
+  entry.selector_candidates = selectorCandidatesFor(node);
+  entry.identity = identityFor(node);
   challengeControls.push(entry);
 }
 
@@ -1270,7 +1506,33 @@ for (const node of all) {
   const dismiss = modalDismissControls(node);
   if (!(role || ariaModal || dismiss.length > 0)) continue;
   seenModal.add(selector);
-  modalOverlays.push({ role: role, aria_modal: ariaModal, id: attr(node, 'id'), class: classesFor(node), selector: selector, text: nodeText(node), dismiss_controls: dismiss });
+  modalOverlays.push({ role: role, aria_modal: ariaModal, id: attr(node, 'id'), class: classesFor(node), selector: selector, selector_candidates: selectorCandidatesFor(node), identity: identityFor(node), text: nodeText(node), dismiss_controls: dismiss });
+}
+
+const interactionBlockingObstructions = [];
+const seenInteractionBlocking = new Set();
+for (const node of all) {
+  if (interactionBlockingObstructions.length >= MAX_PAGE_OBSTRUCTIONS) break;
+  const tag = (node.tagName || '').toLowerCase();
+  if (SKIP_TAGS.has(tag) || isModalCandidate(node) || !isInteractionBlockingLayerCandidate(node)) continue;
+  const selector = selectorFor(node, false, false, false);
+  if (seenInteractionBlocking.has(selector)) continue;
+  const controls = interactionBlockingLayerControls(node);
+  if (!controls.visible_controls.length) continue;
+  seenInteractionBlocking.add(selector);
+  const obstruction = {
+    kind: 'interaction_blocking_layer',
+    source: 'dom_html',
+    selector: selector,
+    selector_candidates: selectorCandidatesFor(node, false, false, false),
+    identity: identityFor(node),
+    text: nodeText(node),
+    intercepts_outside_control: true,
+    underlying_page_blocked: true,
+    visible_controls: controls.visible_controls,
+  };
+  if (controls.visible_controls_omitted > 0) obstruction.visible_controls_omitted = controls.visible_controls_omitted;
+  interactionBlockingObstructions.push(obstruction);
 }
 
 const visualObstructionCandidates = [];
@@ -1279,7 +1541,7 @@ const vh = window.innerHeight || document.documentElement.clientHeight || 0;
 const highZ = (v) => { const n = Number.parseFloat(v); return Number.isFinite(n) && n >= 10; };
 const obstructionVisible = (style, rect) => style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
 const coversViewport = (rect) => vw > 0 && vh > 0 && rect.left <= vw * 0.05 && rect.top <= vh * 0.05 && rect.right >= vw * 0.95 && rect.bottom >= vh * 0.95;
-const obstructionHasControl = (el) => Array.from(el.querySelectorAll('button,a,input,[role="button"]')).some((c) => {
+const obstructionHasControl = (el) => Array.from(el.querySelectorAll('button,a,input,[role="button" i]')).some((c) => {
   const text = ((c.innerText || '') + ' ' + (c.value || '') + ' ' + (c.getAttribute('aria-label') || '')).trim();
   if (!text) return false;
   const t = c.tagName.toLowerCase();
@@ -1311,7 +1573,85 @@ const haystack = (pageTitle + '\n' + scanHtml.slice(0, ANTI_BOT_SCAN_BYTES)).toL
 const antiBotIndicators = ANTI_BOT_PATTERNS.filter((p) => haystack.includes(p));
 const visibleText = document.body ? (document.body.innerText || '') : '';
 
-return JSON.stringify({
+const boundedStructuredEvidence = (payload) => {
+  const pythonCharCount = (value) => Array.from(value).length;
+  let serialized = JSON.stringify(payload);
+  let serializedCharCount = pythonCharCount(serialized);
+  if (serializedCharCount <= STRUCTURED_EVIDENCE_MAX_CHARS) return serialized;
+
+  const originalCharCount = serializedCharCount;
+  const omissions = [];
+  payload.size_compaction = { original_char_count: originalCharCount, omissions: omissions };
+  const recordOmission = (category, omittedCount, unit) => {
+    if (omittedCount <= 0) return;
+    const existing = omissions.find((item) => item.category === category);
+    if (existing) existing.omitted_count += omittedCount;
+    else omissions.push({ category: category, omitted_count: omittedCount, unit: unit });
+  };
+  const refresh = () => {
+    serialized = JSON.stringify(payload);
+    serializedCharCount = pythonCharCount(serialized);
+  };
+  const shedWhileNeeded = (shed) => {
+    while (serializedCharCount > STRUCTURED_EVIDENCE_MAX_CHARS && shed()) refresh();
+  };
+  const shedArrayTail = (category) => () => {
+    const values = payload[category];
+    if (!Array.isArray(values) || !values.length) return false;
+    values.pop();
+    recordOmission(category, 1, 'entries');
+    return true;
+  };
+  const shedOptionRound = () => {
+    let removed = 0;
+    for (let formIndex = payload.forms.length - 1; formIndex >= 0; formIndex--) {
+      const fields = Array.isArray(payload.forms[formIndex].fields) ? payload.forms[formIndex].fields : [];
+      for (let fieldIndex = fields.length - 1; fieldIndex >= 0; fieldIndex--) {
+        const options = fields[fieldIndex].options;
+        if (!Array.isArray(options) || !options.length) continue;
+        options.pop();
+        removed += 1;
+      }
+    }
+    recordOmission('forms.fields.options', removed, 'entries');
+    return removed > 0;
+  };
+  const shedResultDetailRound = (key) => () => {
+    let removed = 0;
+    for (let index = payload.result_containers.length - 1; index >= 0; index--) {
+      const values = payload.result_containers[index][key];
+      if (!Array.isArray(values) || !values.length) continue;
+      values.pop();
+      removed += 1;
+    }
+    recordOmission('result_containers.' + key, removed, 'entries');
+    return removed > 0;
+  };
+
+  refresh();
+  shedWhileNeeded(() => {
+    if (!payload.visible_text_excerpt) return false;
+    const omittedCount = pythonCharCount(payload.visible_text_excerpt);
+    payload.visible_text_excerpt = '';
+    recordOmission('visible_text_excerpt', omittedCount, 'characters');
+    return true;
+  });
+  shedWhileNeeded(shedOptionRound);
+  shedWhileNeeded(shedResultDetailRound('sample_rows'));
+  shedWhileNeeded(shedResultDetailRound('rows'));
+  shedWhileNeeded(shedArrayTail('navigation_targets'));
+  shedWhileNeeded(shedArrayTail('clickable_controls'));
+  shedWhileNeeded(shedArrayTail('forms'));
+  shedWhileNeeded(shedArrayTail('result_containers'));
+  shedWhileNeeded(shedArrayTail('key_value_relations'));
+  shedWhileNeeded(shedArrayTail('visual_obstruction_candidates'));
+  shedWhileNeeded(shedArrayTail('modal_overlays'));
+  shedWhileNeeded(shedArrayTail('page_obstructions'));
+  shedWhileNeeded(shedArrayTail('challenge_controls'));
+  return serialized;
+};
+
+const structuredEvidence = {
   page_title: pageTitle,
   forms: forms,
   navigation_targets_truncated: navigationTargetsTruncated,
@@ -1326,11 +1666,13 @@ return JSON.stringify({
   clickable_controls: clickableControls,
   challenge_controls: challengeControls,
   modal_overlays: modalOverlays,
+  page_obstructions: interactionBlockingObstructions,
   visual_obstruction_candidates: visualObstructionCandidates,
   visible_text_excerpt: visibleText.length > MAX_VISIBLE_TEXT_EXCERPT_CHARS * 2 ? visibleText.slice(0, MAX_VISIBLE_TEXT_EXCERPT_CHARS * 2) : visibleText,
   body_has_markup: !!(document.body && (document.body.children.length > 0 || (document.body.textContent || '').trim().length > 0)),
   anti_bot_indicators: antiBotIndicators,
-});
+};
+return boundedStructuredEvidence(structuredEvidence);
 """
 
 

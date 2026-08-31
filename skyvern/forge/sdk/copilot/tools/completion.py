@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     registered_download_completion_criterion,
     structural_unfired_contingent_criterion_ids,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composition_evidence
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
@@ -815,7 +816,6 @@ _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
         "CREDENTIAL_ERROR",
         "INFRASTRUCTURE_ERROR",
         "NAVIGATION_FAILURE",
-        "PER_TOOL_BUDGET",
         "PROXY_ERROR",
     }
 )
@@ -848,7 +848,7 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
     if not bool(result.get("ok", False)):
         return False
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
-    anti_bot, _empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
+    anti_bot, _empty_data_blocks, _categories, _goal_path_omissions = _analyze_run_blocks(result, copilot_ctx)
     if structured_blocker and (anti_bot or _artifact_challenge_flag_from_result(result, copilot_ctx)):
         return False
     return True
@@ -965,9 +965,9 @@ def _bind_independent_post_run_page_evidence(
     evidence = _same_run_post_run_page_evidence(copilot_ctx, run_id)
     if evidence is None:
         return
-    block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL] = {
-        key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS
-    }
+    block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL] = model_visible_composition_evidence(
+        {key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS}
+    )
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
     LOG.info(
         "copilot_post_run_page_evidence_snapshot_binding",

@@ -13,6 +13,7 @@ from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
 
 from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.tools import (
     _verify_requested_output_reads,
     inspect_page_for_composition_tool,
@@ -54,6 +55,22 @@ def _ctx(server: _DesignationServer) -> SimpleNamespace:
     )
 
 
+def _ctx_with_requested_output(server: _DesignationServer) -> SimpleNamespace:
+    ctx = _ctx(server)
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="return the visitors from last week",
+                output_path=OUTPUT_PATH,
+                requested_output_label="Visitors",
+            )
+        ]
+    )
+    ctx.scouted_output_covered_paths = set()
+    return ctx
+
+
 @pytest.mark.asyncio
 async def test_designation_returns_verified_page_facts_without_authored_code(monkeypatch: pytest.MonkeyPatch) -> None:
     server = _DesignationServer(
@@ -61,8 +78,8 @@ async def test_designation_returns_verified_page_facts_without_authored_code(mon
             "text": "8.89K",
             "selector": "[data-attr=visitors-value]",
             "selector_candidates": [
-                {"selector": "[data-attr=visitors-value]", "match_count": 1, "position": 0},
-                {"selector": "#web-visitors > span", "match_count": 2, "position": 1},
+                {"selector": "[data-attr=visitors-value]", "source": "unknown", "match_count": 1, "position": 0},
+                {"selector": "#web-visitors > span", "source": "unknown", "match_count": 2, "position": 1},
             ],
             "match_count": 1,
             "position": 0,
@@ -81,8 +98,8 @@ async def test_designation_returns_verified_page_facts_without_authored_code(mon
             "label": "Visitors",
             "rendered_value": "8.89K",
             "selector_candidates": [
-                {"selector": "[data-attr=visitors-value]", "match_count": 1, "position": 0},
-                {"selector": "#web-visitors > span", "match_count": 2, "position": 1},
+                {"selector": "[data-attr=visitors-value]", "source": "unknown", "match_count": 1, "position": 0},
+                {"selector": "#web-visitors > span", "source": "unknown", "match_count": 2, "position": 1},
             ],
             "page_url": PAGE_URL,
         }
@@ -127,13 +144,85 @@ def test_page_inspection_schema_exposes_designation_as_optional_model_input() ->
 
 
 @pytest.mark.asyncio
+async def test_page_inspection_offers_requested_output_designation_on_the_page_that_was_just_observed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _DesignationServer({})
+    ctx = _ctx_with_requested_output(server)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._inspect_page_for_composition_impl",
+        AsyncMock(return_value={"ok": True, "data": {"current_url": PAGE_URL}}),
+    )
+
+    raw = await inspect_page_for_composition_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="inspect_page_for_composition"),
+        json.dumps({"target_url": PAGE_URL, "requested_output_reads": []}),
+    )
+
+    result = json.loads(raw)
+    assert result["data"]["requested_output_designation_capability"] == {
+        "tool": "inspect_page_for_composition",
+        "argument": "requested_output_reads",
+        "page_reference": "current_page",
+        "requested_output_paths": [OUTPUT_PATH],
+        "citation_fields": ["output_path", "value_text", "label"],
+        "effect": "browser verifies the cited rendered value and returns selector candidates",
+    }
+
+
+@pytest.mark.asyncio
+async def test_page_inspection_keeps_a_unique_value_designation_when_the_models_label_is_not_on_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _DesignationServer(
+        {
+            "text": "8.89K",
+            "label_association": "not_found",
+            "selector_candidates": [{"selector": "#visitors", "source": "id", "match_count": 1, "position": 0}],
+            "url": PAGE_URL,
+        }
+    )
+    ctx = _ctx_with_requested_output(server)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._inspect_page_for_composition_impl",
+        AsyncMock(return_value={"ok": True, "data": {"current_url": PAGE_URL}}),
+    )
+
+    raw = await inspect_page_for_composition_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="inspect_page_for_composition"),
+        json.dumps(
+            {
+                "target_url": PAGE_URL,
+                "requested_output_reads": [
+                    {"output_path": OUTPUT_PATH, "value_text": "8.89K", "label": "analytics total"}
+                ],
+            }
+        ),
+    )
+
+    result = json.loads(raw)
+    assert result["data"]["requested_output_designations"] == [
+        {
+            "output_path": OUTPUT_PATH,
+            "label": "",
+            "label_association": "not_found",
+            "rendered_value": "8.89K",
+            "selector_candidates": [{"selector": "#visitors", "source": "id", "position": 0}],
+            "page_url": PAGE_URL,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_page_inspection_returns_designation_facts_on_the_existing_tool_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = _DesignationServer(
         {
             "text": "8.89K",
-            "selector_candidates": [{"selector": "#visitors", "match_count": 1, "position": 0}],
+            "selector_candidates": [{"selector": "#visitors", "source": "unknown", "match_count": 1, "position": 0}],
             "url": PAGE_URL,
         }
     )
@@ -159,7 +248,7 @@ async def test_page_inspection_returns_designation_facts_on_the_existing_tool_su
             "output_path": OUTPUT_PATH,
             "label": "Visitors",
             "rendered_value": "8.89K",
-            "selector_candidates": [{"selector": "#visitors", "match_count": 1, "position": 0}],
+            "selector_candidates": [{"selector": "#visitors", "source": "unknown", "position": 0}],
             "page_url": PAGE_URL,
         }
     ]
@@ -186,9 +275,10 @@ async def test_designation_probe_returns_every_verified_representation_without_c
 
     assert payload["text"] == "8.89K"
     assert payload["selector_candidates"] == [
-        {"selector": "span.metric-value", "match_count": 2, "position": 1},
+        {"selector": "span.metric-value", "source": "class", "match_count": 2, "position": 1},
         {
             "selector": "#analytics > section:nth-child(2) > span:nth-child(2)",
+            "source": "structural",
             "match_count": 1,
             "position": 0,
         },
@@ -197,14 +287,19 @@ async def test_designation_probe_returns_every_verified_representation_without_c
 
 @pytest.mark.asyncio
 @_requires_chromium
-async def test_designation_probe_verifies_the_model_cited_label_against_the_page() -> None:
+async def test_designation_probe_uses_a_cited_label_only_to_disambiguate_the_exact_value() -> None:
     async with async_playwright() as runner:
         browser = await runner.chromium.launch()
         try:
             page = await browser.new_page()
             await page.set_content("<section><h2>Visitors</h2><span>8.89K</span></section>")
-            payload = await page.evaluate(value_designation_probe_expression("8.89K", "Conversions"))
+            unique = await page.evaluate(value_designation_probe_expression("8.89K", "Conversions"))
+            await page.set_content("<section><span>8.89K</span><span>8.89K</span></section>")
+            ambiguous = await page.evaluate(value_designation_probe_expression("8.89K", "Conversions"))
         finally:
             await browser.close()
 
-    assert payload == {"error": "label-not-associated", "text": "8.89K", "url": "about:blank"}
+    assert unique["label_association"] == "not_found"
+    assert unique["text"] == "8.89K"
+    assert unique["selector_candidates"]
+    assert ambiguous == {"error": "text-ambiguous", "visible_count": 2, "text": "8.89K", "url": "about:blank"}

@@ -33,10 +33,16 @@ def seconds_until_expiry(
     seconds_since_last_activity: float | None,
     idle_timeout_seconds: float,
     max_lifetime_seconds: float = MAX_LIFETIME_SECONDS,
+    activity_extends_deadline: bool = True,
 ) -> float:
-    """Remaining lifetime under the base, activity, and hard-cap deadlines."""
+    """Remaining lifetime under the base, activity, and hard-cap deadlines.
+
+    Activity carries a session past its base timeout only where a later deadline can actually be
+    served. Infrastructure that pins a session's end at provisioning serves no later one, so
+    counting its activity lease reports time the browser will not be alive for (SKY-15044).
+    """
     lease_remaining_seconds = base_timeout_seconds - seconds_since_start
-    if seconds_since_last_activity is not None:
+    if activity_extends_deadline and seconds_since_last_activity is not None:
         lease_remaining_seconds = max(
             lease_remaining_seconds,
             idle_timeout_seconds - seconds_since_last_activity,

@@ -4,7 +4,7 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 import { humanizeBlockLabel } from "../blockLabel";
 import { everyTestBlockExecuted, hasFailedTestBlock } from "../copilotPhases";
-import { TurnNarrativeState } from "../narrativeState";
+import { TurnNarrativeState, ranCleanOnCurrentSource } from "../narrativeState";
 import { getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
@@ -25,17 +25,32 @@ export function getReviewGateVerdict(
   if (turn && hasFailedTestBlock(turn)) {
     return "untested";
   }
+  // A tested claim needs the turn's own facts behind it, so an absent bundle, partial
+  // coverage or a halted turn reads as untested rather than falling through to green.
+  const covered = ranCleanOnCurrentSource(turn?.turnFacts ?? null);
   if (
-    turn?.proposalDisposition === "review_tested" ||
-    turn?.proposalDisposition === "auto_applicable"
+    covered &&
+    (turn?.proposalDisposition === "review_tested" ||
+      turn?.proposalDisposition === "auto_applicable")
   ) {
     return "tested";
   }
   if (turn?.proposalDisposition) {
     return "untested";
   }
-  const legacy = proposedWorkflow as LegacyProposedWorkflow | null;
-  return legacy?._copilot_unvalidated ? "untested" : null;
+  if (!proposedWorkflow) {
+    return null;
+  }
+  const legacy = proposedWorkflow as LegacyProposedWorkflow;
+  if (legacy._copilot_unvalidated) {
+    return "untested";
+  }
+  // With no turn there are no facts to project from, so a still-pending gate stays
+  // silent rather than inventing either verdict.
+  if (!turn) {
+    return null;
+  }
+  return covered ? "tested" : "untested";
 }
 
 const VERDICT_PILL_CLASSES: Record<"tested" | "untested", string> = {
@@ -169,7 +184,16 @@ export function ReviewGateCard({
                       {section.prefix ? `${section.prefix} ` : ""}
                       {humanizeBlockLabel(block.label)}
                     </span>
-                    {block.neverTested ? (
+                    {block.coverage === "different_source" ? (
+                      <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
+                        Different source
+                      </span>
+                    ) : block.coverage === "unknown" ? (
+                      <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
+                        Not tested under this name
+                      </span>
+                    ) : block.coverage === "never_run" ||
+                      (block.coverage === undefined && block.neverTested) ? (
                       <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
                         Never tested
                       </span>
@@ -240,7 +264,9 @@ export function ReviewGateCard({
               onClick={onTestEndToEnd}
               className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
             >
-              Test end-to-end
+              {turn?.terminalEnvelope?.connectFailure
+                ? "Retry in a fresh session"
+                : "Test end-to-end"}
             </button>
           ) : null}
           {onTestEndToEnd ? (

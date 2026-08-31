@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { buildRevealOffsets, revealedCountAt } from "./actionReveal";
+import {
+  buildRevealOffsets,
+  revealedCharsAt,
+  revealedCountAt,
+} from "./actionReveal";
 
 describe("buildRevealOffsets", () => {
   it("clamps a duration below the floor up to 180ms", () => {
@@ -76,5 +80,25 @@ describe("revealedCountAt", () => {
       const after = revealedCountAt(buildRevealOffsets(grown), elapsed);
       expect(after).toBeGreaterThanOrEqual(before);
     }
+  });
+});
+
+describe("revealedCharsAt", () => {
+  it("reveals nothing at or before the arrival instant", () => {
+    expect(revealedCharsAt(50, 0)).toBe(0);
+    expect(revealedCharsAt(50, -1000)).toBe(0);
+  });
+
+  it("reveals a growing prefix as time passes", () => {
+    const early = revealedCharsAt(200, 300);
+    const later = revealedCharsAt(200, 900);
+    expect(early).toBeGreaterThan(0);
+    expect(later).toBeGreaterThan(early);
+    expect(later).toBeLessThan(200);
+  });
+
+  it("never exceeds the total, including the far-past elapsed a missing stamp produces", () => {
+    expect(revealedCharsAt(50, 10_000)).toBe(50);
+    expect(revealedCharsAt(50, Date.now())).toBe(50);
   });
 });

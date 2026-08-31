@@ -4,28 +4,59 @@ import asyncio
 import inspect
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from os import PathLike, fspath
 from types import FrameType
-from typing import Any, Awaitable, Callable
+from typing import Any, Literal, cast
 
 import pydantic
 import structlog
+from playwright.async_api import BrowserContext, Locator, Page
 
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
+from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.playwright_input import PlaywrightInputDefaults
 
 LOG = structlog.get_logger()
+
+_LOCATOR_STRATEGY_INPUT_OPTIONS = frozenset({"delay", "force", "no_wait_after", "text", "timeout", "value"})
+_PAGE_STRATEGY_INPUT_OPTIONS = frozenset(
+    {"delay", "force", "no_wait_after", "selector", "strict", "text", "timeout", "value"}
+)
+
+
+def _effective_playwright_timeout(defaults: PlaywrightInputDefaults, timeout: float | None) -> float:
+    """Resolve one aggregate deadline while preserving explicit zero."""
+    return defaults.timeout_ms if timeout is None else timeout
+
+
+def _page_strategy_input_locator(
+    page: Page,
+    selector: str,
+    strict: bool | None,
+    defaults: PlaywrightInputDefaults,
+) -> Locator:
+    """Build the locator equivalent of Page.fill/type without changing context strictness."""
+    locator = page.locator(selector)
+    if strict is not None:
+        return locator if strict else locator.first
+    return locator if defaults.strict_selectors else locator.first
+
 
 CODE_BLOCK_FILENAME = "<code_block>"
 # full_code = "\nasync def wrapper(...):\n<user code from line 3>"; user line = frame line - 2
 CODE_LINE_OFFSET = 2
 MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS = 20
 PENDING_CALL_DELAY_SECONDS = 20.0
-RECORDED_FAILURE_RESPONSE_MAX_CHARS = 500
+# Shared by persistence and Copilot projection. The measured attribute-heavy click fixture's
+# first cause line ends at character 933, so 1000 retains it without forwarding the 8000-character
+# capture budget into storage, the run UI, or model context.
+RECORDED_FAILURE_RESPONSE_MAX_CHARS = 1000
 RECORDED_FAILURE_CAPTURE_MAX_CHARS = 8000
 
 _PAGE_ACTION_MAP: dict[str, ActionType] = {
@@ -102,7 +133,7 @@ class PendingAction:
     action_order: int | None = None
 
 
-OnPendingAction = Callable[[PendingAction], Awaitable[None]]
+OnPendingAction = Callable[[PendingAction], None]
 
 
 def _frame_user_line() -> int | None:
@@ -297,21 +328,22 @@ class _Recorder:
         on_action: OnAction | None = None,
         credential_release_guard: CredentialReleaseGuard | None = None,
         on_pending_action: OnPendingAction | None = None,
+        strategy_aware_typing: bool = False,
+        playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self.actions: list[Action] = []
         self.last_exception: BaseException | None = None
         self._on_action = on_action
         self._on_pending_action = on_pending_action
         self.credential_release_guard = credential_release_guard
+        self.strategy_aware_typing = strategy_aware_typing
+        self.playwright_input_defaults = playwright_input_defaults or PlaywrightInputDefaults()
 
-    async def _emit_pending_action(self, pending_action: PendingAction) -> None:
-        await asyncio.sleep(pending_action.threshold_seconds)
+    def _emit_pending_action(self, pending_action: PendingAction) -> None:
         if self._on_pending_action is None:
             return
         try:
-            await self._on_pending_action(pending_action)
-        except asyncio.CancelledError:
-            raise
+            self._on_pending_action(pending_action)
         except Exception:
             LOG.warning(
                 "Code block pending action sink failed",
@@ -319,46 +351,34 @@ class _Recorder:
                 call_name=pending_action.call_name,
             )
 
-    def _arm_pending(self, pending_action: PendingAction) -> asyncio.Task[None] | None:
+    def _arm_pending(self, pending_action: PendingAction) -> asyncio.TimerHandle | None:
         if self._on_pending_action is None:
             return None
-        return asyncio.create_task(self._emit_pending_action(pending_action), name="code-block-call-pending")
-
-    async def _retire_pending(self, pending_task: asyncio.Task[None]) -> bool:
-        """Cancel and drain the pending timer, reporting whether the caller itself was cancelled."""
-        current_task = asyncio.current_task()
-        cancellation_count = current_task.cancelling() if current_task is not None else 0
-        cleanup_cancelled = False
-        pending_task.cancel()
-        while not pending_task.done():
-            try:
-                await asyncio.shield(pending_task)
-            except asyncio.CancelledError:
-                if current_task is not None and current_task.cancelling() > cancellation_count:
-                    cleanup_cancelled = True
-        if pending_task.cancelled():
-            cleanup_cancelled = cleanup_cancelled or (
-                current_task is not None and current_task.cancelling() > cancellation_count
-            )
-        return cleanup_cancelled
+        # A timer handle over a plain callback, never a task: the OTel asyncio instrumentor wraps
+        # every scheduled coroutine, and a coroutine cancelled before its first step is dropped
+        # inside that wrapper, which CPython reports as a "never awaited" RuntimeWarning. Cancelling
+        # a handle is also synchronous, so the guarded call's finally never awaits and can no longer
+        # swallow a cancellation aimed at the caller.
+        return asyncio.get_running_loop().call_later(
+            pending_action.threshold_seconds, self._emit_pending_action, pending_action
+        )
 
     async def await_pending_aware(self, awaitable: Awaitable[Any], call_name: str) -> Any:
         if self._on_pending_action is None:
             return await awaitable
-        pending_task = self._arm_pending(
+        pending_handle = self._arm_pending(
             PendingAction(
                 call_name=call_name,
                 threshold_seconds=PENDING_CALL_DELAY_SECONDS,
                 code_line=_frame_user_line(),
             )
         )
-        if pending_task is None:
+        if pending_handle is None:
             return await awaitable
         try:
             return await awaitable
         finally:
-            if await self._retire_pending(pending_task):
-                raise asyncio.CancelledError
+            pending_handle.cancel()
 
     async def enforce_credential_release(
         self,
@@ -403,8 +423,7 @@ class _Recorder:
             {**common_fields, **_recorded_action_fields(action_type, name, target, args, kwargs)},
             warning="Failed to instantiate recorded action subclass, falling back to base Action",
         )
-        cleanup_cancelled = False
-        pending_task = self._arm_pending(
+        pending_handle = self._arm_pending(
             PendingAction(
                 call_name=name,
                 threshold_seconds=PENDING_CALL_DELAY_SECONDS,
@@ -432,8 +451,8 @@ class _Recorder:
             self.last_exception = exc
             raise
         finally:
-            if pending_task is not None:
-                cleanup_cancelled = await self._retire_pending(pending_task)
+            if pending_handle is not None:
+                pending_handle.cancel()
             duration_ms = int((time.monotonic() - started) * 1000)
             action.started_at = started_wall
             action.finished_at = naive_utc_now()
@@ -445,8 +464,6 @@ class _Recorder:
                     await self._on_action(action)
                 except Exception:
                     LOG.warning("Code block action sink failed", action_type=action_type)
-            if cleanup_cancelled:
-                raise asyncio.CancelledError
         return result
 
 
@@ -515,7 +532,42 @@ class RecordingLocator:
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
             async def call() -> Any:
+                if self.__recorder.strategy_aware_typing and name in ("fill", "type"):
+                    inspect.signature(attr).bind(*args, **kwargs)
                 await self.__recorder.enforce_credential_release(self.__locator, f"locator.{name}", args, kwargs)
+                if (
+                    self.__recorder.strategy_aware_typing
+                    and name in ("fill", "type")
+                    and hasattr(self.__locator, "page")
+                    and kwargs.keys() <= _LOCATOR_STRATEGY_INPUT_OPTIONS
+                ):
+                    value = kwargs.get("value" if name == "fill" else "text", args[0] if args else None)
+                    if isinstance(value, str):
+                        authored_timeout = kwargs.get("timeout")
+                        if authored_timeout is None or isinstance(authored_timeout, int | float):
+                            timeout = _effective_playwright_timeout(
+                                self.__recorder.playwright_input_defaults,
+                                authored_timeout,
+                            )
+                            force = kwargs.get("force")
+                            delay = kwargs.get("delay")
+                            no_wait_after = kwargs.get("no_wait_after")
+                            if force is None and delay is None and no_wait_after is None:
+                                return await strategy_aware_input(
+                                    self.__locator,
+                                    value,
+                                    clear=name == "fill",
+                                    timeout=timeout,
+                                )
+                            return await strategy_aware_input(
+                                self.__locator,
+                                value,
+                                clear=name == "fill",
+                                timeout=timeout,
+                                force=force,
+                                delay=delay,
+                                no_wait_after=no_wait_after,
+                            )
                 return await attr(*args, **kwargs)
 
             return await self.__recorder.record(action_type, f"locator.{name}", self.__selector, call, args, kwargs)
@@ -558,12 +610,27 @@ class RecordingKeyboard:
         return recorded
 
 
-class RecordingPage:
-    """Proxy around a playwright page that records mapped calls as Actions.
+class RecordingBrowserContext:
+    def __init__(self, context: BrowserContext, recorder: _Recorder) -> None:
+        self.__context = context
+        self.__recorder = recorder
 
-    Name-mangled private state keeps casual user code away from recorder
-    internals, but the mangled `_RecordingPage__*` form is still reachable;
-    treat recordings as telemetry, not a tamper-proof audit trail.
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self.__context, name)
+        if name != "set_default_timeout" or not callable(attr):
+            return attr
+
+        def set_default_timeout(timeout: float) -> None:
+            attr(timeout)
+            self.__recorder.playwright_input_defaults.set_context_timeout(timeout)
+
+        return set_default_timeout
+
+
+class RecordingPage:
+    """Proxy that records mapped Playwright calls as Actions.
+
+    Recordings are telemetry, not a tamper-proof audit trail.
     """
 
     def __init__(
@@ -572,15 +639,64 @@ class RecordingPage:
         on_action: OnAction | None = None,
         credential_release_guard: CredentialReleaseGuard | None = None,
         on_pending_action: OnPendingAction | None = None,
+        strategy_aware_typing: bool = False,
+        playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self.__page = page
-        self.__recorder = _Recorder(on_action, credential_release_guard, on_pending_action)
+        self.__recorder = _Recorder(
+            on_action,
+            credential_release_guard,
+            on_pending_action,
+            strategy_aware_typing=strategy_aware_typing,
+            playwright_input_defaults=playwright_input_defaults,
+        )
 
     def recorded_actions(self) -> list[Action]:
         return list(self.__recorder.actions)
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.__recorder.last_exception
+
+    def _brokered_default_timeout(self, scope: Literal["page", "context"]) -> float | None:
+        """Return the trusted timeout that a secure-runner block must restore."""
+        if scope == "page":
+            return self.__recorder.playwright_input_defaults.page_timeout_ms
+        return self.__recorder.playwright_input_defaults.context_timeout_ms
+
+    def _restore_brokered_default_timeout(
+        self,
+        scope: Literal["page", "context"],
+        timeout: float | None,
+    ) -> None:
+        """Restore the pre-block override, including Page inheritance from BrowserContext."""
+        if scope == "page":
+            # The generated public wrapper forwards None to Playwright's supported optional
+            # timeout setting, clearing a Page override without inspecting implementation state.
+            setter = cast(Callable[[float | None], None], self.__page.set_default_timeout)
+            setter(timeout)
+            self.__recorder.playwright_input_defaults.restore_page_timeout(timeout)
+            return
+        if timeout is None:
+            raise ValueError("context default timeout cannot inherit from another scope")
+        self.__page.context.set_default_timeout(timeout)
+        self.__recorder.playwright_input_defaults.set_context_timeout(timeout)
+
+    def _set_brokered_default_timeout(self, scope: Literal["page", "context"], timeout: float) -> None:
+        """Apply a synchronous Playwright setter received over the secure-runner transport."""
+        if not self.__recorder.strategy_aware_typing:
+            raise RuntimeError("brokered default timeout is unavailable")
+        if scope == "page":
+            self.__page.set_default_timeout(timeout)
+            self.__recorder.playwright_input_defaults.set_page_timeout(timeout)
+            return
+        if scope == "context":
+            self.__page.context.set_default_timeout(timeout)
+            self.__recorder.playwright_input_defaults.set_context_timeout(timeout)
+            return
+        raise ValueError(f"unsupported default-timeout scope: {scope}")
+
+    def _supports_brokered_default_timeout(self) -> bool:
+        return self.__recorder.strategy_aware_typing
 
     def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
         return RecordingLocator(self.__page.locator(selector, **kwargs), self.__recorder, selector)
@@ -591,6 +707,15 @@ class RecordingPage:
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__page, name)
+        if name == "context" and self.__recorder.strategy_aware_typing:
+            return RecordingBrowserContext(attr, self.__recorder)
+        if name == "set_default_timeout" and self.__recorder.strategy_aware_typing and callable(attr):
+
+            def set_default_timeout(timeout: float) -> None:
+                attr(timeout)
+                self.__recorder.playwright_input_defaults.set_page_timeout(timeout)
+
+            return set_default_timeout
         if name in _LOCATOR_FACTORY_METHODS and callable(attr):
 
             def factory(*args: Any, **kwargs: Any) -> RecordingLocator:
@@ -620,7 +745,54 @@ class RecordingPage:
                     description = " ".join(prompt.split())[:200]
 
             async def call() -> Any:
+                if self.__recorder.strategy_aware_typing and name in ("fill", "type"):
+                    inspect.signature(attr).bind(*args, **kwargs)
                 await self.__recorder.enforce_credential_release(self.__page, f"page.{name}", args, kwargs)
+                if (
+                    self.__recorder.strategy_aware_typing
+                    and name in ("fill", "type")
+                    and kwargs.keys() <= _PAGE_STRATEGY_INPUT_OPTIONS
+                ):
+                    selector = kwargs.get("selector", args[0] if args else None)
+                    value_index = 1
+                    value = kwargs.get("value" if name == "fill" else "text", _arg(args, value_index))
+                    strict = kwargs.get("strict")
+                    authored_timeout = kwargs.get("timeout")
+                    if (
+                        isinstance(selector, str)
+                        and isinstance(value, str)
+                        and strict in (None, False, True)
+                        and (authored_timeout is None or isinstance(authored_timeout, int | float))
+                    ):
+                        locator = _page_strategy_input_locator(
+                            self.__page,
+                            selector,
+                            strict,
+                            self.__recorder.playwright_input_defaults,
+                        )
+                        timeout = _effective_playwright_timeout(
+                            self.__recorder.playwright_input_defaults,
+                            authored_timeout,
+                        )
+                        force = kwargs.get("force")
+                        delay = kwargs.get("delay")
+                        no_wait_after = kwargs.get("no_wait_after")
+                        if force is None and delay is None and no_wait_after is None:
+                            return await strategy_aware_input(
+                                locator,
+                                value,
+                                clear=name == "fill",
+                                timeout=timeout,
+                            )
+                        return await strategy_aware_input(
+                            locator,
+                            value,
+                            clear=name == "fill",
+                            timeout=timeout,
+                            force=force,
+                            delay=delay,
+                            no_wait_after=no_wait_after,
+                        )
                 return await attr(*args, **kwargs)
 
             return await self.__recorder.record(

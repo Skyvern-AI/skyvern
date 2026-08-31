@@ -120,6 +120,7 @@ async def _run_otp_actions(
     monkeypatch: pytest.MonkeyPatch,
     task: SimpleNamespace,
     json_response: dict,
+    allowed_credential_parameter_keys: list[str] | None = None,
 ) -> tuple[AsyncMock, MagicMock, tuple]:
     """Drive the real handle_potential_OTP_actions post-plan seam. Returns (hpvc mock, parse mock,
     result). hpvc awaited ⇒ the polling verification re-plan fired; not awaited ⇒ the first plan was
@@ -137,7 +138,14 @@ async def _run_otp_actions(
     monkeypatch.setattr("skyvern.forge.agent.stamp_parsed_actions", MagicMock())
 
     agent = ForgeAgent.__new__(ForgeAgent)
-    result = await agent.handle_potential_OTP_actions(task, step, scraped_page, browser_state, json_response)
+    result = await agent.handle_potential_OTP_actions(
+        task,
+        step,
+        scraped_page,
+        browser_state,
+        json_response,
+        allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+    )
     return hpvc, parse_mock, result
 
 
@@ -181,6 +189,29 @@ async def test_single_field_registered_credential_placeholder_skips_and_preserve
         hpvc, _parse, result = await _run_otp_actions(monkeypatch, task, response)
     hpvc.assert_not_awaited()
     assert result[0] is response and result[0]["actions"] is actions and result[1] == []
+
+
+@pytest.mark.asyncio
+async def test_single_field_skip_rejected_when_credential_not_linked_to_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SKY-15181: a first-pass plan carrying a credential the originating block does not link must
+    not be kept on the stale-active-key gate alone — it falls through to the scoped resolver."""
+    context = _real_credential_context()
+    manager = SimpleNamespace(
+        has_workflow_run_context=lambda _id: True,
+        get_workflow_run_context=lambda _id: context,
+    )
+    monkeypatch.setattr(otp_service.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr("skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER", manager)
+    task = _make_task()
+    actions = [{"action_type": "INPUT_TEXT", "id": "AAAA", "text": "cred_totp"}, {"action_type": "CLICK", "id": "BBBB"}]
+    response = _otp_json_response(actions)
+    with skyvern_context.scoped(SkyvernContext(task_id=task.task_id, active_credential_parameter_key="credentials")):
+        hpvc, _parse, _result = await _run_otp_actions(
+            monkeypatch, task, response, allowed_credential_parameter_keys=[]
+        )
+    hpvc.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -593,7 +624,7 @@ async def test_handle_potential_verification_code_uses_resolver_without_db_looku
     agent = ForgeAgent.__new__(ForgeAgent)
     await agent.handle_potential_verification_code(task, step, scraped_page, browser_state, json_response)
 
-    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP)
+    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=None)
     db_get.assert_not_awaited()
 
 
@@ -646,7 +677,7 @@ async def test_handle_potential_verification_code_resolves_with_should_enter_fal
     finally:
         skyvern_context.reset()
 
-    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP)
+    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=None)
     rescrape.assert_awaited_once()
     assert result == {"actions": [{"action_type": "INPUT_TEXT", "text": "123456"}]}
 

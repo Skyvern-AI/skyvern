@@ -39,7 +39,11 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondar
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
-from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
+from skyvern.forge.sdk.copilot.config import (
+    CopilotConfig,
+    block_authoring_policy_for_request,
+    block_authoring_policy_from_code_only_mode,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -66,6 +70,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.taskv3.auto_observe import AutoObserveDecision, auto_observe_from_setting
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
@@ -85,6 +90,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+    from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -93,9 +99,6 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-# Playwright's always-on ffmpeg VP8 encoder scales CPU with pixel count; 720p is the
-# legibility / CPU tradeoff point that the BROWSER_RECORDING_720P flag opts a run into.
-RECORDING_VIDEO_SIZE_720P: dict[str, int] = {"width": 1280, "height": 720}
 EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
 EMAIL_OTP_MAX_RESULTS = 5
 EMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
@@ -147,6 +150,7 @@ DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG = "DISABLE_SVG_CONVERT_CACHE_RESILIENC
 SVG_LOCAL_CACHE_MAX_ITEMS = 4096
 SVG_LOCAL_NEGATIVE_CACHE_EXPIRE_TIME = timedelta(hours=1)
 SVGLocalCacheValue = tuple[str, float | None]
+PageOperationContracts = dict[str, dict[str, str | list[str]]]
 
 # TTLCache has one global TTL, so each value also carries an optional shorter
 # expiry timestamp for negative cache entries.
@@ -879,6 +883,12 @@ class AgentFunction:
     ) -> RunEngine:
         return requested_engine
 
+    # OSS resolves auto-observe from the static setting; cloud overrides to bucket a run per task_id.
+    async def resolve_task_v3_auto_observe(
+        self, *, task_id: str | None, organization_id: str | None, workflow_permanent_id: str | None = None
+    ) -> AutoObserveDecision:
+        return auto_observe_from_setting()
+
     async def record_run_duration(
         self,
         run_type: str,
@@ -887,6 +897,7 @@ class AgentFunction:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
         excluded_reason: str | None = None,
+        finalized_by: str | None = None,
     ) -> None:
         """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
 
@@ -894,6 +905,8 @@ class AgentFunction:
         workflow run that backs a task_v2) without the caller paying for the lookup.
         excluded_reason marks a run whose duration must not count as compute (e.g.
         it never started); the override records it as an exclusion, not as minutes.
+        finalized_by names the writer when it is not the run's own finalizer, so the
+        override can bound a duration that measures the row's age rather than compute.
         """
         return None
 
@@ -1042,6 +1055,7 @@ class AgentFunction:
         distinct_id: str | None,
         organization_id: str | None,
         workflow_permanent_id: str | None = None,
+        viewport: dict[str, int] | None = None,
     ) -> dict[str, int] | None:
         """Resolve the browser recording resolution for this run.
 
@@ -1097,14 +1111,28 @@ class AgentFunction:
 
         Gating lives here, at the block-execution call site, rather than inside
         execute_code_block_override so the override only runs the runner. OSS has no
-        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED and
-        only routes runs that have a browser session for the runner to broker against.
+        runner and returns False; cloud overrides to consult SECURE_CODEBLOCK_ENABLED.
+        The runner brokers against the run's persistent session when one exists, else
+        the worker's local browser.
         """
         return False
+
+    def on_origin_scoped_headers_route_installed(
+        self, browser_context: BrowserContext, target_origin: tuple[str, str, int] | None
+    ) -> None:
+        """A context route now rewrites headers for requests to ``target_origin``.
+
+        Cloud registers an exemption so its CodeBlock egress filter yields matching requests
+        back to that route instead of fulfilling them itself; OSS has no such filter.
+        """
+        return None
 
     def serialize_codeblock_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
         """Cloud overrides this with the runner's canonical parameter serialization."""
         return parameters
+
+    def page_operation_contracts(self) -> PageOperationContracts | None:
+        return None
 
     def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
         """Cloud overrides this with the runner's canonical parameter scrubber."""
@@ -1131,7 +1159,7 @@ class AgentFunction:
     ) -> ScriptExecutionPolicyDecision:
         return ScriptExecutionPolicyDecision(allowed=True, selection_reason="oss_default")
 
-    async def should_auto_create_browser_session_for_code_block(
+    async def should_route_to_secure_codeblock_runner(
         self,
         *,
         workflow_run_id: str,
@@ -1140,15 +1168,13 @@ class AgentFunction:
         workflow_id: str | None = None,
         pin_verdict: bool = False,
     ) -> bool:
-        """Whether a run containing a CodeBlock should get an auto-provisioned browser session.
+        """Whether a run containing a CodeBlock must route to a worker pool that has the runner.
 
         ``pin_verdict`` asks the resolver to freeze an authoritative verdict onto the run, and is
         for the caller whose routing decision depends on it. OSS has nothing to pin.
 
-        The secure CodeBlock runner brokers page operations against a live persistent browser
-        session, so a run that has a CodeBlock but no caller-supplied session needs one created
-        for it before block execution. OSS has no runner and returns False; cloud overrides to
-        consult the same env/flag gate as should_use_codeblock_runner.
+        OSS has no runner and returns False; cloud overrides to consult the same env/flag gate as
+        should_use_codeblock_runner.
         """
         return False
 
@@ -1175,6 +1201,7 @@ class AgentFunction:
         recording_page: RecordingPage | None = None,
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
+        download_evidence: DownloadEvidenceProbe | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner, or return None for legacy.
 
@@ -1721,6 +1748,23 @@ class AgentFunction:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
 
+    async def resolve_google_credential_id(self, organization_id: str, credential_id: str) -> str:
+        """Accept a Google connection name or account email wherever a credential id is expected.
+
+        The id is not surfaced outside the block editor's dropdown, so blocks written by hand or by
+        an agent carry the connection's name instead. An unresolvable reference passes through so
+        the caller's own not-found handling still runs.
+        """
+        try:
+            return await google_oauth_service.resolve_credential_reference(organization_id, credential_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve Google connection reference",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return credential_id
+
     async def get_google_sheets_credentials(
         self,
         organization_id: str,
@@ -1732,6 +1776,7 @@ class AgentFunction:
         instead of crashing. Cloud overrides this with an access-token cache
         on top of the same backend.
         """
+        credential_id = await self.resolve_google_credential_id(organization_id, credential_id)
         try:
             secrets = await google_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
@@ -1803,6 +1848,7 @@ class AgentFunction:
         ``required_scopes`` gates use of a credential whose grant does not cover
         the API the caller is about to use.
         """
+        credential_id = await self.resolve_google_credential_id(organization_id, credential_id)
         try:
             secrets = await google_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
@@ -2304,6 +2350,8 @@ class AgentFunction:
                 aws_access_key_id=destination.aws_access_key_id,
                 aws_secret_access_key=destination.aws_secret_access_key,
                 region_name=destination.aws_region_name,
+                endpoint_url=destination.endpoint_url,
+                endpoint_resolved_ips=destination.endpoint_resolved_ips,
             )
             await aws_client.upload_file_from_path(
                 uri=destination.sdk_uri,
@@ -2414,11 +2462,23 @@ class AgentFunction:
         )
 
     async def get_copilot_config_for_request(
-        self, organization_id: str | None = None, code_block_mode: bool | None = None
+        self,
+        organization_id: str | None = None,
+        code_block_mode: bool | None = None,
+        composer_mode: Literal["ask", "build"] | None = None,
     ) -> CopilotConfig | None:
         """Return a request-scoped workflow copilot config override."""
         del organization_id
-        return self.get_copilot_config(code_block_mode)
+        fallback_code_block_mode = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE
+        config = self.get_copilot_config(code_block_mode)
+        if config is None:
+            return None
+        config.block_authoring_policy = block_authoring_policy_for_request(
+            code_block_mode,
+            composer_mode,
+            fallback_code_block_mode=fallback_code_block_mode,
+        )
+        return config
 
     async def should_render_copilot_terminal_from_envelope(self, organization_id: str | None = None) -> bool:
         del organization_id

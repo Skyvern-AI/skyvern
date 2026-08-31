@@ -55,6 +55,7 @@ class _Relay(Protocol):
     async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
 
     async def ensure_root_lease(self) -> dict | None: ...
+    async def list_scoped_tabs(self) -> list[dict]: ...
 
     async def release_tab(self, tab_id: int) -> None: ...
 
@@ -175,6 +176,23 @@ class BrowserExtensionRuntime:
 
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
+
+    async def evaluate(self, expression: str) -> Any:
+        await self._relay.ensure_root_lease()
+        tabs = await self._relay.list_scoped_tabs()
+        candidates = [tab for tab in tabs if type(tab.get("tabId")) is int]
+        active = [tab for tab in candidates if tab.get("active") is True]
+        if len(active) == 1:
+            tab = active[0]
+        elif len(candidates) == 1:
+            tab = candidates[0]
+        else:
+            raise BrowserExtensionError("Select one Skyvern Controlled tab before evaluating JavaScript")
+        result = await self._relay.request(
+            "dom.evaluate",
+            {"tabId": tab["tabId"], "expression": expression},
+        )
+        return result.get("result")
 
     @staticmethod
     def open_extension_url(url: str) -> bool:

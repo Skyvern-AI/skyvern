@@ -35,7 +35,6 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
     unresolved_page_url_for_log,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
-from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
@@ -56,7 +55,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -67,6 +66,14 @@ from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
+
+
+def _parse_final_response(raw: str) -> dict[str, Any]:
+    from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+
+    return parse_final_response(raw)
+
+
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
 _AUTHORING_INTENTS = {"author_now", "defer_authoring"}
 DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
@@ -151,7 +158,7 @@ class _RawSecretSafetyScreen:
 
 def _raw_secret_safety_verdict(raw: object) -> RawSecretSafetyVerdict | None:
     if isinstance(raw, str):
-        raw = parse_final_response(raw)
+        raw = _parse_final_response(raw)
     try:
         return RawSecretSafetyVerdict.model_validate(raw)
     except ValidationError:
@@ -851,7 +858,9 @@ class RequestPolicy:
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
     # The connection the user picked from the account card on this turn, if any. Recorded as
-    # durable approval at turn end; a draft binding is never a substitute for it.
+    # durable approval at turn end. A draft binding alone is never a substitute; the dispatch
+    # seam may separately admit a selected native Sheets citation for that dispatch only when it
+    # is backed by this turn's server-owned list_integrations result.
     selected_connected_account_id: str | None = None
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
@@ -1362,7 +1371,7 @@ def _coerce_expected_classification(value: Any) -> ClassificationTarget | None:
 
 def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
-        raw = parse_final_response(raw)
+        raw = _parse_final_response(raw)
     if not isinstance(raw, dict):
         return None
     if not any(field in raw for field in _CLASSIFICATION_RESPONSE_FIELDS):
@@ -1372,7 +1381,7 @@ def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
 
 def _parse_terminal_action_reconciliation(raw: Any) -> TerminalActionReconciliationV1 | None:
     if isinstance(raw, str):
-        raw = parse_final_response(raw)
+        raw = _parse_final_response(raw)
     if not isinstance(raw, dict) or set(raw) != _TERMINAL_ACTION_RECONCILIATION_RESPONSE_FIELDS:
         return None
     if raw.get("version") != "1":
@@ -3999,8 +4008,23 @@ def _fallback_structured_record_completion_criteria(user_message: str) -> list[C
     ]
 
 
+def _account_state_atom(value: str) -> str:
+    """Org-controlled text goes into a delimiter-structured prompt block, so a quote or a backtick
+    left intact would forge a fact boundary or a credential id, and any of the characters str.split
+    treats as whitespace — U+2028, U+0085 and friends, not just CR and LF — would forge a line."""
+    return " ".join(value.replace('"', " ").replace("`", " ").split())
+
+
 def credential_candidate_label(credential: Credential) -> str:
-    return f"{credential.name} (`{credential.credential_id}`)"
+    label = f'"{_account_state_atom(credential.name)}" (`{credential.credential_id}`)'
+    facts: list[str] = []
+    if credential.tested_url:
+        facts.append(f'tested_url: "{_account_state_atom(credential.tested_url)}"')
+    if credential.totp_type != TotpType.NONE:
+        facts.append(f"totp_type: {credential.totp_type}")
+    if not facts:
+        return label
+    return f"{label} - {'; '.join(facts)}"
 
 
 def _ground_user_provided_sites(

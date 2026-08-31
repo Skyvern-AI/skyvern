@@ -207,6 +207,164 @@ if (healthy.result.method !== "Runtime.evaluate") {{
     assert result.returncode == 0, result.stderr
 
 
+def test_dom_evaluate_contract() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the extension DOM evaluation contract test")
+
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    dom_uri = (extension_dir / "dom_router.js").as_uri()
+    protocol_uri = (extension_dir / "protocol.js").as_uri()
+    script = f"""
+const scriptCalls = [];
+globalThis.chrome = {{
+  userScripts: {{
+    async execute({{ target, world, injectImmediately, js }}) {{
+      scriptCalls.push({{ target, world, injectImmediately, js }});
+      try {{
+        return [{{ result: await globalThis.eval(js[0].code) }}];
+      }} catch (error) {{
+        return [{{ error: String(error?.message ?? error) }}];
+      }}
+    }},
+  }},
+}};
+
+const {{ evaluateDom }} = await import({json.dumps(dom_uri)});
+const {{ ERROR_CODES, ProtocolError }} = await import({json.dumps(protocol_uri)});
+
+let leaseChecks = 0;
+let controllableChecks = 0;
+let controllableUrl = "https://example.test/";
+const lease = {{ assertCurrent() {{ leaseChecks += 1; }} }};
+const tabScope = {{
+  async runTabOperation(tabId, operation) {{
+    if (tabId !== 7) throw new Error(`unexpected tab ID: ${{tabId}}`);
+    return operation(lease);
+  }},
+  async assertControllableLocked(tabId, currentLease) {{
+    if (tabId !== 7 || currentLease !== lease) throw new Error("scope check lost the tab lease");
+    controllableChecks += 1;
+    return {{ id: tabId, groupId: 700, url: controllableUrl }};
+  }},
+}};
+
+const evaluated = await evaluateDom(tabScope, {{
+  tabId: 7,
+  expression: "({{ answer: 6 * 7 }})",
+}});
+if (
+  evaluated.result?.answer !== 42 ||
+  scriptCalls.length !== 1 ||
+  scriptCalls[0].target?.tabId !== 7 ||
+  scriptCalls[0].world !== "MAIN" ||
+  scriptCalls[0].injectImmediately !== true ||
+  scriptCalls[0].js?.[0]?.code !== "({{ answer: 6 * 7 }})" ||
+  controllableChecks !== 2 ||
+  leaseChecks !== 1
+) {{
+  throw new Error(`DOM evaluation contract failed: ${{JSON.stringify({{
+    evaluated,
+    scriptCalls,
+    controllableChecks,
+    leaseChecks,
+  }})}}`);
+}}
+
+for (const [expression, expected] of [["false", false], ["0", 0], ["null", null]]) {{
+  const response = await evaluateDom(tabScope, {{ tabId: 7, expression }});
+  if (!Object.is(response.result, expected)) {{
+    throw new Error(`DOM evaluation changed a falsy result: ${{expression}}`);
+  }}
+}}
+const thrownEvaluationError = await evaluateDom(tabScope, {{
+  tabId: 7,
+  expression: "(() => {{ throw new Error('page failure'); }})()",
+}}).then(() => null, (error) => error);
+if (
+  thrownEvaluationError?.code !== ERROR_CODES.CDP_ERROR ||
+  !thrownEvaluationError.message.includes("page failure")
+) {{
+  throw new Error(`thrown page evaluation was not structured: ${{thrownEvaluationError?.message}}`);
+}}
+
+const invalidError = await evaluateDom(tabScope, {{
+  tabId: 7,
+  expression: "1 + 1",
+  extra: true,
+}}).then(() => null, (error) => error);
+if (invalidError?.code !== ERROR_CODES.OP_NOT_ALLOWED) {{
+  throw new Error(`invalid DOM arguments did not fail closed: ${{invalidError?.code}}`);
+}}
+
+const callsBeforeBlank = scriptCalls.length;
+controllableUrl = "about:blank";
+const blankError = await evaluateDom(tabScope, {{
+  tabId: 7,
+  expression: "1 + 1",
+}}).then(() => null, (error) => error);
+if (
+  blankError?.code !== ERROR_CODES.RESTRICTED_URL ||
+  scriptCalls.length !== callsBeforeBlank
+) {{
+  throw new Error(`about:blank reached MAIN evaluation: ${{blankError?.code}}`);
+}}
+controllableUrl = "https://example.test/";
+
+chrome.userScripts.execute = async () => {{ throw new Error("injection blocked"); }};
+const injectionError = await evaluateDom(tabScope, {{
+  tabId: 7,
+  expression: "1 + 1",
+}}).then(() => null, (error) => error);
+if (injectionError?.code !== ERROR_CODES.CDP_ERROR) {{
+  throw new Error(`failed injection was not structured: ${{injectionError?.code}}`);
+}}
+
+let revalidationChecks = 0;
+let failedInjectionCalls = 0;
+chrome.userScripts.execute = async () => {{
+  failedInjectionCalls += 1;
+  throw new Error("navigation interrupted injection");
+}};
+tabScope.assertControllableLocked = async (tabId, currentLease) => {{
+  if (tabId !== 7 || currentLease !== lease) throw new Error("scope check lost the tab lease");
+  revalidationChecks += 1;
+  if (revalidationChecks === 2) {{
+    throw new ProtocolError(
+      ERROR_CODES.RESTRICTED_URL,
+      "Chrome does not allow controlling this URL.",
+    );
+  }}
+  return {{ id: tabId, groupId: 700, url: "https://example.test/" }};
+}};
+const revokedError = await evaluateDom(tabScope, {{
+  tabId: 7,
+  expression: "1 + 1",
+}}).then(() => null, (error) => error);
+if (
+  revokedError?.code !== ERROR_CODES.RESTRICTED_URL ||
+  revalidationChecks !== 2 ||
+  failedInjectionCalls !== 1
+) {{
+  throw new Error(`failed injection hid scope revocation: ${{JSON.stringify({{
+    code: revokedError?.code,
+    revalidationChecks,
+    failedInjectionCalls,
+  }})}}`);
+}}
+"""
+
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_extension_reset_and_debugger_lifecycle_contract() -> None:
     node = shutil.which("node")
     if node is None:
@@ -223,6 +381,7 @@ const tabs = new Map();
 const sessionState = {{}};
 const debuggerAttached = new Set();
 let createTab;
+let lastFocusedWindowId = 2;
 globalThis.chrome = {{
   alarms: {{ onAlarm: {{ addListener() {{}} }} }},
   tabs: {{
@@ -234,6 +393,12 @@ globalThis.chrome = {{
       const tab = tabs.get(tabId);
       if (!tab) throw new Error("missing tab");
       return {{ ...tab }};
+    }},
+    async query(values) {{
+      return [...tabs.values()]
+        .filter((tab) => !values.active || tab.active === true)
+        .filter((tab) => !values.lastFocusedWindow || tab.windowId === lastFocusedWindowId)
+        .map((tab) => ({{ ...tab }}));
     }},
     async group({{ tabIds }}) {{
       const tab = tabs.get(tabIds[0]);
@@ -292,6 +457,160 @@ const settleWithin = (promise, timeoutMs = 100) => Promise.race([
 
 const scope = new TabScope({{ sendEvent: () => undefined, operationTimeoutMs: 20 }});
 await scope.initialize();
+// tabs.list marks only the active tab in Chrome's last-focused window.
+tabs.set(18, {{ id: 18, windowId: 1, groupId: 700, url: "https://one.example", active: true }});
+tabs.set(19, {{ id: 19, windowId: 2, groupId: 700, url: "https://two.example", active: true }});
+scope.scopedTabIds.add(18);
+scope.scopedTabIds.add(19);
+scope.scopedGroupIds.set(18, 700);
+scope.scopedGroupIds.set(19, 700);
+const focusedTabs = (await scope.list()).tabs.filter((tab) => tab.active);
+if (focusedTabs.length !== 1 || focusedTabs[0].tabId !== 19) {{
+  throw new Error(`focused tab selection was ambiguous: ${{JSON.stringify(focusedTabs)}}`);
+}}
+scope.scopedTabIds.delete(18);
+scope.scopedTabIds.delete(19);
+scope.scopedGroupIds.delete(18);
+scope.scopedGroupIds.delete(19);
+tabs.delete(18);
+tabs.delete(19);
+
+
+// Closing a just-created tab must cancel its create operation after Chrome returns the tab id.
+const originalAddToScopeLocked = scope.addToScopeLocked.bind(scope);
+let addToScopeStarted = false;
+let releaseAddToScope;
+scope.addToScopeLocked = async (tab, lease) => {{
+  addToScopeStarted = true;
+  await new Promise((resolve) => {{ releaseAddToScope = resolve; }});
+  return originalAddToScopeLocked(tab, lease);
+}};
+createTab = undefined;
+const interruptedCreate = scope.create({{ url: "https://created.example" }}).then(
+  () => null,
+  (error) => error,
+);
+await waitUntil(() => typeof createTab === "function");
+const createdTab = {{ id: 22, windowId: 2, groupId: -1, url: "https://created.example" }};
+tabs.set(22, createdTab);
+createTab({{ ...createdTab }});
+await waitUntil(() => addToScopeStarted && scope.tabOperationLeases.has(22));
+tabs.delete(22);
+listeners.removed.forEach((listener) => listener(22));
+const interruptedCreateError = await settleWithin(interruptedCreate);
+if (interruptedCreateError?.code !== ERROR_CODES.TAB_NOT_FOUND) {{
+  throw new Error(`closed created tab did not invalidate create: ${{interruptedCreateError?.code}}`);
+}}
+releaseAddToScope();
+scope.addToScopeLocked = originalAddToScopeLocked;
+await waitUntil(() => !scope.tabOperationLeases.has(22));
+
+// User revocation must invalidate an active operation before the queued update handler runs.
+tabs.set(20, {{ id: 20, windowId: 1, groupId: 700, url: "https://revoked.example" }});
+scope.scopedTabIds.add(20);
+scope.scopedGroupIds.set(20, 700);
+const originalRemoveFromScopeLocked = scope.removeFromScopeLocked.bind(scope);
+let revocationCleanupStarted = false;
+let releaseRevocationCleanup;
+scope.removeFromScopeLocked = async (...args) => {{
+  if (args[0] === 20) {{
+    revocationCleanupStarted = true;
+    await new Promise((resolve) => {{ releaseRevocationCleanup = resolve; }});
+  }}
+  return originalRemoveFromScopeLocked(...args);
+}};
+let operationStarted = false;
+const revokedOperation = scope.runTabOperation(20, async () => {{
+  operationStarted = true;
+  return new Promise(() => undefined);
+}}).then(() => null, (error) => error);
+await waitUntil(() => operationStarted);
+tabs.get(20).groupId = -1;
+listeners.updated.forEach((listener) => listener(20, {{ groupId: -1 }}));
+const immediateRevocationError = await settleWithin(revokedOperation);
+if (immediateRevocationError?.code !== ERROR_CODES.TAB_NOT_SCOPED) {{
+  throw new Error(`group revocation did not invalidate active work: ${{immediateRevocationError?.code}}`);
+}}
+await waitUntil(() => revocationCleanupStarted);
+listeners.updated.forEach((listener) =>
+  listener(20, {{ url: "https://revoked.example/next" }}),
+);
+releaseRevocationCleanup();
+await waitUntil(() => !scope.scopedTabIds.has(20));
+if (scope.tabOperationLeases.has(20)) {{
+  throw new Error("revoked tab retained an operation lease");
+}}
+scope.removeFromScopeLocked = originalRemoveFromScopeLocked;
+tabs.delete(20);
+// Restored scope metadata must fail closed when it references no real group.
+tabs.set(14, {{ id: 14, windowId: 1, groupId: -1, url: "https://restore.example" }});
+sessionState.scopedTabIds = [14];
+sessionState.scopedTabGroupIds = {{ "14": -1 }};
+const restoredScope = new TabScope({{ sendEvent: () => undefined, operationTimeoutMs: 20 }});
+await restoredScope.initialize();
+if (restoredScope.scopedTabIds.has(14)) {{
+  throw new Error("invalid restored group metadata retained tab scope");
+}}
+sessionState.scopedTabIds = [];
+sessionState.scopedTabGroupIds = {{}};
+tabs.delete(14);
+// A stale positive group ID must not adopt a different controlled group.
+tabs.set(16, {{ id: 16, windowId: 1, groupId: 701, url: "https://stale-group.example" }});
+sessionState.scopedTabIds = [16];
+sessionState.scopedTabGroupIds = {{ "16": 700 }};
+const staleGroupScope = new TabScope({{ sendEvent: () => undefined, operationTimeoutMs: 20 }});
+await staleGroupScope.initialize();
+if (staleGroupScope.scopedTabIds.has(16)) {{
+  throw new Error("stale restored group ID adopted a different group");
+}}
+sessionState.scopedTabIds = [];
+sessionState.scopedTabGroupIds = {{}};
+tabs.delete(16);
+
+// Collection must revoke a tab when the controlled group is renamed.
+tabs.set(17, {{ id: 17, windowId: 1, groupId: 700, url: "https://renamed-group.example" }});
+scope.scopedTabIds.add(17);
+scope.scopedGroupIds.set(17, 700);
+const originalGroupGet = chrome.tabGroups.get;
+chrome.tabGroups.get = async (groupId) => ({{ id: groupId, title: "Renamed" }});
+const renamedTabs = await scope.collectScopedTabs(false);
+chrome.tabGroups.get = originalGroupGet;
+if (renamedTabs.length !== 0 || scope.scopedTabIds.has(17)) {{
+  throw new Error("renamed group remained observable");
+}}
+tabs.delete(17);
+// Popup inheritance must reject an opener whose controlled group was renamed.
+tabs.set(18, {{ id: 18, windowId: 1, groupId: 700, url: "https://opener.example" }});
+tabs.set(19, {{ id: 19, openerTabId: 18, windowId: 1, groupId: -1, url: "https://child.example" }});
+scope.scopedTabIds.add(18);
+scope.scopedGroupIds.set(18, 700);
+chrome.tabGroups.get = async (groupId) => ({{ id: groupId, title: "Renamed" }});
+await scope.handleTabCreated(tabs.get(19));
+chrome.tabGroups.get = originalGroupGet;
+if (
+  scope.scopedTabIds.has(18) ||
+  scope.scopedTabIds.has(19) ||
+  scope.createdTabIds.has(19)
+) {{
+  throw new Error("popup inherited scope from a revoked opener");
+}}
+tabs.delete(18);
+tabs.delete(19);
+
+// Group creation must roll back when Chrome cannot label Skyvern Controlled.
+tabs.set(15, {{ id: 15, windowId: 1, groupId: -1, url: "https://group-failure.example" }});
+const originalGroupUpdate = chrome.tabGroups.update;
+chrome.tabGroups.update = async () => {{ throw new Error("group update failed"); }};
+const groupFailure = await scope.shareTab(15).then(() => null, (error) => error);
+chrome.tabGroups.update = originalGroupUpdate;
+if (
+  groupFailure?.code !== ERROR_CODES.INTERNAL ||
+  scope.scopedTabIds.has(15) ||
+  tabs.get(15)?.groupId !== -1
+) {{
+  throw new Error(`group setup failed open: code=${{groupFailure?.code}} scoped=${{scope.scopedTabIds.has(15)}} group=${{tabs.get(15)?.groupId}}`);
+}}
+tabs.delete(15);
 const originalRemove = chrome.tabs.remove;
 let releaseRemove;
 chrome.tabs.remove = (tabId) => {{
@@ -325,8 +644,9 @@ if (createError?.code !== ERROR_CODES.COMMAND_TIMEOUT || scope.scopedTabIds.has(
 
 // Reset must quarantine an in-flight removal until the late Chrome result is
 // reconciled, so the next ownership epoch cannot re-share the tab.
-tabs.set(13, {{ id: 13, windowId: 1, groupId: -1, url: "https://remove.example" }});
+tabs.set(13, {{ id: 13, windowId: 1, groupId: 700, url: "https://remove.example" }});
 scope.scopedTabIds.add(13);
+scope.scopedGroupIds.set(13, 700);
 const removeOutcome = scope.remove({{ tabId: 13 }}).then(
   () => null,
   (error) => error,
@@ -368,8 +688,9 @@ if (wedgedError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
 }}
 
 for (const tabId of [11, 12, 21]) {{
-  tabs.set(tabId, {{ id: tabId, windowId: 1, groupId: -1, url: "https://example.test" }});
+  tabs.set(tabId, {{ id: tabId, windowId: 1, groupId: 700, url: "https://example.test" }});
   scope.scopedTabIds.add(tabId);
+  scope.scopedGroupIds.set(tabId, 700);
 }}
 const router = new DebuggerRouter({{
   tabScope: scope,

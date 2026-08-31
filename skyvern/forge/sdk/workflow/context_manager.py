@@ -471,7 +471,10 @@ class WorkflowRunContext:
             value = self.values.get(key)
             if not isinstance(value, dict) or "context" not in value:
                 continue
-            has_password_shape = "username" in value and "password" in value
+            # A password-less credential registers "password" as a literal "" rather than a
+            # placeholder id, so username alone marks the password shape; the secrets lookup
+            # below misses on "" and falls back to "", which is the value it actually holds.
+            has_password_shape = "username" in value
             if not has_password_shape and "secret_value" not in value:
                 continue
             entries[f"{key}_real_username"] = self.secrets.get(value.get("username", ""), "")
@@ -840,6 +843,12 @@ class WorkflowRunContext:
             if key in ("totp_type", "totp"):
                 continue
             if not value:
+                # A password-less login stores password="". Blocks dereference `.password`
+                # directly, so the key has to exist or the namespace lookup raises instead of
+                # yielding the empty string the credential actually holds.
+                if key == "password" and isinstance(credential, PasswordCredential):
+                    self.values[parameter.key][key] = ""
+                    used_secret_field_keys.add(key)
                 continue
             for field_key, field_value in self._flatten_credential_secret_field(key, value):
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
@@ -1017,6 +1026,8 @@ class WorkflowRunContext:
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
 
+        totp_field_name = self._resolve_parameter_value(parameter.totp_field_name)
+
         # Process all fields generically so it covers passwords and credit cards
         for field in item.fields:
             if not field.value or field.field_type == ItemFieldType.UNSUPPORTED:
@@ -1027,7 +1038,14 @@ class WorkflowRunContext:
                 continue
 
             field_type = field.field_type.value.lower()
-            if field_type == "totp":
+            # A configured totp_field_name overrides 1Password's own field-type detection, for
+            # items whose OTP lives in a plain field (e.g. named "digits") rather than a native
+            # 1Password one-time-password field.
+            is_totp_field = field_type == "totp" or (
+                totp_field_name is not None
+                and totp_field_name.lower() in {field.id.lower(), (field.title or "").lower()}
+            )
+            if is_totp_field:
                 random_secret_id = self.generate_random_secret_id()
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
@@ -1712,20 +1730,23 @@ class WorkflowRunContext:
         return f"{totp_secret_id}_value"
 
     def is_registered_credential_parameter_key(self, key: str) -> bool:
-        """Whether ``key`` was registered as one of the credential parameter types.
+        """Whether ``key`` names a parameter that may own a credential-backed TOTP secret.
 
-        Ordinary workflow/run inputs can share the dict-with-``totp`` shape but are not
-        credentials; only a registered credential parameter owns a credential-backed TOTP
-        secret. Callers use this to keep arbitrary run inputs out of credential-only paths.
+        Ordinary workflow/run inputs can share the dict-with-``totp`` shape without being
+        credentials, so callers use this to keep them out of credential-only paths; a credential
+        is bound either as a credential parameter class or as a ``credential_id`` workflow
+        parameter, and callers still gate on the value's shape.
         """
-        return isinstance(self.parameters.get(key), _CREDENTIAL_PARAMETER_TYPES)
+        parameter = self.parameters.get(key)
+        if isinstance(parameter, _CREDENTIAL_PARAMETER_TYPES):
+            return True
+        return isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type()
 
     def find_credential_parameter_key_for_secret(self, secret_id: str) -> str | None:
         for parameter_key, value in self.values.items():
             if not isinstance(value, dict):
                 continue
-            parameter = self.parameters.get(parameter_key)
-            if not isinstance(parameter, _CREDENTIAL_PARAMETER_TYPES):
+            if not self.is_registered_credential_parameter_key(parameter_key):
                 continue
             for field_value in value.values():
                 if field_value == secret_id:

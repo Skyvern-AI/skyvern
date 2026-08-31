@@ -23,7 +23,10 @@ from skyvern.forge.sdk.copilot.context import (
     sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    redact_raw_secrets_for_structured_prompt,
+    redact_raw_secrets_in_object,
+)
 
 
 @pytest.mark.parametrize(
@@ -480,7 +483,7 @@ def test_model_authored_context_cannot_introduce_a_carried_interaction() -> None
         },
     )
 
-    assert [entry["selector"] for entry in adopted.carried_trajectory] == ["#real"]
+    assert [entry["executed_selector"] for entry in adopted.carried_trajectory] == ["#real"]
 
 
 def test_model_authored_context_cannot_displace_the_observed_record() -> None:
@@ -493,7 +496,7 @@ def test_model_authored_context_cannot_displace_the_observed_record() -> None:
 
     adopted = adopt_model_authored_context(trusted, {"carried_trajectory": []})
 
-    assert [entry["selector"] for entry in adopted.carried_trajectory] == ["#email"]
+    assert [entry["executed_selector"] for entry in adopted.carried_trajectory] == ["#email"]
 
 
 def test_model_authored_free_text_context_is_preserved_without_approvals() -> None:
@@ -534,7 +537,7 @@ def test_carried_trajectory_from_scout_trajectory_scrubs_raw_values() -> None:
         ]
     )
 
-    assert [(entry["tool_name"], entry["selector"]) for entry in carry] == [
+    assert [(entry["tool_name"], entry["executed_selector"]) for entry in carry] == [
         ("type_text", "#lookup"),
         ("fill_credential_field", "#password"),
     ]
@@ -551,7 +554,7 @@ def test_finalize_context_persists_carried_trajectory() -> None:
         scout_trajectory=[
             {
                 "tool_name": "type_text",
-                "selector": "#search",
+                "executed_selector": "#search",
                 "source_url": "https://example.com/form",
                 "typed_length": 8,
                 "input_id": "inp_sku",
@@ -566,7 +569,7 @@ def test_finalize_context_persists_carried_trajectory() -> None:
     assert parsed.carried_trajectory == [
         {
             "tool_name": "type_text",
-            "selector": "#search",
+            "executed_selector": "#search",
             "source_url": "https://example.com/form",
             "typed_length": 8,
             "input_id": "inp_sku",
@@ -666,7 +669,7 @@ def test_finalize_context_retains_prior_record_when_current_turn_has_no_fills() 
 
     assert raw is not None
     carried = StructuredContext.from_json_str(raw).carried_trajectory
-    assert [(entry["tool_name"], entry["selector"]) for entry in carried] == [
+    assert [(entry["tool_name"], entry["executed_selector"]) for entry in carried] == [
         ("type_text", "#search"),
         ("click", "#go"),
     ]
@@ -815,6 +818,26 @@ def test_legacy_fill_carry_payload_still_loads() -> None:
 
     parsed = StructuredContext.from_json_str(legacy)
 
-    assert [(entry["tool_name"], entry["selector"]) for entry in parsed.carried_trajectory] == [
+    assert [(entry["tool_name"], entry["executed_selector"]) for entry in parsed.carried_trajectory] == [
         ("type_text", "#search")
     ]
+
+
+def test_redacting_a_run_packet_keeps_the_facts_a_repair_acts_on() -> None:
+    """Redacting the serialized document instead of its strings eats the delimiters and yields
+    nothing, which an absence-only assertion cannot tell apart from a redaction that worked."""
+    packet = {
+        "run": {"workflow_run_id": "wr_1", "status": "failed"},
+        "failure": {
+            "reason": "extraction failed with password=hunter2",
+            "failing_line": 6,
+            "error_codes": ["user_code_error"],
+        },
+    }
+
+    redacted = redact_raw_secrets_in_object(packet)
+
+    assert "hunter2" not in json.dumps(redacted)
+    assert redacted["failure"]["failing_line"] == 6
+    assert redacted["failure"]["error_codes"] == ["user_code_error"]
+    assert redacted["run"]["workflow_run_id"] == "wr_1"

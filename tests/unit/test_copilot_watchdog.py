@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -43,7 +43,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.tools import (
-    PER_TOOL_CALL_BUDGET_SECONDS,
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
     WatchdogExitReason,
@@ -61,7 +60,9 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
@@ -261,11 +262,11 @@ async def test_read_progress_sources_swallows_progress_timestamps_errors(
 
 
 class _ErrorCtx:
-    """Minimal ``AgentContext`` stand-in for the error-message path — only
-    ``browser_session_id`` is read, and only by ``_fallback_page_info``."""
+    """Minimal ``AgentContext`` stand-in for the error-message path."""
 
     organization_id = "o_test"
     browser_session_id = None
+    origin_run_redaction_registry = None
 
 
 @pytest.mark.asyncio
@@ -328,7 +329,9 @@ async def test_stagnation_error_message_does_not_invite_retry() -> None:
     """The exact SKY-9163 bug: the old copy said "likely stuck repeating
     failing actions" which the LLM read as "try again". The stagnation
     message must explicitly discourage retry."""
-    msg = await _watchdog_error_message("stagnation", _ErrorCtx(), "wr_test", _fake_run(), PER_TOOL_CALL_BUDGET_SECONDS)
+    msg = await _watchdog_error_message(
+        "stagnation", _ErrorCtx(), "wr_test", _fake_run(), RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
+    )
 
     assert "timed out" not in msg.lower()
     assert "likely stuck repeating" not in msg.lower()
@@ -354,33 +357,13 @@ async def test_ceiling_error_message_advises_splitting() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_tool_budget_message_advises_splitting_chain() -> None:
-    """A per-tool-budget trip names the budget value, tells the agent to
-    inspect the cancelled run via ``get_run_results``, then split the chain.
-    Does NOT carry the strict "Do NOT re-invoke block-running tools" gate
-    that the stagnation/ceiling/task_exit_unfinalized paths use — the budget
-    guard clears unconditionally once ``get_run_results`` confirms the row."""
-    msg = await _watchdog_error_message(
-        "per_tool_budget", _ErrorCtx(), "wr_test", _fake_run(), PER_TOOL_CALL_BUDGET_SECONDS
-    )
-
-    assert "timed out" not in msg.lower()
-    assert str(PER_TOOL_CALL_BUDGET_SECONDS) in msg
-    assert "Run ID: wr_test" in msg
-    assert "get_run_results" in msg
-    assert "smaller chain" in msg.lower()
-    assert "verified-prefix" in msg.lower() or "verified prefix" in msg.lower()
-    assert "Do NOT re-invoke block-running tools" not in msg
-
-
-@pytest.mark.asyncio
 async def test_task_exit_unfinalized_message_reports_last_observed_status() -> None:
     """When ``execute_workflow`` naturally exits but the row isn't terminal,
     the error must name the last-observed status so the LLM has a concrete
     anchor for the follow-up ``get_run_results`` call."""
     run = _fake_run(status="running")
     msg = await _watchdog_error_message(
-        "task_exit_unfinalized", _ErrorCtx(), "wr_test", run, PER_TOOL_CALL_BUDGET_SECONDS
+        "task_exit_unfinalized", _ErrorCtx(), "wr_test", run, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
     )
 
     assert "timed out" not in msg.lower()
@@ -395,7 +378,7 @@ async def test_task_exit_unfinalized_message_tolerates_unreadable_run() -> None:
     still be well-formed and mention the unreadable state rather than
     crashing on a ``None.status`` access."""
     msg = await _watchdog_error_message(
-        "task_exit_unfinalized", _ErrorCtx(), "wr_test", None, PER_TOOL_CALL_BUDGET_SECONDS
+        "task_exit_unfinalized", _ErrorCtx(), "wr_test", None, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10
     )
 
     assert "unreadable" in msg.lower()
@@ -422,7 +405,7 @@ async def test_paused_error_message_reports_a_wait_not_an_uncertain_outcome() ->
 async def test_non_paused_error_messages_keep_the_run_id_for_the_model() -> None:
     """The other arms never direct a relay — they tell the model to look the run up — so stripping
     the id there would take away the only handle it has."""
-    exit_reasons: tuple[WatchdogExitReason, ...] = ("stagnation", "ceiling", "per_tool_budget", "task_exit_unfinalized")
+    exit_reasons: tuple[WatchdogExitReason, ...] = ("stagnation", "ceiling", "task_exit_unfinalized")
     for exit_reason in exit_reasons:
         msg = await _watchdog_error_message(exit_reason, _ErrorCtx(), "wr_test", _fake_run(), 240)
 
@@ -444,15 +427,9 @@ async def test_non_paused_error_messages_keep_the_run_id_for_the_model() -> None
             f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s.",
         ),
         (
-            "per_tool_budget",
-            _fake_run(),
-            f"The run was still making progress but ran longer than the {PER_TOOL_CALL_BUDGET_SECONDS}s "
-            "allowed for a single step, so it was stopped.",
-        ),
-        (
             "ceiling",
             _fake_run(),
-            f"The run exceeded the {PER_TOOL_CALL_BUDGET_SECONDS}s absolute ceiling while still showing progress.",
+            f"The run exceeded the {RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10}s absolute ceiling while still showing progress.",
         ),
         (
             "task_exit_unfinalized",
@@ -469,7 +446,7 @@ async def test_non_paused_error_messages_keep_the_run_id_for_the_model() -> None
 def test_watchdog_user_relayed_text_is_id_free_and_clears_the_output_guard(
     exit_reason: WatchdogExitReason, run: SimpleNamespace | None, expected: str
 ) -> None:
-    reason = _watchdog_user_facing_summary(exit_reason, PER_TOOL_CALL_BUDGET_SECONDS, run)
+    reason = _watchdog_user_facing_summary(exit_reason, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10, run)
 
     assert reason == expected
     assert contains_internal_machinery_leak(reason) is False
@@ -602,12 +579,25 @@ workflow_definition:
       data_extraction_goal: Extract the page heading.
 """
 
+_CODE_WORKFLOW_YAML = """
+title: code example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: click_submit
+      code: |
+        await page.locator("#submit").click()
+"""
+
 
 async def _install_run_harness(
     monkeypatch: pytest.MonkeyPatch,
     *,
     workflow_yaml: str,
     polled_status: str,
+    dispatch_to_worker: bool = False,
+    terminal_blocks: list[WorkflowRunBlock] | None = None,
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
@@ -633,7 +623,7 @@ async def _install_run_harness(
     persisted_output_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, OutputParameter)]
     persisted_workflow_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, WorkflowParameter)]
     database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
-    database.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
+    database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_run(status=polled_status))
     monkeypatch.setattr(forge_app, "DATABASE", database)
 
@@ -647,11 +637,12 @@ async def _install_run_harness(
     workflow_service = MagicMock()
     workflow_service.get_workflow_parameters = AsyncMock(return_value=persisted_workflow_params)
     workflow_service.execute_workflow = AsyncMock(side_effect=_execute_workflow)
+    workflow_service.create_copilot_dispatch_draft_version = AsyncMock(return_value=workflow)
     monkeypatch.setattr(forge_app, "WORKFLOW_SERVICE", workflow_service)
     monkeypatch.setattr(
         forge_app.AGENT_FUNCTION,
         "should_dispatch_copilot_block_run_to_worker",
-        AsyncMock(return_value=False),
+        AsyncMock(return_value=dispatch_to_worker),
     )
     monkeypatch.setattr(
         forge_app.AGENT_FUNCTION,
@@ -693,6 +684,16 @@ async def _install_run_harness(
     monkeypatch.setattr(run_execution, "clear_active_run_session", captured["clear"])
     monkeypatch.setattr(run_execution, "_cancel_run_task_if_not_final", captured["cancel_run_task"])
     monkeypatch.setattr(run_execution, "_cooperative_cancel_dispatched_run", captured["cooperative_cancel"])
+    if dispatch_to_worker:
+        captured["worker_execute"] = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            run_execution.AsyncExecutorFactory,
+            "get_executor",
+            MagicMock(return_value=SimpleNamespace(execute_workflow=captured["worker_execute"])),
+        )
+        monkeypatch.setattr(run_execution, "_delete_dispatch_draft_if_run_final", AsyncMock(return_value=None))
+        monkeypatch.setattr(run_execution, "_capture_dispatched_terminal_page_evidence", AsyncMock(return_value=None))
+        monkeypatch.setattr(run_execution, "_attach_registered_output_parameter_values", AsyncMock(return_value={}))
     return captured
 
 
@@ -807,6 +808,167 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
         assert contains_internal_machinery_leak(relayed) is False
         assert_clean_user_facing_text(relayed)
     assert "Run ID:" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_non_success_watchdog_result_types_selected_failed_block_locators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_CODE_WORKFLOW_YAML,
+        polled_status="running",
+    )
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION,
+        "allow_copilot_inline_code_execution",
+        MagicMock(return_value=True),
+    )
+    forge_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
+        return_value=[
+            WorkflowRunBlock(
+                label="click_submit",
+                block_type=BlockType.CODE,
+                status="failed",
+                workflow_run_block_id="wrb_click_submit",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+            )
+        ]
+    )
+    observe = AsyncMock(return_value=[{"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}])
+    monkeypatch.setattr(run_execution, "_observe_authored_locators", observe)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_STAGNATION_WINDOW_SECONDS", 0)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["click_submit"], "parameters": {}}, ctx)
+
+    assert result["data"].get("authored_locator_observations") == [
+        {"authored_selector": "#submit", "unobserved_reason": "run_page_unavailable"}
+    ], result
+    observe.assert_awaited_once_with(
+        ctx,
+        run_session_id="pbs_run",
+        failed_block_code='await page.locator("#submit").click()\n',
+        worker_owned=False,
+        observation_deadline_exceeded=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("_repeat", range(3))
+async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_terminal_result(
+    monkeypatch: pytest.MonkeyPatch,
+    _repeat: int,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=[
+            WorkflowRunBlock(
+                label="extract_heading",
+                block_type=BlockType.EXTRACTION,
+                status="completed",
+                failure_reason=None,
+                error_codes=[],
+                output={"heading": "Example Domain"},
+                workflow_run_block_id="wrb_terminal",
+                workflow_run_id="wr_paused",
+                organization_id="org-1",
+                task_id=None,
+                final_url="https://example.com/result",
+                created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+                modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+            )
+        ],
+    )
+    elapsed = 0.0
+    progress = iter(
+        (
+            (0.0, "running"),
+            (120.0, "running"),
+            (241.0, "running"),
+            (300.0, "completed"),
+        )
+    )
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime, datetime]:
+        nonlocal elapsed
+        elapsed, status = next(progress)
+        marker = datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC) + timedelta(seconds=elapsed)
+        return _fake_run(status=status, modified_at=marker), marker, marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=lambda: elapsed))
+
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert elapsed == 300.0
+    assert result["ok"] is True, result
+    assert result["data"]["workflow_run_id"] == "wr_paused"
+    assert result["data"]["overall_status"] == "completed"
+    assert result["data"]["current_url"] == "https://example.com/result"
+    assert result["data"]["blocks"] == [
+        {
+            "label": "extract_heading",
+            "block_type": "EXTRACTION",
+            "status": "completed",
+            "workflow_run_block_id": "wrb_terminal",
+            "extracted_data": {"heading": "Example Domain"},
+        }
+    ]
+    assert "failure_categories" not in result["data"]
+    harness["worker_execute"].assert_awaited_once()
+    harness["cooperative_cancel"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_externally_cancelled_worker_run_still_cooperatively_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    polling = asyncio.Event()
+    reads = 0
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime, datetime]:
+        nonlocal reads
+        reads += 1
+        marker = datetime(2026, 4, 21, 12, 0, reads, tzinfo=UTC)
+        if reads > 1:
+            polling.set()
+            await asyncio.Event().wait()
+        return _fake_run(status="running", modified_at=marker), marker, marker
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    run = asyncio.create_task(
+        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    )
+    await asyncio.wait_for(polling.wait(), timeout=5)
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
 
 
 def test_paused_result_records_last_test_ok_as_none() -> None:

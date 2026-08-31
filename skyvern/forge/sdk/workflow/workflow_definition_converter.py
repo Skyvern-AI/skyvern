@@ -187,6 +187,7 @@ def convert_workflow_definition(
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
+                totp_field_name=parameter.totp_field_name,
                 created_at=now,
                 modified_at=now,
             )
@@ -645,6 +646,7 @@ def block_yaml_to_block(
             aws_access_key_id=block_yaml.aws_access_key_id,
             aws_secret_access_key=block_yaml.aws_secret_access_key,
             region_name=block_yaml.region_name,
+            endpoint_url=block_yaml.endpoint_url,
             azure_storage_account_name=block_yaml.azure_storage_account_name,
             azure_storage_account_key=block_yaml.azure_storage_account_key,
             azure_blob_container_name=block_yaml.azure_blob_container_name,
@@ -901,6 +903,7 @@ def block_yaml_to_block(
             aws_access_key_id=block_yaml.aws_access_key_id,
             aws_secret_access_key=block_yaml.aws_secret_access_key,
             region_name=block_yaml.region_name,
+            endpoint_url=block_yaml.endpoint_url,
             azure_storage_account_name=block_yaml.azure_storage_account_name,
             azure_storage_account_key=block_yaml.azure_storage_account_key,
             azure_blob_container_name=block_yaml.azure_blob_container_name,

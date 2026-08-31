@@ -18,7 +18,7 @@ import traceback
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 import httpx
 import typer
@@ -481,7 +481,11 @@ def _check_llm_config() -> CheckResult:
 
     llm_key = os.environ.get("LLM_KEY", "")
 
-    providers: dict[str, dict[str, str | None]] = {
+    class _ProviderCheck(TypedDict):
+        enable: str
+        key: str | tuple[str, ...] | None
+
+    providers: dict[str, _ProviderCheck] = {
         "OPENAI": {"enable": "ENABLE_OPENAI", "key": "OPENAI_API_KEY"},
         "XAI": {"enable": "ENABLE_XAI", "key": "XAI_API_KEY"},
         "ANTHROPIC": {"enable": "ENABLE_ANTHROPIC", "key": "ANTHROPIC_API_KEY"},
@@ -491,6 +495,11 @@ def _check_llm_config() -> CheckResult:
         "OLLAMA": {"enable": "ENABLE_OLLAMA", "key": None},
         "OPENROUTER": {"enable": "ENABLE_OPENROUTER", "key": "OPENROUTER_API_KEY"},
         "GROQ": {"enable": "ENABLE_GROQ", "key": "GROQ_API_KEY"},
+        "OPENAI_COMPATIBLE": {
+            "enable": "ENABLE_OPENAI_COMPATIBLE",
+            # config_registry.py requires all three to register the provider.
+            "key": ("OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_MODEL_NAME", "OPENAI_COMPATIBLE_API_BASE"),
+        },
     }
 
     enabled = []
@@ -499,9 +508,12 @@ def _check_llm_config() -> CheckResult:
         enable_var = cfg["enable"]
         if enable_var and os.environ.get(enable_var, "").lower() in ("true", "1", "yes"):
             enabled.append(name)
-            api_key_var = cfg.get("key")
-            if api_key_var and not os.environ.get(api_key_var):
-                missing_key.append(f"{name} ({api_key_var})")
+            required_vars = cfg.get("key")
+            if isinstance(required_vars, str):
+                required_vars = (required_vars,)
+            for var in required_vars or ():
+                if not os.environ.get(var):
+                    missing_key.append(f"{name} ({var})")
 
     if not enabled:
         return CheckResult(

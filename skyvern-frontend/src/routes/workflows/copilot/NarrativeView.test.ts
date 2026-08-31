@@ -196,6 +196,68 @@ describe("applyNarrativeEvent — design phase", () => {
     });
   });
 
+  it("shows a write's patch at write time, before its run reports back", () => {
+    // update_and_run_blocks writes and runs inside one tool call, so waiting for the
+    // tool_result would put the patch on screen only after the test had finished.
+    const diffs = [
+      { label: "star_count", added: 15, removed: 0, patch: "@@\n+code" },
+    ];
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall());
+    s = applyNarrativeEvent(
+      s,
+      workflowDraft({ code_diffs: diffs, tool_call_id: "call-1" }),
+    );
+
+    // No tool_result yet: the run is still in flight.
+    const call = s.designActivity.find((e) => e.id === "tc-call-1");
+    expect(call?.codeDiffs).toHaveLength(1);
+    expect(call?.codeDiffs?.[0]).toMatchObject({
+      label: "star_count",
+      added: 15,
+      removed: 0,
+      patch: "@@\n+code",
+    });
+    expect(s.designActivity.some((e) => e.id === "tr-call-1")).toBe(false);
+  });
+
+  it("shows a repair patch while its active block is still running", () => {
+    const diffs = [
+      { label: "star_count", added: 4, removed: 2, patch: "@@\n-code\n+fixed" },
+    ];
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      blockProgress({ block_label: "star_count", status: "running" }),
+    );
+    s = applyNarrativeEvent(s, toolCall());
+
+    expect(s.blocks[0]?.activity[0]?.id).toBe("tc-call-1");
+    s = applyNarrativeEvent(
+      s,
+      workflowDraft({
+        block_count: 1,
+        block_labels: ["star_count"],
+        code_diffs: diffs,
+        tool_call_id: "call-1",
+      }),
+    );
+
+    // No tool_result yet: a repair nested under the active block must expose
+    // the write at the same early seam as an initial design-phase write.
+    expect(s.blocks[0]?.activity[0]?.codeDiffs).toMatchObject([
+      { label: "star_count", added: 4, removed: 2, patch: "@@\n-code\n+fixed" },
+    ]);
+    expect(s.designActivity.some((e) => e.id === "tr-call-1")).toBe(false);
+  });
+
+  it("a draft naming no call leaves the activity log untouched", () => {
+    // Older backends send no tool_call_id; the row must not guess which call to attach to.
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall());
+    const before = s.designActivity;
+    s = applyNarrativeEvent(s, workflowDraft());
+
+    expect(s.designActivity).toEqual(before);
+  });
+
   it("last workflow_draft wins on multi-iteration designs", () => {
     let s = applyNarrativeEvent(EMPTY_NARRATIVE, workflowDraft());
     s = applyNarrativeEvent(
@@ -420,6 +482,35 @@ describe("condenseActivityEntries", () => {
     expect(condensed[0]).toMatchObject({ kind: "tool_result", success: true });
   });
 
+  it("keeps the call timestamp when replacing it with its settled result", () => {
+    const condensed = condenseActivityEntries([
+      {
+        id: "tc-call-1",
+        kind: "tool_call",
+        text: "Opening page",
+        iteration: 0,
+        toolName: "navigate_browser",
+        timestamp: "2026-05-25T00:00:04Z",
+      },
+      {
+        id: "tr-call-1",
+        kind: "tool_result",
+        text: "The page did not open",
+        iteration: 0,
+        toolName: "navigate_browser",
+        success: false,
+        timestamp: "2026-05-25T00:00:24Z",
+      },
+    ]);
+
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({
+      kind: "tool_result",
+      activityStartedAt: "2026-05-25T00:00:04Z",
+      timestamp: "2026-05-25T00:00:24Z",
+    });
+  });
+
   it("REGRESSION PIN: substitutes the humanized tool name for the backend's bare 'OK' fallback (celal QA catch)", () => {
     // A tool with no dedicated backend summary falls back to a literal
     // "OK" — condensing already removed the "<tool> · calling…" row that
@@ -489,6 +580,81 @@ describe("condenseActivityEntries", () => {
     const condensed = condenseActivityEntries(s.designActivity);
     expect(condensed).toHaveLength(1);
     expect(condensed[0]).toMatchObject({ success: true, attempts: 3 });
+  });
+
+  it("keeps the first attempt's start across a folded retry chain", () => {
+    const condensed = condenseActivityEntries([
+      {
+        id: "tc-c1",
+        kind: "tool_call",
+        text: "Opening page",
+        iteration: 0,
+        toolName: "navigate_browser",
+        timestamp: "2026-05-25T00:00:04Z",
+      },
+      {
+        id: "tr-c1",
+        kind: "tool_result",
+        text: "The page did not open",
+        iteration: 0,
+        toolName: "navigate_browser",
+        success: false,
+        timestamp: "2026-05-25T00:00:24Z",
+      },
+      {
+        id: "tc-c2",
+        kind: "tool_call",
+        text: "Opening page",
+        iteration: 1,
+        toolName: "navigate_browser",
+        timestamp: "2026-05-25T00:00:29Z",
+      },
+      {
+        id: "tr-c2",
+        kind: "tool_result",
+        text: "Opened",
+        iteration: 1,
+        toolName: "navigate_browser",
+        success: true,
+        timestamp: "2026-05-25T00:00:49Z",
+      },
+    ]);
+
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({
+      attempts: 2,
+      activityStartedAt: "2026-05-25T00:00:04Z",
+      timestamp: "2026-05-25T00:00:49Z",
+    });
+  });
+
+  it("keeps overlapping same-tool siblings separate instead of calling them retries", () => {
+    const condensed = condenseActivityEntries([
+      {
+        id: "tr-a",
+        kind: "tool_result",
+        text: "The first call failed",
+        iteration: 0,
+        toolName: "navigate_browser",
+        success: false,
+        activityStartedAt: "2026-05-25T00:00:10Z",
+        timestamp: "2026-05-25T00:00:30Z",
+      },
+      {
+        id: "tr-b",
+        kind: "tool_result",
+        text: "The parallel call succeeded",
+        iteration: 1,
+        toolName: "navigate_browser",
+        success: true,
+        activityStartedAt: "2026-05-25T00:00:20Z",
+        timestamp: "2026-05-25T00:00:40Z",
+      },
+    ]);
+
+    expect(condensed).toHaveLength(2);
+    expect(condensed.map((entry) => entry.id)).toEqual(["tr-a", "tr-b"]);
+    expect(condensed.every((entry) => entry.attempts === undefined)).toBe(true);
   });
 
   it("folds a retry across a narration sitting between two attempts (narration never breaks the fold)", () => {
@@ -935,6 +1101,19 @@ const draft3 = {
   summary: null,
 };
 
+// What the backend publishes for a draft whose blocks all ran clean on current source.
+const testedFacts = {
+  factsAvailable: true,
+  authoredBlockCount: 3,
+  matchingSourceBlockCount: 3,
+  evaluationState: null,
+  runId: "wr_1",
+  runCompleted: true,
+  terminalCause: null,
+  blocksRunThisTurn: 3,
+  ranCleanOnCurrentSource: true,
+} as const;
+
 describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
   it("hydrates responseKind without inventing an authoring success stamp", () => {
     const turn = hydrateNarrativeFromPayload(
@@ -966,13 +1145,13 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
 });
 
 describe("computeTurnSummary — typed terminal adjudication", () => {
-  it("renders the loop-guard clarify repro as a Question, not a green built-and-tested claim", () => {
+  it("renders the loop-guard clarify repro as needing input, not a green built-and-tested claim", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({ responseKind: "clarify" }),
     );
     expect(turn).toBeDefined();
     const summary = computeTurnSummary(turn!);
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✦");
   });
@@ -1006,7 +1185,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       }),
     );
 
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
   });
 
@@ -1026,7 +1205,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       }),
     );
 
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
   });
 
@@ -1103,7 +1282,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.glyph).toBe("!");
   });
 
-  it("keeps the Question headline when response_type is ASK_QUESTION", () => {
+  it("keeps the Needs your input headline when response_type is ASK_QUESTION", () => {
     const summary = computeTurnSummary(
       buildTurn({
         responseKind: "clarify",
@@ -1114,12 +1293,12 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         },
       }),
     );
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✦");
   });
 
-  it("keeps the Question headline for ASK_QUESTION even when hydrated blocks carry not_demonstrated", () => {
+  it("keeps the Needs your input headline for ASK_QUESTION even when hydrated blocks carry not_demonstrated", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "clarify",
@@ -1143,7 +1322,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     )!;
     expect(turn.lastRunOutcome).toBeNull();
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✦");
   });
@@ -1156,14 +1335,9 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       responseType: "ASK_QUESTION",
     });
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✦");
-
-    const uxSummary = computeTurnSummary(turn, { uxV1: true });
-    expect(uxSummary.headline).toBe("Needs your input");
-    expect(uxSummary.accent).toBe("qa");
-    expect(uxSummary.glyph).toBe("✦");
   });
 
   it("keeps review disposition precedence over build-kind ASK_QUESTION", () => {
@@ -1187,8 +1361,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       responseType: "REPLY",
     });
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
@@ -1198,7 +1372,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "clarify",
       }),
     );
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✦");
   });
@@ -1214,7 +1388,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       turn.blocks.some((block) => block.outcome === "not_demonstrated"),
     ).toBe(false);
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✦");
   });
@@ -1235,14 +1409,14 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       }),
     )!;
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.headline).not.toBe("Applied edits and re-tested");
     expect(summary.accent).not.toBe("ok");
   });
 
   it.each([
-    ["clarify", "Question"],
-    ["recover", "Question"],
+    ["clarify", "Needs your input"],
+    ["recover", "Needs your input"],
     ["refuse", "Declined"],
     ["diagnose", "Answered"],
     ["answer", "Answered"],
@@ -1256,7 +1430,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     },
   );
 
-  it("renders a verdict-authorized tested success green with drafts", () => {
+  it("names the build without claiming it was tested when no coverage facts arrive", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -1264,12 +1438,12 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
-  it("renders a verdict-authorized edit turn green", () => {
+  it("names an edit turn without claiming a re-test when no coverage facts arrive", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -1277,13 +1451,13 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Applied edits and re-tested");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Applied edits");
+    expect(summary.accent).toBe("qa");
   });
 
   it("does not infer a completed run from a build response kind alone", () => {
     const summary = computeTurnSummary(buildTurn({ responseKind: "build" }));
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
   });
 
   it("keeps the prose question heuristic without a run fact", () => {
@@ -1294,7 +1468,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
   });
 
   it("renders a clean completed build from its block lifecycle", () => {
@@ -1310,8 +1484,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
@@ -1328,8 +1502,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         responseKind: "build",
       }),
     );
-    expect(summary.headline).toBe("Applied edits and re-tested");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Applied edits");
+    expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("✓");
   });
 
@@ -1348,7 +1522,8 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         proposalDisposition: "review_tested",
         responseKind: "build",
       }),
-      "Workflow ready for review",
+      // No facts back the tested framing, so the card states what it built and no more.
+      "Built the workflow",
     ],
   ])(
     "keeps stopped or review-required states when there is no clean completed run (%#)",
@@ -1364,12 +1539,13 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const askTurn = buildTurn({
       draft: draft3,
       proposalDisposition: "review_tested",
+      turnFacts: testedFacts,
       responseKind: "clarify",
       responseType: "ASK_QUESTION",
       terminalMessage: "Is that output format okay?",
     });
 
-    expect(computeTurnSummary(askTurn, { uxV1: true }).headline).toBe(
+    expect(computeTurnSummary(askTurn).headline).toBe(
       "Workflow ready for review",
     );
     expect(getReviewGateVerdict(askTurn, null)).toBe("tested");
@@ -1407,21 +1583,20 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
   it("legacy payload without adjudication renders via the unchanged inference chain", () => {
     const turn = hydrateNarrativeFromPayload(reproClarifyPayload())!;
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
     expect(summary.stats).toEqual(["15:02", "3 blocks ran", "3 new"]);
   });
 });
 
-describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", () => {
-  it("a pending untested draft outranks a non-build responseKind (old: Question)", () => {
+describe("computeTurnSummary — disposition-first reorder", () => {
+  it("a pending untested draft outranks a non-build responseKind", () => {
     const turn = buildTurn({
       responseKind: "clarify",
       draft: draft3,
       proposalDisposition: "review_untested",
     });
-    expect(computeTurnSummary(turn).headline).toBe("Question");
-    const summary = computeTurnSummary(turn, { uxV1: true });
+    const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Draft needs review");
     expect(summary.accent).toBe("qa");
     expect(summary.glyph).toBe("!");
@@ -1433,8 +1608,8 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
         responseKind: "clarify",
         draft: draft3,
         proposalDisposition: "review_tested",
+        turnFacts: testedFacts,
       }),
-      { uxV1: true },
     );
     expect(summary.headline).toBe("Workflow ready for review");
     expect(summary.accent).toBe("qa");
@@ -1448,17 +1623,16 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
       terminalMessage: "Could you provide the login details?",
     });
     expect(turn.responseKind).toBeNull();
-    expect(computeTurnSummary(turn).headline).toBe("Question");
-    const summary = computeTurnSummary(turn, { uxV1: true });
+    const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Draft needs review");
   });
 
-  it("old payload (hydrated, no responseKind) still gets the uxV1 draft-review reorder", () => {
+  it("old payload (hydrated, no responseKind) still gets the draft-review reorder", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({ proposalDisposition: "review_untested" }),
     )!;
     expect(turn.responseKind).toBeNull();
-    const summary = computeTurnSummary(turn, { uxV1: true });
+    const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Draft needs review");
   });
 
@@ -1468,7 +1642,6 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
         responseKind: "clarify",
         responseType: "ASK_QUESTION",
       }),
-      { uxV1: true },
     );
     expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
@@ -1480,17 +1653,15 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
     ["diagnose", "Answered"],
     ["answer", "Answered"],
   ] as const)(
-    "leaves %s as %s under uxV1 — only the clarify/Question case renames",
+    "leaves %s as %s under the default summary behavior",
     (kind, headline) => {
-      const summary = computeTurnSummary(buildTurn({ responseKind: kind }), {
-        uxV1: true,
-      });
+      const summary = computeTurnSummary(buildTurn({ responseKind: kind }));
       expect(summary.headline).toBe(headline);
       expect(summary.accent).toBe("qa");
     },
   );
 
-  it("isStoppedWithDraft keeps absolute precedence under uxV1 too", () => {
+  it("isStoppedWithDraft keeps absolute precedence", () => {
     const summary = computeTurnSummary(
       buildTurn({
         cancelled: true,
@@ -1498,18 +1669,16 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
         proposalDisposition: "review_untested",
         responseKind: "build",
       }),
-      { uxV1: true },
     );
     expect(summary.headline).toBe("Stopped with a draft");
     expect(summary.accent).toBe("qa");
   });
 
-  it("uxV1 fallback needsInput still renders Needs your input when no draft is pending", () => {
+  it("fallback needsInput renders Needs your input when no draft is pending", () => {
     const turn = buildTurn({
       terminalMessage: "Could you provide the login details?",
     });
-    expect(computeTurnSummary(turn).headline).toBe("Question");
-    const summary = computeTurnSummary(turn, { uxV1: true });
+    const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Needs your input");
   });
 });
@@ -1521,7 +1690,7 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
     })!;
     expect(turn.responseKind).toBe("clarify");
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Question");
+    expect(summary.headline).toBe("Needs your input");
     expect(summary.accent).toBe("qa");
   });
 
@@ -1539,8 +1708,8 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
     })!;
     expect(turn.responseKind).toBe("build");
     const summary = computeTurnSummary(turn);
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Built the workflow");
+    expect(summary.accent).toBe("qa");
   });
 
   it("tolerates missing or unknown turn_outcome", () => {
@@ -1570,7 +1739,7 @@ describe("applyNarrativeEvent — terminal adjudication on live frames", () => {
       }),
     );
     expect(s.responseKind).toBe("clarify");
-    expect(computeTurnSummary(s).headline).toBe("Question");
+    expect(computeTurnSummary(s).headline).toBe("Needs your input");
   });
 
   it("leaves both fields null on frames from an older backend", () => {
@@ -1822,7 +1991,6 @@ describe("a real cancel's backend payload still renders neutrally", () => {
       const summaryFor = (responseKind: "build" | "answer" | "recover") =>
         computeTurnSummary(
           buildTurn({ cancelled: true, blocks: [], draft: null, responseKind }),
-          { uxV1: true },
         );
 
       expect(summaryFor(priorKind)).toEqual(summaryFor("recover"));
@@ -1843,7 +2011,6 @@ describe("a real cancel's backend payload still renders neutrally", () => {
             proposalDisposition: "review_untested",
             responseKind,
           }),
-          { uxV1: true },
         );
 
       expect(summaryFor(priorKind)).toEqual(summaryFor("recover"));

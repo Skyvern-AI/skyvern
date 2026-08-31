@@ -3,17 +3,28 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime_authoring_repair
-from skyvern.forge.sdk.copilot.agent import _code_authoring_repair_context_prompt
-from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_from_run_blocks_result
+from skyvern.forge.sdk.copilot.agent import (
+    _build_dynamic_system_prompt,
+    _build_user_context,
+    _code_authoring_repair_context_prompt,
+    _prior_run_debug_text,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestEvidencePacket,
+    RecordedBuildTestOutcome,
+    recorded_outcome_from_run_blocks_result,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_KIND_KEY,
     ChallengeKind,
@@ -23,9 +34,10 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     merge_visual_composition_evidence,
+    model_visible_composition_evidence,
     parse_composition_html,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
@@ -37,6 +49,7 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
+from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -48,6 +61,10 @@ from skyvern.forge.sdk.copilot.tools import composition_capture as composition_c
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.schemas.workflows import BlockType
+from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
 
 def _ctx() -> CopilotContext:
@@ -546,9 +563,9 @@ def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_pa
     assert "current_title_present" not in CodeAuthoringRepairContext.model_fields
     assert repair_context.page_evidence_source == "inspect_page_for_composition"
     assert repair_context.observed_after_workflow_run is True
-    assert repair_context.page_form_summaries == ["Search #search", "Go button.search disabled"]
-    assert repair_context.page_result_summaries == ["#results No matching records"]
-    assert repair_context.page_action_summaries == ["Next page a.next"]
+    assert repair_context.page_form_summaries == ["Search", "Go disabled"]
+    assert repair_context.page_result_summaries == ["No matching records"]
+    assert repair_context.page_action_summaries == ["Next page"]
     assert "case=secret" not in repair_context.model_dump_json()
 
 
@@ -586,6 +603,193 @@ def test_post_run_observation_is_false_when_all_four_summary_collections_are_emp
     assert repair_context.page_action_summaries == []
     assert repair_context.page_challenge_summaries == []
     assert repair_context.observed_after_workflow_run is False
+
+
+def _standalone_control_page_evidence() -> dict[str, object]:
+    return {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "page_title": "Statements",
+        "navigation_targets": [{"text": "Next page", "selector": "a.next"}],
+        "clickable_controls": [
+            {
+                "text": "Continue to statements",
+                "selector": "#continue-btn-x9",
+                "tag": "button",
+                "disabled": True,
+                "html": '<button id="continue-btn-x9">Continue to statements</button>',
+            },
+            {"text": "Filters", "selector": "#filters-toggle-q7", "tag": "button", "expanded": False},
+            {"text": "Next page", "selector": "a.next", "tag": "a", "expanded": False},
+            {"selector": "#icon-only-z3", "tag": "button"},
+        ],
+    }
+
+
+def test_page_action_summaries_carry_navigation_targets_and_standalone_clickable_controls() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = _standalone_control_page_evidence()
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == [
+        "Continue to statements disabled",
+        "Filters collapsed",
+        "Next page collapsed",
+    ]
+    assert repair_context.observed_after_workflow_run is True
+    rendered = repair_context.model_dump_json()
+    for leaked in ("#continue-btn-x9", "#filters-toggle-q7", "#icon-only-z3", "a.next", "<button"):
+        assert leaked not in rendered
+
+
+def test_page_action_summaries_keep_a_control_behind_text_less_ones() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(6)],
+        "clickable_controls": [{"selector": f"#icon-{index}", "tag": "button"} for index in range(5)]
+        + [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries[0] == "Continue to statements"
+    assert repair_context.page_action_summaries[1:3] == ["Section 0", "Section 1"]
+
+
+def test_page_action_summaries_skip_text_less_navigation_targets() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"selector": f"a.icon{index}"} for index in range(5)]
+        + [{"text": "Next page", "selector": "a.next"}],
+        "challenge_controls": [{"selector": f"#c{index}"} for index in range(5)]
+        + [{"text": "Verify you are human", "selector": "#verify"}],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == ["Next page"]
+    assert repair_context.page_challenge_summaries == []
+
+
+def test_page_action_summaries_keep_two_controls_on_a_navigation_heavy_page() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(6)],
+        "clickable_controls": [
+            {"text": "Continue to statements", "selector": "#continue", "tag": "button"},
+            {"text": "Download all", "selector": "#download", "tag": "button"},
+        ],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == [
+        "Continue to statements",
+        "Download all",
+        "Section 0",
+        "Section 1",
+        "Section 2",
+    ]
+
+
+def test_page_action_summaries_keep_an_element_listed_in_both_collections_when_the_cap_is_full() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(4)]
+        + [{"text": "Continue to statements", "selector": "a.continue"}],
+        "clickable_controls": [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}]
+        + [{"text": f"Filter {index}", "selector": f"#f{index}", "tag": "button"} for index in range(5)],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries.count("Continue to statements") == 1
+    assert repair_context.page_action_summaries[0] == "Continue to statements"
+
+
+def test_runtime_authoring_repair_admits_a_page_whose_only_content_is_a_clickable_control() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "clickable_controls": [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}],
+    }
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.page_action_summaries == ["Continue to statements"]
+    assert repair_context.observed_after_workflow_run is True
+    assert "page_actions: Continue to statements" in _code_authoring_repair_context_prompt(ctx)
+
+
+def _text_less_control_only_page_evidence() -> dict[str, object]:
+    return {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "clickable_controls": [{"selector": f"#icon-{index}", "tag": "button"} for index in range(3)],
+    }
+
+
+def test_a_text_less_control_only_packet_is_not_admissible_repair_evidence() -> None:
+    assert post_run_inspection_cleanly_matches(_text_less_control_only_page_evidence(), "wr_failed") is False
+
+
+def test_a_text_less_control_only_packet_finalizes_no_repair_context() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_result())
+    ctx.composition_page_evidence = _text_less_control_only_page_evidence()
+
+    assert finalize_runtime_authoring_repair_context_from_page_observation(ctx) is None
 
 
 def test_failed_run_injects_pending_runtime_authoring_context_before_page_observation() -> None:
@@ -2180,11 +2384,7 @@ def test_codeblock_failure_result_carries_same_run_page_facts_for_both_execution
     repair_context = CodeAuthoringRepairContext.model_validate(data["authoring_repair_context"])
     assert repair_context.current_url == "https://example.test/app/results"
     assert repair_context.current_title == "Results"
-    assert repair_context.page_result_summaries == [
-        "#results #results tbody tr",
-        "#results tbody tr button",
-        "First result row",
-    ]
+    assert repair_context.page_result_summaries == ["First result row"]
     assert repair_context.observed_after_workflow_run is True
 
 
@@ -2220,11 +2420,10 @@ def test_store_post_run_page_evidence_refuses_a_packet_read_from_another_browser
     assert "workflow_run_id" not in stored
     assert any(entry["event"] == _SOURCE_MISMATCH_EVENT for entry in logs)
 
-    same_session_twin = recorded_outcome_from_run_blocks_result(
+    refused = recorded_outcome_from_run_blocks_result(
         _cross_session_run_result(), page_evidence={**stored, "source_browser_session_id": "pbs_run"}
     )
-    assert same_session_twin is not None
-    assert any("example.test" in ref for ref in same_session_twin.page_evidence_refs)
+    assert refused is None
 
 
 def test_unknown_run_session_grants_a_foreign_packet_so_producers_must_stamp_the_run_session() -> None:
@@ -2336,7 +2535,8 @@ def test_post_run_failure_page_store_mark_inject_grounds_repair_without_finalizi
     assert repair_context.observed_after_workflow_run is True
     assert result["data"]["authoring_repair_context"]["observed_after_workflow_run"] is True
     grounded = repair_context.page_form_summaries + repair_context.page_action_summaries
-    assert any("button.icon-btn" in summary for summary in grounded)
+    assert any(summary in {"Query", "Details"} for summary in grounded)
+    assert all("button.icon-btn" not in summary for summary in grounded)
     assert repair_context.page_result_summaries
 
 
@@ -2470,7 +2670,7 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
 
     monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
 
-    await run_execution_module._capture_and_store_post_run_page(
+    capture = await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
     )
 
@@ -2479,8 +2679,124 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
     assert evidence["workflow_run_id"] == "wr_failed"
     assert evidence["observed_after_workflow_run"] is True
     assert post_run_inspection_cleanly_matches(evidence, "wr_failed")
+    assert capture.status == "captured"
     assert ctx.page_inspection_calls_this_turn == 0
     assert ctx.browser_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_sensitive_post_run_capture_redacts_registry_values_and_keeps_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {
+            "credential": {"username": "private-user", "password": "private-pass"},
+            "copilot_run_runtime_secret_values": ("654321",),
+        },
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+
+    async def fake_read(
+        _ctx: CopilotContext, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, object], str, None, None]:
+        evidence = _bounded_failure_page_evidence()
+        evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
+        return evidence, run_session_id, None, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
+
+    capture = await run_execution_module._capture_and_store_post_run_page(
+        ctx,
+        run_session_id="run_session",
+        run_id="wr_sensitive",
+        current_url="https://example.test/otp",
+    )
+
+    assert capture.status == "captured"
+    stored = ctx.composition_page_evidence
+    assert isinstance(stored, dict)
+    assert stored["forms"][0]["fields"][0]["selector"] == "#totp"
+    assert "private-user" not in json.dumps(stored)
+    assert "private-pass" not in json.dumps(stored)
+    assert "654321" not in json.dumps(stored)
+    assert "[REDACTED_SECRET]" in json.dumps(stored)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_post_run_capture_stays_withheld_when_registry_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _bounded_failure_page_evidence()
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {"credential": {"username": "private-user"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+    )
+    read = AsyncMock()
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
+
+    capture = await run_execution_module._capture_and_store_post_run_page(
+        ctx,
+        run_session_id="run_session",
+        run_id="wr_sensitive",
+        current_url="https://example.test/otp",
+    )
+
+    assert capture.status == "unavailable"
+    assert ctx.composition_page_evidence is None
+    read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_run_capture_refused_for_a_foreign_session_reports_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+    async def fake_read(
+        _ctx: CopilotContext, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, object], str, None, None]:
+        return _bounded_failure_page_evidence(), "foreign_session", None, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
+
+    capture = await run_execution_module._capture_and_store_post_run_page(
+        ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
+    )
+
+    assert capture.status == "unavailable"
+    assert capture.omission == "page_capture_unavailable"
+    assert run_execution_module._same_run_page_evidence_for_result(ctx, "wr_failed") is None
+
+
+@pytest.mark.asyncio
+async def test_screenshot_capture_failure_keeps_a_typed_omission_on_structured_page_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    monkeypatch.setattr(
+        composition_capture_module,
+        "_composition_get_screenshot",
+        AsyncMock(return_value={"ok": False, "error": "browser session unavailable"}),
+    )
+
+    evidence, captured_frame = await composition_capture_module._augment_composition_evidence_with_visual_fallback(
+        ctx,
+        {
+            "current_url": "https://example.test/checkout/payment",
+            "forms": [{"submit_controls": [{"text": "Place order", "disabled": False}]}],
+        },
+    )
+
+    assert captured_frame is None
+    assert evidence["visual_capture_omissions"] == ["screenshot_capture_failed"]
+    assert evidence["forms"] == [{"submit_controls": [{"text": "Place order", "disabled": False}]}]
 
 
 @pytest.mark.asyncio
@@ -2605,6 +2921,58 @@ async def test_post_run_current_page_inspect_is_sourced_from_the_run_session(
     assert result["reached_via"] == "post_run"
     assert ctx.browser_session_id == "scout_session"
     assert not any(entry.get("event") == "copilot_post_run_evidence_source_mismatch_refused" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    ctx.browser_session_id = "run_session"
+    ctx.last_run_blocks_browser_session_id = "run_session"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_failed",
+        {
+            "credential": {"username": "private-user", "password": "private-pass"},
+            "copilot_run_runtime_secret_values": ("654321",),
+        },
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"run_session"}
+    evidence = _bounded_failure_page_evidence()
+    evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
+
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence)
+
+    assert result["ok"] is True
+    assert result["data"]["forms"][0]["fields"][0]["label"] == "Verification code"
+    assert "private-user" not in json.dumps(result)
+    assert "private-pass" not in json.dumps(result)
+    assert "654321" not in json.dumps(result)
+    assert "[REDACTED_SECRET]" in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_current_page_inspect_stays_withheld_while_origin_run_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    ctx.browser_session_id = "run_session"
+    ctx.last_run_blocks_browser_session_id = "run_session"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_failed",
+        {"credential": {"username": "private-user", "password": "private-pass"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"run_session"}
+    ctx.active_sensitive_origin_browser_session_ids = {"run_session"}
+
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=_bounded_failure_page_evidence())
+
+    assert result["ok"] is False
+    assert "specific named URL" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -2871,6 +3239,131 @@ def test_user_code_error_still_repairs_through_the_contract() -> None:
     assert contract.repair_decision.next_action != RepairNextAction.STOP
 
 
+@pytest.mark.asyncio
+async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_repair_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    now = datetime(2026, 8, 28, tzinfo=UTC)
+    output_parameter = OutputParameter(
+        output_parameter_id="out_confirmation",
+        workflow_id="wf_run_snapshot",
+        key="confirmation",
+        description="Confirmation details",
+        created_at=now,
+        modified_at=now,
+    )
+    run_workflow = SimpleNamespace(
+        organization_id=ctx.organization_id,
+        workflow_definition=SimpleNamespace(
+            parameters=[output_parameter],
+            blocks=[SimpleNamespace(label="open_result", block_type="CODE", output_parameter=output_parameter)],
+        ),
+    )
+    run = SimpleNamespace(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        browser_session_id="pbs_completed_missing_output",
+        status="completed",
+        failure_reason=None,
+    )
+    block = WorkflowRunBlock(
+        workflow_run_block_id="wrb_completed_missing_output",
+        workflow_run_id="wr_completed_missing_output",
+        organization_id=ctx.organization_id,
+        label="open_result",
+        block_type=BlockType.CODE,
+        status="completed",
+        failure_reason=None,
+        error_codes=[],
+        output=None,
+        final_url="https://example.test/complete",
+        created_at=now,
+        modified_at=now,
+    )
+    artifact = make_stub_html_artifact("art_completed_terminal", ArtifactType.HTML_ACTION)
+    html = (
+        b"<html><body><main><h1>Complete</h1><form>"
+        b"<button type='submit'>View confirmation</button></form></main></body></html>"
+    )
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(return_value=run),
+                get_workflow_run_output_parameters=AsyncMock(return_value=[]),
+            ),
+            observer=SimpleNamespace(get_workflow_run_blocks=AsyncMock(return_value=[block])),
+            workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=run_workflow)),
+            artifacts=SimpleNamespace(get_artifacts_for_run=AsyncMock(return_value=[artifact])),
+        ),
+        AGENT_FUNCTION=SimpleNamespace(should_dispatch_copilot_block_run_to_worker=AsyncMock(return_value=True)),
+        ARTIFACT_MANAGER=SimpleNamespace(retrieve_artifact=AsyncMock(return_value=html)),
+    )
+    monkeypatch.setattr(run_execution_module, "app", fake_app)
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
+    monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
+    produced_outcomes: list[RecordedBuildTestOutcome] = []
+    transported_outcomes: list[RecordedBuildTestOutcome | None] = []
+    real_producer = run_execution_module.recorded_outcome_from_run_blocks_result
+    real_packet_builder = run_execution_module.build_test_evidence_packet
+
+    def capture_producer(*args: object, **kwargs: object) -> RecordedBuildTestOutcome:
+        produced = real_producer(*args, **kwargs)
+        produced_outcomes.append(produced)
+        return produced
+
+    def capture_packet(
+        context: CopilotContext,
+        result: object,
+        *,
+        recorded_outcome: RecordedBuildTestOutcome | None = None,
+    ) -> BuildTestEvidencePacket:
+        transported_outcomes.append(recorded_outcome)
+        return real_packet_builder(context, result, recorded_outcome=recorded_outcome)
+
+    monkeypatch.setattr(run_execution_module, "recorded_outcome_from_run_blocks_result", capture_producer)
+    monkeypatch.setattr(run_execution_module, "build_test_evidence_packet", capture_packet)
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr_completed_missing_output")
+    system_input = str(
+        _build_dynamic_system_prompt("", CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER))(
+            SimpleNamespace(context=ctx), None
+        )
+    )
+    ordinary_input = (
+        system_input
+        + "\n"
+        + _build_user_context(
+            workflow_yaml=ctx.workflow_yaml,
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text=_prior_run_debug_text(hydrated),
+            user_message="Repair the recorded run.",
+        )
+    )
+
+    assert hydrated is not None
+    assert len(produced_outcomes) == 1
+    assert produced_outcomes[0].workflow_run_id == "wr_completed_missing_output"
+    assert len(produced_outcomes[0].missing_requested_output_facts) == 1
+    assert produced_outcomes[0].missing_requested_output_facts[0]["output_path"] == "output.confirmation"
+    assert produced_outcomes[0].missing_requested_output_facts[0]["reason_code"] == "registered_output_missing"
+    assert transported_outcomes == [produced_outcomes[0]]
+    assert ctx.latest_recorded_build_test_outcome is None
+    assert '"status": "completed"' in ordinary_input
+    assert '"workflow_run_id": "wr_completed_missing_output"' in ordinary_input
+    assert '"output_parameter_id": "out_confirmation"' in ordinary_input
+    assert '"output_parameter_key": "confirmation"' in ordinary_input
+    assert '"output_path": "output.confirmation"' in ordinary_input
+    assert '"reason_code": "registered_output_missing"' in ordinary_input
+    assert hydrated.get("page_state") is not None
+    assert '"page_state"' in ordinary_input
+    assert "Complete" in ordinary_input
+    assert "View confirmation" in ordinary_input
+    assert "success_verdict" not in ordinary_input
+    assert "RECORDED BUILD-TEST OUTCOME" not in system_input
+    assert "repairable_failure" not in system_input
+    assert "wr_completed_missing_output" not in system_input
+
+
 def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> None:
     # SKY-13624 B2: the strict-render failure is run evidence that arms repair targeting the failed
     # block, never an evidence-free fresh-build route.
@@ -2952,6 +3445,7 @@ def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
     run_execution_module._attach_run_session_facts(
         data,
         used_fresh_run_session=True,
+        run_detached_from_chat=False,
         run_ok=False,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -2966,6 +3460,7 @@ def test_run_envelope_omits_the_challenge_stall_fact_without_a_structured_packet
     run_execution_module._attach_run_session_facts(
         data,
         used_fresh_run_session=True,
+        run_detached_from_chat=False,
         run_ok=False,
         page_evidence=None,
     )
@@ -2980,6 +3475,7 @@ def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
     run_execution_module._attach_run_session_facts(
         data,
         used_fresh_run_session=True,
+        run_detached_from_chat=False,
         run_ok=True,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -3270,6 +3766,71 @@ def test_an_overlay_seen_later_in_the_run_replaces_the_earlier_clean_capture() -
     assert ctx.composition_page_evidence.get("page_obstructions")
 
 
+def test_a_control_only_page_seen_later_in_the_run_replaces_the_earlier_clean_capture() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_test_ok = False
+
+    clean, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+    ctx.composition_page_evidence = clean
+
+    control_only, preserved = store_post_run_page_evidence(
+        ctx,
+        {
+            "source_tool": "inspect_page_for_composition",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+            "clickable_controls": [{"text": "Continue to statements", "selector": "#continue", "tag": "button"}],
+        },
+        run_id="wr_failed",
+        current_url="https://example.test/app/statements",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+
+    assert preserved is False
+    assert control_only.get("clickable_controls")
+    assert ctx.composition_page_evidence.get("clickable_controls")
+    assert not ctx.composition_page_evidence.get("navigation_targets")
+
+
+def test_a_text_less_control_only_page_does_not_evict_the_earlier_clean_capture() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_test_ok = False
+
+    clean, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+    ctx.composition_page_evidence = clean
+
+    _, preserved = store_post_run_page_evidence(
+        ctx,
+        _text_less_control_only_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/statements",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+
+    assert preserved is True
+    assert ctx.composition_page_evidence.get("navigation_targets")
+
+
 def test_obstruction_without_dismiss_controls_still_finalizes_a_repair_context() -> None:
     ctx = _overlay_repair_ctx(_obstruction_only_page_evidence())
     assert has_bounded_page_schema(ctx.composition_page_evidence) is False
@@ -3298,16 +3859,45 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
 
     assert repair_context is not None
     summaries = repair_context.page_obstruction_summaries
-    assert [summary.split()[1] for summary in summaries] == ["#terms-overlay", "#terms-modal"]
+    source_obstructions = ctx.composition_page_evidence["page_obstructions"]
+    assert [obstruction.model_dump(exclude_none=True) for obstruction in repair_context.page_obstructions] == (
+        [model_visible_composition_evidence(obstruction) for obstruction in source_obstructions]
+    )
+    assert [
+        [candidate.model_dump() for candidate in control.selector_candidates]
+        for obstruction in repair_context.page_obstructions
+        for control in obstruction.visible_controls
+    ] == [
+        model_visible_composition_evidence(control)["selector_candidates"]
+        for obstruction in source_obstructions
+        for control in obstruction["visible_controls"]
+    ]
+    assert [
+        control.identity.model_dump()
+        for obstruction in repair_context.page_obstructions
+        for control in obstruction.visible_controls
+        if control.identity is not None
+    ] == [
+        control["identity"]
+        for obstruction in source_obstructions
+        for control in obstruction["visible_controls"]
+        if "identity" in control
+    ]
+    assert len(summaries) == 2
     for summary in summaries:
-        assert "#accept-terms" in summary
-        assert "Continue #btn-continue" in summary
+        assert "Terms" in summary
+        assert "Continue" in summary
+        assert "#terms-" not in summary
+        assert "#accept-terms" not in summary
+        assert "#btn-continue" not in summary
     prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
     assert "runtime_failure_reason: TimeoutError: Locator.wait_for: Timeout 10000ms exceeded." in prompt_lines
     assert "observed_after_workflow_run: true" in prompt_lines
     obstruction_line = next(line for line in prompt_lines if line.startswith("page_obstructions:"))
-    assert "#terms-overlay" in obstruction_line
-    assert "#btn-continue" in obstruction_line
+    assert "Terms" in obstruction_line
+    assert "Continue" in obstruction_line
+    assert "#terms-overlay" not in obstruction_line
+    assert "#btn-continue" not in obstruction_line
 
     ctx.last_code_authoring_repair_context = repair_context.model_copy(update={"selector": "#btn-continue"})
     selector_prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
@@ -3315,7 +3905,7 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
     assert obstruction_line in selector_prompt_lines
 
 
-def test_overlay_selectors_longer_than_a_summary_field_reach_the_prompt_whole() -> None:
+def test_overlay_selectors_do_not_reach_the_repair_prompt() -> None:
     ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))
     long_selector = f"#{_LONG_OVERLAY_SELECTOR_ID}"
     assert len(long_selector) > 100
@@ -3324,9 +3914,11 @@ def test_overlay_selectors_longer_than_a_summary_field_reach_the_prompt_whole() 
 
     assert repair_context is not None
     summary = repair_context.page_obstruction_summaries[0]
-    assert summary.startswith(f"modal_overlay {long_selector} ")
-    assert summary.endswith("#btn-four")
-    assert f"page_obstructions: modal_overlay {long_selector} " in _code_authoring_repair_context_prompt(ctx)
+    assert summary.startswith("modal_overlay Notice ")
+    assert summary.endswith("Close")
+    assert long_selector not in summary
+    assert "#btn-four" not in summary
+    assert long_selector not in _code_authoring_repair_context_prompt(ctx)
 
 
 def test_every_obstruction_keeps_dismiss_controls_when_controls_outnumber_the_summary_budget() -> None:
@@ -3336,16 +3928,12 @@ def test_every_obstruction_keeps_dismiss_controls_when_controls_outnumber_the_su
     repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
 
     assert repair_context is not None
-    per_obstruction = {
-        selector: [summary for summary in repair_context.page_obstruction_summaries if selector in summary]
-        for selector in (long_selector, "#inner-modal")
-    }
-    assert [len(summaries) for summaries in per_obstruction.values()] == [1, 1]
-    assert [
-        selector
-        for selector in ("#btn-one", "#btn-two", "#btn-three", "#btn-four")
-        if selector in per_obstruction["#inner-modal"][0]
-    ] == ["#btn-one", "#btn-two", "#btn-three", "#btn-four"]
+    summaries = repair_context.page_obstruction_summaries
+    assert len(summaries) == 2
+    assert all(label in summaries[1] for label in ("Accept", "Decline", "Manage", "Close"))
+    assert long_selector not in " ".join(summaries)
+    assert "#inner-modal" not in " ".join(summaries)
+    assert all(selector not in " ".join(summaries) for selector in ("#btn-one", "#btn-two", "#btn-three", "#btn-four"))
 
 
 def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> None:
@@ -3359,7 +3947,11 @@ def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> No
     for summary, obstruction in zip(
         repair_context.page_obstruction_summaries, ctx.composition_page_evidence["page_obstructions"]
     ):
-        source_control_order = [control.get("selector") for control in obstruction["visible_controls"]]
+        source_control_order = [
+            control.get("text") or control.get("aria_label") or control.get("title")
+            for control in obstruction["visible_controls"]
+        ]
+        source_control_order = [value for value in source_control_order if isinstance(value, str) and value]
         assert sorted(source_control_order, key=summary.index) == source_control_order
     assert json.dumps(ctx.composition_page_evidence, sort_keys=True) == evidence_before
     assert pending_before is not None
@@ -3369,19 +3961,21 @@ def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> No
         "current_url",
         "current_title",
         "page_evidence_source",
+        "rendered_value_excerpt",
         "observed_after_workflow_run",
         "page_form_summaries",
         "page_result_summaries",
         "page_action_summaries",
         "page_challenge_summaries",
         "page_obstruction_summaries",
+        "page_obstructions",
+        "page_obstruction_omission_notices",
     }
 
 
-def test_modal_overlay_dismiss_controls_are_read_only_without_page_obstructions() -> None:
+def test_modal_overlay_dismiss_controls_are_read_only_when_page_obstructions_is_absent() -> None:
     ctx = _overlay_repair_ctx(
         {
-            "page_obstructions": [],
             "modal_overlays": [
                 {
                     "selector": "#gate-modal",
@@ -3398,7 +3992,18 @@ def test_modal_overlay_dismiss_controls_are_read_only_without_page_obstructions(
     repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
 
     assert repair_context is not None
-    assert repair_context.page_obstruction_summaries == ["#gate-modal Accept All button.accept"]
+    assert repair_context.page_obstruction_summaries == ["Accept All"]
+    assert [obstruction.model_dump(exclude_none=True) for obstruction in repair_context.page_obstructions] == [
+        {
+            "selector_candidates": [],
+            "visible_controls": [
+                {
+                    "text": "Accept All",
+                    "selector_candidates": [],
+                }
+            ],
+        }
+    ]
 
 
 def test_page_free_of_obstructions_renders_no_obstruction_line() -> None:
@@ -3417,7 +4022,22 @@ def test_page_free_of_obstructions_renders_no_obstruction_line() -> None:
 
     assert repair_context is not None
     assert repair_context.page_obstruction_summaries == []
+    assert repair_context.page_obstructions == []
     assert "page_obstructions:" not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_malformed_canonical_obstruction_is_omitted_with_an_exact_notice() -> None:
+    evidence = _obstruction_only_page_evidence()
+    evidence["page_obstructions"].append("malformed")
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert len(repair_context.page_obstructions) == 1
+    assert repair_context.page_obstruction_omission_notices == [
+        "failure.page_state.obstructions omitted: 1 malformed item(s)."
+    ]
 
 
 def test_page_obstruction_summaries_separate_runtime_repair_root_cause_signatures() -> None:
@@ -3491,7 +4111,7 @@ def test_same_run_matcher_keeps_a_stored_obstruction_only_packet() -> None:
     assert post_run_inspection_cleanly_matches(stored, "wr_other") is False
 
 
-def test_a_long_control_text_never_costs_the_prompt_the_dismiss_selector() -> None:
+def test_a_long_control_text_never_leaks_the_dismiss_selector() -> None:
     control_selector = "#" + "dismiss-the-full-page-notice-" * 5
     ctx = _overlay_repair_ctx(
         {
@@ -3518,14 +4138,15 @@ def test_a_long_control_text_never_costs_the_prompt_the_dismiss_selector() -> No
     assert repair_context is not None
     summary = repair_context.page_obstruction_summaries[0]
     assert len(summary) <= OBSTRUCTION_SUMMARY_MAX_CHARS
-    assert summary.endswith(control_selector)
+    assert control_selector not in summary
+    assert "Accept and continue past this notice." in summary
     obstruction_lines = [
         line
         for line in _code_authoring_repair_context_prompt(ctx).splitlines()
         if line.startswith("page_obstructions:")
     ]
     assert obstruction_lines
-    assert control_selector in obstruction_lines[0]
+    assert control_selector not in obstruction_lines[0]
 
 
 _CHALLENGE_PAGE_URL = "https://sso.example.test/challenge"
@@ -3676,3 +4297,314 @@ def test_unbound_credentials_still_ask_even_beside_a_clearable_captcha(monkeypat
     data = {"workflow_run_id": "wr_mixed", "skip_reason": "workflow_credential_inputs_unbound"}
 
     assert runtime_authoring_repair._result_has_terminal_or_ask_precedence(ctx, data, {"ok": False}) is True
+
+
+_OBSERVED_FIELD_SECRET = "s3cret-not-a-real-password"
+
+
+def _observed_state_page_evidence() -> dict[str, Any]:
+    return {
+        "current_url": "https://example.test/booking",
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "label": "Depart date",
+                        "type": "date",
+                        "value": "",
+                        "observed_value": "2026-09-14",
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "label": "Cabin",
+                        "type": "select",
+                        "identity": {"tag": "select"},
+                        "options": [
+                            {"text": "Economy", "value": "economy", "selected": True, "observed_selected": False},
+                            {"text": "Business", "value": "business", "selected": False, "observed_selected": True},
+                        ],
+                    },
+                    {
+                        "label": "Add insurance",
+                        "type": "checkbox",
+                        "value": "yes",
+                        "checked": False,
+                        "observed_checked": True,
+                        "identity": {"tag": "input"},
+                    },
+                    {
+                        "label": "Password",
+                        "type": "password",
+                        "value": _OBSERVED_FIELD_SECRET,
+                        "filled": True,
+                        "identity": {"tag": "input"},
+                    },
+                ],
+                "submit_controls": [{"text": "Book", "disabled": False}],
+            }
+        ],
+    }
+
+
+def test_repair_prompt_carries_the_field_state_the_run_produced_not_the_markup_default() -> None:
+    ctx = _overlay_repair_ctx(_observed_state_page_evidence())
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == [
+        "Depart date date 2026-09-14",
+        "Cabin select Business",
+        "Add insurance checkbox checked",
+        "Password password",
+        "Book enabled",
+    ]
+    assert "page_forms: Depart date date 2026-09-14" in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_a_password_value_never_reaches_the_repair_prompt_beside_the_observed_field_state() -> None:
+    ctx = _overlay_repair_ctx(_observed_state_page_evidence())
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert _OBSERVED_FIELD_SECRET not in repair_context.model_dump_json()
+    assert _OBSERVED_FIELD_SECRET not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_an_observed_value_on_a_secret_typed_field_is_still_not_rendered() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Password",
+            "type": "password",
+            "observed_value": _OBSERVED_FIELD_SECRET,
+            "identity": {"tag": "input"},
+        },
+        {
+            "label": "Notes",
+            "type": "textarea",
+            "observed_value": _OBSERVED_FIELD_SECRET,
+            "identity": {"tag": "textarea"},
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Password password", "Notes textarea"]
+    assert _OBSERVED_FIELD_SECRET not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_a_field_whose_declared_type_lies_about_its_tag_renders_no_observed_state() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Notes",
+            "type": "date",
+            "observed_value": _OBSERVED_FIELD_SECRET,
+            "identity": {"tag": "textarea"},
+        },
+        {
+            "label": "Agree",
+            "type": "checkbox",
+            "observed_checked": True,
+            "identity": {"tag": "textarea"},
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Notes date", "Agree checkbox"]
+    assert _OBSERVED_FIELD_SECRET not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_a_checkbox_state_is_not_rendered_through_the_disabled_key_mapping() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Add insurance",
+            "type": "checkbox",
+            "checked": False,
+            "observed_checked": False,
+            "identity": {"tag": "input"},
+        }
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(_overlay_repair_ctx(evidence))
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Add insurance checkbox unchecked"]
+
+
+def test_a_select_typed_field_whose_real_tag_is_not_select_renders_no_observed_state() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Departure",
+            "type": "select",
+            "identity": {"tag": "div"},
+            "options": [{"text": "2026-09-14", "value": "2026-09-14", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Departure select"]
+
+
+def test_a_real_select_still_renders_its_observed_option() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "Departure",
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [{"text": "2026-09-14", "value": "2026-09-14", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Departure select 2026-09-14"]
+
+
+def test_an_admitted_but_empty_observed_value_is_distinguishable_from_no_observation() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": "Departure", "type": "date", "observed_value": "", "identity": {"tag": "input"}},
+        {"label": "Return", "type": "date", "identity": {"tag": "input"}},
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == ["Departure date empty", "Return date"]
+
+
+def test_a_long_label_cannot_truncate_the_observed_state_away() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {
+            "label": "D" * 200,
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [{"text": "Departing " + "x" * 40 + "2026-09-14", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries[0].endswith("2026-09-14")
+
+
+def test_a_filled_control_is_not_displaced_by_controls_that_observed_nothing() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": "Origin station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Destination station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Departure date", "type": "date", "observed_value": "", "identity": {"tag": "input"}},
+    ] + [
+        {"label": label, "type": "checkbox", "observed_checked": False, "identity": {"tag": "input"}}
+        for label in ("Aisle seat", "Window seat", "Extra legroom", "Travel insurance", "Seat alerts")
+    ]
+    evidence["forms"][0]["submit_controls"] = [{"text": "Continue to payment", "disabled": False}]
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summaries = repair_context.page_form_summaries
+    assert summaries[0] == "Origin station text"
+    assert summaries[1] == "Destination station text"
+    assert "Departure date date empty" in summaries
+
+
+def test_a_control_that_observed_something_still_leads_the_summary_cap() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": f"Filler {index}", "type": "text", "identity": {"tag": "input"}} for index in range(8)
+    ] + [
+        {"label": "Departure", "type": "date", "observed_value": "2026-09-14", "identity": {"tag": "input"}},
+        {"label": "Aisle seat", "type": "checkbox", "observed_checked": True, "identity": {"tag": "input"}},
+    ]
+    evidence["forms"][0]["submit_controls"] = [{"text": "Continue to payment", "disabled": False}]
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summaries = repair_context.page_form_summaries
+    assert summaries[:2] == ["Departure date 2026-09-14", "Aisle seat checkbox checked"]
+    assert summaries[2:] == ["Filler 0 text", "Filler 1 text", "Filler 2 text"]
+
+
+def test_a_select_on_its_blank_leading_option_does_not_displace_filled_controls() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": "Origin station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Destination station", "type": "text", "identity": {"tag": "input"}},
+        {"label": "Passenger name", "type": "text", "identity": {"tag": "input"}},
+    ] + [
+        {
+            "label": label,
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [
+                {"text": "", "value": "", "observed_selected": True},
+                {"text": option, "value": option},
+            ],
+        }
+        for label, option in (("Departure day", "1"), ("Departure month", "Jan"), ("Departure year", "2026"))
+    ]
+    evidence["forms"][0]["submit_controls"] = [{"text": "Continue to payment", "disabled": False}]
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries == [
+        "Origin station text",
+        "Destination station text",
+        "Passenger name text",
+        "Departure day select",
+        "Departure month select",
+    ]
+
+
+def test_a_select_on_a_real_option_still_leads_the_summary_cap() -> None:
+    evidence = _observed_state_page_evidence()
+    evidence["forms"][0]["fields"] = [
+        {"label": f"Filler {index}", "type": "text", "identity": {"tag": "input"}} for index in range(6)
+    ] + [
+        {
+            "label": "Departure month",
+            "type": "select",
+            "identity": {"tag": "select"},
+            "options": [{"text": "", "value": ""}, {"text": "Jan", "value": "1", "observed_selected": True}],
+        },
+    ]
+    evidence["forms"][0]["submit_controls"] = []
+    ctx = _overlay_repair_ctx(evidence)
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_form_summaries[0] == "Departure month select Jan"

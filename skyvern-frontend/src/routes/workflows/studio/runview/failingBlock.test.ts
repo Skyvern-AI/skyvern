@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { Status } from "@/api/types";
 import { type WorkflowRunTimelineItem } from "@/routes/workflows/types/workflowRunTypes";
 
-import { failingBlockLabel } from "./failingBlock";
+import { failingBlock } from "./failingBlock";
 
 function blockItem(
   label: string | null,
@@ -27,51 +27,58 @@ function blockItem(
   } as unknown as WorkflowRunTimelineItem;
 }
 
-describe("failingBlockLabel", () => {
-  test("names the failed block", () => {
-    expect(
-      failingBlockLabel([
-        blockItem("login", Status.Completed),
-        blockItem("checkout", Status.Failed),
-      ]),
-    ).toBe("checkout");
+describe("failingBlock", () => {
+  test("returns the failed block", () => {
+    const timeline = [
+      blockItem("login", Status.Completed),
+      blockItem("checkout", Status.Failed),
+    ];
+
+    expect(failingBlock(timeline)?.workflow_run_block_id).toBe("wrb_checkout");
   });
 
-  test("skips continue-on-failure blocks — they cannot end a run", () => {
+  test("skips continue-on-failure blocks", () => {
     expect(
-      failingBlockLabel([
+      failingBlock([
         blockItem("checkout", Status.Failed),
         blockItem("optional", Status.Failed, true),
-      ]),
+      ])?.label,
     ).toBe("checkout");
   });
 
-  test("finds a failure nested in a container", () => {
+  test("finds a nested failure", () => {
     expect(
-      failingBlockLabel([
+      failingBlock([
         blockItem("loop", Status.Failed, false, [
           blockItem("search", Status.Failed),
         ]),
-      ]),
+      ])?.label,
     ).toBe("search");
   });
 
-  test("skips the finally block, which runs after the real failure", () => {
+  test("prefers a pre-finally failure but keeps a finally-only target", () => {
     expect(
-      failingBlockLabel(
+      failingBlock(
         [
           blockItem("checkout", Status.Failed),
           blockItem("cleanup", Status.Failed),
         ],
         "cleanup",
-      ),
+      )?.label,
     ).toBe("checkout");
+    expect(
+      failingBlock([blockItem("cleanup", Status.Failed)], "cleanup")?.label,
+    ).toBe("cleanup");
   });
 
-  test("null for a clean or absent timeline", () => {
+  test("keeps an unlabeled failed block as the recovery target", () => {
     expect(
-      failingBlockLabel([blockItem("login", Status.Completed)]),
-    ).toBeNull();
-    expect(failingBlockLabel(undefined)).toBeNull();
+      failingBlock([blockItem(null, Status.Failed)])?.workflow_run_block_id,
+    ).toBe("wrb_anon");
+  });
+
+  test("returns null for a clean or absent timeline", () => {
+    expect(failingBlock([blockItem("login", Status.Completed)])).toBeNull();
+    expect(failingBlock(undefined)).toBeNull();
   });
 });

@@ -21,6 +21,8 @@ from yutori.navigator import format_stop_and_summarize, screenshot_to_data_url
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.webeye.actions.actions import Action, WaitAction
+from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionResult, StaleActionAbort
 
 LOG = structlog.get_logger()
 
@@ -83,6 +85,27 @@ def _action_result_description(name: str, arguments_json: str) -> str:
     return f"Executed {name}"
 
 
+def derive_navigator_pending_result(action: Action, result: ActionResult) -> str | None:
+    """Map an executed action and its terminal result to the tool-result text the Navigator model sees
+    next turn. Returns ``None`` to let ``flush_pending_tool_results`` fall back to a generic action
+    description (used for ordinary browser actions that carry no explicit result data)."""
+    if isinstance(result, StaleActionAbort):
+        # Not executed: the target went stale. Never return None here -- the flush would then fall back
+        # to a generic "Clicked ..." description, telling the model the action ran and defeating fresh
+        # re-planning.
+        return STALE_TARGET_TOOL_RESULT
+    if isinstance(action, WaitAction):
+        # Skyvern's handle_wait_action always returns ActionFailure by design (to discourage v1/v2
+        # engines from leaning on wait), but Navigator emits wait as a deliberate cooperative pause --
+        # surface a positive result so the model sees WaitAction success.
+        return f"Waited {action.seconds}s"
+    if result.success:
+        # Use actual data when available (JS output, etc.); otherwise let the flush describe the action.
+        return str(result.data) if result.data is not None else None
+    # Provide error details so the model can recover.
+    return f"ERROR: {result.exception_message or 'Action failed'}"
+
+
 class YutoriNavigatorLLMCaller(LLMCaller):
     """Yutori Navigator LLM caller extending Skyvern's LLMCaller base class.
 
@@ -105,7 +128,7 @@ class YutoriNavigatorLLMCaller(LLMCaller):
     def initialize_conversation(self, task: Task) -> None:
         """Initialize (or re-initialize) conversation. Resets history so retries start fresh."""
         self._task = task
-        self.message_history = []
+        self.message_history: list[dict[str, Any]] = []
         self._pending_tool_calls = []
         self._conversation_initialized = True
         LOG.debug("Initialized Yutori Navigator conversation", task_id=task.task_id)

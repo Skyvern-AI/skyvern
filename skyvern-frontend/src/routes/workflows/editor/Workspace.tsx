@@ -33,7 +33,7 @@ import {
   Edge,
 } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useFeatureFlagEnabled, usePostHog } from "posthog-js/react";
+import { usePostHog } from "posthog-js/react";
 
 import {
   useWorkflowYamlEditorStore,
@@ -49,11 +49,6 @@ import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
-import {
-  resolveBrowserPanelMode,
-  resolveCdpRecordingExfiltrate,
-  updateBrowserPanelLatch,
-} from "./browserPanelMode";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
@@ -132,8 +127,6 @@ import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
-import { RECORD_BROWSER_CDP_TRANSPORT_FLAG } from "@/util/featureFlags";
-
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
 import {
@@ -820,37 +813,10 @@ function Workspace({
   const { streamTransport } = useStreamTransport(
     activeDebugSession?.browser_session_id,
   );
-  const cdpRecordingFlagEnabled =
-    useFeatureFlagEnabled(RECORD_BROWSER_CDP_TRANSPORT_FLAG) ?? false;
-  const browserPanelLatchRef = useRef({
-    streamTransport,
-    cdpRecordingEnabled: cdpRecordingFlagEnabled,
-  });
-  browserPanelLatchRef.current = updateBrowserPanelLatch(
-    browserPanelLatchRef.current,
-    {
-      streamTransport,
-      cdpRecordingEnabled: cdpRecordingFlagEnabled,
-    },
-    recordingStore.isRecording,
-  );
-  const { streamTransport: latchedStreamTransport, cdpRecordingEnabled } =
-    browserPanelLatchRef.current;
-  // Keep the panel mode stable if transport resolution or PostHog changes mid-recording.
-  const { showCdp: isCdpStreamingMode, preferVnc: preferVncStream } =
-    resolveBrowserPanelMode({
-      streamTransport: latchedStreamTransport,
-      isRecording: recordingStore.isRecording,
-      cdpRecordingEnabled,
-    });
-  const recordingTransport =
-    showBrowser && latchedStreamTransport === "cdp" && cdpRecordingEnabled
-      ? "cdp"
-      : "vnc";
-  const setRecordingTransport = recordingStore.setRecordingTransport;
-  useLayoutEffect(() => {
-    setRecordingTransport(recordingTransport);
-  }, [setRecordingTransport, recordingTransport]);
+  // Recording stays on the session's own transport: a cdp-transport session is one
+  // with no relayable RFB endpoint, so swapping to VNC to record kills the view.
+  const isCdpStreamingMode = streamTransport === "cdp";
+  const preferVncStream = streamTransport !== "cdp";
 
   const workflowChangesStore = useWorkflowHasChangesStore();
 
@@ -870,11 +836,11 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
-  // Recording is session-scoped: the stream opts out of reset-on-unmount (it
-  // remounts across the CDP<->VNC recording swap mid-session), so the debug
-  // session owns the reset here — embedded, StudioBrowserStream owns it. The id
-  // guard keeps the null -> first-id transition from clearing a recording that
-  // started before the session resolved.
+  // Recording is session-scoped: the stream opts out of reset-on-unmount (it can
+  // remount while the session persists), so the debug session owns the reset
+  // here — embedded, StudioBrowserStream owns it. The id guard keeps the
+  // null -> first-id transition from clearing a recording that started before
+  // the session resolved.
   useEffect(() => {
     if (embedded || !debugBrowserSessionId) {
       return;
@@ -2730,12 +2696,6 @@ function Workspace({
                       ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserSessionStream
                           browserSessionId={displayBrowserSessionId}
-                          exfiltrate={resolveCdpRecordingExfiltrate({
-                            cdpRecordingEnabled,
-                            isRecording: recordingStore.isRecording,
-                            finishRequested: recordingStore.finishRequested,
-                          })}
-                          workflowPermanentId={workflowPermanentId ?? null}
                           interactive={true}
                           showControlButtons={true}
                           // The CDP transport streams the page viewport only, so
@@ -2743,6 +2703,14 @@ function Workspace({
                           // to type into and a session resting on about:blank has
                           // no way out (SKY-13705).
                           enableUrlInput={true}
+                          // undefined keeps the recording message channel closed on
+                          // the non-recording live view; a defined value opens it.
+                          exfiltrate={
+                            recordingStore.isRecording
+                              ? !recordingStore.finishRequested
+                              : undefined
+                          }
+                          workflowPermanentId={workflowPermanentId ?? null}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (

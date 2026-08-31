@@ -253,6 +253,11 @@ def test_mint_returns_none_on_truncated_or_warned_capture() -> None:
     truncated["result_containers_truncated"] = True
     warned = _kv_page_evidence()
     warned["inspection_warnings"] = ["partial capture"]
+    size_compacted = _kv_page_evidence()
+    size_compacted["size_compaction"] = {
+        "original_char_count": 130_000,
+        "omissions": [{"category": "key_value_relations", "omitted_count": 1, "unit": "entries"}],
+    }
     labels = {"output.overall_credentialing_result": ("Overall Credentialing Result",)}
 
     assert (
@@ -264,6 +269,16 @@ def test_mint_returns_none_on_truncated_or_warned_capture() -> None:
     assert (
         mint_scout_observation_contract(
             warned, labels_by_path=labels, url="https://example.com/x", has_bounded_page_schema=True
+        )
+        is None
+    )
+    assert size_compacted["key_value_relations_truncated"] is False
+    assert (
+        mint_scout_observation_contract(
+            size_compacted,
+            labels_by_path=labels,
+            url="https://example.com/x",
+            has_bounded_page_schema=True,
         )
         is None
     )

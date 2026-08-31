@@ -17,6 +17,7 @@ from skyvern.config import settings
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
+from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
 from skyvern.forge.sdk.copilot.narration import (
     CODE_REPAIR_PROGRESS_SURFACE_KIND,
@@ -81,9 +82,24 @@ _OBSERVATION_TOOLS = {
     "select_option",
     "press_key",
     "wait_for_either_state",
+    "skyvern_frame_list",
+    "skyvern_frame_switch",
+    "skyvern_frame_main",
 }
 
 _AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "update_workflow"})
+
+
+def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -> list[CodeWriteDiff] | None:
+    """Hand a result the diffs its own call stashed, and clear only that entry. Parallel tool calls
+    are the provider default, so draining by arrival would show one write's patch on a sibling's
+    row — or on a sibling that failed."""
+    if tool_name not in CODE_WRITE_TOOL_NAMES:
+        return None
+    diffs = ctx.pending_code_write_diffs.pop(call_id, None)
+    return diffs or None
+
+
 # Pure substring heuristic over raw (unparsed) JSON text: a free-text field (e.g. navigation_goal)
 # that happens to contain the literal "label:" would also match. Accepted trade-off of not
 # json.loads-ing the partial buffer; worst case is a spurious drafted-block entry.
@@ -289,11 +305,8 @@ async def stream_to_sse(
             getattr(ctx, "organization_id", None),
         )
     narrator_enabled = narrator_state.resolved_handler is not None
-    # Iteration numbers restart at 0 on every enforcement pass, so a set carried
-    # over from the previous pass would suppress this pass's clean iterations —
-    # and a transition tagged with a previous pass's iteration number could be
-    # consumed by this pass's same-numbered iteration by coincidence.
-    narrator_state.iterations_with_tool_activity.clear()
+    # Iteration numbers restart at 0 on every enforcement pass, so a tag carried
+    # over would pair a banked transition to this pass's same-numbered step.
     narrator_state.pending_transition_iteration = None
     ctx.narrator_state = narrator_state
     user_message = getattr(ctx, "user_message", "") or ""
@@ -344,6 +357,14 @@ async def stream_to_sse(
                     tool_input = raw_args
 
                 display_label = tool_activity_display_label(tool_name, tool_input)
+                if getattr(ctx, "eval_mode", None) == "browser_ablation":
+                    ctx.eval_tool_activity.append(
+                        {
+                            "tool_call_id": call_id,
+                            "tool_name": tool_name,
+                            "tool_input": _sanitize_input(tool_input),
+                        }
+                    )
                 call_id_to_label[call_id] = display_label
                 ctx.in_flight_stream_tool_call = InFlightStreamToolCall(
                     call_id=call_id, tool_name=tool_name, iteration=iteration, display_label=display_label
@@ -372,7 +393,7 @@ async def stream_to_sse(
                     narrator_state.pending_tool_name = tool_name
                     narrator_state.current_iteration = iteration
                     narrator_state.record_transition(TransitionKind.TOOL_STARTED)
-                    schedule_narration(narrator_state, stream, iteration)
+                    schedule_narration(narrator_state, stream)
 
             elif event.name == "tool_output":
                 raw = event.item.raw_item
@@ -405,7 +426,14 @@ async def stream_to_sse(
                         parsed, tool_name=tool_name, blocker_signal=blocker_signals, success=success
                     )
                     result_label = call_id_to_label.get(call_id) or tool_activity_display_label(tool_name)
+                    if getattr(ctx, "eval_mode", None) == "browser_ablation":
+                        for activity in reversed(ctx.eval_tool_activity):
+                            if activity.get("tool_call_id") == call_id:
+                                activity["success"] = success
+                                activity["summary"] = summary
+                                break
                     tool_result_ts = datetime.now(timezone.utc)
+                    code_diffs = _drain_code_write_diffs(ctx, tool_name, call_id)
                     narrator_state.record_activity(
                         build_tool_result_activity(
                             tool_name,
@@ -415,6 +443,7 @@ async def stream_to_sse(
                             call_id,
                             timestamp=tool_result_ts,
                             display_label=result_label,
+                            code_diffs=code_diffs,
                         )
                     )
 
@@ -428,6 +457,7 @@ async def stream_to_sse(
                                 summary=summary,
                                 iteration=iteration,
                                 tool_call_id=call_id,
+                                code_diffs=code_diffs,
                                 detail=detail,
                                 workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
                                 timestamp=tool_result_ts,
@@ -452,7 +482,7 @@ async def stream_to_sse(
                         for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
                             narrator_state.record_transition(transition)
                         narrator_state.current_iteration = iteration
-                        schedule_narration(narrator_state, stream, iteration)
+                        schedule_narration(narrator_state, stream)
                     else:
                         _update_enforcement_from_tool(ctx, tool_name, parsed)
 
@@ -556,6 +586,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     success = user_facing_success(parsed, blocker_signal=blocker_signals)
     display_label = pending.display_label or tool_activity_display_label(pending.tool_name)
     flush_ts = datetime.now(timezone.utc)
+    code_diffs = _drain_code_write_diffs(ctx, pending.tool_name, pending.call_id)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
@@ -567,6 +598,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
                 pending.call_id,
                 timestamp=flush_ts,
                 display_label=display_label,
+                code_diffs=code_diffs,
             )
         )
     if await stream.is_disconnected():
@@ -580,6 +612,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             summary=summary,
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
+            code_diffs=code_diffs,
             detail=summarize_tool_result_detail(
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),
@@ -764,9 +797,14 @@ async def emit_workflow_draft(
     workflow: Workflow,
     *,
     include_workflow: bool = True,
+    code_diffs: list[CodeWriteDiff] | None = None,
+    tool_call_id: str | None = None,
 ) -> None:
     """Emit a WORKFLOW_DRAFT envelope; ``include_workflow=False`` suppresses
     the canvas auto-render for untested paths (inline REPLACE_WORKFLOW).
+
+    ``code_diffs`` rides here rather than waiting for the ``tool_result`` because a write and
+    its test share one tool call, so the result does not arrive until the run is over.
     """
     block_count = 0
     block_labels: list[str] = []
@@ -791,5 +829,7 @@ async def emit_workflow_draft(
             summary=None,
             timestamp=datetime.now(timezone.utc),
             workflow=workflow_dump,
+            code_diffs=[dict(diff) for diff in code_diffs] if code_diffs else None,
+            tool_call_id=tool_call_id,
         )
     )

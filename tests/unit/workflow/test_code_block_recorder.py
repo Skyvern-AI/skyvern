@@ -10,11 +10,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from playwright.async_api import BrowserContext, Locator, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy import select
 
+from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
@@ -35,6 +38,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_CAPTURE_MAX_CHARS,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     PendingAction,
+    PlaywrightInputDefaults,
     RecordingKeyboard,
     RecordingLocator,
     RecordingPage,
@@ -53,6 +57,11 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, ClickAction, GotoUrlAction, InputTextAction
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.playwright_input import (
+    PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+    playwright_input_defaults_for_page,
+    register_playwright_input_context,
+)
 
 
 class FakeFrame:
@@ -66,6 +75,7 @@ class FakeElementHandle:
     def __init__(self, url):  # noqa: ANN001
         self._url = url
         self.filled: list[str] = []
+        self.typed: list[str] = []
 
     async def owner_frame(self):  # noqa: ANN201
         return FakeFrame(self._url)
@@ -73,12 +83,24 @@ class FakeElementHandle:
     async def fill(self, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
         self.filled.append(value)
 
+    async def type(self, text, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.typed.append(text)
 
-class FakeLocator:
+
+class FakeLocator(Locator):
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.frame_url = "https://dash.example.com/account/login"
         self.element_handle_calls = 0
+        self._page: Any = None
+
+    @property
+    def page(self) -> Any:
+        return self._page
+
+    @page.setter
+    def page(self, value: Any) -> None:
+        self._page = value
 
     def locator(self, selector):  # noqa: ANN001, ANN201
         return self
@@ -103,8 +125,8 @@ class FakeLocator:
     async def fill(self, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
         self.calls.append(f"fill:{value}")
 
-    async def type(self, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
-        self.calls.append(f"type:{value}")
+    async def type(self, text, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.calls.append(f"type:{text}")
 
     async def press_sequentially(self, text, **kwargs):  # noqa: ANN001, ANN003, ANN201
         self.calls.append(f"press_sequentially:{text}")
@@ -133,9 +155,15 @@ class FakeKeyboard:
 class FakePage:
     def __init__(self) -> None:
         self.inner = FakeLocator()
+        self.inner.page = self
         self.keyboard = FakeKeyboard()
         self.url = "about:blank"
         self.autocompleted: list[str] = []
+        self.context = SimpleNamespace()
+        self.default_timeout = PLAYWRIGHT_DEFAULT_TIMEOUT_MS
+
+    def set_default_timeout(self, timeout: float) -> None:
+        self.default_timeout = timeout
 
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
@@ -150,6 +178,9 @@ class FakePage:
         return None
 
     async def fill(self, selector, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        return None
+
+    async def type(self, selector, text, **kwargs):
         return None
 
     def get_by_role(self, role, **kwargs):  # noqa: ANN001, ANN003, ANN201
@@ -230,7 +261,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     pending: list[PendingAction] = []
     emitted = asyncio.Event()
 
-    async def capture_pending(fact: PendingAction) -> None:
+    def capture_pending(fact: PendingAction) -> None:
         pending.append(fact)
         emitted.set()
 
@@ -254,10 +285,9 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     assert await call == "response"
     assert len(pending) == 1
     assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
 
     fast_pending: list[PendingAction] = []
-    fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)  # type: ignore[arg-type]
+    fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)
     await fast_page.goto("https://example.com/fast")
     await asyncio.sleep(0.02)
     assert fast_pending == []
@@ -265,7 +295,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     failed_pending: list[PendingAction] = []
     failed_inner = ControlledGotoPage(outcome=RuntimeError("navigation failed"))
     failed_inner.release.set()
-    failed_page = RecordingPage(failed_inner, on_pending_action=failed_pending.append)  # type: ignore[arg-type]
+    failed_page = RecordingPage(failed_inner, on_pending_action=failed_pending.append)
     with pytest.raises(RuntimeError, match="navigation failed"):
         await failed_page.goto("https://example.com/fail")
     await asyncio.sleep(0.02)
@@ -273,7 +303,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
 
     cancelled_pending: list[PendingAction] = []
     cancelled_inner = ControlledGotoPage()
-    cancelled_page = RecordingPage(cancelled_inner, on_pending_action=cancelled_pending.append)  # type: ignore[arg-type]
+    cancelled_page = RecordingPage(cancelled_inner, on_pending_action=cancelled_pending.append)
     cancelled_call = asyncio.create_task(cancelled_page.goto("https://example.com/cancel"))
     await cancelled_inner.started.wait()
     cancelled_call.cancel()
@@ -284,7 +314,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
 
     callback_started = asyncio.Event()
 
-    async def failing_callback(fact: PendingAction) -> None:
+    def failing_callback(fact: PendingAction) -> None:
         callback_started.set()
         raise RuntimeError("pending callback failed")
 
@@ -295,7 +325,6 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     callback_failure_inner.release.set()
     assert await callback_failure_call == "unchanged"
     assert [action.status for action in callback_failure_page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
 
 
 @pytest.mark.asyncio
@@ -305,7 +334,7 @@ async def test_keyboard_calls_arm_the_pending_fact(monkeypatch: pytest.MonkeyPat
     emitted = asyncio.Event()
     pending: list[PendingAction] = []
 
-    async def capture(fact: PendingAction) -> None:
+    def capture(fact: PendingAction) -> None:
         pending.append(fact)
         emitted.set()
 
@@ -339,62 +368,6 @@ async def test_keyboard_calls_arm_the_pending_fact(monkeypatch: pytest.MonkeyPat
         credential_release_guard=stalled_guard,
     )
     assert (await pending_for(lambda: guarded_page.keyboard.type("value"))).call_name == "keyboard.type"
-
-
-@pytest.mark.asyncio
-async def test_cancellation_while_draining_pending_navigation_is_preserved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pending_started = asyncio.Event()
-    pending_cancelled = asyncio.Event()
-    release_pending = asyncio.Event()
-
-    async def slow_pending_action(self: _Recorder, fact: PendingAction) -> None:
-        pending_started.set()
-        try:
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            pending_cancelled.set()
-            await release_pending.wait()
-            raise
-
-    class YieldingGotoPage(FakePage):
-        async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
-            await asyncio.sleep(0)
-            return "response"
-
-    monkeypatch.setattr(_Recorder, "_emit_pending_action", slow_pending_action)
-    page = RecordingPage(YieldingGotoPage(), on_pending_action=lambda fact: None)  # type: ignore[arg-type]
-    call = asyncio.create_task(page.goto("https://example.com/cancel-during-cleanup"))
-
-    await asyncio.wait_for(pending_started.wait(), timeout=0.5)
-    await asyncio.wait_for(pending_cancelled.wait(), timeout=0.5)
-    call.cancel()
-    release_pending.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await call
-    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
-
-
-@pytest.mark.asyncio
-async def test_prior_cancellation_does_not_cancel_pending_navigation_cleanup() -> None:
-    page = RecordingPage(FakePage(), on_pending_action=lambda fact: None)  # type: ignore[arg-type]
-
-    async def navigate_after_caught_cancellation() -> object:
-        current_task = asyncio.current_task()
-        assert current_task is not None
-        current_task.cancel()
-        try:
-            await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            pass
-        assert current_task.cancelling() == 1
-        return await page.goto("https://example.com/after-caught-cancellation")
-
-    assert await asyncio.create_task(navigate_after_caught_cancellation()) is None
-    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
 
 
 @pytest.mark.asyncio
@@ -553,6 +526,414 @@ async def test_direct_page_actions_are_recorded_with_redaction() -> None:
 
 
 @pytest.mark.asyncio
+async def test_copilot_recording_page_routes_fill_and_type_through_shared_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = FakePage()
+    page = RecordingPage(raw_page, strategy_aware_typing=True)
+
+    await page.locator("#replace").fill("new", timeout=1234)
+    await page.locator("#append").type(" tail", timeout=2345)
+    await page.fill("#page-replace", "page new", timeout=3456)
+    await page.type("#page-append", " page tail", timeout=4567)
+
+    assert strategy_aware_input.await_args_list == [
+        call(raw_page.inner, "new", clear=True, timeout=1234),
+        call(raw_page.inner, " tail", clear=False, timeout=2345),
+        call(raw_page.inner, "page new", clear=True, timeout=3456),
+        call(raw_page.inner, " page tail", clear=False, timeout=4567),
+    ]
+    assert [action.action_type for action in page.recorded_actions()] == [ActionType.INPUT_TEXT] * 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "method", "timeout_form", "default_owner"),
+    [
+        pytest.param(
+            surface,
+            method,
+            timeout_form,
+            default_owner,
+            id=f"{surface}-{method}-{timeout_form}-{default_owner}-custom-default",
+        )
+        for surface in ("locator", "page")
+        for method in ("fill", "type")
+        for timeout_form in ("omitted", "none")
+        for default_owner in ("context", "page")
+    ],
+)
+async def test_copilot_recording_uses_effective_playwright_timeout_when_omitted_or_none(
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    method: str,
+    timeout_form: str,
+    default_owner: str,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = FakePage()
+    context_default = 7654
+    page_default = 8765 if default_owner == "page" else None
+    page = RecordingPage(
+        raw_page,
+        strategy_aware_typing=True,
+        playwright_input_defaults=PlaywrightInputDefaults(timeout_ms=page_default or context_default),
+    )
+    target = page.locator("#field") if surface == "locator" else page
+
+    kwargs = {} if timeout_form == "omitted" else {"timeout": None}
+    if surface == "locator":
+        await getattr(target, method)("value", **kwargs)
+    else:
+        await getattr(target, method)("#field", "value", **kwargs)
+
+    strategy_aware_input.assert_awaited_once_with(
+        raw_page.inner,
+        "value",
+        clear=method == "fill",
+        timeout=page_default or context_default,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "method"),
+    [
+        pytest.param("locator", "fill", id="locator-fill-zero-timeout"),
+        pytest.param("locator", "type", id="locator-type-zero-timeout"),
+        pytest.param("page", "fill", id="page-fill-zero-timeout"),
+        pytest.param("page", "type", id="page-type-zero-timeout"),
+    ],
+)
+async def test_copilot_recording_preserves_zero_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    method: str,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = FakePage()
+    page = RecordingPage(raw_page, strategy_aware_typing=True)
+    target = page.locator("#field") if surface == "locator" else page
+
+    if surface == "locator":
+        await getattr(target, method)("value", timeout=0)
+    else:
+        await getattr(target, method)("#field", "value", timeout=0)
+
+    strategy_aware_input.assert_awaited_once_with(
+        raw_page.inner,
+        "value",
+        clear=method == "fill",
+        timeout=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_copilot_recording_authored_playwright_timeout_catch_still_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_page = FakePage()
+    page = RecordingPage(raw_page, strategy_aware_typing=True)
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field",
+        AsyncMock(side_effect=TimeoutError),
+    )
+
+    caught = False
+    try:
+        await page.locator("#field").fill("value", timeout=1234)
+    except PlaywrightTimeoutError:
+        caught = True
+
+    assert caught is True
+
+
+@pytest.mark.asyncio
+async def test_copilot_recording_page_preserves_page_selector_strictness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = MagicMock()
+    strict_locator = MagicMock(spec=Locator)
+    first_locator = MagicMock(spec=Locator)
+    strict_locator.page = raw_page
+    first_locator.page = raw_page
+    strict_locator.first = first_locator
+    raw_page.locator.return_value = strict_locator
+    page = RecordingPage(
+        raw_page,
+        strategy_aware_typing=True,
+        playwright_input_defaults=PlaywrightInputDefaults(timeout_ms=8765, strict_selectors=False),
+    )
+
+    await page.fill("#default", "default", timeout=None)
+    await page.fill("#multi", "multi", strict=False, timeout=1234)
+    await page.fill(selector="#strict", value="strict", strict=True, timeout=2345)
+
+    assert strategy_aware_input.await_args_list == [
+        call(first_locator, "default", clear=True, timeout=8765),
+        call(first_locator, "multi", clear=True, timeout=1234),
+        call(strict_locator, "strict", clear=True, timeout=2345),
+    ]
+
+
+def test_playwright_input_defaults_source_registered_runtime_context() -> None:
+    context = MagicMock(spec=BrowserContext)
+    page = MagicMock(spec=Page)
+    page.context = context
+    register_playwright_input_context(context, timeout_ms=6543, strict_selectors=True)
+
+    defaults = playwright_input_defaults_for_page(page)
+
+    assert defaults.timeout_ms == 6543
+    assert defaults.strict_selectors is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["fill", "type"])
+@pytest.mark.parametrize("strict_form", ["omitted", "none"])
+@pytest.mark.parametrize("context_strict", [False, True])
+async def test_copilot_recording_page_omitted_or_none_strict_uses_context_default_through_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    strict_form: str,
+    context_strict: bool,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = MagicMock()
+    strict_locator = MagicMock(spec=Locator)
+    first_locator = MagicMock(spec=Locator)
+    strict_locator.page = raw_page
+    first_locator.page = raw_page
+    strict_locator.first = first_locator
+    raw_page.locator.return_value = strict_locator
+    page = RecordingPage(
+        raw_page,
+        strategy_aware_typing=True,
+        playwright_input_defaults=PlaywrightInputDefaults(timeout_ms=4321, strict_selectors=context_strict),
+    )
+
+    kwargs = {} if strict_form == "omitted" else {"strict": None}
+    await getattr(page, method)("#multiple", "value", **kwargs)
+
+    strategy_aware_input.assert_awaited_once_with(
+        strict_locator if context_strict else first_locator,
+        "value",
+        clear=method == "fill",
+        timeout=4321,
+    )
+
+
+@pytest.mark.asyncio
+async def test_copilot_recording_element_handle_fill_and_type_keep_raw_playwright_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    handle = FakeElementHandle("https://example.com/form")
+    recorder = _Recorder(None, None, strategy_aware_typing=True)
+    wrapped = RecordingLocator(handle, recorder, "#field")
+
+    await wrapped.fill("replacement", timeout=1234)
+    await wrapped.type(" appended", timeout=2345)
+
+    strategy_aware_input.assert_not_awaited()
+    assert handle.filled == ["replacement"]
+    assert handle.typed == [" appended"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_recording_routes_supported_playwright_input_options_through_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = MagicMock()
+    raw_page.fill = AsyncMock()
+    raw_page.type = AsyncMock()
+    raw_locator = MagicMock(spec=Locator)
+    raw_locator.page = raw_page
+    raw_locator.first = raw_locator
+    raw_locator.fill = AsyncMock()
+    raw_locator.type = AsyncMock()
+    raw_page.locator.return_value = raw_locator
+    page = RecordingPage(raw_page, strategy_aware_typing=True)
+
+    await page.locator("#forced").fill("replace", force=True, timeout=None)
+    await page.locator("#delayed").type("append", delay=17, no_wait_after=True, timeout=1234)
+    await page.fill("#page-forced", "replace", force=True, strict=False, timeout=None)
+    await page.type("#page-delayed", "append", delay=23, no_wait_after=True, strict=True, timeout=2345)
+
+    assert strategy_aware_input.await_args_list == [
+        call(
+            raw_locator,
+            "replace",
+            clear=True,
+            timeout=PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+            force=True,
+            delay=None,
+            no_wait_after=None,
+        ),
+        call(
+            raw_locator,
+            "append",
+            clear=False,
+            timeout=1234,
+            force=None,
+            delay=17,
+            no_wait_after=True,
+        ),
+        call(
+            raw_locator,
+            "replace",
+            clear=True,
+            timeout=PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+            force=True,
+            delay=None,
+            no_wait_after=None,
+        ),
+        call(
+            raw_locator,
+            "append",
+            clear=False,
+            timeout=2345,
+            force=None,
+            delay=23,
+            no_wait_after=True,
+        ),
+    ]
+    raw_locator.fill.assert_not_awaited()
+    raw_locator.type.assert_not_awaited()
+    raw_page.fill.assert_not_awaited()
+    raw_page.type.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_page_tracks_runtime_default_timeout_for_strategy_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = MagicMock(spec=Page)
+    raw_page.set_default_timeout = MagicMock()
+    locator = MagicMock(spec=Locator)
+    locator.page = raw_page
+    locator.first = locator
+    raw_page.locator.return_value = locator
+    page = RecordingPage(raw_page, strategy_aware_typing=True)
+
+    page.set_default_timeout(9876)
+    await page.fill("#name", "Noor")
+
+    raw_page.set_default_timeout.assert_called_once_with(9876)
+    strategy_aware_input.assert_awaited_once_with(locator, "Noor", clear=True, timeout=9876)
+
+
+@pytest.mark.asyncio
+async def test_recording_context_tracks_runtime_default_timeout_for_strategy_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = MagicMock(spec=Page)
+    raw_context = MagicMock()
+    raw_context.set_default_timeout = MagicMock()
+    raw_page.context = raw_context
+    locator = MagicMock(spec=Locator)
+    locator.page = raw_page
+    locator.first = locator
+    raw_page.locator.return_value = locator
+    page = RecordingPage(raw_page, strategy_aware_typing=True)
+
+    page.context.set_default_timeout(7654)
+    await page.fill("#name", "Noor")
+
+    raw_context.set_default_timeout.assert_called_once_with(7654)
+    strategy_aware_input.assert_awaited_once_with(locator, "Noor", clear=True, timeout=7654)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "method", "malformed_call"),
+    [
+        ("locator", "fill", "duplicate"),
+        ("locator", "fill", "extra_positional"),
+        ("locator", "type", "duplicate"),
+        ("locator", "type", "extra_positional"),
+        ("page", "fill", "duplicate"),
+        ("page", "fill", "extra_positional"),
+        ("page", "type", "duplicate"),
+        ("page", "type", "extra_positional"),
+    ],
+)
+async def test_copilot_recording_rejects_malformed_playwright_input_before_strategy_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    method: str,
+    malformed_call: str,
+) -> None:
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    raw_page = FakePage()
+    guard = CredentialReleaseGuard()
+    enforce_credential_release = AsyncMock()
+    monkeypatch.setattr(guard, "enforce", enforce_credential_release)
+    page = RecordingPage(raw_page, credential_release_guard=guard, strategy_aware_typing=True)
+    target = page.locator("#field") if surface == "locator" else page
+
+    with pytest.raises(TypeError):
+        if surface == "locator":
+            if malformed_call == "duplicate":
+                await getattr(target, method)("first", **{"value" if method == "fill" else "text": "second"})
+            else:
+                await getattr(target, method)("first", 1000)
+        elif malformed_call == "duplicate":
+            await getattr(target, method)("#field", "first", selector="#other")
+        else:
+            await getattr(target, method)("#field", "first", 1000)
+
+    strategy_aware_input.assert_not_awaited()
+    enforce_credential_release.assert_not_awaited()
+    assert raw_page.inner.calls == []
+
+
+@pytest.mark.asyncio
 async def test_filter_locator_chain_click_is_recorded() -> None:
     page = RecordingPage(FakePage())
     await page.get_by_role("button", name="Go").filter(has_text="Submit").click()
@@ -678,6 +1059,72 @@ async def test_input_values_are_elided_from_descriptions() -> None:
     assert "alice-credential" not in dumped
     assert recorded[0].description == "locator.fill #pw"
     assert recorded[1].description == "locator.type #user"
+
+
+@pytest.mark.asyncio
+async def test_copilot_authored_fill_and_type_share_strategy_aware_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakePage()
+    page = RecordingPage(fake, strategy_aware_typing=True)
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field",
+        clear_field,
+    )
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text",
+        type_text,
+    )
+
+    await page.locator("#replace").fill("new")
+    await page.locator("#append").type("more", timeout=1234)
+
+    assert clear_field.await_args_list == [call(fake, fake.inner, char_count=0, timeout=PLAYWRIGHT_DEFAULT_TIMEOUT_MS)]
+    assert type_text.await_args_list == [
+        call(
+            fake,
+            fake.inner,
+            "new",
+            timeout=PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
+            allow_batched_playwright=True,
+        ),
+        call(fake, fake.inner, "more", timeout=1234, allow_batched_playwright=True),
+    ]
+    assert fake.inner.calls == []
+    assert [action.action_type for action in page.recorded_actions()] == [
+        ActionType.INPUT_TEXT,
+        ActionType.INPUT_TEXT,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_copilot_authored_page_fill_keeps_one_action_and_long_value_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "a" * (TEXT_PRESS_MAX_LENGTH + 3)
+    fake = FakePage()
+    page = RecordingPage(fake, strategy_aware_typing=True)
+    type_text = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text",
+        type_text,
+    )
+
+    await page.fill("#replace", text, strict=False, timeout=2468)
+
+    assert fake.inner.calls == [f"fill:{text[:-TEXT_PRESS_MAX_LENGTH]}"]
+    type_text.assert_awaited_once_with(
+        fake,
+        fake.inner,
+        text[-TEXT_PRESS_MAX_LENGTH:],
+        timeout=2468,
+        allow_batched_playwright=True,
+    )
+    [action] = page.recorded_actions()
+    assert action.action_type == ActionType.INPUT_TEXT
+    assert action.element_id == "#replace"
 
 
 def _make_code_block(code: str, goal: str | None = None) -> CodeBlock:
@@ -830,6 +1277,52 @@ async def test_goal_code_block_creates_task_and_links_block(monkeypatch: pytest.
         if call.kwargs.get("task_id") is not None
     ]
     assert linked == ["tsk_code"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_lineage_tracks_runtime_timeout_during_code_block_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+    copilot_authored = AsyncMock(return_value=True)
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(CodeBlock, "_workflow_is_copilot_authored", copilot_authored)
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
+    setter_block = _make_code_block("page.set_default_timeout(8765)")
+    input_block = _make_code_block("await page.locator('#name').fill('Noor')")
+
+    setter_result = await setter_block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+    input_result = await input_block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test_2",
+        organization_id="o_test",
+    )
+
+    assert setter_result.success is True
+    assert input_result.success is True
+    assert copilot_authored.await_args_list == [call(context), call(context)]
+    clear_field.assert_awaited_once_with(
+        page,
+        page.inner,
+        char_count=0,
+        timeout=8765,
+    )
+    type_text.assert_awaited_once_with(
+        page,
+        page.inner,
+        "Noor",
+        timeout=8765,
+        allow_batched_playwright=True,
+    )
+    assert page.default_timeout == 8765
 
 
 @pytest.mark.asyncio

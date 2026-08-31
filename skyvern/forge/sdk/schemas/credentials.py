@@ -139,10 +139,12 @@ class PasswordCredential(BaseModel):
 
 
 class NonEmptyPasswordCredential(PasswordCredential):
-    """Password credential model that requires non-empty values."""
+    """Password credential model for API writes: non-empty username, optionally empty password."""
 
     password: str = Field(
-        ..., min_length=1, description="The password value (must not be empty)", examples=["securepassword123"]
+        default="",
+        description="The password value; may be empty or omitted for logins that have no password",
+        examples=["securepassword123"],
     )
     username: str = Field(
         ...,
@@ -579,9 +581,8 @@ class TestLoginRequest(BaseModel):
         examples=["user@example.com"],
     )
     password: str = Field(
-        ...,
-        min_length=1,
-        description="The password to test",
+        default="",
+        description="The password to test; may be empty for logins that have no password",
         examples=["securepassword123"],
     )
     totp: str | None = Field(

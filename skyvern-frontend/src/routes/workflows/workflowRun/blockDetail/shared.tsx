@@ -1,4 +1,4 @@
-import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
+import { ExclamationTriangleIcon, ImageIcon } from "@radix-ui/react-icons";
 import { CopyButton } from "@/components/CopyButton";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -18,8 +18,14 @@ import {
 } from "../../types/workflowRunTypes";
 import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
 import { ThoughtCard } from "../ThoughtCard";
+import { Button } from "@/components/ui/button";
 import { CodeBlockFailureDetails } from "../CodeBlockFailureDetails";
-import { describeCodeBlockFailure } from "../codeBlockFailure";
+import {
+  describeCodeBlockFailure,
+  failureSupportsScreenshot,
+} from "../codeBlockFailure";
+import { useBlockScreenshot } from "../useBlockScreenshot";
+import { formatFailureReason } from "../failureReasonFormat";
 import { stringifyTimelineValue } from "./formatValue";
 
 function TruncatedWithTooltip({
@@ -237,9 +243,61 @@ function Section({
   );
 }
 
-function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
+// Mounted only once the screenshot flow is in play: block detail renders in contexts that
+// never set up a QueryClient, so the artifact query cannot live in the parent.
+function BlockScreenshotAction({
+  workflowRunBlockId,
+  blockType,
+  onViewScreenshot,
+}: {
+  workflowRunBlockId: string;
+  blockType?: string | null;
+  onViewScreenshot: () => void;
+}) {
+  const screenshot = useBlockScreenshot(workflowRunBlockId, blockType, true);
+  return screenshot ? (
+    <div className="mt-3 flex flex-wrap gap-2">
+      <Button size="sm" onClick={onViewScreenshot}>
+        <ImageIcon className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+        View block screenshot
+      </Button>
+    </div>
+  ) : null;
+}
+
+function BlockDetailFailure({
+  block,
+  onViewScreenshot,
+  statedFailureHeadline = null,
+}: {
+  block: WorkflowRunBlock;
+  onViewScreenshot?: () => void;
+  // The exact headline text the Studio strip already states (only set for
+  // the run's failing block). Compared by text, not just by block identity:
+  // the strip's headline comes from the RUN's failure_reason, which can
+  // differ from this block's own failure_reason even when this is the
+  // block the run failed on — suppressing on identity alone would drop an
+  // actionable reason the strip never actually showed.
+  statedFailureHeadline?: string | null;
+}) {
   const codeFailure = describeCodeBlockFailure(block);
-  if (!block.failure_reason && !codeFailure) return null;
+  // Non-code failures have no curated title/guidance split like codeFailure
+  // does, so borrow the strip's own headline/detail parser to find this
+  // block's own headline and compare it against what the strip stated.
+  const nonCodeReason =
+    !codeFailure && block.failure_reason
+      ? formatFailureReason(block.failure_reason)
+      : null;
+  const headlineElsewhere =
+    codeFailure !== null
+      ? statedFailureHeadline === codeFailure.title
+      : statedFailureHeadline !== null &&
+        nonCodeReason !== null &&
+        statedFailureHeadline === nonCodeReason.headline;
+  const nonCodeContent = headlineElsewhere
+    ? nonCodeReason?.detail
+    : block.failure_reason;
+  if (!codeFailure && !nonCodeContent) return null;
   return (
     <div className="space-y-1.5 duration-200 animate-in fade-in slide-in-from-top-2">
       <div className="text-[11px] font-medium uppercase tracking-wide text-destructive">
@@ -249,21 +307,33 @@ function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
         <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
         {codeFailure ? (
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-semibold leading-5">
-              {codeFailure.title}
-            </div>
-            <p className="mt-1 break-words text-muted-foreground">
+            {headlineElsewhere ? null : (
+              <div className="text-sm font-semibold leading-5">
+                {codeFailure.title}
+              </div>
+            )}
+            <p
+              className={cn(
+                "break-words text-muted-foreground",
+                !headlineElsewhere && "mt-1",
+              )}
+            >
               {codeFailure.guidance}
             </p>
             <CodeBlockFailureDetails
               failure={codeFailure}
               reason={block.failure_reason}
             />
+            {onViewScreenshot && failureSupportsScreenshot(codeFailure) ? (
+              <BlockScreenshotAction
+                workflowRunBlockId={block.workflow_run_block_id}
+                blockType={block.block_type}
+                onViewScreenshot={onViewScreenshot}
+              />
+            ) : null}
           </div>
         ) : (
-          <span className="min-w-0 flex-1 break-words">
-            {block.failure_reason}
-          </span>
+          <span className="min-w-0 flex-1 break-words">{nonCodeContent}</span>
         )}
       </div>
     </div>

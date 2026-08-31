@@ -190,6 +190,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     running_run = _workflow_run(WorkflowRunStatus.running, started_at=started_at)
     timed_out_run = _workflow_run(WorkflowRunStatus.timed_out, started_at=started_at)
     timed_out_run.failure_reason = "Workflow run exceeded max elapsed runtime limit of 1 minute."
+    timed_out_run.copilot_session_id = "copilot_1"
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
@@ -208,9 +209,10 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     )
     organization = SimpleNamespace(organization_id="org_1")
 
+    workflow_run_context = SimpleNamespace(browser_session_id=None, secrets={"runtime_otp": "654321"})
     workflow_context_manager = SimpleNamespace(
         initialize_workflow_run_context=AsyncMock(),
-        get_workflow_run_context=lambda _workflow_run_id: SimpleNamespace(browser_session_id=None),
+        get_workflow_run_context=lambda _workflow_run_id: workflow_run_context,
     )
     monkeypatch.setattr(service_module.app, "WORKFLOW_CONTEXT_MANAGER", workflow_context_manager)
     monkeypatch.setattr(service_module.workflow_script_service, "workflow_has_conditionals", lambda _workflow: False)
@@ -227,7 +229,17 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     execute_workflow_blocks = AsyncMock()
     generate_script_if_needed = AsyncMock()
     execute_finally_block_if_configured = AsyncMock()
-    clean_up_workflow = AsyncMock()
+    finalization_order: list[str] = []
+
+    async def publish_runtime_secrets(**kwargs: object) -> bool:
+        assert kwargs["workflow_run_context"] is workflow_run_context
+        finalization_order.append("publish")
+        return True
+
+    async def clean_up_workflow(**_kwargs: object) -> None:
+        finalization_order.append("cleanup")
+
+    monkeypatch.setattr(service_module, "publish_copilot_runtime_secret_values", publish_runtime_secrets)
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
@@ -262,7 +274,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     generate_script_if_needed.assert_not_awaited()
     execute_finally_block_if_configured.assert_not_awaited()
     mark_failed_if_not_final.assert_not_awaited()
-    clean_up_workflow.assert_awaited_once()
+    assert finalization_order == ["publish", "cleanup"]
 
 
 @pytest.mark.asyncio

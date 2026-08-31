@@ -12,10 +12,11 @@ import {
   TurnNarrativeState,
   condenseActivityEntries,
   formatElapsed,
+  hasPendingToolCall,
+  isDeadlineHalt,
   isInterimOutcome,
   latestBlocksByLabel,
   parseUtcIsoMs,
-  toolCallIdOf,
 } from "./narrativeState";
 
 export { AUTHORING_TOOLS, RUN_TOOLS };
@@ -55,21 +56,6 @@ export function showPhaseChecklist(turn: TurnNarrativeState): boolean {
       turn.blocks.length > 0 ||
       turn.terminal === null)
   );
-}
-
-// A tool_call still has no matching tool_result — the narrator can emit a
-// TOOL_STARTED progress narration mid-flight (streaming_adapter.py), so
-// checking only the LAST entry's kind isn't enough; match ids instead.
-function hasPendingToolCall(designActivity: ActivityEntry[]): boolean {
-  const pending = new Set<string>();
-  for (const entry of designActivity) {
-    if (entry.kind === "tool_call") {
-      pending.add(toolCallIdOf(entry) ?? "");
-    } else if (entry.kind === "tool_result") {
-      pending.delete(toolCallIdOf(entry) ?? "");
-    }
-  }
-  return pending.size > 0;
 }
 
 // Whether the 8s drafting-gap timer should arm for this narrative snapshot.
@@ -250,9 +236,10 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
 
   const isTerminal = turn.terminal !== null;
   const isCancelled = turn.cancelled === true;
-  // A cancelled turn also lands on terminal "error" — that error is the stop
-  // itself, so it must not paint the rail red.
-  const isError = turn.terminal === "error" && !isCancelled;
+  const deadlineHalt = isDeadlineHalt(turn);
+  // A cancelled turn and a deadline halt both land on terminal "error" — that
+  // error is the stop itself, so neither may paint the rail red.
+  const isError = turn.terminal === "error" && !isCancelled && !deadlineHalt;
   const anyFailed = hasFailedTestBlock(turn);
   const anyStopped = latestBlocks.some((b) => b.state === "stopped");
   const anyNotDemonstrated = latestBlocks.some(
@@ -287,7 +274,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     if (!reached(id)) return id === "test" ? "notrun" : "pending";
     if (chainActive === id) {
       if (isError) return "fail";
-      if (isCancelled) return "stopped";
+      if (isCancelled || deadlineHalt) return "stopped";
     }
     return "done";
   }
@@ -333,9 +320,10 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     if (status === "fail")
       return `${pluralize(latestBlocks.length, "block")} · failed`;
     if (status === "stopped") {
+      const halt = deadlineHalt ? "time limit" : "stopped";
       return latestBlocks.length > 0
-        ? `${pluralize(latestBlocks.length, "block")} · stopped`
-        : "stopped";
+        ? `${pluralize(latestBlocks.length, "block")} · ${halt}`
+        : halt;
     }
     if (anyNotDemonstrated) {
       // Surface how many test runs the loop actually made — otherwise a

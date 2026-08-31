@@ -67,6 +67,7 @@ export type OnePasswordCredentialParameter = WorkflowParameterBase & {
   onepassword_credential_parameter_id: string;
   vault_id: string;
   item_id: string;
+  totp_field_name: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -432,6 +433,7 @@ export type FileUploadBlock = WorkflowBlockBase & {
   storage_type: "s3" | "azure" | "google_drive" | "sftp";
   s3_bucket: string | null;
   region_name: string | null;
+  endpoint_url: string | null;
   aws_access_key_id: string | null;
   aws_secret_access_key: string | null;
   azure_storage_account_name: string | null;
@@ -589,6 +591,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   prompt: string | null;
   s3_bucket: string | null;
   region_name: string | null;
+  endpoint_url: string | null;
   aws_access_key_id: string | null;
   aws_secret_access_key: string | null;
   azure_storage_account_name: string | null;

@@ -428,6 +428,8 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
             event_dict["browser_session_id"] = context.browser_session_id
         if getattr(context, "copilot_session_id", None):
             event_dict["copilot_session_id"] = context.copilot_session_id
+        if getattr(context, "codeblock_execution_path", None):
+            event_dict["codeblock_execution_path"] = context.codeblock_execution_path
         if getattr(context, "browser_container_ip", None):
             event_dict["browser_container_ip"] = context.browser_container_ip
         if getattr(context, "browser_container_task_arn", None):
@@ -1144,6 +1146,12 @@ def setup_logger() -> None:
     asyncio_logger = logging.getLogger("asyncio")
     asyncio_logger.filters = [f for f in asyncio_logger.filters if not isinstance(f, _DriverPipeNoiseFilter)]
     asyncio_logger.addFilter(_DriverPipeNoiseFilter())
+
+    # CPython prints "coroutine ... was never awaited" from the coroutine's __del__, so the
+    # file:line it carries is wherever the collector happened to run -- botocore, asyncio, sys:1 --
+    # and never the code that dropped it. Origin tracking makes the warning name the creating frame
+    # instead; depth 1 measures at +57ns per coroutine creation on 3.11, 78.8 -> 136.0 (SKY-15069).
+    sys.set_coroutine_origin_tracking_depth(1)
 
     # Last, so the handler these hooks log through is already installed.
     _install_interpreter_traceback_hooks()

@@ -152,6 +152,9 @@ class PersistentSessionsManager(Protocol):
         bound_key: str | None = None,
         wait_for_startup: bool = True,
         needs_live_view: bool = False,
+        request_deadline_epoch_ms: int | None = None,
+        queue_deadline_epoch_ms: int | None = None,
+        workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...
@@ -169,8 +172,19 @@ class PersistentSessionsManager(Protocol):
         """Occupy a browser session for use."""
         ...
 
-    async def renew_or_close_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:
+    async def renew_or_close_session(
+        self, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
+    ) -> PersistentBrowserSession:
         """Renew a session or close it if renewal fails."""
+        ...
+
+    async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
+        """Seconds until this session's infrastructure ends it no matter what the caller does.
+
+        None where a later deadline can be served, in which case renewal governs the end and there
+        is nothing here to pre-empt. Read-only: a caller asking how long it has must not have the
+        answer changed by asking.
+        """
         ...
 
     async def update_status(

@@ -25,12 +25,15 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     normalized_challenge_kind,
     vision_challenge_carrier,
 )
-from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
+from skyvern.forge.sdk.copilot.runtime import ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
+INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
+COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS = 120_000
 
 # Block types whose acted page, when no url is on the block, is the current
 # frontier (observation of the page suffices). navigation without a url is the
@@ -60,6 +63,10 @@ _MAX_TABLE_HEADERS = 12
 _MAX_RESULT_SAMPLE_ROWS = 5
 _MAX_NAVIGATION_TARGETS = 20
 _MAX_SELECT_OPTIONS = 30
+# Live DOM property state is admitted only for a real <input> whose browser-normalized property type
+# is listed here, so a page declaring type="date" on a textarea cannot mint an observed value.
+OBSERVED_VALUE_FIELD_TYPES: frozenset[str] = frozenset({"date", "datetime-local", "time", "month", "week"})
+OBSERVED_CHECKED_FIELD_TYPES: frozenset[str] = frozenset({"checkbox", "radio"})
 _MAX_CHALLENGE_CONTROLS = 8
 _MAX_MODAL_OVERLAYS = 5
 _MAX_MODAL_DISMISS_CONTROLS = 6
@@ -74,6 +81,8 @@ _MAX_CLICKABLE_CONTROLS = 12
 _MAX_DISCLOSURE_CONTROL_ID_CHARS = 120
 _MODAL_IDENTITY_PATTERNS: frozenset[str] = frozenset({"modal", "popup", "overlay", "dialog", "drawer", "lightbox"})
 _MODAL_ROLE_VALUES: frozenset[str] = frozenset({"dialog", "alertdialog"})
+_RENDERED_STYLE_SNAPSHOT_ATTR = "data-page-evidence-rendered-style"
+_RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR = "data-page-evidence-intercepts-outside-control"
 _MAX_VISIBLE_TEXT_EXCERPT_CHARS = 3000
 DOM_EVIDENCE_SOURCE = "dom_html"
 DOM_STYLE_EVIDENCE_SOURCE = "dom_style"
@@ -103,6 +112,21 @@ _EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
 )
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
+_SIZE_COMPACTION_CATEGORY_UNITS: dict[str, str] = {
+    "visible_text_excerpt": "characters",
+    "forms.fields.options": "entries",
+    "result_containers.rows": "entries",
+    "result_containers.sample_rows": "entries",
+    "navigation_targets": "entries",
+    "clickable_controls": "entries",
+    "forms": "entries",
+    "result_containers": "entries",
+    "key_value_relations": "entries",
+    "visual_obstruction_candidates": "entries",
+    "modal_overlays": "entries",
+    "page_obstructions": "entries",
+    "challenge_controls": "entries",
+}
 _ANTI_BOT_SCAN_BYTES = 250_000
 _NON_ENTRY_FIELD_TYPES: frozenset[str] = frozenset(
     {"hidden", "submit", "button", "reset", "checkbox", "radio", "file", "image"}
@@ -187,15 +211,19 @@ def _gated_submit_controls(forms: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for control in form.get("submit_controls") or []:
             if not isinstance(control, dict) or control.get("disabled") is not True:
                 continue
-            controls.append(
-                {
-                    "text": _bounded_string(control.get("text") or control.get("value"), 120),
-                    "id": _bounded_string(control.get("id"), 120),
-                    "name": _bounded_string(control.get("name"), 120),
-                    "selector": _bounded_string(control.get("selector"), 160),
-                    "disabled": True,
-                }
-            )
+            entry = {
+                "text": _bounded_string(control.get("text") or control.get("value"), 120),
+                "id": _bounded_string(control.get("id"), 120),
+                "name": _bounded_string(control.get("name"), 120),
+                "disabled": True,
+            }
+            candidates = control.get("selector_candidates")
+            if isinstance(candidates, list):
+                entry["selector_candidates"] = candidates
+            identity = control.get("identity")
+            if isinstance(identity, dict):
+                entry["identity"] = identity
+            controls.append(entry)
     return controls[:5]
 
 
@@ -671,11 +699,7 @@ def _same_url_ignoring_fragment(left: str | None, right: str | None) -> bool:
 
 
 def _post_run_recovery_state(ctx: _PostRunCompositionContext) -> bool:
-    if any(ctx.workflow_verification_evidence.per_tool_budget_on_block):
-        return True
-    if ctx.post_run_page_observation_after_failed_test is True:
-        return True
-    return ctx.last_failure_category_top == "PER_TOOL_BUDGET"
+    return ctx.post_run_page_observation_after_failed_test is True
 
 
 def _post_run_observed_url_goto_error(
@@ -812,7 +836,9 @@ def has_witnessed_value_content(evidence: dict[str, Any]) -> bool:
     warnings = evidence.get("inspection_warnings")
     if isinstance(warnings, list) and warnings:
         return False
-    if evidence.get("key_value_relations_truncated") is not True:
+    if evidence.get("key_value_relations_truncated") is not True and not size_compaction_omits(
+        evidence, {"key_value_relations"}
+    ):
         relations = evidence.get("key_value_relations")
         if isinstance(relations, list):
             for relation in relations:
@@ -821,7 +847,10 @@ def has_witnessed_value_content(evidence: dict[str, Any]) -> bool:
                 value_text = relation.get("value_text")
                 if isinstance(value_text, str) and value_text.strip():
                     return True
-    if evidence.get("result_containers_truncated") is not True:
+    if evidence.get("result_containers_truncated") is not True and not size_compaction_omits(
+        evidence,
+        {"result_containers", "result_containers.rows", "result_containers.sample_rows"},
+    ):
         containers = evidence.get("result_containers")
         if isinstance(containers, list):
             for container in containers:
@@ -1379,6 +1408,8 @@ def _inline_style_properties(node: Any) -> dict[str, str]:
         key, value = declaration.split(":", 1)
         key = key.strip().lower()
         value = value.strip().lower()
+        if value.endswith("!important"):
+            value = value[: -len("!important")].strip()
         if key and value:
             properties[key] = value
     return properties
@@ -1484,15 +1515,27 @@ def _class_selector(classes: list[str]) -> str:
     return "".join(parts)
 
 
-def _resolves_uniquely(node: Any, selector: str) -> bool:
+def _selector_matches(node: Any, selector: str) -> list[Any] | None:
+    """Return selector matches, memoized for the lifetime of this parsed document."""
     if not selector:
-        return False
+        return []
     root = node
     while getattr(root, "parent", None) is not None:
         root = root.parent
+    cache = vars(root).setdefault("_skyvern_selector_match_cache", {})
+    if selector in cache:
+        return cache[selector]
     try:
-        matches = root.select(selector)
+        matches = list(root.select(selector))
     except Exception:
+        matches = None
+    cache[selector] = matches
+    return matches
+
+
+def _resolves_uniquely(node: Any, selector: str) -> bool:
+    matches = _selector_matches(node, selector)
+    if matches is None:
         return False
     return len(matches) == 1 and matches[0] is node
 
@@ -1506,7 +1549,9 @@ def _structural_path(node: Any) -> str:
             break
         parent = getattr(current, "parent", None)
         if parent is None or not getattr(parent, "name", None) or parent.name == "[document]":
-            parts.insert(0, tag_name)
+            # The rendered-HTML twin starts at a cloned <body>, while the live DOM has <html> above
+            # it. Preserve the live selector shape so both producers offer the same fallback.
+            parts.insert(0, f"{tag_name}:nth-of-type(1)" if tag_name == "body" else tag_name)
             break
         index = 1
         for sibling in parent.find_all(tag_name, recursive=False):
@@ -1532,14 +1577,23 @@ def _structural_path(node: Any) -> str:
     return full
 
 
-def _control_label(node: Any) -> str:
+def _control_label(
+    node: Any,
+    *,
+    include_non_action_input_value: bool = True,
+    include_action_value: bool = True,
+) -> str:
     """Mirror of ``controlLabel``. A submit control with no text still has an identity in
     title/aria-label/alt; reporting it empty offers the model an anonymous control next to the
     named one it actually wants."""
-    own = _node_text(node) or str(node.get("value") or "")
+    tag_name = str(getattr(node, "name", "") or "").lower()
+    input_type = _attr_value(node, "type").strip().lower()
+    value_can_name_action = tag_name != "input" or input_type in {"button", "submit", "reset", "image"}
+    include_value = include_action_value if value_can_name_action else include_non_action_input_value
+    own = _node_text(node) or (str(node.get("value") or "") if include_value else "")
     if own:
         return own
-    for key in ("aria-label", "title"):
+    for key in ("aria-label", "title", "alt"):
         value = _attr_value(node, key)
         if value:
             return value
@@ -1683,9 +1737,8 @@ def _label_context_from_ancestors(node: Any) -> str:
 
 
 _MAX_SELECTOR_CHARS = 160
-# The rung that produced a candidate, so the model can tell a name-anchored offer from a positional
-# one. An untyped candidate is not passed on: nothing downstream can rank or grade it.
-# The rungs this side knows how to rank. Unknown values are carried, not dropped.
+# The rung that produced a candidate, so provenance survives transport. Unknown values are carried,
+# not dropped; source names never choose a candidate.
 _UNKNOWN_SELECTOR_SOURCE = "unknown"
 _SELECTOR_CANDIDATE_SOURCES = frozenset(
     {
@@ -1696,6 +1749,7 @@ _SELECTOR_CANDIDATE_SOURCES = frozenset(
         "class_value",
         "class_type",
         "aria_label",
+        "data_action",
         "href",
         "text_anchor",
         "structural",
@@ -1709,66 +1763,129 @@ def _bounded_selector(selector: str) -> str:
     return selector if len(selector) <= _MAX_SELECTOR_CHARS else ""
 
 
-def _selector_candidates_for(node: Any, *, include_aria_label: bool = False) -> list[dict[str, str]]:
-    """Mirror of ``selectorCandidatesFor``'s attribute rungs, in the same order. The positional path
-    and the aria-label rung are offered only to callers that ask: the first costs an ancestor walk,
-    and the second would change which selector ``_selector_for`` settles on."""
+def _candidate_match_count(node: Any, selector: str) -> int | None:
+    matches = _selector_matches(node, selector)
+    return len(matches) if matches is not None else None
+
+
+def _selector_candidates_for(
+    node: Any,
+    *,
+    include_aria_label: bool = False,
+    include_non_action_input_value: bool = True,
+    include_action_value: bool = True,
+    include_href: bool = True,
+) -> list[ScoutedSelectorCandidate]:
+    """Mirror ``selectorCandidatesFor`` in deterministic capture order, with factual cardinality."""
     tag_name = getattr(node, "name", None) or "*"
-    candidates: list[dict[str, str]] = []
+    candidates: list[ScoutedSelectorCandidate] = []
+
+    def add(selector: str, source: str) -> None:
+        candidates.append(
+            {"selector": selector, "source": source, "match_count": _candidate_match_count(node, selector)}
+        )
+
     node_id = _attr_value(node, "id")
     if node_id:
-        candidates.append(
-            {
-                "selector": f"#{node_id}"
-                if _simple_css_identifier(node_id)
-                else f'{tag_name}[id="{_css_attr(node_id)}"]',
-                "source": "id",
-            }
+        add(
+            f"#{node_id}" if _simple_css_identifier(node_id) else f'{tag_name}[id="{_css_attr(node_id)}"]',
+            "id",
         )
     node_name = _attr_value(node, "name")
-    node_value = _attr_value(node, "value")
+    input_type = _attr_value(node, "type").strip().lower()
+    value_can_name_action = tag_name != "input" or input_type in {"button", "submit", "reset", "image"}
+    include_value = include_action_value if value_can_name_action else include_non_action_input_value
+    node_value = _attr_value(node, "value") if include_value else ""
+    data_action = _attr_value(node, "data-action")
+    if data_action:
+        add(f'{tag_name}[data-action="{_css_attr(data_action)}"]', "data_action")
     if node_name and node_value:
-        candidates.append(
-            {
-                "selector": f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]',
-                "source": "name_value",
-            }
+        add(
+            f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]',
+            "name_value",
         )
     classes = _classes_for(node)
     class_selector = _class_selector(classes)
     if class_selector and node_value:
-        candidates.append(
-            {"selector": f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]', "source": "class_value"}
-        )
+        add(f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]', "class_value")
     if node_name:
-        candidates.append({"selector": f'{tag_name}[name="{_css_attr(node_name)}"]', "source": "name"})
+        add(f'{tag_name}[name="{_css_attr(node_name)}"]', "name")
     aria_label = _attr_value(node, "aria-label") if include_aria_label else ""
     if aria_label:
-        candidates.append({"selector": f'{tag_name}[aria-label="{_css_attr(aria_label)}"]', "source": "aria_label"})
+        add(f'{tag_name}[aria-label="{_css_attr(aria_label)}"]', "aria_label")
     href = _attr_value(node, "href")
-    if tag_name == "a" and href:
-        candidates.append({"selector": f'a[href="{_css_attr(href)}"]', "source": "href"})
+    if tag_name == "a" and href and include_href:
+        add(f'a[href="{_css_attr(href)}"]', "href")
     if class_selector:
-        candidates.append({"selector": f"{tag_name}{class_selector}", "source": "class"})
+        add(f"{tag_name}{class_selector}", "class")
     node_type = _attr_value(node, "type")
     if class_selector and node_type:
-        candidates.append(
-            {"selector": f'{tag_name}{class_selector}[type="{_css_attr(node_type)}"]', "source": "class_type"}
-        )
+        add(f'{tag_name}{class_selector}[type="{_css_attr(node_type)}"]', "class_type")
     return candidates
 
 
-def _carried_selector_candidates(node: Any) -> list[dict[str, str]]:
-    candidates = _selector_candidates_for(node, include_aria_label=True)
-    candidates.append({"selector": _structural_path(node), "source": "structural"})
+def _carried_selector_candidates(
+    node: Any,
+    *,
+    include_non_action_input_value: bool = True,
+    include_action_value: bool = True,
+    include_href: bool = True,
+) -> list[ScoutedSelectorCandidate]:
+    candidates = _selector_candidates_for(
+        node,
+        include_aria_label=True,
+        include_non_action_input_value=include_non_action_input_value,
+        include_action_value=include_action_value,
+        include_href=include_href,
+    )
+    structural = _structural_path(node)
+    candidates.append(
+        {"selector": structural, "source": "structural", "match_count": _candidate_match_count(node, structural)}
+    )
     return _structured_selector_candidates(candidates)
 
 
-def _selector_for(node: Any) -> str:
-    """Mirror of ``selectorFor`` in composition_browser_expressions. The selector is a contract: the
-    model clicks it and authors it into generated blocks, so every candidate is verified to match
-    this exact node and nothing else before it is handed out."""
-    candidates = [entry["selector"] for entry in _selector_candidates_for(node)]
+def _element_address_evidence(
+    node: Any,
+    *,
+    include_non_action_input_value: bool = True,
+    include_action_value: bool = True,
+    include_href: bool = True,
+) -> dict[str, Any]:
+    return {
+        "selector_candidates": _carried_selector_candidates(
+            node,
+            include_non_action_input_value=include_non_action_input_value,
+            include_action_value=include_action_value,
+            include_href=include_href,
+        ),
+        "identity": {
+            "tag": str(getattr(node, "name", "") or "").lower()[:40],
+            "role": _attr_value(node, "role") or _implicit_role(node),
+            "label_context": _schema_text(_label_context_for(node), _MAX_PARSED_LABEL_CONTEXT_CHARS),
+        },
+    }
+
+
+def _selector_for(
+    node: Any,
+    *,
+    include_non_action_input_value: bool = True,
+    include_action_value: bool = True,
+    include_href: bool = True,
+    include_aria_label: bool = False,
+) -> str:
+    """Internal CSS lookup used for measurement and joins, never a model-visible recommendation."""
+    candidates = [
+        entry["selector"]
+        for entry in _selector_candidates_for(
+            node,
+            include_aria_label=include_aria_label,
+            include_non_action_input_value=include_non_action_input_value,
+            include_action_value=include_action_value,
+            include_href=include_href,
+        )
+    ]
     for candidate in candidates:
         if _resolves_uniquely(node, candidate):
             return candidate
@@ -1851,6 +1968,10 @@ def _clickable_controls_html(
     controls: list[dict[str, Any]] = []
     seen_selectors = set(used_selectors)
     seen_text: set[str] = set()
+
+    def factual_entry(node: Any, entry: dict[str, Any]) -> dict[str, Any]:
+        return _attach_node_evidence(entry, _element_address_evidence(node))
+
     try:
         candidates = soup.select('button, [role="button"], [data-action]')
     except Exception:
@@ -1867,13 +1988,16 @@ def _clickable_controls_html(
         selector = _clickable_control_selector(node)
         if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
             controls.append(
-                {
-                    "text": text,
-                    "selector": _bounded_selector(selector),
-                    "tag": tag_name,
-                    **({"disabled": True} if _control_disabled(node) else {}),
-                    **_html_disclosure_facts(node, controlled_region_visibility),
-                }
+                factual_entry(
+                    node,
+                    {
+                        "text": text,
+                        "selector": _bounded_selector(selector),
+                        "tag": tag_name,
+                        **({"disabled": True} if _control_disabled(node) else {}),
+                        **_html_disclosure_facts(node, controlled_region_visibility),
+                    },
+                )
             )
             seen_selectors.add(selector)
             if text:
@@ -1882,12 +2006,15 @@ def _clickable_controls_html(
         if not text or text in seen_text:
             continue
         controls.append(
-            {
-                "text": text,
-                "tag": tag_name,
-                **({"disabled": True} if _control_disabled(node) else {}),
-                **_html_disclosure_facts(node, controlled_region_visibility),
-            }
+            factual_entry(
+                node,
+                {
+                    "text": text,
+                    "tag": tag_name,
+                    **({"disabled": True} if _control_disabled(node) else {}),
+                    **_html_disclosure_facts(node, controlled_region_visibility),
+                },
+            )
         )
         seen_text.add(text)
     return controls
@@ -2499,7 +2626,7 @@ def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
         text_excerpt = _schema_text(_node_text(node), 240)
         if text_excerpt:
             entry["text_excerpt"] = text_excerpt
-    return entry
+    return _attach_node_evidence(entry, _element_address_evidence(node))
 
 
 def _challenge_control_entry(node: Any) -> dict[str, Any]:
@@ -2525,7 +2652,7 @@ def _challenge_control_entry(node: Any) -> dict[str, Any]:
         value = _attr_value(node, key)
         if value:
             entry[key.replace("-", "_")] = value[:300]
-    return {key: value for key, value in entry.items() if value}
+    return _attach_node_evidence({key: value for key, value in entry.items() if value}, _element_address_evidence(node))
 
 
 def _challenge_identity(node: Any) -> str:
@@ -2602,19 +2729,52 @@ def _is_modal_overlay_candidate(node: Any) -> bool:
         return True
     if _attr_value(node, "aria-modal").strip().lower() == "true":
         return True
-    return any(pattern in _modal_identity(node) for pattern in _MODAL_IDENTITY_PATTERNS)
+    if any(pattern in _modal_identity(node) for pattern in _MODAL_IDENTITY_PATTERNS):
+        return True
+    return False
+
+
+def _is_interaction_blocking_layer_candidate(node: Any) -> bool:
+    if _attr_value(node, _RENDERED_STYLE_SNAPSHOT_ATTR) != "true":
+        return False
+    properties = _inline_style_properties(node)
+    if properties.get("position") not in {"fixed", "sticky"}:
+        return False
+    if not _z_index_is_high(properties.get("z-index", "")):
+        return False
+    if not _style_covers_viewport(properties):
+        return False
+    if properties.get("display") == "none" or properties.get("visibility") == "hidden":
+        return False
+    if properties.get("pointer-events") == "none":
+        return False
+    try:
+        opacity = float(properties.get("opacity", "1"))
+    except ValueError:
+        return False
+    if opacity <= 0.05:
+        return False
+    if _attr_value(node, _RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR) != "true":
+        return False
+    return _first_actionable_layer_control(node) is not None
 
 
 def _is_hidden_modal_candidate(node: Any) -> bool:
+    rendered_snapshot = _attr_value(node, _RENDERED_STYLE_SNAPSHOT_ATTR) == "true"
     current = node
     while current is not None:
         if _attr_value(current, "aria-hidden").strip().lower() == "true":
             return True
         if hasattr(current, "has_attr") and current.has_attr("hidden"):
             return True
-        style = _attr_value(current, "style").replace(" ", "").lower()
-        if "display:none" in style or "visibility:hidden" in style:
+        properties = _inline_style_properties(current)
+        if properties.get("display") == "none":
             return True
+        if properties.get("visibility") == "hidden":
+            # A descendant may restore CSS visibility. Rendered snapshots carry the target's
+            # computed value, while raw HTML needs the ancestor fallback because no cascade ran.
+            if current is node or not rendered_snapshot:
+                return True
         current = getattr(current, "parent", None)
     return False
 
@@ -2624,8 +2784,94 @@ def _is_css_hidden_node(node: Any) -> bool:
         return False
     if node.has_attr("hidden"):
         return True
-    style = _attr_value(node, "style").replace(" ", "").lower()
-    return "display:none" in style or "visibility:hidden" in style
+    properties = _inline_style_properties(node)
+    if properties.get("display") == "none":
+        return True
+    if properties.get("visibility") != "hidden":
+        return False
+    # CSS visibility can be restored below a hidden ancestor. The rendered snapshot stamps relevant
+    # visible descendants with their computed value, so preserve the subtree when one exists.
+    return not any(
+        _attr_value(descendant, _RENDERED_STYLE_SNAPSHOT_ATTR) == "true"
+        and _inline_style_properties(descendant).get("visibility") == "visible"
+        for descendant in node.find_all(True)
+    )
+
+
+def _is_actionable_layer_control(control: Any) -> bool:
+    tag_name = str(getattr(control, "name", "") or "").lower()
+    role = _attr_value(control, "role").strip().lower()
+    if tag_name not in {"a", "button", "input"} and role != "button":
+        return False
+    if tag_name == "input" and _attr_value(control, "type").lower() not in {"button", "reset", "submit", "image"}:
+        return False
+    if _control_disabled(control) or _is_hidden_modal_candidate(control):
+        return False
+    properties = _inline_style_properties(control)
+    if _attr_value(control, _RENDERED_STYLE_SNAPSHOT_ATTR) == "true":
+        if properties.get("pointer-events") == "none":
+            return False
+    else:
+        current = control
+        while current is not None:
+            if _inline_style_properties(current).get("pointer-events") == "none":
+                return False
+            current = getattr(current, "parent", None)
+    for dimension in ("width", "height"):
+        if properties.get(dimension, "").strip().lower() in {
+            "0",
+            "0px",
+            "0%",
+            "0rem",
+            "0em",
+            "0vh",
+            "0vw",
+        }:
+            return False
+    return True
+
+
+def _layer_control_has_actionable_evidence(control: Any) -> bool:
+    if not _is_actionable_layer_control(control):
+        return False
+    has_label = bool(
+        _control_label(control, include_non_action_input_value=False, include_action_value=False)
+        or _attr_value(control, "aria-label")
+        or _attr_value(control, "title")
+    )
+    return bool(
+        has_label
+        and _bounded_selector(
+            _selector_for(
+                control,
+                include_non_action_input_value=False,
+                include_action_value=False,
+                include_href=False,
+                include_aria_label=True,
+            )
+        )
+        and _carried_selector_candidates(
+            control,
+            include_non_action_input_value=False,
+            include_action_value=False,
+            include_href=False,
+        )
+    )
+
+
+def _first_actionable_layer_control(node: Any) -> Any | None:
+    return next(
+        (
+            control
+            for control in node.find_all(True)
+            if (
+                str(getattr(control, "name", "") or "").lower() in {"button", "a", "input"}
+                or _attr_value(control, "role").strip().lower() == "button"
+            )
+            if _layer_control_has_actionable_evidence(control)
+        ),
+        None,
+    )
 
 
 def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
@@ -2634,15 +2880,15 @@ def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
     for control in node.find_all(["button", "a", "input"]):
         if len(controls) >= _MAX_MODAL_DISMISS_CONTROLS:
             break
-        selector = _bounded_selector(_selector_for(control))
+        selector = _bounded_selector(_selector_for(control, include_non_action_input_value=False))
         # A selector too long to survive comes back empty, and every such node would otherwise
         # dedupe against the first one.
         if selector and selector in seen_selectors:
             continue
         # Every control the dialog offers is reported. A keyword list cannot name every way a dialog
-        # closes ("No, keep ...", an icon-only glyph), and filtering on one leaves the agent looking
-        # at a modal it has no way to clear.
-        text = _schema_text(_control_label(control), 120)
+        # closes ("No, keep ...", an icon-only glyph), and filtering on one leaves the agent looking at
+        # a modal it has no way to clear.
+        text = _schema_text(_control_label(control, include_non_action_input_value=False), 120)
         aria_label = _schema_text(_attr_value(control, "aria-label"), 120)
         title = _schema_text(_attr_value(control, "title"), 120)
         seen_selectors.add(selector)
@@ -2658,7 +2904,10 @@ def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
             _attach_node_evidence(
                 {key: value for key, value in entry.items() if value != ""},
                 {
-                    "selector_candidates": _carried_selector_candidates(control),
+                    "selector_candidates": _carried_selector_candidates(
+                        control,
+                        include_non_action_input_value=False,
+                    ),
                     "identity": {
                         "tag": entry["tag"],
                         "role": _attr_value(control, "role") or _implicit_role(control),
@@ -2670,16 +2919,75 @@ def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
     return controls
 
 
+def _interaction_blocking_layer_controls(node: Any) -> tuple[list[dict[str, Any]], int]:
+    actionable_controls = [
+        control
+        for control in node.find_all(True)
+        if (
+            str(getattr(control, "name", "") or "").lower() in {"button", "a", "input"}
+            or _attr_value(control, "role").strip().lower() == "button"
+        )
+        if _layer_control_has_actionable_evidence(control)
+    ]
+    controls: list[dict[str, Any]] = []
+    for control in actionable_controls[:_MAX_VISIBLE_CONTROLS]:
+        selector = _bounded_selector(
+            _selector_for(
+                control,
+                include_non_action_input_value=False,
+                include_action_value=False,
+                include_href=False,
+                include_aria_label=True,
+            )
+        )
+        entry = {
+            "tag": str(getattr(control, "name", "") or "").lower()[:40],
+            "text": _schema_text(
+                _control_label(control, include_non_action_input_value=False, include_action_value=False), 120
+            ),
+            "aria_label": _schema_text(_attr_value(control, "aria-label"), 120),
+            "title": _schema_text(_attr_value(control, "title"), 120),
+            "selector": selector,
+            "type": _attr_value(control, "type")[:40],
+        }
+        controls.append(
+            _attach_node_evidence(
+                {key: value for key, value in entry.items() if value != ""},
+                {
+                    "selector_candidates": _carried_selector_candidates(
+                        control,
+                        include_non_action_input_value=False,
+                        include_action_value=False,
+                        include_href=False,
+                    ),
+                    "identity": {
+                        "tag": entry["tag"],
+                        "role": _attr_value(control, "role") or _implicit_role(control),
+                        "label_context": _schema_text(
+                            _label_context_for(control),
+                            _MAX_PARSED_LABEL_CONTEXT_CHARS,
+                        ),
+                    },
+                },
+            )
+        )
+    return controls, max(len(actionable_controls) - _MAX_VISIBLE_CONTROLS, 0)
+
+
 def _modal_overlay_entry(node: Any) -> dict[str, Any]:
-    return {
-        "role": _attr_value(node, "role")[:80],
-        "aria_modal": _attr_value(node, "aria-modal").strip().lower() == "true",
-        "id": _attr_value(node, "id")[:120],
-        "class": " ".join(_classes_for(node)[:5])[:160],
-        "selector": _bounded_selector(_selector_for(node)),
-        "text": _schema_text(_node_text(node), 240),
-        "dismiss_controls": _modal_dismiss_controls(node),
-    }
+    role = _attr_value(node, "role")
+    return _attach_node_evidence(
+        {
+            "role": role[:80],
+            "aria_modal": _attr_value(node, "aria-modal").strip().lower() == "true",
+            "id": _attr_value(node, "id")[:120],
+            "class": " ".join(_classes_for(node)[:5])[:160],
+            "selector": _bounded_selector(_selector_for(node)),
+            "text": _schema_text(_node_text(node), 240),
+            "dismiss_controls": _modal_dismiss_controls(node),
+        },
+        _element_address_evidence(node),
+    )
 
 
 def _modal_overlays(nodes: Iterable[Any]) -> list[dict[str, Any]]:
@@ -2723,24 +3031,67 @@ def _page_obstructions_from_modal_overlays(modal_overlays: list[dict[str, Any]])
             if not isinstance(control, dict):
                 continue
             text = _bounded_string(control.get("text") or control.get("aria_label") or control.get("title"), 120)
-            selector = _bounded_string(control.get("selector"), 160)
-            if not (text or selector):
+            candidates = control.get("selector_candidates")
+            if not (text or candidates):
                 continue
             # The capture is the only place these facts exist; a control that reaches the model with
             # one selector and no fallbacks cannot be clicked again once that selector goes stale.
             carried = dict(control)
             if text:
                 carried["text"] = text
-            if selector:
-                carried["selector"] = selector
             visible_controls.append(carried)
         entry = {
             "kind": "modal_overlay",
             "source": DOM_EVIDENCE_SOURCE,
-            "selector": _bounded_string(overlay.get("selector"), 160),
+            "selector_candidates": overlay.get("selector_candidates") or [],
+            "identity": overlay.get("identity") or {},
             "text": _bounded_string(overlay.get("text"), 240),
             "visible_controls": visible_controls,
         }
+        obstructions.append({key: value for key, value in entry.items() if value or key == "visible_controls"})
+    return obstructions
+
+
+def _page_obstructions_from_interaction_blocking_layers(nodes: Iterable[Any]) -> list[dict[str, Any]]:
+    obstructions: list[dict[str, Any]] = []
+    seen_selectors: set[str] = set()
+    for node in nodes:
+        if len(obstructions) >= _MAX_PAGE_OBSTRUCTIONS:
+            break
+        if _is_modal_overlay_candidate(node) or not _is_interaction_blocking_layer_candidate(node):
+            continue
+        selector = _bounded_selector(
+            _selector_for(
+                node,
+                include_non_action_input_value=False,
+                include_action_value=False,
+                include_href=False,
+                include_aria_label=True,
+            )
+        )
+        if selector and selector in seen_selectors:
+            continue
+        visible_controls, controls_omitted = _interaction_blocking_layer_controls(node)
+        if not visible_controls:
+            continue
+        seen_selectors.add(selector)
+        entry: dict[str, Any] = {
+            "kind": "interaction_blocking_layer",
+            "source": DOM_EVIDENCE_SOURCE,
+            "selector": selector,
+            "text": _schema_text(_node_text(node), 240),
+            "intercepts_outside_control": True,
+            "underlying_page_blocked": True,
+            "visible_controls": visible_controls,
+            **_element_address_evidence(
+                node,
+                include_non_action_input_value=False,
+                include_action_value=False,
+                include_href=False,
+            ),
+        }
+        if controls_omitted:
+            entry["visible_controls_omitted"] = controls_omitted
         obstructions.append({key: value for key, value in entry.items() if value or key == "visible_controls"})
     return obstructions
 
@@ -2823,11 +3174,17 @@ def parse_composition_html(
             continue
         if _is_css_hidden_node(node):
             node.decompose()
+    # Challenge capture runs against the original document, while the remaining channels report
+    # the cleaned visible DOM. Do not reuse selector matches that still contain decomposed nodes.
+    vars(soup).pop("_skyvern_selector_match_cache", None)
 
     visible_text = _node_text(soup.body if getattr(soup, "body", None) is not None else soup)
     all_nodes = soup.find_all(True)
     modal_overlays = _modal_overlays(all_nodes)
-    page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
+    page_obstructions = (
+        _page_obstructions_from_modal_overlays(modal_overlays)
+        + _page_obstructions_from_interaction_blocking_layers(all_nodes)
+    )[:_MAX_PAGE_OBSTRUCTIONS]
     visual_obstruction_candidates = _visual_obstruction_candidates(soup)
 
     forms: list[dict[str, Any]] = []
@@ -2846,17 +3203,20 @@ def parse_composition_html(
                 continue
             if tag_name == "button" or field_type in {"submit", "button"}:
                 submit_controls.append(
-                    {
-                        "text": _schema_text(_control_label(node), 120),
-                        "name": str(node.get("name") or "")[:120],
-                        "id": str(node.get("id") or "")[:120],
-                        "value": _attr_value(node, "value")[:160],
-                        "class": " ".join(_classes_for(node)[:5])[:160],
-                        "type": field_type[:40],
-                        "disabled": _control_disabled(node),
-                        "selector": _bounded_selector(_selector_for(node)),
-                        **_html_disclosure_facts(node, controlled_region_visibility),
-                    }
+                    _attach_node_evidence(
+                        {
+                            "text": _schema_text(_control_label(node), 120),
+                            "name": str(node.get("name") or "")[:120],
+                            "id": str(node.get("id") or "")[:120],
+                            "value": _attr_value(node, "value")[:160],
+                            "class": " ".join(_classes_for(node)[:5])[:160],
+                            "type": field_type[:40],
+                            "disabled": _control_disabled(node),
+                            "selector": _bounded_selector(_selector_for(node)),
+                            **_html_disclosure_facts(node, controlled_region_visibility),
+                        },
+                        _element_address_evidence(node),
+                    )
                 )
                 continue
             if len(fields) >= _MAX_FIELDS_PER_FORM:
@@ -2883,7 +3243,7 @@ def parse_composition_html(
                 option_count = len(node.find_all("option"))
                 field["option_count"] = option_count
                 field["options_omitted"] = option_count > len(options)
-            fields.append(field)
+            fields.append(_attach_node_evidence(field, _element_address_evidence(node)))
         forms.append(
             {
                 "id": str(form.get("id") or "")[:120],
@@ -2911,12 +3271,15 @@ def parse_composition_html(
         eligible_navigation, _MAX_NAVIGATION_TARGETS
     )
     navigation_targets: list[dict[str, Any]] = [
-        {
-            "text": _schema_text(_node_text(link), 160),
-            "href": resolved_href[:300],
-            "region": region,
-            "selector": _bounded_selector(_selector_for(link)),
-        }
+        _attach_node_evidence(
+            {
+                "text": _schema_text(_node_text(link), 160),
+                "href": resolved_href[:300],
+                "region": region,
+                "selector": _bounded_selector(_selector_for(link)),
+            },
+            _element_address_evidence(link),
+        )
         for link, resolved_href, region in selected_navigation
     ]
 
@@ -3014,20 +3377,21 @@ def _structured_classes(value: Any) -> str:
     return " ".join(classes[:5])[:160]
 
 
-def _structured_select_options(value: Any) -> list[dict[str, Any]]:
+def _structured_select_options(value: Any, *, admit_observed: bool) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     if not isinstance(value, list):
         return options
     for option in value[:_MAX_SELECT_OPTIONS]:
         if not isinstance(option, dict):
             continue
-        options.append(
-            {
-                "text": _structured_str(option.get("text"))[:120],
-                "value": _structured_str(option.get("value")).strip()[:160],
-                "selected": option.get("selected") is True,
-            }
-        )
+        entry = {
+            "text": _structured_str(option.get("text"))[:120],
+            "value": _structured_str(option.get("value")).strip()[:160],
+            "selected": option.get("selected") is True,
+        }
+        if admit_observed and isinstance(option.get("observed_selected"), bool):
+            entry["observed_selected"] = option["observed_selected"]
+        options.append(entry)
     return options
 
 
@@ -3044,8 +3408,8 @@ def _structured_select_option_facts(node: dict[str, Any], options: list[dict[str
     }
 
 
-def _structured_selector_candidates(value: Any) -> list[dict[str, str]]:
-    candidates: list[dict[str, str]] = []
+def _structured_selector_candidates(value: Any) -> list[ScoutedSelectorCandidate]:
+    candidates: list[ScoutedSelectorCandidate] = []
     if not isinstance(value, list):
         return candidates
     seen: set[str] = set()
@@ -3054,9 +3418,8 @@ def _structured_selector_candidates(value: Any) -> list[dict[str, str]]:
             continue
         selector = _structured_str(item.get("selector")).strip()
         # A vocabulary shared across a language boundary keeps the record and preserves the value it
-        # does not recognise (proto3 open enums do exactly this); the known set below ranks candidates,
-        # it does not decide admission. Discarding a selector already verified unique against the live
-        # DOM, because its rung name is unfamiliar, loses evidence to a naming mismatch.
+        # does not recognise (proto3 open enums do exactly this). Discarding an observed selector
+        # because its source name is unfamiliar loses evidence to a naming mismatch.
         source = _structured_str(item.get("source"))[:40]
         if not source or not source.replace("_", "").isalnum():
             source = _UNKNOWN_SELECTOR_SOURCE
@@ -3065,7 +3428,11 @@ def _structured_selector_candidates(value: Any) -> list[dict[str, str]]:
         if len(selector) > _MAX_SELECTOR_CHARS:
             continue
         seen.add(selector)
-        candidates.append({"selector": selector, "source": source})
+        raw_count = item.get("match_count")
+        match_count = (
+            raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0 else None
+        )
+        candidates.append({"selector": selector, "source": source, "match_count": match_count})
     return candidates
 
 
@@ -3085,13 +3452,60 @@ def _structured_identity(value: Any) -> dict[str, str] | None:
 
 
 def _attach_node_evidence(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
-    candidates = _structured_selector_candidates(node.get("selector_candidates"))
-    if candidates:
+    raw_candidates = node.get("selector_candidates")
+    candidates = _structured_selector_candidates(raw_candidates)
+    if isinstance(raw_candidates, list):
         entry["selector_candidates"] = candidates
     identity = _structured_identity(node.get("identity"))
     if identity:
         entry["identity"] = identity
     return entry
+
+
+def model_visible_composition_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Project stored page evidence into factual model input without a preferred locator.
+
+    Capture keeps singular CSS selectors for internal measurement, binding, and execution joins.
+    At this model boundary every singular selector alias and its count are removed, including
+    key/value relations that do not carry candidate packets. Candidate selectors and all unrelated
+    facts retain their original order and values.
+    """
+
+    singular_selector_keys = {
+        "selector",
+        "selector_match_count",
+        "container_selector",
+        "container_match_count",
+        "label_selector",
+        "row_selector",
+        "expand_toggle_candidates",
+    }
+
+    def project(value: Any) -> Any:
+        if isinstance(value, dict):
+            projected: dict[str, Any] = {}
+            for key, child in value.items():
+                if key in singular_selector_keys:
+                    continue
+                if key == "selector_candidates" and isinstance(child, list):
+                    projected[key] = [
+                        {
+                            candidate_key: project(candidate_value)
+                            for candidate_key, candidate_value in candidate.items()
+                            if candidate_key != "match_count"
+                        }
+                        if isinstance(candidate, dict)
+                        else project(candidate)
+                        for candidate in child
+                    ]
+                else:
+                    projected[key] = project(child)
+            return projected
+        if isinstance(value, list):
+            return [project(child) for child in value]
+        return value
+
+    return project(evidence)
 
 
 def _attach_structured_disclosure_facts(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
@@ -3116,7 +3530,8 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         if not isinstance(node, dict) or len(fields) >= _MAX_FIELDS_PER_FORM:
             continue
         field_type = (_structured_str(node.get("type")) or "text").lower()
-        options = _structured_select_options(node.get("options"))
+        real_tag = (_structured_identity(node.get("identity")) or {}).get("tag", "")
+        options = _structured_select_options(node.get("options"), admit_observed=real_tag == "select")
         field = {
             "name": _structured_str(node.get("name"))[:120],
             "id": _structured_str(node.get("id"))[:120],
@@ -3133,6 +3548,11 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
             "options": options,
             "selector": _bounded_selector(_structured_str(node.get("selector"))),
         }
+        if real_tag == "input":
+            if field_type in OBSERVED_VALUE_FIELD_TYPES and isinstance(node.get("observed_value"), str):
+                field["observed_value"] = _structured_str(node["observed_value"]).strip()[:160]
+            if field_type in OBSERVED_CHECKED_FIELD_TYPES and isinstance(node.get("observed_checked"), bool):
+                field["observed_checked"] = node["observed_checked"]
         if field_type == "select":
             field.update(_structured_select_option_facts(node, options))
         if isinstance(node.get("visible"), bool):
@@ -3411,7 +3831,7 @@ def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
             field_value = _structured_str(node.get(key)).strip()
             if field_value:
                 entry[key] = field_value[:300]
-        controls.append({k: v for k, v in entry.items() if v})
+        controls.append(_attach_node_evidence({k: v for k, v in entry.items() if v}, node))
     return controls
 
 
@@ -3475,9 +3895,40 @@ def _structured_modal_overlays(value: Any) -> list[dict[str, Any]]:
             "dismiss_controls": _structured_modal_dismiss_controls(node.get("dismiss_controls")),
         }
         overlays.append(
-            {key: field_value for key, field_value in entry.items() if field_value or key == "dismiss_controls"}
+            _attach_node_evidence(
+                {key: field_value for key, field_value in entry.items() if field_value or key == "dismiss_controls"},
+                node,
+            )
         )
     return overlays
+
+
+def _structured_interaction_blocking_obstructions(value: Any) -> list[dict[str, Any]]:
+    obstructions: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return obstructions
+    for node in value:
+        if len(obstructions) >= _MAX_PAGE_OBSTRUCTIONS:
+            break
+        if not isinstance(node, dict) or node.get("kind") != "interaction_blocking_layer":
+            continue
+        visible_controls = _structured_modal_dismiss_controls(node.get("visible_controls"))
+        if not visible_controls or node.get("intercepts_outside_control") is not True:
+            continue
+        entry: dict[str, Any] = {
+            "kind": "interaction_blocking_layer",
+            "source": DOM_EVIDENCE_SOURCE,
+            "selector": _bounded_selector(_structured_str(node.get("selector"))),
+            "text": _schema_text(_structured_str(node.get("text")), 240),
+            "intercepts_outside_control": True,
+            "underlying_page_blocked": node.get("underlying_page_blocked") is True,
+            "visible_controls": visible_controls,
+        }
+        controls_omitted = node.get("visible_controls_omitted")
+        if isinstance(controls_omitted, int) and not isinstance(controls_omitted, bool) and controls_omitted > 0:
+            entry["visible_controls_omitted"] = controls_omitted
+        obstructions.append({key: field for key, field in entry.items() if field or key == "visible_controls"})
+    return obstructions
 
 
 def _structured_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]]:
@@ -3504,6 +3955,47 @@ def _structured_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]
     return candidates
 
 
+def _structured_size_compaction(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    original_char_count = value.get("original_char_count")
+    if (
+        not isinstance(original_char_count, int)
+        or isinstance(original_char_count, bool)
+        or original_char_count <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    ):
+        return None
+    omissions: list[dict[str, Any]] = []
+    seen_categories: set[str] = set()
+    for item in value.get("omissions") or []:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category")
+        if not isinstance(category, str):
+            continue
+        expected_unit = _SIZE_COMPACTION_CATEGORY_UNITS.get(category)
+        if expected_unit is None:
+            LOG.warning(
+                "copilot_structured_size_compaction_unknown_category_ignored",
+                category=category,
+            )
+            continue
+        omitted_count = item.get("omitted_count")
+        if (
+            category in seen_categories
+            or item.get("unit") != expected_unit
+            or not isinstance(omitted_count, int)
+            or isinstance(omitted_count, bool)
+            or omitted_count <= 0
+        ):
+            continue
+        seen_categories.add(category)
+        omissions.append({"category": category, "omitted_count": omitted_count, "unit": expected_unit})
+    if not omissions:
+        return None
+    return {"original_char_count": original_char_count, "omissions": omissions}
+
+
 def parse_composition_structured(data: Any, *, inspected_url: str, current_url: str) -> dict[str, Any] | None:
     """Map bounded structured JSON to PageEvidence; None denotes an invalid structured result."""
     if not isinstance(data, dict):
@@ -3526,8 +4018,12 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
     clickable_controls = _structured_clickable_controls(data.get("clickable_controls"))
     challenge_controls = _structured_challenge_controls(data.get("challenge_controls"))
     modal_overlays = _structured_modal_overlays(data.get("modal_overlays"))
-    page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
+    page_obstructions = (
+        _page_obstructions_from_modal_overlays(modal_overlays)
+        + _structured_interaction_blocking_obstructions(data.get("page_obstructions"))
+    )[:_MAX_PAGE_OBSTRUCTIONS]
     visual_obstruction_candidates = _structured_visual_obstruction_candidates(data.get("visual_obstruction_candidates"))
+    size_compaction = _structured_size_compaction(data.get("size_compaction"))
     visible_text = _schema_text(_structured_str(data.get("visible_text_excerpt")), _MAX_VISIBLE_TEXT_EXCERPT_CHARS)
 
     # Re-validate JS-reported indicators against _ANTI_BOT_PATTERNS and union a title scan.
@@ -3552,6 +4048,7 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "inspected_url": inspected_url,
         "current_url": current_url,
         "page_title": page_title,
+        **({"size_compaction": size_compaction} if size_compaction is not None else {}),
         "forms": forms,
         # Ahead of the list it describes: tool output is head-truncated, so a flag placed after a
         # long navigation_targets is dropped exactly on the pages where it is true.
