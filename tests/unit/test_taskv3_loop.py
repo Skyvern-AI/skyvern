@@ -35,6 +35,7 @@ from skyvern.forge.taskv3.loop import (
     NAVIGATION_DEAD_END_STATUSES,
     NO_TOOL_CALL_NUDGE,
     PAGE_REFRESH_EXHAUSTED_REASON_PREFIX,
+    PAGE_STATE_STALL_SHADOW_EVENT,
     PAGE_UNAVAILABLE_ERROR,
     PERCEPTION_STALL_NUDGE_AFTER,
     PERCEPTION_STALL_REASON_PREFIX,
@@ -2050,6 +2051,203 @@ def test_budget_extension_gate_deadline_scales_with_observed_pace() -> None:
         False,
         "insufficient_deadline_headroom",
     )
+
+
+@pytest.mark.asyncio
+async def test_page_state_stall_nudges_then_terminates_a_frozen_page_cycle() -> None:
+    # SKY-15265: a tool cycle that leaves the page fingerprint byte-identical round after round is
+    # a stall no per-tool guard can see (varied selectors never streak; scroll/wait carry no
+    # digest). The detector re-plans the model once, then ends the run with a facetable verdict —
+    # on EITHER arm (auto-observe off here).
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"panel variant {i}" for i in range(30)])
+
+    async def frozen_fingerprint() -> str:
+        return "FROZEN-DOM"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(14):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#try-{i}"})])  # varied: the action-loop guard is blind
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            page_fingerprint=frozen_fingerprint,
+            max_action_steps=24,
+            max_turns=60,
+            max_tool_calls=200,
+        )
+    assert outcome.status == "completed"  # the verdict is SHADOW-only: measured, never enforced yet
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "unchanged" in str(m.get("content"))]
+    assert len(nudges) == 1  # exactly one re-plan nudge
+    shadow = [entry for entry in logs if entry["event"] == PAGE_STATE_STALL_SHADOW_EVENT]
+    assert len(shadow) == 1 and shadow[0]["rounds"] == 12
+    assert len(clicks) == 14  # nothing was cut short
+
+
+@pytest.mark.asyncio
+async def test_page_state_stall_never_fires_while_the_fingerprint_moves() -> None:
+    # A real form fill mutates innerHTML every round, so the fingerprint moves and the detector
+    # stays silent for the life of the run.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    fp_n = {"n": 0}
+
+    async def moving_fingerprint() -> str:
+        fp_n["n"] += 1
+        return f"dom-{fp_n['n']}"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#field-{i}"})] for i in range(14)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        page_fingerprint=moving_fingerprint,
+        max_action_steps=24,
+        max_turns=60,
+        max_tool_calls=200,
+    )
+    assert outcome.status == "completed"
+    assert len(clicks) == 14
+
+
+@pytest.mark.asyncio
+async def test_page_state_stall_counter_resets_when_the_cycle_breaks_after_the_nudge() -> None:
+    # The nudge is a real second chance: a run that changes the page after being warned survives.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    fp_state = {"n": 0}
+
+    async def thawing_fingerprint() -> str:
+        fp_state["n"] += 1
+        # Two samples per round: frozen through round 9's after-sample (18 calls), moving after.
+        return "FROZEN" if fp_state["n"] <= 18 else f"dom-{fp_state['n']}"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#try-{i}"})] for i in range(12)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            page_fingerprint=thawing_fingerprint,
+            max_action_steps=24,
+            max_turns=60,
+            max_tool_calls=200,
+        )
+    assert outcome.status == "completed"
+    assert len(clicks) == 12
+    assert not [entry for entry in logs if entry["event"] == PAGE_STATE_STALL_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_page_state_stall_sees_movement_landing_between_batches() -> None:
+    # A delayed render can land after one batch's after-sample and before the next batch's
+    # before-sample: each batch reads internally frozen, but the page IS moving. The detector
+    # compares across batches, so this healthy pattern never accumulates a stall streak.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    fp_calls = {"n": 0}
+
+    async def between_batch_fingerprint() -> str:
+        # Two samples per batch (before, after): identical within a batch, different across batches.
+        fp_calls["n"] += 1
+        return f"dom-{(fp_calls['n'] - 1) // 2}"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#step-{i}"})] for i in range(10)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            page_fingerprint=between_batch_fingerprint,
+            max_action_steps=24,
+            max_turns=60,
+            max_tool_calls=200,
+        )
+    assert outcome.status == "completed"
+    assert len(clicks) == 10
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "unchanged" in str(m.get("content"))]
+    assert nudges == []
+    assert not [entry for entry in logs if entry["event"] == PAGE_STATE_STALL_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_page_state_stall_not_defeated_by_url_only_transitions() -> None:
+    # history.pushState churn moves the URL without touching the document: a URL-only transition is
+    # a hint, and it must not reset the stall counter while the fingerprint stays frozen.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def push_state_click(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        return ToolResult.ok("clicked", data={"page_transitioned": True})
+
+    click = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {}},
+        handler=push_state_click,
+        billable=True,
+    )
+
+    async def frozen_fingerprint() -> str:
+        return "FROZEN-DOM"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#tab-{i}"})] for i in range(13)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            page_fingerprint=frozen_fingerprint,
+            max_action_steps=24,
+            max_turns=60,
+            max_tool_calls=200,
+        )
+    assert outcome.status == "completed"
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "unchanged" in str(m.get("content"))]
+    assert len(nudges) == 1
+    assert [entry for entry in logs if entry["event"] == PAGE_STATE_STALL_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_page_state_stall_resets_when_new_downloads_land() -> None:
+    # A download-next flow produces files without changing the DOM: a freshly detected download is
+    # real progress for this detector too, so a healthy multi-download run is never nudged.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def download_click(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        return ToolResult.ok("clicked", data={"download_notice": True, "download_new": True})
+
+    click = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {}},
+        handler=download_click,
+        billable=True,
+    )
+
+    async def frozen_fingerprint() -> str:
+        return "FROZEN-DOM"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#next-file-{i}"})] for i in range(10)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            page_fingerprint=frozen_fingerprint,
+            max_action_steps=24,
+            max_turns=60,
+            max_tool_calls=200,
+        )
+    assert outcome.status == "completed"
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "unchanged" in str(m.get("content"))]
+    assert nudges == []
+    assert not [entry for entry in logs if entry["event"] == PAGE_STATE_STALL_SHADOW_EVENT]
 
 
 def test_budget_extension_gate_vetoes_fire_independently() -> None:

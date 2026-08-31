@@ -1802,10 +1802,21 @@ class ForgeAgent:
         # the gate, not here. Built for both populations — the failure-evidence gate needs a sampler
         # to run at all — over the same page accessor each population's tools use, so the evidence
         # is sampled from the page the model actually acted on.
+        # Field values are hashed separately: typing sets the value IDL property, which innerHTML
+        # serialization does not reflect, so a form being filled would otherwise read as frozen.
+        # Open shadow roots are traversed for the same reason — the tools pierce them, so work
+        # inside a shadow widget must move the fingerprint too (closed roots stay invisible).
         _PAGE_FINGERPRINT_PROBE_JS = (
-            "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
-            " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
-            " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
+            "() => { if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
+            " const mix = (str, seed) => { let x = seed;"
+            " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
+            " const walk = (root) => { h = mix(root.innerHTML || '', h);"
+            " const all = root.querySelectorAll('*'); elems += all.length;"
+            " for (const el of root.querySelectorAll('input, textarea, select'))"
+            " v = mix(String(el.value || '') + '|' + (el.checked === true ? '1' : '0'), v);"
+            " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
+            " walk(document.body);"
+            " return h + ':' + elems + ':' + v; }"
         )
 
         _DOCUMENT_NONCE_JS = (
