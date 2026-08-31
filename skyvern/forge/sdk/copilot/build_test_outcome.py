@@ -13,6 +13,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     carrier_backed_anti_bot_categories,
     interactive_challenge_controls,
@@ -265,6 +266,7 @@ class BuildTestPacketFailure(BaseModel):
     error_codes: list[str] = Field(default_factory=list)
     failing_line: int | None = None
     failed_operation: BuildTestFailedOperation | None = None
+    connect_failure: BuildTestConnectFailure | None = None
     action_trace: list[str] = Field(default_factory=list)
     page_state: BuildTestPacketPageState | None = None
     locator_observations: list[BuildTestPacketLocatorObservation] = Field(default_factory=list)
@@ -384,6 +386,7 @@ class RecordedBuildTestOutcome(BaseModel):
     code_safety_rejection_facts: list[CodeSafetyRejectionFact] = Field(default_factory=list)
     page_path_failure: PostRunPagePathFailure | None = None
     failed_operation: BuildTestFailedOperation | None = None
+    connect_failure: BuildTestConnectFailure | None = None
     failed_operation_call_signature: str | None = Field(default=None, exclude=True, repr=False)
     failed_operation_code_signature: str | None = Field(default=None, exclude=True, repr=False)
     executed_block_associations: tuple[str, ...] = Field(default=(), exclude=True, repr=False)
@@ -456,7 +459,7 @@ class _RecordedBuildTestOutcomeContext(Protocol):
 def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome | None) -> None:
     if outcome is None:
         latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
-        if latest is None or latest.failed_operation is None:
+        if latest is None or (latest.failed_operation is None and latest.connect_failure is None):
             ctx.latest_recorded_build_test_outcome = None
         return
     prior = getattr(ctx, "latest_recorded_build_test_outcome", None)
@@ -519,6 +522,9 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
             ],
             "failed_operation": (
                 outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
+            ),
+            "connect_failure": (
+                outcome.connect_failure.model_dump(mode="json") if outcome.connect_failure is not None else None
             ),
             "failed_operation_call_signature": outcome.failed_operation_call_signature,
         }
@@ -1074,6 +1080,20 @@ def recorded_outcome_from_run_blocks_result(
         if isinstance(requested, list)
         else []
     )
+    connect_failure = connect_failure_from_run_blocks_result(result)
+    if connect_failure is not None:
+        return RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="not_authoritative",
+            reason_code="unrecoverable_tool_error",
+            workflow_run_id=connect_failure.workflow_run_id,
+            requested_block_labels=requested_block_labels,
+            structural_failure_identity=f"build_test_connect:{connect_failure.state}",
+            connect_failure=connect_failure,
+            observed_evidence_summary=f"Build-test browser acquisition stopped: {connect_failure.state}.",
+            key_provenance={"structural_failure_identity": "typed build-test browser acquisition fact"},
+        )
     executed_block_labels = _clean_list(
         [
             redacted
@@ -1459,6 +1479,17 @@ def failed_operation_from_run_blocks_result(
         failing_line=failing_line if type(failing_line) is int else None,
         block_association=(block_associations_by_label or {}).get(_safe_str(failed_block.get("label"))),
     )
+
+
+def connect_failure_from_run_blocks_result(result: Mapping[str, object]) -> BuildTestConnectFailure | None:
+    data = _dict(result.get("data"))
+    payload = data.get("build_test_connect_failure")
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        return BuildTestConnectFailure.model_validate(payload)
+    except ValueError:
+        return None
 
 
 def _stable_hash(payload: object) -> str:

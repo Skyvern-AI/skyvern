@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
+    connect_failure_from_run_blocks_result,
     failed_operation_from_run_blocks_result,
     post_run_page_capture_from_result,
     record_build_test_outcome,
@@ -122,11 +123,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
     browser_page_custody_lock,
-    ensure_browser_session,
+    ensure_build_test_browser_session,
     register_sensitive_origin_run_lease,
     release_sensitive_origin_run_lease,
     resolve_persistent_browser_state,
-    verify_browser_session_by_attaching,
+    verify_build_test_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     build_test_page_state_from_evidence,
@@ -2272,6 +2273,26 @@ def _credit_composition_verified_labels(
     ctx.composition_verified_labels = workflow_labels[: max(end, len(credited))]
 
 
+async def acquire_build_test_browser_session(ctx: CopilotContext, *, fresh: bool) -> dict[str, Any] | None:
+    """The single initial-acquisition seam used by every build-test run."""
+    if fresh:
+        return await ensure_build_test_browser_session(ctx)
+    return await verify_build_test_browser_session_by_attaching(ctx)
+
+
+def _with_build_test_acquisition_context(
+    result: dict[str, Any], *, requested_block_labels: Sequence[str], fresh: bool
+) -> dict[str, Any]:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        result["data"] = data
+    data["requested_block_labels"] = list(requested_block_labels)
+    data["executed_block_labels"] = []
+    data["used_fresh_run_session"] = fresh
+    return result
+
+
 async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> dict[str, Any]:
     """Run every block of a candidate workflow in one browser minted for this run. Frontier
     selection is bypassed and the provenance stamped so a clean result earns composition credit
@@ -2585,10 +2606,10 @@ async def _run_blocks_and_collect_debug(
         # keeps it; the fresh id is threaded into the run calls explicitly.
         debug_session_id = ctx.browser_session_id
         ctx.browser_session_id = None
-        session_err = await ensure_browser_session(ctx)
+        session_err = await acquire_build_test_browser_session(ctx, fresh=True)
         if session_err is not None:
             ctx.browser_session_id = debug_session_id
-            return session_err
+            return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels, fresh=True)
         run_session_id = ctx.browser_session_id
         ctx.browser_session_id = debug_session_id
         used_fresh_run_session = True
@@ -2616,9 +2637,9 @@ async def _run_blocks_and_collect_debug(
     else:
         # This id is dispatched into a workflow run without ever being attached here, so an
         # unverified session cannot be discovered later and must fail now instead.
-        session_err = await verify_browser_session_by_attaching(ctx)
+        session_err = await acquire_build_test_browser_session(ctx, fresh=False)
         if session_err is not None:
-            return session_err
+            return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels, fresh=False)
         run_session_id = ctx.browser_session_id
 
     seeded_runtime_workflow = await _workflow_with_runtime_frontier_starter_url_seed(
@@ -4850,6 +4871,11 @@ def build_test_evidence_packet(
         page_capture = recorded_outcome.page_capture
     failure: BuildTestPacketFailure | None = None
     if failed_block is not None or result.get("ok") is False:
+        connect_failure = (
+            recorded_outcome.connect_failure
+            if recorded_outcome is not None
+            else connect_failure_from_run_blocks_result(result)
+        )
         if recorded_outcome is not None and recorded_outcome.workflow_run_id == run_id:
             failed_operation = recorded_outcome.failed_operation
             if failed_operation is not None and failed_operation.workflow_run_id != run_id:
@@ -4891,6 +4917,7 @@ def build_test_evidence_packet(
             error_codes=(_packet_string_list(failed_block.get("error_codes")) if failed_block is not None else []),
             failing_line=data.get("failing_code_line") if type(data.get("failing_code_line")) is int else None,
             failed_operation=failed_operation,
+            connect_failure=connect_failure,
             action_trace=action_trace,
             page_state=page_state,
             locator_observations=_packet_locator_observations(data, omission_notices),

@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     config_for_eval_mode,
     resolve_copilot_tool_surface,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _TEXT_MAX,
     _VALUE_EXCERPT_MAX,
@@ -1505,6 +1506,9 @@ def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
         return "deadline_expired"
     if ctx.copilot_max_turns_exceeded is True:
         return "max_turns_exceeded"
+    connect_failure = _terminal_connect_failure(ctx)
+    if connect_failure is not None:
+        return connect_failure.state
     failed_operation = _terminal_failed_operation(ctx)
     if failed_operation is not None:
         return failed_operation.kind
@@ -1613,6 +1617,11 @@ def _terminal_failed_operation(
     return outcome.failed_operation if isinstance(outcome, RecordedBuildTestOutcome) else None
 
 
+def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | None:
+    outcome = ctx.latest_recorded_build_test_outcome
+    return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
@@ -1629,6 +1638,7 @@ def _assemble_terminal_envelope_safe(
     terminal_cause: TerminalCause | None = None,
     blocks_run_this_turn: int | None = None,
     failed_operation: BuildTestFailedOperation | None = None,
+    connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
 ) -> dict[str, Any] | None:
     try:
@@ -1646,6 +1656,7 @@ def _assemble_terminal_envelope_safe(
             terminal_cause=terminal_cause,
             blocks_run_this_turn=blocks_run_this_turn,
             failed_operation=failed_operation,
+            connect_failure=connect_failure,
             proposal_present=proposal_present,
         )
     except Exception:
@@ -1753,7 +1764,8 @@ def _make_agent_result(
         ctx is not None and (result_carries_workflow or ctx.has_genuine_workflow_attempt())
     )
     failed_operation = _terminal_failed_operation(ctx) if ctx is not None else None
-    if failed_operation is not None and proposal_disposition == "auto_applicable":
+    connect_failure = _terminal_connect_failure(ctx) if ctx is not None else None
+    if (failed_operation is not None or connect_failure is not None) and proposal_disposition == "auto_applicable":
         proposal_disposition = "review_untested" if result_carries_workflow else "no_proposal"
         kwargs["proposal_disposition"] = proposal_disposition
     if isinstance(narrative_payload, dict):
@@ -1873,9 +1885,12 @@ def _make_agent_result(
             terminal_cause=terminal_cause,
             blocks_run_this_turn=len(ctx.executed_block_labels),
             failed_operation=failed_operation,
+            connect_failure=connect_failure,
             proposal_present=result_carries_workflow,
         )
-    if terminal_envelope is not None and terminal_envelope.get("failed_operation") is not None:
+    if terminal_envelope is not None and (
+        terminal_envelope.get("failed_operation") is not None or terminal_envelope.get("connect_failure") is not None
+    ):
         envelope = TerminalOutcomeEnvelope.model_validate(terminal_envelope)
         terminal_message, replaced = render_terminal_message(
             envelope,

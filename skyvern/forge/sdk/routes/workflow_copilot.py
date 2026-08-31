@@ -440,8 +440,8 @@ def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None
     the review gate.
     """
     terminal_envelope = getattr(agent_result, "terminal_envelope", None)
-    unresolved_failed_operation = (
-        isinstance(terminal_envelope, dict) and terminal_envelope.get("failed_operation") is not None
+    unresolved_failed_operation = isinstance(terminal_envelope, dict) and (
+        terminal_envelope.get("failed_operation") is not None or terminal_envelope.get("connect_failure") is not None
     )
     if (
         getattr(agent_result, "cancelled", False) is True

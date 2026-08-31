@@ -14,6 +14,7 @@ import structlog
 
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _TEXT_MAX,
     BuildTestEvidencePacket,
@@ -356,6 +357,42 @@ def _bounded_failed_operation(
             "block_label": _bounded_packet_string(
                 operation.block_label,
                 field_name="failure.failed_operation.block_label",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+        }
+    )
+
+
+def _bounded_connect_failure(
+    failure: BuildTestConnectFailure | None,
+    notices: list[str],
+) -> BuildTestConnectFailure | None:
+    if failure is None:
+        return None
+    return failure.model_copy(
+        update={
+            "workflow_run_id": _bounded_packet_string(
+                failure.workflow_run_id,
+                field_name="failure.connect_failure.workflow_run_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "workflow_run_block_id": _bounded_packet_string(
+                failure.workflow_run_block_id,
+                field_name="failure.connect_failure.workflow_run_block_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "task_id": _bounded_packet_string(
+                failure.task_id,
+                field_name="failure.connect_failure.task_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
+            "browser_session_id": _bounded_packet_string(
+                failure.browser_session_id,
+                field_name="failure.connect_failure.browser_session_id",
                 max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                 notices=notices,
             ),
@@ -894,6 +931,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     notices=notices,
                 ),
                 "failed_operation": _bounded_failed_operation(failure.failed_operation, notices),
+                "connect_failure": _bounded_connect_failure(failure.connect_failure, notices),
                 "action_trace": action_trace,
                 "page_state": _bounded_packet_page_state(
                     failure.page_state, notices, field_prefix="failure.page_state"
