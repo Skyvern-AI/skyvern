@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
+from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -2684,6 +2685,74 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
 
 
 @pytest.mark.asyncio
+async def test_sensitive_post_run_capture_redacts_registry_values_and_keeps_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {
+            "credential": {"username": "private-user", "password": "private-pass"},
+            "copilot_run_runtime_secret_values": ("654321",),
+        },
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+
+    async def fake_read(
+        _ctx: CopilotContext, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, object], str, None, None]:
+        evidence = _bounded_failure_page_evidence()
+        evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
+        return evidence, run_session_id, None, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
+
+    capture = await run_execution_module._capture_and_store_post_run_page(
+        ctx,
+        run_session_id="run_session",
+        run_id="wr_sensitive",
+        current_url="https://example.test/otp",
+    )
+
+    assert capture.status == "captured"
+    stored = ctx.composition_page_evidence
+    assert isinstance(stored, dict)
+    assert stored["forms"][0]["fields"][0]["selector"] == "#totp"
+    assert "private-user" not in json.dumps(stored)
+    assert "private-pass" not in json.dumps(stored)
+    assert "654321" not in json.dumps(stored)
+    assert "[REDACTED_SECRET]" in json.dumps(stored)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_post_run_capture_stays_withheld_when_registry_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _bounded_failure_page_evidence()
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {"credential": {"username": "private-user"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+    )
+    read = AsyncMock()
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
+
+    capture = await run_execution_module._capture_and_store_post_run_page(
+        ctx,
+        run_session_id="run_session",
+        run_id="wr_sensitive",
+        current_url="https://example.test/otp",
+    )
+
+    assert capture.status == "unavailable"
+    assert ctx.composition_page_evidence is None
+    read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_post_run_capture_refused_for_a_foreign_session_reports_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2852,6 +2921,58 @@ async def test_post_run_current_page_inspect_is_sourced_from_the_run_session(
     assert result["reached_via"] == "post_run"
     assert ctx.browser_session_id == "scout_session"
     assert not any(entry.get("event") == "copilot_post_run_evidence_source_mismatch_refused" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    ctx.browser_session_id = "run_session"
+    ctx.last_run_blocks_browser_session_id = "run_session"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_failed",
+        {
+            "credential": {"username": "private-user", "password": "private-pass"},
+            "copilot_run_runtime_secret_values": ("654321",),
+        },
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"run_session"}
+    evidence = _bounded_failure_page_evidence()
+    evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
+
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence)
+
+    assert result["ok"] is True
+    assert result["data"]["forms"][0]["fields"][0]["label"] == "Verification code"
+    assert "private-user" not in json.dumps(result)
+    assert "private-pass" not in json.dumps(result)
+    assert "654321" not in json.dumps(result)
+    assert "[REDACTED_SECRET]" in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_current_page_inspect_stays_withheld_while_origin_run_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    ctx.browser_session_id = "run_session"
+    ctx.last_run_blocks_browser_session_id = "run_session"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_failed",
+        {"credential": {"username": "private-user", "password": "private-pass"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"run_session"}
+    ctx.active_sensitive_origin_browser_session_ids = {"run_session"}
+
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=_bounded_failure_page_evidence())
+
+    assert result["ok"] is False
+    assert "specific named URL" in result["error"]
 
 
 @pytest.mark.asyncio

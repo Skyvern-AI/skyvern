@@ -7,6 +7,7 @@ stay scrubbed on readbacks in later turns whose per-turn context is empty.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -63,6 +64,53 @@ def register_secret_scrub_value(ctx: AgentContext, value: str | None) -> None:
         if new_session:
             while len(_SESSION_SCRUB_VALUES) > _MAX_SCRUB_SESSIONS:
                 _SESSION_SCRUB_VALUES.pop(next(iter(_SESSION_SCRUB_VALUES)))
+
+
+def register_secret_scrub_values_from_structure(ctx: AgentContext, obj: Any) -> None:
+    """Register string leaves without treating field names as secret values."""
+    if isinstance(obj, str):
+        register_secret_scrub_value(ctx, obj)
+        return
+    if isinstance(obj, Mapping):
+        for value in obj.values():
+            register_secret_scrub_values_from_structure(ctx, value)
+        return
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        for value in obj:
+            register_secret_scrub_values_from_structure(ctx, value)
+
+
+def matching_origin_run_redaction_parameters(ctx: AgentContext, run_id: str | None = None) -> dict[str, Any] | None:
+    """Return a mutable copy of the complete, run-bound model-disclosure scrub set."""
+    expected_run_id = run_id or getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    registry = getattr(ctx, "origin_run_redaction_registry", None)
+    if (
+        not isinstance(expected_run_id, str)
+        or not expected_run_id
+        or registry is None
+        or registry.workflow_run_id != expected_run_id
+        or not registry.contains_sensitive_values
+        or not registry.contains_all_sensitive_values
+    ):
+        return None
+
+    def mutable(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: mutable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [mutable(item) for item in value]
+        return value
+
+    return mutable(registry.parameters)
+
+
+def register_matching_origin_run_redaction_values(ctx: AgentContext, run_id: str | None = None) -> bool:
+    """Bind the terminal origin run's known values to the existing exact-value scrubber."""
+    parameters = matching_origin_run_redaction_parameters(ctx, run_id)
+    if parameters is None:
+        return False
+    register_secret_scrub_values_from_structure(ctx, parameters)
+    return True
 
 
 def clear_session_scrub_values(session_id: str | None) -> None:

@@ -58,7 +58,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    register_matching_origin_run_redaction_values,
+    registered_scrub_values,
+    scrub_secrets_from_structure,
+)
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.schemas.workflows import TaskBlockYAML
 
@@ -647,7 +651,12 @@ async def _evaluate_pre_hook(
     # call's post-hook to consume.
     ctx.pending_scout_read_expression = None
     ctx.pending_scout_read_output_path = None
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
+    sensitive_page_refusal = None
+    if sensitive_origin_page_has_active_run(ctx) or (
+        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
+    ):
+        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     raw_expression = params.get("expression")
@@ -1505,11 +1514,18 @@ async def _evaluate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     ctx.scout_observation_contract = None
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
+    sensitive_page_refusal = None
+    if sensitive_origin_page_has_active_run(ctx) or (
+        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
+    ):
+        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
     if sensitive_page_refusal is not None:
         ctx.pending_scout_read_expression = None
         ctx.pending_scout_read_output_path = None
         return sensitive_page_refusal
+    if matching_registry_is_scrubbable:
+        result = scrub_secrets_from_structure(ctx, result)
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
         return result
@@ -1923,6 +1939,7 @@ def _build_skyvern_mcp_overlays(
                 BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM,
             },
             requires_browser=True,
+            redacts_sensitive_origin_structured_result=True,
             timeout=30,
             pre_hook=_evaluate_pre_hook,
             post_hook=_evaluate_post_hook,
