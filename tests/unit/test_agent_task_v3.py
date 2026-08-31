@@ -2508,7 +2508,9 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     # a fresh or detached state would let a refused source false-complete despite the blocker.
     seen_states: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(
+        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+    ) -> tuple[list[Any], str]:
         seen_states.append(state)
         return [], ""
 
@@ -2535,7 +2537,9 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     seen_keys: list[str | None] = []
     seen_providers: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(
+        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+    ) -> tuple[list[Any], str]:
         ctx = skyvern_context.current()
         seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
         seen_providers.append(page_provider)
@@ -2564,7 +2568,9 @@ async def test_execute_task_v3_withholds_the_page_provider_from_auth_tools_when_
     # navigate; a page-aware run must be, or the sign-in-link tool is silently never offered.
     seen_providers: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(
+        task: Any, page_provider: Any = None, state: Any = None, allowed_credential_parameter_keys: Any = None
+    ) -> tuple[list[Any], str]:
         seen_providers.append(page_provider)
         return [], ""
 

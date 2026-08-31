@@ -115,11 +115,13 @@ async def test_build_auth_tools_offered_iff_resolve_otp_value_has_a_source(
     task = _task(**overrides)
     has_credential = case == "credential"
     credential_value = OTPValue(value="424242", type=OTPType.TOTP)
-    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda run_id: has_credential and bool(run_id))
+    monkeypatch.setattr(
+        otp_service, "has_credential_totp_candidate", lambda run_id, *a, **k: has_credential and bool(run_id)
+    )
     monkeypatch.setattr(
         otp_service,
         "try_generate_totp_from_credential",
-        lambda run_id: credential_value if has_credential and run_id else None,
+        lambda run_id, *a, **k: credential_value if has_credential and run_id else None,
     )
     poll = AsyncMock(return_value=OTPValue(value="111111", type=OTPType.TOTP))
     monkeypatch.setattr(otp_service, "poll_otp_value", poll)
@@ -1194,3 +1196,22 @@ async def test_verification_tools_share_one_polling_budget(monkeypatch: pytest.M
     code_result = await handlers["get_verification_code"]({})
     assert code_result.status == "error" and "budget exhausted" in code_result.content
     assert resolver_calls == calls_after_link_tool
+
+
+def test_block_credential_parameter_keys_script_mode_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-15181 review: script-built blocks carry no parameters=, so deriving scope from them would
+    silently disable credential-TOTP for cached-script logins; script-mode runs stay legacy (None)."""
+    from types import SimpleNamespace as NS
+
+    from skyvern.forge import agent as agent_module
+
+    block = NS(parameters=[])
+    monkeypatch.setattr(
+        agent_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        NS(has_workflow_run_context=lambda _id: True, get_workflow_run_context=lambda _id: NS()),
+    )
+    with skyvern_context.scoped(SkyvernContext(script_mode=True)):
+        assert agent_module.block_credential_parameter_keys(block, "wr_test") is None
+    with skyvern_context.scoped(SkyvernContext()):
+        assert agent_module.block_credential_parameter_keys(NS(parameters=[]), "wr_test") == []
