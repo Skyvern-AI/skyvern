@@ -74,6 +74,7 @@ console.log(result.output);
 | `output` | `dict \| None` | Extracted data from the run. Shape depends on your prompt or `data_extraction_schema`. |
 | `downloaded_files` | `list[FileInfo] \| None` | Files downloaded during the run. |
 | `recording_url` | `str \| None` | URL to the session recording video. |
+| `recording_archived` | `bool` | `True` when the recording exists but has been archived to cold storage and is not currently accessible. |
 | `screenshot_urls` | `list[str] \| None` | Final screenshots (most recent first). |
 | `failure_reason` | `str \| None` | Error description if the run failed. |
 | `app_url` | `str \| None` | Link to view this run in the Cloud UI. |
