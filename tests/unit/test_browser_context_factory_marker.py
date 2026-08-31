@@ -13,8 +13,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import BrowserContext, Locator, Page
 
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.webeye import browser_factory as factory_module
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_factory import BrowserContextFactory
+from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 
 
 @pytest.mark.asyncio
@@ -73,8 +78,6 @@ async def test_cdp_connect_creator_trusts_configured_browser_address(monkeypatch
 @pytest.mark.asyncio
 async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """The factory does not auto-stamp; a local creator's marker stays False."""
-    from skyvern.webeye.browser_artifacts import BrowserArtifacts
-    from skyvern.webeye.browser_factory import BrowserContextFactory
 
     async def _local_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
         return object(), BrowserArtifacts(), None
@@ -128,10 +131,67 @@ def _factory_harness(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_factory_warns_when_requested_profile_not_applied(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.webeye.browser_artifacts import BrowserArtifacts
-    from skyvern.webeye.browser_factory import BrowserContextFactory
+async def test_factory_registers_authoritative_playwright_input_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = MagicMock()
 
+    async def _creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        return context, BrowserArtifacts(), None
+
+    _factory_harness(monkeypatch)
+    register_defaults = MagicMock()
+    monkeypatch.setattr(factory_module, "register_playwright_input_context", register_defaults)
+    BrowserContextFactory.register_type("test-input-defaults", _creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-input-defaults")
+
+    await BrowserContextFactory.create_browser_context(playwright=object())
+
+    register_defaults.assert_called_once_with(context, strict_selectors=False)
+
+
+@pytest.mark.asyncio
+async def test_factory_preserves_context_strictness_for_recorder_omitted_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = MagicMock(spec=BrowserContext)
+    raw_page = MagicMock(spec=Page)
+    raw_page.context = context
+    strict_locator = MagicMock(spec=Locator)
+    strict_locator.page = raw_page
+    strict_locator.first = MagicMock(spec=Locator)
+    raw_page.locator.return_value = strict_locator
+
+    async def _creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        assert kwargs["strict_selectors"] is True
+        return context, BrowserArtifacts(), None
+
+    _factory_harness(monkeypatch)
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.code_block_recorder.strategy_aware_input",
+        strategy_aware_input,
+    )
+    BrowserContextFactory.register_type("test-strict-input-defaults", _creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-strict-input-defaults")
+
+    await BrowserContextFactory.create_browser_context(playwright=object(), strict_selectors=True)
+    recording_page = RecordingPage(
+        raw_page,
+        strategy_aware_typing=True,
+        playwright_input_defaults=playwright_input_defaults_for_page(raw_page),
+    )
+
+    await recording_page.fill("#multiple", "value")
+
+    strategy_aware_input.assert_awaited_once_with(
+        strict_locator,
+        "value",
+        clear=True,
+        timeout=30_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_factory_warns_when_requested_profile_not_applied(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _profile_blind_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
         # Mirrors remote/vendor creators: accepts browser_profile_id but never applies it.
         return object(), BrowserArtifacts(), None
@@ -152,9 +212,6 @@ async def test_factory_warns_when_requested_profile_not_applied(monkeypatch: pyt
 
 @pytest.mark.asyncio
 async def test_factory_stays_quiet_when_requested_profile_applied(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.webeye.browser_artifacts import BrowserArtifacts
-    from skyvern.webeye.browser_factory import BrowserContextFactory
-
     async def _profile_applying_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
         return object(), BrowserArtifacts(applied_browser_profile_id=str(kwargs.get("browser_profile_id"))), None
 
@@ -177,7 +234,6 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     from skyvern.forge import app
-    from skyvern.webeye.browser_factory import BrowserContextFactory
 
     monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(tmp_path / "profile")))
     monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
@@ -217,7 +273,6 @@ async def test_bootstrap_error_propagates_unwrapped_but_other_errors_are_wrapped
     is still wrapped in ``UnknownErrorWhileCreatingBrowserContext`` as before."""
     from skyvern.exceptions import UnknownErrorWhileCreatingBrowserContext
     from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
-    from skyvern.webeye.browser_factory import BrowserContextFactory
 
     async def _bootstrap_failing_creator(playwright: Any, **kwargs: Any) -> tuple[Any, Any, None]:
         raise BrowserEngineBootstrapError("rustwright launch failed")

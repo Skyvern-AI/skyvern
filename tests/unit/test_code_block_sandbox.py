@@ -858,6 +858,7 @@ async def wrapper({default_args}):
             workflow_run_id = "wrid_test"
             browser_session_id = None
             workflow_run_outputs: list[object] = []
+            workflow = None
 
             def get_block_metadata(self, label: str | None) -> dict[str, object]:
                 return {}
@@ -940,6 +941,7 @@ async def wrapper({default_args}):
             workflow_run_id = "wrid_test"
             browser_session_id = "pbs_test"
             workflow_run_outputs: list[object] = []
+            workflow = None
 
             def get_block_metadata(self, label: str | None) -> dict[str, object]:
                 return {}
