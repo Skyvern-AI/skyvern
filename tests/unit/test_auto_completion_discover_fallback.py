@@ -595,6 +595,7 @@ async def test_input_or_auto_complete_calls_discover_fallback_on_failure() -> No
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
         )
 
         assert isinstance(result, ActionSuccess)
@@ -636,6 +637,7 @@ async def test_input_or_auto_complete_skips_discover_for_search_bar() -> None:
             skyvern_element=skyvern_el,
             step=_STEP,
             task=_TASK,
+            is_secret_value=False,
         )
 
         # Search bar returns None early, never reaching discover fallback

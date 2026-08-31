@@ -471,6 +471,7 @@ async def test_auto_completion_call_path_forwards_committed_value_to_shadow_matc
                 skyvern_element=skyvern_element,
                 step=SimpleNamespace(step_id="step-1"),
                 task=_shadow_task(),
+                is_secret_value=False,
             )
 
     events = [log for log in logs if log.get("event") == "select_shadow_match"]

@@ -204,6 +204,7 @@ async def test_autocomplete_threads_one_fresh_selection_snapshot(monkeypatch: py
         step=MagicMock(),
         task=task,
         preserved_elements=[{"id": "preserved"}],
+        is_secret_value=False,
     )
     await handler._reset_autocomplete_for_llm_fallback(
         current_incremental_scraped=incremental,
