@@ -399,6 +399,7 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(withEnvelope.terminalEnvelope).toEqual({
       runVerdict: "not_demonstrated",
       runDisplayReason: "Checkout never reached confirmation.",
+      connectFailure: null,
     });
 
     const legacy = hydrateNarrativeFromPayload(payload([]))!;
@@ -411,7 +412,50 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(malformed.terminalEnvelope).toEqual({
       runVerdict: null,
       runDisplayReason: null,
+      connectFailure: null,
     });
+
+    const typedConnect = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        connect_failure: {
+          state: "already_closed",
+          retry_action: "test_end_to_end",
+          browser_session_id: "pbs_1",
+        },
+      },
+    })!;
+    expect(typedConnect.terminalEnvelope?.connectFailure).toEqual({
+      state: "already_closed",
+      retryAction: "test_end_to_end",
+      workflowRunId: null,
+      workflowRunBlockId: null,
+      taskId: null,
+      browserSessionId: "pbs_1",
+    });
+
+    const futureConnectState = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        connect_failure: {
+          state: "future_manager_state",
+          retry_action: "test_end_to_end",
+          browser_session_id: "pbs_2",
+        },
+      },
+    })!;
+    expect(futureConnectState.terminalEnvelope?.connectFailure).toBeNull();
+
+    const missingRetryContract = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        connect_failure: {
+          state: "already_closed",
+          browser_session_id: "pbs_3",
+        },
+      },
+    })!;
+    expect(missingRetryContract.terminalEnvelope?.connectFailure).toBeNull();
   });
 });
 

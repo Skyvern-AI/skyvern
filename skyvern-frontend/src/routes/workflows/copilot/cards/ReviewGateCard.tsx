@@ -264,7 +264,9 @@ export function ReviewGateCard({
               onClick={onTestEndToEnd}
               className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
             >
-              Test end-to-end
+              {turn?.terminalEnvelope?.connectFailure
+                ? "Retry in a fresh session"
+                : "Test end-to-end"}
             </button>
           ) : null}
           {onTestEndToEnd ? (

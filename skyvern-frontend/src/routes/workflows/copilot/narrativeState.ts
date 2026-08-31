@@ -150,9 +150,32 @@ export function humanizeJudgeText(text: string): string {
   return stripJudgeInstruction(rewritten).replace(/ {2,}/g, " ").trim();
 }
 
+type BuildTestConnectFailureState =
+  | "already_closed"
+  | "provisioning_unavailable"
+  | "cdp_connect_failed";
+
+function isBuildTestConnectFailureState(
+  value: unknown,
+): value is BuildTestConnectFailureState {
+  return (
+    value === "already_closed" ||
+    value === "provisioning_unavailable" ||
+    value === "cdp_connect_failed"
+  );
+}
+
 export interface TerminalEnvelopeFacts {
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
+  connectFailure?: {
+    state: BuildTestConnectFailureState;
+    retryAction: "test_end_to_end";
+    workflowRunId: string | null;
+    workflowRunBlockId: string | null;
+    taskId: string | null;
+    browserSessionId: string | null;
+  } | null;
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
@@ -211,6 +234,29 @@ export function parseTerminalEnvelope(
   if (!raw || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
   const v = obj.run_verdict;
+  const rawConnectFailure = obj.connect_failure;
+  const connectFailure = (() => {
+    if (!rawConnectFailure || typeof rawConnectFailure !== "object")
+      return null;
+    const failure = rawConnectFailure as Record<string, unknown>;
+    const state = failure.state;
+    if (
+      !isBuildTestConnectFailureState(state) ||
+      failure.retry_action !== "test_end_to_end"
+    ) {
+      return null;
+    }
+    const text = (key: string) =>
+      typeof failure[key] === "string" ? (failure[key] as string) : null;
+    return {
+      state,
+      retryAction: "test_end_to_end" as const,
+      workflowRunId: text("workflow_run_id"),
+      workflowRunBlockId: text("workflow_run_block_id"),
+      taskId: text("task_id"),
+      browserSessionId: text("browser_session_id"),
+    };
+  })();
   return {
     runVerdict:
       v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
@@ -220,6 +266,7 @@ export function parseTerminalEnvelope(
       typeof obj.run_display_reason === "string"
         ? obj.run_display_reason
         : null,
+    connectFailure,
   };
 }
 
