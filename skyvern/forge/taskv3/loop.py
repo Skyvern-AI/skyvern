@@ -205,6 +205,21 @@ ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
 
+# Page-state stall policy (SKY-15265): rounds of billable batches that left the page fingerprint
+# byte-identical, with no page-change flag, mean the run is cycling on a frozen document in shapes
+# the per-tool guards cannot see (varied probes never streak; scroll/wait carry no digest at all).
+# Completions of the worst-affected canary block finish in <=9 rounds; the nudge re-plans the model
+# once before the verdict.
+PAGE_STATE_STALL_NUDGE_AFTER = 8
+PAGE_STATE_STALL_TERMINATE_AFTER = 12
+# The verdict is SHADOW-ONLY for now: the fingerprint is blind to work inside iframes (main-frame
+# innerHTML only), so a live termination could kill healthy embedded-widget runs. The nudge ships
+# live (benign direction); the shadow event measures the would-terminate precision on the canary,
+# and promotion to a live verdict is a separate release decision on that data.
+PAGE_STATE_STALL_SHADOW_EVENT = "taskv3 loop page state stall would terminate"
+# Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; reserved for the future live verdict.
+PAGE_STATE_STALL_REASON_PREFIX = "page_state_stall:"
+
 # Hard "the resource does not exist / is gone" HTTP statuses. A navigation landing on one of these is
 # a genuine non-capability dead-end (a dead or removed posting), which v1 routes to `terminated`. Both
 # the in-loop `navigate` tool and the pre-loop initial-URL navigation classify against this set. NARROW
@@ -817,6 +832,15 @@ def _unblocker_options(available_tools: set[str]) -> list[str]:
     return options
 
 
+def _page_state_nudge_text(rounds: int) -> str:
+    return (
+        f"Your last {rounds} action rounds left the page's rendered content completely unchanged — "
+        "whatever you are trying is not affecting this page. Stop repeating the current approach: "
+        "re-plan from a fresh observe, try a genuinely different control or path, or finish honestly "
+        "(status=failed or terminated) naming what is blocking you."
+    )
+
+
 def _stall_nudge_text(stalled: list[tuple[str, int]], available_tools: set[str]) -> str:
     """One warning naming every stalled perception tool and the unblockers this run actually has —
     a model that cannot see the gate won't reach for solve_captcha unless the symptom names it."""
@@ -1282,6 +1306,15 @@ async def run_agent_tool_loop(
     outcome: LoopOutcome | None = None
     pending_nav_dead_end: int | None = None
     stall_nudges_due: list[tuple[str, int]] = []
+    # Page-state stall detector (SKY-15265): consecutive billable rounds on a byte-identical
+    # fingerprint, whether the one re-plan nudge went out, and whether one is due this turn.
+    page_state_stall_rounds = 0
+    page_state_nudge_delivered = False
+    page_state_nudge_due = False
+    # The last fingerprint sample from the PREVIOUS batch: a delayed render can land between one
+    # batch's after-sample and the next batch's before-sample, so movement is checked across
+    # batches, not only within them.
+    page_state_prev_fp: str | None = None
     refresh_cycles = 0
     refresh_nudge_due = False
     reload_failed_nudge_due = False
@@ -1340,6 +1373,7 @@ async def run_agent_tool_loop(
         """Clear the page-refresh signal and, unless dropped or past the cap, reload and void `remaining`."""
         nonlocal refresh_cycles, refresh_nudge_due, reload_failed_nudge_due, pending_screenshots, outcome
         nonlocal pending_nav_dead_end, stall_nudges_due, last_change_evidence_step
+        nonlocal page_state_stall_rounds, page_state_nudge_delivered, page_state_prev_fp
         ctx.refresh_working_page = False
         refresh_cycles += 1
         if drop:
@@ -1378,6 +1412,9 @@ async def run_agent_tool_loop(
         # so the run must re-demonstrate progress before it can earn an extension.
         _clear_action_state()
         last_change_evidence_step = None
+        page_state_stall_rounds = 0
+        page_state_nudge_delivered = False
+        page_state_prev_fp = None
         perception.reset()
         auto_perception.reset()
         if activity is not None:
@@ -1776,14 +1813,20 @@ async def run_agent_tool_loop(
         )
         # A cancellation that already landed makes this batch's baselines dead work: the per-call
         # check below (before the first dispatch) ends the batch before anything they'd inform runs.
-        batch_will_sample_baseline = (
-            auto_observe and batch_has_billable_call and (page_probe is not None or page_fingerprint is not None)
+        batch_will_sample_baseline = batch_has_billable_call and (
+            page_fingerprint is not None or (auto_observe and page_probe is not None)
         )
         batch_cancelled = batch_will_sample_baseline and should_cancel is not None and await should_cancel()
         if auto_observe and page_probe is not None and batch_has_billable_call and not batch_cancelled:
             batch_probe_before = await _sample_probe(page_probe, deadline_at=deadline_at)
-        if auto_observe and page_fingerprint is not None and batch_has_billable_call and not batch_cancelled:
+        # Sampled on BOTH arms (not just auto-observe): the page-state stall detector reads the
+        # before/after fingerprint pair for every billable batch.
+        if page_fingerprint is not None and batch_has_billable_call and not batch_cancelled:
             batch_fp_before = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
+        batch_fp_after: str | None = None
+        # The auto-observe path's FINAL page-changed verdict (resample included) when it ran; the
+        # stall detector prefers this over re-comparing raw samples so the two can never disagree.
+        batch_auto_page_changed: bool | None = None
         # The batch's carrier for an auto-observe digest: the LAST tool message appended for an
         # EXECUTED (dispatched) call whose spec is not compactable -- i.e. a real action result, never
         # a skip stub and never a compactable perception dump that would otherwise elide the digest's
@@ -2041,20 +2084,29 @@ async def run_agent_tool_loop(
                     batch_observed_ok = False
                 if tool_name == "observe" and result.status == "ok":
                     batch_observed_ok = True
-                # Keeps the FIRST qualifying signal this batch -- the reason field is diagnostic
-                # (telemetry), not the decision itself, so a later call's signal never overwrites it.
-                if batch_page_change_reason is None:
-                    if result_data.get("page_transitioned") is True:
-                        batch_page_change_reason = "page_transitioned"
-                    elif result_data.get("page_state_changed"):
-                        batch_page_change_reason = "page_state_changed"
-                    elif tool_name == "hover" and result.status == "ok":
-                        # A hover's only purpose is to reveal state (submenus, tooltips) that a
-                        # CSS-only change leaves invisible to the innerHTML fingerprint and the
-                        # document-identity probe alike -- always treat it as a change signal.
-                        batch_page_change_reason = "hover"
-                    elif tool_name == "navigate" and result.status == "ok":
-                        batch_page_change_reason = "navigate"
+            # Accumulated on BOTH arms (hoisted out of the auto-observe gate for SKY-15265): the
+            # page-state stall detector re-baselines on these flags, and a hover or file-upload
+            # signal only the auto arm could see would false-kill the manual arm. Keeps the FIRST
+            # qualifying signal this batch -- the reason field is diagnostic (telemetry), not the
+            # decision itself, so a later call's signal never overwrites it.
+            if batch_page_change_reason is None or batch_page_change_reason == "page_transitioned":
+                # page_transitioned checks LAST and can be superseded: it is a URL-only hint the
+                # stall detector must not reset on, so a stronger same-batch signal outranks it.
+                if result_data.get("page_state_changed"):
+                    batch_page_change_reason = "page_state_changed"
+                elif result_data.get("download_new"):
+                    # A freshly detected download is progress even when the DOM never moves (a
+                    # download-next flow); a replayed notice deliberately does not qualify.
+                    batch_page_change_reason = "download_new"
+                elif tool_name == "hover" and result.status == "ok":
+                    # A hover's only purpose is to reveal state (submenus, tooltips) that a
+                    # CSS-only change leaves invisible to the innerHTML fingerprint and the
+                    # document-identity probe alike -- always treat it as a change signal.
+                    batch_page_change_reason = "hover"
+                elif tool_name == "navigate" and result.status == "ok":
+                    batch_page_change_reason = "navigate"
+                elif batch_page_change_reason is None and result_data.get("page_transitioned") is True:
+                    batch_page_change_reason = "page_transitioned"
             if _absorb_result_data(tool_name, spec, result_data):
                 # Every mark=N still queued in this batch was chosen before this look renumbered the
                 # marks, so it now names an arbitrary element; a look refused before rebuilding its
@@ -2264,6 +2316,7 @@ async def run_agent_tool_loop(
                     # probe below reads as "unchanged". Only trusted when BOTH samples landed -- a missing
                     # before or after reading is not evidence either way, so it falls back to the probe.
                     fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
+                    batch_fp_after = fp_after
                     if batch_fp_before is not None and fp_after is not None:
                         page_changed = fp_after != batch_fp_before
                         reason = "fingerprint_mismatch" if page_changed else "unchanged"
@@ -2301,6 +2354,7 @@ async def run_agent_tool_loop(
                             page_changed = True
                             reason = "fingerprint_mismatch" if signal == "fingerprint" else "probe_mismatch"
 
+                batch_auto_page_changed = page_changed
                 if not page_changed:
                     messages[batch_carrier_idx]["content"] = (
                         str(messages[batch_carrier_idx]["content"]) + "\n\n[no markup change detected after this batch]"
@@ -2474,6 +2528,44 @@ async def run_agent_tool_loop(
                                 wait_seconds=wait_seconds,
                             )
 
+        # Page-state stall detector (SKY-15265): tool-independent — any batch of billable work that
+        # leaves the rendered document byte-identical ticks the counter, whatever tools produced it.
+        # A missing sample is no evidence either way; any page-change flag or fingerprint movement
+        # re-baselines. When the auto-observe path already resolved the batch's verdict (resample
+        # included), that verdict is reused so the two can never disagree.
+        if outcome is None and turn_did_action and page_fingerprint is not None and batch_fp_before is not None:
+            if page_state_prev_fp is not None and batch_fp_before != page_state_prev_fp:
+                # The page moved BETWEEN batches (a delayed render landing after the prior
+                # after-sample): the streak the old samples described is stale.
+                page_state_stall_rounds = 0
+                page_state_nudge_delivered = False
+            page_state_changed: bool | None
+            if batch_page_change_reason is not None and batch_page_change_reason != "page_transitioned":
+                page_state_changed = True
+            elif batch_auto_page_changed is not None and batch_page_change_reason is None:
+                # The auto verdict treats ANY flag as changed, so when the only signal is the
+                # URL-only page_transitioned hint, fall through to the raw fingerprint instead.
+                page_state_changed = batch_auto_page_changed
+            else:
+                if batch_fp_after is None and not (deadline_at is not None and deadline_at - time.monotonic() <= 0):
+                    batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
+                page_state_changed = None if batch_fp_after is None else batch_fp_after != batch_fp_before
+            page_state_prev_fp = batch_fp_after if batch_fp_after is not None else batch_fp_before
+            if page_state_changed is True:
+                page_state_stall_rounds = 0
+                page_state_nudge_delivered = False
+            elif page_state_changed is False:
+                page_state_stall_rounds += 1
+                if page_state_stall_rounds == PAGE_STATE_STALL_TERMINATE_AFTER and page_state_nudge_delivered:
+                    # Shadow-only verdict: measured, not enforced (see PAGE_STATE_STALL_SHADOW_EVENT).
+                    LOG.info(
+                        PAGE_STATE_STALL_SHADOW_EVENT,
+                        rounds=page_state_stall_rounds,
+                        turn=turns,
+                    )
+                elif page_state_stall_rounds >= PAGE_STATE_STALL_NUDGE_AFTER and not page_state_nudge_delivered:
+                    page_state_nudge_due = True
+
         # Warn only after the batch completes: a user message may not sit between an assistant
         # turn's tool results, and the model reads it with the snapshot that tripped it. Every note
         # due this turn (including auto-observe's own stall nudge, folded in above) shares ONE user
@@ -2485,6 +2577,11 @@ async def run_agent_tool_loop(
             nudge_parts.append(_reload_failed_nudge_text())
         if outcome is None and stall_nudges_due:
             nudge_parts.append(_stall_nudge_text(stall_nudges_due, set(tool_by_name)))
+        if outcome is None and page_state_nudge_due:
+            page_state_nudge_due = False
+            page_state_nudge_delivered = True
+            LOG.info("taskv3 loop page state stall nudged", rounds=page_state_stall_rounds, turn=turns)
+            nudge_parts.append(_page_state_nudge_text(page_state_stall_rounds))
         if outcome is None and ao_nudges_result:
             nudge_parts.append(_stall_nudge_text(ao_nudges_result, set(tool_by_name)))
         if outcome is None and action_nudges_due:
