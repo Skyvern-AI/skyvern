@@ -107,7 +107,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
@@ -13359,7 +13359,7 @@ def _schedule_extraction_shadow_check_for_hit(
         )
         # Apply the same post-processing the miss path applies so the
         # comparison is apples-to-apples against the cached value.
-        if shadow_schema:
+        if shadow_schema and extraction_shape_matches(fresh, shadow_schema):
             fresh = validate_and_fill_extraction_result(
                 extraction_result=fresh,
                 schema=shadow_schema,
@@ -13722,8 +13722,11 @@ async def extract_information_for_navigation_goal(
         system_prompt=task.workflow_system_prompt,
     )
 
-    # Validate and fill missing fields based on schema
-    if task.extracted_information_schema:
+    # Fill fields only after the model has produced the schema's root shape.
+    # Otherwise `fill_missing_fields` replaces a populated but mismatched
+    # response with an all-default stub (for example, `{"records": []}`),
+    # which makes an extraction failure look like authoritative empty data.
+    if task.extracted_information_schema and extraction_shape_matches(json_response, task.extracted_information_schema):
         json_response = validate_and_fill_extraction_result(
             extraction_result=json_response,
             schema=task.extracted_information_schema,

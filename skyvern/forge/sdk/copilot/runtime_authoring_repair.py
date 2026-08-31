@@ -36,6 +36,7 @@ _MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
 _OBSERVED_STATE_MAX_CHARS = 60
+_RENDERED_VALUE_EXCERPT_MAX_CHARS = 300
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _OBSTRUCTION_KEYS = ("kind", "text", "visual_location")
 _OBSTRUCTION_CONTROL_KEYS = ("text",)
@@ -319,14 +320,22 @@ def _has_page_obstruction(evidence: dict[str, Any]) -> bool:
     return bool(obstructions)
 
 
+def _has_rendered_value_excerpt(evidence: dict[str, Any]) -> bool:
+    return bool(_bounded_runtime_text(evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS))
+
+
 def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
-    """A packet whose only structured content is an obstruction or a standalone clickable control
-    carries no bounded page schema, yet it is the entire repair signal for the click that failed. The
-    control arm asks the producer for a renderable summary, so a text-less control admits nothing."""
+    """Admit only a bounded, scrubbed page fact that can ground a repair.
+
+    A rendered value is a first-class fact even when a generic page schema did not classify it as a
+    result container. It remains bounded and redacted; this does not turn page prose into a repair
+    decision.
+    """
     return (
         has_bounded_page_schema(evidence)
         or bool(_runtime_action_summaries(None, evidence.get("clickable_controls")))
         or _has_page_obstruction(evidence)
+        or _has_rendered_value_excerpt(evidence)
     )
 
 
@@ -341,6 +350,9 @@ def build_test_page_state_from_evidence(
         return None
     current_url = evidence.get("current_url") or evidence.get("inspected_url")
     page_title = evidence.get("page_title") or evidence.get("title")
+    rendered_value_excerpt = _bounded_runtime_text(
+        evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS
+    )
     obstructions, _ = _typed_runtime_page_obstructions(evidence)
     page_state = BuildTestPacketPageState(
         current_origin=_origin_from_runtime_url(current_url),
@@ -348,6 +360,7 @@ def build_test_page_state_from_evidence(
         title=_bounded_runtime_text(page_title, 160) or None,
         evidence_source=_bounded_runtime_text(evidence.get("source_tool"), 80) or None,
         observed_after_workflow_run=True,
+        rendered_value_excerpt=rendered_value_excerpt or None,
         form_summaries=_runtime_form_summaries(evidence.get("forms")),
         result_summaries=_runtime_result_summaries(evidence.get("result_containers")),
         action_summaries=_runtime_action_summaries(
@@ -364,6 +377,7 @@ def build_test_page_state_from_evidence(
                 page_state.current_origin,
                 page_state.current_url,
                 page_state.title,
+                page_state.rendered_value_excerpt,
                 page_state.form_summaries,
                 page_state.result_summaries,
                 page_state.action_summaries,
@@ -662,6 +676,9 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
         return None
     current_url = evidence.get("current_url") or evidence.get("inspected_url")
     page_title = evidence.get("page_title") or evidence.get("title")
+    rendered_value_excerpt = _bounded_runtime_text(
+        evidence.get("visible_text_excerpt"), _RENDERED_VALUE_EXCERPT_MAX_CHARS
+    )
     page_form_summaries = _runtime_form_summaries(evidence.get("forms"))
     page_result_summaries = _runtime_result_summaries(evidence.get("result_containers"))
     page_action_summaries = _runtime_action_summaries(
@@ -682,7 +699,9 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
                 or page_action_summaries
                 or page_challenge_summaries
                 or page_obstructions
+                or rendered_value_excerpt
             ),
+            "rendered_value_excerpt": rendered_value_excerpt or None,
             "page_form_summaries": page_form_summaries,
             "page_result_summaries": page_result_summaries,
             "page_action_summaries": page_action_summaries,
