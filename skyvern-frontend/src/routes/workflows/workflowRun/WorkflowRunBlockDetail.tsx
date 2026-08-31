@@ -48,6 +48,14 @@ type Props = {
   workflowRunId?: string;
   onThoughtSelect?: (thought: ObserverThought) => void;
   onViewScreenshot?: (workflowRunBlockId: string) => void;
+  // The block the run-level line's headline is actually about, and that
+  // headline's exact text. Both must match — the ID alone (a block can fail
+  // with different text than the run's own failure_reason) and the text
+  // alone (an unrelated block, e.g. an earlier continue_on_failure failure,
+  // can coincidentally parse to the same headline) are each insufficient on
+  // their own to say "the line already stated this."
+  statedFailureBlockId?: string | null;
+  statedFailureHeadline?: string | null;
 };
 
 function BlockDownloadedFiles({
@@ -154,6 +162,8 @@ function WorkflowRunBlockDetail({
   workflowRunId,
   onThoughtSelect,
   onViewScreenshot,
+  statedFailureBlockId = null,
+  statedFailureHeadline = null,
 }: Props) {
   // activeIteration is a URL hint scoped to a specific selection. In
   // fallback mode (null or "stream") the resolved block may not be the
@@ -262,6 +272,11 @@ function WorkflowRunBlockDetail({
                 onViewScreenshot
                   ? () => onViewScreenshot(resolvedBlock.workflow_run_block_id)
                   : undefined
+              }
+              statedFailureHeadline={
+                resolvedBlock.workflow_run_block_id === statedFailureBlockId
+                  ? statedFailureHeadline
+                  : null
               }
             />
           )}

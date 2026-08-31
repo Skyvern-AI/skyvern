@@ -566,10 +566,12 @@ function BlockInspector({
   block,
   action,
   onViewScreenshot,
+  statedFailureHeadline = null,
 }: {
   block: WorkflowRunBlock;
   action?: ActionsApiResponse | null;
   onViewScreenshot?: () => void;
+  statedFailureHeadline?: string | null;
 }) {
   const inputFields = useMemo(
     () => getInputFields(block, action),
@@ -661,6 +663,7 @@ function BlockInspector({
           <BlockDetailFailure
             block={block}
             onViewScreenshot={onViewScreenshot}
+            statedFailureHeadline={statedFailureHeadline}
           />
           <FieldList
             fields={summaryFields}

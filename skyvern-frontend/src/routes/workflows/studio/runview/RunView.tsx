@@ -1,17 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Cross2Icon,
-  ExclamationTriangleIcon,
-  ImageIcon,
-  MagicWandIcon,
-  MagnifyingGlassIcon,
-  ReloadIcon,
-} from "@radix-ui/react-icons";
+import { MagnifyingGlassIcon } from "@radix-ui/react-icons";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Status } from "@/api/types";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
 import {
   Command,
   CommandEmpty,
@@ -38,7 +29,7 @@ import {
   type WorkflowRunMilestoneCardProps,
   usePageSlots,
 } from "@/store/PageSlots";
-import { cn, isRecord } from "@/util/utils";
+import { isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
@@ -47,12 +38,7 @@ import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
-import { CodeBlockFailureDetails } from "../../workflowRun/CodeBlockFailureDetails";
-import {
-  failureSupportsScreenshot,
-  findRunCodeBlockFailure,
-} from "../../workflowRun/codeBlockFailure";
-import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
+import { findRunCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
 import { pickDownloadedFileFilename } from "../../workflowRun/blockDownloadedFiles";
 import {
   buildBlockOrderIndex,
@@ -72,10 +58,7 @@ import {
 import { searchWithRunReference, toReadableSearch } from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
 import { collectBlockPrompts } from "./blockPrompts";
-import {
-  failureDetailIsLong,
-  formatFailureReason,
-} from "./failureReasonFormat";
+import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
 import { matchFailureTips } from "./failureTips";
 import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
@@ -84,10 +67,14 @@ import {
   type RunOutputError,
   type RunOutputFile,
 } from "./RunOutputsSection";
-import { failingBlockLabel } from "./failingBlock";
+import { failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
+import {
+  FailureRecoveryActions,
+  RunFailureLine,
+} from "./RunFailurePresentation";
 import { resolveEditorSelectionPin } from "./editorSelectionPin";
 import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
 
@@ -236,8 +223,6 @@ export function RunView({
   searchParamsRef.current = searchParams;
   const view = useRunPaneViewStore((s) => s.view);
   const resetPaneView = useRunPaneViewStore((s) => s.reset);
-  const [failureDismissed, setFailureDismissed] = useState(false);
-  const [failureDetailExpanded, setFailureDetailExpanded] = useState(false);
   const [outputSummary, setOutputSummary] = useState<string | null>(null);
 
   // Last editor selection the canvas→run sync below acted on.
@@ -249,8 +234,6 @@ export function RunView({
     resetRunView();
     setOutputSummary(null);
     resetPaneView();
-    setFailureDismissed(false);
-    setFailureDetailExpanded(false);
     const active = searchParamsRef.current.get("active");
     if (active) {
       pinFrame(active);
@@ -336,6 +319,33 @@ export function RunView({
   );
   const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
 
+  const outcome = runOutcomeFromStatus(workflowRun?.status);
+  // A user-canceled run isn't a failure — don't show the "run failed" CTA.
+  const canceled = workflowRun?.status === Status.Canceled;
+  const failed = !statusUnavailable && outcome === "failed" && !canceled;
+  const finalized =
+    !statusUnavailable && workflowRun ? statusIsFinalized(workflowRun) : false;
+  useLiveClock(Boolean(workflowRun) && !finalized && !statusUnavailable);
+  const finallyBlockLabel =
+    workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
+  const codeFailure = useMemo(
+    () =>
+      findRunCodeBlockFailure(
+        workflowRun?.failure_reason,
+        timeline,
+        finallyBlockLabel,
+      ),
+    [workflowRun?.failure_reason, timeline, finallyBlockLabel],
+  );
+  const failedBlock = useMemo(
+    () => failingBlock(timeline, finallyBlockLabel),
+    [timeline, finallyBlockLabel],
+  );
+  const failureBlockId =
+    codeFailure?.workflowRunBlockId ??
+    failedBlock?.workflow_run_block_id ??
+    null;
+
   // Landing the selection on the LAST timeline item — so the Browser pane
   // shows the final screenshot instead of an idle replay — happens on two
   // paths sharing this one-shot: cold-opening a deep link to an already-
@@ -374,7 +384,13 @@ export function RunView({
     // matching path id is the focused deep link too (parity with ?wr= cold open).
     const isFocusedDeepLink =
       params.get("wr") === workflowRunId || pathRunId === workflowRunId;
-    if (!isFocusedDeepLink || params.get("active")) {
+    // The normal Studio route resolves the latest run without naming it in the
+    // URL. For failures, give its strip the same zero-click failed-block target.
+    const isLatestRunRoute = !params.get("wr") && !pathRunId;
+    if (
+      (!isFocusedDeepLink && !(failed && isLatestRunRoute)) ||
+      params.get("active")
+    ) {
       return;
     }
     if (params.has("bl")) {
@@ -390,30 +406,28 @@ export function RunView({
     if (watchedLive && useStudioBrowserStore.getState().view !== "auto") {
       return;
     }
+    // A failed run lands on the block that killed it, so its Failure section
+    // is on screen with zero clicks; anything else lands on the last item so
+    // the Browser pane shows the final screenshot.
     const last = frames.length > 0 ? frames[frames.length - 1] : null;
-    if (last) {
-      pinFrame(last.id);
+    const target =
+      failed && failureBlockId ? failureBlockId : (last?.id ?? null);
+    if (target) {
+      pinFrame(target);
     }
   }, [
     workflowRunId,
     workflowRun,
     timeline,
     frames,
+    failed,
+    failureBlockId,
     pinFrame,
     pathRunId,
     runIsPlaceholder,
     timelineIsPlaceholder,
   ]);
 
-  const outcome = runOutcomeFromStatus(workflowRun?.status);
-  // A user-canceled run isn't a failure — don't show the "run failed" CTA.
-  const canceled = workflowRun?.status === Status.Canceled;
-  const failed = !statusUnavailable && outcome === "failed" && !canceled;
-  const finalized =
-    !statusUnavailable && workflowRun ? statusIsFinalized(workflowRun) : false;
-  useLiveClock(Boolean(workflowRun) && !finalized && !statusUnavailable);
-  const finallyBlockLabel =
-    workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
   // the live edge — the same resolution the Browser pane applies in useRunVisuals.
   const selectedId =
@@ -468,22 +482,6 @@ export function RunView({
   const fixSeedMessage = useMemo(
     () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
     [workflowRun?.failure_reason],
-  );
-
-  const codeFailure = useMemo(
-    () =>
-      findRunCodeBlockFailure(
-        workflowRun?.failure_reason,
-        timeline,
-        finallyBlockLabel,
-      ),
-    [workflowRun?.failure_reason, timeline, finallyBlockLabel],
-  );
-
-  const failureScreenshot = useBlockScreenshot(
-    codeFailure?.workflowRunBlockId,
-    "code",
-    codeFailure !== null && failureSupportsScreenshot(codeFailure),
   );
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
@@ -633,138 +631,35 @@ export function RunView({
   const failureReason = formatFailureReason(
     workflowRun.failure_reason ?? "The run failed.",
   );
-  const failureDetailLong = failureReason.detail
-    ? failureDetailIsLong(failureReason.detail)
-    : false;
-  const codeFailureDetail = codeFailure
-    ? (failureReason.detail ?? workflowRun.failure_reason?.trim() ?? null)
-    : null;
+  const failureHeadline = codeFailure
+    ? codeFailure.title
+    : failureReason.headline;
+  const failureDetail = failureReason.detail;
+  const failureTips = matchFailureTips(workflowRun.failure_reason ?? null);
   // Editing code cannot reach a sandbox that was never available, so a fault the
   // block did not cause offers a retry alone rather than a copilot session that
   // would rewrite working code.
   const showFix = codeFailure === null || codeFailure.recovery !== "retry";
   const hasFixAction = Boolean(onFix && showFix);
+  const recovery = failed ? (
+    <FailureRecoveryActions
+      onFix={
+        onFix && hasFixAction
+          ? () => onFix(fixSeedMessage, failedBlock?.label ?? null)
+          : undefined
+      }
+      onRetry={onRetry}
+    />
+  ) : null;
+  const jumpToFailedBlock = failedBlock
+    ? () => selectTimelineBlock(failedBlock)
+    : undefined;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col gap-2 overflow-hidden p-2">
       <WorkflowRunVerificationCodeForm
         workflowRunId={workflowRun.workflow_run_id}
       />
-      {failed && !failureDismissed && view === "timeline" ? (
-        <Alert className="shrink-0 border-destructive/40 bg-destructive/5 py-3.5 dark:bg-destructive/10 [&>svg]:text-destructive">
-          <ExclamationTriangleIcon className="h-4 w-4" />
-          <div className="min-w-0 pr-6">
-            <AlertTitle className="mb-0 text-sm font-semibold leading-5 text-foreground">
-              {codeFailure ? codeFailure.title : failureReason.headline}
-            </AlertTitle>
-            <AlertDescription className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              {codeFailure ? <p>{codeFailure.guidance}</p> : null}
-              {codeFailure ? (
-                <CodeBlockFailureDetails
-                  failure={codeFailure}
-                  reason={codeFailureDetail}
-                />
-              ) : failureReason.detail ? (
-                <>
-                  <p
-                    className={cn(
-                      "mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted-foreground",
-                      !failureDetailExpanded && "line-clamp-3",
-                    )}
-                  >
-                    {failureReason.detail}
-                  </p>
-                  {failureDetailLong ? (
-                    <button
-                      type="button"
-                      onClick={() => setFailureDetailExpanded((v) => !v)}
-                      className="mt-1 text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    >
-                      {failureDetailExpanded ? "Show less" : "Show more"}
-                    </button>
-                  ) : null}
-                </>
-              ) : null}
-              {matchFailureTips(workflowRun.failure_reason ?? null).map(
-                (tip) => (
-                  <span
-                    key={tip}
-                    className="mt-1.5 block text-xs italic text-muted-foreground"
-                  >
-                    {tip}
-                  </span>
-                ),
-              )}
-              {hasFixAction || onRetry || failureScreenshot ? (
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {onFix && showFix ? (
-                    <Button
-                      size="sm"
-                      onClick={() =>
-                        onFix(
-                          fixSeedMessage,
-                          failingBlockLabel(timeline, finallyBlockLabel),
-                        )
-                      }
-                    >
-                      <MagicWandIcon
-                        className="mr-1.5 h-3.5 w-3.5"
-                        aria-hidden="true"
-                      />
-                      Fix with Copilot
-                    </Button>
-                  ) : null}
-                  {onRetry ? (
-                    <Button
-                      size="sm"
-                      variant={hasFixAction ? "secondary" : "default"}
-                      onClick={onRetry}
-                    >
-                      <ReloadIcon
-                        className="mr-1.5 h-3.5 w-3.5"
-                        aria-hidden="true"
-                      />
-                      Retry
-                    </Button>
-                  ) : null}
-                  {failureScreenshot && codeFailure ? (
-                    <Button
-                      size="sm"
-                      variant={
-                        hasFixAction || onRetry ? "secondary" : "default"
-                      }
-                      onClick={() => {
-                        openPane("browser");
-                        // Let the pane-open navigation commit before mirroring
-                        // the pin. Otherwise the pin's URL writer can drop
-                        // `browser`.
-                        requestAnimationFrame(() =>
-                          pinFrame(codeFailure.workflowRunBlockId),
-                        );
-                      }}
-                    >
-                      <ImageIcon
-                        className="mr-1.5 h-3.5 w-3.5"
-                        aria-hidden="true"
-                      />
-                      View block screenshot
-                    </Button>
-                  ) : null}
-                </div>
-              ) : null}
-            </AlertDescription>
-            <button
-              type="button"
-              onClick={() => setFailureDismissed(true)}
-              className="absolute right-2 top-2 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              aria-label="Dismiss"
-              title="Dismiss"
-            >
-              <Cross2Icon className="h-4 w-4" />
-            </button>
-          </div>
-        </Alert>
-      ) : null}
       {WorkflowRunMilestoneCard &&
       runPaneOpen &&
       !runIsPlaceholder &&
@@ -790,6 +685,17 @@ export function RunView({
               />
             }
           />
+          {failed ? (
+            <RunFailureLine
+              blockLabel={failedBlock?.label ?? null}
+              headline={failureHeadline}
+              detail={failureDetail}
+              onJump={jumpToFailedBlock}
+              tips={failureTips}
+            >
+              {recovery}
+            </RunFailureLine>
+          ) : null}
           <ResizableTimelineSplit
             className="flex-1"
             top={
@@ -830,6 +736,14 @@ export function RunView({
                   showDownloadedFiles
                   workflowRunId={workflowRunId}
                   onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
+                  onViewScreenshot={(workflowRunBlockId) => {
+                    openPane("browser");
+                    // Let the pane-open navigation commit before mirroring the
+                    // pin; otherwise the pin's URL writer can drop `browser`.
+                    requestAnimationFrame(() => pinFrame(workflowRunBlockId));
+                  }}
+                  statedFailureBlockId={failed ? failureBlockId : null}
+                  statedFailureHeadline={failed ? failureHeadline : null}
                 />
               </div>
             }
