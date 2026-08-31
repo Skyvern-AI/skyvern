@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from urllib.parse import quote
 
 import pytest
 from mcp.types import CallToolResult
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserLivenessUndetermined,
     CopilotBrowserSessionUnavailable,
+    OriginRunRedactionRegistry,
     bound_call_browser_session,
     browser_page_custody_lock,
     mcp_to_copilot,
@@ -52,6 +54,49 @@ def _schema() -> dict:
         },
         "required": ["expression"],
     }
+
+
+def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "magic+link@example.test?token=one&next=/done"
+    encoded = quote(secret, safe="")
+    seen_parameters: list[dict[str, Any]] = []
+
+    def redact(value: Any, parameters: dict[str, Any]) -> Any:
+        seen_parameters.append(parameters)
+
+        def walk(node: Any) -> Any:
+            if isinstance(node, str):
+                return node.replace(encoded, "[redacted]")
+            if isinstance(node, dict):
+                return {key: walk(item) for key, item in node.items()}
+            return node
+
+        return walk(value)
+
+    ctx = make_copilot_ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {"magic_link": secret},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    monkeypatch.setattr(
+        mcp_adapter.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(redact_codeblock_parameter_values=redact),
+    )
+
+    scrubbed = mcp_adapter._scrub_tool_result(
+        ctx,
+        {"ok": True, "data": {"url": f"https://example.test/callback?payload={encoded}"}},
+    )
+
+    assert scrubbed["ok"] is True
+    assert secret not in str(scrubbed)
+    assert encoded not in str(scrubbed)
+    assert "[redacted]" in str(scrubbed)
+    assert seen_parameters == [{"magic_link": secret}]
 
 
 class TestRequestedOutputPathChoices:
@@ -892,6 +937,123 @@ class TestMCPToolTiming:
         assert "data" not in surfaced
         assert ctx.flow_evidence == [existing_flow]
         assert ctx.scouted_output_covered_paths == {"output.existing"}
+
+    @pytest.mark.asyncio
+    async def test_evaluate_on_sensitive_origin_redacts_matching_run_registry_before_disclosure(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_sensitive",
+            {
+                "credential": {"username": "private-user", "password": "private-pass"},
+                "copilot_run_runtime_secret_values": ("654321",),
+            },
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=True,
+        )
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        overlay = _build_skyvern_mcp_overlays()["evaluate"]
+        server = _make_server(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "form": {"selector": "#otp-form", "field": "#totp"},
+                        "echo": "private-user:private-pass:654321",
+                    },
+                    "url": "https://example.test/otp",
+                    "title": "Verification for private-user",
+                },
+            },
+            overlay,
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is True
+        assert surfaced["data"]["result"]["form"] == {"selector": "#otp-form", "field": "#totp"}
+        assert "private-user" not in result.content[0].text
+        assert "private-pass" not in result.content[0].text
+        assert "654321" not in result.content[0].text
+        assert "[REDACTED_SECRET]" in result.content[0].text
+        retained = json.dumps(
+            {
+                "composition_page_evidence": ctx.composition_page_evidence,
+                "flow_evidence": ctx.flow_evidence,
+                "scout_trajectory": ctx.scout_trajectory,
+            },
+            default=str,
+        )
+        assert "private-user" not in retained
+        assert "private-pass" not in retained
+        assert "654321" not in retained
+
+    @pytest.mark.asyncio
+    async def test_evaluate_on_sensitive_origin_stays_withheld_when_matching_registry_is_incomplete(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_sensitive",
+            {"credential": {"username": "private-user"}},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=False,
+        )
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        server = _make_server(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "result": "private-user:unregistered-pass",
+                    "url": "https://example.test/otp",
+                },
+            },
+            _build_skyvern_mcp_overlays()["evaluate"],
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert "private-user" not in result.content[0].text
+        assert "unregistered-pass" not in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_evaluate_stays_withheld_while_the_sensitive_origin_run_is_active(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_sensitive",
+            {"password": "private-pass"},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=True,
+        )
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        ctx.active_sensitive_origin_browser_session_ids.add("pbs_1")
+        server = _make_server(
+            ctx,
+            {"ok": True, "data": {"result": "private-pass"}},
+            _build_skyvern_mcp_overlays()["evaluate"],
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert "private-pass" not in result.content[0].text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

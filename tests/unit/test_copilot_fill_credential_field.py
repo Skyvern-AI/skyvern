@@ -416,6 +416,29 @@ class _FakePage:
         return args[0] if args else None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "secret_value"),
+    [("totp", "123456"), ("password", "short-pass-13")],
+)
+async def test_the_readback_comes_from_the_page_not_the_tool_layer(
+    monkeypatch: pytest.MonkeyPatch, field: str, secret_value: str
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page, secret_value=secret_value)
+    ctx = _ctx()
+
+    selector = f"#{field}"
+    result = await tools_module._fill_credential_field_impl(ctx, selector, "cred_123", field)
+
+    assert result["ok"] is True
+    assert result["data"]["readback_outcome"] == "exact_match"
+    # Through the tool layer a registered secret returns as `[REDACTED_SECRET]`, so only a
+    # read taken on the page handle that filled the field sees what was actually typed.
+    assert page.read_calls == [selector]
+    assert ctx.scout_trajectory[-1]["credential_field"] == field
+
+
 def _wire_impl(
     monkeypatch: pytest.MonkeyPatch,
     page: _FakePage,
@@ -511,24 +534,6 @@ def _wire_impl(
             mcp_hooks_module._scout_readback_outcome(readback, otp) is mcp_hooks_module.ScoutReadbackOutcome.DIFFERENT
         )
         assert mcp_hooks_module._scout_readback_outcome(otp, otp) is mcp_hooks_module.ScoutReadbackOutcome.EXACT_MATCH
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("secret_value", ["mk-one", "mk-two-value"])
-    async def test_the_readback_comes_from_the_page_not_the_tool_layer(
-        self, monkeypatch: pytest.MonkeyPatch, secret_value: str
-    ) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page, secret_value=secret_value)
-        ctx = _ctx()
-
-        result = await tools_module._fill_credential_field_impl(ctx, "#totp", "cred_123", "totp")
-
-        assert result["ok"] is True
-        assert result["data"]["readback_outcome"] == "exact_match"
-        # Through the tool layer a registered secret returns as `[REDACTED_SECRET]`, so only a
-        # read taken on the page handle that filled the field sees what was actually typed.
-        assert page.read_calls == ["#totp"]
-        assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
 
     @pytest.mark.asyncio
     async def test_multi_match_selector_still_reaches_an_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _extract_credential_ids_from_workflow_definition,
 )
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
+from skyvern.forge.sdk.workflow import runtime_secret_bridge
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
     make_completion_criterion,
@@ -547,11 +549,11 @@ def _snapshot_from_ctx(ctx: SimpleNamespace, run_id: str) -> RunEvidenceSnapshot
 
 
 @pytest.mark.asyncio
-async def test_track_a_binds_serialized_redaction_registry_to_origin_run(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_track_a_excludes_nonsensitive_parameters_from_origin_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _producer_ctx()
 
     def serialize(values: dict[str, object]) -> dict[str, object]:
-        return {"account": values["account"]}
+        return dict(values)
 
     monkeypatch.setattr(
         run_execution_module,
@@ -569,14 +571,50 @@ async def test_track_a_binds_serialized_redaction_registry_to_origin_run(monkeyp
 
     assert registry == OriginRunRedactionRegistry(
         "wr_origin",
-        {
-            "account": "private-value",
-        },
+        {},
         contains_sensitive_values=False,
         contains_all_sensitive_values=True,
+        artifact_parameters={"account": "private-value"},
     )
     assert ctx.origin_run_redaction_registry is registry
     assert ctx.codeblock_redaction_parameters == {}
+
+
+@pytest.mark.asyncio
+async def test_nonsensitive_origin_parameters_still_scrub_dispatched_terminal_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_value = "ordinary-run-parameter"
+    html = f"<html><body><p>{parameter_value}</p><p>safe evidence</p></body></html>"
+    artifacts = [_html_artifact("art_parameter", ArtifactType.HTML_ACTION)]
+    _stub_app(monkeypatch, artifacts, {"art_parameter": html.encode()})
+    seen_parameters: list[object] = []
+
+    def redact(value: object, parameters: object) -> object:
+        seen_parameters.append(parameters)
+        return value.replace(parameter_value, "[REDACTED]") if isinstance(value, str) else value
+
+    run_execution_module.app.AGENT_FUNCTION = SimpleNamespace(redact_codeblock_parameter_values=redact)
+    ctx = _producer_ctx()
+
+    result = await run_execution_module._fetch_dispatched_terminal_page_evidence(
+        run_id="wr_origin",
+        organization_id="o_1",
+        current_url="",
+        workflow=ctx.last_workflow,
+        origin_redaction_registry=OriginRunRedactionRegistry(
+            "wr_origin",
+            {},
+            contains_sensitive_values=False,
+            contains_all_sensitive_values=True,
+            artifact_parameters={"account": parameter_value},
+        ),
+    )
+
+    assert result is not None
+    assert seen_parameters == [{"account": parameter_value}]
+    assert parameter_value not in str(result)
+    assert "safe evidence" in page_evidence_prose_text(result)
 
 
 def test_origin_run_redaction_registry_defensively_copies_and_exposes_parameters_immutably() -> None:
@@ -647,6 +685,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
 ) -> None:
     ctx = _producer_ctx()
     ctx.organization_id = "o_1"
+    ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier=None)
     credential = PasswordCredential(username="private-user", password="private-pass")
     credential_item = SimpleNamespace(credential=credential)
@@ -674,13 +713,337 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
     )
 
     assert registry.contains_all_sensitive_values is True
+    assert "cred_origin" not in registry.parameters.values()
+    assert "cred_origin" not in ctx.secret_scrub_values
     assert registry.parameters["copilot_run_credential_0"]["username"] == "private-user"
     assert registry.parameters["copilot_run_credential_0"]["password"] == "private-pass"
+    assert "private-user" in ctx.secret_scrub_values
+    assert "private-pass" in ctx.secret_scrub_values
     process.assert_awaited_once_with(
         workflow_run_id="wr_origin",
         db_credential=db_credential,
         credential_item=credential_item,
     )
+
+
+@pytest.mark.asyncio
+async def test_track_a_registry_keeps_static_credential_values_when_totp_is_dynamic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _producer_ctx()
+    ctx.organization_id = "o_1"
+    ctx.secret_scrub_values = []
+    db_credential = SimpleNamespace(vault_type=None, totp_identifier="totp_ref")
+    credential = PasswordCredential(username="private-user", password="private-pass", totp_identifier="totp_ref")
+    credential_item = SimpleNamespace(credential=credential)
+    service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(
+                serialize_codeblock_parameters=lambda values: values,
+                process_registered_credential_item=AsyncMock(return_value=credential_item),
+            ),
+            DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=db_credential))),
+            CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: service},
+        ),
+    )
+
+    registry = await run_execution_module._bind_origin_run_redaction_registry(
+        ctx,
+        workflow_run_id="wr_origin",
+        parameter_values={"login_credential": "cred_origin"},
+        credential_ids=["cred_origin"],
+        sensitive_parameter_keys=[],
+    )
+
+    assert registry.contains_all_sensitive_values is False
+    assert registry.contains_all_static_sensitive_values is True
+    assert registry.awaiting_runtime_secret_values is True
+    assert registry.parameters["copilot_run_credential_0"]["username"] == "private-user"
+    assert registry.parameters["copilot_run_credential_0"]["password"] == "private-pass"
+    assert "totp_identifier" not in registry.parameters["copilot_run_credential_0"]
+    assert "totp_ref" not in ctx.secret_scrub_values
+
+
+@pytest.mark.asyncio
+async def test_track_a_registry_imports_dispatched_runtime_otp_without_local_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_otp = "654321"
+    ctx = _producer_ctx()
+    ctx.organization_id = "o_1"
+    ctx.secret_scrub_values = []
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_origin",
+        {"credential": {"username": "private-user", "password": "private-pass"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+        contains_all_static_sensitive_values=True,
+        awaiting_runtime_secret_values=True,
+        artifact_parameters={"account": "ordinary-run-parameter"},
+    )
+    consume = AsyncMock(return_value={runtime_otp})
+    monkeypatch.setattr(run_execution_module, "consume_copilot_runtime_secret_values", consume)
+
+    registry = await run_execution_module._complete_origin_run_redaction_registry_from_runtime(ctx, "wr_origin")
+
+    assert registry is not None
+    assert registry.contains_all_sensitive_values is True
+    assert registry.awaiting_runtime_secret_values is False
+    assert registry.parameters["copilot_run_runtime_secret_values"] == (runtime_otp,)
+    assert registry.artifact_parameters["account"] == "ordinary-run-parameter"
+    assert registry.artifact_parameters["copilot_run_runtime_secret_values"] == (runtime_otp,)
+    assert runtime_otp in ctx.secret_scrub_values
+    consume.assert_awaited_once_with(organization_id=ctx.organization_id, workflow_run_id="wr_origin")
+
+
+@pytest.mark.asyncio
+async def test_runtime_bridge_completion_excludes_totp_routing_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values: dict[str, str] = {}
+
+    class FakeLocalCache:
+        is_shared = False
+
+        def get_lock(self, *_args: object, **_kwargs: object) -> asyncio.Lock:
+            return asyncio.Lock()
+
+        async def set(self, key: str, value: str, ex: int) -> None:
+            values[key] = value
+
+        async def get(self, key: str) -> str | None:
+            return values.get(key)
+
+    monkeypatch.setattr(runtime_secret_bridge, "app", SimpleNamespace(CACHE=FakeLocalCache()))
+    monkeypatch.setattr(
+        run_execution_module,
+        "consume_copilot_runtime_secret_values",
+        runtime_secret_bridge.consume_copilot_runtime_secret_values,
+    )
+    runtime_otp = "654321"
+    ctx = _producer_ctx()
+    ctx.organization_id = "o_1"
+    ctx.secret_scrub_values = ["private-user", "private-pass"]
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_origin",
+        {"credential": {"username": "private-user", "password": "private-pass"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+        contains_all_static_sensitive_values=True,
+        awaiting_runtime_secret_values=True,
+    )
+    workflow_run_context = SimpleNamespace(
+        secrets={
+            "username": "private-user",
+            "password": "private-pass",
+            "totp_type": "authenticator",
+            "totp_identifier": "totp",
+            "runtime": runtime_otp,
+        },
+        runtime_otp_values={runtime_otp},
+    )
+
+    assert await runtime_secret_bridge.publish_copilot_runtime_secret_values(
+        organization_id=ctx.organization_id,
+        workflow_run_id="wr_origin",
+        workflow_run_context=workflow_run_context,
+    )
+    registry = await run_execution_module._complete_origin_run_redaction_registry_from_runtime(ctx, "wr_origin")
+
+    assert registry is not None
+    assert registry.parameters["credential"] == {"username": "private-user", "password": "private-pass"}
+    assert registry.parameters["copilot_run_runtime_secret_values"] == (runtime_otp,)
+    assert {"private-user", "private-pass", runtime_otp}.issubset(ctx.secret_scrub_values)
+    assert "totp" not in ctx.secret_scrub_values
+    assert "authenticator" not in ctx.secret_scrub_values
+
+
+@pytest.mark.asyncio
+async def test_runtime_secret_bridge_round_trips_exact_values_through_local_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values: dict[str, str] = {}
+
+    class FakeLocalCache:
+        is_shared = False
+
+        def get_lock(self, *_args: object, **_kwargs: object) -> asyncio.Lock:
+            return asyncio.Lock()
+
+        async def set(self, key: str, value: str, ex: int) -> None:
+            values[key] = value
+
+        async def get(self, key: str) -> str | None:
+            return values.get(key)
+
+    monkeypatch.setattr(runtime_secret_bridge, "app", SimpleNamespace(CACHE=FakeLocalCache()))
+    workflow_run_context = SimpleNamespace(
+        secrets={"password": "private-pass", "totp_identifier": "totp", "runtime": "654321"},
+        runtime_otp_values={"654321"},
+    )
+
+    published = await runtime_secret_bridge.publish_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+        workflow_run_context=workflow_run_context,
+    )
+    consumed = await runtime_secret_bridge.consume_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+    )
+
+    assert published is True
+    assert consumed == {"654321"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    values: dict[str, str] = {}
+    plaintext: str | None = None
+
+    class FakeSharedCache:
+        is_shared = True
+
+        def get_lock(self, *_args: object, **_kwargs: object) -> asyncio.Lock:
+            return asyncio.Lock()
+
+        async def set(self, key: str, value: str, ex: int) -> None:
+            values[key] = value
+
+        async def get(self, key: str) -> str | None:
+            return values.get(key)
+
+    async def fake_encrypt(value: str, _method: object) -> str:
+        nonlocal plaintext
+        plaintext = value
+        return "opaque-ciphertext"
+
+    async def fake_decrypt(_value: str, _method: object) -> str:
+        assert plaintext is not None
+        return plaintext
+
+    monkeypatch.setattr(runtime_secret_bridge, "app", SimpleNamespace(CACHE=FakeSharedCache()))
+    monkeypatch.setattr(
+        runtime_secret_bridge,
+        "encryptor",
+        SimpleNamespace(encrypt=fake_encrypt, decrypt=fake_decrypt),
+    )
+    workflow_run_context = SimpleNamespace(
+        secrets={"password": "private-pass", "runtime": "654321"},
+        runtime_otp_values={"654321"},
+    )
+
+    assert await runtime_secret_bridge.publish_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+        workflow_run_context=workflow_run_context,
+    )
+    assert all("private-pass" not in stored and "654321" not in stored for stored in values.values())
+    assert await runtime_secret_bridge.consume_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+    ) == {"654321"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_secret_bridge_allows_exactly_one_concurrent_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values: dict[str, str] = {}
+
+    class FakeLocalCache:
+        is_shared = False
+
+        def get_lock(self, *_args: object, **_kwargs: object) -> asyncio.Lock:
+            return asyncio.Lock()
+
+        async def set(self, key: str, value: str, ex: int) -> None:
+            values[key] = value
+
+        async def get(self, key: str) -> str | None:
+            return values.get(key)
+
+    monkeypatch.setattr(runtime_secret_bridge, "app", SimpleNamespace(CACHE=FakeLocalCache()))
+    workflow_run_context = SimpleNamespace(
+        secrets={"runtime": "654321"},
+        runtime_otp_values={"654321"},
+    )
+    assert await runtime_secret_bridge.publish_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+        workflow_run_context=workflow_run_context,
+    )
+
+    consumed = await asyncio.gather(
+        runtime_secret_bridge.consume_copilot_runtime_secret_values(organization_id="o_1", workflow_run_id="wr_origin"),
+        runtime_secret_bridge.consume_copilot_runtime_secret_values(organization_id="o_1", workflow_run_id="wr_origin"),
+    )
+
+    assert consumed.count({"654321"}) == 1
+    assert consumed.count(None) == 1
+
+
+@pytest.mark.asyncio
+async def test_origin_registry_recovers_when_a_later_terminal_read_finds_the_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _producer_ctx()
+    ctx.organization_id = "o_1"
+    ctx.workflow_permanent_id = "wp_origin"
+    ctx.secret_scrub_values = []
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_origin",
+        {"credential": {"password": "private-pass"}},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+        contains_all_static_sensitive_values=True,
+        awaiting_runtime_secret_values=True,
+    )
+    consume = AsyncMock(side_effect=[None, {"654321"}])
+    monkeypatch.setattr(run_execution_module, "consume_copilot_runtime_secret_values", consume)
+
+    run = SimpleNamespace(
+        status="completed",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        workflow_id="wf_origin",
+        failure_reason=None,
+        browser_session_id=None,
+    )
+    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[]))
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)),
+                workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
+                observer=SimpleNamespace(get_workflow_run_blocks=AsyncMock(return_value=[])),
+            ),
+            AGENT_FUNCTION=SimpleNamespace(
+                should_dispatch_copilot_block_run_to_worker=AsyncMock(return_value=False),
+            ),
+        ),
+    )
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
+    monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", AsyncMock())
+    monkeypatch.setattr(run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None))
+
+    first = await run_execution_module._complete_origin_run_redaction_registry_from_runtime(ctx, "wr_origin")
+    result = await run_execution_module._get_run_results(
+        {"workflow_run_id": "wr_origin"},
+        ctx,
+        read_live_page=False,
+    )
+    second = ctx.origin_run_redaction_registry
+
+    assert first is not None and first.contains_all_sensitive_values is False
+    assert result["ok"] is True
+    assert second is not None and second.contains_all_sensitive_values is True
+    assert second.parameters["copilot_run_runtime_secret_values"] == ("654321",)
+    assert consume.await_count == 2
 
 
 @pytest.mark.asyncio
