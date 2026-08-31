@@ -664,3 +664,32 @@ class TestCollectSecretParamKeys:
     def test_returns_empty_when_no_definition(self) -> None:
         assert _collect_secret_param_keys({}) == frozenset()
         assert _collect_secret_param_keys({"workflow_definition": None}) == frozenset()
+
+
+class TestTurnScopedReasoningExcludedFromPrompts:
+    """A v3-persisted row's reasoning is the whole turn's text (stamped via its description);
+    it must never become a per-action prompt in generated scripts."""
+
+    def _render(self, stmt: cst.BaseStatement) -> str:
+        return cst.Module(body=[stmt]).code
+
+    def test_v3_stamped_reasoning_is_not_a_prompt(self) -> None:
+        act: dict[str, Any] = {
+            "action_type": "click",
+            "xpath": "//button",
+            "description": "task_v3 click [data-tv3='t1']",
+            "reasoning": "Filling name, email and phone, then submitting the form",
+        }
+        stmt = _action_to_stmt(act, {}, value_to_param=None)
+        code = self._render(stmt)
+        assert "Filling name, email and phone" not in code
+
+    def test_unstamped_reasoning_still_prompts(self) -> None:
+        act: dict[str, Any] = {
+            "action_type": "click",
+            "xpath": "//button",
+            "reasoning": "Click the submit button",
+        }
+        stmt = _action_to_stmt(act, {}, value_to_param=None)
+        code = self._render(stmt)
+        assert "Click the submit button" in code
