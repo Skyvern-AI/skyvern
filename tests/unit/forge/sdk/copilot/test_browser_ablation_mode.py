@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastmcp.tools.tool import Tool as RegisteredTool
+from jsonschema import Draft202012Validator
 from mcp.types import Tool as MCPTool
 
 from skyvern.cli.mcp_tools import mcp
@@ -21,7 +24,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+from skyvern.forge.sdk.copilot.mcp_adapter import BROWSER_TARGET_PARAM_NAME, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBrowserAblationResponseUpdate,
@@ -172,6 +175,70 @@ async def test_browser_ablation_projects_the_app_registry_contract() -> None:
     assert {"get_workflow_knowledge", "get_block_schema", "validate_block"}.isdisjoint(surface.ordered_mcp_names)
     registered_workflow_tools = {tool.name for tool in registered_tools if "workflow" in set(tool.tags or ())}
     assert registered_workflow_tools.isdisjoint(surface.alias_map.values())
+
+
+async def _advertised_schemas(
+    surface: CopilotToolSurface, registered: list[RegisteredTool]
+) -> dict[str, dict[str, Any]]:
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays=surface.overlays,
+        alias_map=surface.alias_map,
+        allowlist=frozenset(surface.alias_map.values()),
+        context_provider=lambda: SimpleNamespace(organization_id="o_test"),
+    )
+    server._client = MagicMock()
+    server._cached_raw_tools = [
+        MCPTool(name=tool.name, description=tool.description, inputSchema=tool.parameters) for tool in registered
+    ]
+    return {tool.name: tool.inputSchema for tool in await server.list_tools()}
+
+
+def _production_surfaces(registered: list[RegisteredTool]) -> tuple[CopilotToolSurface, CopilotToolSurface]:
+    aliases = get_skyvern_mcp_alias_map()
+    overlays = _build_skyvern_mcp_overlays()
+    normal = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=aliases,
+        overlays=overlays,
+    )
+    ablation = resolve_copilot_tool_surface(
+        mode=CopilotEvalMode.BROWSER_ABLATION,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=aliases,
+        overlays=overlays,
+        registered_mcp_tools=registered,
+    )
+    return normal, ablation
+
+
+@pytest.mark.asyncio
+async def test_the_advertised_tab_contract_is_closed_around_the_fields_it_offers() -> None:
+    registered = await mcp.list_tools(run_middleware=False)
+    _, ablation = _production_surfaces(registered)
+
+    tab_new = (await _advertised_schemas(ablation, registered))["skyvern_tab_new"]
+
+    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME}
+    assert tab_new["additionalProperties"] is False
+    validator = Draft202012Validator(tab_new)
+    assert validator.is_valid({"url": "https://example.com"})
+    assert not validator.is_valid({"url": "https://example.com", "settle_seconds": 30})
+
+
+@pytest.mark.asyncio
+async def test_shared_browser_tools_advertise_one_contract_across_both_modes() -> None:
+    registered = await mcp.list_tools(run_middleware=False)
+    normal, ablation = _production_surfaces(registered)
+
+    normal_schemas = await _advertised_schemas(normal, registered)
+    ablation_schemas = await _advertised_schemas(ablation, registered)
+
+    shared = set(normal_schemas) & set(ablation_schemas)
+    assert set(_EXISTING_BROWSER_ALIASES) <= shared
+    assert {name: normal_schemas[name] for name in shared} == {name: ablation_schemas[name] for name in shared}
+    assert all(normal_schemas[name].get("additionalProperties") is False for name in shared)
 
 
 def test_browser_ablation_preserves_existing_aliases_then_adds_required_registry_capabilities() -> None:
