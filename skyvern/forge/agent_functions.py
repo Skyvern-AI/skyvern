@@ -885,7 +885,7 @@ class AgentFunction:
 
     # OSS resolves auto-observe from the static setting; cloud overrides to bucket a run per task_id.
     async def resolve_task_v3_auto_observe(
-        self, *, task_id: str | None, organization_id: str | None
+        self, *, task_id: str | None, organization_id: str | None, workflow_permanent_id: str | None = None
     ) -> AutoObserveDecision:
         return auto_observe_from_setting()
 

@@ -195,6 +195,7 @@ async def run_task_v3_agent_loop(
     downloads_dir: str | None = None,
     organization_id: str | None = None,
     task_id: str | None = None,
+    workflow_permanent_id: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_action_steps: int | None = None,
@@ -310,7 +311,9 @@ async def run_task_v3_agent_loop(
     auto_observe_decision = (
         AutoObserveDecision(enabled=False, arm="default")
         if page_free
-        else await app.AGENT_FUNCTION.resolve_task_v3_auto_observe(task_id=task_id, organization_id=organization_id)
+        else await app.AGENT_FUNCTION.resolve_task_v3_auto_observe(
+            task_id=task_id, organization_id=organization_id, workflow_permanent_id=workflow_permanent_id
+        )
     )
     auto_observe = auto_observe_decision.enabled
     if not page_free:
