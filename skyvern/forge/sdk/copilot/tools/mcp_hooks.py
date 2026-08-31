@@ -1806,6 +1806,10 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
         "wait_for_either_state": "skyvern_wait_for_either_state",
+        # These frame controls already use their user-facing MCP names.
+        "skyvern_frame_list": "skyvern_frame_list",
+        "skyvern_frame_switch": "skyvern_frame_switch",
+        "skyvern_frame_main": "skyvern_frame_main",
     }
 
 
@@ -2024,5 +2028,26 @@ def _build_skyvern_mcp_overlays(
             requires_browser=True,
             pre_hook=_sensitive_origin_page_pre_hook,
             post_hook=_wait_for_either_state_post_hook,
+        ),
+        "skyvern_frame_list": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_frame_switch": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_frame_main": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
         ),
     }

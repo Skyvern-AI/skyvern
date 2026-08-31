@@ -789,6 +789,47 @@ class TestMCPToolTiming:
         assert ctx.scouted_output_covered_paths == {"output.existing"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tool_name", "args"),
+        [
+            ("skyvern_frame_list", {}),
+            ("skyvern_frame_switch", {"selector": "#payment-frame"}),
+            ("skyvern_frame_main", {}),
+        ],
+    )
+    async def test_frame_controls_refuse_tainted_browser_sessions_before_dispatch(
+        self,
+        _stub_browser_session: None,
+        tool_name: str,
+        args: dict[str, str],
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        dispatched: list[str] = []
+
+        class _CapturingClient:
+            async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> Any:
+                dispatched.append(name)
+                return SimpleNamespace(structured_content={"ok": True}, is_error=False, content=[])
+
+        aliases = get_skyvern_mcp_alias_map()
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={tool_name: _build_skyvern_mcp_overlays()[tool_name]},
+            alias_map={tool_name: aliases[tool_name]},
+            allowlist=frozenset({aliases[tool_name]}),
+            context_provider=lambda: ctx,
+        )
+        server._client = _CapturingClient()
+
+        result = await server.call_tool(tool_name, args)
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert dispatched == []
+
+    @pytest.mark.asyncio
     async def test_a_call_that_exceeds_its_ceiling_reports_its_wall_time(self, _fake_clock: list[float]) -> None:
         overlay = SchemaOverlay(requires_browser=True, timeout=30)
         server = _server_whose_call_takes_time(TimeoutError(), overlay, _fake_clock)
@@ -1677,7 +1718,12 @@ def test_every_browser_overlay_offers_the_target_param() -> None:
     overlays = _build_skyvern_mcp_overlays(BlockAuthoringPolicy.CODE_ONLY_BROWSER)
     browser_overlays = {name: overlay for name, overlay in overlays.items() if overlay.requires_browser}
 
-    assert len(browser_overlays) == 10
+    assert {
+        "skyvern_frame_list",
+        "skyvern_frame_switch",
+        "skyvern_frame_main",
+    } <= set(browser_overlays)
+    assert len(browser_overlays) == 13
     assert all(BROWSER_TARGET_PARAM_NAME in overlay.copilot_params for overlay in browser_overlays.values())
     # inspect_page_for_composition owns target_url semantics; a second target would overload it.
     assert "inspect_page_for_composition" not in browser_overlays

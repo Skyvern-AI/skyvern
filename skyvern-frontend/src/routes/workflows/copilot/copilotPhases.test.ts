@@ -79,6 +79,15 @@ describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
     expect(toolActivityDisplayLabel("inspect_page_for_composition")).toBe(
       "Inspecting the page",
     );
+    expect(toolActivityDisplayLabel("skyvern_frame_list")).toBe(
+      "Finding embedded pages",
+    );
+    expect(toolActivityDisplayLabel("skyvern_frame_switch")).toBe(
+      "Opening embedded page",
+    );
+    expect(toolActivityDisplayLabel("skyvern_frame_main")).toBe(
+      "Returning to main page",
+    );
   });
 
   it("labels fill_credential_field without naming any credential", () => {
