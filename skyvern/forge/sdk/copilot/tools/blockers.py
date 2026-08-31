@@ -23,9 +23,7 @@ from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
     _DATA_PRODUCING_BLOCK_TYPES,
-    PER_TOOL_CALL_BUDGET_SECONDS,
     _block_data_payload,
-    _copilot_seconds_remaining,
     _is_meaningful_extracted_data,
     _registered_output_parameter_payloads,
     _workflow_output_parameter_payloads,
@@ -497,15 +495,17 @@ def _iter_goal_value_path_values(value: Any, path_parts: list[str]) -> list[Any]
     return _iter_goal_value_path_values(next_value, remaining)
 
 
-def _code_output_goal_paths_have_content(value: Any, goal_value_paths: list[str]) -> bool:
+def _unmet_code_output_goal_paths(value: Any, goal_value_paths: list[str]) -> list[str]:
+    """The declared goal-value paths this output retained no content for, in declared order."""
+    unmet: list[str] = []
     for path in goal_value_paths:
         path_parts = _normalize_goal_value_path(path)
         values = _iter_goal_value_path_values(value, path_parts)
         if not values and _goal_value_path_targets_registered_download(path):
             values = _registered_download_output_values(value)
         if not any(_code_output_goal_path_value_has_content(item) for item in values):
-            return False
-    return True
+            unmet.append(".".join(path_parts) or path.strip())
+    return unmet
 
 
 def _code_output_goal_path_value_has_content(value: Any) -> bool:
@@ -534,15 +534,6 @@ def _code_output_has_registered_download_content(value: Any) -> bool:
     return any(_code_output_has_goal_content(item) for item in _registered_download_output_values(value))
 
 
-def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
-    """One outer wall clock bounds the turn; reserving a slice of it for a reply the model may not
-    need shortens every run for a composition step that costs seconds."""
-    remaining = _copilot_seconds_remaining(ctx)
-    if remaining is None:
-        return PER_TOOL_CALL_BUDGET_SECONDS
-    return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining)))
-
-
 def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:
     if not use_current_page:
         return False
@@ -556,17 +547,17 @@ def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *,
 
 def _analyze_run_blocks(
     result: dict[str, Any], copilot_ctx: Any | None = None
-) -> tuple[str | None, bool, list[dict] | None]:
+) -> tuple[str | None, bool, list[dict] | None, list[dict[str, str]]]:
     """Single-pass analysis of run result blocks.
 
-    Returns ``(anti_bot_match, has_empty_data_blocks, failure_categories)``
-    by iterating the block list once. When ``data["failure_categories"]`` is
-    already populated by a structured producer, honor it. Runtime prose and
-    block source never mint a second classification plane here.
+    Returns ``(anti_bot_match, has_empty_data_blocks, failure_categories,
+    unmet_goal_path_omissions)`` by iterating the block list once. When
+    ``data["failure_categories"]`` is already populated by a structured producer, honor it.
+    Runtime prose and block source never mint a second classification plane here.
     """
     data = result.get("data")
     if not isinstance(data, dict):
-        return None, False, None
+        return None, False, None, []
 
     anti_bot_match: str | None = None
 
@@ -576,12 +567,11 @@ def _analyze_run_blocks(
             if isinstance(cat, dict) and trusted_terminal_challenge_category_name(cat) is not None:
                 anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
                 break
-        return anti_bot_match, False, precomputed_categories
+        return anti_bot_match, False, precomputed_categories, []
 
     has_data_blocks = False
     any_data_output = False
-    missing_metadata_goal_content = False
-    complete_structured_record_output = False
+    unmet_goal_path_omissions: list[dict[str, str]] = []
 
     blocks = data.get("blocks")
     if isinstance(blocks, list):
@@ -598,7 +588,8 @@ def _analyze_run_blocks(
                     any_data_output = True
             elif _is_code_block_type(block_type):
                 extracted = block.get("extracted_data")
-                if extracted is None:
+                goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
+                if extracted is None and not goal_value_paths:
                     continue
                 declared_keys = _declared_code_output_keys(copilot_ctx, block.get("label"))
                 output_parameter_payloads = _workflow_output_parameter_payloads(extracted)
@@ -606,8 +597,6 @@ def _analyze_run_blocks(
                     has_data_blocks = True
                     if any(_is_meaningful_extracted_data(value) for value in output_parameter_payloads.values()):
                         any_data_output = True
-                    if any(_structured_record_has_goal_content(value) for value in output_parameter_payloads.values()):
-                        complete_structured_record_output = True
                 extraction_schema = _extraction_schema_for_code_block(copilot_ctx, block.get("label"))
                 # Array-typed schemas would coerce the keyed dict return to [] (fill_missing_fields), making the
                 # goal-path check below read a real extraction as empty; the keyed-return floor guarantees a dict.
@@ -617,12 +606,12 @@ def _analyze_run_blocks(
                     and extraction_schema.get("type") != "array"
                 ):
                     extracted = validate_and_fill_extraction_result(extracted, extraction_schema)
-                goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
                 if goal_value_paths:
                     has_data_blocks = True
+                    unmet_paths = _unmet_code_output_goal_paths(extracted, goal_value_paths)
                     if (
                         _code_output_has_registered_download_content(extracted)
-                        or _code_output_goal_paths_have_content(extracted, goal_value_paths)
+                        or not unmet_paths
                         or _structured_record_has_goal_content(extracted)
                     ):
                         any_data_output = True
@@ -630,7 +619,11 @@ def _analyze_run_blocks(
                         # Terminal goal paths are conjunctive: one missing
                         # declared field means the block did not prove the
                         # requested outcome, even if another path had data.
-                        missing_metadata_goal_content = True
+                        label = block.get("label")
+                        unmet_goal_path_omissions.extend(
+                            {"block_label": label if isinstance(label, str) else "", "output_path": path}
+                            for path in unmet_paths
+                        )
                     # Goal-path contracts supersede the generic collection-shape
                     # fallback below; they are the stronger outcome evidence check.
                     continue
@@ -646,28 +639,15 @@ def _analyze_run_blocks(
         has_data_blocks = True
         if any(_is_meaningful_extracted_data(value) for value in top_level_output_payloads.values()):
             any_data_output = True
-        if any(_structured_record_has_goal_content(value) for value in top_level_output_payloads.values()):
-            complete_structured_record_output = True
 
     registered_payloads = _registered_output_parameter_payloads(data)
     if registered_payloads:
         has_data_blocks = True
         for registered in registered_payloads:
-            value = registered.get("value")
-            if _is_meaningful_extracted_data(value):
+            if _is_meaningful_extracted_data(registered.get("value")):
                 any_data_output = True
-            if _structured_record_has_goal_content(value):
-                complete_structured_record_output = True
-    if complete_structured_record_output:
-        if missing_metadata_goal_content:
-            LOG.info(
-                "copilot run evidence: a complete structured-record output suppressed a "
-                "per-block missing-metadata-goal-content signal",
-                workflow_run_id=data.get("workflow_run_id"),
-            )
-        missing_metadata_goal_content = False
-    empty_data_blocks = (has_data_blocks and not any_data_output) or missing_metadata_goal_content
-    return anti_bot_match, empty_data_blocks, None
+    empty_data_blocks = (has_data_blocks and not any_data_output) or bool(unmet_goal_path_omissions)
+    return anti_bot_match, empty_data_blocks, None, unmet_goal_path_omissions
 
 
 def _structured_record_has_goal_content(value: Any) -> bool:

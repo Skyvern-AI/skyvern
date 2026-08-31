@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,6 +38,8 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockType
 
 
 class _FakeStream:
@@ -114,25 +117,48 @@ workflow_definition:
     assert before < ctx.executed_block_fingerprints["step"]
 
 
-@pytest.mark.asyncio
-async def test_watchdog_receipts_preserve_terminal_block_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    observer = SimpleNamespace(
-        get_workflow_run_blocks=lambda **_kwargs: None,
+def _run_block(label: str, status: str, **fields: Any) -> WorkflowRunBlock:
+    now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    return WorkflowRunBlock(
+        workflow_run_block_id=f"wrb_{label}",
+        workflow_run_id="wr_test",
+        organization_id="org",
+        block_type=BlockType.CODE,
+        label=label,
+        status=status,
+        created_at=now,
+        modified_at=now,
+        **fields,
     )
 
-    async def get_workflow_run_blocks(**_kwargs: Any) -> list[SimpleNamespace]:
+
+@pytest.mark.asyncio
+async def test_watchdog_receipts_carry_why_a_block_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run capped by the watchdog still has to say what failed, not only that something did."""
+
+    async def get_workflow_run_blocks(**_kwargs: Any) -> list[WorkflowRunBlock]:
         return [
-            SimpleNamespace(label="ran", status=SimpleNamespace(value="failed")),
-            SimpleNamespace(label="waiting", status=SimpleNamespace(value="queued")),
+            _run_block(
+                "ran",
+                "failed",
+                failure_reason="CodeBlock failed with NameError at line 2: name 'total' is not defined.",
+                error_codes=["user_code_error"],
+            ),
+            _run_block("waiting", "queued"),
         ]
 
-    observer.get_workflow_run_blocks = get_workflow_run_blocks
-    monkeypatch.setattr(run_execution.app.DATABASE, "observer", observer)
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "observer",
+        SimpleNamespace(get_workflow_run_blocks=get_workflow_run_blocks),
+    )
 
-    assert await _recorded_watchdog_block_receipts("wr_test", "org") == [
-        {"label": "ran", "status": "failed"},
-        {"label": "waiting", "status": "queued"},
-    ]
+    receipts = await _recorded_watchdog_block_receipts("wr_test", "org")
+
+    assert [receipt["status"] for receipt in receipts] == ["failed", "queued"]
+    assert receipts[0]["block_type"] == "CODE"
+    assert receipts[0]["error_codes"] == ["user_code_error"]
+    assert "NameError" in receipts[0]["failure_reason"]
 
 
 def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
@@ -304,6 +330,7 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
         reason_code=final.reason_code,
         display_reason=final.display_reason,
         workflow_run_id="wr_test",
+        run_completed=False,
     )
     assert ctx.last_run_outcome_block_labels == final.block_labels
 
@@ -319,6 +346,7 @@ def test_challenge_failure_records_observation_without_halting_agent() -> None:
         reason_code="blocker_reported",
         display_reason=run_outcome_display_reason("Human verification challenge blocked the search."),
         workflow_run_id="wr_challenge",
+        run_completed=False,
     )
     assert ctx.last_run_outcome == outcome
     assert ctx.last_test_ok is False
@@ -396,6 +424,7 @@ async def test_completion_judge_cannot_overturn_run_output() -> None:
     assert outcome == RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id="wr_test",
+        run_completed=True,
     )
     assert ctx.completion_verification_result is None
     assert ctx.last_test_suspicious_success is False
@@ -457,6 +486,7 @@ async def test_completed_partial_run_does_not_promote_full_workflow() -> None:
     assert ctx.last_run_outcome == RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id="wr_test",
+        run_completed=True,
     )
 
 
@@ -483,6 +513,7 @@ async def test_failed_run_emits_its_own_outcome() -> None:
     assert [frame.verdict for frame in frames] == ["not_demonstrated"]
     assert ctx.last_run_outcome is not None
     assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.last_run_outcome.run_completed is False
 
 
 @pytest.mark.asyncio
@@ -605,9 +636,75 @@ async def test_missing_run_id_does_not_reuse_prior_run_id() -> None:
 def test_both_consumers_route_through_single_producer() -> None:
     source = inspect.getsource(copilot_tools)
     assert source.count("await _verify_and_record_run_blocks_result(") == 2
+    assert source.count("recorded_outcome = await _verify_and_record_run_blocks_result(") == 2
+    assert source.count("recorded_outcome=recorded_outcome") == 2
     assert "_record_run_blocks_result(copilot_ctx, result, completion_verification" not in source
     assert "_record_run_blocks_result(copilot_ctx, run_result, completion_verification" not in source
     assert "await _maybe_run_completion_verification(copilot_ctx" not in source
+
+
+@pytest.mark.parametrize(
+    "result_name",
+    ["result", "run_result"],
+    ids=["run_blocks_tool", "run_updated_workflow_blocks"],
+)
+def test_each_current_run_consumer_passes_the_recorded_outcome_to_finalization(
+    result_name: str,
+) -> None:
+    source = inspect.getsource(copilot_tools)
+    producer = (
+        f"recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, {result_name}, handler_start)"
+    )
+    start = source.index(producer)
+    consumer = source[start : start + 700]
+    assert f"result={result_name}" in consumer
+    assert "recorded_outcome=recorded_outcome" in consumer
+
+
+@pytest.mark.asyncio
+async def test_same_run_recorded_operation_remains_packet_authority_after_raw_result_mutation() -> None:
+    result = _run_result(
+        [
+            {
+                "label": "collect_failure_rate",
+                "block_type": "CODE",
+                "status": "failed",
+                "workflow_run_block_id": "wrb_recorded",
+                "error_codes": ["browser_operation_failed"],
+                "failure_reason": "browser operation failed",
+            }
+        ],
+        ok=False,
+    )
+    result["data"]["requested_block_labels"] = ["collect_failure_rate"]
+    result["data"]["executed_block_labels"] = ["collect_failure_rate"]
+    result["data"]["failing_code_line"] = 1
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.workflow_yaml = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return await page.locator("canvas.failure-rate").inner_text()
+"""
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+
+    recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+    assert recorded_outcome is not None
+    assert recorded_outcome.failed_operation is not None
+    assert recorded_outcome.failed_operation.workflow_run_block_id == "wrb_recorded"
+
+    result["data"]["blocks"][0]["workflow_run_block_id"] = "wrb_mutated"
+    run_execution.finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+        recorded_outcome=recorded_outcome,
+    )
+
+    packet = result["data"]["build_test_packet"]
+    assert packet["failure"]["failed_operation"]["workflow_run_block_id"] == "wrb_recorded"
 
 
 def test_display_reason_collapses_whitespace_and_caps_length() -> None:
@@ -823,6 +920,7 @@ def test_completed_run_uses_retained_terminal_output_when_parameter_identity_can
             'Recorded output from the latest completed run: {"retrieve_resale_demand_document":'
             '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
         ),
+        run_completed=True,
     )
     assert ctx.last_test_ok is True
     assert ctx.last_full_workflow_test_ok is True

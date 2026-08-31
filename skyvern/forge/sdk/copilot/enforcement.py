@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    BUILD_TEST_PACKET_KEY,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
@@ -597,6 +598,46 @@ def is_synthetic_user_message(item: Any) -> bool:
     return is_screenshot_message(item) or _is_nudge_message(item)
 
 
+_PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
+_PACKET_LIST_CAP = 6
+_PACKET_REASON_CAP = 200
+
+
+def _bounded_error_codes(codes: Any) -> list[str]:
+    return [str(c)[:64] for c in codes if isinstance(c, str)][:_PACKET_LIST_CAP]
+
+
+def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
+    """The packet's identity and failure scalars, bounded. Lists are tails, so they yield first."""
+    if not isinstance(packet, dict):
+        return None
+    kept: dict[str, Any] = {}
+    version = packet.get("contract_version")
+    if isinstance(version, str) and version:
+        kept["contract_version"] = version
+    run = packet.get("run")
+    if isinstance(run, dict):
+        run_id = run.get("workflow_run_id")
+        status = run.get("status")
+        bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
+        if bounded_run:
+            kept["run"] = bounded_run
+    failure = packet.get("failure")
+    if isinstance(failure, dict):
+        bounded: dict[str, Any] = {}
+        for field in _PACKET_FAILURE_SCALARS:
+            value = failure.get(field)
+            if value is None or value == "":
+                continue
+            bounded[field] = value if isinstance(value, (bool, int, float)) else str(value)[:_PACKET_REASON_CAP]
+        codes = failure.get("error_codes")
+        if isinstance(codes, list) and codes:
+            bounded["error_codes"] = _bounded_error_codes(codes)
+        if bounded:
+            kept["failure"] = bounded
+    return kept or None
+
+
 def _truncated_output_fallback(output: str) -> str:
     return output[:_TOOL_OUTPUT_SUMMARIZE_THRESHOLD] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
 
@@ -714,6 +755,12 @@ def _summarize_tool_output(output: str) -> str:
             return _truncated_output_fallback(output)
 
     if isinstance(data, dict):
+        retained_packet = _retained_run_packet(data.get(BUILD_TEST_PACKET_KEY))
+        if retained_packet is not None:
+            synopsis[BUILD_TEST_PACKET_KEY] = retained_packet
+        failing_line = data.get("failing_code_line")
+        if type(failing_line) is int:
+            synopsis["failing_code_line"] = failing_line
         code = data.get("code")
         if isinstance(code, str) and code:
             synopsis["code_chars_elided"] = len(code)
@@ -722,6 +769,13 @@ def _summarize_tool_output(output: str) -> str:
             if val is None or val == "":
                 continue
             synopsis[key] = val if isinstance(val, (bool, int, float)) else str(val)[:200]
+
+        # An unresolved earlier failure survives compaction for the reason it is attached at all:
+        # the model may decide whether to repair several turns after the run that passed, and dropping
+        # it here would reproduce the loss it exists to prevent.
+        unresolved = data.get("unresolved_earlier_failure")
+        if isinstance(unresolved, dict) and unresolved:
+            synopsis["unresolved_earlier_failure"] = unresolved
 
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
@@ -738,6 +792,9 @@ def _summarize_tool_output(output: str) -> str:
                 entry: dict[str, Any] = {"label": block.get("label"), "status": block.get("status")}
                 if block.get("failure_reason"):
                     entry["failure_reason"] = str(block["failure_reason"])[:120]
+                codes = block.get("error_codes")
+                if isinstance(codes, list) and codes:
+                    entry["error_codes"] = _bounded_error_codes(codes)
                 block_summary.append(entry)
             if block_summary:
                 synopsis["blocks"] = block_summary

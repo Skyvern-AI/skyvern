@@ -8,8 +8,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from skyvern.forge.sdk.db.models import OrganizationModel, TaskModel
+from skyvern.forge.sdk.db.models import (
+    OrganizationModel,
+    ScriptBlockModel,
+    ScriptModel,
+    TaskModel,
+    WorkflowScriptModel,
+)
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
+from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
@@ -263,6 +270,127 @@ def test_scripts_repository_instantiation():
     assert hasattr(repo, "get_scripts")
     assert hasattr(repo, "soft_delete_workflow_script_if_matches")
     assert hasattr(repo, "restore_workflow_script_if_matches")
+
+
+@pytest.mark.asyncio
+async def test_get_cached_block_groups_by_labels_filters_in_sql(sqlite_engine: AsyncEngine):
+    """SKY-15102: workflow save timed out because cache invalidation loaded every cached
+    script for the workflow (tens of thousands, in the reported incident) before filtering
+    by label in Python. ``get_cached_block_groups_by_labels`` pushes that filter into SQL
+    instead. This exercises the real query against a real database and pins every exclusion
+    it must apply: wrong label, missing run_signature, soft-deleted workflow_script,
+    soft-deleted latest script version, an older (non-latest) version, wrong workflow, and
+    wrong organization.
+    """
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = ScriptsRepository(session_factory=factory, debug_enabled=False)
+    org = "o_1"
+    wpid = "wpid_1"
+
+    def workflow_script(
+        suffix: str,
+        *,
+        script_id: str | None = None,
+        workflow_permanent_id: str = wpid,
+        organization_id: str = org,
+        status: str = "published",
+        **kwargs,
+    ):
+        return WorkflowScriptModel(
+            workflow_script_id=f"ws_{suffix}",
+            script_id=script_id or f"s_{suffix}",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            cache_key="default",
+            cache_key_value=f"default-{suffix}",
+            status=status,
+            **kwargs,
+        )
+
+    def script(
+        suffix: str,
+        *,
+        script_id: str | None = None,
+        revision_id: str | None = None,
+        version: int = 1,
+        organization_id: str = org,
+        **kwargs,
+    ):
+        return ScriptModel(
+            script_revision_id=revision_id or f"r_{suffix}",
+            script_id=script_id or f"s_{suffix}",
+            organization_id=organization_id,
+            version=version,
+            **kwargs,
+        )
+
+    def block(revision_id: str, label: str, *, script_id: str, run_signature: str | None, organization_id: str = org):
+        return ScriptBlockModel(
+            organization_id=organization_id,
+            script_id=script_id,
+            script_revision_id=revision_id,
+            script_block_label=label,
+            run_signature=run_signature,
+        )
+
+    deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async with factory() as session:
+        session.add_all(
+            [
+                # a: happy path -> returned
+                workflow_script("a"),
+                script("a"),
+                block("r_a", "target_label", script_id="s_a", run_signature="sig_a"),
+                # b: two versions of the same script; only the latest (v2) counts
+                workflow_script("b", status="pending"),
+                script("b", revision_id="r_b_v1", version=1),
+                block("r_b_v1", "target_label", script_id="s_b", run_signature="sig_b_old"),
+                script("b", revision_id="r_b_v2", version=2),
+                block("r_b_v2", "target_label", script_id="s_b", run_signature="sig_b_new"),
+                # c: matching label but no run_signature -> excluded
+                workflow_script("c"),
+                script("c"),
+                block("r_c", "target_label", script_id="s_c", run_signature=None),
+                # d: matching run_signature but wrong label -> excluded
+                workflow_script("d"),
+                script("d"),
+                block("r_d", "other_label", script_id="s_d", run_signature="sig_d"),
+                # e: soft-deleted workflow_script -> excluded
+                workflow_script("e", deleted_at=deleted_at),
+                script("e"),
+                block("r_e", "target_label", script_id="s_e", run_signature="sig_e"),
+                # f: soft-deleted latest script version -> excluded
+                workflow_script("f"),
+                script("f", deleted_at=deleted_at),
+                block("r_f", "target_label", script_id="s_f", run_signature="sig_f"),
+                # g: different workflow_permanent_id -> excluded
+                workflow_script("g", workflow_permanent_id="wpid_other"),
+                script("g"),
+                block("r_g", "target_label", script_id="s_g", run_signature="sig_g"),
+                # h: different organization -> excluded
+                workflow_script("h", organization_id="o_other"),
+                script("h", organization_id="o_other"),
+                block("r_h", "target_label", script_id="s_h", run_signature="sig_h", organization_id="o_other"),
+                # i: empty-string run_signature -> excluded (matches the old truthy check)
+                workflow_script("i"),
+                script("i"),
+                block("r_i", "target_label", script_id="s_i", run_signature=""),
+            ]
+        )
+        await session.commit()
+
+    rows = await repo.get_cached_block_groups_by_labels(
+        organization_id=org,
+        workflow_permanent_id=wpid,
+        block_labels=["target_label"],
+    )
+
+    returned = {(ws.workflow_script_id, sc.script_revision_id, blk.run_signature) for ws, sc, blk in rows}
+    assert returned == {
+        ("ws_a", "r_a", "sig_a"),
+        ("ws_b", "r_b_v2", "sig_b_new"),
+    }
 
 
 def test_self_heal_repository_instantiation():

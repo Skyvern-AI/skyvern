@@ -3006,7 +3006,7 @@
           "agent"
         ],
         "summary": "List runs",
-        "description": "List the organization's task and agent runs, newest first, filterable by status, run type, agent, and a free-text search term. Returns a paginated array of run summaries.",
+        "description": "List the organization's task and agent runs, newest first, filterable by status, run type, agent, a free-text search term, and failure category. Returns a paginated array of run summaries.",
         "operationId": "get_runs_v2_v1_runs_get",
         "parameters": [
           {
@@ -3143,6 +3143,29 @@
               "title": "Tags"
             },
             "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
+            "name": "failure_category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 100
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact-match filter on a workflow run's top classifier failure category (`failure_category[0].category`). Only failed, terminated, and timed_out runs are eligible; canceled runs are never returned by this filter. Applies to `run_type=workflow_run` only — combined with a task run_type it matches nothing.",
+              "examples": [
+                "ANTI_BOT_DETECTION",
+                "AUTH_FAILURE"
+              ],
+              "title": "Failure Category"
+            },
+            "description": "Exact-match filter on a workflow run's top classifier failure category (`failure_category[0].category`). Only failed, terminated, and timed_out runs are eligible; canceled runs are never returned by this filter. Applies to `run_type=workflow_run` only — combined with a task run_type it matches nothing."
           },
           {
             "name": "x-api-key",
@@ -18809,6 +18832,18 @@
             "title": "Onepassword Item Id",
             "description": "1Password item ID"
           },
+          "onepassword_totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Onepassword Totp Field Name",
+            "description": "1Password item field id or label to treat as the TOTP secret, overriding 1Password's own field-type detection"
+          },
           "azure_vault_name": {
             "anyOf": [
               {
@@ -19627,6 +19662,17 @@
             "type": "string",
             "title": "Item Id"
           },
+          "totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Field Name"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -19692,6 +19738,17 @@
           "item_id": {
             "type": "string",
             "title": "Item Id"
+          },
+          "totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Field Name"
           }
         },
         "type": "object",
@@ -29236,6 +29293,17 @@
               }
             ],
             "title": "Final Url"
+          },
+          "finish_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finish Reason"
           },
           "navigation_goal": {
             "anyOf": [

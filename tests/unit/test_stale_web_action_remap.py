@@ -102,6 +102,7 @@ async def test_successful_remap_rebinds_caller_action_and_provenance_in_place(
     batch = _scraped({"OLD": _element("Approve", html_id="approve_field", xpath="/old")})
     fresh = _scraped({"FRESH": _element("Approve", html_id="approve_field", xpath="/fresh")})
     batch.generate_scraped_page_without_screenshots = AsyncMock(return_value=fresh)
+    monkeypatch.setattr(handler, "_document_continuity", AsyncMock(return_value=True))
     _mock_resolve_locator(monkeypatch, count=0)  # exact injected node is gone -> stale
 
     action = ClickAction(
@@ -253,6 +254,7 @@ async def test_same_main_frame_candidate_still_remaps(monkeypatch: pytest.Monkey
         frames={"IN_IFRAME": "iframe_token_1"},
     )
     batch.generate_scraped_page_without_screenshots = AsyncMock(return_value=fresh)
+    monkeypatch.setattr(handler, "_document_continuity", AsyncMock(return_value=True))
     _mock_resolve_locator(monkeypatch, count=0)
 
     action = ClickAction(element_id="OLD")

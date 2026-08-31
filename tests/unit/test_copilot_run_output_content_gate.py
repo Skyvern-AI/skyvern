@@ -657,7 +657,7 @@ def test_genuine_success_run_keeps_clean_path() -> None:
     ctx = _ctx(result["data"]["blocks"])
 
     assert _run_blocks_structured_blocker_message(result) is None
-    _, empty_data_blocks, _ = _analyze_run_blocks(result)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -671,7 +671,7 @@ def test_nested_code_output_record_is_meaningful_and_not_suspicious_when_verifie
     result = _nested_code_output_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -691,7 +691,7 @@ def test_registered_code_output_parameter_record_is_meaningful() -> None:
     result = _registered_code_output_parameter_run_result()
     ctx = _ctx([])
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
 
     assert empty_data_blocks is False
 
@@ -703,7 +703,7 @@ def test_registered_code_output_parameter_record_is_current_run_scoped() -> None
     )["data"]["registered_output_parameter_values"]
     ctx = _ctx(result["data"]["blocks"])
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
 
     assert empty_data_blocks is True
 
@@ -712,7 +712,7 @@ def test_structured_record_top_level_output_record_is_meaningful() -> None:
     result = _structured_record_qa_top_level_output_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
 
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
@@ -1029,7 +1029,7 @@ def test_satisfied_interactive_completion_does_not_make_empty_output_terminal_re
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
 
     _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
@@ -1064,7 +1064,7 @@ def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
     assert _run_blocks_structured_blocker_message(result) is None
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
     # Empty output remains a factual test-readiness floor. It does not invoke an
     # interactive outcome judge or convert the completed platform run to failure.
@@ -1083,7 +1083,7 @@ def test_metadata_goal_fields_with_values_keep_clean_path() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1099,7 +1099,7 @@ def test_metadata_boolean_goal_paths_count_as_present_content() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_boolean_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1109,7 +1109,7 @@ def test_path_summary_goal_paths_with_boolean_flags_keep_clean_path() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1119,7 +1119,7 @@ def test_goal_path_alias_without_exact_declared_path_is_flagged_as_no_goal_conte
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1129,7 +1129,7 @@ def test_null_goal_path_value_does_not_fall_back_to_alias_field() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1139,7 +1139,7 @@ def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1153,7 +1153,7 @@ def test_top_level_array_goal_value_paths_keep_clean_path() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_top_level_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1182,7 +1182,7 @@ def test_downloaded_files_satisfy_registered_download_goal_paths() -> None:
     ]
     ctx.code_artifact_metadata = {"download_statement": entry}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1197,7 +1197,7 @@ def test_array_goal_value_path_does_not_match_scalar_root() -> None:
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_top_level_goal_fields()}
 
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1219,7 +1219,7 @@ def test_empty_goal_collections_without_blocker_are_flagged() -> None:
     ctx = _ctx(result["data"]["blocks"])
 
     assert _run_blocks_structured_blocker_message(result) is None
-    _, empty_data_blocks, _ = _analyze_run_blocks(result)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is True
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
@@ -1231,7 +1231,7 @@ def test_empty_goal_collections_without_blocker_are_flagged() -> None:
 
 def test_neutral_status_string_does_not_redeem_empty_collections() -> None:
     result = _run_result([_code_block("search_registry_person", {"status": "completed", "records": []})])
-    _, empty_data_blocks, _ = _analyze_run_blocks(result)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is True
 
 
@@ -1244,7 +1244,7 @@ def test_falsy_blocker_flags_and_action_only_outputs_do_not_trip() -> None:
         ]
     )
     assert _run_blocks_structured_blocker_message(result) is None
-    _, empty_data_blocks, _ = _analyze_run_blocks(result)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is False
 
 
@@ -1268,7 +1268,7 @@ def test_verification_key_counts_as_goal_content_for_code_outputs() -> None:
         [_code_block("verify_listing", {"verification_results": [{"name": "DOE, JANE", "verified": True}]})]
     )
     assert _run_blocks_structured_blocker_message(result) is None
-    _, empty_data_blocks, _ = _analyze_run_blocks(result)
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is False
 
 
@@ -1316,7 +1316,7 @@ def test_declared_outcome_keys_exempt_from_blocker_term_matching() -> None:
     result = _run_result([block])
     assert _run_blocks_structured_blocker_message(result) is not None
     assert _run_blocks_structured_blocker_message(result, _MetadataCtx(metadata)) is None
-    _, empty_data_blocks, _ = _analyze_run_blocks(result, _MetadataCtx(metadata))
+    _, empty_data_blocks, _, _ = _analyze_run_blocks(result, _MetadataCtx(metadata))
     assert empty_data_blocks is False
 
 

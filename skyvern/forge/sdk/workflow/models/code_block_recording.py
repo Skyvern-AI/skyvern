@@ -16,6 +16,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     PendingAction,
+    PlaywrightInputDefaults,
     RecordingPage,
     recorded_action_from_payload,
 )
@@ -95,6 +96,8 @@ class CodeBlockActionRecording:
         workflow_run_context: WorkflowRunContext,
         redaction_parameters: dict[str, object] | None = None,
         credential_release_guard: CredentialReleaseGuard | None = None,
+        strategy_aware_typing: bool = False,
+        playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self._code_block = code_block
         self._page = page
@@ -117,6 +120,8 @@ class CodeBlockActionRecording:
             on_action=self._recorded_action_sink,
             on_pending_action=self._page_call_still_pending,
             credential_release_guard=credential_release_guard,
+            strategy_aware_typing=strategy_aware_typing,
+            playwright_input_defaults=playwright_input_defaults,
         )
 
     def set_redaction_parameters(self, parameters: dict[str, object]) -> None:

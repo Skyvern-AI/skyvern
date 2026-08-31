@@ -1088,6 +1088,44 @@ async def test_setup_workflow_run_uses_selected_rotating_credential_for_profile_
     )
 
 
+def test_managed_browser_profile_digest_key_avoids_delimiter_collision() -> None:
+    # A naive "|".join(rendered_key, credential_segment) lets two different (key, credential) pairs
+    # collide onto the same digest, since rendered_key is an unrestricted Jinja render that can
+    # itself contain "|" — e.g. key renders "acct|X" with credential "Y" vs. key "acct" with
+    # credential "X|Y" both naively joining to "acct|X|Y". That would silently reunite two distinct
+    # credentials' state on one managed profile, the exact bug SKY-15192 fixes.
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential(browser_profile_key="unused")
+
+    digest_key_a, _ = service._managed_browser_profile_digest_key(workflow, {"login_cred": "Y"}, rendered_key="acct|X")
+    digest_key_b, _ = service._managed_browser_profile_digest_key(workflow, {"login_cred": "X|Y"}, rendered_key="acct")
+
+    assert digest_key_a != digest_key_b
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_separates_managed_profile_by_credential_without_key_reference() -> None:
+    # SKY-15192: browser_profile_key is unset (or doesn't reference the rotating credential
+    # parameter), so before the fix every credential in the pool rendered the same empty digest and
+    # collapsed onto one shared managed profile. The selected credential must still segment the
+    # profile on its own.
+    result, mock_app, _, caught = await _attempt_setup_rotation_profile_run(
+        select_side_effect="cred_b",
+        profile_id="bp_selected",
+        browser_profile_key=None,
+    )
+
+    assert caught is None
+    assert result is not None
+    assert result.browser_profile_id == "bp_selected"
+    mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile.assert_awaited_once_with(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        browser_profile_key_digest=build_browser_profile_key_digest("cred_b"),
+        name="Workflow (auto-saved: cred_b)",
+    )
+
+
 @pytest.mark.asyncio
 async def test_keyed_setup_workflow_run_fails_when_rotation_selection_fails() -> None:
     result, _, service, caught = await _attempt_setup_rotation_profile_run(

@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     render_terminal_message,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import (
+    _approve_server_verified_google_sheet_bindings,
     _approved_run_credential_ids,
     _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
@@ -58,6 +59,23 @@ def _google(
         created_at=datetime(2026, 8, 15),
         modified_at=datetime(2026, 8, 15),
     )
+
+
+def _listed_integrations(*credentials: GoogleOAuthCredentialBase) -> list[dict[str, object]]:
+    return [
+        {
+            "tool": "list_integrations",
+            "integrations": [
+                {
+                    "connection_id": credential.id,
+                    "provider": "google",
+                    "state": credential.state,
+                    "scopes_granted": list(credential.scopes_granted),
+                }
+                for credential in credentials
+            ],
+        }
+    ]
 
 
 def test_persisted_account_choice_allows_missing_display_email() -> None:
@@ -581,6 +599,122 @@ async def test_named_account_with_no_server_owned_choice_selects_nothing_and_sta
 
     assert selected_connected_account_id(offered, named_message) is None
     assert f'"connection_id":"{NAMED_PICK_ACCOUNT_ID}"' in connected_account_choice_context(offered, named_message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cited_connection_id", "active_connections"),
+    [
+        ("goac_inactive", [_google("goac_other", "Other active account")]),
+        ("goac_unknown", []),
+    ],
+)
+async def test_inactive_or_unknown_model_bound_account_stays_authority_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    cited_connection_id: str,
+    active_connections: list[GoogleOAuthCredentialBase],
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_credentials_for_org",
+        AsyncMock(return_value=active_connections),
+    )
+    policy = request_policy_module.RequestPolicy()
+
+    approved = await _approve_server_verified_google_sheet_bindings(
+        [(SHEETS_BLOCK_LABEL, cited_connection_id)],
+        tool_activity=_listed_integrations(_google(cited_connection_id, "Cited account")),
+        organization_id="org-1",
+        request_policy=policy,
+    )
+    blocker = _credential_run_approval_blocker_signal([cited_connection_id], policy)
+
+    assert approved == []
+    assert policy.run_approved_google_connection_ids == []
+    assert blocker is not None
+    assert blocker.blocker_kind == "authority_denied"
+
+
+@pytest.mark.asyncio
+async def test_model_bound_account_requires_sheets_scope_and_effective_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incompatible = _google("goac_gmail", "Gmail account").model_copy(
+        update={"scopes_granted": ["https://www.googleapis.com/auth/gmail.readonly"]}
+    )
+    lookup = AsyncMock(
+        return_value=[
+            incompatible,
+            _google("goac_not_executed", "Unused Sheets account"),
+            _google(NAMED_PICK_ACCOUNT_ID, "Sheets Writer"),
+        ]
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_credentials_for_org",
+        lookup,
+    )
+    policy = request_policy_module.RequestPolicy()
+
+    approved = await _approve_server_verified_google_sheet_bindings(
+        [(SHEETS_BLOCK_LABEL, NAMED_PICK_ACCOUNT_ID)],
+        tool_activity=_listed_integrations(incompatible, _google(NAMED_PICK_ACCOUNT_ID, "Sheets Writer")),
+        organization_id="org-1",
+        request_policy=policy,
+    )
+
+    assert approved == [NAMED_PICK_ACCOUNT_ID]
+    assert policy.run_approved_google_connection_ids == []
+    assert (
+        _credential_run_approval_blocker_signal(
+            [NAMED_PICK_ACCOUNT_ID],
+            policy,
+            additional_approved_ids=approved,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_bound_account_lookup_failure_preserves_authority_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_credentials_for_org",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+    policy = request_policy_module.RequestPolicy()
+
+    approved = await _approve_server_verified_google_sheet_bindings(
+        [(SHEETS_BLOCK_LABEL, NAMED_PICK_ACCOUNT_ID)],
+        tool_activity=_listed_integrations(_google(NAMED_PICK_ACCOUNT_ID, "Sheets Writer")),
+        organization_id="org-1",
+        request_policy=policy,
+    )
+
+    assert approved == []
+    assert policy.run_approved_google_connection_ids == []
+
+
+@pytest.mark.asyncio
+async def test_model_bound_account_without_same_turn_list_result_stays_authority_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lookup = AsyncMock(return_value=[_google(NAMED_PICK_ACCOUNT_ID, "Sheets Writer")])
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_credentials_for_org",
+        lookup,
+    )
+    policy = request_policy_module.RequestPolicy()
+
+    approved = await _approve_server_verified_google_sheet_bindings(
+        [(SHEETS_BLOCK_LABEL, NAMED_PICK_ACCOUNT_ID)],
+        tool_activity=[],
+        organization_id="org-1",
+        request_policy=policy,
+    )
+
+    assert approved == []
+    assert policy.run_approved_google_connection_ids == []
+    lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

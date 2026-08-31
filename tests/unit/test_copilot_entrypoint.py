@@ -156,7 +156,6 @@ async def _capture_seeded_turn(
         ),
         chat_history=[],
         global_llm_context=global_llm_context,
-        debug_run_info_text="",
         llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
         raw_secret_safety_handler=AsyncMock(
             return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}

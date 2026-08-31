@@ -220,6 +220,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     _browser_state: "BrowserState" = PrivateAttr()
     _clean_up_func: CleanupElementTreeFunc = PrivateAttr()
     _scrape_exclude: ScrapeExcludeFunc | None = PrivateAttr(default=None)
+    _document_loader_id: str | None = PrivateAttr(default=None)
 
     def __init__(self, **data: Any) -> None:
         missing_attrs = [attr for attr in ["_browser_state", "_clean_up_func"] if attr not in data]
@@ -230,12 +231,14 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         browser_state = data.pop("_browser_state")
         clean_up_func = data.pop("_clean_up_func")
         scrape_exclude = data.pop("_scrape_exclude")
+        document_loader_id = data.pop("_document_loader_id", None)
 
         super().__init__(**data)
 
         self._browser_state = browser_state
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
+        self._document_loader_id = document_loader_id
 
     @staticmethod
     def _is_pdf_embed(element: dict) -> str | None:

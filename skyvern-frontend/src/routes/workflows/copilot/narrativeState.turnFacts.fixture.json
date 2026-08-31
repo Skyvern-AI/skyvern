@@ -1,0 +1,807 @@
+{
+  "deadline-after-one-clean-run": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard. 1 block ran this turn. The recorded run completed, and its outcome was not evaluated. The turn reached its time limit.",
+    "proposalDisposition": "review_untested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "changed",
+          "coverage": "never_run",
+          "label": "extract_github_star_count",
+          "neverTested": true
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sheet",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "added",
+          "coverage": "never_run",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": true
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "error",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 1,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": "deadline_expired",
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard. 1 block ran this turn. The recorded run completed, and its outcome was not evaluated. The turn reached its time limit.",
+    "turnFacts": {
+      "authoredBlockCount": 3,
+      "blocksRunThisTurn": 1,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 1,
+      "ranCleanOnCurrentSource": false,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": "deadline_expired"
+    },
+    "turnId": "turn_deadline-after-one-clean-run",
+    "turnIndex": 0
+  },
+  "different-source-edit-one-of-two": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "proposalDisposition": "review_untested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "changed",
+          "coverage": "different_source",
+          "label": "extract_github_star_count",
+          "neverTested": true
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "never_run",
+          "label": "append_star_count_to_sheet",
+          "neverTested": true
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "added",
+          "coverage": "never_run",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": true
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 1,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "turnFacts": {
+      "authoredBlockCount": 3,
+      "blocksRunThisTurn": 1,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 0,
+      "ranCleanOnCurrentSource": false,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": null
+    },
+    "turnId": "turn_different-source-edit-one-of-two",
+    "turnIndex": 0
+  },
+  "facts-absent": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+    "proposalDisposition": "review_tested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "unchanged",
+          "label": "extract_github_star_count",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "label": "append_star_count_to_sheet",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": false
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 3,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+    "turnFacts": null,
+    "turnId": "turn_facts-absent",
+    "turnIndex": 0
+  },
+  "full-coverage": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+    "proposalDisposition": "review_tested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "extract_github_star_count",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sheet",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": false
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 3,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+    "turnFacts": {
+      "authoredBlockCount": 3,
+      "blocksRunThisTurn": 3,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 3,
+      "ranCleanOnCurrentSource": true,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": null
+    },
+    "turnId": "turn_full-coverage",
+    "turnIndex": 0
+  },
+  "mixed-edit-and-delete": {
+    "draft": {
+      "blockCount": 2,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "proposalDisposition": "review_untested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "changed",
+          "coverage": "different_source",
+          "label": "extract_github_star_count",
+          "neverTested": true
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "removed",
+          "label": "append_star_count_to_sheet"
+        }
+      ],
+      "duplicateWrites": []
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 3,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "turnFacts": {
+      "authoredBlockCount": 2,
+      "blocksRunThisTurn": 3,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 1,
+      "ranCleanOnCurrentSource": false,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": null
+    },
+    "turnId": "turn_mixed-edit-and-delete",
+    "turnIndex": 0
+  },
+  "partial-coverage": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "proposalDisposition": "review_untested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "changed",
+          "coverage": "never_run",
+          "label": "extract_github_star_count",
+          "neverTested": true
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sheet",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "added",
+          "coverage": "never_run",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": true
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 1,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "turnFacts": {
+      "authoredBlockCount": 3,
+      "blocksRunThisTurn": 1,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 1,
+      "ranCleanOnCurrentSource": false,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": null
+    },
+    "turnId": "turn_partial-coverage",
+    "turnIndex": 0
+  },
+  "renamed-block": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count_v2",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "proposalDisposition": "review_untested",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "added",
+          "coverage": "unknown",
+          "label": "extract_github_star_count_v2",
+          "neverTested": true
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sheet",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": false
+        },
+        {
+          "blockType": "code",
+          "change": "removed",
+          "label": "extract_github_star_count"
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 3,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time. I have a draft workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard.",
+    "turnFacts": {
+      "authoredBlockCount": 3,
+      "blocksRunThisTurn": 3,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 2,
+      "ranCleanOnCurrentSource": false,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": null
+    },
+    "turnId": "turn_renamed-block",
+    "turnIndex": 0
+  },
+  "satisfaction": {
+    "draft": {
+      "blockCount": 3,
+      "blockLabels": [
+        "extract_github_star_count",
+        "append_star_count_to_sheet",
+        "append_star_count_to_sales_marketing"
+      ],
+      "summary": null
+    },
+    "narrativeSummary": "I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+    "proposalDisposition": "auto_applicable",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "extract_github_star_count",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sheet",
+          "neverTested": false
+        },
+        {
+          "blockType": "google_sheets_write",
+          "change": "unchanged",
+          "coverage": "current_source",
+          "label": "append_star_count_to_sales_marketing",
+          "neverTested": false
+        }
+      ],
+      "duplicateWrites": [
+        {
+          "blockLabels": [
+            "append_star_count_to_sheet",
+            "append_star_count_to_sales_marketing"
+          ],
+          "blockType": "google_sheets_write"
+        }
+      ]
+    },
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": null,
+      "blocker_reason": null,
+      "blocks_run_this_turn": 3,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "proposal_pending",
+      "rendered_from_envelope": false,
+      "response_kind": "update",
+      "run_completed": true,
+      "run_display_reason": null,
+      "run_id": "wr_recorded",
+      "run_output_report": null,
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+    "turnFacts": {
+      "authoredBlockCount": 3,
+      "blocksRunThisTurn": 3,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 3,
+      "ranCleanOnCurrentSource": true,
+      "runCompleted": true,
+      "runId": "wr_recorded",
+      "terminalCause": null
+    },
+    "turnId": "turn_satisfaction",
+    "turnIndex": 0
+  },
+  "surface-20260820T082523349904": {
+    "blocks": [
+      {
+        "activity": [],
+        "blockType": "code",
+        "endedAt": "2026-08-20T08:25:06.357598+00:00",
+        "label": "read_heading",
+        "lastSeenIteration": 0,
+        "outcome": "not_evaluated",
+        "outcomeRole": "recorded",
+        "startedAt": null,
+        "state": "completed"
+      }
+    ],
+    "designActivity": [
+      {
+        "displayLabel": "Inspecting the page",
+        "id": "tc-call_XNWFbCYGnBdzH5FhZBxmnDjG",
+        "iteration": 0,
+        "kind": "tool_call",
+        "text": "Inspecting the page…",
+        "toolName": "inspect_page_for_composition"
+      },
+      {
+        "displayLabel": "Inspecting the page",
+        "id": "tr-call_XNWFbCYGnBdzH5FhZBxmnDjG",
+        "iteration": 0,
+        "kind": "tool_result",
+        "success": true,
+        "text": "Inspected the page",
+        "toolName": "inspect_page_for_composition"
+      },
+      {
+        "displayLabel": "Checking workflow block options",
+        "id": "tc-call_rGCSiY2vPKAql7diyBAosK4Y",
+        "iteration": 1,
+        "kind": "tool_call",
+        "text": "Checking workflow block options…",
+        "toolName": "get_block_schema"
+      },
+      {
+        "displayLabel": "Checking workflow block options",
+        "id": "tr-call_rGCSiY2vPKAql7diyBAosK4Y",
+        "iteration": 1,
+        "kind": "tool_result",
+        "success": true,
+        "text": "Schema for code",
+        "toolName": "get_block_schema"
+      },
+      {
+        "displayLabel": "Testing workflow",
+        "id": "tc-call_RTKazhVldm7xi5e3Z3YRuFXk",
+        "iteration": 2,
+        "kind": "tool_call",
+        "text": "Testing workflow…",
+        "toolName": "update_and_run_blocks"
+      },
+      {
+        "displayLabel": "Testing workflow",
+        "id": "tr-call_RTKazhVldm7xi5e3Z3YRuFXk",
+        "iteration": 2,
+        "kind": "tool_result",
+        "success": true,
+        "text": "Updated the workflow and ran it: completed",
+        "toolName": "update_and_run_blocks"
+      },
+      {
+        "displayLabel": "Editing block \"Read Heading\"",
+        "id": "tc-call_1HHXFiV5MeiZOEZe4XfOOV3K",
+        "iteration": 3,
+        "kind": "tool_call",
+        "text": "Editing block \"Read Heading\"…",
+        "toolName": "edit_block"
+      },
+      {
+        "displayLabel": "Editing block \"Read Heading\"",
+        "id": "tr-call_1HHXFiV5MeiZOEZe4XfOOV3K",
+        "iteration": 3,
+        "kind": "tool_result",
+        "success": true,
+        "text": "Editing block \"Read Heading\"",
+        "toolName": "edit_block"
+      },
+      {
+        "displayLabel": "Testing workflow",
+        "id": "tc-call_bQZ2EQkM6gukPffLSwTuVQPk",
+        "iteration": 4,
+        "kind": "tool_call",
+        "text": "Testing workflow…",
+        "toolName": "run_blocks_and_collect_debug"
+      },
+      {
+        "displayLabel": "Testing workflow",
+        "id": "tr-call_bQZ2EQkM6gukPffLSwTuVQPk",
+        "iteration": 4,
+        "kind": "tool_result",
+        "success": true,
+        "text": "Run read_heading: completed",
+        "toolName": "run_blocks_and_collect_debug"
+      }
+    ],
+    "designEnded": true,
+    "designStarted": true,
+    "draft": {
+      "blockCount": 1,
+      "blockLabels": ["read_heading"],
+      "summary": null
+    },
+    "endedAt": "2026-08-20T08:25:23.337402+00:00",
+    "narrativeSummary": "I created and tested the single read_heading block twice. It now returns both the top heading and page title; the latest run completed with non-empty output.",
+    "priorBlockCount": 0,
+    "proposalDisposition": "auto_applicable",
+    "responseKind": "build",
+    "responseType": "REPLY",
+    "review": {
+      "blocks": [
+        {
+          "blockType": "code",
+          "change": "added",
+          "coverage": "current_source",
+          "label": "read_heading",
+          "neverTested": false
+        }
+      ],
+      "duplicateWrites": []
+    },
+    "startedAt": "2026-08-20T08:23:33.076908+00:00",
+    "terminal": "response",
+    "terminalEnvelope": {
+      "attempted": "I created and tested the single read_heading block twice. It now returns both the top heading and page title; the latest run completed with non-empty output.",
+      "blocker_reason": null,
+      "blocks_run_this_turn": 1,
+      "envelope_version": 1,
+      "halt_kind": null,
+      "interruption": null,
+      "next_state": "stopped",
+      "rendered_from_envelope": false,
+      "response_kind": "stopped",
+      "run_display_reason": null,
+      "run_id": "wr_564921777870827706",
+      "run_output_report": "Recorded output from the latest completed run: {\"read_heading_output\":{\"evidence_text\":\"Example Domain | Example Domain\",\"heading_text\":\"Example Domain\",\"page_title\":\"Example Domain\"}}",
+      "run_verdict": "not_evaluated",
+      "terminal_cause": null,
+      "user_action_required": false,
+      "verified": false,
+      "workflow_applied": false
+    },
+    "terminalMessage": "I created and tested the single read_heading block twice. It now returns both the top heading and page title; the latest run completed with non-empty output.",
+    "testedBlockFingerprints": {
+      "read_heading": [
+        "67244b78a2676852d281c77e0f4ba3310b68d0083180318109a6b1de4e791b82",
+        "79e5d6d7ed953e0beb207ebb9033e9d6bbb72d7b68118b1df4133406608e339d"
+      ]
+    },
+    "turnFacts": {
+      "authoredBlockCount": 1,
+      "blocksRunThisTurn": 1,
+      "evaluationState": "not_evaluated",
+      "factsAvailable": true,
+      "matchingSourceBlockCount": 1,
+      "ranCleanOnCurrentSource": true,
+      "runCompleted": null,
+      "runId": "wr_564921777870827706",
+      "terminalCause": null
+    },
+    "turnId": "466012b32fd94e0ca274b00aa59650db",
+    "turnIndex": 0
+  }
+}

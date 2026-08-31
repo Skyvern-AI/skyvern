@@ -3,18 +3,21 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
+from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
-TerminalCause = Literal["deadline_expired", "max_turns_exceeded"]
+TerminalCause = Literal["deadline_expired", "max_turns_exceeded", "browser_operation_failed"]
 _FINAL_RUN_VERDICTS = frozenset({"not_demonstrated", "not_evaluated"})
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
+
+MINIMAL_HONEST_STOP = "I stopped without confirming the goal was met."
 
 INTERRUPTED_TERMINAL_REASON = "interrupted"
 INTERRUPTED_TERMINAL_HEADLINE = "This turn was interrupted before it could finish."
@@ -42,6 +45,9 @@ class TerminalOutcomeEnvelope(BaseModel):
     verified: bool
     workflow_applied: bool = False
     run_verdict: str | None = None
+    run_id: str | None = None
+    run_completed: bool | None = None
+    blocks_run_this_turn: int | None = None
     run_display_reason: str | None = None
     run_output_report: str | None = None
     blocker_reason: str | None = None
@@ -50,9 +56,18 @@ class TerminalOutcomeEnvelope(BaseModel):
     attempted: str | None = None
     response_kind: TerminalResponseKind
     terminal_cause: TerminalCause | None = None
+    failed_operation: BuildTestFailedOperation | None = None
+    proposal_present: bool = False
     interruption: InterruptedTurnFacts | None = None
     rendered_from_envelope: bool = False
     envelope_version: int = 1
+
+    @model_validator(mode="after")
+    def normalize_failed_operation_state(self) -> TerminalOutcomeEnvelope:
+        if self.failed_operation is not None:
+            self.verified = False
+            self.workflow_applied = False
+        return self
 
 
 def assemble_terminal_envelope(
@@ -68,12 +83,22 @@ def assemble_terminal_envelope(
     workflow_mutated: bool,
     workflow_attempted: bool,
     terminal_cause: TerminalCause | None = None,
+    blocks_run_this_turn: int | None = None,
+    failed_operation: BuildTestFailedOperation | None = None,
+    proposal_present: bool = False,
 ) -> TerminalOutcomeEnvelope | None:
-    run_outcome = _select_run_outcome_anchor(run_outcomes)
+    run_outcome = select_run_outcome_anchor(run_outcomes)
     run_verdict = run_outcome.verdict if run_outcome is not None else None
+    run_id = _clean_text(run_outcome.workflow_run_id) if run_outcome is not None else None
+    # Lifecycle and identity come from the same archived outcome, which a workflow edit
+    # never rewrites, so the two can never name different runs.
+    run_completed = run_outcome.run_completed if run_outcome is not None else None
     run_display_reason = _clean_text(run_outcome.display_reason) if run_outcome is not None else None
     run_output_report = _safe_output_report(run_outcome.output_report) if run_outcome is not None else None
     user_action_required = response_type == "ASK_QUESTION"
+    if failed_operation is not None:
+        verified = False
+        workflow_applied = False
     next_state = _derive_next_state(
         user_action_required=user_action_required,
         verified=verified,
@@ -87,11 +112,19 @@ def assemble_terminal_envelope(
         workflow_attempted=workflow_attempted,
         explicit_stop=bool(run_outcome or blocker_reason or halt_kind or terminal_cause),
     )
+    if failed_operation is not None:
+        if not user_action_required:
+            next_state = "stopped"
+            response_kind = "stopped"
+        terminal_cause = terminal_cause or failed_operation.kind
     return TerminalOutcomeEnvelope(
         next_state=next_state,
         verified=verified,
         workflow_applied=workflow_applied,
         run_verdict=run_verdict,
+        run_id=run_id,
+        run_completed=run_completed,
+        blocks_run_this_turn=blocks_run_this_turn,
         run_display_reason=run_display_reason,
         run_output_report=run_output_report,
         blocker_reason=_clean_text(blocker_reason),
@@ -100,12 +133,27 @@ def assemble_terminal_envelope(
         attempted=_clean_text(attempted),
         response_kind=response_kind,
         terminal_cause=terminal_cause,
+        failed_operation=failed_operation,
+        proposal_present=proposal_present,
     )
 
 
 def finalize_applied_state(
     envelope: TerminalOutcomeEnvelope, *, applied: bool, proposal_present: bool = False
 ) -> TerminalOutcomeEnvelope:
+    if envelope.failed_operation is not None:
+        if envelope.user_action_required:
+            return envelope.model_copy(
+                update={
+                    "verified": False,
+                    "workflow_applied": False,
+                    "next_state": "awaiting_user_input",
+                    "response_kind": "question",
+                }
+            )
+        return envelope.model_copy(
+            update={"verified": False, "workflow_applied": False, "next_state": "stopped", "response_kind": "stopped"}
+        )
     if envelope.user_action_required:
         next_state: TerminalNextState = "awaiting_user_input"
     elif envelope.verified and applied:
@@ -165,6 +213,27 @@ def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str
 
 def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:
     output_report = _safe_output_report(envelope.run_output_report)
+    if envelope.failed_operation is not None and not cancelled:
+        message = "I stopped after a browser operation failed while testing the workflow."
+        if envelope.proposal_present:
+            message = _append_sentence(
+                message,
+                "The untested draft is available for review, but the requested work was not confirmed.",
+            )
+        else:
+            message = _append_sentence(message, "The requested work was not confirmed.")
+        if envelope.user_action_required:
+            pending_question_intro = "The pending question is quoted below; its premise is not confirmed"
+            # The route may render an AgentResult again when envelope-authoritative copy is enabled.
+            # Preserve the first server-authored rendering instead of quoting that whole rendering as
+            # though it were the model's pending question.
+            if _text_contains(agent_message, message) and _text_contains(agent_message, pending_question_intro):
+                return agent_message, False
+            message = _append_sentence(
+                message,
+                f"{pending_question_intro}: {agent_message}",
+            )
+        return message, True
     # A deadline-expired turn already authored copy naming time and the draft's
     # state; replaced=True is what syncs it to the surfaces hydration prefers.
     # "completed" is excluded because replaced=True also overwrites a distinct
@@ -172,13 +241,20 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
     # "awaiting_user_input" needs no exclusion: it requires ASK_QUESTION, and a deadline
     # always exits through _build_wip_exit_result, which only ever builds REPLY results.
     if envelope.terminal_cause == "deadline_expired" and not cancelled and envelope.next_state != "completed":
-        if output_report and not _text_contains(agent_message, output_report):
-            return _append_sentence(agent_message, output_report), True
-        return agent_message, True
+        message = agent_message
+        facts = _recorded_run_facts(envelope)
+        # The agent's own deadline copy already names time, so the time-limit
+        # sentence rides along only with facts that copy does not carry.
+        if facts:
+            for sentence in [*facts, "The turn reached its time limit."]:
+                message = _append_sentence(message, sentence)
+        if output_report and not _text_contains(message, output_report):
+            return _append_sentence(message, output_report), True
+        return message, True
 
     # A plain reply with no concrete workflow/run/blocker evidence is an answer
-    # even though next_state remains "stopped"; only stopped-kind turns get the
-    # honest-stop replacement.
+    # even though next_state remains "stopped"; only stopped-kind turns carry the
+    # recorded facts.
     if cancelled:
         return agent_message, False
 
@@ -187,12 +263,16 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
             return _append_sentence(agent_message, output_report), True
         return agent_message, False
 
-    if envelope.run_verdict == "not_demonstrated":
-        message = "I ran the workflow, but I could not confirm the goal was met."
-    elif envelope.run_verdict == "not_evaluated":
-        message = "I ran the workflow. The latest recorded run completed."
-    else:
-        message = "I stopped without confirming the goal was met."
+    # Facts are appended to the agent's own text rather than replacing it: a message
+    # whose unsupported clause sits beside accurate detail loses that detail if replaced.
+    message = agent_message.strip() or MINIMAL_HONEST_STOP
+    recorded_facts = _recorded_run_facts(envelope)
+    # With no run anchored there is no fact to set beside the agent's text, and silence
+    # would let an unsupported success claim stand alone on a turn that stopped.
+    if not recorded_facts and message != MINIMAL_HONEST_STOP:
+        recorded_facts = [MINIMAL_HONEST_STOP]
+    for sentence in recorded_facts:
+        message = _append_sentence(message, sentence)
 
     if envelope.run_display_reason:
         message = _append_labeled_sentence(message, label="Reason", text=envelope.run_display_reason)
@@ -202,10 +282,25 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
     blocker_reason = envelope.blocker_reason
     if blocker_reason and not _text_contains(message, blocker_reason):
         message = _append_labeled_sentence(message, label="Evidence", text=blocker_reason)
-    return message, True
+    return message, message != agent_message
 
 
-def _select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> RecordedRunOutcome | None:
+def _recorded_run_facts(envelope: TerminalOutcomeEnvelope) -> list[str]:
+    facts: list[str] = []
+    ran = envelope.blocks_run_this_turn
+    if ran is not None:
+        facts.append(f"{ran} block{'' if ran == 1 else 's'} ran this turn.")
+    # The completion clause rides on the recorded lifecycle fact, never on the
+    # verdict: an unevaluated outcome says nothing about whether the run finished.
+    lifecycle = "The recorded run completed, and its" if envelope.run_completed else "The recorded run's"
+    if envelope.run_verdict == "not_evaluated":
+        facts.append(f"{lifecycle} outcome was not evaluated.")
+    elif envelope.run_verdict == "not_demonstrated":
+        facts.append(f"{lifecycle} outcome did not confirm the goal was met.")
+    return facts
+
+
+def select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> RecordedRunOutcome | None:
     final_outcomes = [outcome for outcome in run_outcomes if outcome.verdict in _FINAL_RUN_VERDICTS]
     if not final_outcomes:
         return None

@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
+from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
 from time import monotonic
@@ -265,6 +266,7 @@ from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
+from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -5667,10 +5669,11 @@ async def wrapper({default_args}):
         # failure must fail closed — callers gate copilot-only behavior on this, and it must
         # never mask a block failure.
         try:
-            return await app.DATABASE.workflows.is_workflow_copilot_authored(
+            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=workflow.organization_id,
             )
+            return copilot_authored is True
         except Exception:
             LOG.warning(
                 "Copilot-lineage lookup failed; failing closed",
@@ -7020,6 +7023,8 @@ async def wrapper({default_args}):
         # Every code block gets a container task v1 + step so its recorded calls render through
         # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
         # task also seats a later agent takeover on failure.
+        strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
+        playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,
@@ -7029,6 +7034,8 @@ async def wrapper({default_args}):
             workflow_run_context=workflow_run_context,
             redaction_parameters=serialized_parameter_values,
             credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
+            strategy_aware_typing=strategy_aware_typing,
+            playwright_input_defaults=playwright_input_defaults,
         )
         if credential_release_guard.is_armed:
             credential_release_guard.log_armed()
@@ -15283,8 +15290,23 @@ def _task_block_supports_v3(task_block: BaseTaskBlock) -> bool:
     return task_block.block_type in _TASK_V3_SUPPORTED_BLOCK_TYPES
 
 
-def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
-    """Whether a whole workflow run may be rerouted onto v3 by the A/B.
+class V3AbIneligibleReason(StrEnum):
+    """The closed set of reasons a run is excluded from the workflow-block engine A/B.
+
+    Parity with the bare-task route reason (``RunRouteReason`` in ``cloud/agent_functions.py``):
+    a closed set an operator can slice logs by, instead of a bare boolean that answers "is
+    eligible" but not "why not."
+    """
+
+    script_run = "script_run"
+    pinned_engine = "pinned_engine"
+    unsupported_block = "unsupported_block"
+    block_totp_verification_url = "block_totp_verification_url"
+    no_reroutable_blocks = "no_reroutable_blocks"
+
+
+def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: bool) -> V3AbIneligibleReason | None:
+    """Why a whole workflow run may not be rerouted onto v3 by the A/B, or None if it may.
 
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
     engine would drive one browser session with two engines, so no per-run outcome would be
@@ -15305,7 +15327,7 @@ def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool
     execution.
     """
     if is_script_run:
-        return False
+        return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
         if not isinstance(block, BaseTaskBlock):
@@ -15313,18 +15335,25 @@ def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
             continue
         if block.engine != RunEngine.skyvern_v1:
-            return False
+            return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
-            return False
+            return V3AbIneligibleReason.unsupported_block
         # A/B rerouting never admits a run with a verification-URL block (a block explicitly pinned to
         # v3 is honored as requested); bare tasks with a verification URL are rerouted. Block-run
         # code/budget dynamics are unmeasured (SKY-14816).
         if block.totp_verification_url:
-            return False
+            return V3AbIneligibleReason.block_totp_verification_url
         reroutable_blocks += 1
     # A run with nothing to reroute would be bucketed and recorded as an exposure while both arms
     # execute identically, diluting the experiment.
-    return reroutable_blocks > 0
+    if reroutable_blocks == 0:
+        return V3AbIneligibleReason.no_reroutable_blocks
+    return None
+
+
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+    """Whether a whole workflow run may be rerouted onto v3 by the A/B; see v3_ab_ineligibility_reason."""
+    return v3_ab_ineligibility_reason(blocks, is_script_run=is_script_run) is None
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:

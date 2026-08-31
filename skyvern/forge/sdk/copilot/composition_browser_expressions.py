@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _RENDERED_INTERCEPTS_OUTSIDE_CONTROL_ATTR,
     _RENDERED_STYLE_SNAPSHOT_ATTR,
     _RESULT_CONTAINER_HINTS,
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
 )
@@ -295,6 +296,7 @@ _JS_SELECTOR_CANDIDATES_HELPER = (
     "  const type = attr(el, 'type'); if (type) add(tag + '[type=\"' + type.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'type');"
     "  const classes = Array.from(el.classList || []).filter(Boolean);"
     "  if (classes.length) add(tag + classes.map((value) => '.' + esc(value)).join(''), 'class_list');"
+    "  add(tag, 'tag');"
     "  return candidates;"
     "};"
 )
@@ -315,6 +317,18 @@ def selector_candidates_expression(css_selector: str) -> str:
         f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
         "  return collectCandidates(el, requested);"
         "})()"
+    )
+
+
+def resolved_locator_selector_candidates_expression(requested_selector: str) -> str:
+    """Collect CSS identities from the exact element Playwright resolved at match index zero."""
+    requested = json.dumps(requested_selector)
+    return (
+        "(el) => {"
+        f"  const requested = {requested};"
+        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        "  return collectCandidates(el, requested);"
+        "}"
     )
 
 
@@ -475,9 +489,6 @@ COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
     "})()"
 )
 
-# Safety bound; an over-cap payload is returned as a typed structured-extraction failure.
-COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS = 120_000
-
 # Injected from composition_evidence so the JS matches the parser's caps/vocabulary (single source of truth).
 _STRUCTURED_CONST_HEADER = (
     f"const ANTI_BOT_PATTERNS={json.dumps(list(_ANTI_BOT_PATTERNS))};"
@@ -504,7 +515,9 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_PAGE_OBSTRUCTIONS={int(_MAX_PAGE_OBSTRUCTIONS)};"
     f"const MAX_VISIBLE_CONTROLS={int(_MAX_VISIBLE_CONTROLS)};"
     f"const MAX_VISIBLE_TEXT_EXCERPT_CHARS={int(_MAX_VISIBLE_TEXT_EXCERPT_CHARS)};"
-    f"const ANTI_BOT_SCAN_BYTES={int(_ANTI_BOT_SCAN_BYTES)};" + _JS_IMPLICIT_ROLE_HELPER
+    f"const ANTI_BOT_SCAN_BYTES={int(_ANTI_BOT_SCAN_BYTES)};"
+    + _JS_IMPLICIT_ROLE_HELPER
+    + f"const STRUCTURED_EVIDENCE_MAX_CHARS={int(COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS)};"
 )
 
 # Mirrors parse_composition_html's structural extraction; Python re-bounds the values to the exact caps.
@@ -1560,7 +1573,85 @@ const haystack = (pageTitle + '\n' + scanHtml.slice(0, ANTI_BOT_SCAN_BYTES)).toL
 const antiBotIndicators = ANTI_BOT_PATTERNS.filter((p) => haystack.includes(p));
 const visibleText = document.body ? (document.body.innerText || '') : '';
 
-return JSON.stringify({
+const boundedStructuredEvidence = (payload) => {
+  const pythonCharCount = (value) => Array.from(value).length;
+  let serialized = JSON.stringify(payload);
+  let serializedCharCount = pythonCharCount(serialized);
+  if (serializedCharCount <= STRUCTURED_EVIDENCE_MAX_CHARS) return serialized;
+
+  const originalCharCount = serializedCharCount;
+  const omissions = [];
+  payload.size_compaction = { original_char_count: originalCharCount, omissions: omissions };
+  const recordOmission = (category, omittedCount, unit) => {
+    if (omittedCount <= 0) return;
+    const existing = omissions.find((item) => item.category === category);
+    if (existing) existing.omitted_count += omittedCount;
+    else omissions.push({ category: category, omitted_count: omittedCount, unit: unit });
+  };
+  const refresh = () => {
+    serialized = JSON.stringify(payload);
+    serializedCharCount = pythonCharCount(serialized);
+  };
+  const shedWhileNeeded = (shed) => {
+    while (serializedCharCount > STRUCTURED_EVIDENCE_MAX_CHARS && shed()) refresh();
+  };
+  const shedArrayTail = (category) => () => {
+    const values = payload[category];
+    if (!Array.isArray(values) || !values.length) return false;
+    values.pop();
+    recordOmission(category, 1, 'entries');
+    return true;
+  };
+  const shedOptionRound = () => {
+    let removed = 0;
+    for (let formIndex = payload.forms.length - 1; formIndex >= 0; formIndex--) {
+      const fields = Array.isArray(payload.forms[formIndex].fields) ? payload.forms[formIndex].fields : [];
+      for (let fieldIndex = fields.length - 1; fieldIndex >= 0; fieldIndex--) {
+        const options = fields[fieldIndex].options;
+        if (!Array.isArray(options) || !options.length) continue;
+        options.pop();
+        removed += 1;
+      }
+    }
+    recordOmission('forms.fields.options', removed, 'entries');
+    return removed > 0;
+  };
+  const shedResultDetailRound = (key) => () => {
+    let removed = 0;
+    for (let index = payload.result_containers.length - 1; index >= 0; index--) {
+      const values = payload.result_containers[index][key];
+      if (!Array.isArray(values) || !values.length) continue;
+      values.pop();
+      removed += 1;
+    }
+    recordOmission('result_containers.' + key, removed, 'entries');
+    return removed > 0;
+  };
+
+  refresh();
+  shedWhileNeeded(() => {
+    if (!payload.visible_text_excerpt) return false;
+    const omittedCount = pythonCharCount(payload.visible_text_excerpt);
+    payload.visible_text_excerpt = '';
+    recordOmission('visible_text_excerpt', omittedCount, 'characters');
+    return true;
+  });
+  shedWhileNeeded(shedOptionRound);
+  shedWhileNeeded(shedResultDetailRound('sample_rows'));
+  shedWhileNeeded(shedResultDetailRound('rows'));
+  shedWhileNeeded(shedArrayTail('navigation_targets'));
+  shedWhileNeeded(shedArrayTail('clickable_controls'));
+  shedWhileNeeded(shedArrayTail('forms'));
+  shedWhileNeeded(shedArrayTail('result_containers'));
+  shedWhileNeeded(shedArrayTail('key_value_relations'));
+  shedWhileNeeded(shedArrayTail('visual_obstruction_candidates'));
+  shedWhileNeeded(shedArrayTail('modal_overlays'));
+  shedWhileNeeded(shedArrayTail('page_obstructions'));
+  shedWhileNeeded(shedArrayTail('challenge_controls'));
+  return serialized;
+};
+
+const structuredEvidence = {
   page_title: pageTitle,
   forms: forms,
   navigation_targets_truncated: navigationTargetsTruncated,
@@ -1580,7 +1671,8 @@ return JSON.stringify({
   visible_text_excerpt: visibleText.length > MAX_VISIBLE_TEXT_EXCERPT_CHARS * 2 ? visibleText.slice(0, MAX_VISIBLE_TEXT_EXCERPT_CHARS * 2) : visibleText,
   body_has_markup: !!(document.body && (document.body.children.length > 0 || (document.body.textContent || '').trim().length > 0)),
   anti_bot_indicators: antiBotIndicators,
-});
+};
+return boundedStructuredEvidence(structuredEvidence);
 """
 
 

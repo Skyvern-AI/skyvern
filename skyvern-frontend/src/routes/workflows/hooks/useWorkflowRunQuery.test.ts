@@ -8,6 +8,7 @@ import { retryTransientNetworkFailures } from "@/api/QueryClient";
 import {
   getRunStatusRefetchInterval,
   POLL_OUTAGE_BUDGET_MS,
+  RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,
 } from "./useWorkflowRunQuery";
 
@@ -81,7 +82,7 @@ describe("getRunStatusRefetchInterval", () => {
     ).toBe(RUN_STATUS_POLL_INTERVAL_MS);
   });
 
-  test("stops polling once the outage outlives its budget", () => {
+  test("retries at a quieter cadence once the outage outlives its budget", () => {
     const lastSuccess = 1_000_000;
     expect(
       getRunStatusRefetchInterval({
@@ -90,7 +91,7 @@ describe("getRunStatusRefetchInterval", () => {
         dataUpdatedAt: lastSuccess,
         errorUpdatedAt: lastSuccess + POLL_OUTAGE_BUDGET_MS + 1,
       }),
-    ).toBe(false);
+    ).toBe(RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS);
   });
 
   test("does not poll before the first successful fetch", () => {

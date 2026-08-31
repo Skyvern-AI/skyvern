@@ -1,13 +1,14 @@
-"""Asymmetric debug-session vs workflow-run semantics for LoginBlock credential profile.
+"""Explicit-session vs workflow-run semantics for LoginBlock credential profile.
 
-Debug-session runs (workflow_run.debug_session_id is not None) prioritize stream
-fidelity: attach the visible PBS, and keep the skip-login fast path only when the
-PBS profile actually matches the credential. Mismatched / missing PBS profile
-yields a structured warning, no profile_id write, no navigation_goal rewrite, and
-fall-through to ordinary LoginBlock execution so the user watches the actual
-login. Non-debug runs preserve existing behavior — credential-profile launches a
-fresh browser, no PBS attach. The decision lives in
-``WorkflowService._evaluate_debug_session_profile_decision``.
+Any run with an explicit browser_session_id — a debug session, or one supplied
+by a caller such as MCP's skyvern_login — prioritizes that live session:
+attach it, and keep the skip-login fast path only when its profile
+actually matches the credential. Mismatched / missing session profile yields a
+structured warning, no profile_id write, no navigation_goal rewrite, and
+fall-through to ordinary LoginBlock execution so the login runs for real in
+that session. A run with no explicit browser_session_id preserves the legacy
+behavior — credential-profile launches a fresh browser, no attach. The decision
+lives in ``WorkflowService._evaluate_debug_session_profile_decision``.
 """
 
 from __future__ import annotations
@@ -66,6 +67,30 @@ class TestDebugSessionProfileDecision:
             mock_app.DATABASE.browser_sessions.get_persistent_browser_session.assert_not_called()
 
         assert decision.attach_browser_session_id is None
+        assert decision.incompatible_reason is None
+
+    @pytest.mark.asyncio
+    async def test_non_debug_run_with_explicit_session_attaches_it(self) -> None:
+        """A plain (non-debug) run carrying an explicit browser_session_id — e.g.
+        MCP's skyvern_login supplying an already-created persistent session —
+        must attach that session exactly like a debug run does, instead of
+        ignoring it and booting a fresh browser from the credential's saved
+        profile."""
+        service = WorkflowService()
+        workflow_run = _workflow_run(debug_session_id=None)
+
+        with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+            mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
+                return_value=_pbs(browser_profile_id="bp_cred"),
+            )
+            decision = await service._evaluate_debug_session_profile_decision(
+                workflow_run=workflow_run,
+                browser_session_id="pbs_test",
+                resolved_browser_profile_id="bp_cred",
+                organization_id="o_test",
+            )
+
+        assert decision.attach_browser_session_id == "pbs_test"
         assert decision.incompatible_reason is None
 
     @pytest.mark.asyncio

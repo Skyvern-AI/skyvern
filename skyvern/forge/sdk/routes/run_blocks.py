@@ -238,6 +238,7 @@ async def login(
                 key=parameter_key,
                 vault_id=login_request.onepassword_vault_id,
                 item_id=login_request.onepassword_item_id,
+                totp_field_name=login_request.onepassword_totp_field_name,
             )
         ]
     elif login_request.credential_type == CredentialType.azure_vault:

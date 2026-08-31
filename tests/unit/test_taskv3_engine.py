@@ -6,6 +6,7 @@ from the tools test, so the engine's wiring is exercised without a real LLM or b
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import AsyncMock
@@ -16,6 +17,7 @@ import yarl
 
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.taskv3 import engine as engine_mod
 from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TURNS,
@@ -196,20 +198,39 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
 
 def test_runaway_backstops_scale_with_action_step_budget() -> None:
     # No action-step budget -> the guards are the engine's fixed defaults.
-    assert taskv3_runaway_backstops(None) == (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS)
-    assert taskv3_runaway_backstops(0) == (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS)
+    defaults = (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, engine_mod.DEFAULT_MAX_TOKENS)
+    assert taskv3_runaway_backstops(None) == defaults
+    assert taskv3_runaway_backstops(0) == defaults
     # Small cap: the fixed floors dominate, so a productive run keeps its historical headroom.
-    assert taskv3_runaway_backstops(10) == (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS)
-    # Large cap: both guards scale up so the action-step budget -- not the guards -- bounds the run.
-    big = 100
+    assert taskv3_runaway_backstops(10) == defaults
+    # Large cap: all guards scale up so the action-step budget -- not the guards -- bounds the run.
+    big = 80
     assert taskv3_runaway_backstops(big) == (
         big * MAX_TURNS_PER_ACTION_STEP,
         big * MAX_TOOL_CALLS_PER_ACTION_STEP,
+        big * engine_mod.MAX_TOKENS_PER_ACTION_STEP,
     )
     # Monotonic: a larger cap never yields smaller guards.
-    t_small, c_small = taskv3_runaway_backstops(20)
-    t_big, c_big = taskv3_runaway_backstops(80)
-    assert t_big >= t_small and c_big >= c_small
+    t_small, c_small, k_small = taskv3_runaway_backstops(20)
+    t_big, c_big, k_big = taskv3_runaway_backstops(80)
+    assert t_big >= t_small and c_big >= c_small and k_big >= k_small
+
+
+def test_runaway_backstops_token_ceiling_anchored_to_the_floor() -> None:
+    # The per-step token allowance is anchored so a budget at the action-step floor keeps exactly
+    # the historical 1.5M ceiling; only budgets above the floor get a proportionally higher one.
+    assert taskv3_runaway_backstops(engine_mod.MIN_ACTION_STEPS)[2] == engine_mod.DEFAULT_MAX_TOKENS
+    assert taskv3_runaway_backstops(2 * engine_mod.MIN_ACTION_STEPS)[2] == 2 * engine_mod.DEFAULT_MAX_TOKENS
+
+
+def test_runaway_backstops_token_ceiling_is_bounded() -> None:
+    # The token guard is a runaway BACKSTOP, not a budget: a caller-supplied step cap is not
+    # bounded at the route layer, so an extreme value must not carry the token ceiling away
+    # with it — the scaling clamps at a hard maximum.
+    assert engine_mod.MAX_TOKENS_CEILING == 4 * engine_mod.DEFAULT_MAX_TOKENS
+    assert taskv3_runaway_backstops(5000)[2] == engine_mod.MAX_TOKENS_CEILING
+    # Turn/tool-call guards keep their pre-existing proportional scaling.
+    assert taskv3_runaway_backstops(5000)[0] == 5000 * MAX_TURNS_PER_ACTION_STEP
 
 
 @pytest.mark.asyncio
@@ -459,6 +480,74 @@ async def test_engine_wires_failure_evidence_gate() -> None:
     )
     assert outcome.status == "failed"
     assert outcome.reason == "still blocked, re-verified"
+
+
+@pytest.mark.asyncio
+async def test_engine_forwards_the_page_probe_and_withholds_it_from_page_free_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Drop this kwarg anywhere on the way in and the loop classifies every unflagged error as
+    # non-poisoning -- the fail-open state -- with every loop-level test still green.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: list[object] = []
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.append(kwargs.get("page_probe"))
+        return LoopOutcome(status="completed", reason="ok")
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", page_probe=probe
+    )
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_probe=probe,
+        page_free=True,
+    )
+    assert captured == [probe, None]
+
+
+@pytest.mark.asyncio
+async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_free_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The innerHTML fingerprint sampler also drives the loop's auto-observe change decision (not just
+    # make_finish_tool's settle gate) -- drop it anywhere on the way to run_agent_tool_loop and
+    # auto-observe silently falls back to the document-identity probe for every in-page mutation.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: list[object] = []
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.append(kwargs.get("page_fingerprint"))
+        return LoopOutcome(status="completed", reason="ok")
+
+    async def fingerprint() -> str | None:
+        return "markup-1"
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_fingerprint=fingerprint,
+    )
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_fingerprint=fingerprint,
+        page_free=True,
+    )
+    assert captured == [fingerprint, None]
 
 
 @pytest.mark.asyncio
@@ -889,3 +978,91 @@ async def test_engine_system_prompt_dates_in_the_runs_timezone(monkeypatch: pyte
     system_prompt = loop_kwargs["system_prompt"]
     assert f"Today's date is {datetime.now(tz).strftime('%Y-%m-%d')}" in system_prompt, system_prompt[-200:]
     assert f"Today's date is {datetime.now(UTC).strftime('%Y-%m-%d')}" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_engine_drops_a_leftover_refresh_signal_when_the_loop_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run context outlives the run: a signal raised as the loop was cancelled must not fire on
+    # the next block's first action.
+    async def _cancelled_loop(*args: Any, **kwargs: Any) -> Any:
+        skyvern_context.current().refresh_working_page = True
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _cancelled_loop)
+    ctx = SkyvernContext(task_id="tsk_refresh_cancelled")
+    skyvern_context.set(ctx)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="noop"
+            )
+    finally:
+        skyvern_context.reset()
+    assert ctx.refresh_working_page is False
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_carries_auto_observe_guidance_only_when_the_flag_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SYSTEM_PROMPT itself must stay byte-identical to the flag-off prompt: the two auto-observe
+    # sentences belong in an addendum appended at the call site, never baked into the base constant,
+    # or TASK_V3_AUTO_OBSERVE=off would no longer be a no-op against the base engine.
+    from skyvern.config import settings
+    from skyvern.forge.taskv3.engine import SYSTEM_PROMPT
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+
+    when_auto_observe_present = "act from that snapshot instead of calling observe again"
+    when_batching_present = "put it in the same turn"
+
+    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", False)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="fill the form"
+    )
+    system_prompt = loop_kwargs["system_prompt"]
+    assert system_prompt.startswith(SYSTEM_PROMPT)
+    assert when_auto_observe_present not in system_prompt
+    assert when_batching_present not in system_prompt
+
+    loop_kwargs.clear()
+    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", True)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="fill the form"
+    )
+    system_prompt = loop_kwargs["system_prompt"]
+    assert when_auto_observe_present in system_prompt
+    assert when_batching_present in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_page_free_run_never_gets_auto_observe_guidance_even_with_the_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.config import settings
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", True)
+
+    async def no_page() -> Any:
+        raise AssertionError("page provider must never be consulted in page-free mode")
+
+    await run_task_v3_agent_loop(page_provider=no_page, llm_caller=_ScriptedCaller([]), goal="decide", page_free=True)
+    assert loop_kwargs["auto_observe"] is False
+    assert "act from that snapshot instead of calling observe again" not in loop_kwargs["system_prompt"]

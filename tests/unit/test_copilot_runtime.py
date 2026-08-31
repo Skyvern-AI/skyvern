@@ -109,6 +109,84 @@ def _make_ctx(*, api_key: str | None = "test-api-key") -> AgentContext:
     )
 
 
+def _manager_reporting_fixed_deadline(remaining_seconds: float | None) -> MagicMock:
+    manager = MagicMock()
+    manager.seconds_until_fixed_deadline = AsyncMock(return_value=remaining_seconds)
+    manager.close_session = AsyncMock()
+    manager.create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_fresh"))
+    manager.get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=_FakeBrowserContext()))
+    return manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remaining_seconds", "expected_session_id"),
+    [(30.0, "pbs_fresh"), (900.0, "pbs_held"), (None, "pbs_held")],
+    ids=["inside_final_minute", "time_left", "deadline_is_not_fixed"],
+)
+async def test_a_session_at_its_fixed_deadline_is_replaced_before_it_is_used(
+    monkeypatch: pytest.MonkeyPatch, remaining_seconds: float | None, expected_session_id: str
+) -> None:
+    """SKY-15044: on infrastructure that pins the deadline at provisioning, a session in its final
+    minute still attaches and then dies mid-call, so the attach cannot catch it. Time left, or a
+    deadline that is not fixed at all, must leave the held session and its page state alone."""
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    mock_manager = _manager_reporting_fixed_deadline(remaining_seconds)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_held"
+
+    assert await ensure_browser_session(ctx) is None
+    assert ctx.browser_session_id == expected_session_id
+
+
+@pytest.mark.asyncio
+async def test_a_run_dispatch_does_not_hand_out_a_session_at_its_fixed_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held id reaches a workflow run through verify_browser_session_by_attaching, which attaches
+    directly instead of going through ensure_browser_session. A run outlives the check by far more
+    than a tool call does, so this is the path where handing over an expiring session hurts most."""
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    mock_manager = _manager_reporting_fixed_deadline(30.0)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_held"
+
+    assert await runtime.verify_browser_session_by_attaching(ctx) is None
+    assert ctx.browser_session_id == "pbs_fresh"
+    mock_manager.create_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_read_that_failed_keeps_the_held_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A backend that could not answer is not an answer about the session. Discarding the id here
+    would throw away a live browser and its page state on a transient failure; the attach that
+    follows is the oracle for whether it is really gone."""
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    mock_manager = MagicMock()
+    mock_manager.seconds_until_fixed_deadline = AsyncMock(side_effect=RuntimeError("temporal unreachable"))
+    mock_manager.create_session = AsyncMock(side_effect=AssertionError("must not replace a live session"))
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_live"
+
+    assert await ensure_browser_session(ctx) is None
+    assert ctx.browser_session_id == "pbs_live"
+
+
 @pytest.mark.asyncio
 async def test_ensure_browser_session_error_dict_omits_raw_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     # The returned error envelope flows back through the tool/agent path and

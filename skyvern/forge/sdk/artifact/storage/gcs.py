@@ -28,6 +28,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
     key_is_org_scoped,
     presign_with_sensitive_cap,
@@ -662,6 +663,7 @@ class GcsStorage(BaseStorage):
         # downloaded files remain reachable.
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            artifacts = dedupe_run_scoped_download_artifacts(artifacts)
             if artifacts:
                 return await _file_infos_from_download_artifacts(artifacts)
 

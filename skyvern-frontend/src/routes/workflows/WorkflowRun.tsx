@@ -44,7 +44,10 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { runViewTabBasePath } from "@/routes/runs/runViewTabBasePath";
+import {
+  runOverviewScreenshotLocation,
+  runViewTabBasePath,
+} from "@/routes/runs/runViewTabBasePath";
 import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
@@ -104,6 +107,7 @@ function WorkflowRunRightColumn({
   timelineReady,
   onSetActiveItem,
   onSetActiveIteration,
+  onViewScreenshot,
 }: {
   activeItem: ReturnType<typeof findActiveItem>;
   activeIteration: number | null;
@@ -111,6 +115,7 @@ function WorkflowRunRightColumn({
   timelineReady: boolean;
   onSetActiveItem: (id: string) => void;
   onSetActiveIteration: (loopBlockId: string, iterationIndex: number) => void;
+  onViewScreenshot: (workflowRunBlockId: string) => void;
 }) {
   return (
     <ResizableTimelineSplit
@@ -148,6 +153,7 @@ function WorkflowRunRightColumn({
             activeIteration={activeIteration}
             timeline={timeline}
             timelineReady={timelineReady}
+            onViewScreenshot={onViewScreenshot}
             onThoughtSelect={(thought) => {
               onSetActiveItem(thought.thought_id);
             }}
@@ -168,6 +174,8 @@ function WorkflowRun() {
   const iterationParam = searchParams.get("iteration");
   const activeIteration = parseActiveIterationParam(iterationParam);
   const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const runBasePath =
+    runViewTabBasePath(useParams()) ?? `/runs/${workflowRunId}`;
   const workflowPermanentIdParam = useFirstParam("workflowPermanentId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
@@ -300,8 +308,9 @@ function WorkflowRun() {
     },
   });
 
+  const statusUnavailable = Boolean(error);
   const workflowRunIsCancellable =
-    workflowRun && statusIsCancellable(workflowRun);
+    !statusUnavailable && workflowRun && statusIsCancellable(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
 
@@ -499,6 +508,19 @@ function WorkflowRun() {
     });
   }
 
+  const handleViewScreenshot = useCallback(
+    (workflowRunBlockId: string) => {
+      const destination = runOverviewScreenshotLocation(
+        runBasePath,
+        searchParamsRef.current.toString(),
+        workflowRunBlockId,
+      );
+      searchParamsRef.current = new URLSearchParams(destination.search);
+      navigate(destination, { replace: true });
+    },
+    [navigate, runBasePath],
+  );
+
   function handleSetActiveIteration(
     loopBlockId: string,
     iterationIndex: number,
@@ -568,8 +590,6 @@ function WorkflowRun() {
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
-  const runBasePath =
-    runViewTabBasePath(useParams()) ?? `/runs/${workflowRunId}`;
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {
       label: "Overview",
@@ -631,7 +651,7 @@ function WorkflowRun() {
               {title}
               {workflowRunIsLoading ? (
                 <Skeleton className="h-8 w-28" />
-              ) : workflowRun ? (
+              ) : workflowRun && !statusUnavailable ? (
                 <div className="mt-[0.27rem] flex items-center gap-2">
                   <StatusBadge status={workflowRun?.status} />
                   <CredentialFallbackRetryBadge
@@ -912,7 +932,7 @@ function WorkflowRun() {
             <WorkflowRunStatusAlert
               status={workflowRun.status}
               title={workflow?.title}
-              visible={workflowRun && !isFinalized}
+              visible={!statusUnavailable && !isFinalized}
             />
           )}
         </div>
@@ -929,6 +949,7 @@ function WorkflowRun() {
           timelineReady={workflowRunTimeline !== undefined}
           onSetActiveItem={handleSetActiveItem}
           onSetActiveIteration={handleSetActiveIteration}
+          onViewScreenshot={handleViewScreenshot}
         />
       </div>
     </div>

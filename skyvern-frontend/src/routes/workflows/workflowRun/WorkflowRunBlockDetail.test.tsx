@@ -1,6 +1,10 @@
 // @vitest-environment jsdom
 
-vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
+const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: async () => ({ get: getSpy }),
+}));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
@@ -26,11 +30,23 @@ vi.mock("./WorkflowRunHumanInteraction", () => ({
   WorkflowRunHumanInteraction: () => null,
 }));
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import {
+  ActionTypes,
+  ArtifactType,
+  Status,
+  type ActionsApiResponse,
+} from "@/api/types";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem,
@@ -134,6 +150,7 @@ function renderActionDiagnosticsHref(
 
 afterEach(() => {
   cleanup();
+  getSpy.mockReset();
 });
 
 describe("WorkflowRunBlockDetail router", () => {
@@ -165,6 +182,103 @@ describe("WorkflowRunBlockDetail router", () => {
     // Switching sub-panels no longer repeats the failure.
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Inputs" }));
     expect(screen.queryByText("Could not locate the price element")).toBeNull();
+  });
+
+  it("routes a failed code block screenshot link to that block", async () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_failed",
+      block_type: "code",
+      error_codes: ["browser_operation_failed"],
+      failure_reason: "Browser operation failed.",
+    });
+    const onViewScreenshot = vi.fn();
+    getSpy.mockResolvedValue({
+      data: [
+        {
+          artifact_id: "art_screenshot",
+          artifact_type: ArtifactType.ActionScreenshot,
+          created_at: "2026-08-27T00:00:00Z",
+          modified_at: "2026-08-27T00:00:00Z",
+          organization_id: "org_1",
+          task_id: "task_1",
+          step_id: "step_1",
+          uri: "s3://bucket/screenshot.png",
+        },
+      ],
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunBlockDetail
+          activeItem={block}
+          timeline={[]}
+          onViewScreenshot={onViewScreenshot}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View block screenshot" }),
+    );
+    expect(onViewScreenshot).toHaveBeenCalledWith("wrb_failed");
+  });
+
+  it("offers no screenshot action when the failed block has no capture", async () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_failed",
+      block_type: "code",
+      error_codes: ["browser_operation_failed"],
+      failure_reason: "Browser operation failed.",
+    });
+    getSpy.mockResolvedValue({ data: [] });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunBlockDetail
+          activeItem={block}
+          timeline={[]}
+          onViewScreenshot={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(getSpy).toHaveBeenCalled());
+    expect(
+      screen.queryByRole("button", { name: "View block screenshot" }),
+    ).toBeNull();
+  });
+
+  it("does not look for a capture when the failure is not about page state", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_failed",
+      block_type: "code",
+      error_codes: ["sandbox_unavailable"],
+      failure_reason: "Sandbox unavailable.",
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunBlockDetail
+          activeItem={block}
+          timeline={[]}
+          onViewScreenshot={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "View block screenshot" }),
+    ).toBeNull();
+    expect(getSpy).not.toHaveBeenCalled();
   });
 
   it("shows a triggered-workflow failure once, not in a separate body section", () => {

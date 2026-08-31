@@ -1191,6 +1191,7 @@ class WorkflowRunBlockModel(Base):
     # Page URL at the moment the block failed. Distinct from the task's target url, which is
     # where the block was aimed rather than where it ended up.
     final_url = Column(String, nullable=True)
+    finish_reason = Column(String, nullable=True)
     error_codes = Column(JSON, nullable=True)
     engine = Column(String, nullable=True)
 

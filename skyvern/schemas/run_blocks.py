@@ -103,6 +103,11 @@ class LoginRequest(BaseRunBlockRequest):
     # 1Password credential
     onepassword_vault_id: str | None = Field(default=None, description="1Password vault ID")
     onepassword_item_id: str | None = Field(default=None, description="1Password item ID")
+    onepassword_totp_field_name: str | None = Field(
+        default=None,
+        description="1Password item field id or label to treat as the TOTP secret, overriding "
+        "1Password's own field-type detection",
+    )
 
     # Azure Vault credential
     azure_vault_name: str | None = Field(default=None, description="Azure Vault Name")

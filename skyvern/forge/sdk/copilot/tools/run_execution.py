@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -9,8 +10,8 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import Any, Literal, NotRequired, TypedDict
 from urllib.parse import urlparse
 
 import structlog
@@ -23,22 +24,33 @@ from skyvern.forge.sdk.copilot.active_run_session import (
     clear_active_run_session,
     publish_active_run_session,
 )
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locator_selector
 from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    INFRASTRUCTURE_RUNNER_ERROR_CODES,
     BuildTestEvidencePacket,
     BuildTestPacketDownload,
     BuildTestPacketFailure,
+    BuildTestPacketLocatorObservation,
+    BuildTestPacketLocatorUnobservedReason,
+    BuildTestPacketPageCapture,
     BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
+    BuildTestPacketRequestedOutput,
     BuildTestPacketRun,
+    BuildTestPacketRunBrowser,
     BuildTestPacketScreenshot,
     BuildTestPacketUnfinishedItem,
+    RecordedBuildTestOutcome,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
+    failed_operation_from_run_blocks_result,
+    post_run_page_capture_from_result,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
+    unresolved_runtime_block_failure_with_disposition,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
@@ -61,10 +73,14 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
 )
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    resolved_locator_selector_candidates_expression,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     model_visible_composition_evidence,
     parse_composition_html,
+    stamp_page_evidence_provenance,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext, PageObstruction
@@ -72,11 +88,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    PER_TOOL_BUDGET_FAILURE_CATEGORY,
-    _blocks_by_label,
-    block_shape_hashes_by_label,
-)
+from skyvern.forge.sdk.copilot.failure_tracking import _blocks_by_label, block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.frontier_provenance_dump import frontier_dump_root, trust_snapshot, write_packet
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
@@ -87,6 +99,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     BUILD_TEST_PACKET_KEY,
     build_run_blocks_response,
     iter_failure_reasons,
+    project_build_test_packet_for_llm,
     sanitize_tool_result_for_llm,
     truncate_output,
 )
@@ -104,14 +117,19 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     FrontierStartProvenance,
+    OriginRunRedactionRegistry,
     PreRunPageReference,
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
+    browser_page_custody_lock,
     ensure_browser_session,
+    register_sensitive_origin_run_lease,
+    release_sensitive_origin_run_lease,
     resolve_persistent_browser_state,
     verify_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    build_test_page_state_from_evidence,
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
@@ -124,11 +142,13 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotRunOutcomeUpdate,
     WorkflowCopilotRunStartedUpdate,
@@ -139,14 +159,19 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RECORDED_FAILURE_RESPONSE_MAX_CHARS
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+    is_sensitive_workflow_parameter,
+)
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
 from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -166,7 +191,6 @@ from ._shared import (
 )
 from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import (
-    _active_block_run_budget_seconds,
     _analyze_run_blocks,
     _artifact_challenge_flag_from_result,
     _looks_like_anti_bot_blocker,
@@ -180,12 +204,14 @@ from .composition_capture import (
     store_post_run_page_evidence,
 )
 from .credentials import (
+    _approve_server_verified_google_sheet_bindings,
     _credential_ids_validation_error,
     _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
     _extract_credential_ids_for_labels,
     _extract_credential_ids_from_tool_value,
     _extract_credential_ids_from_workflow_definition,
+    _google_sheet_connection_bindings_from_workflow_definition,
     _server_verified_google_account_choices,
 )
 from .frontier import (
@@ -243,21 +269,6 @@ _SANDBOX_REQUIRED_BLOCK_TYPES = frozenset(
     }
 )
 
-# Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
-# out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
-# a saturated runner gate says nothing about the code, so rewriting it cannot help.
-INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
-    {
-        "runner_unavailable",
-        "protocol_error",
-        "internal_error",
-        "child_exited",
-        "child_no_request",
-        "child_malformed_request",
-        "busy",
-    }
-)
-
 # Detached cleanup tasks held here so the garbage collector does not drop them
 # while they still have work to do, and so the "task exception was never
 # retrieved" warning cannot fire — each task adds a done-callback that logs
@@ -289,7 +300,7 @@ async def _cancel_run_task_if_not_final(
         # Shield run_task so OUR wait timeout does not send another cancel
         # through to it — the cancel we want is already pending.
         await asyncio.wait_for(asyncio.shield(run_task), timeout=5.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
+    except (TimeoutError, asyncio.CancelledError):
         pass
     except Exception:
         LOG.warning(
@@ -382,11 +393,18 @@ def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
         LOG.warning("Detached cancel fallback failed", exc_info=exc)
 
 
-def _copilot_sandbox_unavailable_result() -> dict[str, Any]:
+def _copilot_sandbox_unavailable_result(*, organization_id: str, workflow_permanent_id: str) -> dict[str, Any]:
     # No repair can make the sandbox reachable, so the result carries
     # UNRECOVERABLE_TOOL_ERROR to reach the contract's STOP lane. Without it the
     # refusal classifies as a generic FAILED_RUN and the enforcement loop nudges
     # the model to retry a run that never started.
+    # The single choke point every "sandbox unavailable" return goes through, so the
+    # org/workflow refusal rate is measurable regardless of which caller refused.
+    LOG.info(
+        "Copilot block run refused: sandboxed worker unavailable",
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
     return {
         "ok": False,
         "error": COPILOT_SANDBOX_UNAVAILABLE_ERROR,
@@ -407,34 +425,56 @@ def _copilot_sandbox_unavailable_result() -> dict[str, Any]:
 
 
 async def _attach_action_traces(
-    blocks: list,
+    blocks: list[WorkflowRunBlock],
     results: list[dict[str, Any]],
     organization_id: str,
+    *,
+    include_completed: bool = False,
 ) -> None:
-    """For non-success blocks with a task_id, fetch and attach a compact action trace."""
-    failed_task_ids = [
-        b.task_id for b, r in zip(blocks, results) if b.task_id and r.get("status") in _FAILED_BLOCK_STATUSES
+    """Fetch compact retained actions for failed blocks, or every block in the just-finished run."""
+    task_ids = [
+        block.task_id
+        for block, result in zip(blocks, results)
+        if block.task_id and (include_completed or result.get("status") in _FAILED_BLOCK_STATUSES)
     ]
-    if not failed_task_ids:
+    if not task_ids:
         return
 
-    rows = await app.DATABASE.tasks.get_recent_actions_for_tasks(
-        task_ids=failed_task_ids,
-        organization_id=organization_id,
-    )
+    try:
+        rows = await app.DATABASE.tasks.get_recent_actions_for_tasks(
+            task_ids=task_ids,
+            organization_id=organization_id,
+        )
+    except Exception:
+        if not include_completed:
+            raise
+        LOG.warning(
+            "Failed to load optional completed-run action observations",
+            organization_id=organization_id,
+            task_count=len(task_ids),
+            exc_info=True,
+        )
+        return
 
-    actions_by_task: dict[str, list] = defaultdict(list)
+    actions_by_task: dict[str, list[Action]] = defaultdict(list)
     for row in rows:
         if row.task_id is not None:
             actions_by_task[row.task_id].append(row)
 
     for block, block_result in zip(blocks, results):
-        if block_result.get("status") not in _FAILED_BLOCK_STATUSES or not block.task_id:
+        task_id = block.task_id
+        if not task_id or (not include_completed and block_result.get("status") not in _FAILED_BLOCK_STATUSES):
             continue
-        task_actions = actions_by_task.get(block.task_id, [])
+        task_actions = actions_by_task.get(task_id, [])
+        newest_step_id = next(
+            (step_id for action in task_actions if isinstance(step_id := action.step_id, str) and step_id),
+            None,
+        )
+        if newest_step_id is not None:
+            block_result["step_id"] = newest_step_id
         action_trace = []
         for action in task_actions:
-            entry = {
+            entry: dict[str, str | int | None] = {
                 "action": action.action_type,
                 "status": action.status,
                 "reasoning": action.reasoning[:150] if action.reasoning else None,
@@ -442,22 +482,36 @@ async def _attach_action_traces(
             }
             output = action.output
             code_line = output.get("code_line") if isinstance(output, dict) else None
-            if action.status == ActionStatus.failed:
+            if action.status == ActionStatus.failed and type(code_line) is int:
                 # code_line is the code-block recorder's stamp. Gating on it keeps this to the
                 # recorder's own rows: personalize_action writes the typed-in field value to
                 # response, which is user data and must not reach the packet.
-                if type(code_line) is int:
-                    entry["code_line"] = code_line
-                    if action.action_type == ActionType.NULL_ACTION and action.description:
-                        entry["description"] = action.description[:150]
-                    if action.response:
-                        # Persistence masks registered secrets and parameters; a token the block
-                        # obtained at runtime is in neither registry, so screen it here too.
-                        entry["response"] = redact_raw_secrets_for_prompt(action.response)[
-                            :RECORDED_FAILURE_RESPONSE_MAX_CHARS
-                        ]
+                entry["code_line"] = code_line
+                if action.response:
+                    # Persistence masks registered secrets and parameters; a token the block
+                    # obtained at runtime is in neither registry, so screen it here too.
+                    entry["response"] = redact_raw_secrets_for_prompt(action.response)[
+                        :RECORDED_FAILURE_RESPONSE_MAX_CHARS
+                    ]
             action_trace.append(entry)
         block_result["action_trace"] = action_trace
+
+
+def _recorded_run_block_result(block: WorkflowRunBlock) -> dict[str, Any]:
+    """Project one persisted run-block row without dropping its machine identity."""
+    result: dict[str, Any] = {
+        "label": block.label,
+        "block_type": block.block_type.name,
+        "status": block.status,
+    }
+    result["workflow_run_block_id"] = block.workflow_run_block_id
+    if block.task_id:
+        result["task_id"] = block.task_id
+    if block.failure_reason:
+        result["failure_reason"] = block.failure_reason
+    if block.error_codes:
+        result["error_codes"] = list(block.error_codes)
+    return result
 
 
 async def _fetch_last_screenshot_b64(task_id: str, organization_id: str) -> str | None:
@@ -580,15 +634,9 @@ async def _recorded_watchdog_block_receipts(workflow_run_id: str, organization_i
     except Exception:
         LOG.debug("Failed to load block receipts after watchdog exit", workflow_run_id=workflow_run_id, exc_info=True)
         return []
-    receipts: list[dict[str, Any]] = []
-    for block in blocks:
-        label = getattr(block, "label", None)
-        raw_status = getattr(block, "status", None)
-        enum_value = getattr(raw_status, "value", None)
-        status = enum_value if isinstance(enum_value, str) else raw_status
-        if isinstance(label, str) and label and isinstance(status, str) and status:
-            receipts.append({"label": label, "status": status})
-    return receipts
+    # The same projection a normal run's receipts get: a block that failed before the watchdog exit
+    # failed for a reason, and dropping it here left that failure with no identity to repair.
+    return [_recorded_run_block_result(block) for block in blocks if block.status]
 
 
 def _forget_browser_position(ctx: CopilotContext) -> None:
@@ -606,6 +654,24 @@ def _block_end_urls_by_label(run_block_rows: list[WorkflowRunBlock]) -> dict[str
         if block.label and final_url is not None:
             end_urls[block.label] = final_url
     return end_urls
+
+
+async def _resolve_post_run_page_info(
+    ctx: CopilotContext,
+    *,
+    run_block_rows: list[WorkflowRunBlock],
+    dispatch_to_worker: bool,
+    sensitive_origin_run: bool,
+    run_session_id: str | None,
+) -> tuple[str, str, str | None]:
+    """Return model-visible terminal page facts without reading or retaining a sensitive origin."""
+    if sensitive_origin_run:
+        return "", "", None
+    if dispatch_to_worker:
+        dispatched_end_url = _dispatched_end_url(run_block_rows)
+        return dispatched_end_url or "", "", dispatched_end_url
+    current_url, page_title = await _fallback_page_info(ctx, session_id_override=run_session_id)
+    return current_url, page_title, None
 
 
 NO_PERSISTED_END_URL = "No worker-persisted final URL exists for this run; the page it ended on is unknown."
@@ -637,6 +703,19 @@ def _dispatched_end_url(run_block_rows: list[WorkflowRunBlock]) -> str | None:
     return screened
 
 
+def _failing_code_line(action_trace: Any) -> int | None:
+    """The code-block recorder's line stamp on the newest failed action, if it recorded one."""
+    if not isinstance(action_trace, list):
+        return None
+    for entry in action_trace:
+        if not isinstance(entry, dict):
+            continue
+        code_line = entry.get("code_line")
+        if type(code_line) is int:
+            return code_line
+    return None
+
+
 def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
     """Render the six newest action entries chronologically for the compact packet."""
     if not action_trace:
@@ -648,7 +727,6 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
         action = entry.get("action") or "?"
         status = entry.get("status") or ""
         element = entry.get("element")
-        description = entry.get("description")
         response = entry.get("response")
         code_line = entry.get("code_line")
         bits = [str(action)]
@@ -658,12 +736,56 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
             bits.append(str(status))
         if isinstance(response, str) and response:
             bits.append(f"response={response}")
-        elif isinstance(description, str) and description:
-            bits.append(f"description={description}")
         if type(code_line) is int:
             bits.append(f"code_line={code_line}")
         summary.append(" ".join(bits).strip())
     return summary
+
+
+def _retained_action_observations(results: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Render the newest six safe action facts chronologically from newest-block-first results."""
+    bounded_newest: list[dict[str, Any]] = []
+    entries_seen = 0
+    for block_result in results:
+        action_trace = block_result.get("action_trace")
+        if not isinstance(action_trace, list):
+            continue
+        for entry in action_trace:
+            entries_seen += 1
+            if isinstance(entry, dict):
+                bounded_newest.append(entry)
+            if entries_seen == 6:
+                break
+        if entries_seen == 6:
+            break
+
+    observations: list[str] = []
+    for entry in reversed(bounded_newest):
+        raw_action = entry.get("action")
+        raw_status = entry.get("status")
+        if not isinstance(raw_action, str) or not isinstance(raw_status, str):
+            continue
+        try:
+            action = ActionType(raw_action)
+            status = ActionStatus(raw_status)
+        except ValueError:
+            continue
+        observation = f"{action.value} {status.value}"
+        code_line = entry.get("code_line")
+        if type(code_line) is int:
+            observation += f" code_line={code_line}"
+        observations.append(observation)
+    return observations
+
+
+def _failure_action_trace_summary(failed_result: Mapping[str, Any] | None) -> list[str]:
+    """Keep code-recorder diagnostics; native task rows use only the safe typed projection."""
+    if failed_result is None:
+        return []
+    action_trace = failed_result.get("action_trace")
+    if _failing_code_line(action_trace) is not None:
+        return _summarize_action_trace(action_trace)
+    return _retained_action_observations([failed_result])
 
 
 # Watchdog exit reasons. ``success`` means the run reached a trustworthy
@@ -679,7 +801,6 @@ WatchdogExitReason = Literal[
     "success",
     "stagnation",
     "ceiling",
-    "per_tool_budget",
     "task_exit_unfinalized",
     "paused",
 ]
@@ -798,6 +919,10 @@ async def _watchdog_error_message(
     ``dispatch_to_worker`` runs skip the ``_fallback_page_info`` CDP read: the worker
     owns the run's persistent browser session, so the API must not attach to it.
     """
+    suppress_live_page = dispatch_to_worker or _origin_registry_contains_sensitive_values(
+        ctx.origin_run_redaction_registry,
+        workflow_run_id,
+    )
     if exit_reason == "stagnation":
         body = (
             f"The run has not made progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s. "
@@ -816,31 +941,6 @@ async def _watchdog_error_message(
             "elapses; nothing was cancelled. Tell the user the run is paused and what it is waiting "
             "for, and do not re-run these blocks."
         )
-    elif exit_reason == "per_tool_budget":
-        message = (
-            f"The run exceeded the {budget_seconds}s per-tool-call budget while still "
-            f"making progress. This budget exists so a single in-flight call cannot "
-            f"consume the whole copilot session.\n"
-            f"Run ID: {workflow_run_id}.\n"
-            f"Next step: call get_run_results with this workflow_run_id to inspect what "
-            f"the cancelled run actually completed (the in-flight block was cancelled "
-            f"mid-execution and may have left partial side effects). If the result "
-            f"includes a current_url, inspect that current page before any further "
-            f'block-running call with inspect_page_for_composition(target_url="current_page"). '
-            f"Generic screenshot/evaluate reads can help answer the user, but they do not "
-            f"satisfy the bounded page-evidence contract for workflow mutations. Use the "
-            f"bounded evidence to decide whether the answer is already visible, whether "
-            f"a challenge-gated submit/search control is still disabled, or which page-state "
-            f"change is still missing. Then call "
-            f"update_and_run_blocks with a smaller chain — the first 1-2 unverified blocks. "
-            f"Verified-prefix state is preserved, so the next call only re-runs from the new frontier. "
-            f"Do NOT retry the same chain unchanged — a longer "
-            f"run won't fit either."
-        )
-        current_url, _ = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
-        if current_url:
-            message += f" Browser was on: {current_url}"
-        return message
     elif exit_reason == "ceiling":
         body = (
             f"The run exceeded the {budget_seconds}s absolute ceiling "
@@ -859,7 +959,7 @@ async def _watchdog_error_message(
         f"Do NOT re-invoke block-running tools in this session without first calling "
         f"`get_run_results` with this workflow_run_id and reporting the result to the user."
     )
-    current_url, _ = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
+    current_url, _ = ("", "") if suppress_live_page else await _fallback_page_info(ctx)
     if current_url:
         message += f" Browser was on: {current_url}"
     return message
@@ -874,29 +974,11 @@ def _watchdog_user_facing_summary(
         return f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
     if exit_reason == "paused":
         return "The run is paused, waiting for a person to approve or reject it."
-    if exit_reason == "per_tool_budget":
-        return (
-            f"The run was still making progress but ran longer than the {budget_seconds}s "
-            "allowed for a single step, so it was stopped."
-        )
     if exit_reason == "ceiling":
         return f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
     if run is not None:
         return f"The run ended before recording a trustworthy terminal status. Last observed status: {run.status}."
     return "The run ended before recording a trustworthy terminal status."
-
-
-def _per_tool_budget_failure_category(budget_seconds: int) -> dict[str, Any]:
-    # Stable entry so consecutive budget trips hash to the same streak signature; the
-    # run id in ``error_msg`` would otherwise make every trip unique.
-    return {
-        "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
-        "confidence_float": 1.0,
-        "reasoning": (
-            f"The run was making progress but ran past the {budget_seconds}s "
-            "allowed for a single step, so it cannot fit in one call."
-        ),
-    }
 
 
 def _workflow_covers_labels(workflow: Workflow | None, labels: list[str]) -> bool:
@@ -1210,6 +1292,18 @@ def _workflow_output_parameter_indexes(
     return by_id, by_key
 
 
+def _workflow_parameters(workflow: Workflow | None) -> list[Any]:
+    if workflow is None:
+        return []
+    workflow_definition = workflow.workflow_definition
+    parameters = (
+        workflow_definition.get("parameters")
+        if isinstance(workflow_definition, Mapping)
+        else getattr(workflow_definition, "parameters", None)
+    )
+    return parameters if isinstance(parameters, list) else []
+
+
 def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) -> None:
     """Mutate ``data["blocks"]`` so registered output parameters share the block-output evidence path."""
 
@@ -1280,11 +1374,13 @@ async def _attach_registered_output_parameter_values(
             "Failed to read workflow run output parameters for copilot run evidence; "
             "deterministic graders lose authoritative output-parameter evidence",
             workflow_run_id=workflow_run_id,
-            organization_id=workflow.organization_id if workflow is not None else None,
+            organization_id=getattr(workflow, "organization_id", None),
             exc_info=True,
         )
+        data["registered_output_values_omission"] = "persisted registered output values were unavailable"
         return {}
     if not registered_rows:
+        data["registered_output_parameter_values"] = []
         return {}
 
     exact_output_identity = output_identity_workflow is not None
@@ -1342,6 +1438,26 @@ async def _attach_registered_output_parameter_values(
     return values_by_label
 
 
+def _requested_output_parameter_definitions(*, workflow_run_id: str, workflow: Workflow) -> list[dict[str, str | None]]:
+    index_by_id, _ = _workflow_output_parameter_indexes(workflow)
+    definitions: list[dict[str, str | None]] = []
+    for parameter in _workflow_parameters(workflow):
+        if not isinstance(parameter, OutputParameter):
+            continue
+        block_info = index_by_id.get(parameter.output_parameter_id, {})
+        definitions.append(
+            {
+                "workflow_run_id": workflow_run_id,
+                "output_parameter_id": parameter.output_parameter_id,
+                "output_parameter_key": parameter.key,
+                "description": parameter.description,
+                "block_label": block_info.get("block_label"),
+                "block_type": block_info.get("block_type"),
+            }
+        )
+    return definitions
+
+
 def _pin_pre_run_page_reference(ctx: CopilotContext, run_id: str) -> None:
     evidence = ctx.composition_page_evidence
     if not isinstance(evidence, Mapping):
@@ -1373,6 +1489,7 @@ def _attach_run_session_facts(
     data: dict[str, Any],
     *,
     used_fresh_run_session: bool,
+    run_detached_from_chat: bool,
     run_ok: bool,
     page_evidence: Mapping[str, Any] | None,
 ) -> None:
@@ -1380,6 +1497,9 @@ def _attach_run_session_facts(
     decision. ``challenge_stalled_fresh_session`` is omitted rather than set False when no
     structured page packet exists, so absent reads as unknown."""
     data["used_fresh_run_session"] = used_fresh_run_session
+    # A carried resume browser is also not the chat's, so detachment is the honest fact for
+    # "can I look at this run's page from here", not whether the session was minted.
+    data["run_detached_from_chat"] = run_detached_from_chat
     if not isinstance(page_evidence, Mapping):
         return
     data["challenge_stalled_fresh_session"] = (
@@ -1514,15 +1634,189 @@ async def _capture_registered_artifact_evidence(
         ctx.registered_artifact_evidence = RegisteredArtifactEvidence(entries=tuple(entries), workflow_run_id=run_id)
 
 
+# The failure this enrichment describes is often a wedged page, so its own reads need a
+# ceiling: page.evaluate has no action timeout, and hanging here would cancel the whole tool
+# and lose the run failure that was already recorded.
+_OBSERVED_LOCATOR_BUDGET_SECONDS = 8.0
+
+
+class AuthoredLocatorObservationRow(TypedDict):
+    authored_selector: str
+    match_count: NotRequired[int]
+    match_index: NotRequired[Literal[0]]
+    observed_candidates: NotRequired[list[str]]
+    unobserved_reason: NotRequired[BuildTestPacketLocatorUnobservedReason]
+
+
+def _unobserved_locator_row(
+    selector: str,
+    reason: BuildTestPacketLocatorUnobservedReason,
+) -> AuthoredLocatorObservationRow:
+    return {"authored_selector": selector, "unobserved_reason": reason}
+
+
+def _first_failed_result(results: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    return next((result for result in results if result.get("status") in _FAILED_BLOCK_STATUSES), None)
+
+
+def _failed_block_code(workflow: Workflow, failed_result: Mapping[str, Any] | None) -> str | None:
+    """The selected failed row's authored code, read from the definition rather than the run row.
+
+    ``run_blocks`` works with workflow_run_block rows, which carry status and output but no code.
+    A missing label cannot be correlated to definition code, so it must not fall through to a
+    later failed row whose locators belong to a different failure.
+    """
+    if failed_result is None:
+        return None
+    failed_label = failed_result.get("label")
+    if not isinstance(failed_label, str) or not failed_label:
+        return None
+    code_inputs = _selected_code_security_inputs(
+        _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+        selected_labels={failed_label},
+    )
+    return next((code_input.code for code_input in code_inputs if code_input.code), None)
+
+
+def _authored_literal_locator_selectors(code: str) -> list[str]:
+    """Every literal ``page.locator("...")`` the block names, ordered by source position.
+
+    ``ast.walk`` is breadth-first, so a nested locator would otherwise surface after a later
+    shallow one and the observations would not read in the order the block does.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    found: dict[str, tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        selector = _literal_locator_selector(node)
+        if selector and selector not in found:
+            found[selector] = (node.lineno, node.col_offset)
+    return sorted(found, key=lambda selector: found[selector])
+
+
+async def _observe_authored_locators(
+    ctx: AgentContext,
+    *,
+    run_session_id: str | None,
+    failed_block_code: str | None,
+    worker_owned: bool = False,
+    observation_deadline_exceeded: bool = False,
+) -> list[AuthoredLocatorObservationRow] | None:
+    """Resolve the failed block's own literal locators against the page the run ended on.
+
+    Reports the count and the identities the page carried. It does not rank them or pick a
+    replacement; the repair remains the model's.
+    """
+    if not failed_block_code:
+        return None
+    selectors = _authored_literal_locator_selectors(failed_block_code)
+    if not selectors:
+        return []
+    if worker_owned:
+        return [_unobserved_locator_row(selector, "worker_owned_run") for selector in selectors]
+    if observation_deadline_exceeded:
+        return [_unobserved_locator_row(selector, "observation_deadline_exceeded") for selector in selectors]
+    if run_session_id is None:
+        return [_unobserved_locator_row(selector, "run_browser_unavailable") for selector in selectors]
+
+    collected: dict[str, AuthoredLocatorObservationRow] = {}
+
+    async def _observe() -> BuildTestPacketLocatorUnobservedReason | None:
+        try:
+            browser_state = await resolve_persistent_browser_state(
+                session_id=run_session_id,
+                organization_id=ctx.organization_id,
+            )
+        except Exception:
+            LOG.debug("Run browser was unavailable for authored-locator observation", exc_info=True)
+            return "run_browser_unavailable"
+        if browser_state is None:
+            return "run_browser_unavailable"
+        # Creating one would count every authored selector against a blank page, so a run whose
+        # page has since closed would report as a dead locator rather than an unobserved one.
+        try:
+            page = await browser_state.get_working_page()
+        except Exception:
+            LOG.debug("Run page was unavailable for authored-locator observation", exc_info=True)
+            return "run_page_unavailable"
+        if page is None:
+            return "run_page_unavailable"
+        for selector in selectors:
+            try:
+                # Playwright's own engines (text=, :has-text, >> nth=) are exactly the locators most
+                # likely to be the failure, and querySelectorAll cannot parse them.
+                locator = page.locator(selector)
+                match_count = await locator.count()
+            except Exception:  # noqa: BLE001 - optional locator evidence must not replace the run failure
+                # This is optional enrichment after the run failure was recorded. Preserve that
+                # failure across browser/transport errors; cancellation and control flow inherit
+                # from BaseException and still propagate.
+                collected[selector] = _unobserved_locator_row(selector, "locator_resolution_failed")
+                continue
+            if not isinstance(match_count, int) or isinstance(match_count, bool) or match_count < 0:
+                collected[selector] = _unobserved_locator_row(selector, "locator_resolution_failed")
+                continue
+            if match_count == 0:
+                collected[selector] = {"authored_selector": selector, "match_count": 0}
+                continue
+            try:
+                raw_candidates = await locator.nth(0).evaluate(
+                    resolved_locator_selector_candidates_expression(selector)
+                )
+            except Exception:  # noqa: BLE001 - optional identity evidence must not replace the run failure
+                # Identity collection is the same optional seam as resolution above: an ordinary
+                # read failure is typed absence, while cancellation still escapes this handler.
+                collected[selector] = _unobserved_locator_row(selector, "identity_read_failed")
+                continue
+            candidates: list[str] = []
+            for candidate in raw_candidates if isinstance(raw_candidates, list) else []:
+                if not isinstance(candidate, Mapping):
+                    continue
+                candidate_selector = candidate.get("selector")
+                if isinstance(candidate_selector, str) and candidate_selector and candidate_selector not in candidates:
+                    candidates.append(candidate_selector)
+            if not candidates:
+                collected[selector] = _unobserved_locator_row(selector, "identity_read_failed")
+                continue
+            collected[selector] = {
+                "authored_selector": selector,
+                "match_count": match_count,
+                "match_index": 0,
+                "observed_candidates": candidates,
+            }
+        return None
+
+    incomplete_reason: BuildTestPacketLocatorUnobservedReason | None = None
+    try:
+        incomplete_reason = await asyncio.wait_for(_observe(), timeout=_OBSERVED_LOCATOR_BUDGET_SECONDS)
+    except TimeoutError:
+        # Partial results are kept: a timeout or a wedged browser is itself a fact about the page,
+        # and discarding what was already read would report the attempt as never made.
+        LOG.debug("Observing authored locators after the run did not finish", exc_info=True)
+        incomplete_reason = "observation_deadline_exceeded"
+    return [
+        collected.get(selector) or _unobserved_locator_row(selector, incomplete_reason or "locator_resolution_failed")
+        for selector in selectors
+    ]
+
+
 async def _capture_and_store_post_run_page(
     ctx: CopilotContext,
     *,
     run_session_id: str,
     run_id: str,
     current_url: str,
-) -> None:
+) -> BuildTestPacketPageCapture:
     """A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
+    registry = ctx.origin_run_redaction_registry
+    if registry is not None and registry.workflow_run_id == run_id and registry.contains_sensitive_values:
+        ctx.composition_page_evidence = None
+        return BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
     evidence, observed_session_id, _, captured_frame = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
@@ -1535,7 +1829,17 @@ async def _capture_and_store_post_run_page(
             source_browser_session_id=observed_session_id,
             run_browser_session_id=run_session_id,
         )
-        if captured_frame is not None and not preserved_stored_evidence:
+        same_run_stored_evidence = _same_run_page_evidence_for_result(ctx, run_id)
+        if (
+            captured_frame is not None
+            and not preserved_stored_evidence
+            and same_run_stored_evidence is not None
+            and not (
+                ctx.origin_run_redaction_registry is not None
+                and ctx.origin_run_redaction_registry.workflow_run_id == run_id
+                and ctx.origin_run_redaction_registry.contains_sensitive_values
+            )
+        ):
             enqueue_screenshot(
                 ctx,
                 captured_frame.b64,
@@ -1553,9 +1857,14 @@ async def _capture_and_store_post_run_page(
                 ),
                 captured_at=captured_frame.captured_at,
             )
-        return
+        stored_capture = post_run_page_capture_from_result(
+            {"workflow_run_id": run_id, "browser_session_id": run_session_id},
+            same_run_stored_evidence,
+        )
+        return stored_capture or BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
     if not post_run_inspection_cleanly_matches(ctx.composition_page_evidence, run_id):
         ctx.composition_page_evidence = None
+    return BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
 
 
 def _pre_run_baseline_is_provenance_valid(evidence: Mapping[str, Any] | None) -> bool:
@@ -1576,9 +1885,66 @@ def _select_terminal_page_artifact(artifacts: Sequence[Artifact]) -> Artifact | 
     return None
 
 
+def _workflow_requires_terminal_artifact_redaction(workflow: Workflow | None) -> bool:
+    if workflow is None:
+        return True
+    return any(is_sensitive_workflow_parameter(parameter) for parameter in _workflow_parameters(workflow))
+
+
+def _origin_registry_contains_sensitive_values(
+    registry: OriginRunRedactionRegistry | None,
+    workflow_run_id: str,
+) -> bool:
+    return registry is not None and registry.workflow_run_id == workflow_run_id and registry.contains_sensitive_values
+
+
+def _sensitive_parameter_keys_requiring_resolved_values(workflow: Workflow) -> list[str]:
+    return [
+        parameter.key
+        for parameter in _workflow_parameters(workflow)
+        if is_sensitive_workflow_parameter(parameter)
+        and not (
+            isinstance(parameter, WorkflowParameter)
+            and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+        )
+    ]
+
+
+def _mutable_redaction_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _mutable_redaction_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_redaction_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return [_mutable_redaction_value(item) for item in value]
+    return value
+
+
 async def _fetch_dispatched_terminal_page_evidence(
-    *, run_id: str, organization_id: str, current_url: str
+    *,
+    run_id: str,
+    organization_id: str,
+    current_url: str,
+    workflow: Workflow | None,
+    origin_redaction_registry: OriginRunRedactionRegistry | None,
 ) -> dict[str, Any] | None:
+    # Persisted HTML is untrusted. A sensitive workflow requires the active producer's serialized
+    # parameter registry, structurally bound to this exact run, before artifact bytes are read.
+    matching_registry = (
+        origin_redaction_registry
+        if origin_redaction_registry is not None and origin_redaction_registry.workflow_run_id == run_id
+        else None
+    )
+    origin_redaction_parameters = matching_registry.parameters if matching_registry is not None else None
+    if workflow is None or (
+        _workflow_requires_terminal_artifact_redaction(workflow)
+        and (
+            not origin_redaction_parameters
+            or matching_registry is None
+            or not matching_registry.contains_all_sensitive_values
+        )
+    ):
+        return None
     try:
         result = await app.DATABASE.artifacts.get_artifacts_for_run(
             run_id,
@@ -1604,12 +1970,24 @@ async def _fetch_dispatched_terminal_page_evidence(
         return None
     if artifact_bytes.startswith(_ZIP_MAGIC_PREFIXES):
         return None
-    html = artifact_bytes.decode("utf-8", errors="ignore")[:_MAX_POST_RUN_PAGE_HTML_CHARS]
-    if not html:
+    raw_html = artifact_bytes.decode("utf-8", errors="ignore")[:_MAX_POST_RUN_PAGE_HTML_CHARS]
+    scrubbed_html = (
+        app.AGENT_FUNCTION.redact_codeblock_parameter_values(
+            raw_html, _mutable_redaction_value(origin_redaction_parameters)
+        )
+        if origin_redaction_parameters
+        else raw_html
+    )
+    if not isinstance(scrubbed_html, str) or not scrubbed_html:
         return None
     try:
         evidence = await asyncio.wait_for(
-            asyncio.to_thread(parse_composition_html, html, inspected_url=current_url, current_url=current_url),
+            asyncio.to_thread(
+                parse_composition_html,
+                scrubbed_html,
+                inspected_url=current_url,
+                current_url=current_url,
+            ),
             timeout=_POST_RUN_PAGE_PARSE_TIMEOUT_SECONDS,
         )
     except Exception:
@@ -1621,19 +1999,28 @@ async def _fetch_dispatched_terminal_page_evidence(
 async def _capture_dispatched_terminal_page_evidence(
     ctx: CopilotContext,
     *,
+    workflow: Workflow | None = None,
     run_id: str,
     run_session_id: str,
     organization_id: str,
     current_url: str,
+    origin_redaction_registry: OriginRunRedactionRegistry | None = None,
 ) -> None:
     """Read the run's own browser session first; the worker HTML artifact is only a fallback because
     its presence never proved the run had reached its terminal page."""
     if _pre_run_baseline_is_provenance_valid(ctx.composition_page_evidence):
         _pin_pre_run_page_reference(ctx, run_id)
-    source = "cdp_run_session"
-    evidence, source_session_id, _, captured_frame = await _read_run_session_page_evidence(
-        ctx, run_session_id=run_session_id, current_url=current_url
-    )
+    matching_sensitive_registry = _origin_registry_contains_sensitive_values(origin_redaction_registry, run_id)
+    source = "worker_artifact" if matching_sensitive_registry else "cdp_run_session"
+    source_session_id: str | None
+    if matching_sensitive_registry:
+        evidence = None
+        source_session_id = run_session_id
+        captured_frame = None
+    else:
+        evidence, source_session_id, _, captured_frame = await _read_run_session_page_evidence(
+            ctx, run_session_id=run_session_id, current_url=current_url
+        )
     # A capture that landed on a substituted session can still look usable (a blank replacement page
     # satisfies the schema check), and stamping it honestly would then refuse it, leaving the run with
     # nothing. The worker artifact is the run's own page, so prefer it over any foreign-session read.
@@ -1646,7 +2033,11 @@ async def _capture_dispatched_terminal_page_evidence(
         captured_frame = None
         source_session_id = run_session_id
         evidence = await _fetch_dispatched_terminal_page_evidence(
-            run_id=run_id, organization_id=organization_id, current_url=current_url
+            run_id=run_id,
+            organization_id=organization_id,
+            current_url=current_url,
+            workflow=workflow or ctx.last_workflow,
+            origin_redaction_registry=origin_redaction_registry,
         )
     if evidence is None or not _dispatched_terminal_page_evidence_is_usable(evidence):
         return
@@ -1658,7 +2049,15 @@ async def _capture_dispatched_terminal_page_evidence(
         source_browser_session_id=source_session_id,
         run_browser_session_id=run_session_id,
     )
-    if captured_frame is not None and not preserved_stored_evidence:
+    if (
+        captured_frame is not None
+        and not preserved_stored_evidence
+        and not (
+            origin_redaction_registry is not None
+            and origin_redaction_registry.workflow_run_id == run_id
+            and origin_redaction_registry.contains_sensitive_values
+        )
+    ):
         enqueue_screenshot(
             ctx,
             captured_frame.b64,
@@ -1753,6 +2152,67 @@ def _resolve_run_data_and_unbound_keys(
     return data, unbound
 
 
+async def _bind_origin_run_redaction_registry(
+    ctx: CopilotContext,
+    *,
+    workflow_run_id: str,
+    parameter_values: Mapping[str, Any],
+    credential_ids: Sequence[str],
+    sensitive_parameter_keys: Sequence[str],
+) -> OriginRunRedactionRegistry:
+    serialized = app.AGENT_FUNCTION.serialize_codeblock_parameters(dict(parameter_values))
+    sensitive_values_complete = all(key in parameter_values and key in serialized for key in sensitive_parameter_keys)
+    credential_parameters: dict[str, Any] = {}
+    for index, credential_id in enumerate(credential_ids):
+        try:
+            db_credential = await app.DATABASE.credentials.get_credential(
+                credential_id,
+                organization_id=ctx.organization_id,
+            )
+            if db_credential is None:
+                sensitive_values_complete = False
+                continue
+            vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+            credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+            if credential_service is None:
+                sensitive_values_complete = False
+                continue
+            credential_item = await credential_service.get_credential_item(db_credential)
+            credential_item = await app.AGENT_FUNCTION.process_registered_credential_item(
+                workflow_run_id=workflow_run_id,
+                db_credential=db_credential,
+                credential_item=credential_item,
+            )
+            credential = credential_item.credential
+            if isinstance(credential, PasswordCredential) and (
+                credential.totp or credential.totp_identifier or db_credential.totp_identifier
+            ):
+                sensitive_values_complete = False
+                continue
+            credential_parameters[f"copilot_run_credential_{index}"] = credential.model_dump(exclude_none=True)
+        except Exception:
+            sensitive_values_complete = False
+            LOG.warning(
+                "Origin-run credential redaction registry could not be completed",
+                workflow_run_id=workflow_run_id,
+                credential_id=credential_id,
+                exc_info=True,
+            )
+    if credential_parameters:
+        serialized_credentials = app.AGENT_FUNCTION.serialize_codeblock_parameters(credential_parameters)
+        if set(serialized_credentials) != set(credential_parameters):
+            sensitive_values_complete = False
+        serialized.update(serialized_credentials)
+    registry = OriginRunRedactionRegistry(
+        workflow_run_id=workflow_run_id,
+        parameters=dict(serialized),
+        contains_sensitive_values=bool(sensitive_parameter_keys or credential_ids),
+        contains_all_sensitive_values=sensitive_values_complete,
+    )
+    ctx.origin_run_redaction_registry = registry
+    return registry
+
+
 def terminal_ready_for_latch(
     *,
     current_workflow_labels: list[str],
@@ -1820,6 +2280,11 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
     if authority_error:
         return {"ok": False, "error": authority_error}
 
+    ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+        workflow_yaml,
+        prior_associations=ctx.runner_code_block_associations_by_label,
+        preserve_existing=True,
+    )
     workflow = await _process_workflow_yaml(
         workflow_id=ctx.workflow_id,
         workflow_permanent_id=ctx.workflow_permanent_id,
@@ -1853,10 +2318,14 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
         frontier_start_label=labels[0],
         force_fresh_session=True,
         definition_unpersisted=True,
-        outside_turn_deadline=True,
     )
-    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
-    return result
+    recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+    return finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+        recorded_outcome=recorded_outcome,
+    )
 
 
 async def _run_blocks_and_collect_debug(
@@ -1868,8 +2337,14 @@ async def _run_blocks_and_collect_debug(
     frontier_start_label: str | None = None,
     force_fresh_session: bool = False,
     definition_unpersisted: bool = False,
-    outside_turn_deadline: bool = False,
 ) -> dict[str, Any]:
+    # Older drafts predate server-owned block associations. Associate their current raw snapshot
+    # once before outcome collection without adding anything to model-controlled YAML.
+    if not ctx.runner_code_block_associations_by_label:
+        ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+            ctx.staged_workflow_yaml or ctx.workflow_yaml
+        )
+
     # Read the planner's session choice before any exit path, so a run that bails cannot leave it
     # set for a later run whose frontier was never proven against that browser.
     resume_session_id = ctx.frontier_resume_session_id
@@ -1969,9 +2444,27 @@ async def _run_blocks_and_collect_debug(
         workflow.workflow_definition, labels_that_may_execute
     )
     approval_credential_ids = list(dict.fromkeys(tool_credential_ids + definition_credential_ids))
+    admitted_sheet_ids = await _approve_server_verified_google_sheet_bindings(
+        _google_sheet_connection_bindings_from_workflow_definition(
+            workflow.workflow_definition,
+            selected_labels=labels_that_may_execute,
+        ),
+        tool_activity=ctx.tool_activity,
+        organization_id=ctx.organization_id,
+        request_policy=ctx.request_policy,
+    )
+    non_sheet_credential_ids = set(tool_credential_ids) | set(
+        _extract_credential_ids_for_labels(
+            workflow.workflow_definition,
+            labels_that_may_execute,
+            excluded_block_types={"google_sheets_read", "google_sheets_write"},
+        )
+    )
+    dispatch_scoped_sheet_ids = set(admitted_sheet_ids) - non_sheet_credential_ids
     google_approval_blocker = _credential_run_approval_blocker_signal(
         approval_credential_ids,
-        getattr(ctx, "request_policy", None),
+        ctx.request_policy,
+        additional_approved_ids=dispatch_scoped_sheet_ids,
     )
     if google_approval_blocker is not None:
         ctx.connected_account_recovery_choices = (
@@ -1982,7 +2475,8 @@ async def _run_blocks_and_collect_debug(
         return {"ok": False, "error": tool_error}
     credential_approval_error = _credential_run_approval_error(
         approval_credential_ids,
-        getattr(ctx, "request_policy", None),
+        ctx.request_policy,
+        additional_approved_ids=dispatch_scoped_sheet_ids,
     )
     if credential_approval_error is not None:
         return {"ok": False, "error": credential_approval_error}
@@ -2012,7 +2506,10 @@ async def _run_blocks_and_collect_debug(
         app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is True if not dispatch_to_worker else False
     )
     if requires_sandbox and not dispatch_to_worker and not allow_inline_code_execution:
-        return _copilot_sandbox_unavailable_result()
+        return _copilot_sandbox_unavailable_result(
+            organization_id=ctx.organization_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
 
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
     runtime_workflow, runtime_frontier_anchor_url = _workflow_with_runtime_frontier_anchor(
@@ -2168,13 +2665,17 @@ async def _run_blocks_and_collect_debug(
         except Exception:
             LOG.warning(
                 "Failed to persist copilot run snapshot; blocking execution",
+                organization_id=ctx.organization_id,
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 dispatch_to_worker=dispatch_to_worker,
                 executes_unpersisted_definition=executes_unpersisted_definition,
                 exc_info=True,
             )
             if dispatch_to_worker:
-                return _copilot_sandbox_unavailable_result()
+                return _copilot_sandbox_unavailable_result(
+                    organization_id=ctx.organization_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                )
             return {
                 "ok": False,
                 "error": "Unable to prepare the Copilot test-run snapshot; execution was not started.",
@@ -2217,6 +2718,8 @@ async def _run_blocks_and_collect_debug(
     # For dispatched runs it stays None: the worker owns execution and the watchdog observes purely
     # via DB polling.
     run_task: asyncio.Task | None = None
+    sensitive_run_custody_lock: asyncio.Lock | None = None
+    sensitive_run_session_id: str | None = None
     try:
         workflow_run = await workflow_service.prepare_workflow(
             workflow_id=ctx.workflow_permanent_id,
@@ -2235,6 +2738,24 @@ async def _run_blocks_and_collect_debug(
             trigger_type=(app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None),
             copilot_session_id=ctx.workflow_copilot_chat_id,
         )
+
+        # The ordinary Track-A producer owns this registry at run creation. Keeping the run id and
+        # serialized values in one immutable carrier prevents a later context from vouching for it.
+        origin_registry = await _bind_origin_run_redaction_registry(
+            ctx,
+            workflow_run_id=workflow_run.workflow_run_id,
+            parameter_values=data,
+            credential_ids=approval_credential_ids,
+            sensitive_parameter_keys=_sensitive_parameter_keys_requiring_resolved_values(dispatch_workflow or workflow),
+        )
+        if origin_registry.contains_sensitive_values and run_session_id:
+            sensitive_run_custody_lock = browser_page_custody_lock(ctx, session_id=run_session_id)
+            await sensitive_run_custody_lock.acquire()
+            sensitive_run_session_id = run_session_id
+            ctx.sensitive_origin_browser_session_ids.add(run_session_id)
+            register_sensitive_origin_run_lease(
+                ctx, workflow_run_id=workflow_run.workflow_run_id, session_id=run_session_id
+            )
 
         # From here blocks execute and the browser moves, so the pages recorded before this run no
         # longer say where it is. Dropped now rather than on the way out, because the watchdog and
@@ -2321,6 +2842,10 @@ async def _run_blocks_and_collect_debug(
         if dispatch_draft_workflow_id is not None:
             await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
             dispatch_draft_workflow_id = None
+        if sensitive_run_custody_lock is not None and sensitive_run_custody_lock.locked():
+            if sensitive_run_session_id is not None:
+                release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run.workflow_run_id)
+            sensitive_run_custody_lock.release()
         raise
 
     active_run_association: ActiveRunSessionAssociation | None = None
@@ -2349,7 +2874,7 @@ async def _run_blocks_and_collect_debug(
     try:
         # The OpenAI Agents SDK wraps this tool in
         # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``, so
-        # the inner budget leaves 10 s of headroom for the cancel-drain and
+        # the poll loop leaves 10 s of headroom for the cancel-drain and
         # post-drain reconcile to finish before the SDK's own cancel fires.
         #
         # Do NOT short-circuit on client disconnect: the agent loop runs to
@@ -2368,18 +2893,7 @@ async def _run_blocks_and_collect_debug(
         # DB-silent periods; disable stagnation for any invocation that includes
         # one. Safety ceiling still applies.
         stagnation_enabled = not _any_quiet_block_requested(ctx, labels_to_execute)
-        # Active block runs use the tighter per-tool budget so a single in-flight
-        # call cannot consume the whole copilot session. Quiet-block runs keep the
-        # long safety ceiling because HumanInteractionBlock can legitimately pause
-        # indefinitely, and so does a run the user triggered outside the turn: it
-        # replays every block, which the per-tool budget is far too small to cover.
-        budget_exit_reason: WatchdogExitReason
-        if stagnation_enabled and not outside_turn_deadline:
-            budget_seconds = _active_block_run_budget_seconds(ctx)
-            budget_exit_reason = "per_tool_budget"
-        else:
-            budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
-            budget_exit_reason = "ceiling"
+        budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
 
         # Mid-tool narrator bridge: feed block-status changes and step-level
         # heartbeats into NarratorState so the narration ticker keeps emitting
@@ -2450,7 +2964,7 @@ async def _run_blocks_and_collect_debug(
                     break
 
                 if now - started_monotonic >= budget_seconds:
-                    exit_reason = budget_exit_reason
+                    exit_reason = "ceiling"
                     break
 
             if exit_reason is not None and exit_reason not in ("success", "paused"):
@@ -2495,9 +3009,13 @@ async def _run_blocks_and_collect_debug(
                 )
                 user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
                 # Dispatched runs: the worker owns the run session, so do not attach to it over CDP.
+                sensitive_origin_run = _origin_registry_contains_sensitive_values(
+                    ctx.origin_run_redaction_registry,
+                    workflow_run.workflow_run_id,
+                )
                 current_url, page_title = (
                     ("", "")
-                    if dispatch_to_worker
+                    if dispatch_to_worker or sensitive_origin_run
                     else await _fallback_page_info(ctx, session_id_override=run_session_id)
                 )
                 result: dict[str, Any] = {
@@ -2522,6 +3040,7 @@ async def _run_blocks_and_collect_debug(
                 _attach_run_session_facts(
                     result["data"],
                     used_fresh_run_session=used_fresh_run_session,
+                    run_detached_from_chat=run_detached_from_chat,
                     run_ok=False,
                     page_evidence=_same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id),
                 )
@@ -2530,10 +3049,22 @@ async def _run_blocks_and_collect_debug(
                     "user_facing_summary": user_facing_summary,
                 }
                 result["data"]["user_facing_summary"] = user_facing_summary
-                if exit_reason == "per_tool_budget":
-                    result["data"]["failure_categories"] = [_per_tool_budget_failure_category(budget_seconds)]
                 if run_cancelled_by_watchdog:
                     result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
+                failed_result = _first_failed_result(result["data"]["blocks"])
+                watchdog_locator_observations = (
+                    None
+                    if sensitive_origin_run
+                    else await _observe_authored_locators(
+                        ctx,
+                        run_session_id=run_session_id,
+                        failed_block_code=_failed_block_code(workflow, failed_result),
+                        worker_owned=dispatch_to_worker,
+                        observation_deadline_exceeded=ctx.copilot_total_timeout_exceeded,
+                    )
+                )
+                if watchdog_locator_observations is not None:
+                    result["data"]["authored_locator_observations"] = watchdog_locator_observations
                 return result
         except asyncio.CancelledError:
             # A pause is detected several awaits before the result is returned, so a tool timeout
@@ -2601,15 +3132,7 @@ async def _run_blocks_and_collect_debug(
         results = []
         block_outputs_by_label: dict[str, Any] = {}
         for block in blocks:
-            block_result: dict[str, Any] = {
-                "label": block.label,
-                "block_type": block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type),
-                "status": block.status,
-            }
-            if block.failure_reason:
-                block_result["failure_reason"] = block.failure_reason
-            if block.error_codes:
-                block_result["error_codes"] = list(block.error_codes)
+            block_result = _recorded_run_block_result(block)
             if hasattr(block, "output") and block.output:
                 block_result["extracted_data"] = block.output
                 if block.label is not None:
@@ -2623,21 +3146,29 @@ async def _run_blocks_and_collect_debug(
         )
         ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
 
-        await _attach_action_traces(blocks, results, ctx.organization_id)
-        await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
+        await _attach_action_traces(blocks, results, ctx.organization_id, include_completed=True)
+        recorded_origin_registry = ctx.origin_run_redaction_registry
+        sensitive_origin_run = _origin_registry_contains_sensitive_values(
+            recorded_origin_registry,
+            workflow_run.workflow_run_id,
+        )
+        if not sensitive_origin_run:
+            await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
 
         # final_status is guaranteed set here: every non-success exit returns
         # above, and the success path always populates final_status.
         assert final_status is not None
         run_ok = WorkflowRunStatus(final_status) == WorkflowRunStatus.completed
 
+        action_observations = _retained_action_observations(results)
+
         action_trace_summary: list[str] = []
-        first_failed = next(
-            (r for r in results if r.get("status") in _FAILED_BLOCK_STATUSES and r.get("action_trace")),
-            None,
-        )
+        first_failed = _first_failed_result(results)
+        failing_code_line: int | None = None
         if first_failed is not None:
-            action_trace_summary = _summarize_action_trace(first_failed.get("action_trace"))
+            action_trace_summary = _failure_action_trace_summary(first_failed)
+            failing_code_line = _failing_code_line(first_failed.get("action_trace"))
+        failed_block_code = _failed_block_code(workflow, first_failed)
 
         # Per-block action_trace is for derivation only — keep it out of the
         # compact packet. get_run_results remains the heavier inspection path.
@@ -2647,18 +3178,19 @@ async def _run_blocks_and_collect_debug(
         # Dispatched runs: the worker owns the run session; do not touch it over CDP from the API.
         # The frontier's anchors and the page the run ended on both come from the rows the worker
         # persisted instead. A dispatched run has no page title to report.
-        block_end_urls = _block_end_urls_by_label(run_block_rows)
-        dispatched_end_url = _dispatched_end_url(run_block_rows) if dispatch_to_worker else None
-        current_url, page_title = (
-            (dispatched_end_url or "", "")
-            if dispatch_to_worker
-            else await _fallback_page_info(ctx, session_id_override=run_session_id)
+        block_end_urls = {} if sensitive_origin_run else _block_end_urls_by_label(run_block_rows)
+        current_url, page_title, dispatched_end_url = await _resolve_post_run_page_info(
+            ctx,
+            run_block_rows=run_block_rows,
+            dispatch_to_worker=dispatch_to_worker,
+            sensitive_origin_run=sensitive_origin_run,
+            run_session_id=run_session_id,
         )
 
         screenshot_b64: str | None = None
         # Dispatched runs: the worker owns the persistent browser session, so the API side must not
         # grab the live page over CDP. Their at-failure frames come from worker-persisted artifacts.
-        if not dispatch_to_worker and not run_ok and run_session_id:
+        if not dispatch_to_worker and not run_ok and run_session_id and not sensitive_origin_run:
             try:
                 browser_state = await resolve_persistent_browser_state(
                     session_id=run_session_id,
@@ -2683,19 +3215,31 @@ async def _run_blocks_and_collect_debug(
             except Exception:
                 LOG.debug("Failed to capture post-run screenshot", exc_info=True)
 
-        if (
-            not dispatch_to_worker
-            and run_session_id
-            and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-            and not ctx.copilot_total_timeout_exceeded
-        ):
-            # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
-            _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
-            await _capture_and_store_post_run_page(
+        locator_observations: list[AuthoredLocatorObservationRow] | None = None
+        post_run_page_capture: BuildTestPacketPageCapture | None = None
+        if not sensitive_origin_run:
+            if (
+                not dispatch_to_worker
+                and run_session_id
+                and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+                and not ctx.copilot_total_timeout_exceeded
+            ):
+                # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
+                # A dispatched run therefore carries no locator observation, and the packet says so.
+                _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
+                post_run_page_capture = await _capture_and_store_post_run_page(
+                    ctx,
+                    run_session_id=run_session_id,
+                    run_id=workflow_run.workflow_run_id,
+                    current_url=current_url,
+                )
+
+            locator_observations = await _observe_authored_locators(
                 ctx,
                 run_session_id=run_session_id,
-                run_id=workflow_run.workflow_run_id,
-                current_url=current_url,
+                failed_block_code=failed_block_code,
+                worker_owned=dispatch_to_worker,
+                observation_deadline_exceeded=ctx.copilot_total_timeout_exceeded,
             )
 
         if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
@@ -2711,10 +3255,12 @@ async def _run_blocks_and_collect_debug(
         if dispatch_to_worker and run_session_id and not ctx.copilot_total_timeout_exceeded:
             await _capture_dispatched_terminal_page_evidence(
                 ctx,
+                workflow=workflow,
                 run_id=workflow_run.workflow_run_id,
                 run_session_id=run_session_id,
                 organization_id=ctx.organization_id,
                 current_url=current_url,
+                origin_redaction_registry=ctx.origin_run_redaction_registry,
             )
 
         result_data: dict[str, Any] = {
@@ -2728,7 +3274,11 @@ async def _run_blocks_and_collect_debug(
             "current_url": current_url,
             "page_title": page_title,
             "action_trace_summary": action_trace_summary,
+            "failing_code_line": failing_code_line,
+            "action_observations": action_observations,
         }
+        if locator_observations is not None:
+            result_data["authored_locator_observations"] = locator_observations
         if not dispatch_to_worker and current_url:
             result_data["current_url_live_observed"] = True
         if dispatch_to_worker and dispatched_end_url is None:
@@ -2736,9 +3286,12 @@ async def _run_blocks_and_collect_debug(
         post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id)
         if post_run_page_evidence is not None:
             result_data["post_run_page_evidence"] = model_visible_composition_evidence(post_run_page_evidence)
+        if post_run_page_capture is not None:
+            result_data["post_run_page_capture"] = post_run_page_capture.model_dump(mode="json")
         _attach_run_session_facts(
             result_data,
             used_fresh_run_session=used_fresh_run_session,
+            run_detached_from_chat=run_detached_from_chat,
             run_ok=run_ok,
             page_evidence=post_run_page_evidence,
         )
@@ -2757,6 +3310,13 @@ async def _run_blocks_and_collect_debug(
             dispatch_workflow=dispatch_workflow,
             runtime_workflow=runtime_workflow,
         )
+        if output_identity_workflow is None:
+            result_data["requested_output_definitions_omission"] = "the run-pinned workflow snapshot was unavailable"
+        else:
+            result_data["requested_output_parameter_definitions"] = _requested_output_parameter_definitions(
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow=output_identity_workflow,
+            )
 
         registered_outputs_by_label = await _attach_registered_output_parameter_values(
             workflow_run_id=workflow_run.workflow_run_id,
@@ -2784,14 +3344,20 @@ async def _run_blocks_and_collect_debug(
                     existing_set.add(label)
             ctx.verified_prefix_labels = existing_prefix
             _credit_composition_verified_labels(ctx, labels_to_execute, start_provenance)
-            # Rebuilt from this run's rows alone: the position was forgotten at dispatch, and the
-            # browser these pages describe is the one this run used.
-            ctx.verified_prefix_block_end_urls = dict(block_end_urls)
-            ctx.verified_prefix_block_end_session_id = run_session_id
-            ctx.verified_prefix_terminal_label = run_block_rows[-1].label if run_block_rows else None
-            verified_current_url = _valid_runtime_anchor_url(current_url)
-            if verified_current_url is not None:
-                ctx.verified_prefix_current_url = verified_current_url
+            if sensitive_origin_run:
+                # Preserve verified labels and outputs, but never carry browser-position URLs from
+                # a credential-bearing run into a later frontier or model-visible result.
+                _forget_browser_position(ctx)
+                ctx.verified_prefix_current_url = None
+            else:
+                # Rebuilt from this run's rows alone: the position was forgotten at dispatch, and the
+                # browser these pages describe is the one this run used.
+                ctx.verified_prefix_block_end_urls = dict(block_end_urls)
+                ctx.verified_prefix_block_end_session_id = run_session_id
+                ctx.verified_prefix_terminal_label = run_block_rows[-1].label if run_block_rows else None
+                verified_current_url = _valid_runtime_anchor_url(current_url)
+                if verified_current_url is not None:
+                    ctx.verified_prefix_current_url = verified_current_url
 
         return build_run_blocks_response(run_ok, result_data)
     finally:
@@ -2813,9 +3379,19 @@ async def _run_blocks_and_collect_debug(
                     generation=active_run_association.generation,
                     exc_info=True,
                 )
+        if sensitive_run_custody_lock is not None and sensitive_run_custody_lock.locked():
+            if sensitive_run_session_id is not None and not run_paused:
+                release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run.workflow_run_id)
+            sensitive_run_custody_lock.release()
 
 
-async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+async def _get_run_results(
+    params: dict[str, Any],
+    ctx: AgentContext,
+    *,
+    read_live_page: bool = True,
+    admit_sensitive_origin_artifact: bool = True,
+) -> dict[str, Any]:
     workflow_run_id = params.get("workflow_run_id")
     if not workflow_run_id:
         same_turn_run_id = getattr(ctx, "last_successful_run_blocks_workflow_run_id", None)
@@ -2853,6 +3429,41 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
         return {"ok": False, "error": f"Workflow run not found: {workflow_run_id}"}
     if getattr(run, "workflow_permanent_id", None) != ctx.workflow_permanent_id:
         return {"ok": False, "error": f"Workflow run not found for this workflow: {workflow_run_id}"}
+    run_browser_session_id = getattr(run, "browser_session_id", None)
+    if isinstance(run_browser_session_id, str) and run_browser_session_id and WorkflowRunStatus(run.status).is_final():
+        async with browser_page_custody_lock(ctx, session_id=run_browser_session_id):
+            release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run_id)
+
+    try:
+        run_workflow = await app.DATABASE.workflows.get_workflow_for_workflow_run(
+            workflow_run_id,
+            organization_id=ctx.organization_id,
+            filter_deleted=False,
+        )
+    except Exception:
+        run_workflow = None
+    if run_workflow is None and getattr(run, "workflow_id", None):
+        try:
+            run_workflow = await app.DATABASE.workflows.get_workflow(
+                workflow_id=run.workflow_id,
+                organization_id=ctx.organization_id,
+            )
+        except Exception:
+            run_workflow = None
+    if run_workflow is None:
+        LOG.warning("Prior-run workflow snapshot fetch failed", workflow_run_id=workflow_run_id)
+
+    origin_registry = getattr(ctx, "origin_run_redaction_registry", None)
+    matching_origin_registry = (
+        origin_registry if origin_registry is not None and origin_registry.workflow_run_id == workflow_run_id else None
+    )
+    # Unknown provenance is not evidence that a cold run was nonsensitive. Use the same
+    # fail-closed classification for every direct page producer and for terminal artifacts.
+    workflow_has_sensitive_parameters = _workflow_requires_terminal_artifact_redaction(run_workflow)
+    sensitive_origin_run = (
+        _origin_registry_contains_sensitive_values(matching_origin_registry, workflow_run_id)
+        or workflow_has_sensitive_parameters
+    )
 
     blocks = await app.DATABASE.observer.get_workflow_run_blocks(
         workflow_run_id=workflow_run_id,
@@ -2861,25 +3472,33 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
 
     results = []
     for block in blocks:
-        block_result: dict[str, Any] = {
-            "label": block.label,
-            "block_type": block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type),
-            "status": block.status,
-        }
-        if block.failure_reason:
-            block_result["failure_reason"] = block.failure_reason
+        block_result = _recorded_run_block_result(block)
         output = truncate_output(getattr(block, "output", None))
         if output:
             block_result["output"] = output
         results.append(block_result)
 
     await _attach_action_traces(blocks, results, ctx.organization_id)
-    await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
+    if not sensitive_origin_run:
+        await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
 
+    first_failed = _first_failed_result(results)
+    action_trace_summary = _failure_action_trace_summary(first_failed)
+    action_observations = _retained_action_observations(results)
     result_data: dict[str, Any] = {
         "workflow_run_id": workflow_run_id,
+        "browser_session_id": run.browser_session_id,
         "overall_status": run.status,
+        "requested_block_labels": [result["label"] for result in results if result.get("label")],
+        "executed_block_labels": [
+            result["label"]
+            for result in results
+            if result.get("label") and result.get("status") in _EXECUTED_BLOCK_STATUSES
+        ],
         "blocks": results,
+        "failing_code_line": _failing_code_line(first_failed.get("action_trace")) if first_failed else None,
+        "action_trace_summary": action_trace_summary,
+        "action_observations": action_observations,
     }
     # When worker-dispatch is enabled for this copilot session the run's persistent browser
     # session is worker-owned (for a non-fresh run ctx.browser_session_id == run_session_id), so
@@ -2888,8 +3507,31 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
         organization_id=ctx.organization_id,
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
-    dispatched_end_url = _dispatched_end_url(list(reversed(blocks))) if dispatch_to_worker else None
-    current_url, page_title = (dispatched_end_url or "", "") if dispatch_to_worker else await _fallback_page_info(ctx)
+    locator_observations: list[AuthoredLocatorObservationRow] | None = None
+    if not sensitive_origin_run:
+        failed_block_code = _failed_block_code(run_workflow, first_failed) if run_workflow is not None else None
+        locator_observations = await _observe_authored_locators(
+            ctx,
+            run_session_id=run.browser_session_id,
+            failed_block_code=failed_block_code,
+            worker_owned=dispatch_to_worker,
+            observation_deadline_exceeded=getattr(ctx, "copilot_total_timeout_exceeded", False),
+        )
+    if locator_observations is not None:
+        result_data["authored_locator_observations"] = locator_observations
+    dispatched_end_url = (
+        _dispatched_end_url(list(reversed(blocks))) if dispatch_to_worker and not sensitive_origin_run else None
+    )
+    if sensitive_origin_run:
+        current_url, page_title = "", ""
+    elif dispatch_to_worker:
+        current_url, page_title = dispatched_end_url or "", ""
+    elif read_live_page:
+        current_url, page_title = await _fallback_page_info(ctx)
+    else:
+        # Outside a call's dynamic extent this would resolve the chat's own browser and report its
+        # page as the finished run's, which is the substitution the repair binding refuses to make.
+        current_url, page_title = "", ""
     if current_url:
         result_data["current_url"] = current_url
         if not dispatch_to_worker:
@@ -2900,6 +3542,61 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     if getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
+
+    if run_workflow is None:
+        result_data["requested_output_definitions_omission"] = "the run-pinned workflow snapshot was unavailable"
+    else:
+        result_data["requested_output_parameter_definitions"] = _requested_output_parameter_definitions(
+            workflow_run_id=workflow_run_id,
+            workflow=run_workflow,
+        )
+    await _attach_registered_output_parameter_values(
+        workflow_run_id=workflow_run_id,
+        workflow=run_workflow,
+        output_identity_workflow=run_workflow,
+        data=result_data,
+        persisted_output_parameters=(
+            [parameter for parameter in _workflow_parameters(run_workflow) if isinstance(parameter, OutputParameter)]
+            if run_workflow is not None
+            else None
+        ),
+    )
+
+    cold_artifact_requires_redaction_context = _workflow_requires_terminal_artifact_redaction(run_workflow)
+    # Cold ordinary-turn hydration did not perform a sensitive run and cannot use mutable context
+    # alone to vouch for its raw artifact custody. The direct same-turn tool route may use its exact
+    # immutable registry; cold sensitive hydration receives a typed omission instead.
+    artifact_redaction_registry = (
+        matching_origin_registry if sensitive_origin_run and admit_sensitive_origin_artifact else None
+    )
+    artifact_has_redaction_context = (
+        artifact_redaction_registry is not None and artifact_redaction_registry.contains_all_sensitive_values
+    )
+    terminal_page_evidence = (
+        None
+        if (cold_artifact_requires_redaction_context or sensitive_origin_run) and not artifact_has_redaction_context
+        else await _fetch_dispatched_terminal_page_evidence(
+            run_id=workflow_run_id,
+            organization_id=ctx.organization_id,
+            current_url=current_url,
+            workflow=run_workflow,
+            origin_redaction_registry=artifact_redaction_registry,
+        )
+    )
+    if terminal_page_evidence is None:
+        result_data["terminal_page_evidence_omission"] = (
+            "persisted terminal page artifact was not admitted without origin-run credential redaction context"
+            if cold_artifact_requires_redaction_context or sensitive_origin_run
+            else "no persisted terminal page artifact was available"
+        )
+    else:
+        stamped_page_evidence = stamp_page_evidence_provenance(
+            terminal_page_evidence,
+            source_browser_session_id=run.browser_session_id,
+            run_id=workflow_run_id,
+            run_browser_session_id=run.browser_session_id,
+        )
+        result_data["post_run_page_evidence"] = model_visible_composition_evidence(stamped_page_evidence)
 
     return {
         "ok": True,
@@ -3171,8 +3868,6 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
 
     failed_labels = _failed_run_block_labels(data)
     evidence.failed_block_labels = failed_labels
-    if copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY:
-        evidence.merge_per_tool_budget_blocks(failed_labels)
     failure_reason = copilot_ctx.last_test_failure_reason or result.get("error")
     if isinstance(failure_reason, str) and failure_reason.strip():
         evidence.failure_reason = " ".join(failure_reason.split())[:240]
@@ -3277,7 +3972,9 @@ def _record_run_blocks_result(
     record_pending_runtime_authoring_repair_context(copilot_ctx, result)
 
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
-    anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
+    anti_bot_match, empty_data_blocks, failure_categories, goal_path_omissions = _analyze_run_blocks(
+        result, copilot_ctx
+    )
     infrastructure_runner_codes = _infrastructure_runner_error_codes(result)
     if infrastructure_runner_codes:
         copilot_ctx.last_infrastructure_tool_error = ", ".join(infrastructure_runner_codes)
@@ -3394,6 +4091,7 @@ def _record_run_blocks_result(
         recorded_outcome = _recorded_run_outcome(
             workflow_run_id=run_id if isinstance(run_id, str) else None,
             output_report=output_report,
+            run_completed=run_ok,
         )
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         composition_unverified = _composition_unverified_current_workflow_labels(copilot_ctx)
@@ -3439,7 +4137,7 @@ def _record_run_blocks_result(
             copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
             copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        _record_build_test_outcome(copilot_ctx, result, recorded_outcome)
+        _record_build_test_outcome(copilot_ctx, result, recorded_outcome, goal_path_omissions)
         return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
@@ -3465,8 +4163,9 @@ def _record_run_blocks_result(
             copilot_ctx.last_test_failure_reason or str(result.get("error") or "The run failed.")
         ),
         workflow_run_id=run_id if isinstance(run_id, str) else None,
+        run_completed=False,
     )
-    _record_build_test_outcome(copilot_ctx, result, recorded_outcome)
+    _record_build_test_outcome(copilot_ctx, result, recorded_outcome, goal_path_omissions)
     return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
 
@@ -3490,22 +4189,32 @@ def _record_executed_block_labels(copilot_ctx: CopilotContext, result: dict[str,
                 copilot_ctx.executed_block_fingerprints.setdefault(label, set()).update(block_fingerprints)
 
 
-def _record_build_test_outcome(
+def _build_recorded_build_test_outcome(
     copilot_ctx: CopilotContext,
     result: dict[str, Any],
     recorded_run_outcome: RecordedRunOutcome | None,
-) -> None:
-    result_data = result.get("data")
+    declared_goal_path_omissions: Sequence[Mapping[str, str]] | None = None,
+) -> RecordedBuildTestOutcome | None:
+    raw_result_data = result.get("data")
+    result_data = raw_result_data if isinstance(raw_result_data, dict) else {}
+    requested_output_parameter_payloads: list[BuildTestPacketRequestedOutput] | None = (
+        _packet_requested_outputs(
+            result_data,
+            _packet_string(result_data.get("workflow_run_id")),
+            [],
+        )
+        or None
+    )
     registered_output_parameter_payloads = (
         result_data.get("registered_output_parameter_values")
-        if isinstance(result_data, dict) and isinstance(result_data.get("registered_output_parameter_values"), list)
+        if isinstance(result_data.get("registered_output_parameter_values"), list)
         else None
     )
     workflow_yaml = copilot_ctx.workflow_yaml
     code_artifact_metadata = copilot_ctx.code_artifact_metadata
     workflow_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
     raw_requested_block_labels = getattr(copilot_ctx, "last_requested_block_labels", None)
-    result_requested_block_labels = result_data.get("requested_block_labels") if isinstance(result_data, dict) else None
+    result_requested_block_labels = result_data.get("requested_block_labels")
     raw_requested_values: list[Any] = (
         raw_requested_block_labels
         if isinstance(raw_requested_block_labels, list)
@@ -3516,24 +4225,46 @@ def _record_build_test_outcome(
         requested_block_labels,
         workflow_definition,
     )
+    result_page_evidence = (
+        result_data.get("post_run_page_evidence")
+        if isinstance(result_data.get("post_run_page_evidence"), dict)
+        else None
+    )
+    return recorded_outcome_from_run_blocks_result(
+        result,
+        page_evidence=result_page_evidence or copilot_ctx.composition_page_evidence,
+        recorded_run_outcome=recorded_run_outcome,
+        completion_verification=None,
+        authored_structure_signature=authored_structure_signature_from_workflow(
+            workflow_yaml,
+            code_artifact_metadata,
+        ),
+        requested_output_parameter_payloads=requested_output_parameter_payloads,
+        registered_output_parameter_payloads=registered_output_parameter_payloads,
+        declared_goal_path_omissions=declared_goal_path_omissions,
+        unbound_required_parameter_keys=list(copilot_ctx.unbound_required_parameter_keys),
+        block_parameter_keys=authored_block_parameter_keys_from_workflow(
+            workflow_yaml,
+            code_artifact_metadata,
+        ),
+        block_shape_hashes=block_shape_hashes,
+        block_associations_by_label=getattr(copilot_ctx, "runner_code_block_associations_by_label", {}),
+    )
+
+
+def _record_build_test_outcome(
+    copilot_ctx: CopilotContext,
+    result: dict[str, Any],
+    recorded_run_outcome: RecordedRunOutcome | None,
+    declared_goal_path_omissions: Sequence[Mapping[str, str]] | None = None,
+) -> None:
     record_build_test_outcome(
         copilot_ctx,
-        recorded_outcome_from_run_blocks_result(
+        _build_recorded_build_test_outcome(
+            copilot_ctx,
             result,
-            page_evidence=copilot_ctx.composition_page_evidence,
-            recorded_run_outcome=recorded_run_outcome,
-            completion_verification=None,
-            authored_structure_signature=authored_structure_signature_from_workflow(
-                workflow_yaml,
-                code_artifact_metadata,
-            ),
-            registered_output_parameter_payloads=registered_output_parameter_payloads,
-            unbound_required_parameter_keys=list(copilot_ctx.unbound_required_parameter_keys),
-            block_parameter_keys=authored_block_parameter_keys_from_workflow(
-                workflow_yaml,
-                code_artifact_metadata,
-            ),
-            block_shape_hashes=block_shape_hashes,
+            recorded_run_outcome,
+            declared_goal_path_omissions,
         ),
     )
 
@@ -3550,12 +4281,14 @@ def _recorded_run_outcome(
     *,
     workflow_run_id: str | None = None,
     output_report: str | None = None,
+    run_completed: bool | None = None,
 ) -> RecordedRunOutcome:
     """Record the completed run status without interpreting whether it met the request."""
     return RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id=workflow_run_id,
         output_report=output_report,
+        run_completed=run_completed,
     )
 
 
@@ -3565,7 +4298,7 @@ async def _send_run_started_update(copilot_ctx: CopilotContext, workflow_run_id:
             WorkflowCopilotRunStartedUpdate(
                 type=WorkflowCopilotStreamMessageType.RUN_STARTED,
                 workflow_run_id=workflow_run_id,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
         )
     except Exception:
@@ -3611,7 +4344,7 @@ async def _send_run_outcome_update(
                 continuity_source="workflow_run",
                 terminal_disposition=terminal_disposition if isinstance(terminal_disposition, str) else None,
                 iteration=iteration,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
         )
     except Exception:
@@ -3658,9 +4391,64 @@ async def _resolve_captcha_solver_availability(copilot_ctx: Any) -> None:
     copilot_ctx.captcha_solver_available_for_url = url
 
 
+def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, Any], tool_name: str = "") -> None:
+    """Keep an earlier unresolved failure visible in the result this run returns to the model.
+
+    A later success otherwise displaces the failure before the model decides whether to repair: it
+    sees a passing run, has no record of the one that failed, and reports done. The fact is reported,
+    not interpreted - which run failed, at which block, how, and that this success did not establish
+    the failure was resolved. The model still owns what to do about it.
+    """
+    if not result.get("ok"):
+        return
+    data = result.get("data")
+    this_run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
+        copilot_ctx,
+        reported_workflow_yaml=copilot_ctx.persisted_workflow_yaml,
+        pending_later_run_id=this_run_id if isinstance(this_run_id, str) else None,
+    )
+    # This seam is load-bearing for repair: a failure it fails to carry is one the model decides
+    # without. One bounded event per successful hand-back, so a miss is attributable rather than
+    # silent.
+    LOG.info(
+        "copilot run result unresolved-failure disposition",
+        tool_name=tool_name,
+        workflow_run_id=this_run_id,
+        retained_history=len(getattr(copilot_ctx, "recorded_build_test_outcome_history", [])),
+        disposition=disposition,
+        attached=unresolved is not None,
+    )
+    if unresolved is None:
+        return
+    failure_kind = ""
+    for entry in reversed(getattr(copilot_ctx, "recorded_build_test_outcome_history", [])):
+        if entry.get("workflow_run_id") == unresolved.workflow_run_id:
+            failure_kind = _safe_reason_code(entry.get("reason_code"))
+            break
+    if not isinstance(data, dict):
+        return
+    data["unresolved_earlier_failure"] = {
+        "workflow_run_id": unresolved.workflow_run_id,
+        "block_label": unresolved.block_label,
+        "failure_kind": failure_kind,
+        "note": "this run passing does not establish that the earlier failure was resolved",
+    }
+    LOG.info(
+        "copilot carried unresolved failure into run result",
+        workflow_run_id=unresolved.workflow_run_id,
+        block_label=unresolved.block_label,
+        failure_kind=failure_kind,
+    )
+
+
+def _safe_reason_code(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], _handler_start: float
-) -> RecordedRunOutcome | None:
+) -> RecordedBuildTestOutcome | None:
     """Record and emit the run fact once; no authoring judge may rewrite it."""
     await _resolve_captcha_solver_availability(copilot_ctx)
     recorded = _record_run_blocks_result(copilot_ctx, result, completion_verification=None)
@@ -3676,7 +4464,12 @@ async def _verify_and_record_run_blocks_result(
         reason_code=recorded.reason_code,
         display_reason=recorded.display_reason,
     )
-    return recorded
+    build_test_outcome = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
+    result_data = result.get("data")
+    result_run_id = result_data.get("workflow_run_id") if isinstance(result_data, dict) else None
+    if isinstance(build_test_outcome, RecordedBuildTestOutcome) and build_test_outcome.workflow_run_id == result_run_id:
+        return build_test_outcome
+    return None
 
 
 def _record_diagnosis_repair_contract(
@@ -3764,6 +4557,7 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
         title=title,
         evidence_source=_packet_string(repair.get("page_evidence_source")),
         observed_after_workflow_run=repair.get("observed_after_workflow_run") is True,
+        rendered_value_excerpt=_packet_string(repair.get("rendered_value_excerpt")),
         form_summaries=_packet_string_list(repair.get("page_form_summaries")),
         result_summaries=_packet_string_list(repair.get("page_result_summaries")),
         action_summaries=_packet_string_list(repair.get("page_action_summaries")),
@@ -3771,7 +4565,7 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
         obstruction_summaries=_packet_string_list(repair.get("page_obstruction_summaries")),
         obstructions=_packet_page_obstructions(repair.get("page_obstructions"), omission_notices),
     )
-    return (
+    repair_page_state = (
         page_state
         if any(
             (
@@ -3779,6 +4573,7 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
                 page_state.current_url,
                 page_state.title,
                 page_state.evidence_source,
+                page_state.rendered_value_excerpt,
                 page_state.form_summaries,
                 page_state.result_summaries,
                 page_state.action_summaries,
@@ -3789,15 +4584,121 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
         )
         else None
     )
+    if repair and repair_page_state is not None:
+        return repair_page_state
+    raw_page_evidence = data.get("post_run_page_evidence")
+    if isinstance(raw_page_evidence, Mapping):
+        evidence_page_state = build_test_page_state_from_evidence(raw_page_evidence, workflow_run_id=run_id)
+        if evidence_page_state is not None:
+            return evidence_page_state
+    return repair_page_state
+
+
+_OWN_BROWSER_NOTE = (
+    "This run executed in a browser other than the one this chat's browser tools drive by default, "
+    "so the page it left behind is not the page they answer from."
+)
+_SHARED_BROWSER_NOTE = "This run executed in this chat's browser, which the browser tools drive by default."
+
+
+def _packet_run_browser(data: Mapping[str, Any]) -> BuildTestPacketRunBrowser | None:
+    """Say which browser ran this, so a look at 'the page' can be aimed at the right one."""
+    detached = data.get("run_detached_from_chat")
+    if not isinstance(detached, bool):
+        return None
+    return BuildTestPacketRunBrowser(
+        ran_outside_this_chats_browser=detached,
+        note=_OWN_BROWSER_NOTE if detached else _SHARED_BROWSER_NOTE,
+    )
+
+
+def _packet_locator_observations(
+    data: Mapping[str, Any], omission_notices: list[str]
+) -> list[BuildTestPacketLocatorObservation]:
+    raw = data.get("authored_locator_observations")
+    if raw is None:
+        omission_notices.append(
+            "failure.locator_observations omitted: no post-action locator observation was attempted for this run."
+        )
+        return []
+    observations: list[BuildTestPacketLocatorObservation] = []
+    malformed = 0
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, Mapping):
+            malformed += 1
+            continue
+        try:
+            observations.append(BuildTestPacketLocatorObservation.model_validate(entry))
+        except ValueError:
+            malformed += 1
+    if malformed:
+        omission_notices.append(f"failure.locator_observations omitted {malformed} malformed item(s).")
+    if not observations and not malformed:
+        omission_notices.append("failure.locator_observations empty: the failed block names no literal locator.")
+    return observations
 
 
 def _packet_registered_outputs(
-    data: Mapping[str, Any], run_id: str | None, omission_notices: list[str]
+    copilot_ctx: CopilotContext,
+    data: Mapping[str, Any],
+    run_id: str | None,
+    omission_notices: list[str],
 ) -> list[BuildTestPacketRegisteredOutput]:
     raw_outputs = data.get("registered_output_parameter_values")
     if not isinstance(raw_outputs, list):
+        omission = _packet_string(data.get("registered_output_values_omission"))
+        if omission is not None:
+            omission_notices.append(f"registered_outputs omitted: {omission}.")
         return []
     outputs: list[BuildTestPacketRegisteredOutput] = []
+    malformed = 0
+    other_run = 0
+    redacted = 0
+    for raw_output in raw_outputs:
+        if not isinstance(raw_output, Mapping):
+            malformed += 1
+            continue
+        output_run_id = _packet_string(raw_output.get("workflow_run_id"))
+        if run_id is None or output_run_id != run_id:
+            other_run += 1
+            continue
+        raw_value = raw_output.get("value")
+        scrubbed_value = scrub_secrets_from_structure(copilot_ctx, raw_value)
+        value_redacted = scrubbed_value != raw_value
+        try:
+            outputs.append(
+                BuildTestPacketRegisteredOutput(
+                    workflow_run_id=_packet_string(raw_output.get("workflow_run_id")),
+                    output_parameter_id=_packet_string(raw_output.get("output_parameter_id")),
+                    output_parameter_key=_packet_string(raw_output.get("output_parameter_key")),
+                    block_label=_packet_string(raw_output.get("block_label")),
+                    block_type=_packet_string(raw_output.get("block_type")),
+                    value=scrubbed_value,
+                )
+            )
+            if value_redacted:
+                redacted += 1
+        except ValueError:
+            malformed += 1
+    if malformed:
+        omission_notices.append(f"registered_outputs omitted {malformed} non-JSON or malformed item(s).")
+    if other_run:
+        omission_notices.append(f"registered_outputs omitted {other_run} item(s) belonging to another or unknown run.")
+    if redacted:
+        omission_notices.append(f"registered_outputs redacted {redacted} item(s) containing registered secret values.")
+    return outputs
+
+
+def _packet_requested_outputs(
+    data: Mapping[str, Any], run_id: str | None, omission_notices: list[str]
+) -> list[BuildTestPacketRequestedOutput]:
+    raw_outputs = data.get("requested_output_parameter_definitions")
+    if not isinstance(raw_outputs, list):
+        omission = _packet_string(data.get("requested_output_definitions_omission"))
+        if omission is not None:
+            omission_notices.append(f"requested_outputs omitted: {omission}.")
+        return []
+    outputs: list[BuildTestPacketRequestedOutput] = []
     malformed = 0
     other_run = 0
     for raw_output in raw_outputs:
@@ -3810,21 +4711,21 @@ def _packet_registered_outputs(
             continue
         try:
             outputs.append(
-                BuildTestPacketRegisteredOutput(
-                    workflow_run_id=_packet_string(raw_output.get("workflow_run_id")),
-                    output_parameter_id=_packet_string(raw_output.get("output_parameter_id")),
-                    output_parameter_key=_packet_string(raw_output.get("output_parameter_key")),
+                BuildTestPacketRequestedOutput(
+                    workflow_run_id=output_run_id,
+                    output_parameter_id=_packet_string(raw_output.get("output_parameter_id")) or "",
+                    output_parameter_key=_packet_string(raw_output.get("output_parameter_key")) or "",
+                    description=_packet_string(raw_output.get("description")),
                     block_label=_packet_string(raw_output.get("block_label")),
                     block_type=_packet_string(raw_output.get("block_type")),
-                    value=raw_output.get("value"),
                 )
             )
         except ValueError:
             malformed += 1
     if malformed:
-        omission_notices.append(f"registered_outputs omitted {malformed} non-JSON or malformed item(s).")
+        omission_notices.append(f"requested_outputs omitted {malformed} malformed item(s).")
     if other_run:
-        omission_notices.append(f"registered_outputs omitted {other_run} item(s) belonging to another or unknown run.")
+        omission_notices.append(f"requested_outputs omitted {other_run} item(s) belonging to another run.")
     return outputs
 
 
@@ -3862,33 +4763,54 @@ def _packet_downloads(
 def _packet_unfinished_items(
     copilot_ctx: CopilotContext,
     run_id: str | None,
+    recorded_outcome: RecordedBuildTestOutcome | None,
     omission_notices: list[str],
 ) -> list[BuildTestPacketUnfinishedItem]:
-    outcome = copilot_ctx.latest_recorded_build_test_outcome
-    if run_id is None or outcome is None or outcome.workflow_run_id != run_id:
+    latest_outcome = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
+    outcome = recorded_outcome or (latest_outcome if isinstance(latest_outcome, RecordedBuildTestOutcome) else None)
+    if run_id is None:
         if copilot_ctx.last_unverified_block_labels or outcome is not None:
             omission_notices.append("unfinished_items omitted: recorded unfinished evidence is not bound to this run.")
         return []
-    unfinished = [
-        BuildTestPacketUnfinishedItem(kind="unverified_block", label=label)
-        for label in dict.fromkeys(copilot_ctx.last_unverified_block_labels)
-        if isinstance(label, str) and label
-    ]
-    for fact in outcome.missing_requested_output_facts:
-        output_path = _packet_string(fact.get("output_path"))
-        reason_code = _packet_string(fact.get("reason_code"))
-        if output_path is not None:
-            unfinished.append(
-                BuildTestPacketUnfinishedItem(
-                    kind="missing_requested_output",
-                    output_path=output_path,
-                    reason_code=reason_code,
-                )
-            )
+    outcome_matches_run = outcome is not None and outcome.workflow_run_id == run_id
+    if not outcome_matches_run and (copilot_ctx.last_unverified_block_labels or outcome is not None):
+        omission_notices.append("unfinished_items omitted: recorded unfinished evidence is not bound to this run.")
+    unfinished: list[BuildTestPacketUnfinishedItem] = (
+        [
+            BuildTestPacketUnfinishedItem(kind="unverified_block", label=label)
+            for label in dict.fromkeys(copilot_ctx.last_unverified_block_labels)
+            if isinstance(label, str) and label
+        ]
+        if outcome_matches_run
+        else []
+    )
+    # Keyed by owning block as well as path: two blocks can omit the same declared path, and
+    # collapsing them here would tell repair to fix one and leave the other broken.
+    missing_by_path: dict[tuple[str, str | None], str | None] = {}
+    if outcome is not None and outcome.workflow_run_id == run_id:
+        for fact in outcome.missing_requested_output_facts:
+            output_path = _packet_string(fact.get("output_path"))
+            if output_path is not None:
+                block_label = _packet_string(fact.get("block_label"))
+                missing_by_path[(output_path, block_label)] = _packet_string(fact.get("reason_code"))
+    unfinished.extend(
+        BuildTestPacketUnfinishedItem(
+            kind="missing_requested_output",
+            label=block_label,
+            output_path=path,
+            reason_code=reason_code,
+        )
+        for (path, block_label), reason_code in missing_by_path.items()
+    )
     return unfinished
 
 
-def build_test_evidence_packet(copilot_ctx: CopilotContext, result: Mapping[str, Any]) -> BuildTestEvidencePacket:
+def build_test_evidence_packet(
+    copilot_ctx: CopilotContext,
+    result: Mapping[str, Any],
+    *,
+    recorded_outcome: RecordedBuildTestOutcome | None = None,
+) -> BuildTestEvidencePacket:
     raw_data = result.get("data")
     data = raw_data if isinstance(raw_data, Mapping) else {}
     omission_notices: list[str] = []
@@ -3913,24 +4835,65 @@ def build_test_evidence_packet(copilot_ctx: CopilotContext, result: Mapping[str,
 
     raw_blocks = data.get("blocks")
     blocks = raw_blocks if isinstance(raw_blocks, list) else []
-    failed_block = next(
-        (block for block in blocks if isinstance(block, Mapping) and block.get("status") in _FAILED_BLOCK_STATUSES),
-        None,
-    )
+    failed_block = _first_failed_result([block for block in blocks if isinstance(block, Mapping)])
     action_trace = _packet_string_list(data.get("action_trace_summary"))
+    action_observations = _packet_string_list(data.get("action_observations"))
+    if not action_observations:
+        omission_notices.append("action_observations empty: no same-run action observation was recorded.")
     page_state = _packet_page_state(data, omission_notices)
+    raw_page_evidence = data.get("post_run_page_evidence")
+    page_capture = post_run_page_capture_from_result(
+        data,
+        raw_page_evidence if isinstance(raw_page_evidence, Mapping) else None,
+    )
+    if page_capture is None and recorded_outcome is not None:
+        page_capture = recorded_outcome.page_capture
     failure: BuildTestPacketFailure | None = None
     if failed_block is not None or result.get("ok") is False:
+        if recorded_outcome is not None and recorded_outcome.workflow_run_id == run_id:
+            failed_operation = recorded_outcome.failed_operation
+            if failed_operation is not None and failed_operation.workflow_run_id != run_id:
+                failed_operation = None
+        else:
+            failed_operation = failed_operation_from_run_blocks_result(result)
+        if failed_operation is not None:
+            if failed_operation.workflow_run_id is None:
+                omission_notices.append(
+                    "failure.failed_operation.workflow_run_id omitted: no run identity was recorded for the operation."
+                )
+            if failed_operation.workflow_run_block_id is None:
+                omission_notices.append(
+                    "failure.failed_operation.workflow_run_block_id omitted: no run-block identity was recorded for "
+                    "the operation."
+                )
+            if failed_operation.block_label is None:
+                omission_notices.append(
+                    "failure.failed_operation.block_label omitted: no block label was recorded for the operation."
+                )
+            if failed_operation.failing_line is None:
+                omission_notices.append(
+                    "failure.failed_operation.failing_line omitted: no failing code line was recorded for the operation."
+                )
         failure = BuildTestPacketFailure(
+            workflow_run_block_id=(
+                _packet_string(failed_block.get("workflow_run_block_id")) if failed_block is not None else None
+            ),
+            task_id=_packet_string(failed_block.get("task_id")) if failed_block is not None else None,
+            step_id=_packet_string(failed_block.get("step_id")) if failed_block is not None else None,
             block_label=_packet_string(failed_block.get("label")) if failed_block is not None else None,
+            block_type=_packet_string(failed_block.get("block_type")) if failed_block is not None else None,
             block_status=_packet_string(failed_block.get("status")) if failed_block is not None else run_status,
             reason=(
                 _packet_string(failed_block.get("failure_reason"))
                 if failed_block is not None
                 else _packet_string(data.get("failure_reason")) or _packet_string(result.get("error"))
             ),
+            error_codes=(_packet_string_list(failed_block.get("error_codes")) if failed_block is not None else []),
+            failing_line=data.get("failing_code_line") if type(data.get("failing_code_line")) is int else None,
+            failed_operation=failed_operation,
             action_trace=action_trace,
             page_state=page_state,
+            locator_observations=_packet_locator_observations(data, omission_notices),
         )
         if not action_trace:
             omission_notices.append("failure.action_trace omitted: no failed action was recorded.")
@@ -3940,8 +4903,14 @@ def build_test_evidence_packet(copilot_ctx: CopilotContext, result: Mapping[str,
             omission_notices.append("failure.reason omitted: no recorded failure reason exists.")
     else:
         omission_notices.append("failure omitted: no failed run or failed block was recorded.")
+        terminal_omission = _packet_string(data.get("terminal_page_evidence_omission"))
+        if terminal_omission is not None:
+            omission_notices.append(f"page_state terminal artifact omitted: {terminal_omission}.")
+        elif page_state is None:
+            omission_notices.append("page_state omitted: no bounded same-run terminal page state was recorded.")
 
-    registered_outputs = _packet_registered_outputs(data, run_id, omission_notices)
+    requested_outputs = _packet_requested_outputs(data, run_id, omission_notices)
+    registered_outputs = _packet_registered_outputs(copilot_ctx, data, run_id, omission_notices)
     if not registered_outputs:
         omission_notices.append("registered_outputs empty: no output parameter value was recorded.")
     downloads = _packet_downloads(copilot_ctx, data, omission_notices)
@@ -3969,7 +4938,12 @@ def build_test_evidence_packet(copilot_ctx: CopilotContext, result: Mapping[str,
     if not screenshot_present:
         omission_notices.append("screenshot omitted: no final or failed-block screenshot was recorded.")
 
-    unfinished_items = _packet_unfinished_items(copilot_ctx, run_id, omission_notices)
+    unfinished_items = _packet_unfinished_items(
+        copilot_ctx,
+        run_id,
+        recorded_outcome,
+        omission_notices,
+    )
     if not unfinished_items:
         omission_notices.append("unfinished_items empty: recorded outcome and workflow evidence identify none.")
 
@@ -3980,8 +4954,17 @@ def build_test_evidence_packet(copilot_ctx: CopilotContext, result: Mapping[str,
         canonical_workflow_yaml_complete=workflow_yaml is not None,
         attempted_block_labels=attempted_labels,
         executed_block_labels=executed_labels,
-        run=BuildTestPacketRun(workflow_run_id=run_id, status=run_status),
+        run=BuildTestPacketRun(
+            workflow_run_id=run_id,
+            browser_session_id=_packet_string(data.get("browser_session_id")),
+            status=run_status,
+            browser=_packet_run_browser(data),
+        ),
+        action_observations=action_observations,
         failure=failure,
+        page_state=page_state if failure is None else None,
+        page_capture=page_capture,
+        requested_outputs=requested_outputs,
         registered_outputs=registered_outputs,
         downloads=downloads,
         screenshot=BuildTestPacketScreenshot(present=screenshot_present, provenance=screenshot_provenance),
@@ -3997,8 +4980,14 @@ def finalize_build_test_result(
     result: dict[str, Any],
     workflow_updated: bool = False,
     diagnosis_shadow_eligible: bool = True,
+    recorded_outcome: RecordedBuildTestOutcome | None = None,
 ) -> dict[str, Any]:
     """Finalize diagnosis state and attach the one shared factual packet."""
+    # Tool seams sometimes deliberately suppress collection and return no recorded outcome.
+    # Treat any non-record as absent rather than allowing a test double or failed observer to
+    # contaminate the model-facing packet.
+    if not isinstance(recorded_outcome, RecordedBuildTestOutcome):
+        recorded_outcome = None
     if diagnosis_shadow_eligible:
         _record_diagnosis_repair_contract(
             copilot_ctx,
@@ -4010,10 +4999,69 @@ def finalize_build_test_result(
     if not isinstance(data, dict):
         data = {}
         result["data"] = data
-    data[BUILD_TEST_PACKET_KEY] = build_test_evidence_packet(copilot_ctx, result).model_dump(
-        mode="json", exclude_none=True
+    data[BUILD_TEST_PACKET_KEY] = scrub_secrets_from_structure(
+        copilot_ctx,
+        build_test_evidence_packet(
+            copilot_ctx,
+            result,
+            recorded_outcome=recorded_outcome,
+        ).model_dump(mode="json", exclude_none=True),
     )
     return result
+
+
+async def hydrate_prior_run_packet(
+    copilot_ctx: CopilotContext,
+    *,
+    workflow_run_id: str | None,
+) -> dict[str, Any] | None:
+    """The persisted facts of a run this turn did not perform, as the one shared packet. Diagnosis
+    shadow recording is off: nothing was diagnosed here, the run already happened."""
+    if not workflow_run_id:
+        return None
+    # A turn that cannot read its origin run still has to run. Reading, validating and projecting
+    # all sit inside this, so a failure anywhere degrades to no packet rather than ending the turn.
+    try:
+        result = await _get_run_results(
+            {"workflow_run_id": workflow_run_id},
+            copilot_ctx,
+            read_live_page=False,
+            admit_sensitive_origin_artifact=False,
+        )
+        if result.get("ok") is False:
+            return None
+        recorded_outcome = _build_recorded_build_test_outcome(copilot_ctx, result, recorded_run_outcome=None)
+        finalized = finalize_build_test_result(
+            copilot_ctx,
+            source_tool="get_run_results",
+            result=result,
+            diagnosis_shadow_eligible=False,
+            recorded_outcome=recorded_outcome,
+        )
+        data = finalized.get("data")
+        packet = data.get(BUILD_TEST_PACKET_KEY) if isinstance(data, dict) else None
+        if not isinstance(packet, dict):
+            return None
+        # The same bounded projection the tool path applies. This one is rendered into the user
+        # turn, which the input budget does not trim, so an unbounded packet would reach the model.
+        projected = project_build_test_packet_for_llm(BuildTestEvidencePacket.model_validate(packet)).model_dump(
+            mode="json", exclude_none=True
+        )
+    except Exception:
+        LOG.warning("copilot prior-run packet unavailable", workflow_run_id=workflow_run_id, exc_info=True)
+        return None
+    # The prompt already carries the workflow in its own section; a second copy here would sit
+    # unlabelled beside it, and disagree with it whenever the editor holds an unsaved draft.
+    for field in ("canonical_workflow_yaml", "canonical_workflow_yaml_complete", "canonical_workflow_source"):
+        projected.pop(field, None)
+    notices = projected.get("omission_notices")
+    if isinstance(notices, list):
+        kept = [n for n in notices if not (isinstance(n, str) and "canonical_workflow_yaml" in n)]
+        if kept:
+            projected["omission_notices"] = kept
+        else:
+            projected.pop("omission_notices", None)
+    return projected
 
 
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:

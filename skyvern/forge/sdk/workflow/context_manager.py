@@ -1026,6 +1026,8 @@ class WorkflowRunContext:
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
 
+        totp_field_name = self._resolve_parameter_value(parameter.totp_field_name)
+
         # Process all fields generically so it covers passwords and credit cards
         for field in item.fields:
             if not field.value or field.field_type == ItemFieldType.UNSUPPORTED:
@@ -1036,7 +1038,14 @@ class WorkflowRunContext:
                 continue
 
             field_type = field.field_type.value.lower()
-            if field_type == "totp":
+            # A configured totp_field_name overrides 1Password's own field-type detection, for
+            # items whose OTP lives in a plain field (e.g. named "digits") rather than a native
+            # 1Password one-time-password field.
+            is_totp_field = field_type == "totp" or (
+                totp_field_name is not None
+                and totp_field_name.lower() in {field.id.lower(), (field.title or "").lower()}
+            )
+            if is_totp_field:
                 random_secret_id = self.generate_random_secret_id()
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP

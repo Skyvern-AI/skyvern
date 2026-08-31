@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Cross2Icon,
   ExclamationTriangleIcon,
+  ImageIcon,
   MagicWandIcon,
   MagnifyingGlassIcon,
   ReloadIcon,
@@ -47,7 +48,11 @@ import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { CodeBlockFailureDetails } from "../../workflowRun/CodeBlockFailureDetails";
-import { findRunCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
+import {
+  failureSupportsScreenshot,
+  findRunCodeBlockFailure,
+} from "../../workflowRun/codeBlockFailure";
+import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import { pickDownloadedFileFilename } from "../../workflowRun/blockDownloadedFiles";
 import {
   buildBlockOrderIndex,
@@ -215,6 +220,7 @@ export function RunView({
     data: workflowRun,
     isLoading,
     isPlaceholderData: runIsPlaceholder,
+    isError: statusUnavailable,
   } = useWorkflowRunWithWorkflowQuery(queryOptions);
   const { data: timeline, isPlaceholderData: timelineIsPlaceholder } =
     useWorkflowRunTimelineQuery(queryOptions);
@@ -222,7 +228,7 @@ export function RunView({
   const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
   const resetRunView = useRunViewStore((s) => s.reset);
-  const { panes: studioPanes } = useStudioPanes();
+  const { panes: studioPanes, openPane } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("overview");
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -402,9 +408,10 @@ export function RunView({
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
-  const failed = outcome === "failed" && !canceled;
-  const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
-  useLiveClock(Boolean(workflowRun) && !finalized);
+  const failed = !statusUnavailable && outcome === "failed" && !canceled;
+  const finalized =
+    !statusUnavailable && workflowRun ? statusIsFinalized(workflowRun) : false;
+  useLiveClock(Boolean(workflowRun) && !finalized && !statusUnavailable);
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
@@ -471,6 +478,12 @@ export function RunView({
         finallyBlockLabel,
       ),
     [workflowRun?.failure_reason, timeline, finallyBlockLabel],
+  );
+
+  const failureScreenshot = useBlockScreenshot(
+    codeFailure?.workflowRunBlockId,
+    "code",
+    codeFailure !== null && failureSupportsScreenshot(codeFailure),
   );
 
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
@@ -578,7 +591,11 @@ export function RunView({
   const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
-    return <RunPlaceholder loading={isLoading || runIdPending} />;
+    return (
+      <RunPlaceholder
+        loading={isLoading || runIdPending || statusUnavailable}
+      />
+    );
   }
 
   // Same rule as the summary strip: created_at is always set, so falling back to
@@ -678,7 +695,7 @@ export function RunView({
                   </span>
                 ),
               )}
-              {hasFixAction || onRetry ? (
+              {hasFixAction || onRetry || failureScreenshot ? (
                 <div className="mt-3 flex flex-wrap gap-2">
                   {onFix && showFix ? (
                     <Button
@@ -708,6 +725,29 @@ export function RunView({
                         aria-hidden="true"
                       />
                       Retry
+                    </Button>
+                  ) : null}
+                  {failureScreenshot && codeFailure ? (
+                    <Button
+                      size="sm"
+                      variant={
+                        hasFixAction || onRetry ? "secondary" : "default"
+                      }
+                      onClick={() => {
+                        openPane("browser");
+                        // Let the pane-open navigation commit before mirroring
+                        // the pin. Otherwise the pin's URL writer can drop
+                        // `browser`.
+                        requestAnimationFrame(() =>
+                          pinFrame(codeFailure.workflowRunBlockId),
+                        );
+                      }}
+                    >
+                      <ImageIcon
+                        className="mr-1.5 h-3.5 w-3.5"
+                        aria-hidden="true"
+                      />
+                      View block screenshot
                     </Button>
                   ) : null}
                 </div>
@@ -741,7 +781,8 @@ export function RunView({
           <RunSummaryStrip
             workflowRun={workflowRun}
             timeline={timeline}
-            liveElapsed={liveElapsed}
+            liveElapsed={statusUnavailable ? null : liveElapsed}
+            statusUnavailable={statusUnavailable}
             trailing={
               <TimelineBlockSearch
                 targets={searchTargets}

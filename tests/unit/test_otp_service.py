@@ -28,6 +28,7 @@ from skyvern.services.otp_service import (
     _get_otp_value_from_url,
     _is_mfa_like_parameter_key,
     extract_totp_from_navigation_inputs,
+    has_credential_totp_candidate,
     parse_otp_login,
     poll_otp_value,
     resolve_otp_value,
@@ -181,7 +182,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
             result = await resolve_otp_value(task)
 
         assert result is credential_value
-        credential.assert_called_once_with("wr_test")
+        credential.assert_called_once_with("wr_test", None)
         poll.assert_not_called()
 
     @pytest.mark.asyncio
@@ -223,6 +224,44 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         with skyvern_context.scoped(_scoped_context(active=None)):
             result = await resolve_otp_value(task)
+
+        assert result is polled
+        poll.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unlinked_credential_falls_through_to_polling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SKY-15181 end to end: a block with a webhook and no linked credential must poll, even
+        though the run context holds the login block's TOTP-bearing credential (still active)."""
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "111111")
+        fake_context = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u", "password": "p", "totp": "tot_b"}},
+            secrets={"tot_b_value": _VALID_TOTP_SEED},
+        )
+        fake_app = SimpleNamespace(
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: fake_context,
+                has_workflow_run_context=lambda _wr_id: True,
+            ),
+            DATABASE=SimpleNamespace(
+                workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            ),
+        )
+        monkeypatch.setattr(otp_service, "app", fake_app)
+
+        task = SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            totp_verification_url="https://example.com/email-otp-webhook",
+            totp_identifier=None,
+            navigation_payload={},
+        )
+        polled = OTPValue(value="654321", type=OTPType.TOTP)
+        poll = AsyncMock(return_value=polled)
+        monkeypatch.setattr(otp_service, "poll_otp_value", poll)
+
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            result = await resolve_otp_value(task, allowed_credential_parameter_keys=[])
 
         assert result is polled
         poll.assert_awaited_once()
@@ -276,7 +315,7 @@ class TestResolveOtpValueExpectedOtpTypeGating:
             result = await resolve_otp_value(self._task(), expected_otp_type=OTPType.TOTP)
 
         assert result is credential_value
-        credential.assert_called_once_with(None)
+        credential.assert_called_once_with(None, None)
         poll.assert_not_called()
 
 
@@ -1872,6 +1911,42 @@ class TestTryGenerateTotpFromCredential:
         assert result is not None
         assert result.value == "131313"
 
+    def test_block_with_no_linked_credential_ignores_stale_active_key_and_run_scan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SKY-15181: an email-OTP block links no credential, so neither the login block's stale
+        active key nor the run-wide single-candidate scan may produce a code."""
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u_b", "password": "p_b", "totp": "tot_b"}},
+            secrets={"tot_b_value": _VALID_TOTP_SEED},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            result = try_generate_totp_from_credential("wr_test", allowed_credential_parameter_keys=[])
+            candidate = has_credential_totp_candidate("wr_test", allowed_credential_parameter_keys=[])
+
+        assert result is None
+        assert candidate is False
+
+    def test_block_linked_credential_wins_over_stale_active_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stale active key from an earlier block yields to the current block's own credential."""
+        fake = _FakeWorkflowRunContext(
+            values={
+                "login_credentials": {"username": "u_a", "password": "p_a", "totp": "tot_a"},
+                "mfa_credentials": {"username": "u_b", "password": "p_b", "totp": "tot_b"},
+            },
+            secrets={"tot_a_value": _VALID_TOTP_SEED, "tot_b_value": _OTHER_TOTP_SEED},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda self: "111111" if self.secret == _VALID_TOTP_SEED else "222222")
+
+        with skyvern_context.scoped(_scoped_context(active="login_credentials")):
+            result = try_generate_totp_from_credential("wr_test", allowed_credential_parameter_keys=["mfa_credentials"])
+
+        assert result is not None
+        assert result.value == "222222"
+
     def test_ordinary_input_dict_with_placeholder_totp_is_not_a_candidate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2811,6 +2886,71 @@ def test_has_otp_source_credential_totp_candidate_gated_on_expected_type(
         organization_id="o_1",
         workflow_run_id="wr_1",
     )
-    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda run_id: True)
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda run_id, *a, **k: True)
 
     assert otp_service.has_otp_source(task, expected_otp_type=expected_otp_type) is expected
+
+
+class TestScopeSuppressionRegressionSentinel:
+    """SKY-15181 rollout: a workflow that accidentally relied on a cross-block credential (and has
+    no polling fallback) must emit the facetable sentinel when scoping suppresses it — the only
+    signal separating an intended fallthrough-to-polling from a run that used to pass and now fails."""
+
+    def _armed_run_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u", "password": "p", "totp": "tot_b"}},
+            secrets={"tot_b_value": _VALID_TOTP_SEED},
+        )
+        fake_app = SimpleNamespace(
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: fake,
+                has_workflow_run_context=lambda _wr_id: True,
+            ),
+        )
+        monkeypatch.setattr(otp_service, "app", fake_app)
+
+    def _task(self, totp_verification_url: str | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            totp_verification_url=totp_verification_url,
+            totp_identifier=None,
+            navigation_payload=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_suppression_warns_from_resolver_and_offer_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._armed_run_context(monkeypatch)
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            with structlog.testing.capture_logs() as logs:
+                result = await resolve_otp_value(self._task(), allowed_credential_parameter_keys=[])
+                offered = otp_service.has_otp_source(
+                    self._task(), expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=[]
+                )
+        assert result is None and offered is False
+        sentinel = [r for r in logs if r["event"] == otp_service.SCOPE_SUPPRESSED_LEGACY_CREDENTIAL_EVENT]
+        assert len(sentinel) == 2
+        assert sentinel[0]["log_level"] == "warning"
+
+    @pytest.mark.asyncio
+    async def test_webhook_fallback_or_unscoped_run_stays_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._armed_run_context(monkeypatch)
+        polled = OTPValue(value="654321", type=OTPType.TOTP)
+        monkeypatch.setattr(otp_service, "poll_otp_value", AsyncMock(return_value=polled))
+        fake_db = SimpleNamespace(
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+        )
+        otp_service.app.DATABASE = fake_db
+        with skyvern_context.scoped(_scoped_context(active="credentials")):
+            with structlog.testing.capture_logs() as logs:
+                with_webhook = await resolve_otp_value(
+                    self._task(totp_verification_url="https://example.com/webhook"),
+                    allowed_credential_parameter_keys=[],
+                )
+                unscoped = await resolve_otp_value(self._task())
+        assert with_webhook is polled
+        assert unscoped is not None
+        assert not [r for r in logs if r["event"] == otp_service.SCOPE_SUPPRESSED_LEGACY_CREDENTIAL_EVENT]

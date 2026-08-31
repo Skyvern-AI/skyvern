@@ -65,7 +65,10 @@ from skyvern.forge.sdk.copilot.runtime import (
     PendingBrowserInteractionObservation,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
+    current_call_browser_session_override,
+    effective_browser_session_id,
     resolve_browser_state_for_context,
+    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -131,10 +134,10 @@ _MAX_SCOUTED_INTERACTIONS = 60
 
 
 async def _live_working_page_url(ctx: AgentContext) -> str | None:
-    if not ctx.browser_session_id:
+    if not effective_browser_session_id(ctx):
         return None
     try:
-        browser_state = await resolve_browser_state_for_context(ctx, session_id=ctx.browser_session_id)
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=effective_browser_session_id(ctx))
         if not browser_state:
             return None
         page = await browser_state.get_or_create_page()
@@ -545,6 +548,8 @@ async def _capture_post_interaction_screenshot(
     """
     if getattr(ctx, "codeblock_redaction_parameters", None):
         return False
+    if sensitive_origin_page_is_tainted(ctx):
+        return False
     # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
     if not getattr(ctx, "supports_vision", False):
         return False
@@ -552,7 +557,7 @@ async def _capture_post_interaction_screenshot(
     if server is None:
         return False
     capture_started_at = time.monotonic()
-    capture_session_id = ctx.browser_session_id
+    capture_session_id = effective_browser_session_id(ctx)
     screenshot_arguments = {"session_id": capture_session_id} if capture_session_id else {}
     try:
         result = await asyncio.wait_for(
@@ -562,6 +567,8 @@ async def _capture_post_interaction_screenshot(
     except Exception:
         return False
     if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    if sensitive_origin_page_is_tainted(ctx):
         return False
     producer_url, producer_session_id, session_binding = screenshot_result_facts(
         result,
@@ -773,6 +780,9 @@ def _record_scouted_interaction(
         )
         return
     artifact: ScoutedInteraction = {"tool_name": tool_name}
+    demonstrated_session_id = current_call_browser_session_override()
+    if demonstrated_session_id is not None and demonstrated_session_id != ctx.browser_session_id:
+        artifact["demonstrated_browser_session_id"] = demonstrated_session_id
     if selector:
         artifact["selector"] = selector
         artifact["executed_selector"] = selector
@@ -984,6 +994,7 @@ def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
 
 _PAGE_EVIDENCE_STATE_KEYS = (
     "page_title",
+    "size_compaction",
     "forms",
     "navigation_targets",
     "navigation_targets_truncated",
@@ -1191,6 +1202,8 @@ async def _register_scout_interaction_observation(
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
+    if sensitive_origin_page_is_tainted(ctx):
+        return None, None
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
@@ -1223,6 +1236,10 @@ async def _register_scout_interaction_observation(
             observed_after_interaction=True,
             prior_page_evidence=prior_page_evidence,
         )
+        if sensitive_origin_page_is_tainted(ctx):
+            ctx.last_scout_act_observe_outcome = None
+            ctx.last_scout_act_observe_packet = None
+            return None, None
         # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
         # that rendered witnessed value content is bindable even when it exposes no actionable schema.
         if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
@@ -1243,7 +1260,7 @@ async def _register_scout_interaction_observation(
                 source_tool="evaluate",
                 url=safe_url,
                 page_evidence=parsed,
-                source_browser_session_id=ctx.browser_session_id,
+                source_browser_session_id=effective_browser_session_id(ctx),
             )
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
@@ -1415,7 +1432,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             continue
         seen_disclosures.add(identity)
         disclosure_controls.append(summary)
-    return {
+    page_summary: dict[str, Any] = {
         "page_title": _summary_text(evidence.get("page_title")),
         "forms": forms_summary,
         "navigation_target_count": len(nav_targets),
@@ -1433,6 +1450,10 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         "modal_dismiss_controls": dismiss_entries,
         "interaction_blocking_layers": interaction_blocking_layers,
     }
+    size_compaction = evidence.get("size_compaction")
+    if isinstance(size_compaction, dict):
+        page_summary["size_compaction"] = size_compaction
+    return page_summary
 
 
 def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
@@ -1603,7 +1624,7 @@ async def _scout_session_download_names(ctx: AgentContext) -> frozenset[str] | N
 
     Read-only and failure-tolerant: this only sharpens download detection, so a storage hiccup must
     never break a scout click."""
-    browser_session_id = ctx.browser_session_id
+    browser_session_id = effective_browser_session_id(ctx)
     organization_id = ctx.organization_id
     if not browser_session_id or not organization_id:
         return None

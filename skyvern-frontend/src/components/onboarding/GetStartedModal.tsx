@@ -1,7 +1,7 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
-import { useAuth } from "@clerk/clerk-react";
+import { useAuth, useUser } from "@clerk/clerk-react";
 import {
   Dialog,
   DialogContent,
@@ -50,6 +50,13 @@ import {
 } from "@/util/onboarding/experimentConfig";
 
 const SURFACE = "discover" as const;
+
+export const DECIDING_PLACEHOLDER_DELAY_MS = 500;
+
+// Mirrors the backend questionnaire signup cutoff: reservation can only answer
+// ineligible for accounts created before it, so those users skip the reserve
+// call entirely. The server stays authoritative for everyone else.
+export const QUESTIONNAIRE_SIGNUP_CUTOFF_MS = Date.UTC(2026, 7, 27);
 
 type EditorStep = "intent" | "templates";
 type DiscoverOnboardingOwner =
@@ -136,6 +143,7 @@ function questionnaireTerminalOwner(
 function GetStartedModalForUser() {
   const { state, isLoading, isNewUser, updateState, updateStateConfirmed } =
     useOnboardingState();
+  const { user, isLoaded: userLoaded } = useUser();
   const flagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const [owner, setOwner] = useState<DiscoverOnboardingOwner>({
     kind: "deciding",
@@ -146,6 +154,8 @@ function GetStartedModalForUser() {
   const [questionnaire, setQuestionnaire] =
     useState<QuestionnaireStateV1 | null>(null);
   const [intentPending, setIntentPending] = useState(false);
+  const [decidingPlaceholderVisible, setDecidingPlaceholderVisible] =
+    useState(false);
   const [questionnairePending, setQuestionnairePending] = useState(false);
   const [intentError, setIntentError] = useState<string | null>(null);
   const [copilotStepBusy, setCopilotStepBusy] = useState(false);
@@ -194,9 +204,26 @@ function GetStartedModalForUser() {
     state !== null &&
     state.questionnaire_prompted_at == null &&
     state.questionnaire == null;
+  const questionnaireLocallyIneligible =
+    userLoaded &&
+    (user?.createdAt == null ||
+      user.createdAt.getTime() < QUESTIONNAIRE_SIGNUP_CUTOFF_MS);
   const decidingOpen = reservationCandidate;
   const ownedOpen = questionnaireOwner || editorOpen;
   const isOpen = decidingOpen || ownedOpen;
+  // The deciding dialog must block interaction but stay invisible at first, so
+  // a reservation that resolves to "nothing to show" never flashes the
+  // placeholder; it is revealed only if the check outlasts the grace delay.
+  const decidingHidden =
+    owner.kind === "deciding" && !decidingPlaceholderVisible;
+  useEffect(() => {
+    if (!decidingOpen) return;
+    const timer = window.setTimeout(
+      () => setDecidingPlaceholderVisible(true),
+      DECIDING_PLACEHOLDER_DELAY_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [decidingOpen]);
   useLayoutEffect(() => {
     if (ownedOpen && !isOpenRef.current) openVisitRef.current += 1;
     isOpenRef.current = ownedOpen;
@@ -235,6 +262,21 @@ function GetStartedModalForUser() {
     }
     if (!reservationCandidate) {
       setOwner({ kind: "closed" });
+      return;
+    }
+    if (!userLoaded) {
+      return;
+    }
+    if (questionnaireLocallyIneligible) {
+      if (state.modal_dismissed_at !== null || state.first_save_at !== null) {
+        setOwner({ kind: "closed" });
+        return;
+      }
+      if (state.user_intent) {
+        setSelectedIntent(state.user_intent);
+        setStep("templates");
+      }
+      setOwner({ kind: "editor" });
       return;
     }
     reservationStartedRef.current = true;
@@ -298,9 +340,11 @@ function GetStartedModalForUser() {
   }, [
     isLoading,
     owner.kind,
+    questionnaireLocallyIneligible,
     reservationCandidate,
     state,
     updateStateConfirmed,
+    userLoaded,
   ]);
 
   useEffect(() => {
@@ -549,7 +593,11 @@ function GetStartedModalForUser() {
   return (
     <Dialog open={isOpen} onOpenChange={() => handleSkip()}>
       <DialogContent
-        className="z-[2147480003] grid max-h-[calc(100dvh-2rem)] max-w-xl grid-rows-[minmax(0,1fr)] overflow-hidden overscroll-contain [&>button]:right-2 [&>button]:top-2 [&>button]:inline-flex [&>button]:size-11 [&>button]:touch-manipulation [&>button]:items-center [&>button]:justify-center [&>button]:motion-reduce:transition-none"
+        className={cn(
+          "z-[2147480003] grid max-h-[calc(100dvh-2rem)] max-w-xl grid-rows-[minmax(0,1fr)] overflow-hidden overscroll-contain [&>button]:right-2 [&>button]:top-2 [&>button]:inline-flex [&>button]:size-11 [&>button]:touch-manipulation [&>button]:items-center [&>button]:justify-center [&>button]:motion-reduce:transition-none",
+          decidingHidden && "opacity-0",
+        )}
+        overlayClassName={decidingHidden ? "opacity-0" : undefined}
         onPointerDownOutside={(e) => e.preventDefault()}
       >
         {view === null ? (

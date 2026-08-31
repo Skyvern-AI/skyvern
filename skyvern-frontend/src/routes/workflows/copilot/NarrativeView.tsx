@@ -1,19 +1,12 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  type Ref,
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-
-import {
+  REVEAL_MS_PER_CHAR,
   buildRevealOffsets,
   revealedCharsAt,
   revealedCountAt,
 } from "./actionReveal";
 import { humanizeBlockLabel } from "./blockLabel";
+import { CopilotMarkdown } from "./CopilotMarkdown";
 import {
   ACTIVITY_KIND_GLYPH,
   ACTIVITY_KIND_WORD,
@@ -27,13 +20,10 @@ import {
   BlockState,
   RecordedActionSummary,
   TurnNarrativeState,
-  TurnSummary,
-  computeTurnSummary,
   formatElapsed,
   humanizeJudgeText,
   isBlockOk,
   isInterimOutcome,
-  latestBlocksByLabel,
   notConfirmedOutcome,
   parseUtcIsoMs,
   toolActivityDisplayLabel,
@@ -45,6 +35,8 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+const TERMINAL_PROSE_GRADIENT_CHARS = 32;
+const TERMINAL_PROSE_GRADIENT_SETTLE_MS = 420;
 
 function normalizeOutcomeReason(
   reason: string | null | undefined,
@@ -55,18 +47,6 @@ function normalizeOutcomeReason(
   return humanized.length > 0 ? humanized : null;
 }
 
-function normalizeOutcomeReasonSearchText(
-  text: string | null | undefined,
-): string {
-  const normalized = normalizeOutcomeReason(text);
-  if (!normalized) return "";
-  return normalized
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[.,!?;:]+$/g, "")
-    .trim();
-}
-
 function truncateOutcomeReason(reason: string): string {
   if (reason.length <= OUTCOME_REASON_PREVIEW_LIMIT) return reason;
   const slice = reason.slice(0, OUTCOME_REASON_PREVIEW_LIMIT - 3).trimEnd();
@@ -75,6 +55,15 @@ function truncateOutcomeReason(reason: string): string {
 
 function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
   return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
+}
+
+function hasBlockOutcomeNotConfirmed(turn: TurnNarrativeState): boolean {
+  return turn.blocks.some(
+    (block) =>
+      block.state === "completed" &&
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole),
+  );
 }
 
 interface BlockPalette {
@@ -411,7 +400,7 @@ function useTick(active: boolean, intervalMs = 1000): void {
 }
 
 // Both reveals advance faster than an interval coarse enough for status text:
-// narration moves a character every 14ms, and buildRevealOffsets scales a long
+// narration moves a character every REVEAL_MS_PER_CHAR, and buildRevealOffsets scales a long
 // block's steps under 150ms, so a timer samples them in visible jumps.
 function useFrameTick(active: boolean): void {
   const [, setTick] = useState(0);
@@ -487,9 +476,8 @@ interface FBlockRunProps {
   turnEnded: boolean;
   onSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
-  // Narrator title for the row this card heads. The card's own status text and
-  // the rollup's block lists still name the block, so the title replaces only
-  // the label here.
+  // Narrator title for the row this card heads. The card's own status text
+  // still names the block, so the title replaces only the label here.
   rowTitle?: string | null;
   // Inside the activity log the card sheds its puck for the shared row grid,
   // so a block does not read as a different species from the steps around it.
@@ -1488,303 +1476,21 @@ function FActivityLog({
   );
 }
 
-function accentBg(accent: TurnSummary["accent"]): string {
-  if (accent === "fail") {
-    return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
-  }
-  if (accent === "warn") {
-    return "border-amber-400/60 bg-amber-500/15 text-amber-700 dark:text-amber-300";
-  }
-  if (accent === "qa") {
-    return "border-sky-400/60 bg-sky-500/15 text-sky-700 dark:text-sky-300";
-  }
-  return "border-emerald-400/60 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
-}
-
-interface TurnHeadProps {
-  summary: TurnSummary;
-  expanded: boolean;
-  onClick?: () => void;
-  subtitle?: ReactNode;
-  buttonRef?: Ref<HTMLButtonElement>;
-  controlsId?: string;
-}
-
-function TurnHead({
-  summary,
-  expanded,
-  onClick,
-  subtitle,
-  buttonRef,
-  controlsId,
-}: TurnHeadProps) {
-  const expandable = Boolean(onClick);
-  const headClass = "flex w-full items-start gap-3 px-3.5 py-3 text-left";
-  const body = (
-    <>
-      <span
-        className={`flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full border text-[12px] font-bold ${accentBg(
-          summary.accent,
-        )}`}
-        aria-hidden="true"
-      >
-        {summary.glyph}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="mb-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className="text-[14px] font-semibold tracking-tight text-foreground">
-            {summary.headline}
-          </span>
-          {summary.stats.length ? (
-            <span className="text-[11.5px] text-muted-foreground">
-              {summary.stats.join(" · ")}
-            </span>
-          ) : null}
-        </div>
-        {subtitle}
-      </div>
-      {expandable ? (
-        <span
-          className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
-            expanded ? "rotate-90" : ""
-          }`}
-          aria-hidden="true"
-        >
-          ›
-        </span>
-      ) : null}
-    </>
-  );
-
-  if (!expandable) {
-    return <div className={headClass}>{body}</div>;
-  }
-
-  return (
-    <button
-      ref={buttonRef}
-      type="button"
-      onClick={onClick}
-      aria-expanded={expanded}
-      aria-controls={controlsId}
-      className={headClass}
-    >
-      {body}
-    </button>
-  );
-}
-
-interface RollupCardProps {
-  turn: TurnNarrativeState;
-  summary: TurnSummary;
-  onExpand: () => void;
-  onBlockSelect?: (label: string) => void;
-  activityInteractionRef?: { current: string | null };
-  headerRef?: Ref<HTMLButtonElement>;
-}
-
-function RollupCard({
-  turn,
-  summary,
-  onExpand,
-  onBlockSelect,
-  activityInteractionRef,
-  headerRef,
-}: RollupCardProps) {
-  // The backend appends the judge's verdict to the closing message, so it needs the
-  // same display-layer rewrite the outcome reason gets.
-  const closing = humanizeJudgeText(
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
-  );
-  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
-  const truncatedOutcomeReason = collapsedOutcomeReason
-    ? truncateOutcomeReason(collapsedOutcomeReason)
-    : null;
-  const normalizedClosing = normalizeOutcomeReasonSearchText(closing);
-  // Normalizing the truncated preview (its trailing "..." strips as punctuation)
-  // makes the containment check a prefix match, so closings carrying either the
-  // full reason or a truncated form of it both suppress the appended segment.
-  const normalizedOutcomeReason = normalizeOutcomeReasonSearchText(
-    truncatedOutcomeReason,
-  );
-  const shouldAppendOutcomeReason =
-    normalizedOutcomeReason.length > 0 &&
-    !normalizedClosing.includes(normalizedOutcomeReason);
-  const outcomeReasonSubtitle = shouldAppendOutcomeReason
-    ? `Outcome not confirmed: ${truncatedOutcomeReason!}`
-    : "";
-  const subtitle = [closing, outcomeReasonSubtitle].filter(Boolean).join(" · ");
-  const rollupBlocks = latestBlocksByLabel(turn.blocks);
-  const completed = rollupBlocks.filter((b) => isBlockOk(b));
-  const failed = rollupBlocks.filter((b) => b.state === "failed");
-  const stopped = rollupBlocks.filter((b) => b.state === "stopped");
-  const showChecklist = showPhaseChecklist(turn);
-  // The log holds every block, but a non-solo run row renders its cards in the
-  // body, which is collapsed once the turn ends — so the log names a block on
-  // screen only in the one-block case. These lists stay until a run row carries
-  // its blocks' outcomes in the collapsed line.
-  const showCommit = !summary.isQA && completed.length > 0;
-  const showHalted = failed.length > 0;
-  // Expand only earns a chevron when DetailView adds content beyond the head's
-  // message — a pure ask (no scouting) re-renders the same text, so no chevron.
-  const hasExpandableDetail =
-    showChecklist ||
-    turn.blocks.length > 0 ||
-    (turn.designStarted && (turn.draft?.blockCount ?? 0) > 0) ||
-    turn.designActivity.some((e) => e.kind === "narration");
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-border/60 bg-slate-elevation2">
-      <TurnHead
-        summary={summary}
-        expanded={false}
-        onClick={hasExpandableDetail ? onExpand : undefined}
-        buttonRef={headerRef}
-        controlsId={undefined}
-        subtitle={
-          subtitle ? (
-            <div
-              className={`mt-0.5 text-[12.5px] leading-[1.5] ${
-                summary.isFail && !summary.isStoppedWithDraft
-                  ? "text-rose-700 dark:text-rose-200/90"
-                  : "text-muted-foreground"
-              }`}
-            >
-              {subtitle}
-            </div>
-          ) : null
-        }
-      />
-
-      {showChecklist ? (
-        <div className="border-t border-white/5 px-3.5 py-2">
-          <FActivityLog
-            key={turn.turnId ?? ""}
-            turn={turn}
-            turnEnded
-            onBlockSelect={onBlockSelect}
-            interactionRef={activityInteractionRef}
-          />
-        </div>
-      ) : null}
-
-      {showCommit ? (
-        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground dark:text-slate-500">
-            What changed
-          </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {completed.map((b) => {
-              const palette = paletteFor(b.blockType);
-              return (
-                <li
-                  key={b.label}
-                  className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-foreground dark:text-slate-200"
-                >
-                  <span
-                    className={`w-3.5 shrink-0 text-center text-[11px] font-bold ${palette.fg}`}
-                    aria-hidden="true"
-                  >
-                    {palette.glyph}
-                  </span>
-                  <span
-                    className="text-[11px] text-muted-foreground"
-                    title={b.label}
-                  >
-                    {humanizeBlockLabel(b.label)}
-                  </span>
-                  <span className="text-slate-600">·</span>
-                  <span className="text-[11.5px] text-foreground dark:text-slate-200">
-                    {b.blockType}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      ) : null}
-
-      {showHalted ? (
-        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-rose-700 dark:text-rose-400">
-            Halted
-          </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {failed.map((b) => (
-              <li
-                key={b.label}
-                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200"
-              >
-                <span
-                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-rose-700 dark:text-rose-300"
-                  aria-hidden="true"
-                >
-                  ✕
-                </span>
-                <span
-                  className="text-[11px] text-rose-700 dark:text-rose-300/80"
-                  title={b.label}
-                >
-                  {humanizeBlockLabel(b.label)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {stopped.length > 0 ? (
-        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground">
-            Stopped
-          </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {stopped.map((b) => (
-              <li
-                key={b.label}
-                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-tertiary-foreground"
-              >
-                <span
-                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-muted-foreground"
-                  aria-hidden="true"
-                >
-                  ■
-                </span>
-                <span
-                  className="text-[11px] text-muted-foreground"
-                  title={b.label}
-                >
-                  {humanizeBlockLabel(b.label)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 interface DetailViewProps {
   turn: TurnNarrativeState;
-  onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
   workingRowActive?: boolean;
   activityInteractionRef?: { current: string | null };
-  collapseRef?: Ref<HTMLButtonElement>;
-  detailsId?: string;
 }
 
 function DetailView({
   turn,
-  onCollapse,
   onBlockSelect,
   workingRowActive,
   activityInteractionRef,
-  collapseRef,
-  detailsId,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
+  const blockShowsOutcomeNotConfirmed = hasBlockOutcomeNotConfirmed(turn);
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -1801,24 +1507,7 @@ function DetailView({
 
   return (
     <div className="flex flex-col gap-2.5">
-      {onCollapse ? (
-        <button
-          ref={collapseRef}
-          type="button"
-          onClick={onCollapse}
-          aria-label="Collapse turn"
-          aria-expanded={true}
-          aria-controls={detailsId}
-          className="flex w-full items-center justify-end gap-1.5 px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground hover:text-tertiary-foreground dark:text-slate-500"
-        >
-          <span>Collapse</span>
-          <span aria-hidden="true" className="rotate-90 text-[13px]">
-            ›
-          </span>
-        </button>
-      ) : null}
-
-      <div id={detailsId} className="flex flex-col gap-2.5">
+      <div className="flex flex-col gap-2.5">
         {showChecklist ? (
           <FActivityLog
             key={turn.turnId ?? ""}
@@ -1860,12 +1549,21 @@ function DetailView({
         ) : null}
 
         {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
-          <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-            {humanizeJudgeText(
-              turn.narrativeSummary?.trim() ||
-                turn.terminalMessage?.trim() ||
-                "",
-            )}
+          <div className="text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
+            <CopilotMarkdown
+              text={humanizeJudgeText(
+                turn.narrativeSummary?.trim() ||
+                  turn.terminalMessage?.trim() ||
+                  "",
+              )}
+            />
+          </div>
+        ) : null}
+
+        {collapsedOutcomeReason && !blockShowsOutcomeNotConfirmed ? (
+          <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-300">
+            <span className="font-medium">Outcome not confirmed</span>
+            {` — ${truncateOutcomeReason(collapsedOutcomeReason)}`}
           </div>
         ) : null}
       </div>
@@ -1879,43 +1577,149 @@ interface NarrativeViewProps {
   workingRowActive?: boolean;
 }
 
+type TerminalProseTone = "answer" | "question";
+
+function hasRecordedTerminalEvidence(turn: TurnNarrativeState): boolean {
+  return (
+    turn.blocks.length > 0 ||
+    (turn.draft?.blockCount ?? 0) > 0 ||
+    turn.lastRunOutcome !== null
+  );
+}
+
+function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
+  // This is intentionally driven only by the structured terminal outcome.
+  // Agent language is freeform, so parsing it to decide whether the user needs
+  // to respond would turn presentation into a brittle copy contract.
+  if (turn.terminal !== "response" || turn.cancelled) return null;
+  // A run whose outcome was not demonstrated needs its existing warning and
+  // expandable evidence. Freeform clarification prose cannot replace that
+  // inspection path.
+  if (notConfirmedOutcome(turn) !== null) return null;
+  if (
+    turn.proposalDisposition === "review_untested" ||
+    turn.proposalDisposition === "review_tested"
+  ) {
+    return null;
+  }
+  // A terminal question can follow a partial build or test. Keep recorded work
+  // on the expandable evidence path rather than losing it to prose-only chrome.
+  if (hasRecordedTerminalEvidence(turn)) return null;
+  if (turn.responseKind === "clarify" || turn.responseType === "ASK_QUESTION") {
+    return "question";
+  }
+  if (
+    turn.responseKind === "answer" ||
+    turn.responseKind === "diagnose" ||
+    turn.responseKind === "refuse" ||
+    turn.responseKind === "recover"
+  ) {
+    return "answer";
+  }
+  return null;
+}
+
+function TerminalProse({
+  text,
+  tone,
+  arrivedAt,
+}: {
+  text: string;
+  tone: TerminalProseTone;
+  arrivedAt: string | null;
+}) {
+  const visibleLengthRef = useRef({ text, length: text.length });
+  if (visibleLengthRef.current.text !== text) {
+    visibleLengthRef.current = { text, length: text.length };
+  }
+  const onCharacterCount = useCallback(
+    (count: number) => {
+      visibleLengthRef.current = { text, length: Math.max(1, count) };
+    },
+    [text],
+  );
+  const reducedMotion =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // A hydrated history row should never replay. The terminal timestamp is the
+  // recorded arrival time for a live response, while an absent timestamp means
+  // the browser cannot truthfully reconstruct the original reveal.
+  const arrivalMs = parseUtcIsoMs(arrivedAt);
+  const elapsedMs = arrivalMs === null ? null : Date.now() - arrivalMs;
+  const visibleLength = visibleLengthRef.current.length;
+  const shown =
+    reducedMotion || elapsedMs === null
+      ? visibleLength
+      : Math.min(
+          visibleLength,
+          Math.max(1, revealedCharsAt(visibleLength, elapsedMs)),
+        );
+  const revealing = shown < visibleLength;
+  const settleProgress =
+    !revealing && elapsedMs !== null
+      ? Math.min(
+          1,
+          Math.max(
+            0,
+            (elapsedMs - visibleLength * REVEAL_MS_PER_CHAR) /
+              TERMINAL_PROSE_GRADIENT_SETTLE_MS,
+          ),
+        )
+      : 0;
+  const settling =
+    !reducedMotion && elapsedMs !== null && !revealing && settleProgress < 1;
+  const gradientChars = revealing
+    ? TERMINAL_PROSE_GRADIENT_CHARS
+    : Math.ceil(TERMINAL_PROSE_GRADIENT_CHARS * (1 - settleProgress));
+  const gradientStart =
+    revealing || settling ? Math.max(0, shown - gradientChars) : shown;
+  useFrameTick(revealing || settling);
+
+  return (
+    <div
+      data-testid="copilot-terminal-prose"
+      className={[
+        "text-[13px] leading-[1.55]",
+        tone === "question"
+          ? "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]"
+          : "text-foreground dark:text-slate-200",
+      ].join(" ")}
+    >
+      <div className="sr-only">
+        <CopilotMarkdown text={text} />
+      </div>
+      <div data-testid="copilot-terminal-prose-visual" aria-hidden="true">
+        <CopilotMarkdown
+          text={text}
+          reveal={
+            revealing || settling
+              ? { shown, gradientStart, onCharacterCount }
+              : undefined
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
 export function NarrativeView({
   turn,
   onBlockSelect,
   workingRowActive,
 }: NarrativeViewProps) {
-  const summary = useMemo(() => computeTurnSummary(turn), [turn]);
-  const isInFlight = turn.terminal === null;
-  const isComplete = !isInFlight;
-  const [userRolled, setUserRolled] = useState<boolean | null>(null);
+  const proseTone = terminalProseTone(turn);
+  const proseText = humanizeJudgeText(
+    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+  );
   const activityInteractionRef = useRef<string | null>(null);
-  const rolled = userRolled === null ? isComplete : userRolled;
-  const rollupButtonRef = useRef<HTMLButtonElement>(null);
-  const collapseButtonRef = useRef<HTMLButtonElement>(null);
-  const pendingTurnFocus = useRef<"rollup" | "detail" | null>(null);
-  const detailsId = `copilot-turn-${turn.turnId ?? turn.turnIndex}-details`;
-  useEffect(() => {
-    if (pendingTurnFocus.current === "rollup") {
-      rollupButtonRef.current?.focus();
-    } else if (pendingTurnFocus.current === "detail") {
-      collapseButtonRef.current?.focus();
-    }
-    pendingTurnFocus.current = null;
-  }, [rolled]);
 
-  if (rolled && isComplete) {
+  if (proseTone !== null && proseText) {
     return (
-      <RollupCard
-        turn={turn}
-        summary={summary}
-        onExpand={() => {
-          activityInteractionRef.current = null;
-          pendingTurnFocus.current = "detail";
-          setUserRolled(false);
-        }}
-        onBlockSelect={onBlockSelect}
-        activityInteractionRef={activityInteractionRef}
-        headerRef={rollupButtonRef}
+      <TerminalProse
+        text={proseText}
+        tone={proseTone}
+        arrivedAt={turn.endedAt}
       />
     );
   }
@@ -1923,20 +1727,9 @@ export function NarrativeView({
   return (
     <DetailView
       turn={turn}
-      onCollapse={
-        isComplete
-          ? () => {
-              activityInteractionRef.current = null;
-              pendingTurnFocus.current = "rollup";
-              setUserRolled(true);
-            }
-          : null
-      }
       onBlockSelect={onBlockSelect}
       workingRowActive={workingRowActive}
       activityInteractionRef={activityInteractionRef}
-      collapseRef={collapseButtonRef}
-      detailsId={detailsId}
     />
   );
 }

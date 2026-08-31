@@ -70,6 +70,7 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.playwright_input import register_playwright_input_context
 from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
 LOG = structlog.get_logger()
@@ -808,6 +809,10 @@ class BrowserContextFactory:
                 target_url=cast(str | None, kwargs.get("url")),
                 headers=scoped_headers,
                 route_handlers_allowed=route_handlers_allowed,
+            )
+            register_playwright_input_context(
+                browser_context,
+                strict_selectors=cast(bool, kwargs.get("strict_selectors", False)),
             )
 
             proxy_location: ProxyLocationInput = kwargs.get("proxy_location")

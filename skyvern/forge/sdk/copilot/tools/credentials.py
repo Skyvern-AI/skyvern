@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from typing import Any
 
 import structlog
@@ -43,8 +43,9 @@ def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
         if isinstance(item, str):
             found.extend(_CREDENTIAL_ID_RE.findall(item))
             # Google connection IDs are accepted only as an exact structured slot value. Do not
-            # search prose for them: account authority comes from a verified click or persisted
-            # workflow binding, and this extractor is only the later existence-validation seam.
+            # search prose for them: account authority comes from a verified click, a persisted
+            # workflow binding, or a selected native Sheets binding cited from this turn's
+            # server-owned integration result. This extractor is only the later validation seam.
             if item.startswith("goac_"):
                 found.append(item)
         elif isinstance(item, dict):
@@ -94,6 +95,7 @@ def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[st
         found.extend(_extract_credential_ids_from_tool_value(parameter.get(slot_field)))
         if slot_field == "credential_id":
             found.extend(_extract_credential_ids_from_tool_value(parameter.get("credential_ids")))
+            found.extend(_extract_credential_ids_from_tool_value(parameter.get("fallback_credential_ids")))
 
     return list(dict.fromkeys(found))
 
@@ -107,7 +109,12 @@ def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -
     return list(dict.fromkeys(found))
 
 
-def _extract_credential_ids_for_labels(workflow_definition: Any, labels: Collection[str]) -> list[str]:
+def _extract_credential_ids_for_labels(
+    workflow_definition: Any,
+    labels: Collection[str],
+    *,
+    excluded_block_types: Collection[str] = (),
+) -> list[str]:
     """Credential IDs reachable from the blocks named by `labels` and their descendants, plus any
     top-level credential parameter no block claims; falls back to the whole-document set when the
     label set is empty or a label does not resolve. Sound only while the runtime exposes a
@@ -123,6 +130,7 @@ def _extract_credential_ids_for_labels(workflow_definition: Any, labels: Collect
         return _extract_credential_ids_from_workflow_definition(definition)
 
     credential_params_by_key = credential_param_ids(definition.get("parameters"))
+    excluded_types = set(excluded_block_types)
 
     def block_ids(block: dict[str, Any]) -> list[str]:
         return _extract_credential_ids_from_workflow_parameters(block.get("parameters")) + sorted(
@@ -136,8 +144,28 @@ def _extract_credential_ids_for_labels(workflow_definition: Any, labels: Collect
         if credential_id not in claimed_by_any_block
     ]
     for block in selected_blocks:
+        if block.get("block_type") in excluded_types:
+            continue
         found.extend(block_ids(block))
     return list(dict.fromkeys(found))
+
+
+def _google_sheet_connection_bindings_from_workflow_definition(
+    workflow_definition: Any,
+    *,
+    selected_labels: Collection[str] | None = None,
+) -> list[tuple[str, str]]:
+    definition = _workflow_definition_as_dict(workflow_definition)
+    return [
+        (label, connection_id)
+        for block in workflow_blocks(
+            {"workflow_definition": definition},
+            selected_labels=set(selected_labels) if selected_labels is not None else None,
+        )
+        if block.get("block_type") in {"google_sheets_read", "google_sheets_write"}
+        and isinstance((label := block.get("label")), str)
+        and isinstance((connection_id := block.get("credential_id")), str)
+    ]
 
 
 def _parsed_workflow_definition(workflow_yaml: str | None) -> dict[str, Any] | None:
@@ -257,10 +285,71 @@ def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[st
     )
 
 
-def _credential_run_approval_error(credential_ids: list[str], request_policy: RequestPolicy | None) -> str | None:
+async def _approve_server_verified_google_sheet_bindings(
+    bindings: Collection[tuple[str, str]],
+    *,
+    tool_activity: Sequence[dict[str, Any]],
+    organization_id: str,
+    request_policy: RequestPolicy | None,
+) -> list[str]:
+    """Admit selected Sheets citations backed by this turn's server-owned listing."""
+    if request_policy is None:
+        return []
+
+    listed_ids: set[str] = set()
+    for activity in reversed(tool_activity):
+        if activity.get("tool") != "list_integrations":
+            continue
+        integrations = activity.get("integrations")
+        if not isinstance(integrations, list):
+            break
+        listed_ids = {
+            connection_id
+            for integration in integrations
+            if isinstance(integration, dict)
+            and integration.get("provider") == "google"
+            and integration.get("state") == "active"
+            and isinstance((connection_id := integration.get("connection_id")), str)
+            and isinstance(integration.get("scopes_granted"), list)
+            and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in integration["scopes_granted"]
+        }
+        break
+    if not listed_ids:
+        return []
+
+    cited_ids = list(dict.fromkeys(connection_id for _, connection_id in bindings if connection_id in listed_ids))
+    already_approved = set(request_policy.run_approved_google_connection_ids)
+    candidates = [connection_id for connection_id in cited_ids if connection_id not in already_approved]
+    if not candidates:
+        return []
+    try:
+        active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
+    except Exception:
+        LOG.warning(
+            "copilot cited Google Sheets binding authority lookup failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return []
+
+    eligible_ids = {
+        connection.id
+        for connection in active_connections
+        if google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
+    }
+    approved = [connection_id for connection_id in candidates if connection_id in eligible_ids]
+    return approved
+
+
+def _credential_run_approval_error(
+    credential_ids: list[str],
+    request_policy: RequestPolicy | None,
+    *,
+    additional_approved_ids: Collection[str] = (),
+) -> str | None:
     if not credential_ids:
         return None
-    approved_ids = _approved_run_credential_ids(request_policy)
+    approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
     unapproved_ids = [credential_id for credential_id in credential_ids if credential_id not in approved_ids]
     if not unapproved_ids:
         return None
@@ -268,9 +357,12 @@ def _credential_run_approval_error(credential_ids: list[str], request_policy: Re
 
 
 def _credential_run_approval_blocker_signal(
-    credential_ids: list[str], request_policy: RequestPolicy | None
+    credential_ids: list[str],
+    request_policy: RequestPolicy | None,
+    *,
+    additional_approved_ids: Collection[str] = (),
 ) -> CopilotToolBlockerSignal | None:
-    approved_ids = _approved_run_credential_ids(request_policy)
+    approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
     unapproved_google_ids = [
         credential_id
         for credential_id in credential_ids

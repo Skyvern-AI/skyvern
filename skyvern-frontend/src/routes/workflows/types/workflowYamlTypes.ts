@@ -112,6 +112,7 @@ export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "onepassword";
   vault_id: string;
   item_id: string;
+  totp_field_name?: string | null;
 };
 
 export type AzureVaultCredentialParameterYAML = ParameterYAMLBase & {

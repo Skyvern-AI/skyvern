@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyVerdict,
 )
 from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -47,6 +48,16 @@ _LEAK_TOKENS_FULL = _LEAK_DENY_TOKENS
 # automatically rather than silently passing with stale values.
 _ALL_BLOCKER_KINDS: tuple[BlockerKind, ...] = get_args(BlockerKind)
 _ALL_RECOVERY_HINTS: tuple[RecoveryHint, ...] = get_args(RecoveryHint)
+
+
+_COVERED_DRAFT_YAML = """title: Draft
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: task
+    label: step
+    prompt: Do it
+"""
 
 
 def _signal(
@@ -275,7 +286,10 @@ def test_output_policy_generic_block_uses_only_safety_and_draft_evidence() -> No
     ctx = _ctx()
     fake_workflow: Any = object()
     ctx.last_workflow = fake_workflow
-    ctx.last_workflow_yaml = "title: Draft\n"
+    ctx.last_workflow_yaml = _COVERED_DRAFT_YAML
+    ctx.executed_block_fingerprints = {
+        label: set(values) for label, values in workflow_block_fingerprints(_COVERED_DRAFT_YAML).items()
+    }
     ctx.workflow_persisted = True
     ctx.last_test_ok = True
     _seed_terminal_evidence(ctx)
@@ -285,7 +299,7 @@ def test_output_policy_generic_block_uses_only_safety_and_draft_evidence() -> No
 
     assert result.response_type == "ASK_QUESTION"
     assert result.updated_workflow is fake_workflow
-    assert result.proposal_disposition == "review_tested"
+    assert result.proposal_disposition == "review_untested"
     assert "latest run recorded workflow output" not in result.user_response
     assert "did not demonstrate" not in result.user_response
     assert "verification challenge" in result.user_response

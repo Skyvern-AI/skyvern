@@ -9,6 +9,7 @@ import type {
 import {
   describeCodeBlockFailure,
   failingCodeLineFromActions,
+  failureSupportsScreenshot,
   findRunCodeBlockFailure,
 } from "./codeBlockFailure";
 
@@ -359,4 +360,31 @@ describe("findRunCodeBlockFailure", () => {
       recovery: "retry",
     });
   });
+});
+
+describe("failureSupportsScreenshot", () => {
+  // Only faults that are claims about the page have a capture worth offering.
+  const kinds = {
+    "user-code": true,
+    browser: true,
+    declared: false,
+    infrastructure: false,
+    limit: false,
+    cancelled: false,
+  } as const;
+
+  for (const [kind, supported] of Object.entries(kinds)) {
+    test(`${kind} -> ${supported}`, () => {
+      expect(
+        failureSupportsScreenshot({
+          kind: kind as keyof typeof kinds,
+          code: null,
+          title: "t",
+          guidance: "g",
+          line: null,
+          recovery: "fix",
+        }),
+      ).toBe(supported);
+    });
+  }
 });

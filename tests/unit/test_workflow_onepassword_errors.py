@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from onepassword import ItemFieldType
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.exceptions import (
@@ -28,6 +29,8 @@ from skyvern.forge.sdk.services.credentials import (
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import OnePasswordCredentialParameter
 
+_TEST_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
+
 
 def _make_context() -> WorkflowRunContext:
     return WorkflowRunContext(
@@ -39,7 +42,11 @@ def _make_context() -> WorkflowRunContext:
     )
 
 
-def _make_parameter(vault_id: str = "vault123", item_id: str = "item123") -> OnePasswordCredentialParameter:
+def _make_parameter(
+    vault_id: str = "vault123",
+    item_id: str = "item123",
+    totp_field_name: str | None = None,
+) -> OnePasswordCredentialParameter:
     now = datetime.now(timezone.utc)
     return OnePasswordCredentialParameter(
         key="op_cred",
@@ -47,9 +54,14 @@ def _make_parameter(vault_id: str = "vault123", item_id: str = "item123") -> One
         workflow_id="wf-id",
         vault_id=vault_id,
         item_id=item_id,
+        totp_field_name=totp_field_name,
         created_at=now,
         modified_at=now,
     )
+
+
+def _make_field(field_id: str, title: str | None, value: str, field_type: ItemFieldType) -> SimpleNamespace:
+    return SimpleNamespace(id=field_id, title=title, value=value, field_type=field_type)
 
 
 def _make_organization() -> MagicMock:
@@ -182,6 +194,94 @@ async def test_onepassword_error_includes_resolved_vault_and_item_ids(
     assert "{{ vault_param }}" not in message
     assert "{{ item_param }}" not in message
     assert "fake-token" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_type, totp_field_name",
+    [
+        # Regression: 1Password's own TOTP field type is still auto-detected with no override set.
+        (ItemFieldType.TOTP, None),
+        # SKY-14541: a plain field (e.g. a custom field named "digits") isn't tagged as 1Password's
+        # native TOTP type, so an external automation that writes the OTP seed there needs
+        # totp_field_name to tell Skyvern which field carries it. Matching is case-insensitive.
+        (ItemFieldType.CONCEALED, "DIGITS"),
+    ],
+)
+async def test_onepassword_totp_field_is_detected(
+    mocked_app_database, patched_settings_token, field_type, totp_field_name
+):
+    ctx = _make_context()
+    forge_app.AGENT_FUNCTION.parse_enterprise_totp_secret = AsyncMock(return_value=None)
+    fake_item = SimpleNamespace(
+        fields=[_make_field("digits", "Digits", _TEST_TOTP_SECRET, field_type)],
+        notes=None,
+    )
+    fake_client = MagicMock()
+    fake_client.items.get = AsyncMock(return_value=fake_item)
+    with patch(
+        "skyvern.forge.sdk.workflow.context_manager.OnePasswordClient.authenticate",
+        new_callable=AsyncMock,
+        return_value=fake_client,
+    ):
+        await ctx.register_onepassword_credential_parameter_value(
+            _make_parameter(totp_field_name=totp_field_name), _make_organization()
+        )
+
+    totp_secret_id = ctx.values["op_cred"]["totp"]
+    assert ctx.secrets[ctx.totp_secret_value_key(totp_secret_id)] == _TEST_TOTP_SECRET
+
+
+@pytest.mark.asyncio
+async def test_onepassword_totp_field_name_matches_by_id_when_title_is_missing(
+    mocked_app_database, patched_settings_token
+):
+    """A field with no title (title=None is valid per the 1Password SDK) must still match by id
+    instead of raising AttributeError out of the credential registration."""
+    ctx = _make_context()
+    forge_app.AGENT_FUNCTION.parse_enterprise_totp_secret = AsyncMock(return_value=None)
+    fake_item = SimpleNamespace(
+        fields=[_make_field("digits", None, _TEST_TOTP_SECRET, ItemFieldType.CONCEALED)],
+        notes=None,
+    )
+    fake_client = MagicMock()
+    fake_client.items.get = AsyncMock(return_value=fake_item)
+    with patch(
+        "skyvern.forge.sdk.workflow.context_manager.OnePasswordClient.authenticate",
+        new_callable=AsyncMock,
+        return_value=fake_client,
+    ):
+        await ctx.register_onepassword_credential_parameter_value(
+            _make_parameter(totp_field_name="digits"), _make_organization()
+        )
+
+    totp_secret_id = ctx.values["op_cred"]["totp"]
+    assert ctx.secrets[ctx.totp_secret_value_key(totp_secret_id)] == _TEST_TOTP_SECRET
+
+
+@pytest.mark.asyncio
+async def test_onepassword_unmatched_totp_field_name_falls_back_to_plain_field(
+    mocked_app_database, patched_settings_token
+):
+    """A totp_field_name that matches nothing must not crash the run — the field is registered
+    as a plain secret and no TOTP value is set."""
+    ctx = _make_context()
+    fake_item = SimpleNamespace(
+        fields=[_make_field("digits", "Digits", _TEST_TOTP_SECRET, ItemFieldType.CONCEALED)],
+        notes=None,
+    )
+    fake_client = MagicMock()
+    fake_client.items.get = AsyncMock(return_value=fake_item)
+    with patch(
+        "skyvern.forge.sdk.workflow.context_manager.OnePasswordClient.authenticate",
+        new_callable=AsyncMock,
+        return_value=fake_client,
+    ):
+        await ctx.register_onepassword_credential_parameter_value(
+            _make_parameter(totp_field_name="otp_code"), _make_organization()
+        )
+
+    assert "totp" not in ctx.values["op_cred"]
 
 
 @pytest.mark.asyncio

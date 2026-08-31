@@ -1,8 +1,31 @@
 from __future__ import annotations
 
+import copy
+import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
+
+from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent import (
+    _build_dynamic_system_prompt,
+    _build_user_context,
+    _prior_run_debug_text,
+    _recorded_build_test_outcome_prompt,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestEvidencePacket,
+    BuildTestFailedOperation,
+    BuildTestPacketDownload,
+    BuildTestPacketFailure,
+    BuildTestPacketLocatorObservation,
+    BuildTestPacketRegisteredOutput,
+    BuildTestPacketRequestedOutput,
+    BuildTestPacketUnfinishedItem,
     RecordedBuildTestOutcome,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
@@ -15,11 +38,32 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     unresolved_runtime_block_failure,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
+from skyvern.forge.sdk.copilot.output_utils import project_build_test_packet_for_llm
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
+from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _authored_literal_locator_selectors,
+    _failed_block_code,
+    _failing_code_line,
+    _first_failed_result,
+    _record_run_blocks_result,
+    _recorded_run_block_result,
+    build_test_evidence_packet,
+)
+from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
     failed_second_factor_run,
+    make_stub_html_artifact,
     passing_run,
     straight_line_login_yaml,
     two_page_login_yaml,
@@ -1154,6 +1198,170 @@ def test_runtime_block_failure_outcome_includes_bounded_page_state_and_run_id() 
     assert "result:#results rows=unknown" in outcome.page_evidence_refs
 
 
+@pytest.mark.asyncio
+async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _locator_packet_ctx()
+    now = datetime(2026, 8, 28, tzinfo=UTC)
+    output_parameter = OutputParameter(
+        output_parameter_id="out_records",
+        workflow_id="wf_run_snapshot",
+        key="records",
+        description="Collected records",
+        created_at=now,
+        modified_at=now,
+    )
+    run_workflow = SimpleNamespace(
+        organization_id=ctx.organization_id,
+        workflow_definition=SimpleNamespace(
+            parameters=[output_parameter],
+            blocks=[SimpleNamespace(label="collect_records", block_type="CODE", output_parameter=output_parameter)],
+        ),
+    )
+    run = SimpleNamespace(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        browser_session_id="pbs_failed_complete_packet",
+        status="failed",
+        failure_reason="Code block failed.",
+    )
+    block = SimpleNamespace(
+        workflow_run_block_id="wrb_failed_complete_packet",
+        task_id=None,
+        label="collect_records",
+        block_type=SimpleNamespace(name="CODE"),
+        status="failed",
+        failure_reason="NameError at generated line 7",
+        error_codes=["user_code_error"],
+        output=None,
+        final_url="https://example.test/results",
+    )
+    artifact = make_stub_html_artifact("art_failed_terminal", ArtifactType.HTML_ACTION)
+    html = (
+        b"<html><body><main><h1>Results</h1><table><tbody>"
+        b"<tr><td>One bounded result</td></tr></tbody></table></main></body></html>"
+    )
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(return_value=run),
+                get_workflow_run_output_parameters=AsyncMock(
+                    return_value=[
+                        SimpleNamespace(output_parameter_id="out_records", value=[{"name": "bounded result"}])
+                    ]
+                ),
+            ),
+            observer=SimpleNamespace(get_workflow_run_blocks=AsyncMock(return_value=[block])),
+            workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=run_workflow)),
+            artifacts=SimpleNamespace(get_artifacts_for_run=AsyncMock(return_value=[artifact])),
+        ),
+        AGENT_FUNCTION=SimpleNamespace(should_dispatch_copilot_block_run_to_worker=AsyncMock(return_value=True)),
+        ARTIFACT_MANAGER=SimpleNamespace(retrieve_artifact=AsyncMock(return_value=html)),
+    )
+    monkeypatch.setattr(run_execution_module, "app", fake_app)
+
+    async def attach_trace(blocks: object, results: list[dict[str, object]], organization_id: str) -> None:
+        results[0]["action_trace"] = [{"code_line": 7, "action": "evaluate"}]
+
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", attach_trace)
+    monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
+    produced_outcomes: list[RecordedBuildTestOutcome] = []
+    transported_outcomes: list[RecordedBuildTestOutcome | None] = []
+    real_producer = run_execution_module.recorded_outcome_from_run_blocks_result
+    real_packet_builder = run_execution_module.build_test_evidence_packet
+
+    def capture_producer(*args: object, **kwargs: object) -> RecordedBuildTestOutcome:
+        produced = real_producer(*args, **kwargs)
+        produced_outcomes.append(produced)
+        return produced
+
+    def capture_packet(
+        context: CopilotContext,
+        result: object,
+        *,
+        recorded_outcome: RecordedBuildTestOutcome | None = None,
+    ) -> BuildTestEvidencePacket:
+        transported_outcomes.append(recorded_outcome)
+        return real_packet_builder(context, result, recorded_outcome=recorded_outcome)
+
+    monkeypatch.setattr(run_execution_module, "recorded_outcome_from_run_blocks_result", capture_producer)
+    monkeypatch.setattr(run_execution_module, "build_test_evidence_packet", capture_packet)
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr_failed_complete_packet")
+    system_input = str(
+        _build_dynamic_system_prompt("", CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER))(
+            SimpleNamespace(context=ctx), None
+        )
+    )
+    ordinary_input = (
+        system_input
+        + "\n"
+        + _build_user_context(
+            workflow_yaml=ctx.workflow_yaml,
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text=_prior_run_debug_text(hydrated),
+            user_message="Repair the recorded run.",
+        )
+    )
+
+    assert hydrated is not None
+    assert len(produced_outcomes) == 1
+    assert produced_outcomes[0].workflow_run_id == "wr_failed_complete_packet"
+    assert transported_outcomes == [produced_outcomes[0]]
+    assert ctx.latest_recorded_build_test_outcome is None
+    assert '"status": "failed"' in ordinary_input
+    assert '"workflow_run_id": "wr_failed_complete_packet"' in ordinary_input
+    assert '"output_parameter_id": "out_records"' in ordinary_input
+    assert '"output_parameter_key": "records"' in ordinary_input
+    assert '"block_label": "collect_records"' in ordinary_input
+    assert '"block_status": "failed"' in ordinary_input
+    assert '"error_codes"' in ordinary_input
+    assert '"user_code_error"' in ordinary_input
+    assert '"failing_line": 7' in ordinary_input
+    assert '"name": "bounded result"' in ordinary_input
+    assert '"page_state"' in ordinary_input
+    assert "One bounded result" in ordinary_input
+    assert "RECORDED BUILD-TEST OUTCOME" not in system_input
+    assert "repairable_failure" not in system_input
+    assert "wr_failed_complete_packet" not in system_input
+
+
+def test_unavailable_registered_output_rows_do_not_become_false_missing_output_facts() -> None:
+    ctx = _locator_packet_ctx()
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_registry_unavailable",
+            "overall_status": "failed",
+            "failure_type": "user_code_error",
+            "blocks": [
+                {
+                    "label": "collect_records",
+                    "status": "failed",
+                    "failure_reason": "failed",
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+            "requested_output_parameter_definitions": [
+                {
+                    "workflow_run_id": "wr_registry_unavailable",
+                    "output_parameter_id": "out_records",
+                    "output_parameter_key": "records",
+                }
+            ],
+            "registered_output_values_omission": "persisted registered output values were unavailable",
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.missing_requested_output_facts == []
+    record_build_test_outcome(ctx, outcome)
+    packet = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+    assert any("persisted registered output values were unavailable" in notice for notice in packet.omission_notices)
+
+
 def test_runtime_block_failure_outcome_keys_playwright_hidden_locator_structure() -> None:
     table_result = {
         "ok": False,
@@ -1224,10 +1432,297 @@ def test_persisted_run_prose_only_failure_is_not_authoritative() -> None:
 def _run_history_ctx(workflow_yaml: str) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_yaml=workflow_yaml,
+        # The delivered candidate defaults to what the turn is working on; a test that cares about a
+        # draft diverging from the saved workflow sets them apart explicitly.
+        persisted_workflow_yaml=workflow_yaml,
+        staged_workflow_yaml=None,
         latest_recorded_build_test_outcome=None,
         recorded_build_test_outcome_history=[],
         recorded_persisted_block_run_workflow_run_id=None,
     )
+
+
+def _raising_code_workflow_yaml(code: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: book_trip\n"
+        "    code: |\n" + "".join(f"      {line}\n" for line in code.splitlines())
+    )
+
+
+def _generated_code_exception_result(
+    workflow_run_id: str,
+    failure_reason: str,
+) -> dict[str, object]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": workflow_run_id,
+            "browser_session_id": "pbs_trip",
+            "overall_status": "failed",
+            "requested_block_labels": ["book_trip"],
+            "executed_block_labels": ["book_trip"],
+            # The run reached the page but retained no usable evidence of it, which is the shape
+            # that used to erase the whole outcome.
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+            "blocks": [
+                {
+                    "label": "book_trip",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "workflow_run_block_id": "wrb_trip",
+                    "failure_reason": failure_reason,
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+        },
+    }
+
+
+def test_generated_code_exception_reaches_repair_and_needs_a_changed_submission() -> None:
+    """A raised exception is the only evidence: no page state, no outputs, no failure categories."""
+    raising_code = "total = passenger_count * fare\nawait page.locator('#pay-now').click()\n"
+    repaired_code = (
+        "total = int(await page.locator('#pax').input_value()) * fare\nawait page.locator('#pay-now').click()\n"
+    )
+    failure_reason = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
+    other_line_reason = "CodeBlock failed with NameError at line 2: name 'passenger_count' is not defined."
+
+    ctx = CopilotContext(
+        organization_id="org",
+        workflow_id="w",
+        workflow_permanent_id="wpid",
+        workflow_yaml=_raising_code_workflow_yaml(raising_code),
+        persisted_workflow_yaml=_raising_code_workflow_yaml(raising_code),
+        browser_session_id=None,
+        stream=None,  # type: ignore[arg-type]
+        api_key=None,
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        _generated_code_exception_result("wr_trip", failure_reason),
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason=failure_reason,
+            workflow_run_id="wr_trip",
+            run_completed=False,
+        ),
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"
+    assert outcome.attempted_block_label == "book_trip"
+    assert outcome.is_authoritative is True
+    assert failure_reason in outcome.observed_evidence_summary
+    assert outcome.page_capture is not None and outcome.page_capture.omission == "page_capture_unavailable"
+
+    # Two exceptions in the same block are different failures, not one repeated one.
+    other_line_outcome = recorded_outcome_from_run_blocks_result(
+        _generated_code_exception_result("wr_trip_again", other_line_reason)
+    )
+    assert other_line_outcome is not None
+    assert other_line_outcome.structural_key != outcome.structural_key
+
+    # The exception's own message is written by the failing code, so it cannot decide identity.
+    # These two ran out of the same unlocatable raise; only the value the message quotes differs.
+    unlocated = "CodeBlock failed with NameError: name 'passenger_count' is not defined."
+    unlocated_quoting_a_line = "CodeBlock failed with NameError: name 'passenger_count' is not defined at line 9."
+    assert (
+        recorded_outcome_from_run_blocks_result(
+            _generated_code_exception_result("wr_trip_third", unlocated_quoting_a_line)
+        ).structural_key  # type: ignore[union-attr]
+        == recorded_outcome_from_run_blocks_result(
+            _generated_code_exception_result("wr_trip_fourth", unlocated)
+        ).structural_key  # type: ignore[union-attr]
+    )
+
+    record_build_test_outcome(ctx, outcome)
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+    assert failure_reason in rendered
+    assert "page_capture: status=unavailable; omission=page_capture_unavailable" in rendered
+
+    # Re-running the same code does not clear the failure; a changed submission does.
+    assert unresolved_runtime_block_failure(
+        ctx,
+        reported_workflow_yaml=_raising_code_workflow_yaml(raising_code),
+        pending_later_run_id="wr_trip_rerun",
+    ) == UnresolvedRuntimeFailure(workflow_run_id="wr_trip", block_label="book_trip")
+    assert (
+        unresolved_runtime_block_failure(
+            ctx,
+            reported_workflow_yaml=_raising_code_workflow_yaml(repaired_code),
+            pending_later_run_id="wr_trip_rerun",
+        )
+        is None
+    )
+
+
+def _looped_code_workflow_yaml(code: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "  - block_type: for_loop\n"
+        "    label: per_passenger\n"
+        "    loop_over: passengers\n"
+        "    loop_blocks:\n"
+        "    - block_type: code\n"
+        "      label: book_trip\n"
+        "      code: |\n" + "".join(f"        {line}\n" for line in code.splitlines())
+    )
+
+
+def test_a_repaired_code_block_inside_a_loop_clears_its_failure() -> None:
+    """A nested block is repaired by editing its code, so its signature has to be readable there."""
+    raising_code = "total = passenger_count * fare\n"
+    repaired_code = "total = int(await page.locator('#pax').input_value()) * fare\n"
+    failure_reason = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
+
+    ctx = _run_history_ctx(_looped_code_workflow_yaml(raising_code))
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_run_blocks_result(_generated_code_exception_result("wr_loop", failure_reason)),
+    )
+
+    assert ctx.recorded_build_test_outcome_history[-1]["attempted_block_signature"]
+    assert unresolved_runtime_block_failure(
+        ctx,
+        reported_workflow_yaml=_looped_code_workflow_yaml(raising_code),
+        pending_later_run_id="wr_loop_rerun",
+    ) == UnresolvedRuntimeFailure(workflow_run_id="wr_loop", block_label="book_trip")
+    assert (
+        unresolved_runtime_block_failure(
+            ctx,
+            reported_workflow_yaml=_looped_code_workflow_yaml(repaired_code),
+            pending_later_run_id="wr_loop_rerun",
+        )
+        is None
+    )
+
+
+def test_a_code_failure_with_no_typed_identity_is_not_admitted() -> None:
+    """Nothing names the failure, so no later edit could ever be shown to have addressed it."""
+    assert (
+        recorded_outcome_from_run_blocks_result(
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_untyped",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["book_trip"],
+                    "blocks": [
+                        {
+                            "label": "book_trip",
+                            "block_type": "CODE",
+                            "status": "failed",
+                            "failure_reason": "the block did not produce the requested output",
+                        }
+                    ],
+                },
+            }
+        )
+        is None
+    )
+
+
+def test_a_recorded_code_failure_always_has_a_route_out_and_native_blocks_stay_out() -> None:
+    """Both edges of admitting a bare block failure.
+
+    A non-builtin exception inside a code block reaches persistence as the runner's generic phrase,
+    naming neither the exception nor a line, and that failure still has to clear when the block is
+    rewritten. A native block — which has no code signature to change — must not be admitted at
+    all, or its unresolved-failure note could never be cleared by any edit.
+    """
+    # Byte-for-byte what the runner persists when the raised class is not a builtin, e.g. a
+    # Playwright timeout: the exception's own words are stripped on the way out.
+    generic_reason = "CodeBlock failed while running user code."
+    timed_out = 'await page.locator("#pay-now").click()\n'
+    repaired_same_selector = 'await page.locator("#pay-now").first.click(timeout=15000)\n'
+
+    ctx = _run_history_ctx(_raising_code_workflow_yaml(timed_out))
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_run_blocks_result(
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_browser_op",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["book_trip"],
+                    "blocks": [
+                        {
+                            "label": "book_trip",
+                            "block_type": "CODE",
+                            "status": "failed",
+                            "failure_reason": generic_reason,
+                            "error_codes": ["user_code_error"],
+                        }
+                    ],
+                },
+            }
+        ),
+    )
+    assert (
+        unresolved_runtime_block_failure(
+            ctx,
+            reported_workflow_yaml=_raising_code_workflow_yaml(repaired_same_selector),
+            pending_later_run_id="wr_browser_op_rerun",
+        )
+        is None
+    )
+
+    # A failure no rewrite could have prevented is not recorded as an authored-code failure: the
+    # same block can pass unchanged once the sandbox is back, the browser reconnects, or the run is
+    # not cancelled, and recording one would hold the block open until an unrelated edit.
+    for code in ("runner_unavailable", "browser_disconnected", "cancelled"):
+        assert (
+            recorded_outcome_from_run_blocks_result(
+                {
+                    "ok": False,
+                    "data": {
+                        "workflow_run_id": f"wr_{code}",
+                        "overall_status": "failed",
+                        "requested_block_labels": ["book_trip"],
+                        "blocks": [
+                            {
+                                "label": "book_trip",
+                                "block_type": "CODE",
+                                "status": "failed",
+                                "failure_reason": generic_reason,
+                                "error_codes": [code],
+                            }
+                        ],
+                    },
+                }
+            )
+            is None
+        ), code
+
+    native_outcome = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_native",
+                "overall_status": "failed",
+                "requested_block_labels": ["inspect_record"],
+                "blocks": [
+                    {
+                        "label": "inspect_record",
+                        "block_type": "TASK",
+                        "status": "failed",
+                        "failure_reason": "Reached the maximum steps (30)",
+                        "error_codes": ["max_steps_exceeded"],
+                    }
+                ],
+            },
+        }
+    )
+    assert native_outcome is None
 
 
 def test_failure_stays_open_when_a_later_run_passes_without_taking_the_failed_branch() -> None:
@@ -1243,22 +1738,49 @@ def test_failure_stays_open_when_a_later_run_passes_without_taking_the_failed_br
     assert open_failure.block_label == "sign_in_and_read"
 
 
-def test_a_straight_line_block_a_later_run_executed_is_re_exercised() -> None:
-    """No branch can skip a call, so executing the block proves the failing call ran again."""
+def test_a_later_run_of_a_straight_line_block_does_not_clear_the_failure() -> None:
+    """Executing the block again proves the call ran, not that it met the condition that failed.
+
+    A login step fails against an already-authenticated page and passes against a signed-out one on
+    the same lines, so a later success on unchanged code establishes nothing about the failure.
+    """
     ctx = _run_history_ctx(straight_line_login_yaml())
     record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
     record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
 
-    assert unresolved_runtime_block_failure(ctx) is None
+    open_failure = unresolved_runtime_block_failure(ctx)
+    assert open_failure is not None
+    assert open_failure.workflow_run_id == "wr_1"
 
 
-def test_failure_retires_once_the_implicated_call_leaves_the_draft() -> None:
+def test_a_later_run_of_a_branched_block_does_not_clear_the_failure() -> None:
     ctx = _run_history_ctx(two_page_login_yaml())
     record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
     record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    ctx.workflow_yaml = two_page_login_yaml(submit_selector="Continue")
 
-    assert unresolved_runtime_block_failure(ctx) is None
+    assert unresolved_runtime_block_failure(ctx) is not None
+
+
+def test_a_delivered_candidate_that_removes_the_call_retires_the_failure() -> None:
+    """The legitimate repair: the candidate this turn delivers no longer carries the failing call."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    repaired = two_page_login_yaml(submit_selector="Continue")
+    ctx.workflow_yaml = repaired
+
+    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=repaired) is None
+
+
+def test_a_block_missing_from_the_delivered_workflow_does_not_clear_the_failure() -> None:
+    """The delivered snapshot is taken before the turn authors anything, so a block written during
+    the turn is absent from it. Absence is not proof of repair."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    snapshot_without_the_block = "title: t\nworkflow_definition:\n  blocks: []\n"
+
+    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=snapshot_without_the_block) is not None
 
 
 def test_an_unrelated_edit_to_the_block_does_not_retire_the_failing_call() -> None:
@@ -1440,12 +1962,13 @@ def test_a_templated_selector_does_not_read_as_the_call_being_removed() -> None:
 
 def test_an_all_literal_block_still_retires_when_the_call_is_gone() -> None:
     """The pass path: with every selector a literal, absence really is proof of removal."""
-    ctx = _run_history_ctx(_templated_selector_yaml(templated=False))
+    delivered = _templated_selector_yaml(templated=False)
+    ctx = _run_history_ctx(delivered)
     outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": "locator:#gone-btn"})
     record_build_test_outcome(ctx, outcome)
     record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
 
-    assert unresolved_runtime_block_failure(ctx) is None
+    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=delivered) is None
 
 
 def _secure_runner_failure_result(error_code: str, category: str | None) -> dict[str, object]:
@@ -1496,3 +2019,2494 @@ def test_runner_timeout_run_stays_repairable() -> None:
     assert outcome is not None
     assert outcome.verdict == "repairable_failure"
     assert outcome.reason_code == "runtime_block_failure"
+
+
+def _failed_run_result(observations: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "workflow_run_id": "wr_1",
+        "overall_status": "failed",
+        "requested_block_labels": ["read_value"],
+        "executed_block_labels": ["read_value"],
+        "blocks": [{"label": "read_value", "status": "failed", "failure_reason": "CodeBlock execution timed out."}],
+    }
+    if observations is not None:
+        data["authored_locator_observations"] = observations
+    return {"ok": False, "data": data}
+
+
+def _locator_packet_ctx() -> CopilotContext:
+    return CopilotContext(
+        organization_id="org",
+        workflow_id="w",
+        workflow_permanent_id="wpid",
+        workflow_yaml="workflow_definition:\n  blocks: []\n",
+        persisted_workflow_yaml="workflow_definition:\n  blocks: []\n",
+        browser_session_id=None,
+        stream=None,  # type: ignore[arg-type]
+        api_key=None,
+    )
+
+
+def _oversized_packet(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
+    filler = "f" * 200
+    return packet.model_copy(
+        update={
+            "attempted_block_labels": [f"{filler}{index}" for index in range(30)],
+            "executed_block_labels": [f"{filler}{index}" for index in range(30)],
+            "registered_outputs": [
+                BuildTestPacketRegisteredOutput(
+                    workflow_run_id=filler,
+                    output_parameter_id=filler,
+                    output_parameter_key=filler,
+                    block_label=filler,
+                    block_type=filler,
+                    value="v" * 1_000,
+                )
+                for _ in range(15)
+            ],
+            "requested_outputs": [
+                BuildTestPacketRequestedOutput(
+                    workflow_run_id="wr_failed_complete_packet",
+                    output_parameter_id=f"requested_{index}",
+                    output_parameter_key=f"requested_{index}",
+                )
+                for index in range(10)
+            ],
+            "downloads": [BuildTestPacketDownload(artifact_id=filler, file_name=filler) for _ in range(15)],
+            "unfinished_items": [
+                BuildTestPacketUnfinishedItem(
+                    kind="unverified_block",
+                    label=filler,
+                    output_path=filler,
+                    reason_code=filler,
+                )
+                for _ in range(30)
+            ],
+        }
+    )
+
+
+def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_llm_projection() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    result: dict[str, object] = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "open_statements",
+                    "status": "failed",
+                    "failure_reason": 'Timeout waiting for locator("#continue-btn-x9")',
+                }
+            ],
+        },
+    }
+    _record_run_blocks_result(ctx, result)
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/statements",
+        "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(6)],
+        "clickable_controls": [
+            {"text": "Continue to statements", "selector": "#continue-btn-x9", "tag": "button", "disabled": True}
+        ],
+    }
+    inject_runtime_authoring_repair_context(ctx, result)
+    finalized = ctx.last_code_authoring_repair_context
+    assert isinstance(finalized, CodeAuthoringRepairContext)
+
+    packet = build_test_evidence_packet(ctx, result)
+    projected = project_build_test_packet_for_llm(packet)
+    compacted = project_build_test_packet_for_llm(_oversized_packet(packet))
+
+    assert packet.failure is not None and packet.failure.page_state is not None
+    assert packet.run.workflow_run_id == "wr_failed"
+    assert packet.failure.page_state.action_summaries == finalized.page_action_summaries
+    assert projected.failure is not None and projected.failure.page_state is not None
+    assert projected.failure.page_state.action_summaries == [
+        "Continue to statements disabled",
+        "Section 0",
+        "Section 1",
+        "Section 2",
+        "Section 3",
+    ]
+    assert all("#continue-btn-x9" not in summary for summary in projected.failure.page_state.action_summaries)
+    assert compacted.failure is not None and compacted.failure.page_state is not None
+    assert any("repeated packet facts shortened further" in notice for notice in compacted.omission_notices)
+    assert compacted.failure.page_state.action_summaries == ["Continue to statements disabled", "Section 0"]
+
+
+def test_screenshot_ablation_replays_preserve_page_facts_without_minting_a_decision() -> None:
+    """A missing frame changes only capture facts; the recorded run's failure remains a run fact."""
+
+    def rendered_bytes(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    def replay(*, screenshot_present: bool) -> tuple[dict[str, object], dict[str, object], str]:
+        ctx = _locator_packet_ctx()
+        page_evidence: dict[str, object] = {
+            "workflow_run_id": "wr_capture_failure",
+            "source_browser_session_id": "pbs_capture_failure",
+            "run_browser_session_id": "pbs_capture_failure",
+            "observed_after_workflow_run": True,
+            "source_tool": "inspect_page_for_composition",
+            "current_url": "https://example.test/checkout/payment",
+            "forms": [{"submit_controls": [{"text": "Place order", "disabled": False}]}],
+            "clickable_controls": [{"text": "Continue to payment", "disabled": False}],
+            **({} if screenshot_present else {"visual_capture_omissions": ["screenshot_capture_failed"]}),
+        }
+        result: dict[str, object] = {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_capture_failure",
+                "browser_session_id": "pbs_capture_failure",
+                "overall_status": "failed",
+                "requested_block_labels": ["continue_to_payment"],
+                "executed_block_labels": ["continue_to_payment"],
+                "blocks": [
+                    {
+                        "label": "continue_to_payment",
+                        "status": "failed",
+                        "failure_reason": "Click did not reach payment options.",
+                    }
+                ],
+                "post_run_page_evidence": page_evidence,
+                **({"screenshot_base64": "c2NyZWVuc2hvdA=="} if screenshot_present else {}),
+            },
+        }
+        stored, preserved = store_post_run_page_evidence(
+            ctx,
+            page_evidence,
+            run_id="wr_capture_failure",
+            current_url="https://example.test/checkout/payment",
+            source_browser_session_id="pbs_capture_failure",
+            run_browser_session_id="pbs_capture_failure",
+        )
+        assert preserved is False
+        assert stored["observed_after_workflow_run"] is True
+        result["data"]["post_run_page_evidence"] = run_execution_module._same_run_page_evidence_for_result(
+            ctx, "wr_capture_failure"
+        )
+        outcome = recorded_outcome_from_run_blocks_result(
+            result,
+            page_evidence=result["data"]["post_run_page_evidence"],
+        )
+        assert outcome is not None
+        packet = project_build_test_packet_for_llm(
+            build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+        ).model_dump(mode="json", exclude_none=True)
+        ordinary_input = _build_user_context(
+            workflow_yaml=ctx.workflow_yaml,
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text=_prior_run_debug_text(packet),
+            user_message="Repair the recorded run.",
+        )
+        return outcome.model_dump(mode="json"), packet, ordinary_input
+
+    with_screenshot = [replay(screenshot_present=True) for _ in range(3)]
+    without_screenshot = [replay(screenshot_present=False) for _ in range(3)]
+    assert len({rendered_bytes(replay_outcome) for replay_outcome, _, _ in with_screenshot}) == 1
+    assert len({rendered_bytes(replay_outcome) for replay_outcome, _, _ in without_screenshot}) == 1
+    assert len({rendered_bytes(packet) for _, packet, _ in with_screenshot}) == 1
+    assert len({rendered_bytes(packet) for _, packet, _ in without_screenshot}) == 1
+
+    baseline_outcome, baseline_packet, _ = with_screenshot[0]
+    missing_outcome, missing_packet, ordinary_input = without_screenshot[0]
+    assert {key: value for key, value in baseline_outcome.items() if key != "page_capture"} == {
+        key: value for key, value in missing_outcome.items() if key != "page_capture"
+    }
+    assert missing_packet["page_capture"] == {"status": "captured", "omission": "screenshot_capture_failed"}
+    assert baseline_packet["screenshot"]["present"] is True
+    assert missing_packet["screenshot"]["present"] is False
+    assert {
+        key: value
+        for key, value in baseline_packet.items()
+        if key not in {"page_capture", "screenshot", "omission_notices"}
+    } == {
+        key: value
+        for key, value in missing_packet.items()
+        if key not in {"page_capture", "screenshot", "omission_notices"}
+    }
+    assert not {"success_verdict", "terminal", "repair_decision"}.intersection(missing_packet)
+    decision_surface = {
+        key: value
+        for key, value in missing_packet.items()
+        if key not in {"page_capture", "screenshot", "omission_notices"}
+    }
+    assert b"success_verdict" not in rendered_bytes(decision_surface)
+    assert b"terminal" not in rendered_bytes(decision_surface)
+    assert b"repair_decision" not in rendered_bytes(decision_surface)
+    assert '"workflow_run_id": "wr_capture_failure"' in ordinary_input
+    assert '"browser_session_id": "pbs_capture_failure"' in ordinary_input
+    assert "Place order" in ordinary_input
+    assert "Continue to payment" in ordinary_input
+    assert '"screenshot_capture_failed"' in ordinary_input
+
+
+def test_unavailable_page_capture_is_a_typed_omission_without_invented_page_state() -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_page_unavailable",
+            "overall_status": "failed",
+            "failure_type": "runtime_error",
+            "requested_block_labels": ["continue_to_payment"],
+            "executed_block_labels": ["continue_to_payment"],
+            "blocks": [
+                {
+                    "label": "continue_to_payment",
+                    "status": "failed",
+                    "failure_reason": "Click did not reach payment options.",
+                }
+            ],
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+        },
+    }
+
+    replayed_outcomes_and_packets = []
+    for _ in range(3):
+        outcome = recorded_outcome_from_run_blocks_result(result)
+        assert outcome is not None
+        packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+        replayed_outcomes_and_packets.append((outcome, packet))
+    assert len({outcome.model_dump_json() for outcome, _ in replayed_outcomes_and_packets}) == 1
+    assert len({packet.model_dump_json() for _, packet in replayed_outcomes_and_packets}) == 1
+    outcome, packet = replayed_outcomes_and_packets[0]
+
+    assert outcome.page_capture is not None
+    assert outcome.page_capture.status == "unavailable"
+    assert outcome.page_capture.omission == "page_capture_unavailable"
+    assert packet.page_capture == outcome.page_capture
+    assert packet.failure is not None and packet.failure.page_state is None
+    assert packet.page_state is None
+    assert "success_verdict" not in packet.model_dump_json()
+    assert "repair_decision" not in packet.model_dump_json()
+    assert "terminal" not in packet.model_dump_json()
+
+
+def test_stale_page_evidence_cannot_infer_a_capture_for_the_current_run() -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_current",
+            "browser_session_id": "pbs_current",
+            "overall_status": "failed",
+            "failure_type": "runtime_error",
+            "blocks": [{"label": "continue", "status": "failed", "failure_reason": "Click failed."}],
+        },
+    }
+    stale_scout_packet = {
+        "source_browser_session_id": "pbs_current",
+        "observed_after_workflow_run": False,
+        "forms": [{"submit_controls": [{"text": "Place order", "disabled": False}]}],
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result, page_evidence=stale_scout_packet)
+    assert outcome is not None
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert outcome.page_capture is None
+    assert outcome.page_evidence_refs == []
+    assert packet.page_capture is None
+
+
+def test_required_input_unbound_outcome_preserves_the_typed_capture_fact() -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_unbound",
+            "overall_status": "failed",
+            "blocks": [{"label": "continue", "status": "failed", "failure_reason": "Input was not bound."}],
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        unbound_required_parameter_keys=["checkout_id"],
+        block_parameter_keys={"continue": ["checkout_id"]},
+    )
+
+    assert outcome is not None
+    assert outcome.reason_code == "required_input_unbound"
+    assert outcome.page_capture is not None
+    assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
+
+
+@pytest.mark.parametrize(
+    "return_path",
+    [
+        "terminal_challenge",
+        "demonstrated",
+        "not_evaluated",
+        "no_structural_identity",
+        "degraded_floor",
+        "recorded_failed_block",
+        "run_failed_block",
+    ],
+)
+def test_every_run_outcome_return_path_preserves_the_typed_capture_fact(return_path: str) -> None:
+    result: dict[str, object] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_capture_paths",
+            "overall_status": "failed",
+            "failure_type": "runtime_error",
+            "blocks": [{"label": "continue", "status": "failed", "failure_reason": "Click failed."}],
+            "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
+        },
+    }
+    recorded_run_outcome: RecordedRunOutcome | None = None
+    completion_verification: CompletionVerificationResult | None = None
+    if return_path == "terminal_challenge":
+        recorded_run_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="terminal_challenge_blocker",
+            workflow_run_id="wr_capture_paths",
+        )
+    elif return_path == "demonstrated":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": []}}
+        recorded_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_capture_paths")
+    elif return_path == "not_evaluated":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": []}}
+        recorded_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_capture_paths")
+    elif return_path == "no_structural_identity":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": [], "failure_type": None}}
+        recorded_run_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            workflow_run_id="wr_capture_paths",
+        )
+    elif return_path == "degraded_floor":
+        result = {**result, "ok": True, "data": {**result["data"], "blocks": [], "failure_type": None}}
+        recorded_run_outcome = RecordedRunOutcome(verdict="not_demonstrated", workflow_run_id="wr_capture_paths")
+        completion_verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="unsatisfied", reason_code="no_evidence")],
+            degraded_criterion_ids=["c0"],
+        )
+    elif return_path == "recorded_failed_block":
+        recorded_run_outcome = RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            workflow_run_id="wr_capture_paths",
+        )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=recorded_run_outcome,
+        completion_verification=completion_verification,
+    )
+
+    assert outcome is not None
+    assert outcome.page_capture is not None
+    assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
+
+
+def test_page_capture_rejects_an_unavailable_page_without_its_typed_omission() -> None:
+    with pytest.raises(ValidationError, match="page_capture_unavailable"):
+        BuildTestEvidencePacket.model_validate(
+            {
+                "canonical_workflow_source": "unavailable",
+                "run": {},
+                "screenshot": {"present": False},
+                "page_capture": {"status": "unavailable"},
+            }
+        )
+
+
+def test_locator_observations_reach_the_failure_packet() -> None:
+    result = _failed_run_result([{"authored_selector": "button.old", "match_count": 0}])
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    observation = packet.failure.locator_observations[0]
+    assert (observation.authored_selector, observation.match_count) == ("button.old", 0)
+    assert observation.match_index is None
+    assert observation.observed_candidates is None
+    assert observation.unobserved_reason is None
+
+
+def test_an_unattempted_observation_is_disclosed_rather_than_reported_as_no_locators() -> None:
+    # A dispatched run, a non-code block, or a policy without inline execution never attempts the
+    # observation. That is a different fact from "this block names no locator", and it is also not
+    # evidence the page was unreachable.
+    packet = build_test_evidence_packet(_locator_packet_ctx(), _failed_run_result(None))
+
+    assert packet.failure is not None
+    assert packet.failure.locator_observations == []
+    assert any("no post-action locator observation was attempted" in notice for notice in packet.omission_notices)
+
+
+def test_a_block_with_no_literal_locator_is_disclosed_as_such() -> None:
+    packet = build_test_evidence_packet(_locator_packet_ctx(), _failed_run_result([]))
+
+    assert packet.failure is not None
+    assert any("names no literal locator" in notice for notice in packet.omission_notices)
+
+
+def test_locators_the_run_could_not_be_asked_about_remain_typed_rows() -> None:
+    result = _failed_run_result(
+        [
+            {"authored_selector": "#rate", "unobserved_reason": "run_page_unavailable"},
+            {"authored_selector": "text=Submit", "unobserved_reason": "run_page_unavailable"},
+        ]
+    )
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    assert [row.authored_selector for row in packet.failure.locator_observations] == ["#rate", "text=Submit"]
+    assert {row.unobserved_reason for row in packet.failure.locator_observations} == {"run_page_unavailable"}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"match_count": None},
+        {"match_count": False},
+        {"match_count": 0, "match_index": 0},
+        {"match_count": 0, "observed_candidates": ["button"]},
+        {"match_count": 2, "match_index": 0},
+        {"match_count": 2, "observed_candidates": ["button"]},
+        {"match_count": 2, "match_index": 0, "observed_candidates": [""]},
+        {
+            "match_count": 2,
+            "match_index": 0,
+            "observed_candidates": ["button"],
+            "unobserved_reason": "identity_read_failed",
+        },
+        {"unobserved_reason": "run_page_unavailable", "observed_candidates": ["button"]},
+    ],
+)
+def test_locator_observation_schema_rejects_mixed_or_incomplete_states(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        BuildTestPacketLocatorObservation.model_validate({"authored_selector": "button", **kwargs})
+
+
+def test_positive_locator_observation_requires_index_zero_and_an_identity() -> None:
+    row = BuildTestPacketLocatorObservation(
+        authored_selector="button",
+        match_count=2,
+        match_index=0,
+        observed_candidates=["button#save"],
+    )
+
+    assert row.match_count == 2
+    assert row.match_index == 0
+    assert row.observed_candidates == ["button#save"]
+
+
+def test_a_malformed_observation_is_dropped_and_counted() -> None:
+    result = _failed_run_result([{"authored_selector": "button.old", "match_count": "many"}, {"no_selector": True}])
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    assert packet.failure.locator_observations == []
+    assert any("omitted 2 malformed item(s)" in notice for notice in packet.omission_notices)
+
+
+def test_failed_block_code_reads_the_definition_not_the_run_rows() -> None:
+    # run_blocks works with workflow_run_block rows, which carry status and output but no code, so
+    # a producer that looked for code on them would silently never observe anything.
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "blocks": [
+                {"label": "ok_block", "block_type": "code", "code": "pass"},
+                {"label": "read_value", "block_type": "code", "code": 'page.locator("button.old")'},
+            ]
+        }
+    )
+    run_rows = [{"label": "ok_block", "status": "completed"}, {"label": "read_value", "status": "failed"}]
+
+    assert _failed_block_code(workflow, _first_failed_result(run_rows)) == 'page.locator("button.old")'
+
+
+def test_failed_block_code_uses_failed_result_row_order_not_definition_order() -> None:
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "blocks": [
+                {"label": "main", "block_type": "code", "code": 'page.locator("#main")'},
+                {"label": "finally", "block_type": "code", "code": 'page.locator("#finally")'},
+            ]
+        }
+    )
+
+    assert (
+        _failed_block_code(
+            workflow,
+            _first_failed_result([{"label": "finally", "status": "failed"}, {"label": "main", "status": "failed"}]),
+        )
+        == 'page.locator("#finally")'
+    )
+
+
+def test_failed_block_code_does_not_skip_a_nullable_label_to_later_failed_row() -> None:
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "blocks": [
+                {"label": "main", "block_type": "code", "code": 'page.locator("#main")'},
+                {"label": "finally", "block_type": "code", "code": 'page.locator("#finally")'},
+            ]
+        }
+    )
+    failed_rows = [{"label": None, "status": "failed"}, {"label": "finally", "status": "failed"}]
+
+    selected = _first_failed_result(failed_rows)
+
+    assert selected is failed_rows[0]
+    assert _failed_block_code(workflow, selected) is None
+
+
+def test_nullable_label_sequence_keeps_packet_metadata_and_locator_evidence_on_selected_row() -> None:
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "blocks": [
+                {"label": "finally", "block_type": "code", "code": 'page.locator("#finally")'},
+            ]
+        }
+    )
+    failed_rows = [
+        {"label": None, "status": "failed", "failure_reason": "unlabeled failed"},
+        {"label": "finally", "status": "failed", "failure_reason": "finally failed"},
+    ]
+    selected = _first_failed_result(failed_rows)
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["blocks"] = failed_rows
+    data["action_trace_summary"] = ["unlabeled line 3 failed"]
+    data["failing_code_line"] = 3
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert _failed_block_code(workflow, selected) is None
+    assert packet.failure is not None
+    assert packet.failure.block_label is None
+    assert packet.failure.reason == "unlabeled failed"
+    assert packet.failure.action_trace == ["unlabeled line 3 failed"]
+    assert packet.failure.failing_line == 3
+    assert packet.failure.locator_observations == []
+
+
+def test_failure_label_trace_and_locators_share_the_first_failed_result_row() -> None:
+    result = _failed_run_result(
+        [
+            {
+                "authored_selector": "#finally",
+                "match_count": 1,
+                "match_index": 0,
+                "observed_candidates": ["button#finally"],
+            }
+        ]
+    )
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["blocks"] = [
+        {"label": "finally", "status": "failed", "failure_reason": "finally failed"},
+        {"label": "main", "status": "failed", "failure_reason": "main failed"},
+    ]
+    data["action_trace_summary"] = ["finally line 7 failed"]
+    data["failing_code_line"] = 7
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    assert packet.failure.block_label == "finally"
+    assert packet.failure.action_trace == ["finally line 7 failed"]
+    assert packet.failure.failing_line == 7
+    assert [row.authored_selector for row in packet.failure.locator_observations] == ["#finally"]
+
+
+def test_failed_block_code_is_none_when_nothing_failed() -> None:
+    workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "a", "block_type": "code", "code": "pass"}]})
+
+    results = [{"label": "a", "status": "completed"}]
+    assert _failed_block_code(workflow, _first_failed_result(results)) is None
+
+
+def test_authored_literal_selectors_are_ordered_by_source_position() -> None:
+    # ast.walk is breadth-first, so a nested locator would surface after a later shallow one.
+    code = 'await wrapper(page.locator("first"))\npage.locator("second")\n'
+
+    assert _authored_literal_locator_selectors(code) == ["first", "second"]
+
+
+def test_a_run_outside_the_chats_browser_says_so() -> None:
+    # A carried resume browser is detached without being freshly minted, so the fact is derived
+    # from detachment: keying it on minting would tell the model it shared the chat's browser.
+    result = _failed_run_result(None)
+    result["data"]["run_detached_from_chat"] = True
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.run.browser is not None
+    assert packet.run.browser.ran_outside_this_chats_browser is True
+    assert "other than" in packet.run.browser.note
+
+
+def test_a_run_sharing_the_chat_browser_says_that_instead() -> None:
+    result = _failed_run_result(None)
+    result["data"]["run_detached_from_chat"] = False
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.run.browser is not None
+    assert packet.run.browser.ran_outside_this_chats_browser is False
+    assert "target=" not in packet.run.browser.note
+
+
+def test_an_unrecorded_browser_relationship_is_absent_rather_than_guessed() -> None:
+    packet = build_test_evidence_packet(_locator_packet_ctx(), _failed_run_result(None))
+
+    assert packet.run.browser is None
+
+
+def test_the_runners_typed_error_and_failing_line_reach_the_repair_turn() -> None:
+    # The runtime records which error code fired and which line raised. Rendering them into an
+    # action-summary sentence tells the repair turn the block failed in English; these are the
+    # fields it would act on.
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["blocks"] = [
+        {
+            "label": "extract_failure_rate",
+            "status": "failed",
+            "failure_reason": "code error at line 6",
+            "error_codes": ["user_code_error"],
+        }
+    ]
+    data["failing_code_line"] = 6
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    assert packet.failure.error_codes == ["user_code_error"]
+    assert packet.failure.failing_line == 6
+
+
+def test_browser_operation_failure_projects_same_row_run_and_block_identity() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = "wr_browser_operation"
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_capture_failure",
+            "label": "collect_failure_rate",
+            "status": "failed",
+            "failure_reason": "browser operation failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    data["failing_code_line"] = 11
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert outcome.failed_operation.model_dump() == {
+        "kind": "browser_operation_failed",
+        "workflow_run_id": "wr_browser_operation",
+        "workflow_run_block_id": "wrb_capture_failure",
+        "block_label": "collect_failure_rate",
+        "failing_line": 11,
+    }
+    assert packet.failure is not None
+    assert packet.failure.failed_operation == outcome.failed_operation
+    projected = project_build_test_packet_for_llm(packet)
+    assert projected.failure is not None
+    assert projected.failure.failed_operation == outcome.failed_operation
+
+
+def test_browser_operation_packet_uses_same_run_recorded_outcome_as_its_authority() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = "wr_recorded_authority"
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_recorded_authority",
+            "label": "collect_failure_rate",
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    assert isinstance(blocks[0], dict)
+    blocks[0]["workflow_run_block_id"] = "wrb_raw_result_changed_after_recording"
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert packet.failure is not None
+    assert packet.failure.failed_operation == outcome.failed_operation
+    assert packet.failure.failed_operation.workflow_run_block_id == "wrb_recorded_authority"
+
+
+def test_browser_operation_producer_redacts_registered_block_label_secret() -> None:
+    session_id = "pbs_build_test_operation_redaction"
+    secret = "build-test-label-secret-value"
+    ctx = SimpleNamespace(browser_session_id=session_id, secret_scrub_values=[])
+    register_secret_scrub_value(ctx, secret)
+    try:
+        result = _failed_run_result(None)
+        data = result["data"]
+        assert isinstance(data, dict)
+        data["blocks"] = [
+            {
+                "label": f"collect_{secret}_rate",
+                "status": "failed",
+                "error_codes": ["browser_operation_failed"],
+            }
+        ]
+        outcome = recorded_outcome_from_run_blocks_result(result)
+    finally:
+        clear_session_scrub_values(session_id)
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert secret not in outcome.model_dump_json()
+    assert outcome.failed_operation.block_label == "collect_[REDACTED_SECRET]_rate"
+
+
+def test_browser_operation_structural_key_ignores_transient_run_and_block_ids() -> None:
+    first = _failed_run_result(None)
+    first_data = first["data"]
+    assert isinstance(first_data, dict)
+    first_data["workflow_run_id"] = "wr_first"
+    first_data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_first",
+            "label": "collect_failure_rate",
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    first_data["failing_code_line"] = 11
+    second = copy.deepcopy(first)
+    second_data = second["data"]
+    assert isinstance(second_data, dict)
+    second_data["workflow_run_id"] = "wr_second"
+    blocks = second_data["blocks"]
+    assert isinstance(blocks, list)
+    assert isinstance(blocks[0], dict)
+    blocks[0]["workflow_run_block_id"] = "wrb_second"
+
+    first_outcome = recorded_outcome_from_run_blocks_result(first)
+    second_outcome = recorded_outcome_from_run_blocks_result(second)
+
+    assert first_outcome is not None
+    assert second_outcome is not None
+    assert first_outcome.failed_operation is not None
+    assert second_outcome.failed_operation is not None
+    assert first_outcome.failed_operation.workflow_run_id != second_outcome.failed_operation.workflow_run_id
+    assert first_outcome.structural_key == second_outcome.structural_key
+
+
+def test_browser_operation_failure_survives_non_clearing_outcomes_until_changed_attempt_is_tested() -> None:
+    failed_workflow = """title: retain browser failure
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return {"failure_rate": await page.locator("canvas.failure-rate").inner_text()}
+"""
+    repaired_workflow = failed_workflow.replace("canvas.failure-rate", "[data-testid='failure-rate']")
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        workflow_run_block_id="wrb_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+        block_association="cba_collect_failure_rate",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="scout_evaluate",
+            attempted_tool="inspect_page_for_composition",
+            verdict="progress_observed",
+            reason_code="verified_success",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_unchanged",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            verified_progress_marker="run-completed",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+    ctx.workflow_yaml = repaired_workflow
+    ctx.persisted_workflow_yaml = repaired_workflow
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_changed_but_not_executed",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            executed_block_labels=[],
+            verified_progress_marker="run-completed",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_changed_and_tested",
+            block_labels=["collect_failure_rate"],
+            requested_block_labels=["collect_failure_rate"],
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=("cba_collect_failure_rate",),
+            verified_progress_marker="run-completed",
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_existing_workflow_failure_and_retest_use_the_exact_unmasked_staged_snapshots() -> None:
+    turn_start_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return await page.locator("[data-testid='turn-start']").inner_text()
+"""
+    failed_snapshot = turn_start_workflow.replace("[data-testid='turn-start']", "canvas.failure-rate")
+    repaired_snapshot = turn_start_workflow.replace("[data-testid='turn-start']", "[data-testid='failure-rate']")
+    ctx = _locator_packet_ctx()
+    ctx.persisted_workflow_yaml = turn_start_workflow
+    ctx.workflow_yaml = failed_snapshot
+    ctx.staged_workflow_yaml = failed_snapshot
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+        block_association="cba_collect_failure_rate",
+    )
+
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+    ctx.workflow_yaml = repaired_snapshot
+    ctx.staged_workflow_yaml = repaired_snapshot
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_retested",
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=("cba_collect_failure_rate",),
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_verified_retest_clears_a_changed_outer_browser_operation_not_its_nested_locator() -> None:
+    failed_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: submit
+      code: |
+        await page.locator("#submit").click(timeout=1000)
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"submit": "cba_submit"}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_failed",
+                block_label="submit",
+                failing_line=1,
+                block_association="cba_submit",
+            ),
+        ),
+    )
+    ctx.workflow_yaml = failed_workflow.replace("timeout=1000", "timeout=5000")
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_retested",
+            executed_block_associations=("cba_submit",),
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_browser_operation_failure_is_not_cleared_when_full_replacement_copies_its_old_association() -> None:
+    failed_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_original
+      code: |
+        return await page.locator("canvas.failure-rate").inner_text()
+    - block_type: code
+      label: summarize
+      code: |
+        return {"summary": "ready"}
+"""
+    replacement_workflow = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: summarize
+      code: |
+        return {"summary": "ready"}
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_original
+      code: |
+        return {"unrelated": "replacement"}
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.staged_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_original"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+        block_association="cba_original",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    ctx.workflow_yaml = replacement_workflow
+    ctx.staged_workflow_yaml = replacement_workflow
+    ctx.runner_code_block_associations_by_label = runner_code_block_associations(
+        replacement_workflow,
+        prior_associations=ctx.runner_code_block_associations_by_label,
+        preserve_existing=False,
+    )
+    replacement_association = ctx.runner_code_block_associations_by_label["collect_failure_rate"]
+    assert replacement_association != "cba_original"
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_replacement",
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=(replacement_association,),
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+def test_code_block_association_covers_conditional_blocks_without_entering_packet_projection() -> None:
+    workflow_yaml = """workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: conditional
+      label: inspect_state
+      branch_conditions:
+        - condition: "True"
+          blocks:
+            - block_type: code
+              label: read_failure_rate
+              code: |
+                return await page.locator("canvas.failure-rate").inner_text()
+"""
+    associations = runner_code_block_associations(workflow_yaml)
+
+    assert set(associations) == {"read_failure_rate"}
+    assert "copilot_block_association" not in workflow_yaml
+    outcome = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_conditional_failure",
+                "overall_status": "failed",
+                "failing_code_line": 1,
+                "blocks": [
+                    {
+                        "label": "read_failure_rate",
+                        "status": "failed",
+                        "error_codes": ["browser_operation_failed"],
+                    }
+                ],
+            },
+        },
+        block_associations_by_label=associations,
+    )
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert outcome.failed_operation.block_association == associations["read_failure_rate"]
+    assert "copilot_block_association" not in outcome.model_dump_json()
+
+
+def test_recorded_outcome_execution_receipts_come_from_block_status_not_requested_labels() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_receipts",
+            "overall_status": "failed",
+            "requested_block_labels": ["requested_only", "executed"],
+            "executed_block_labels": ["requested_only", "executed"],
+            "blocks": [
+                {"label": "requested_only", "status": "skipped"},
+                {
+                    "label": "executed",
+                    "status": "failed",
+                    "failure_reason": "browser operation failed",
+                    "error_codes": ["browser_operation_failed"],
+                },
+            ],
+        },
+    }
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+
+    assert outcome is not None
+    assert outcome.requested_block_labels == ["requested_only", "executed"]
+    assert outcome.executed_block_labels == ["executed"]
+
+
+def test_browser_operation_failure_is_not_cleared_by_unrelated_edit_in_executed_block() -> None:
+    failed_workflow = """title: retain browser failure
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_collect_failure_rate
+      code: |
+        value = await page.locator("canvas.failure-rate").inner_text()
+        return {"failure_rate": value}
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    unrelated_edit = failed_workflow.replace(
+        'return {"failure_rate": value}',
+        'return {"failure_rate": value, "note": "unchanged locator"}',
+    )
+    ctx.workflow_yaml = unrelated_edit
+    ctx.persisted_workflow_yaml = unrelated_edit
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_unrelated_edit",
+            requested_block_labels=["collect_failure_rate"],
+            executed_block_labels=["collect_failure_rate"],
+            verified_progress_marker="run-completed",
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+def test_browser_operation_failure_is_not_cleared_by_an_untested_persisted_edit() -> None:
+    failed_workflow = """title: retain browser failure
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      code: |
+        return {"failure_rate": await page.locator("canvas.failure-rate").inner_text()}
+"""
+    ctx = _locator_packet_ctx()
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_failed",
+        block_label="collect_failure_rate",
+        failing_line=1,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            requested_block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+
+    ctx.workflow_yaml = failed_workflow.replace("canvas.failure-rate", "[data-testid='failure-rate']")
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+    record_build_test_outcome(ctx, None)
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+@pytest.mark.asyncio
+async def test_browser_operation_outcome_clears_after_server_composed_verified_retest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_workflow = """title: read the failure rate
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: collect_failure_rate
+      copilot_block_association: cba_collect_failure_rate
+      code: |
+        value = await page.locator("canvas.failure-rate").inner_text()
+        return {"failure_rate": value}
+"""
+    repaired_workflow = failed_workflow.replace(
+        'page.locator("canvas.failure-rate")',
+        "page.locator(\"[data-testid='failure-rate']\")",
+    )
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = failed_workflow
+    ctx.persisted_workflow_yaml = failed_workflow
+    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_browser_operation",
+            block_labels=["collect_failure_rate"],
+            structural_failure_identity="browser-operation",
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_browser_operation",
+                workflow_run_block_id="wrb_browser_operation",
+                block_label="collect_failure_rate",
+                failing_line=1,
+                block_association="cba_collect_failure_rate",
+            ),
+        ),
+    )
+
+    prompt = _recorded_build_test_outcome_prompt(ctx)
+    persisted_attempts = [failed_workflow]
+    tested_attempts: list[str] = []
+
+    async def persist_workflow(
+        payload: dict[str, object], copilot_ctx: CopilotContext, **_kwargs: object
+    ) -> dict[str, object]:
+        candidate = payload["workflow_yaml"]
+        assert isinstance(candidate, str)
+        assert payload["_preserve_code_block_associations"] is True
+        persisted_attempts.append(candidate)
+        copilot_ctx.workflow_yaml = candidate
+        copilot_ctx.persisted_workflow_yaml = candidate
+        code = candidate.split("code: |", 1)[1]
+        workflow = SimpleNamespace(
+            proxy_location=None,
+            workflow_definition=SimpleNamespace(
+                blocks=[
+                    SimpleNamespace(
+                        label="collect_failure_rate",
+                        block_type=SimpleNamespace(value="code"),
+                        code=code,
+                    )
+                ]
+            ),
+        )
+        return {"ok": True, "data": {"block_count": 1}, "_workflow": workflow}
+
+    async def test_persisted_workflow(
+        _params: dict[str, object], copilot_ctx: CopilotContext, **_kwargs: object
+    ) -> dict[str, object]:
+        persisted = copilot_ctx.persisted_workflow_yaml
+        assert isinstance(persisted, str)
+        tested_attempts.append(persisted)
+        repaired_selector_present = "[data-testid='failure-rate']" in persisted
+        return {
+            "ok": repaired_selector_present,
+            "data": {
+                "workflow_run_id": "wr_retested_repair",
+                "overall_status": "completed" if repaired_selector_present else "failed",
+                "requested_block_labels": ["collect_failure_rate"],
+                "executed_block_labels": ["collect_failure_rate"],
+                "blocks": [
+                    {
+                        "label": "collect_failure_rate",
+                        "status": "completed" if repaired_selector_present else "failed",
+                        "extracted_data": {"failure_rate": "16.67%"} if repaired_selector_present else None,
+                    }
+                ],
+            },
+        }
+
+    async def observe_test_result(
+        copilot_ctx: CopilotContext, result: dict[str, object], _handler_start: float
+    ) -> object:
+        record_build_test_outcome(
+            copilot_ctx,
+            RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="edit_block_and_run",
+                verdict="progress_observed",
+                reason_code="verified_success",
+                workflow_run_id="wr_retested_repair",
+                executed_block_associations=("cba_collect_failure_rate",),
+                verified_progress_marker="run-completed",
+            ),
+        )
+        return copilot_ctx.latest_recorded_build_test_outcome
+
+    monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        tools_module,
+        "_plan_frontier",
+        lambda *args: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
+    )
+    monkeypatch.setattr(tools_module, "_update_workflow", persist_workflow)
+    monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", test_persisted_workflow)
+    monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", observe_test_result)
+    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+    tool_result = await tools_module.edit_block_and_run_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
+        json.dumps(
+            {
+                "label": "collect_failure_rate",
+                "expected_code": 'value = await page.locator("canvas.failure-rate").inner_text()\nreturn {"failure_rate": value}',
+                "replacement_code": (
+                    "value = await page.locator(\"[data-testid='failure-rate']\").inner_text()\n"
+                    'return {"failure_rate": value}'
+                ),
+                "block_labels": ["collect_failure_rate"],
+                "parameters": {},
+            }
+        ),
+    )
+    parsed_result = json.loads(tool_result)
+
+    assert "browser_operation_failed" in prompt
+    assert "wrb_browser_operation" in prompt
+    assert "collect_failure_rate" in prompt
+    assert "failing_line=1" in prompt
+    assert persisted_attempts == [failed_workflow, repaired_workflow]
+    assert "canvas.failure-rate" in persisted_attempts[0]
+    assert "canvas.failure-rate" not in persisted_attempts[1]
+    assert tested_attempts == [repaired_workflow]
+    assert parsed_result["ok"] is True
+    assert parsed_result["data"]["workflow_run_id"] == "wr_retested_repair"
+    assert parsed_result["data"]["build_test_packet"]["run"] == {
+        "workflow_run_id": "wr_retested_repair",
+        "status": "completed",
+    }
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.workflow_run_id == "wr_retested_repair"
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_browser_operation_identity_is_bounded_by_the_shared_packet_projection() -> None:
+    long_identity = "x" * 200
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = long_identity
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": long_identity,
+            "label": long_identity,
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(_locator_packet_ctx(), result))
+
+    assert projected.failure is not None
+    assert projected.failure.failed_operation is not None
+    operation = projected.failure.failed_operation
+    assert len(operation.workflow_run_id or "") == 160
+    assert len(operation.workflow_run_block_id or "") == 160
+    assert len(operation.block_label or "") == 160
+    assert all(
+        value.endswith("...")
+        for value in (operation.workflow_run_id, operation.workflow_run_block_id, operation.block_label)
+        if value
+    )
+    assert any("failure.failed_operation.workflow_run_id shortened" in notice for notice in projected.omission_notices)
+    assert any(
+        "failure.failed_operation.workflow_run_block_id shortened" in notice for notice in projected.omission_notices
+    )
+    assert any("failure.failed_operation.block_label shortened" in notice for notice in projected.omission_notices)
+
+
+def test_browser_operation_packet_names_each_unavailable_operation_identity() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data.pop("workflow_run_id", None)
+    data["blocks"] = [
+        {
+            "label": None,
+            "status": "failed",
+            "error_codes": ["browser_operation_failed"],
+        }
+    ]
+    data.pop("failing_code_line", None)
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert packet.failure is not None
+    assert packet.failure.failed_operation is not None
+    notices = packet.omission_notices
+    assert any("failure.failed_operation.workflow_run_id omitted" in notice for notice in notices)
+    assert any("failure.failed_operation.workflow_run_block_id omitted" in notice for notice in notices)
+    assert any("failure.failed_operation.block_label omitted" in notice for notice in notices)
+    assert any("failure.failed_operation.failing_line omitted" in notice for notice in notices)
+
+
+def test_a_failure_the_runner_did_not_type_carries_neither_field() -> None:
+    packet = build_test_evidence_packet(_locator_packet_ctx(), _failed_run_result(None))
+
+    assert packet.failure is not None
+    assert packet.failure.error_codes == []
+    assert packet.failure.failing_line is None
+
+
+def test_native_failed_block_identity_survives_packet_projection_and_aggregate_compaction() -> None:
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["action_observations"] = ["click completed"]
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_native",
+            "task_id": "tsk_native",
+            "step_id": "stp_native",
+            "label": "native_task",
+            "block_type": "TASK",
+            "status": "failed",
+            "failure_reason": "Reached the maximum steps (30)",
+        }
+    ]
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+    projected = project_build_test_packet_for_llm(packet)
+    compacted = project_build_test_packet_for_llm(_oversized_packet(packet))
+
+    assert packet.failure is not None
+    assert projected.failure is not None
+    assert compacted.failure is not None
+    expected = ("wrb_native", "tsk_native", "stp_native", "TASK")
+    for failure in (packet.failure, projected.failure, compacted.failure):
+        assert (
+            failure.workflow_run_block_id,
+            failure.task_id,
+            failure.step_id,
+            failure.block_type,
+        ) == expected
+    assert [notice for notice in projected.omission_notices if notice.startswith("failure.page_state omitted:")] == [
+        "failure.page_state omitted: no bounded same-run page state was recorded."
+    ]
+
+
+def test_historical_failure_packet_without_native_identities_remains_valid() -> None:
+    failure = BuildTestPacketFailure(block_label="code", block_status="failed", reason="boom")
+
+    assert failure.workflow_run_block_id is None
+    assert failure.task_id is None
+    assert failure.step_id is None
+    assert failure.block_type is None
+
+
+def test_recorded_run_block_result_keeps_native_machine_identities() -> None:
+    row = SimpleNamespace(
+        workflow_run_block_id="wrb_native",
+        task_id="tsk_native",
+        label="native_task",
+        block_type=SimpleNamespace(name="TASK"),
+        status="failed",
+        failure_reason="Reached the maximum steps (30)",
+        error_codes=["max_steps_exceeded"],
+        output=None,
+    )
+
+    result = _recorded_run_block_result(row)
+
+    assert result == {
+        "workflow_run_block_id": "wrb_native",
+        "task_id": "tsk_native",
+        "label": "native_task",
+        "block_type": "TASK",
+        "status": "failed",
+        "failure_reason": "Reached the maximum steps (30)",
+        "error_codes": ["max_steps_exceeded"],
+    }
+
+
+@pytest.fixture
+def synthetic_native_actions_newest_first() -> list[SimpleNamespace]:
+    """Synthetic rows exercise ordering and privacy without claiming production custody."""
+    return [
+        SimpleNamespace(
+            task_id="tsk_synthetic",
+            step_id="stp_newest",
+            action_type="click",
+            status="completed",
+            reasoning="private reasoning newest",
+            element_id="private-element-newest",
+            output=None,
+            response=None,
+        ),
+        *[
+            SimpleNamespace(
+                task_id="tsk_synthetic",
+                step_id=f"stp_{number}",
+                action_type=action_type,
+                status="completed",
+                reasoning=f"private reasoning {number}",
+                element_id=f"private-element-{number}",
+                output=None,
+                response=None,
+            )
+            for number, action_type in [
+                (5, "scroll"),
+                (4, "wait"),
+                (3, "hover"),
+                (2, "select_option"),
+                (1, "input_text"),
+                (0, "goto_url"),
+            ]
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_actions_use_newest_step_and_keep_newest_six_chronological(
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_native_actions_newest_first: list[SimpleNamespace],
+) -> None:
+    block = SimpleNamespace(task_id="tsk_synthetic")
+    result = {"status": "failed"}
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            tasks=SimpleNamespace(
+                get_recent_actions_for_tasks=AsyncMock(return_value=synthetic_native_actions_newest_first)
+            )
+        )
+    )
+    monkeypatch.setattr(run_execution_module, "app", fake_app)
+
+    await run_execution_module._attach_action_traces([block], [result], "org_native")
+
+    assert result["step_id"] == "stp_newest"
+    assert run_execution_module._retained_action_observations([result]) == [
+        "input_text completed",
+        "select_option completed",
+        "hover completed",
+        "wait completed",
+        "scroll completed",
+        "click completed",
+    ]
+    summary = run_execution_module._failure_action_trace_summary(result)
+    assert summary == run_execution_module._retained_action_observations([result])
+    assert "private" not in str(summary)
+    assert "goto_url" not in str(summary)
+
+
+def test_native_actions_bound_the_global_newest_slice_before_chronological_rendering() -> None:
+    results = [
+        {
+            "action_trace": [
+                {"action": "click", "status": "completed"},
+                {"action": "scroll", "status": "completed"},
+                {"action": "wait", "status": "completed"},
+                {"action": "hover", "status": "completed"},
+            ]
+        },
+        {
+            "action_trace": [
+                {"action": "select_option", "status": "completed"},
+                {"action": "input_text", "status": "completed"},
+                {"action": "goto_url", "status": "completed"},
+                {"action": "reload_page", "status": "completed"},
+            ]
+        },
+    ]
+
+    assert run_execution_module._retained_action_observations(results) == [
+        "input_text completed",
+        "select_option completed",
+        "hover completed",
+        "wait completed",
+        "scroll completed",
+        "click completed",
+    ]
+
+
+def test_the_failing_line_is_read_from_the_recorders_own_stamp() -> None:
+    # The cold-repair path derives the line from the attached action trace rather than parsing a
+    # rendered sentence. Only the recorder's integer stamp counts: personalize_action writes user
+    # data to other action fields.
+    trace = [
+        {"action": "NULL_ACTION", "status": "failed", "code_line": 6},
+        {"action": "CLICK", "status": "completed"},
+    ]
+
+    assert _failing_code_line(trace) == 6
+
+
+def test_a_trace_without_a_line_stamp_yields_none_rather_than_a_guess() -> None:
+    assert _failing_code_line([{"action": "CLICK", "status": "failed"}]) is None
+    assert _failing_code_line([{"action": "CLICK", "status": "failed", "code_line": "6"}]) is None
+    assert _failing_code_line(None) is None
+
+
+def test_the_projection_hands_every_consumer_an_already_redacted_packet() -> None:
+    """This projection is the only redaction on the tool-result path, so a test that exercises the
+    redactor rather than the projection would let a simplification delete it in silence."""
+    from skyvern.forge.sdk.copilot.output_utils import project_build_test_packet_for_llm
+
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_secret",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "extract",
+                    "status": "failed",
+                    "failure_reason": "login rejected with password=hunter2",
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+        },
+    }
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(_locator_packet_ctx(), result))
+    rendered = projected.model_dump_json()
+
+    assert "hunter2" not in rendered
+    assert "[REDACTED_SECRET]" in rendered
+    assert projected.run.workflow_run_id == "wr_secret"
+    assert projected.failure is not None
+    assert projected.failure.block_label == "extract"
+    assert projected.failure.error_codes == ["user_code_error"]
+
+
+def test_a_draft_that_drops_the_call_does_not_clear_it_in_the_delivered_workflow() -> None:
+    """Clearance must read the candidate the turn presents as saved, not whichever draft is current.
+
+    A draft the user never receives can remove the failing call while the delivered workflow still
+    contains it, which would clear a failure the customer still has.
+    """
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["read_metric"]))
+    # The draft under the cursor drops the failing call; the delivered workflow keeps it.
+    ctx.workflow_yaml = two_page_login_yaml(submit_selector="Continue")
+    delivered = two_page_login_yaml()
+    ctx.persisted_workflow_yaml = delivered
+
+    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=delivered) is not None
+
+
+def test_clearance_holds_when_the_delivered_workflow_dropped_the_call() -> None:
+    """The legitimate case: the saved workflow itself no longer carries the failing call."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["read_metric"]))
+    repaired = two_page_login_yaml(submit_selector="Continue")
+    ctx.workflow_yaml = repaired
+    ctx.persisted_workflow_yaml = repaired
+
+    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=repaired) is None
+
+
+def _run_result_ok() -> dict:
+    return {"ok": True, "data": {"workflow_run_id": "wr_2", "overall_status": "completed"}}
+
+
+def test_a_passing_run_carries_an_earlier_unresolved_failure_to_the_model() -> None:
+    """The model decides whether to repair from this result, so the failure has to survive into it.
+
+    A later success otherwise displaces the failing run before that decision is made: the model sees a
+    pass, has no record of the failure, and reports done.
+    """
+    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
+
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    result = _run_result_ok()
+
+    _carry_unresolved_failure_into_result(ctx, result)
+
+    carried = result["data"]["unresolved_earlier_failure"]
+    assert carried["workflow_run_id"] == "wr_1"
+    assert carried["block_label"] == "sign_in_and_read"
+    assert carried["failure_kind"] == "runtime_block_failure"
+    assert "does not establish" in carried["note"]
+
+
+def test_a_delivered_repair_leaves_the_passing_result_untouched() -> None:
+    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
+
+    repaired = two_page_login_yaml(submit_selector="Continue")
+    ctx = _run_history_ctx(repaired)
+    ctx.persisted_workflow_yaml = repaired
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    result = _run_result_ok()
+
+    _carry_unresolved_failure_into_result(ctx, result)
+
+    assert "unresolved_earlier_failure" not in result["data"]
+
+
+def test_a_passing_run_with_no_earlier_failure_carries_no_extra_field() -> None:
+    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
+
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    result = _run_result_ok()
+
+    _carry_unresolved_failure_into_result(ctx, result)
+
+    assert "unresolved_earlier_failure" not in result["data"]
+
+
+def test_the_carry_survives_compaction_of_an_older_tool_output() -> None:
+    """The model may decide to repair several turns later, after the output has been compacted.
+
+    Dropping the field there would reproduce the loss it exists to prevent.
+    """
+    import json
+
+    from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
+
+    carried = {
+        "workflow_run_id": "wr_1",
+        "block_label": "sign_in_and_read",
+        "failure_kind": "runtime_block_failure",
+        "note": "this run passing does not establish that the earlier failure was resolved",
+    }
+    output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_2",
+                "overall_status": "completed",
+                "unresolved_earlier_failure": carried,
+                "padding": "x" * 400,
+            },
+        }
+    )
+
+    synopsis = json.loads(_summarize_tool_output(output))
+
+    assert synopsis["unresolved_earlier_failure"] == carried
+
+
+def test_every_run_surface_attaches_through_the_same_helper() -> None:
+    """One attachment helper covers every run surface; attaching at a single tool left it inert.
+
+    Successful runs reach it from `run_blocks` and from the shared edit/update path, and some
+    unsuccessful early returns call it harmlessly. What matters is that no run surface returns a
+    result without passing through it.
+    """
+    from pathlib import Path as _Path
+
+    tools = _Path(__file__).resolve().parents[2] / "skyvern/forge/sdk/copilot/tools/__init__.py"
+    source = tools.read_text()
+
+    call = "_carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)"
+    assert source.count(call) == 1
+    shared = source.index(call)
+    # The shared path records the run, then attaches, then hands the result to the model.
+    window = source[shared - 400 : shared + 200]
+    assert "_verify_and_record_run_blocks_result" in window
+    assert "record_tool_step_result_for_ctx" in window
+
+
+def test_the_carried_field_claims_only_that_the_pass_proves_nothing() -> None:
+    """It reports a fact and prescribes no repair; the model still owns the branch."""
+    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
+
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    result = {"ok": True, "data": {"workflow_run_id": "wr_2", "overall_status": "completed"}}
+
+    _carry_unresolved_failure_into_result(ctx, result)
+
+    carried = result["data"]["unresolved_earlier_failure"]
+    assert set(carried) == {"workflow_run_id", "block_label", "failure_kind", "note"}
+    assert carried["note"] == "this run passing does not establish that the earlier failure was resolved"
+    for forbidden in ("add", "guard", "should", "must", "conditional", "if "):
+        assert forbidden not in carried["note"].lower(), "the note prescribes a fix"
+
+
+def _completed_output_run_result(retained_value: object, *, register_row: bool = True) -> dict[str, object]:
+    run_id = "wr_requested_output"
+    registered_row = {
+        "workflow_run_id": run_id,
+        "output_parameter_id": "op_payment_options",
+        "output_parameter_key": "collect_options_output",
+        "block_label": "collect_options",
+        "block_type": "code",
+        "value": retained_value,
+    }
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_options"],
+            "executed_block_labels": ["collect_options"],
+            "blocks": [
+                {
+                    "label": "collect_options",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"collect_options_output": retained_value},
+                }
+            ],
+            "requested_output_parameter_definitions": [
+                {
+                    "workflow_run_id": run_id,
+                    "output_parameter_id": "op_payment_options",
+                    "output_parameter_key": "collect_options_output",
+                    "block_label": "collect_options",
+                    "block_type": "code",
+                }
+            ],
+            "registered_output_parameter_values": [registered_row] if register_row else [],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "retained_value", "register_row", "expected_reason_code"),
+    [
+        ("no_row", {"payment_options": ["Visa"]}, False, "registered_output_missing"),
+        ("null_value", None, True, "registered_output_null"),
+        # An empty collection is a value the code returned. Whether "no options were offered" is
+        # the right answer is the model's call; reporting it absent would invite invented data.
+        ("empty_object", {}, True, None),
+        ("empty_list", [], True, None),
+        ("run_owned_value", {"payment_options": ["Visa", "PayPal"]}, True, None),
+    ],
+)
+def test_a_completed_run_that_retained_no_requested_output_value_returns_to_ordinary_repair(
+    case: str,
+    retained_value: object,
+    register_row: bool,
+    expected_reason_code: str | None,
+) -> None:
+    """A retained row proves the block ran; it is not proof the requested output was produced."""
+    result = _completed_output_run_result(retained_value, register_row=register_row)
+    data = result["data"]
+    assert isinstance(data, dict)
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_evaluated",
+            workflow_run_id="wr_requested_output",
+            run_completed=True,
+        ),
+        registered_output_parameter_payloads=data["registered_output_parameter_values"],
+    )
+    assert outcome is not None
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    ordinary_input = _build_user_context(
+        workflow_yaml="",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text=_prior_run_debug_text(packet),
+        user_message="Repair the recorded run.",
+    )
+
+    if expected_reason_code is None:
+        assert outcome.missing_requested_output_facts == []
+        assert outcome.verdict == "not_authoritative"
+        assert packet["unfinished_items"] == []
+        if case == "run_owned_value":
+            assert '"payment_options"' in ordinary_input, "the run-owned value is not handed back"
+        return
+
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "no_meaningful_output"
+    assert outcome.is_authoritative is True
+    assert [fact["reason_code"] for fact in outcome.missing_requested_output_facts] == [expected_reason_code]
+    assert [fact["output_path"] for fact in outcome.missing_requested_output_facts] == ["output.collect_options_output"]
+    assert {
+        "kind": "missing_requested_output",
+        "label": "collect_options",
+        "output_path": "output.collect_options_output",
+        "reason_code": expected_reason_code,
+    } in packet["unfinished_items"]
+    assert '"output_path": "output.collect_options_output"' in ordinary_input
+    assert f'"reason_code": "{expected_reason_code}"' in ordinary_input
+
+
+def test_a_declared_goal_path_the_run_left_empty_reaches_repair_and_the_latch_from_one_source() -> None:
+    """The terminal latch and ordinary repair read the same unmet declared goal paths."""
+    run_id = "wr_goal_paths"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_options": {
+            "claimed_outcomes": [
+                {"id": "options", "goal_value_paths": ["$.payment_options", "$.cart_line_item"]},
+            ]
+        }
+    }
+    retained_value = {"url": "https://example.test/cart", "actions": ["click", "click"], "payment_options": ["Visa"]}
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_options"],
+            "executed_block_labels": ["collect_options"],
+            "blocks": [
+                {
+                    "label": "collect_options",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": retained_value,
+                }
+            ],
+        },
+    }
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+
+    # The latch already refused this run; the same unmet paths now reach repair by name.
+    assert empty_data_blocks is True
+    assert goal_path_omissions == [{"block_label": "collect_options", "output_path": "cart_line_item"}]
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "no_meaningful_output"
+    assert outcome.missing_requested_output_facts == [
+        {
+            "output_path": "cart_line_item",
+            "output_root": "cart_line_item",
+            "reason_code": "declared_goal_path_absent",
+            "value_status": "no_typed_value",
+            "block_label": "collect_options",
+        }
+    ]
+    assert {
+        "kind": "missing_requested_output",
+        "label": "collect_options",
+        "output_path": "cart_line_item",
+        "reason_code": "declared_goal_path_absent",
+    } in packet["unfinished_items"]
+
+    satisfied_result = json.loads(json.dumps(result))
+    satisfied_result["data"]["blocks"][0]["extracted_data"]["cart_line_item"] = {"qty": 1}
+    _anti_bot, satisfied_empty, _categories, satisfied_omissions = run_execution_module._analyze_run_blocks(
+        satisfied_result, ctx
+    )
+    assert satisfied_empty is False
+    assert satisfied_omissions == []
+
+
+def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root() -> None:
+    """``$[*].number`` normalizes to ``[].number``, whose root is empty; the path still binds."""
+    run_id = "wr_array_goal_path"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_rows": {"claimed_outcomes": [{"id": "rows", "goal_value_paths": ["$[*].number"]}]}
+    }
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_rows"],
+            "executed_block_labels": ["collect_rows"],
+            "blocks": [
+                {
+                    "label": "collect_rows",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"url": "https://example.test/rows"},
+                }
+            ],
+        },
+    }
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert empty_data_blocks is True
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.missing_requested_output_facts == [
+        {
+            "output_path": "[].number",
+            "reason_code": "declared_goal_path_absent",
+            "value_status": "no_typed_value",
+            "block_label": "collect_rows",
+        }
+    ]
+
+
+def test_two_blocks_omitting_the_same_declared_path_both_reach_repair() -> None:
+    """Deduping on the path alone would repair one block and leave the other silently broken."""
+    run_id = "wr_shared_goal_path"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        label: {"claimed_outcomes": [{"id": label, "goal_value_paths": ["$.status"]}]}
+        for label in ("collect_first", "collect_second")
+    }
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_first", "collect_second"],
+            "executed_block_labels": ["collect_first", "collect_second"],
+            "blocks": [
+                {
+                    "label": label,
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"url": f"https://example.test/{label}"},
+                }
+                for label in ("collect_first", "collect_second")
+            ],
+        },
+    }
+
+    _anti_bot, _empty, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(result, ctx)
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert [(fact["output_path"], fact["block_label"]) for fact in outcome.missing_requested_output_facts] == [
+        ("status", "collect_first"),
+        ("status", "collect_second"),
+    ]
+
+    # Retaining both facts is only half the fix: repair must be able to tell them apart.
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert [
+        (item["output_path"], item["label"])
+        for item in packet["unfinished_items"]
+        if item["kind"] == "missing_requested_output"
+    ] == [("status", "collect_first"), ("status", "collect_second")]
+
+    ctx.latest_recorded_build_test_outcome = outcome
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+    assert "block_label=collect_first" in rendered
+    assert "block_label=collect_second" in rendered
+
+
+def test_a_long_declared_goal_path_reaches_repair_uncut() -> None:
+    """The prompt tells the model to copy output_path verbatim; a clipped path names nothing."""
+    run_id = "wr_long_goal_path"
+    long_path = "$.checkout.summary." + ".".join(f"level_{index:02d}" for index in range(15)) + ".amount_due"
+    normalized = long_path.removeprefix("$.")
+    # Wider than every ceiling the path crosses on its way to the model, and inside the one the
+    # facts themselves carry, so a survivor proves the projections and not a shorter fixture.
+    assert 160 < len(normalized) <= 180, "the fixture must exceed every downstream bound"
+
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_total": {"claimed_outcomes": [{"id": "total", "goal_value_paths": [long_path]}]}
+    }
+    result: dict[str, object] = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": ["collect_total"],
+            "executed_block_labels": ["collect_total"],
+            "blocks": [
+                {
+                    "label": "collect_total",
+                    "block_type": "code",
+                    "status": "completed",
+                    "extracted_data": {"url": "https://example.test/checkout"},
+                }
+            ],
+        },
+    }
+
+    _anti_bot, _empty, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(result, ctx)
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert [fact["output_path"] for fact in outcome.missing_requested_output_facts] == [normalized]
+
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert [
+        item["output_path"] for item in packet["unfinished_items"] if item["kind"] == "missing_requested_output"
+    ] == [normalized]
+
+    ctx.latest_recorded_build_test_outcome = outcome
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    assert f"output_path={normalized}" in _recorded_build_test_outcome_prompt(ctx)
+
+
+def _goal_path_run_result(run_id: str, blocks: list[dict[str, object]]) -> dict[str, object]:
+    labels = [str(block["label"]) for block in blocks]
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "requested_block_labels": labels,
+            "executed_block_labels": labels,
+            "blocks": blocks,
+        },
+    }
+
+
+def test_a_sibling_blocks_complete_record_does_not_clear_another_blocks_omission() -> None:
+    """A run must not be credited for a path one block omitted because a different block proved its own."""
+    run_id = "wr_sibling_record"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_options": {
+            "claimed_outcomes": [{"id": "options", "goal_value_paths": ["$.payment_options", "$.cart_line_item"]}]
+        }
+    }
+    result = _goal_path_run_result(
+        run_id,
+        [
+            {
+                "label": "collect_options",
+                "block_type": "code",
+                "status": "completed",
+                "extracted_data": {
+                    "url": "https://example.test/cart",
+                    "actions": ["click", "click"],
+                    "payment_options": ["Visa"],
+                },
+            },
+            {
+                "label": "lookup_record",
+                "block_type": "code",
+                "status": "completed",
+                "extracted_data": {
+                    "lookup_record_output": {
+                        "entity_found": True,
+                        "entity_name": "Jordan Example",
+                        "record_number": "1234567890",
+                        "items": [{"item_label": "Sample Practice", "status": "Active"}],
+                        "overall_status": "Active",
+                    }
+                },
+            },
+        ],
+    )
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert goal_path_omissions == [{"block_label": "collect_options", "output_path": "cart_line_item"}]
+    assert empty_data_blocks is True
+    assert outcome.verdict == "repairable_failure"
+
+    ctx.latest_recorded_build_test_outcome = outcome
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    rendered = _recorded_build_test_outcome_prompt(ctx)
+    assert "output_path=cart_line_item" in rendered
+    assert "block_label=collect_options" in rendered
+
+
+def test_a_completed_block_that_retained_nothing_at_all_reports_every_declared_path() -> None:
+    """Retaining no output is the strongest omission there is; it must not skip the arm that records it."""
+    run_id = "wr_null_extracted"
+    ctx = _locator_packet_ctx()
+    ctx.code_artifact_metadata = {
+        "collect_options": {
+            "claimed_outcomes": [{"id": "options", "goal_value_paths": ["$.payment_options", "$.cart_line_item"]}]
+        }
+    }
+    result = _goal_path_run_result(
+        run_id,
+        [{"label": "collect_options", "block_type": "code", "status": "completed", "extracted_data": None}],
+    )
+
+    _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
+        result, ctx
+    )
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        declared_goal_path_omissions=goal_path_omissions,
+    )
+    assert outcome is not None
+
+    assert empty_data_blocks is True
+    assert [omission["output_path"] for omission in goal_path_omissions] == ["payment_options", "cart_line_item"]
+    assert outcome.verdict == "repairable_failure"
+
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert sorted(
+        item["output_path"] for item in packet["unfinished_items"] if item["kind"] == "missing_requested_output"
+    ) == ["cart_line_item", "payment_options"]
+
+
+class _CheckoutPage:
+    """The focused local fixture the repaired block reads; no browser, no network."""
+
+    _TEXT = {
+        "#cart-line-item": "Running Jacket / Size M / Qty 1 / 88.00",
+        "#payment-methods": "Card, Wallet, Pay in 4",
+        "#selected-product": "Running Jacket",
+    }
+
+    async def inner_text(self, selector: str) -> str:
+        return self._TEXT[selector]
+
+
+_UNREPAIRED_CODE = """
+url = "https://example.test/checkout"
+actions = ["goto", "click", "click"]
+"""
+
+_REPAIRED_CODE = """
+url = "https://example.test/checkout"
+actions = ["goto", "click", "click"]
+line_item_text = await page.inner_text("#cart-line-item")
+name, size, quantity, price = [part.strip() for part in line_item_text.split("/")]
+cart_line_item = {"name": name, "size": size, "quantity": quantity, "price": price}
+payment_options = [option.strip() for option in (await page.inner_text("#payment-methods")).split(",")]
+selection_output = {"product": await page.inner_text("#selected-product"), "price": price}
+"""
+
+
+async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dict[str, object]:
+    """Run the block through the real CodeBlock executor and return the output it produced."""
+
+    class FakeBrowserState:
+        def __init__(self) -> None:
+            self.browser_artifacts = BrowserArtifacts()
+
+        async def get_working_page(self) -> object:
+            return _CheckoutPage()
+
+    class FakeWorkflowRunContext:
+        values: dict[str, object] = {}
+        secrets: dict[str, object] = {}
+        include_secrets_in_templates = False
+        organization_id = None
+        workflow_title = "Checkout"
+        workflow_id = "w_checkout"
+        workflow_permanent_id = "wpid_checkout"
+        workflow_run_id = "wr_executor_witness"
+        browser_session_id = None
+        workflow_run_outputs: list[object] = []
+        workflow = None
+
+        def get_block_metadata(self, label: str | None) -> dict[str, object]:
+            return {}
+
+        def build_workflow_run_summary(self) -> str:
+            return ""
+
+        def mask_secrets_in_data(self, data: object, mask: str = "*****") -> object:
+            return data
+
+    async def noop(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def browser_state(*args: object, **kwargs: object) -> FakeBrowserState:
+        return FakeBrowserState()
+
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", noop)
+    monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", browser_state)
+    monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext())
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", noop)
+
+    now = datetime.now(UTC)
+    block = CodeBlock(
+        label="collect_payment_options",
+        code=code,
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="collect_payment_options_output",
+            description="checkout facts",
+            output_parameter_id="op_checkout",
+            workflow_id="w_checkout",
+            created_at=now,
+            modified_at=now,
+        ),
+    )
+    result = await block.execute(workflow_run_id="wr_executor_witness", workflow_run_block_id="")
+    assert result.success is True, "the fixture block must execute"
+    assert isinstance(result.output_parameter_value, dict)
+    return result.output_parameter_value
+
+
+def _executor_witness_ctx() -> CopilotContext:
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.code_artifact_metadata = {
+        "collect_payment_options": {
+            "claimed_outcomes": [
+                {
+                    "id": "checkout",
+                    "goal_value_paths": ["$.cart_line_item", "$.payment_options", "$.selection_output"],
+                }
+            ]
+        }
+    }
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole chain on executed code: a completed run that owns nothing names the paths it owes,
+    and the repaired block's own execution output clears them."""
+    before_output = await _execute_code_block(monkeypatch, _UNREPAIRED_CODE)
+    after_output = await _execute_code_block(monkeypatch, _REPAIRED_CODE)
+
+    # The outputs under test came out of the executor, not out of a fixture file.
+    assert set(before_output) == {"url", "actions"}
+    assert after_output["payment_options"] == ["Card", "Wallet", "Pay in 4"]
+    assert after_output["cart_line_item"] == {
+        "name": "Running Jacket",
+        "size": "Size M",
+        "quantity": "Qty 1",
+        "price": "88.00",
+    }
+
+    def recorded(output: dict[str, object]) -> tuple[CopilotContext, object]:
+        ctx = _executor_witness_ctx()
+        result = {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_executor_witness",
+                "overall_status": "completed",
+                "requested_block_labels": ["collect_payment_options"],
+                "executed_block_labels": ["collect_payment_options"],
+                "blocks": [
+                    {
+                        "label": "collect_payment_options",
+                        "block_type": "code",
+                        "status": "completed",
+                        "extracted_data": output,
+                    }
+                ],
+                # The value the executor produced, on the surface the runtime registers it on.
+                "registered_output_parameter_values": [
+                    {
+                        "workflow_run_id": "wr_executor_witness",
+                        "output_parameter_id": "op_checkout",
+                        "output_parameter_key": "collect_payment_options_output",
+                        "block_label": "collect_payment_options",
+                        "block_type": "code",
+                        "value": output,
+                    }
+                ],
+            },
+        }
+        run_execution_module._record_run_blocks_result(ctx, result, completion_verification=None)
+        return ctx, result
+
+    before_ctx, _before_result = recorded(before_output)
+    after_ctx, after_result = recorded(after_output)
+
+    before_outcome = before_ctx.latest_recorded_build_test_outcome
+    assert before_outcome is not None
+    assert before_outcome.verdict == "repairable_failure"
+    assert sorted(fact["output_path"] for fact in before_outcome.missing_requested_output_facts) == [
+        "cart_line_item",
+        "payment_options",
+        "selection_output",
+    ]
+    rendered = _recorded_build_test_outcome_prompt(before_ctx)
+    for path in ("cart_line_item", "payment_options", "selection_output"):
+        assert f"output_path={path}" in rendered
+
+    after_outcome = after_ctx.latest_recorded_build_test_outcome
+    assert after_outcome is not None
+    assert after_outcome.missing_requested_output_facts == []
+    assert after_outcome.verdict == "not_authoritative"
+
+    # The corrected run hands back the values its own code produced.
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(after_ctx, after_result, recorded_outcome=after_outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert packet["unfinished_items"] == []
+    run_owned = [
+        output["value"]
+        for output in packet["registered_outputs"]
+        if output["output_parameter_key"] == "collect_payment_options_output"
+    ]
+    assert run_owned == [after_output], "the corrected run does not hand back the output its code produced"
