@@ -55,7 +55,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -4008,8 +4008,23 @@ def _fallback_structured_record_completion_criteria(user_message: str) -> list[C
     ]
 
 
+def _account_state_atom(value: str) -> str:
+    """Org-controlled text goes into a delimiter-structured prompt block, so a quote or a backtick
+    left intact would forge a fact boundary or a credential id, and any of the characters str.split
+    treats as whitespace — U+2028, U+0085 and friends, not just CR and LF — would forge a line."""
+    return " ".join(value.replace('"', " ").replace("`", " ").split())
+
+
 def credential_candidate_label(credential: Credential) -> str:
-    return f"{credential.name} (`{credential.credential_id}`)"
+    label = f'"{_account_state_atom(credential.name)}" (`{credential.credential_id}`)'
+    facts: list[str] = []
+    if credential.tested_url:
+        facts.append(f'tested_url: "{_account_state_atom(credential.tested_url)}"')
+    if credential.totp_type != TotpType.NONE:
+        facts.append(f"totp_type: {credential.totp_type}")
+    if not facts:
+        return label
+    return f"{label} - {'; '.join(facts)}"
 
 
 def _ground_user_provided_sites(
