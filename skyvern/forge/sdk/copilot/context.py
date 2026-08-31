@@ -294,6 +294,7 @@ class CodeAuthoringRepairContext(BaseModel):
     current_title: str | None = None
     page_evidence_source: str | None = None
     observed_after_workflow_run: bool = False
+    rendered_value_excerpt: str | None = None
     page_form_summaries: list[str] = Field(default_factory=list)
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)

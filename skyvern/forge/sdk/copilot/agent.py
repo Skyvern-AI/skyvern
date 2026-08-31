@@ -866,6 +866,13 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             lines.append(f"page_forms: {_render_authoring_repair_prompt_list(repair_context.page_form_summaries)}")
         if repair_context.page_result_summaries:
             lines.append(f"page_results: {_render_authoring_repair_prompt_list(repair_context.page_result_summaries)}")
+        if repair_context.rendered_value_excerpt:
+            rendered_value = _clean_authoring_repair_prompt_atom(
+                repair_context.rendered_value_excerpt,
+                max_chars=_VALUE_EXCERPT_MAX,
+            )
+            if rendered_value:
+                lines.append(f"rendered_page_value: {rendered_value}")
         if repair_context.page_action_summaries:
             lines.append(f"page_actions: {_render_authoring_repair_prompt_list(repair_context.page_action_summaries)}")
         if repair_context.page_challenge_summaries:
@@ -1100,6 +1107,10 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
                     fields.append(f"{key}={_clean_authoring_repair_prompt_atom(value, max_chars=_TEXT_MAX)}")
             if fields:
                 lines.append(f"- {'; '.join(fields)}")
+    if outcome.code_safety_rejection_facts:
+        lines.append("code_safety_rejection_facts:")
+        for fact in outcome.code_safety_rejection_facts:
+            lines.append("- " + json.dumps(fact.model_dump(mode="json"), separators=(",", ":")))
     if outcome.workflow_run_id:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
     failed_operation = outcome.failed_operation

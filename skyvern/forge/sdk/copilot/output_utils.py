@@ -565,6 +565,12 @@ def _bounded_packet_page_state(
             max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
             notices=notices,
         ),
+        "rendered_value_excerpt": _bounded_packet_string(
+            page_state.rendered_value_excerpt,
+            field_name=f"{field_prefix}.rendered_value_excerpt",
+            max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
+            notices=notices,
+        ),
         "form_summaries": _bounded_packet_strings(
             page_state.form_summaries,
             field_name=f"{field_prefix}.form_summaries",
@@ -1086,6 +1092,7 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
                         "current_url": None,
                         "title": None,
                         "evidence_source": None,
+                        "rendered_value_excerpt": None,
                         "form_summaries": [],
                         "result_summaries": [],
                         "action_summaries": [],

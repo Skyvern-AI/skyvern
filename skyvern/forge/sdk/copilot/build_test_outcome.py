@@ -171,6 +171,7 @@ class BuildTestPacketPageState(BaseModel):
     title: str | None = None
     evidence_source: str | None = None
     observed_after_workflow_run: bool = False
+    rendered_value_excerpt: str | None = None
     form_summaries: list[str] = Field(default_factory=list)
     result_summaries: list[str] = Field(default_factory=list)
     action_summaries: list[str] = Field(default_factory=list)
@@ -338,6 +339,25 @@ class BuildTestEvidencePacket(BaseModel):
     omission_notices: list[str] = Field(default_factory=list)
 
 
+class CodeSafetyRejectionFact(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str
+    reason_code: str
+    surface: str
+    submission_ref: str
+
+    @field_validator("block_label", "reason_code", "surface")
+    @classmethod
+    def scrub_fact_value(cls, value: str) -> str:
+        return redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
+
+    @field_validator("submission_ref")
+    @classmethod
+    def scrub_submission_ref(cls, value: str) -> str:
+        return redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
+
+
 class RecordedBuildTestOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -361,6 +381,7 @@ class RecordedBuildTestOutcome(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
     runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
+    code_safety_rejection_facts: list[CodeSafetyRejectionFact] = Field(default_factory=list)
     page_path_failure: PostRunPagePathFailure | None = None
     failed_operation: BuildTestFailedOperation | None = None
     failed_operation_call_signature: str | None = Field(default=None, exclude=True, repr=False)
@@ -493,6 +514,9 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
             "attempted_block_label": outcome.attempted_block_label,
             "attempted_block_signature": _attempted_block_signature(ctx, outcome),
             "attempted_call_ref": outcome.attempted_call_ref,
+            "code_safety_rejection_facts": [
+                fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts
+            ],
             "failed_operation": (
                 outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
             ),
@@ -881,6 +905,7 @@ def recorded_outcome_from_author_time_reject(
     observed_page_value_excerpt: str = "",
     page_evidence_refs: Sequence[str] = (),
     missing_requested_output_facts: Sequence[Mapping[str, object]] = (),
+    code_safety_rejection_facts: Sequence[CodeSafetyRejectionFact] = (),
 ) -> RecordedBuildTestOutcome:
     if structural_payload is not None:
         structural_failure_identity = "author_time:" + _stable_hash(structural_payload)
@@ -894,6 +919,7 @@ def recorded_outcome_from_author_time_reject(
         structural_failure_identity=structural_failure_identity,
         authored_structure_signature=authored_structure_signature,
         missing_requested_output_facts=[dict(fact) for fact in missing_requested_output_facts],
+        code_safety_rejection_facts=list(code_safety_rejection_facts),
         observed_evidence_summary=_bounded_text(observed_evidence_summary),
         observed_page_value_excerpt=" ".join(observed_page_value_excerpt.split())[:_VALUE_EXCERPT_MAX],
         page_evidence_refs=_clean_list(page_evidence_refs),
@@ -1390,6 +1416,7 @@ def recorded_outcome_from_run_blocks_result(
         authored_structure_signature=authored_structure_signature,
         failed_operation=failed_operation,
         executed_block_associations=executed_block_associations,
+        observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
         # The failed block's recorded reason carries the exception and its line; the run status is
         # the word "failed" and says nothing a repair can act on.
         observed_evidence_summary=(
