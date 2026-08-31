@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     normalized_challenge_kind,
     vision_challenge_carrier,
 )
+from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
 from skyvern.forge.sdk.copilot.runtime import ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -32,6 +33,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
+COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS = 120_000
 
 # Block types whose acted page, when no url is on the block, is the current
 # frontier (observation of the page suffices). navigation without a url is the
@@ -110,6 +112,21 @@ _EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
 )
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
+_SIZE_COMPACTION_CATEGORY_UNITS: dict[str, str] = {
+    "visible_text_excerpt": "characters",
+    "forms.fields.options": "entries",
+    "result_containers.rows": "entries",
+    "result_containers.sample_rows": "entries",
+    "navigation_targets": "entries",
+    "clickable_controls": "entries",
+    "forms": "entries",
+    "result_containers": "entries",
+    "key_value_relations": "entries",
+    "visual_obstruction_candidates": "entries",
+    "modal_overlays": "entries",
+    "page_obstructions": "entries",
+    "challenge_controls": "entries",
+}
 _ANTI_BOT_SCAN_BYTES = 250_000
 _NON_ENTRY_FIELD_TYPES: frozenset[str] = frozenset(
     {"hidden", "submit", "button", "reset", "checkbox", "radio", "file", "image"}
@@ -819,7 +836,9 @@ def has_witnessed_value_content(evidence: dict[str, Any]) -> bool:
     warnings = evidence.get("inspection_warnings")
     if isinstance(warnings, list) and warnings:
         return False
-    if evidence.get("key_value_relations_truncated") is not True:
+    if evidence.get("key_value_relations_truncated") is not True and not size_compaction_omits(
+        evidence, {"key_value_relations"}
+    ):
         relations = evidence.get("key_value_relations")
         if isinstance(relations, list):
             for relation in relations:
@@ -828,7 +847,10 @@ def has_witnessed_value_content(evidence: dict[str, Any]) -> bool:
                 value_text = relation.get("value_text")
                 if isinstance(value_text, str) and value_text.strip():
                     return True
-    if evidence.get("result_containers_truncated") is not True:
+    if evidence.get("result_containers_truncated") is not True and not size_compaction_omits(
+        evidence,
+        {"result_containers", "result_containers.rows", "result_containers.sample_rows"},
+    ):
         containers = evidence.get("result_containers")
         if isinstance(containers, list):
             for container in containers:
@@ -3933,6 +3955,47 @@ def _structured_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]
     return candidates
 
 
+def _structured_size_compaction(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    original_char_count = value.get("original_char_count")
+    if (
+        not isinstance(original_char_count, int)
+        or isinstance(original_char_count, bool)
+        or original_char_count <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    ):
+        return None
+    omissions: list[dict[str, Any]] = []
+    seen_categories: set[str] = set()
+    for item in value.get("omissions") or []:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category")
+        if not isinstance(category, str):
+            continue
+        expected_unit = _SIZE_COMPACTION_CATEGORY_UNITS.get(category)
+        if expected_unit is None:
+            LOG.warning(
+                "copilot_structured_size_compaction_unknown_category_ignored",
+                category=category,
+            )
+            continue
+        omitted_count = item.get("omitted_count")
+        if (
+            category in seen_categories
+            or item.get("unit") != expected_unit
+            or not isinstance(omitted_count, int)
+            or isinstance(omitted_count, bool)
+            or omitted_count <= 0
+        ):
+            continue
+        seen_categories.add(category)
+        omissions.append({"category": category, "omitted_count": omitted_count, "unit": expected_unit})
+    if not omissions:
+        return None
+    return {"original_char_count": original_char_count, "omissions": omissions}
+
+
 def parse_composition_structured(data: Any, *, inspected_url: str, current_url: str) -> dict[str, Any] | None:
     """Map bounded structured JSON to PageEvidence; None denotes an invalid structured result."""
     if not isinstance(data, dict):
@@ -3960,6 +4023,7 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         + _structured_interaction_blocking_obstructions(data.get("page_obstructions"))
     )[:_MAX_PAGE_OBSTRUCTIONS]
     visual_obstruction_candidates = _structured_visual_obstruction_candidates(data.get("visual_obstruction_candidates"))
+    size_compaction = _structured_size_compaction(data.get("size_compaction"))
     visible_text = _schema_text(_structured_str(data.get("visible_text_excerpt")), _MAX_VISIBLE_TEXT_EXCERPT_CHARS)
 
     # Re-validate JS-reported indicators against _ANTI_BOT_PATTERNS and union a title scan.
@@ -3984,6 +4048,7 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "inspected_url": inspected_url,
         "current_url": current_url,
         "page_title": page_title,
+        **({"size_compaction": size_compaction} if size_compaction is not None else {}),
         "forms": forms,
         # Ahead of the list it describes: tool output is head-truncated, so a flag placed after a
         # long navigation_targets is dropped exactly on the pages where it is true.

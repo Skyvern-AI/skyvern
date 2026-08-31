@@ -845,6 +845,23 @@ class TestActObserveSuccess:
         assert len(json.dumps(result)) <= _SCOUT_RESULT_CHAR_CAP
 
     @pytest.mark.asyncio
+    async def test_result_summary_carries_structured_size_omissions_to_the_authoring_model(self) -> None:
+        payload = _bounded_extractor_payload()
+        payload["size_compaction"] = {
+            "original_char_count": 132_400,
+            "omissions": [
+                {"category": "forms.fields.options", "omitted_count": 180, "unit": "entries"},
+                {"category": "visible_text_excerpt", "omitted_count": 6000, "unit": "characters"},
+            ],
+        }
+        ctx = _ctx(server=_server_returning(payload))
+
+        result = await _run_click(ctx)
+
+        assert result["data"]["page"]["size_compaction"] == payload["size_compaction"]
+        assert ctx.flow_evidence[0]["evidence"]["inspection_warnings"] == []
+
+    @pytest.mark.asyncio
     async def test_result_summary_carries_disclosure_controls_to_the_authoring_model(self) -> None:
         payload = _bounded_extractor_payload()
         payload["clickable_controls"] = [

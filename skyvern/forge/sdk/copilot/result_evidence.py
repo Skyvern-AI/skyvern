@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     LiveReadBinding,
     LiveReadKind,
@@ -323,6 +324,17 @@ def mint_scout_observation_contract(
     quorum, and truncated or warned captures void the mint."""
     if not isinstance(page_evidence, Mapping) or not url.strip() or not labels_by_path:
         return None
+    packet = dict(page_evidence)
+    if size_compaction_omits(
+        packet,
+        {
+            "key_value_relations",
+            "result_containers",
+            "result_containers.rows",
+            "result_containers.sample_rows",
+        },
+    ):
+        return None
     if page_evidence.get("result_containers_truncated") is not False:
         return None
     if page_evidence.get("key_value_relations_truncated") is not False:
@@ -330,8 +342,6 @@ def mint_scout_observation_contract(
     warnings = page_evidence.get("inspection_warnings")
     if isinstance(warnings, list) and warnings:
         return None
-    packet = dict(page_evidence)
-
     lexical_by_path: dict[str, list[LiveReadBinding]] = {}
     for binding in _key_value_bindings(packet, labels_by_path):
         lexical_by_path.setdefault(binding.output_path, []).append(binding)
