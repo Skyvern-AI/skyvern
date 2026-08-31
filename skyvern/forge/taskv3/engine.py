@@ -203,7 +203,7 @@ async def run_task_v3_agent_loop(
     prompt_name: str = "taskv3-agent-loop",
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]]], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",

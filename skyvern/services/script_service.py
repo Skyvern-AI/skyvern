@@ -118,7 +118,7 @@ from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, DecisiveAction
+from skyvern.webeye.actions.actions import Action, DecisiveAction, reasoning_is_turn_scoped
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
@@ -1181,7 +1181,10 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
         for action, field_name in action_entries:
             if not field_name:
                 continue
-            prompt_text = action.intention or action.reasoning or ""
+            # A v3 row's reasoning is the whole turn's text, shared across the round — not a
+            # per-field prompt; using it would give N fields one prompt naming all N.
+            per_action_reasoning = None if reasoning_is_turn_scoped(action.description) else action.reasoning
+            prompt_text = action.intention or per_action_reasoning or ""
             if action.input_or_select_context and action.input_or_select_context.intention:
                 prompt_text = action.input_or_select_context.intention
             field_prompts.append({"name": field_name, "prompt": prompt_text})

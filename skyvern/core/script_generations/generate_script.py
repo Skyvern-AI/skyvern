@@ -44,6 +44,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.workflows import FileStorageType
 from skyvern.utils.strings import sanitize_identifier
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import reasoning_is_turn_scoped
 
 LOG = structlog.get_logger(__name__)
 GENERATE_CODE_AI_MODE_PROACTIVE = "proactive"
@@ -739,6 +740,14 @@ def safe_name(label: str) -> str:
     return s
 
 
+def _per_action_reasoning(act: dict) -> str:
+    """A v3 row's reasoning is the whole turn's text, shared across the round — never a per-action
+    prompt source. Only pre-v3 rows carry per-action reasoning."""
+    if reasoning_is_turn_scoped(act.get("description")):
+        return ""
+    return act.get("reasoning") or ""
+
+
 def _value(value: Any) -> cst.BaseExpression:
     """Convert simple Python objects to CST expressions."""
     if isinstance(value, str):
@@ -1107,7 +1116,7 @@ def _action_to_stmt(
         value = option.get("value")
         label = option.get("label")
         value = value or label
-        if not value and use_semantic_selectors and (act.get("intention") or act.get("reasoning")):
+        if not value and use_semantic_selectors and (act.get("intention") or _per_action_reasoning(act)):
             args.append(
                 cst.Arg(
                     keyword=cst.Name("ai"),
@@ -1346,7 +1355,7 @@ def _action_to_stmt(
             )
         )
 
-    intention = act.get("intention") or act.get("reasoning") or ""
+    intention = act.get("intention") or _per_action_reasoning(act) or ""
     if intention and method not in ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT:
         # Try to parameterize the prompt for click actions so cached scripts
         # don't embed recording-specific values (e.g. a patient ID).

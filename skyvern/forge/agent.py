@@ -195,6 +195,7 @@ from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
+    TASK_V3_ACTION_DESCRIPTION_PREFIX,
     Action,
     ActionStatus,
     ClickAction,
@@ -370,6 +371,11 @@ def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
     return value
 
 
+# Cap on the persisted turn text: actions is a high-traffic table and readers clamp far lower for
+# display; a runaway multi-paragraph turn must not become a per-row payload.
+_TASKV3_REASONING_MAX_CHARS = 1000
+
+
 def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields: Any) -> Action:
     """Build the Action a v3 tool call persists as, carrying the fields its typed subclass requires so
     the row hydrates as that subclass instead of falling back to base Action on every read."""
@@ -392,7 +398,11 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
     if tool_name == "navigate":
         return GotoUrlAction(url=str(args.get("url") or ""), **fields)
     if tool_name == "reload_page":
-        return ReloadPageAction(reasoning=str(args.get("reason") or ""), **fields)
+        # fields carries reasoning=turn_reasoning; popped to avoid a duplicate kwarg. Loop-injected
+        # reloads always set a "reason" arg, so the turn-text fallback is future-proofing only.
+        turn_reasoning = fields.pop("reasoning", None)
+        reload_reason = str(args.get("reason") or "") or (turn_reasoning or "")
+        return ReloadPageAction(reasoning=reload_reason, **fields)
     return Action(action_type=_TASKV3_TOOL_ACTION_TYPES.get(tool_name, ActionType.CLICK), **fields)
 
 
@@ -1759,7 +1769,9 @@ class ForgeAgent:
         v3_persisted_actions: list[Action] = []
         v3_round_index = 0
 
-        async def _on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+        async def _on_action_round(
+            round_actions: list[tuple[str, dict[str, Any], bool]], turn_reasoning: str | None
+        ) -> None:
             nonlocal v3_round_index
             screenshot_artifact_id: str | None = None
             try:
@@ -1769,9 +1781,19 @@ class ForgeAgent:
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
-            secret_values: set[str] = set()
-            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id):
-                secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+            # Opted-out runs still floor runtime-resolved secrets (e.g. verification codes),
+            # matching the recording/HAR finalization sites.
+            secret_values = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+                else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            )
+            if turn_reasoning:
+                if secret_values:
+                    # Default (substring) matching: turn text is free-form prose, where a long secret
+                    # can be glued to adjacent alphanumerics — boundary anchoring would let it through.
+                    turn_reasoning = redact_secrets_from_text(turn_reasoning, secret_values)
+                turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
             for name, args, succeeded in round_actions:
                 try:
                     tool_args = _redact_tool_args(args if isinstance(args, dict) else {}, secret_values)
@@ -1788,8 +1810,9 @@ class ForgeAgent:
                         # as one unit of the workflow-run step budget (distinct (task, order) pairs).
                         step_order=v3_round_index,
                         action_order=len(v3_persisted_actions),
-                        description=f"task_v3 {name} {selector}".strip(),
+                        description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
+                        reasoning=turn_reasoning,
                     )
                     v3_persisted_actions.append(action)
                     await app.DATABASE.workflow_params.create_action(action=action)
