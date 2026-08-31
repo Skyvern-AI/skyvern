@@ -2572,7 +2572,11 @@ def _artifact_row_storage(
 async def test_downloads_read_stays_silent_when_artifact_rows_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
     resolved = [FileInfo(url="https://example.test/a")]
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=resolved)
-    monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([SimpleNamespace()], False)))
+    monkeypatch.setattr(
+        storage,
+        "_list_download_artifacts_safe",
+        AsyncMock(return_value=([SimpleNamespace(browser_session_id=None, checksum=None)], False)),
+    )
 
     with capture_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == resolved
@@ -2583,7 +2587,11 @@ async def test_downloads_read_stays_silent_when_artifact_rows_resolve(monkeypatc
 @pytest.mark.asyncio
 async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
-    monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([SimpleNamespace()], False)))
+    monkeypatch.setattr(
+        storage,
+        "_list_download_artifacts_safe",
+        AsyncMock(return_value=([SimpleNamespace(browser_session_id=None, checksum=None)], False)),
+    )
 
     with capture_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
