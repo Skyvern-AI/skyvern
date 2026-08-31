@@ -84,15 +84,19 @@ def _immutable_redaction_value(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class OriginRunRedactionRegistry:
-    """Serialized parameter values owned by one concrete workflow run."""
+    """Run-bound redaction sets for model disclosures and persisted artifacts."""
 
     workflow_run_id: str
     parameters: Mapping[str, Any]
     contains_sensitive_values: bool
     contains_all_sensitive_values: bool
+    contains_all_static_sensitive_values: bool = True
+    awaiting_runtime_secret_values: bool = False
+    artifact_parameters: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", _immutable_redaction_value(self.parameters))
+        object.__setattr__(self, "artifact_parameters", _immutable_redaction_value(self.artifact_parameters))
 
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0

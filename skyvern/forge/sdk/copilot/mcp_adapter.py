@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
     resolve_browser_state_for_context,
     retire_browser_session_id,
+    sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -65,7 +66,11 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot_from_result,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    matching_origin_run_redaction_parameters,
+    register_matching_origin_run_redaction_values,
+    scrub_secrets_from_structure,
+)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_state import BrowserState
@@ -439,6 +444,7 @@ class SchemaOverlay:
     # stripped before the call, so the underlying tool never sees an argument it cannot accept.
     copilot_params: dict[str, Any] = field(default_factory=dict)
     requires_browser: bool = False
+    redacts_sensitive_origin_structured_result: bool = False
     timeout: int | None = None
     pre_hook: PreHook | None = None
     post_hook: PostHook | None = None
@@ -630,14 +636,22 @@ def _scrub_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
     scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
     if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
         return {}
+    parameter_sets: list[dict[str, Any]] = []
     parameters = getattr(ctx, "codeblock_redaction_parameters", None)
-    if not isinstance(parameters, dict) or not parameters:
-        return scrubbed_secrets
-    scrubbed = app.AGENT_FUNCTION.redact_codeblock_parameter_values(scrubbed_secrets, parameters)
-    if not isinstance(scrubbed, dict) or not _mapping_keys_preserved(scrubbed_secrets, scrubbed):
-        return {}
-    if type(scrubbed_secrets.get("ok")) is bool:
-        scrubbed["ok"] = scrubbed_secrets["ok"]
+    if isinstance(parameters, dict) and parameters:
+        parameter_sets.append(parameters)
+    origin_parameters = matching_origin_run_redaction_parameters(ctx)
+    if origin_parameters:
+        parameter_sets.append(origin_parameters)
+
+    scrubbed = scrubbed_secrets
+    for parameter_set in parameter_sets:
+        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(scrubbed, parameter_set)
+        if not isinstance(candidate, dict) or not _mapping_keys_preserved(scrubbed, candidate):
+            return {}
+        if type(scrubbed.get("ok")) is bool:
+            candidate["ok"] = scrubbed["ok"]
+        scrubbed = candidate
     return scrubbed
 
 
@@ -1848,7 +1862,16 @@ class SkyvernOverlayMCPServer(MCPServer):
                     # The adapter is the last disclosure boundary. Production custody changes share
                     # this call's outer lock; this gate also fails closed if an unexpected producer
                     # marks the exact session while an enrichment awaits.
-                    if overlay.requires_browser and sensitive_origin_page_is_tainted(copilot_ctx):
+                    sensitive_result_is_scrubbable = (
+                        overlay.redacts_sensitive_origin_structured_result
+                        and not sensitive_origin_page_has_active_run(copilot_ctx)
+                        and register_matching_origin_run_redaction_values(copilot_ctx)
+                    )
+                    if (
+                        overlay.requires_browser
+                        and sensitive_origin_page_is_tainted(copilot_ctx)
+                        and not sensitive_result_is_scrubbable
+                    ):
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
                         copilot_result = {
                             "ok": False,

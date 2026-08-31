@@ -186,6 +186,7 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     grade_completion_contract,
     parse_completion_contract,
 )
+from skyvern.forge.sdk.workflow.runtime_secret_bridge import publish_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.secret_encryption import encrypt_workflow_definition_secrets
 from skyvern.forge.sdk.workflow.sequential_key import (
     REUSE_ADMISSION_OFF_DISABLED,
@@ -245,6 +246,7 @@ from skyvern.services.webhook_delivery import (
     describe_delivery_error,
 )
 from skyvern.services.workflow_script_service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
@@ -5482,6 +5484,20 @@ class WorkflowService:
                         "Failed to finalize interrupted workflow run during cleanup",
                         workflow_run_id=workflow_run_id,
                         exc_info=True,
+                    )
+
+            if getattr(workflow_run, "copilot_session_id", None):
+                with contained_effect(
+                    "publish Copilot origin-run runtime secrets",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                ):
+                    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                        workflow_run.workflow_run_id
+                    )
+                    await publish_copilot_runtime_secret_values(
+                        organization_id=workflow_run.organization_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_context=workflow_run_context,
                     )
 
             if renewal_task is not None and not renewal_task.done():

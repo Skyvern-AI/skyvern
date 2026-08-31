@@ -52,6 +52,10 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot,
     screenshot_result_facts,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    register_matching_origin_run_redaction_values,
+    scrub_secrets_from_structure,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -854,24 +858,7 @@ async def _inspect_page_for_composition_under_custody(
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
-    origin_registry = getattr(copilot_ctx, "origin_run_redaction_registry", None)
-    sensitive_same_turn_run = (
-        isinstance(run_id, str)
-        and origin_registry is not None
-        and origin_registry.workflow_run_id == run_id
-        and origin_registry.contains_sensitive_values
-    )
-    if use_current_page and sensitive_same_turn_run:
-        result = {
-            "ok": False,
-            "data": None,
-            "error": (
-                "Current-page inspection is unavailable after a run with sensitive inputs. "
-                "Inspect a specific named URL instead; that route performs a fresh navigation before inspection."
-            ),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
+    sensitive_same_turn_run = register_matching_origin_run_redaction_values(copilot_ctx, run_id)
     if not use_current_page:
         _clear_pending_browser_interaction_observation(copilot_ctx)
     bypass_budget_for_post_run_current_page = _allows_post_run_current_page_inspection_budget_bypass(
@@ -990,7 +977,7 @@ async def _inspect_page_for_composition_under_custody(
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
 
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_is_tainted(copilot_ctx) and not sensitive_same_turn_run:
         result = {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
@@ -1029,6 +1016,11 @@ async def _inspect_page_for_composition_under_custody(
         }
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
+
+    if sensitive_same_turn_run:
+        evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
+        # Exact-value scrubbing applies to structured evidence, not pixels.
+        visual_fallback_frame = None
 
     if isinstance(run_id, str) and run_id:
         session_provenance = evidence.get("browser_session_provenance")

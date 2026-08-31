@@ -143,13 +143,17 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    register_matching_origin_run_redaction_values,
+    register_secret_scrub_values_from_structure,
+    scrub_secrets_from_structure,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotRunOutcomeUpdate,
     WorkflowCopilotRunStartedUpdate,
@@ -168,6 +172,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
+from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
@@ -1814,14 +1819,23 @@ async def _capture_and_store_post_run_page(
 ) -> BuildTestPacketPageCapture:
     """A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
+    sensitive_origin_run = register_matching_origin_run_redaction_values(ctx, run_id)
     registry = ctx.origin_run_redaction_registry
-    if registry is not None and registry.workflow_run_id == run_id and registry.contains_sensitive_values:
+    if (
+        registry is not None
+        and registry.workflow_run_id == run_id
+        and registry.contains_sensitive_values
+        and not sensitive_origin_run
+    ):
         ctx.composition_page_evidence = None
         return BuildTestPacketPageCapture(status="unavailable", omission="page_capture_unavailable")
     evidence, observed_session_id, _, captured_frame = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
     if evidence is not None and repair_page_evidence_is_admissible(evidence):
+        if sensitive_origin_run:
+            evidence = scrub_secrets_from_structure(ctx, evidence)
+            captured_frame = None
         _, preserved_stored_evidence = store_post_run_page_evidence(
             ctx,
             evidence,
@@ -1937,6 +1951,9 @@ async def _fetch_dispatched_terminal_page_evidence(
         else None
     )
     origin_redaction_parameters = matching_registry.parameters if matching_registry is not None else None
+    artifact_redaction_parameters = None
+    if matching_registry is not None:
+        artifact_redaction_parameters = matching_registry.artifact_parameters or matching_registry.parameters
     if workflow is None or (
         _workflow_requires_terminal_artifact_redaction(workflow)
         and (
@@ -1974,9 +1991,9 @@ async def _fetch_dispatched_terminal_page_evidence(
     raw_html = artifact_bytes.decode("utf-8", errors="ignore")[:_MAX_POST_RUN_PAGE_HTML_CHARS]
     scrubbed_html = (
         app.AGENT_FUNCTION.redact_codeblock_parameter_values(
-            raw_html, _mutable_redaction_value(origin_redaction_parameters)
+            raw_html, _mutable_redaction_value(artifact_redaction_parameters)
         )
-        if origin_redaction_parameters
+        if artifact_redaction_parameters
         else raw_html
     )
     if not isinstance(scrubbed_html, str) or not scrubbed_html:
@@ -2161,8 +2178,16 @@ async def _bind_origin_run_redaction_registry(
     credential_ids: Sequence[str],
     sensitive_parameter_keys: Sequence[str],
 ) -> OriginRunRedactionRegistry:
-    serialized = app.AGENT_FUNCTION.serialize_codeblock_parameters(dict(parameter_values))
+    # The model-disclosure registry is a sensitive-value scrub set, not a copy of the run request.
+    # Persisted worker HTML retains the pre-existing, broader all-parameter redaction set without
+    # registering capability references at the workflow write seam.
+    serialized_artifact_parameters = app.AGENT_FUNCTION.serialize_codeblock_parameters(dict(parameter_values))
+    sensitive_parameter_values = {
+        key: parameter_values[key] for key in sensitive_parameter_keys if key in parameter_values
+    }
+    serialized = app.AGENT_FUNCTION.serialize_codeblock_parameters(sensitive_parameter_values)
     sensitive_values_complete = all(key in parameter_values and key in serialized for key in sensitive_parameter_keys)
+    awaiting_runtime_secret_values = False
     credential_parameters: dict[str, Any] = {}
     for index, credential_id in enumerate(credential_ids):
         try:
@@ -2185,12 +2210,20 @@ async def _bind_origin_run_redaction_registry(
                 credential_item=credential_item,
             )
             credential = credential_item.credential
-            if isinstance(credential, PasswordCredential) and (
-                credential.totp or credential.totp_identifier or db_credential.totp_identifier
-            ):
-                sensitive_values_complete = False
-                continue
-            credential_parameters[f"copilot_run_credential_{index}"] = credential.model_dump(exclude_none=True)
+            # TOTP routing metadata identifies a retrieval capability; it is not the runtime OTP.
+            # Registering it as a secret value can corrupt ordinary generated code (for example,
+            # an identifier named ``totp_input``) before the workflow write seam sees it.
+            credential_parameters[f"copilot_run_credential_{index}"] = credential.model_dump(
+                exclude_none=True,
+                exclude={"totp_identifier", "totp_type"},
+            )
+            # A code block can mint or poll an OTP after parameter binding. Keep disclosure closed
+            # until the terminal run context has supplied the exact values it actually generated.
+            awaiting_runtime_secret_values = awaiting_runtime_secret_values or bool(
+                getattr(db_credential, "totp_identifier", None)
+                or getattr(credential, "totp", None)
+                or getattr(credential, "totp_identifier", None)
+            )
         except Exception:
             sensitive_values_complete = False
             LOG.warning(
@@ -2204,14 +2237,56 @@ async def _bind_origin_run_redaction_registry(
         if set(serialized_credentials) != set(credential_parameters):
             sensitive_values_complete = False
         serialized.update(serialized_credentials)
+        serialized_artifact_parameters.update(serialized_credentials)
     registry = OriginRunRedactionRegistry(
         workflow_run_id=workflow_run_id,
         parameters=dict(serialized),
         contains_sensitive_values=bool(sensitive_parameter_keys or credential_ids),
-        contains_all_sensitive_values=sensitive_values_complete,
+        contains_all_sensitive_values=sensitive_values_complete and not awaiting_runtime_secret_values,
+        contains_all_static_sensitive_values=sensitive_values_complete,
+        awaiting_runtime_secret_values=awaiting_runtime_secret_values,
+        artifact_parameters=dict(serialized_artifact_parameters),
     )
     ctx.origin_run_redaction_registry = registry
+    if registry.contains_sensitive_values:
+        register_secret_scrub_values_from_structure(ctx, registry.parameters)
     return registry
+
+
+async def _complete_origin_run_redaction_registry_from_runtime(
+    ctx: CopilotContext,
+    workflow_run_id: str,
+) -> OriginRunRedactionRegistry | None:
+    """Import the terminal run's exact runtime secrets before admitting structured page reads."""
+    registry = getattr(ctx, "origin_run_redaction_registry", None)
+    if registry is None or registry.workflow_run_id != workflow_run_id or not registry.awaiting_runtime_secret_values:
+        return registry
+
+    runtime_secret_values = await consume_copilot_runtime_secret_values(
+        organization_id=ctx.organization_id,
+        workflow_run_id=workflow_run_id,
+    )
+    if runtime_secret_values is None:
+        return registry
+
+    parameters = dict(registry.parameters)
+    artifact_parameters = dict(registry.artifact_parameters or registry.parameters)
+    if runtime_secret_values:
+        parameters["copilot_run_runtime_secret_values"] = tuple(sorted(runtime_secret_values))
+        artifact_parameters["copilot_run_runtime_secret_values"] = tuple(sorted(runtime_secret_values))
+    completed = OriginRunRedactionRegistry(
+        workflow_run_id=registry.workflow_run_id,
+        parameters=parameters,
+        contains_sensitive_values=registry.contains_sensitive_values,
+        contains_all_sensitive_values=registry.contains_all_static_sensitive_values,
+        contains_all_static_sensitive_values=registry.contains_all_static_sensitive_values,
+        awaiting_runtime_secret_values=False,
+        artifact_parameters=artifact_parameters,
+    )
+    ctx.origin_run_redaction_registry = completed
+    if completed.contains_all_sensitive_values:
+        register_secret_scrub_values_from_structure(ctx, completed.parameters)
+    return completed
 
 
 def terminal_ready_for_latch(
@@ -3168,6 +3243,7 @@ async def _run_blocks_and_collect_debug(
         ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
 
         await _attach_action_traces(blocks, results, ctx.organization_id, include_completed=True)
+        await _complete_origin_run_redaction_registry_from_runtime(ctx, workflow_run.workflow_run_id)
         recorded_origin_registry = ctx.origin_run_redaction_registry
         sensitive_origin_run = _origin_registry_contains_sensitive_values(
             recorded_origin_registry,
@@ -3238,23 +3314,24 @@ async def _run_blocks_and_collect_debug(
 
         locator_observations: list[AuthoredLocatorObservationRow] | None = None
         post_run_page_capture: BuildTestPacketPageCapture | None = None
-        if not sensitive_origin_run:
-            if (
-                not dispatch_to_worker
-                and run_session_id
-                and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-                and not ctx.copilot_total_timeout_exceeded
-            ):
-                # CDP capture against the run session: worker-owned for dispatched runs, so skip it.
-                # A dispatched run therefore carries no locator observation, and the packet says so.
-                _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
-                post_run_page_capture = await _capture_and_store_post_run_page(
-                    ctx,
-                    run_session_id=run_session_id,
-                    run_id=workflow_run.workflow_run_id,
-                    current_url=current_url,
-                )
+        if (
+            not dispatch_to_worker
+            and run_session_id
+            and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+            and not ctx.copilot_total_timeout_exceeded
+        ):
+            # Structured evidence is admitted through the origin registry scrubber. Pixel capture
+            # and locator probes remain withheld for sensitive runs because they have no equivalent
+            # exact-value disclosure boundary.
+            _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
+            post_run_page_capture = await _capture_and_store_post_run_page(
+                ctx,
+                run_session_id=run_session_id,
+                run_id=workflow_run.workflow_run_id,
+                current_url=current_url,
+            )
 
+        if not sensitive_origin_run:
             locator_observations = await _observe_authored_locators(
                 ctx,
                 run_session_id=run_session_id,
@@ -3408,7 +3485,7 @@ async def _run_blocks_and_collect_debug(
 
 async def _get_run_results(
     params: dict[str, Any],
-    ctx: AgentContext,
+    ctx: CopilotContext,
     *,
     read_live_page: bool = True,
     admit_sensitive_origin_artifact: bool = True,
@@ -3450,6 +3527,8 @@ async def _get_run_results(
         return {"ok": False, "error": f"Workflow run not found: {workflow_run_id}"}
     if getattr(run, "workflow_permanent_id", None) != ctx.workflow_permanent_id:
         return {"ok": False, "error": f"Workflow run not found for this workflow: {workflow_run_id}"}
+    if WorkflowRunStatus(run.status).is_final():
+        await _complete_origin_run_redaction_registry_from_runtime(ctx, workflow_run_id)
     run_browser_session_id = getattr(run, "browser_session_id", None)
     if isinstance(run_browser_session_id, str) and run_browser_session_id and WorkflowRunStatus(run.status).is_final():
         async with browser_page_custody_lock(ctx, session_id=run_browser_session_id):
