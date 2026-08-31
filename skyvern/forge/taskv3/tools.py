@@ -21,6 +21,7 @@ import re
 import time
 import unicodedata
 import weakref
+from collections import deque
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
@@ -5930,6 +5931,10 @@ def build_browser_tools(
     # refused. A repeat to that URL confirms intent and is allowed — but only if the at-risk state has
     # not GROWN since (else a file attached after the refusal would be wiped by a stale confirmation).
     _reload_confirm_pending: list[tuple[str, int] | None] = [None]
+    # Canonical URLs recently touched by navigate (both endpoints of each hop, so maxlen=16 spans
+    # the last ~8 hops — hops, not action rounds): a navigation landing back on one is a revisit,
+    # not fresh-page progress, for the budget-extension evidence.
+    _recent_nav_canonicals: deque[str] = deque(maxlen=16)
 
     async def _resolve_page() -> tuple[Any, ToolResult | None]:
         # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
@@ -6849,6 +6854,11 @@ def build_browser_tools(
         transition_data: dict[str, Any] = {
             "page_transitioned": bool(url_before and url_after and url_after != url_before)
         }
+        if url_before and url_after and url_after != url_before:
+            # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
+            # navigate back to a click-reached page is classified as a revisit, not fresh territory.
+            _recent_nav_canonicals.append(canonical_url(url_before))
+            _recent_nav_canonicals.append(canonical_url(url_after))
 
         # An already-checked radio legitimately doesn't change on re-click, so the readback is
         # skipped for it -- same as the skinned path's short-circuit above.
@@ -8391,7 +8401,8 @@ def build_browser_tools(
         # otherwise scores as progress. Refuse it once with an actionable message; a repeat to the same
         # URL confirms the model means to reset and is allowed through.
         target_canonical = canonical_url(url)
-        same_page = canonical_url(await _url(page)) == target_canonical
+        pre_nav_canonical = canonical_url(await _url(page))
+        same_page = pre_nav_canonical == target_canonical
         filled = await _count_filled_fields(page) if same_page else 0
         if filled > 0:
             pending = _reload_confirm_pending[0]
@@ -8432,8 +8443,22 @@ def build_browser_tools(
         # dead URLs and blank shells from the model.
         status = f" (HTTP {response.status})" if response is not None else ""
         # page_state_changed tells the loop's action-loop guard the world moved: a re-attempt after
-        # a navigation is a fresh attempt, not a repeat against unchanged state.
+        # a navigation is a fresh attempt, not a repeat against unchanged state. A same-URL reload is
+        # flagged separately: it resets state rather than progressing it, and the loop's budget
+        # extension must not read it as page-change evidence.
         data: dict[str, Any] = {"page_state_changed": True}
+        # Classified from where the navigation LANDED, not what was requested: a same-URL request
+        # that redirects somewhere new is a real transition, while any request (alias, redirect,
+        # or the URL itself) landing back on the pre-navigation page is a reload in effect.
+        landed_canonical = canonical_url(landed)
+        if landed_canonical == pre_nav_canonical:
+            data["same_url_reload"] = True
+        elif landed_canonical in _recent_nav_canonicals:
+            # Landing on a page this run recently navigated through (an A->B->A hop) re-visits
+            # known territory: the retry ledger still resets, but it is not fresh-page evidence.
+            data["nav_revisit"] = True
+        _recent_nav_canonicals.append(pre_nav_canonical)
+        _recent_nav_canonicals.append(landed_canonical)
         # A hard 404/410 landing is a dead/removed target: flag it so the loop ends the run as
         # terminated (v1's behavior) rather than defaulting the outcome to failed.
         if response is not None and response.status in NAVIGATION_DEAD_END_STATUSES:
@@ -9002,7 +9027,9 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
                 return ToolResult(
                     result.status,
                     result.content + "\n" + "\n".join(capped),
-                    {**(result.data or {}), "download_notice": True},
+                    # download_new marks a download detected on THIS call; a compactable tool
+                    # replaying retained pending lines carries only download_notice.
+                    {**(result.data or {}), "download_notice": True, "download_new": bool(new_lines)},
                     result.screenshots,
                 )
             except Exception:

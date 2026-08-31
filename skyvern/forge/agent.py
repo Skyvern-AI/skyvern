@@ -1663,6 +1663,7 @@ class ForgeAgent:
                     floored_step_cap=floored_step_cap,
                 )
             step_cap = floored_step_cap
+        workflow_step_ceiling: int | None = None
         if task_block is not None:
             # The org's workflow-run-wide step ceiling binds v3 blocks too: an action round is the
             # budget unit (round-stamped action rows make prior v3 rounds count exactly).
@@ -1695,6 +1696,11 @@ class ForgeAgent:
                     )
                     return step, task
                 step_cap = min(step_cap, remaining_workflow_steps)
+                workflow_step_ceiling = remaining_workflow_steps
+        if atomic_block_budget:
+            # A block that owns a deliberately small budget (action/validation) keeps it: the
+            # in-loop extension is refused by pinning the hard ceiling to the cap itself.
+            workflow_step_ceiling = step_cap if workflow_step_ceiling is None else min(workflow_step_ceiling, step_cap)
         max_turns, max_tool_calls, max_tokens = taskv3_runaway_backstops(step_cap)
         if max_tokens == MAX_TOKENS_CEILING:
             # A step cap large enough to hit the token ceiling silently re-caps the run's tokens; make
@@ -1907,6 +1913,7 @@ class ForgeAgent:
                 # builds Task without it); the caller sources it from the WorkflowRun row.
                 workflow_permanent_id=workflow_permanent_id,
                 max_action_steps=step_cap,
+                max_action_steps_ceiling=workflow_step_ceiling,
                 max_turns=max_turns,
                 max_tool_calls=max_tool_calls,
                 max_tokens=max_tokens,

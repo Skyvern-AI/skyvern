@@ -193,6 +193,18 @@ ACTION_LOOP_TERMINATE_AFTER = 6
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
 
+# Progress-gated action-step budget extension (SKY-15264): a run that hits its action-step cap while
+# the page is still demonstrably changing (a repeated probe returned fresh content, a navigation or
+# download landed) earns ONE extension of half the original cap — the observed failure population is
+# genuinely long multi-page forms dying mid-progress, while a stalled run must be refused exactly as
+# before. Evidence must be at most this many action rounds old: staler change evidence says nothing
+# about the run's current state.
+ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
+# Facetable event names — both the grant and the refusal are queryable so the gate's decision
+# precision is measurable on the canary; change only with the dashboards that read them.
+ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
+ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+
 # Hard "the resource does not exist / is gone" HTTP statuses. A navigation landing on one of these is
 # a genuine non-capability dead-end (a dead or removed posting), which v1 routes to `terminated`. Both
 # the in-loop `navigate` tool and the pre-loop initial-URL navigation classify against this set. NARROW
@@ -260,9 +272,20 @@ _TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"|data-tv3-ref="(?:\d
 _TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)|data-tv3-ref="[\d?]*(?=[^"]*\Z)')
 
 
+_PERCEPTION_URL_LINE_RE = re.compile(r"^url=\S+", flags=re.MULTILINE)
+
+
 def _canonical_perception_content(content: str) -> str:
     closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', content)
     return _TV3_MARKER_CUT_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*', closed)
+
+
+def _content_only_perception(content: str) -> str:
+    # The URL is a hint, not content: history.pushState moves it without changing the document. The
+    # full canonicalization (URL included) keeps clearing the repeat guards — a wizard whose pages
+    # differ only by URL must survive — but budget-extension evidence hashes THIS, so a URL flip
+    # alone can never earn budget.
+    return _PERCEPTION_URL_LINE_RE.sub("url=*", _canonical_perception_content(content))
 
 
 # How many recent states a probe remembers. This length IS the longest oscillation period that can
@@ -319,6 +342,7 @@ class _PerceptionLedger:
     def __init__(self) -> None:
         self._probes: dict[tuple[str, str], _ProbeStreak] = {}
         self._tools: dict[str, tuple[str, int]] = {}
+        self.content_only: dict[tuple[str, str], deque[str]] = {}
         self.shadow_reported = False
         self.suppressed_reported = False
 
@@ -326,6 +350,7 @@ class _PerceptionLedger:
         """Forget every streak: the document they described is gone (a reload)."""
         self._probes.clear()
         self._tools.clear()
+        self.content_only.clear()
 
     def first_time(self, key: tuple[str, str]) -> bool:
         return key not in self._probes
@@ -690,6 +715,69 @@ def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | No
     if deadline_at is not None and deadline_at - time.monotonic() < FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS:
         return False
     return True
+
+
+def _budget_extension_gate(
+    action_steps: int,
+    last_change_evidence_step: int | None,
+    action_warned: set[tuple[str, str]],
+    progress_stalled: bool,
+    activity: ActivityRecency | None,
+    deadline_at: float | None,
+    extension: int,
+    seconds_per_step: float | None = None,
+) -> tuple[bool, str]:
+    """Whether an exhausted action-step budget may be extended once, and the deciding reason.
+
+    Progress is the property, not its absence-of-stall proxy: the gate requires POSITIVE recent
+    evidence the page changed (a repeated probe returning fresh content, a navigation or download —
+    the same events that clear the action-retry ledger), then vetoes on any live stall signal, and
+    finally requires the turn/token/deadline headroom to actually fund the extension — granting
+    budget the runaway guards would immediately revoke converts an honest exhaustion into a worse
+    one. The pre-computed turn/tool-call backstops are NOT re-derived from the extended cap: these
+    headroom checks are the margin the extension runs on, so tightening the per-step guard
+    multipliers also tightens what an extension can fund. They are a funding FLOOR sized off the
+    run's own observed burn (turns per step so far, last turn's tokens), not a guarantee the
+    extension completes — the facetable grant/refusal events measure that on the canary."""
+    if (
+        last_change_evidence_step is None
+        or action_steps - last_change_evidence_step > ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW
+    ):
+        return False, "no_recent_page_change_evidence"
+    if action_warned:
+        return False, "warned_action_retry_streak"
+    if progress_stalled:
+        return False, "no_net_progress_window"
+    if activity is not None and activity.turns_remaining is not None:
+        # Fractional comparison (cross-multiplied): floor division would read 1.9 observed
+        # turns-per-step as 1 and fund an extension the remaining turns cannot run.
+        if (
+            activity.turns_remaining < extension
+            or activity.turns_remaining * max(action_steps, 1) < extension * activity.turn
+        ):
+            return False, "insufficient_turn_headroom"
+    if activity is not None and activity.tool_calls_remaining is not None:
+        # +1 reserves the terminal finish call: funding only the actions trades one budget
+        # exhaustion for another at the very last call.
+        if activity.tool_calls_remaining < extension + 1:
+            return False, "insufficient_tool_call_headroom"
+    if (
+        activity is not None
+        and activity.tokens_remaining is not None
+        and activity.tokens_remaining < extension * max(activity.last_turn_tokens, 1)
+    ):
+        return False, "insufficient_token_headroom"
+    if activity is not None and activity.perception_stall_imminent:
+        return False, "perception_stall_imminent"
+    if deadline_at is not None:
+        # Fund the extension in wall-clock at the run's own observed pace, never below the flat
+        # minimum the deferral gates use.
+        required = FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS
+        if seconds_per_step is not None:
+            required = max(required, extension * seconds_per_step)
+        if deadline_at - time.monotonic() < required:
+            return False, "insufficient_deadline_headroom"
+    return True, "recent_page_change_evidence"
 
 
 @dataclass
@@ -1161,6 +1249,7 @@ async def run_agent_tool_loop(
     max_turns: int,
     max_tool_calls: int,
     max_action_steps: int | None = None,
+    max_action_steps_ceiling: int | None = None,
     prompt_name: str = "taskv3-agent-loop",
     organization_id: str | None = None,
     call_kwargs: dict[str, Any] | None = None,
@@ -1232,17 +1321,25 @@ async def run_agent_tool_loop(
     # the warning (and a chance to self-correct) at least one turn before the verdict.
     action_counts: dict[tuple[str, str], tuple[int, int]] = {}
     action_warned: set[tuple[str, str]] = set()
+    # Progress-gated budget extension (SKY-15264): the action round of the latest positive
+    # page-change evidence, and whether the single extension has been spent.
+    last_change_evidence_step: int | None = None
+    budget_extension_granted = False
 
     def _clear_action_state() -> None:
         action_counts.clear()
         action_warned.clear()
+
+    def _note_page_change_evidence() -> None:
+        nonlocal last_change_evidence_step
+        last_change_evidence_step = action_steps
 
     async def _consume_refresh_signal(
         ctx: SkyvernContext, tool_name: str, remaining: list[Any], round_actions: list[Any], *, drop: bool
     ) -> bool:
         """Clear the page-refresh signal and, unless dropped or past the cap, reload and void `remaining`."""
         nonlocal refresh_cycles, refresh_nudge_due, reload_failed_nudge_due, pending_screenshots, outcome
-        nonlocal pending_nav_dead_end, stall_nudges_due
+        nonlocal pending_nav_dead_end, stall_nudges_due, last_change_evidence_step
         ctx.refresh_working_page = False
         refresh_cycles += 1
         if drop:
@@ -1276,8 +1373,11 @@ async def run_agent_tool_loop(
             round_actions.append((*reload_record, True))
         LOG.info("taskv3 loop honored page refresh signal", tool=tool_name, turn=turns)
         # The reloaded document is a new baseline for every ledger that described the old one, and a
-        # look taken before it would hand the model marks that no longer exist.
+        # look taken before it would hand the model marks that no longer exist. That includes the
+        # budget-extension evidence stamp: pre-reload progress says nothing about the fresh document,
+        # so the run must re-demonstrate progress before it can earn an extension.
         _clear_action_state()
+        last_change_evidence_step = None
         perception.reset()
         auto_perception.reset()
         if activity is not None:
@@ -1320,16 +1420,42 @@ async def run_agent_tool_loop(
             # A download landing or a navigation is progress no matter which tool witnessed it or
             # whether that call itself errored: re-clicking the button that produces a file (a
             # "download next" flow), or re-trying after navigating to a fresh page, is a healthy
-            # loop, not a stuck one.
+            # loop, not a stuck one. A same-URL reload is the exception: it resets the retry ledger
+            # like any reload but is a state WIPE, not progress — it clears the extension evidence
+            # exactly like the refresh-signal path.
             _clear_action_state()
+            if result_data.get("same_url_reload") or result_data.get("nav_revisit"):
+                # A reload destroys the observed document and a revisit replaces it with a fresh
+                # instance of known territory: re-baseline the perception ledgers (as the refresh
+                # path does) so the first post-navigation look cannot diff against a pre-navigation
+                # digest and read as progress — and clear the evidence stamp in both cases, since
+                # navigation is non-billable and a surviving stamp would stay maximally recent
+                # through any amount of oscillation.
+                perception.reset()
+                auto_perception.reset()
+                nonlocal last_change_evidence_step
+                last_change_evidence_step = None
+                if activity is not None:
+                    activity.perception_stall_imminent = False
+            elif result_data.get("download_new") or result_data.get("page_state_changed"):
+                # Only a download detected on THIS call is evidence — a compactable tool replaying
+                # a retained notice re-clears the retry ledger but earns no budget.
+                _note_page_change_evidence()
+                # The old document's perception streak cannot speak for the fresh page: clear the
+                # imminent flag exactly as the refresh path does.
+                if activity is not None:
+                    activity.perception_stall_imminent = False
             if progress is not None:
                 progress.hard_progress()
         # A click that moved the URL is a real page transition (H1 hard progress) for the shadow
         # ledger, but URL equality does NOT prove same-page (a URL-stable SPA form advance) — so only
         # the positive direction is acted on, and kept OUT of the branch above so it never clears the
-        # action-loop guard's state; this signal is shadow-only and additive.
-        if result_data.get("page_transitioned") is True and progress is not None:
-            progress.hard_progress()
+        # action-loop guard's state; this signal is shadow-only and additive. It is a URL-only HINT
+        # (history.pushState moves the URL without changing the document), so it never stamps
+        # budget-extension evidence either — the content-confirmed signals are that bar.
+        if result_data.get("page_transitioned") is True:
+            if progress is not None:
+                progress.hard_progress()
         return tool_name == "look" and bool(result_data.get("marks_renumbered"))
 
     async def _completion_probe_outcome(
@@ -1363,6 +1489,7 @@ async def run_agent_tool_loop(
         tool_name: str,
         attribution: dict[str, Any],
         *,
+        content_only_digest: str | None = None,
         refresh_pending: bool = False,
         can_terminate: bool = True,
     ) -> tuple[LoopOutcome | None, list[tuple[str, int]]]:
@@ -1384,6 +1511,17 @@ async def run_agent_tool_loop(
             # terminate verdict, since it fires far more often than the model calls observe on its own
             # and would trip those far too eagerly for a path the model never asked to take.
             _clear_action_state()
+            # Evidence requires NEW content: a URL-only flip (history.pushState) still clears the
+            # repeat guards above but earns no budget, and neither does a return to a content state
+            # in the probe's recent ring (a panel toggling open and shut).
+            ring = ledger.content_only.get(action_key) if content_only_digest is not None else None
+            if ring and content_only_digest not in ring:
+                _note_page_change_evidence()
+        if content_only_digest is not None:
+            ring = ledger.content_only.get(action_key)
+            if ring is None:
+                ring = ledger.content_only.setdefault(action_key, deque(maxlen=PERCEPTION_RING))
+            ring.append(content_only_digest)
         if can_terminate and activity is not None and stall_terminate_after is not None:
             # Auto-observe (can_terminate=False) is a path the model never asked to take, so its
             # snapshots must not arm this flag: it feeds the failure-evidence retry gate below, and a
@@ -1719,10 +1857,69 @@ async def run_agent_tool_loop(
             # Once the action-step budget is spent, refuse a further page action — terminate, mirroring
             # the step engine's max-steps stop — but let perception/finish through, since the cap bounds
             # new action rounds, not the separate re-observe/finish turn the system prompt asks for.
+            # A run with recent positive page-change evidence earns ONE extension of half the original
+            # cap first (SKY-15264): the observed exhaustion population splits into genuinely long
+            # multi-page forms dying mid-progress (the extension's target) and stalled runs the gate
+            # refuses so they fail exactly as before.
             if spec is not None and spec.billable and max_action_steps is not None and action_steps >= max_action_steps:
-                outcome = LoopOutcome("budget_exhausted", f"Reached the maximum steps ({max_action_steps})")
-                _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
-                break
+                raw_extension = max_action_steps // 2
+                extension = raw_extension
+                if max_action_steps_ceiling is not None:
+                    # The org's workflow-run-wide step pool is a HARD ceiling the extension must
+                    # never breach: truncate the grant to what the pool can fund.
+                    extension = min(extension, max_action_steps_ceiling - max_action_steps)
+                refresh_ctx = skyvern_context.current()
+                if budget_extension_granted:
+                    allowed, gate_reason = False, "already_extended"
+                elif raw_extension <= 0:
+                    allowed, gate_reason = False, "cap_too_small"
+                elif extension <= 0:
+                    allowed, gate_reason = False, "hard_step_ceiling"
+                elif refresh_ctx is not None and refresh_ctx.refresh_working_page:
+                    # A pending refresh voids this very action and re-baselines the page: the grant
+                    # must not race it and spend the extension on pre-reload evidence.
+                    allowed, gate_reason = False, "refresh_pending"
+                else:
+                    allowed, gate_reason = _budget_extension_gate(
+                        action_steps,
+                        last_change_evidence_step,
+                        action_warned,
+                        # CURRENT confirmed stalled-ness by the ledger's own rules: form_armed
+                        # (the latest look showed a form) plus a window of fruitless actions. Not
+                        # the one-shot telemetry latch, and never a bare counter — a form-less page
+                        # increments the counter but must not be judged stuck by it.
+                        progress is not None
+                        and progress.form_armed
+                        and progress.actions_since_progress >= progress.window,
+                        activity,
+                        deadline_at,
+                        extension,
+                        seconds_per_step=(time.monotonic() - started_at) / max(action_steps, 1),
+                    )
+                if allowed:
+                    original_cap = max_action_steps
+                    budget_extension_granted = True
+                    max_action_steps += extension
+                    LOG.info(
+                        ACTION_BUDGET_EXTENDED_EVENT,
+                        original_cap=original_cap,
+                        extension=extension,
+                        action_steps=action_steps,
+                        turn=turns,
+                        tool=tool_name,
+                    )
+                else:
+                    LOG.info(
+                        ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
+                        gate_reason=gate_reason,
+                        max_action_steps=max_action_steps,
+                        action_steps=action_steps,
+                        turn=turns,
+                        tool=tool_name,
+                    )
+                    outcome = LoopOutcome("budget_exhausted", f"Reached the maximum steps ({max_action_steps})")
+                    _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
+                    break
             # Submit-shaped actions (the failure-evidence predicate, minus captcha) are reported BEFORE
             # dispatch, since after it the page may be the confirmation page. A failure here never fails
             # the action, and the time is not billed to the tool.
@@ -1866,7 +2063,13 @@ async def run_agent_tool_loop(
             _progress_observe_shadow(observe_summary, tool_name, attribution)
             if content_digest is not None:
                 stall_outcome, nudges_due = _perception_stall_check(
-                    perception, content_digest, action_key, tool_name, attribution, refresh_pending=refresh_pending
+                    perception,
+                    content_digest,
+                    action_key,
+                    tool_name,
+                    attribution,
+                    content_only_digest=hashlib.sha256(_content_only_perception(result.content).encode()).hexdigest(),
+                    refresh_pending=refresh_pending,
                 )
                 stall_nudges_due.extend(nudges_due)
                 if stall_outcome is not None:
@@ -2232,6 +2435,9 @@ async def run_agent_tool_loop(
                                     ao_action_key,
                                     "observe",
                                     ao_attribution,
+                                    content_only_digest=hashlib.sha256(
+                                        _content_only_perception(ao_result.content).encode()
+                                    ).hexdigest(),
                                     can_terminate=False,
                                 )
                                 if stall_outcome is not None:
