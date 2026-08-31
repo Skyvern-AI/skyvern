@@ -4,21 +4,49 @@ import asyncio
 import inspect
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from os import PathLike, fspath
 from types import FrameType
-from typing import Any, Awaitable, Callable
+from typing import Any, Literal, cast
 
 import pydantic
 import structlog
+from playwright.async_api import BrowserContext, Locator, Page
 
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
+from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.playwright_input import PlaywrightInputDefaults
 
 LOG = structlog.get_logger()
+
+_LOCATOR_STRATEGY_INPUT_OPTIONS = frozenset({"delay", "force", "no_wait_after", "text", "timeout", "value"})
+_PAGE_STRATEGY_INPUT_OPTIONS = frozenset(
+    {"delay", "force", "no_wait_after", "selector", "strict", "text", "timeout", "value"}
+)
+
+
+def _effective_playwright_timeout(defaults: PlaywrightInputDefaults, timeout: float | None) -> float:
+    """Resolve one aggregate deadline while preserving explicit zero."""
+    return defaults.timeout_ms if timeout is None else timeout
+
+
+def _page_strategy_input_locator(
+    page: Page,
+    selector: str,
+    strict: bool | None,
+    defaults: PlaywrightInputDefaults,
+) -> Locator:
+    """Build the locator equivalent of Page.fill/type without changing context strictness."""
+    locator = page.locator(selector)
+    if strict is not None:
+        return locator if strict else locator.first
+    return locator if defaults.strict_selectors else locator.first
+
 
 CODE_BLOCK_FILENAME = "<code_block>"
 # full_code = "\nasync def wrapper(...):\n<user code from line 3>"; user line = frame line - 2
@@ -300,12 +328,16 @@ class _Recorder:
         on_action: OnAction | None = None,
         credential_release_guard: CredentialReleaseGuard | None = None,
         on_pending_action: OnPendingAction | None = None,
+        strategy_aware_typing: bool = False,
+        playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self.actions: list[Action] = []
         self.last_exception: BaseException | None = None
         self._on_action = on_action
         self._on_pending_action = on_pending_action
         self.credential_release_guard = credential_release_guard
+        self.strategy_aware_typing = strategy_aware_typing
+        self.playwright_input_defaults = playwright_input_defaults or PlaywrightInputDefaults()
 
     def _emit_pending_action(self, pending_action: PendingAction) -> None:
         if self._on_pending_action is None:
@@ -500,7 +532,42 @@ class RecordingLocator:
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
             async def call() -> Any:
+                if self.__recorder.strategy_aware_typing and name in ("fill", "type"):
+                    inspect.signature(attr).bind(*args, **kwargs)
                 await self.__recorder.enforce_credential_release(self.__locator, f"locator.{name}", args, kwargs)
+                if (
+                    self.__recorder.strategy_aware_typing
+                    and name in ("fill", "type")
+                    and hasattr(self.__locator, "page")
+                    and kwargs.keys() <= _LOCATOR_STRATEGY_INPUT_OPTIONS
+                ):
+                    value = kwargs.get("value" if name == "fill" else "text", args[0] if args else None)
+                    if isinstance(value, str):
+                        authored_timeout = kwargs.get("timeout")
+                        if authored_timeout is None or isinstance(authored_timeout, int | float):
+                            timeout = _effective_playwright_timeout(
+                                self.__recorder.playwright_input_defaults,
+                                authored_timeout,
+                            )
+                            force = kwargs.get("force")
+                            delay = kwargs.get("delay")
+                            no_wait_after = kwargs.get("no_wait_after")
+                            if force is None and delay is None and no_wait_after is None:
+                                return await strategy_aware_input(
+                                    self.__locator,
+                                    value,
+                                    clear=name == "fill",
+                                    timeout=timeout,
+                                )
+                            return await strategy_aware_input(
+                                self.__locator,
+                                value,
+                                clear=name == "fill",
+                                timeout=timeout,
+                                force=force,
+                                delay=delay,
+                                no_wait_after=no_wait_after,
+                            )
                 return await attr(*args, **kwargs)
 
             return await self.__recorder.record(action_type, f"locator.{name}", self.__selector, call, args, kwargs)
@@ -543,12 +610,27 @@ class RecordingKeyboard:
         return recorded
 
 
-class RecordingPage:
-    """Proxy around a playwright page that records mapped calls as Actions.
+class RecordingBrowserContext:
+    def __init__(self, context: BrowserContext, recorder: _Recorder) -> None:
+        self.__context = context
+        self.__recorder = recorder
 
-    Name-mangled private state keeps casual user code away from recorder
-    internals, but the mangled `_RecordingPage__*` form is still reachable;
-    treat recordings as telemetry, not a tamper-proof audit trail.
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self.__context, name)
+        if name != "set_default_timeout" or not callable(attr):
+            return attr
+
+        def set_default_timeout(timeout: float) -> None:
+            attr(timeout)
+            self.__recorder.playwright_input_defaults.set_context_timeout(timeout)
+
+        return set_default_timeout
+
+
+class RecordingPage:
+    """Proxy that records mapped Playwright calls as Actions.
+
+    Recordings are telemetry, not a tamper-proof audit trail.
     """
 
     def __init__(
@@ -557,15 +639,64 @@ class RecordingPage:
         on_action: OnAction | None = None,
         credential_release_guard: CredentialReleaseGuard | None = None,
         on_pending_action: OnPendingAction | None = None,
+        strategy_aware_typing: bool = False,
+        playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self.__page = page
-        self.__recorder = _Recorder(on_action, credential_release_guard, on_pending_action)
+        self.__recorder = _Recorder(
+            on_action,
+            credential_release_guard,
+            on_pending_action,
+            strategy_aware_typing=strategy_aware_typing,
+            playwright_input_defaults=playwright_input_defaults,
+        )
 
     def recorded_actions(self) -> list[Action]:
         return list(self.__recorder.actions)
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.__recorder.last_exception
+
+    def _brokered_default_timeout(self, scope: Literal["page", "context"]) -> float | None:
+        """Return the trusted timeout that a secure-runner block must restore."""
+        if scope == "page":
+            return self.__recorder.playwright_input_defaults.page_timeout_ms
+        return self.__recorder.playwright_input_defaults.context_timeout_ms
+
+    def _restore_brokered_default_timeout(
+        self,
+        scope: Literal["page", "context"],
+        timeout: float | None,
+    ) -> None:
+        """Restore the pre-block override, including Page inheritance from BrowserContext."""
+        if scope == "page":
+            # The generated public wrapper forwards None to Playwright's supported optional
+            # timeout setting, clearing a Page override without inspecting implementation state.
+            setter = cast(Callable[[float | None], None], self.__page.set_default_timeout)
+            setter(timeout)
+            self.__recorder.playwright_input_defaults.restore_page_timeout(timeout)
+            return
+        if timeout is None:
+            raise ValueError("context default timeout cannot inherit from another scope")
+        self.__page.context.set_default_timeout(timeout)
+        self.__recorder.playwright_input_defaults.set_context_timeout(timeout)
+
+    def _set_brokered_default_timeout(self, scope: Literal["page", "context"], timeout: float) -> None:
+        """Apply a synchronous Playwright setter received over the secure-runner transport."""
+        if not self.__recorder.strategy_aware_typing:
+            raise RuntimeError("brokered default timeout is unavailable")
+        if scope == "page":
+            self.__page.set_default_timeout(timeout)
+            self.__recorder.playwright_input_defaults.set_page_timeout(timeout)
+            return
+        if scope == "context":
+            self.__page.context.set_default_timeout(timeout)
+            self.__recorder.playwright_input_defaults.set_context_timeout(timeout)
+            return
+        raise ValueError(f"unsupported default-timeout scope: {scope}")
+
+    def _supports_brokered_default_timeout(self) -> bool:
+        return self.__recorder.strategy_aware_typing
 
     def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
         return RecordingLocator(self.__page.locator(selector, **kwargs), self.__recorder, selector)
@@ -576,6 +707,15 @@ class RecordingPage:
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__page, name)
+        if name == "context" and self.__recorder.strategy_aware_typing:
+            return RecordingBrowserContext(attr, self.__recorder)
+        if name == "set_default_timeout" and self.__recorder.strategy_aware_typing and callable(attr):
+
+            def set_default_timeout(timeout: float) -> None:
+                attr(timeout)
+                self.__recorder.playwright_input_defaults.set_page_timeout(timeout)
+
+            return set_default_timeout
         if name in _LOCATOR_FACTORY_METHODS and callable(attr):
 
             def factory(*args: Any, **kwargs: Any) -> RecordingLocator:
@@ -605,7 +745,54 @@ class RecordingPage:
                     description = " ".join(prompt.split())[:200]
 
             async def call() -> Any:
+                if self.__recorder.strategy_aware_typing and name in ("fill", "type"):
+                    inspect.signature(attr).bind(*args, **kwargs)
                 await self.__recorder.enforce_credential_release(self.__page, f"page.{name}", args, kwargs)
+                if (
+                    self.__recorder.strategy_aware_typing
+                    and name in ("fill", "type")
+                    and kwargs.keys() <= _PAGE_STRATEGY_INPUT_OPTIONS
+                ):
+                    selector = kwargs.get("selector", args[0] if args else None)
+                    value_index = 1
+                    value = kwargs.get("value" if name == "fill" else "text", _arg(args, value_index))
+                    strict = kwargs.get("strict")
+                    authored_timeout = kwargs.get("timeout")
+                    if (
+                        isinstance(selector, str)
+                        and isinstance(value, str)
+                        and strict in (None, False, True)
+                        and (authored_timeout is None or isinstance(authored_timeout, int | float))
+                    ):
+                        locator = _page_strategy_input_locator(
+                            self.__page,
+                            selector,
+                            strict,
+                            self.__recorder.playwright_input_defaults,
+                        )
+                        timeout = _effective_playwright_timeout(
+                            self.__recorder.playwright_input_defaults,
+                            authored_timeout,
+                        )
+                        force = kwargs.get("force")
+                        delay = kwargs.get("delay")
+                        no_wait_after = kwargs.get("no_wait_after")
+                        if force is None and delay is None and no_wait_after is None:
+                            return await strategy_aware_input(
+                                locator,
+                                value,
+                                clear=name == "fill",
+                                timeout=timeout,
+                            )
+                        return await strategy_aware_input(
+                            locator,
+                            value,
+                            clear=name == "fill",
+                            timeout=timeout,
+                            force=force,
+                            delay=delay,
+                            no_wait_after=no_wait_after,
+                        )
                 return await attr(*args, **kwargs)
 
             return await self.__recorder.record(

@@ -266,6 +266,7 @@ from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
+from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -5668,10 +5669,11 @@ async def wrapper({default_args}):
         # failure must fail closed — callers gate copilot-only behavior on this, and it must
         # never mask a block failure.
         try:
-            return await app.DATABASE.workflows.is_workflow_copilot_authored(
+            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=workflow.organization_id,
             )
+            return copilot_authored is True
         except Exception:
             LOG.warning(
                 "Copilot-lineage lookup failed; failing closed",
@@ -7021,6 +7023,8 @@ async def wrapper({default_args}):
         # Every code block gets a container task v1 + step so its recorded calls render through
         # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
         # task also seats a later agent takeover on failure.
+        strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
+        playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,
@@ -7030,6 +7034,8 @@ async def wrapper({default_args}):
             workflow_run_context=workflow_run_context,
             redaction_parameters=serialized_parameter_values,
             credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
+            strategy_aware_typing=strategy_aware_typing,
+            playwright_input_defaults=playwright_input_defaults,
         )
         if credential_release_guard.is_armed:
             credential_release_guard.log_armed()

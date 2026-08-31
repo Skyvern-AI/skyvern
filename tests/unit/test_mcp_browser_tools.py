@@ -28,6 +28,8 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import cdp_input as mcp_cdp_input
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
+from skyvern.config import settings
+from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
 from tests.unit._mcp_browser_fakes import (
     make_mock_page,
@@ -1231,16 +1233,295 @@ async def test_skyvern_type_selector_is_resilient_by_default(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_skyvern_type_selector_mode_direct_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
-    fill = AsyncMock(return_value="Noor")
-    _action_page(monkeypatch, fill=fill)
+async def test_skyvern_type_direct_uses_event_strategy_deterministically(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.first = locator
+    locator.fill = AsyncMock()
+    locator.dispatch_event = AsyncMock()
+    raw_page = MagicMock()
+    locator.page = raw_page
+    raw_page.locator = MagicMock(return_value=locator)
+    raw_page.url = "https://example.test/form"
+    raw_page.evaluate = AsyncMock(return_value=False)
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = raw_page
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
 
-    result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor", selector_mode="direct")
+    result = await mcp_browser.skyvern_type(
+        selector="#first_name",
+        text="Noor",
+        selector_mode="direct",
+    )
 
-    assert result["ok"] is True
-    assert fill.await_args.kwargs["mode"] == "direct"
-    assert "prompt" not in fill.await_args.kwargs and "ai" not in fill.await_args.kwargs
-    assert "_skip_element_prep" not in fill.await_args.kwargs
+    assert result["ok"] is True, result.get("error")
+    raw_page.locator.assert_called_once_with("#first_name")
+    clear_field.assert_awaited_once_with(
+        raw_page,
+        locator,
+        char_count=0,
+        timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+    )
+    type_text.assert_awaited_once_with(
+        raw_page,
+        locator,
+        "Noor",
+        timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        allow_batched_playwright=True,
+    )
+    assert [call.args[0] for call in locator.dispatch_event.await_args_list] == ["change", "blur"]
+    locator.fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_direct_event_strategy_handles_aggregate_playwright_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = MagicMock()
+    locator.first = locator
+    locator.fill = AsyncMock()
+    raw_page = MagicMock()
+    locator.page = raw_page
+    raw_page.locator = MagicMock(return_value=locator)
+    raw_page.url = "https://example.test/form"
+    raw_page.evaluate = AsyncMock(return_value=False)
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = raw_page
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field",
+        AsyncMock(side_effect=TimeoutError),
+    )
+
+    result = await mcp_browser.skyvern_type(
+        selector="#first_name",
+        text="Noor",
+        selector_mode="direct",
+        timeout=1234,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["details"]["actionability_timeout_ms"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_missing_selector_preflight_uses_aggregate_direct_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preflight_cancelled = asyncio.Event()
+
+    async def wait_for_missing_selector(*_args: object, **_kwargs: object) -> bool:
+        try:
+            await asyncio.Future()
+        finally:
+            preflight_cancelled.set()
+        return False
+
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    active_frame = MagicMock()
+    matches = MagicMock()
+    matches.count = AsyncMock(return_value=0)
+    first_match = MagicMock()
+    first_match.evaluate = AsyncMock(side_effect=wait_for_missing_selector)
+    matches.first = first_match
+    active_frame.locator.return_value = matches
+    page = SimpleNamespace(page=raw_page, locator_scope=active_frame, _locator_scope=active_frame)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(mcp_browser, "strategy_aware_input", strategy_aware_input)
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    result = await asyncio.wait_for(
+        mcp_browser.skyvern_type(
+            selector="#missing",
+            text="Noor",
+            selector_mode="direct",
+            timeout=1000,
+        ),
+        timeout=1.5,
+    )
+
+    assert loop.time() - started_at < 1.5
+    assert preflight_cancelled.is_set()
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SELECTOR_NOT_FOUND
+    assert result["error"]["details"]["actionability_timeout_ms"] == 1000
+    strategy_aware_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_direct_append_uses_strategy_without_replacing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = MagicMock()
+    locator.first = locator
+    locator.fill = AsyncMock()
+    raw_page = MagicMock()
+    locator.page = raw_page
+    raw_page.locator = MagicMock(return_value=locator)
+    raw_page.url = "https://example.test/form"
+    raw_page.evaluate = AsyncMock(return_value=False)
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = raw_page
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
+
+    result = await mcp_browser.skyvern_type(
+        selector="#notes",
+        text="more",
+        selector_mode="direct",
+        clear=False,
+        delay=17,
+    )
+
+    assert result["ok"] is True, result
+    clear_field.assert_not_awaited()
+    locator.fill.assert_not_awaited()
+    type_text.assert_awaited_once_with(
+        raw_page,
+        locator,
+        "more",
+        timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        delay=17,
+        no_wait_after=None,
+        allow_batched_playwright=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_direct_long_replacement_keeps_atomic_prefix_and_strategy_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "x" * (TEXT_PRESS_MAX_LENGTH + 4)
+    locator = MagicMock()
+    locator.first = locator
+    locator.fill = AsyncMock()
+    raw_page = MagicMock()
+    locator.page = raw_page
+    raw_page.locator = MagicMock(return_value=locator)
+    raw_page.url = "https://example.test/form"
+    raw_page.evaluate = AsyncMock(return_value=False)
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = raw_page
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
+
+    result = await mcp_browser.skyvern_type(
+        selector="#notes",
+        text=text,
+        selector_mode="direct",
+    )
+
+    assert result["ok"] is True, result
+    clear_field.assert_not_awaited()
+    locator.fill.assert_awaited_once_with(text[:-TEXT_PRESS_MAX_LENGTH], timeout=5000)
+    type_text.assert_awaited_once_with(
+        raw_page,
+        locator,
+        text[-TEXT_PRESS_MAX_LENGTH:],
+        timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        allow_batched_playwright=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_direct_event_strategy_uses_active_iframe_and_first_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    raw_page.evaluate = AsyncMock(return_value=False)
+    active_frame = MagicMock()
+    matches = MagicMock()
+    first_match = MagicMock()
+    first_match.page = raw_page
+    matches.first = first_match
+    active_frame.locator.return_value = matches
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = active_frame
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
+
+    result = await mcp_browser.skyvern_type(
+        selector=".shared-name",
+        text="Noor",
+        selector_mode="direct",
+    )
+
+    assert result["ok"] is True, result
+    active_frame.locator.assert_called_once_with(".shared-name")
+    raw_page.locator.assert_not_called()
+    clear_field.assert_awaited_once_with(
+        raw_page,
+        first_match,
+        char_count=0,
+        timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+    )
+    type_text.assert_awaited_once_with(
+        raw_page,
+        first_match,
+        "Noor",
+        timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        allow_batched_playwright=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear", [pytest.param(True, id="replace"), pytest.param(False, id="append")])
+async def test_skyvern_type_direct_event_strategy_refuses_active_iframe_password_first_match(
+    monkeypatch: pytest.MonkeyPatch,
+    clear: bool,
+) -> None:
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    raw_page.evaluate = AsyncMock()
+    active_frame = MagicMock()
+    matches = MagicMock()
+    first_match = MagicMock()
+    first_match.evaluate = AsyncMock(return_value=True)
+    matches.first = first_match
+    active_frame.locator.return_value = matches
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = active_frame
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    strategy_aware_input = AsyncMock()
+    monkeypatch.setattr(mcp_browser, "strategy_aware_input", strategy_aware_input)
+
+    result = await mcp_browser.skyvern_type(
+        selector=".shared-field",
+        text="opaque-value",
+        selector_mode="direct",
+        clear=clear,
+    )
+
+    assert result["ok"] is False
+    assert "password" in result["error"]["message"].lower()
+    active_frame.locator.assert_called_once_with(".shared-field")
+    first_match.evaluate.assert_awaited_once()
+    raw_page.evaluate.assert_not_awaited()
+    strategy_aware_input.assert_not_awaited()
 
 
 @pytest.mark.asyncio

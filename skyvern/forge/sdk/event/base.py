@@ -44,12 +44,35 @@ class InputEventStrategy(ABC):
     """Strategy for dispatching keyboard input events to a page."""
 
     @abstractmethod
-    async def type_text(self, page: Page, locator: Locator | None, text: str) -> None:
-        pass
+    async def type_text(
+        self,
+        page: Page,
+        locator: Locator | None,
+        text: str,
+        *,
+        timeout: float | None,
+        delay: float | None = None,
+        no_wait_after: bool | None = None,
+        allow_batched_playwright: bool = False,
+    ) -> None:
+        """Type text while preserving caller-owned Playwright input options.
+
+        ``allow_batched_playwright`` lets the plain Playwright strategy collapse the text into one
+        locator call. Strategies that emit their own humanized events may retain their cadence.
+        """
 
     @abstractmethod
-    async def clear_field(self, page: Page, locator: Locator, char_count: int) -> None:
-        pass
+    async def clear_field(
+        self,
+        page: Page,
+        locator: Locator,
+        char_count: int,
+        *,
+        timeout: float | None,
+        force: bool | None = None,
+        no_wait_after: bool | None = None,
+    ) -> None:
+        """Clear a field while preserving caller-owned Playwright input options."""
 
 
 class ScrollEventStrategy(ABC):
