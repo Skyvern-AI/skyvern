@@ -7904,7 +7904,7 @@ class WorkflowService:
             block_type=block.block_type,
             block_label=block.label,
             block_status=block_result.status,
-            workflow_status=target_status,
+            resolved_terminal_status=target_status,
             deferred=defer_status_write,
         )
         if defer_status_write:
@@ -9498,7 +9498,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as completed",
             workflow_run_id=workflow_run_id,
-            workflow_status="completed",
         )
 
         # Add workflow completion tag to trace
@@ -9695,7 +9694,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as failed",
             workflow_run_id=workflow_run_id,
-            workflow_status="failed",
             failure_reason=failure_reason,
         )
 
@@ -9713,7 +9711,6 @@ class WorkflowService:
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
-            workflow_status="failed",
             failure_category=failure_category,
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source=failure_category_source,
@@ -9767,7 +9764,6 @@ class WorkflowService:
         LOG.info(
             f"Marked workflow run {workflow_run_id} as failed (conditional)",
             workflow_run_id=workflow_run_id,
-            workflow_status="failed",
             failure_category=failure_category,
         )
         if cascade_children:
@@ -9816,7 +9812,6 @@ class WorkflowService:
         LOG.info(
             f"Marked workflow run {workflow_run_id} as running",
             workflow_run_id=workflow_run_id,
-            workflow_status="running",
             run_with=run_with,
             queued_seconds=queued_seconds,
         )
@@ -9832,7 +9827,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as terminated",
             workflow_run_id=workflow_run_id,
-            workflow_status="terminated",
             failure_reason=failure_reason,
         )
 
@@ -9852,7 +9846,6 @@ class WorkflowService:
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
-            workflow_status="terminated",
             failure_category=failure_category,
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source=failure_category_source,
@@ -9880,7 +9873,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as canceled",
             workflow_run_id=workflow_run_id,
-            workflow_status="canceled",
         )
 
         updated = await self.mark_workflow_run_as_canceled_if_not_final(
@@ -9920,7 +9912,6 @@ class WorkflowService:
         LOG.info(
             f"Marked workflow run {workflow_run_id} as canceled (conditional)",
             workflow_run_id=workflow_run_id,
-            workflow_status="canceled",
         )
         otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.canceled)
 
@@ -9990,7 +9981,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as timed out",
             workflow_run_id=workflow_run_id,
-            workflow_status="timed_out",
         )
 
         failure_category = self._classify_workflow_terminal_failure(
@@ -10000,7 +9990,6 @@ class WorkflowService:
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
-            workflow_status="timed_out",
             failure_category=failure_category,
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source="code_level",
