@@ -178,6 +178,15 @@ class PersistentSessionsManager(Protocol):
         """Renew a session or close it if renewal fails."""
         ...
 
+    async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
+        """Seconds until this session's infrastructure ends it no matter what the caller does.
+
+        None where a later deadline can be served, in which case renewal governs the end and there
+        is nothing here to pre-empt. Read-only: a caller asking how long it has must not have the
+        answer changed by asking.
+        """
+        ...
+
     async def update_status(
         self, session_id: str, organization_id: str, status: str
     ) -> PersistentBrowserSession | None:

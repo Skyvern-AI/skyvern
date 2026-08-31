@@ -31,7 +31,6 @@ const {
   historyResponse,
   routeParams,
   workflowRunQueryMock,
-  mockFeatureFlagEnabled,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const post = vi.fn().mockResolvedValue({});
@@ -66,13 +65,8 @@ const {
     historyResponse: history,
     routeParams: params,
     workflowRunQueryMock: vi.fn(),
-    mockFeatureFlagEnabled: vi.fn().mockReturnValue(true),
   };
 });
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: mockFeatureFlagEnabled,
-}));
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -239,7 +233,6 @@ beforeEach(() => {
   };
   workflowRunQueryMock.mockReset();
   workflowRunQueryMock.mockReturnValue({ data: undefined });
-  mockFeatureFlagEnabled.mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -327,36 +320,6 @@ describe("WorkflowCopilotChat — run lifecycle lines", () => {
 
     // REGRESSION: a plain omitted workflowRunId used to still let
     // useWorkflowRunQuery fall back to the route's own :workflowRunId and poll it.
-    expect(workflowRunQueryMock.mock.calls.length).toBeGreaterThan(0);
-    for (const call of workflowRunQueryMock.mock.calls) {
-      expect(call[0]).toEqual({ workflowRunId: undefined, enabled: false });
-    }
-  });
-
-  it("renders no lifecycle line when copilot_ux_v1 is off, even for a docked chat with a live run", async () => {
-    mockFeatureFlagEnabled.mockReturnValue(false);
-    workflowRunQueryMock.mockReturnValue({ data: makeRun() });
-    const props = makeDockedProps({ workflowRunId: "wr_1" });
-    const view = await renderChat(props);
-
-    // Give any (incorrect) announcement a chance to land before asserting absence.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(screen.queryByText(/watching it now/)).toBeNull();
-
-    workflowRunQueryMock.mockReturnValue({
-      data: makeRun({
-        status: Status.Completed,
-        started_at: "2026-01-01T00:00:00Z",
-        finished_at: "2026-01-01T00:00:42Z",
-      }),
-    });
-    view.rerender(chatUi(props));
-
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(screen.queryByText(/Run completed in/)).toBeNull();
-
-    // Flag off must genuinely disable the run query, not just hide its output —
-    // otherwise a docked-off/flag-off chat still polls the run in the background.
     expect(workflowRunQueryMock.mock.calls.length).toBeGreaterThan(0);
     for (const call of workflowRunQueryMock.mock.calls) {
       expect(call[0]).toEqual({ workflowRunId: undefined, enabled: false });

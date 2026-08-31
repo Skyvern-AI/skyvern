@@ -1378,3 +1378,77 @@ describe("CredentialsModal run-sequentially toggle", () => {
     );
   }, 10_000);
 });
+
+describe("CredentialsModal record-browser defaults", () => {
+  function renderRecordingModal(opts: {
+    overrideType?: (typeof CredentialModalTypes)[keyof typeof CredentialModalTypes];
+    defaultTotpType?: "authenticator" | "email";
+    heading?: string;
+  }) {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={opts.overrideType ?? CredentialModalTypes.PASSWORD}
+            defaultTotpType={opts.defaultTotpType}
+            heading={opts.heading}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("uses the supplied heading and opens 2FA on the authenticator method", async () => {
+    renderRecordingModal({
+      defaultTotpType: "authenticator",
+      heading: "Add Two-Factor Authentication",
+    });
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Add Two-Factor Authentication",
+      }),
+    ).toBeTruthy();
+    // Every method tile renders whenever the accordion is open, so presence alone passes
+    // for defaultTotpType "email" too; aria-pressed is what distinguishes the selection.
+    const authenticatorMethod = await screen.findByRole("button", {
+      name: /authenticator app/i,
+    });
+    expect(authenticatorMethod.getAttribute("aria-pressed")).toBe("true");
+    const emailMethod = await screen.findByRole("button", { name: /email/i });
+    expect(emailMethod.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("opens 2FA on the email method for a magic-link prompt", async () => {
+    renderRecordingModal({
+      defaultTotpType: "email",
+      heading: "Add Magic Link",
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Add Magic Link" }),
+    ).toBeTruthy();
+    const emailMethod = await screen.findByRole("button", { name: /email/i });
+    expect(emailMethod.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("renders the secret form for a secret override", async () => {
+    renderRecordingModal({
+      overrideType: CredentialModalTypes.SECRET,
+      heading: "Add Secret",
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Add Secret" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Secret Label (optional)")).toBeTruthy();
+  });
+});

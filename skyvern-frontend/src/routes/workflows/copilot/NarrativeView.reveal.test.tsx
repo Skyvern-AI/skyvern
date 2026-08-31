@@ -111,39 +111,6 @@ describe("NarrativeView — recorded action reveal", () => {
     expect(document.querySelectorAll(".animate-spin").length).toBe(0);
   });
 
-  it("survives a real unmount/remount (rollup collapse -> expand) without restarting the schedule", () => {
-    const actions = [action("a1"), action("a2")];
-    const failedBlock: BlockState = {
-      ...verifyingBlockWithActions(actions, NOW),
-      state: "failed",
-      outcome: undefined,
-    };
-    const terminalTurn: TurnNarrativeState = {
-      ...inFlightTurnWithBlock(failedBlock),
-      terminal: "response",
-      terminalMessage: "Halted.",
-      endedAt: "2026-06-10T00:00:10Z",
-    };
-
-    render(<NarrativeView turn={terminalTurn} />);
-    // A terminal turn defaults to the rolled-up summary card — the block
-    // row (and its actions) are not mounted at all yet.
-    expect(screen.queryByText("Action a1")).toBeNull();
-
-    act(() => {
-      vi.advanceTimersByTime(350);
-    });
-
-    // Expand into the detail view — FBlockRun mounts for the first time here.
-    fireEvent.click(screen.getByRole("button", { name: /Run halted/ }));
-
-    // 350ms had already elapsed before this fresh mount: one action already
-    // done, the second mid-reveal — not restarted from zero.
-    expect(screen.getByText("Action a1")).toBeTruthy();
-    expect(screen.getByText("Action a2")).toBeTruthy();
-    expect(document.querySelectorAll(".animate-spin").length).toBe(1);
-  });
-
   it("renders no recorded-action rows when the block has none (byte-identical to today)", () => {
     const block: BlockState = {
       workflowRunBlockId: "wrb_1",
@@ -229,7 +196,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, NOW - 500)])}
-        uxV1
       />,
     );
 
@@ -250,7 +216,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, undefined)])}
-        uxV1
       />,
     );
 
@@ -263,7 +228,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, undefined)])}
-        uxV1
       />,
     );
 
@@ -275,7 +239,6 @@ describe("NarrativeView — narration reveal", () => {
     render(
       <NarrativeView
         turn={narrationTurn([toolCall("1", 1), narration(1, NOW - 500)])}
-        uxV1
       />,
     );
 
@@ -297,7 +260,6 @@ describe("NarrativeView — narration reveal", () => {
           narration(1, NOW),
           toolCall("2", 2, "edit_block"),
         ])}
-        uxV1
       />,
     );
 

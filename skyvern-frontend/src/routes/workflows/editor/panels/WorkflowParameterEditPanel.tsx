@@ -364,6 +364,9 @@ function WorkflowParameterEditPanel({
       (initialValues.vaultId.includes("{{") ||
         initialValues.itemId.includes("{{")),
   );
+  const [opTotpFieldName, setOpTotpFieldName] = useState(
+    isOnePasswordCredential ? (initialValues.totpFieldName ?? "") : "",
+  );
   const opEditModeInitializedRef = useRef(false);
   const opUserTouchedRef = useRef(false);
   const savedOpVaultId = isOnePasswordCredential ? initialValues.vaultId : "";
@@ -951,6 +954,24 @@ function WorkflowParameterEditPanel({
                   />
                 )}
               </div>
+              {credentialDataType === "password" && (
+                <div className="space-y-1">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      1Password TOTP Field (optional)
+                    </Label>
+                    <HelpTooltip content="Item field id or label holding the TOTP secret. Set this if the OTP is stored in a plain field (e.g. a custom field named 'digits') rather than 1Password's own one-time-password field type. Leave empty to auto-detect." />
+                  </div>
+                  <Input
+                    value={opTotpFieldName}
+                    onChange={(e) => {
+                      opUserTouchedRef.current = true;
+                      setOpTotpFieldName(e.target.value);
+                    }}
+                    placeholder="Leave empty to auto-detect"
+                  />
+                </div>
+              )}
               {credentialDataType === "creditCard" && (
                 <div className="rounded-md bg-muted p-2">
                   <div className="space-y-1 text-xs text-muted-foreground">
@@ -1353,6 +1374,8 @@ function WorkflowParameterEditPanel({
                       parameterType: "onepassword",
                       vaultId: opVaultId,
                       itemId: opItemId,
+                      totpFieldName:
+                        opTotpFieldName.trim() === "" ? null : opTotpFieldName,
                       description,
                     });
                     return;

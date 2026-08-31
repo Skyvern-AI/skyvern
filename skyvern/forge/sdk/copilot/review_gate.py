@@ -16,6 +16,7 @@ from skyvern.schemas.google_sheets import extract_a1_sheet_prefix, extract_sprea
 from skyvern.schemas.workflows import BlockType, FileStorageType
 
 ReviewChange = Literal["added", "changed", "unchanged", "removed"]
+BlockCoverage = Literal["current_source", "different_source", "never_run", "unknown"]
 ParameterDefault = str | int | float | bool
 DestinationIdentity = tuple[str, ...]
 DestinationAdapter = Callable[[dict[str, Any], Mapping[str, ParameterDefault]], DestinationIdentity | None]
@@ -31,6 +32,7 @@ class NarrativeReviewBlock(TypedDict):
     blockType: str
     change: ReviewChange
     neverTested: NotRequired[bool]
+    coverage: NotRequired[BlockCoverage]
 
 
 class NarrativeDuplicateWrite(TypedDict):
@@ -353,6 +355,23 @@ def build_review_projection(
         block["label"]: _block_fingerprint(block, staged_execution_inputs) for block in staged_blocks
     }
 
+    if isinstance(executed_blocks, Mapping):
+        receipts: dict[str, set[str]] = {
+            label: {value} if isinstance(value, str) else set(value) for label, value in executed_blocks.items()
+        }
+        source_bound = True
+    else:
+        receipts = {label: set() for label in executed_blocks}
+        source_bound = False
+    # A block's own label is excluded from its fingerprint, so a receipt stranded under a
+    # label the staged workflow no longer has still identifies source this turn ran.
+    orphan_fingerprints = {
+        fingerprint
+        for label, recorded in receipts.items()
+        if label not in staged_fingerprints
+        for fingerprint in recorded
+    }
+
     review_blocks: list[NarrativeReviewBlock] = []
     for block in staged_blocks:
         label = block["label"]
@@ -369,21 +388,20 @@ def build_review_projection(
             change = "unchanged"
         else:
             change = "changed"
+        recorded = receipts.get(label)
+        if recorded is None:
+            coverage: BlockCoverage = "unknown" if staged_fingerprints[label] in orphan_fingerprints else "never_run"
+        elif not source_bound or staged_fingerprints[label] in recorded:
+            coverage = "current_source"
+        else:
+            coverage = "different_source"
         review_blocks.append(
             {
                 "label": label,
                 "blockType": _block_type(block),
                 "change": change,
-                "neverTested": (
-                    staged_fingerprints[label]
-                    not in (
-                        {executed_blocks[label]}
-                        if isinstance(executed_blocks.get(label), str)
-                        else executed_blocks.get(label, ())
-                    )
-                    if isinstance(executed_blocks, Mapping)
-                    else label not in executed_blocks
-                ),
+                "neverTested": coverage != "current_source",
+                "coverage": coverage,
             }
         )
     for block in persisted_blocks:

@@ -431,7 +431,7 @@ describe("BrowserTab pills and selection sync", () => {
 
     expect(screen.getByTestId("hero-recording")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Live" }));
+    fireEvent.click(screen.getByRole("button", { name: "Debug browser" }));
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
@@ -448,7 +448,7 @@ describe("BrowserTab pills and selection sync", () => {
 
     expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Live" }));
+    fireEvent.click(screen.getByRole("button", { name: "Debug browser" }));
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
 
     // A timeline click pins the frame (even the already-selected one); the
@@ -518,8 +518,31 @@ describe("BrowserTab pills and selection sync", () => {
         .getAttribute("aria-pressed"),
     ).toBe("true");
     expect(
-      screen.getByRole("button", { name: "Live" }).getAttribute("aria-pressed"),
+      screen
+        .getByRole("button", { name: "Debug browser" })
+        .getAttribute("aria-pressed"),
     ).toBe("false");
+  });
+
+  it("never offers a finished run a Live pill", () => {
+    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    // Beside the run's own Recording/Screenshots pills, a pulsing "Live" reads
+    // as the run's status — but this view is the debug browser the run left.
+    expect(screen.queryByRole("button", { name: "Live" })).toBeNull();
+    const pill = screen.getByRole("button", { name: "Debug browser" });
+    expect(pill.querySelector(".animate-pulse")).toBeNull();
+  });
+
+  it("keeps the Live pill while the inspected run is still running", () => {
+    seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    expect(screen.getByRole("button", { name: "Live" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Debug browser" })).toBeNull();
   });
 });
 

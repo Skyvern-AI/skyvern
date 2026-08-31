@@ -440,7 +440,7 @@ async def _run_self_heal_recovery(
                         ctx=ctx,
                         stream=stream,
                         chat_id=f"selfheal:{workflow_run_id}:{uuid.uuid4().hex}",
-                        user_message=_self_heal_recovery_prompt(composed_goal),
+                        initial_input=_self_heal_recovery_prompt(composed_goal),
                         system_prompt="You are a browser-only runtime self-heal recovery agent.",
                         model_name=model_name,
                         run_config=run_config,

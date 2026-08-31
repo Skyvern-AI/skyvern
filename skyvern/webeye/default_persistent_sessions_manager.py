@@ -149,6 +149,15 @@ async def validate_session_for_renewal(
     return browser_session, started_at_utc, browser_session.timeout_minutes
 
 
+def _renewal_extension_minutes(new_timeout_datetime: datetime, current_timeout_datetime: datetime) -> int:
+    """Minutes to extend a session by so its expiry never moves earlier than it already is.
+
+    A fresh DEBUG_SESSION_TIMEOUT_MINUTES window from now can land before the session's existing
+    expiry (e.g. Copilot's 30-minute sessions), which would otherwise shorten it.
+    """
+    return max(0, floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60))
+
+
 async def renew_session(
     database: AgentDB, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
 ) -> PersistentBrowserSession:
@@ -168,7 +177,9 @@ async def renew_session(
 
     if minutes_left >= settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES:
         new_timeout_datetime = right_now + timedelta(minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES)
-        minutes_diff = floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60)
+        minutes_diff = _renewal_extension_minutes(new_timeout_datetime, current_timeout_datetime)
+        if minutes_diff == 0:
+            return browser_session
         new_timeout_minutes = current_timeout_minutes + minutes_diff
 
         browser_session = await database.browser_sessions.update_persistent_browser_session(
@@ -647,6 +658,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             if session is None or session.completed_at is None:
                 await self.close_session(organization_id, session_id)
             raise
+
+    async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
+        """These sessions run on browsers this process owns, which can always be given longer."""
+        return None
 
     async def update_status(
         self,

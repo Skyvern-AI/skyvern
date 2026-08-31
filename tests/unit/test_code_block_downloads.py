@@ -11,6 +11,7 @@ Covers the three acceptance behaviors:
 
 import asyncio
 import hashlib
+import json
 import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.exceptions import (
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
@@ -28,6 +30,9 @@ from skyvern.exceptions import (
     ScriptTerminationException,
 )
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.api.files import classify_download_visibility, observe_download_dir
+from skyvern.forge.sdk.artifact.storage import s3 as s3_module
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
@@ -134,9 +139,16 @@ def _wire_block_runtime(
 
 
 def _wire_secure_runner(
-    monkeypatch: pytest.MonkeyPatch, *, output: dict, on_execute: Callable[[], None] | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    output: dict,
+    on_execute: Callable[[], None] | None = None,
+    downgrade: bool = False,
 ) -> None:
-    """Route execute() down the secure sidecar arm, whose returned payload is what the host binds."""
+    """Route execute() down the secure sidecar arm, whose returned payload is what the host binds.
+
+    ``downgrade`` returns no result from the override, the one way the runner arm falls through to
+    inline execution."""
     block_result = BlockResult(
         success=True,
         output_parameter=_output_parameter("code_out"),
@@ -145,9 +157,11 @@ def _wire_secure_runner(
         workflow_run_block_id="",
     )
 
-    async def _execute_override(**kwargs: object) -> SimpleNamespace:
+    async def _execute_override(**kwargs: object) -> SimpleNamespace | None:
         if on_execute is not None:
             on_execute()
+        if downgrade:
+            return None
         return SimpleNamespace(block_result=block_result, failure=None)
 
     fake_app = block_module.app
@@ -845,6 +859,45 @@ async def test_secure_runner_download_intent_is_counted_too(
     assert len(events) == 1
     assert events[0]["engine"] == "secure_runner"
     assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_downgraded_secure_runner_hands_inline_an_inline_labelled_evidence_probe(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A runner that declines leaves the block running inline, so the probe it handed on must
+    register under the engine that actually executed."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch)
+    _wire_secure_runner(monkeypatch, output={"downloaded_files": []}, downgrade=True)
+
+    handed_off: dict[str, object] = {}
+    generate = CodeBlock.generate_async_user_function
+
+    def _spy(self: CodeBlock, *args: object, **kwargs: object) -> object:
+        handed_off["probe"] = kwargs.get("download_evidence")
+        return generate(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(CodeBlock, "generate_async_user_function", _spy)
+
+    block = CodeBlock(
+        label="download_invoice",
+        code='return {"downloaded_files": []}',
+        output_parameter=_output_parameter("code_out"),
+    )
+    await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    probe = handed_off["probe"]
+    assert callable(probe)
+    with capture_logs() as logs:
+        await probe()
+
+    engines = [
+        entry.get("engine") for entry in logs if entry.get("event") == "codeblock.download_registration_visibility"
+    ]
+    assert engines == ["inline"]
 
 
 @pytest.mark.asyncio
@@ -2427,3 +2480,350 @@ async def test_failing_session_block_that_never_downloaded_invents_no_evidence(
     claim.assert_awaited()
     output = result.output_parameter_value
     assert output is None or not output.get("downloaded_file_urls")
+
+
+_DOWNLOAD_ENTRY_SENTINEL = "quarterly-policy-summary-sentinel.pdf"
+
+
+def _keyed_fingerprints(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.core.hashing.settings.SECRET_KEY", "download-observation-fingerprint-key")
+
+
+def test_observe_download_dir_separates_landed_bytes_from_in_flight(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _keyed_fingerprints(monkeypatch)
+    (tmp_path / _DOWNLOAD_ENTRY_SENTINEL).write_bytes(b"%PDF-1.4 sentinel")
+    (tmp_path / f"partial-{_DOWNLOAD_ENTRY_SENTINEL}{BROWSER_DOWNLOADING_SUFFIX}").write_bytes(b"%PDF")
+
+    observation = observe_download_dir(tmp_path)
+
+    assert observation.entry_count == 2
+    assert observation.total_bytes == 21
+    assert observation.in_flight_count == 1
+    assert observation.dir_missing is False
+    assert observation.read_failed is False
+    assert observation.entry_fps_truncated is False
+    assert len(set(observation.entry_fps)) == 2
+    assert "unkeyed" not in observation.entry_fps
+    rendered = repr(observation)
+    assert _DOWNLOAD_ENTRY_SENTINEL not in rendered
+    assert "policy-summary" not in rendered
+    assert ".pdf" not in rendered
+
+
+def test_observe_download_dir_caps_and_flags_truncated_fingerprints(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _keyed_fingerprints(monkeypatch)
+    for index in range(11):
+        (tmp_path / f"{index}-{_DOWNLOAD_ENTRY_SENTINEL}").write_bytes(b"x")
+
+    observation = observe_download_dir(tmp_path)
+
+    assert observation.entry_count == 11
+    assert len(observation.entry_fps) == 10
+    assert observation.entry_fps_truncated is True
+    assert _DOWNLOAD_ENTRY_SENTINEL not in repr(observation)
+
+
+def test_observe_download_dir_survives_a_path_scandir_rejects(tmp_path) -> None:
+    """The helper promises never to raise; scandir rejects an embedded null with ValueError."""
+    observation = observe_download_dir(tmp_path / "bad\x00name")
+
+    assert observation.read_failed is True
+    assert observation.entry_count == 0
+
+
+def test_observe_download_dir_reports_missing_directory(tmp_path) -> None:
+    observation = observe_download_dir(tmp_path / "never-created")
+
+    assert observation.dir_missing is True
+    assert observation.read_failed is False
+    assert observation.entry_count == 0
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_observe_download_dir_reports_unreadable_directory_instead_of_zero(tmp_path) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / _DOWNLOAD_ENTRY_SENTINEL).write_bytes(b"x")
+    os.chmod(blocked, 0o000)
+    try:
+        observation = observe_download_dir(blocked)
+    finally:
+        os.chmod(blocked, 0o700)
+
+    assert observation.read_failed is True
+    assert observation.dir_missing is False
+    assert observation.entry_count == 0
+    assert _DOWNLOAD_ENTRY_SENTINEL not in repr(observation)
+
+
+def _empty_read_rows(logs: list[dict]) -> list[dict]:
+    return [entry for entry in logs if entry.get("event") == "downloads.empty_read"]
+
+
+def _artifact_row_storage(
+    monkeypatch: pytest.MonkeyPatch, *, keyring: str | None, file_infos: list[FileInfo]
+) -> S3Storage:
+    monkeypatch.setattr(s3_module.settings, "ARTIFACT_CONTENT_HMAC_KEYRING", keyring)
+    monkeypatch.setattr(s3_module, "_file_infos_from_download_artifacts", AsyncMock(return_value=file_infos))
+    return S3Storage()
+
+
+@pytest.mark.asyncio
+async def test_downloads_read_stays_silent_when_artifact_rows_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = [FileInfo(url="https://example.test/a")]
+    storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=resolved)
+    monkeypatch.setattr(
+        storage,
+        "_list_download_artifacts_safe",
+        AsyncMock(return_value=([SimpleNamespace(browser_session_id=None, checksum=None)], False)),
+    )
+
+    with capture_logs() as logs:
+        assert await storage.get_downloaded_files("o_1", "wr_1") == resolved
+
+    assert _empty_read_rows(logs) == []
+
+
+@pytest.mark.asyncio
+async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
+    monkeypatch.setattr(
+        storage,
+        "_list_download_artifacts_safe",
+        AsyncMock(return_value=([SimpleNamespace(browser_session_id=None, checksum=None)], False)),
+    )
+
+    with capture_logs() as logs:
+        assert await storage.get_downloaded_files("o_1", "wr_1") == []
+
+    row = _empty_read_rows(logs)[0]
+    assert row["download_row_count"] == 1
+    assert row["rows_present_but_unresolvable"] is True
+    assert row["rows_lookup_failed"] is False
+    assert row["skip_fired"] is False
+    assert row["listed"] is False
+
+
+@pytest.mark.asyncio
+async def test_downloads_empty_read_reports_listing_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
+    monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], False)))
+    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=True))
+    listing = AsyncMock(return_value=[])
+    monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", listing)
+
+    with capture_logs() as logs:
+        assert await storage.get_downloaded_files("o_1", "wr_1") == []
+
+    row = _empty_read_rows(logs)[0]
+    assert row["download_row_count"] == 0
+    assert row["skip_fired"] is True
+    assert row["listed"] is False
+    listing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_downloads_empty_read_reports_failed_row_lookup_as_unknown_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
+    monkeypatch.setattr(
+        s3_module.app.DATABASE.artifacts,
+        "list_artifacts_for_run_by_type",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=False))
+    monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
+
+    with capture_logs() as logs:
+        assert await storage.get_downloaded_files("o_1", "wr_1") == []
+
+    row = _empty_read_rows(logs)[0]
+    assert row["download_row_count"] is None
+    assert row["rows_lookup_failed"] is True
+    assert row["listed"] is True
+
+
+@pytest.mark.asyncio
+async def test_downloads_empty_read_reports_unqueried_rows_on_legacy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = _artifact_row_storage(monkeypatch, keyring="", file_infos=[])
+    monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
+
+    with capture_logs() as logs:
+        assert await storage.get_downloaded_files("o_1", "wr_1") == []
+
+    row = _empty_read_rows(logs)[0]
+    assert row["download_row_count"] is None
+    assert row["rows_lookup_failed"] is False
+    assert row["listed"] is True
+
+
+def test_observe_download_dir_moves_on_same_name_same_size_overwrite(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _keyed_fingerprints(monkeypatch)
+    target = tmp_path / _DOWNLOAD_ENTRY_SENTINEL
+    target.write_bytes(b"%PDF-1.4 sentinel")
+    before = observe_download_dir(tmp_path)
+    rewritten_at = before.newest_mtime_ns + 1_000_000_000
+    target.write_bytes(b"%PDF-1.4 replaced")
+    os.utime(target, ns=(rewritten_at, rewritten_at))
+
+    after = observe_download_dir(tmp_path)
+
+    assert after.entry_count == before.entry_count
+    assert after.total_bytes == before.total_bytes
+    assert after.in_flight_count == before.in_flight_count
+    assert after.newest_mtime_ns > before.newest_mtime_ns
+    fields = classify_download_visibility(
+        pre=before,
+        settled=after,
+        post=after,
+        alt_pre=None,
+        alt_post=None,
+        listed_run_id="wr_1",
+        workflow_run_id="wr_1",
+        download_binding_kind=None,
+    )
+    assert fields["landed_during_settle"] is True
+
+
+def test_classify_reports_unknown_movement_when_a_snapshot_could_not_be_read(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _keyed_fingerprints(monkeypatch)
+    listed = tmp_path / "listed"
+    listed.mkdir()
+    (listed / _DOWNLOAD_ENTRY_SENTINEL).write_bytes(b"%PDF-1.4 already here")
+    os.chmod(listed, 0o000)
+    try:
+        pre = observe_download_dir(listed)
+    finally:
+        os.chmod(listed, 0o700)
+    readable = observe_download_dir(listed)
+
+    assert pre.read_failed is True
+    assert readable.total_bytes > 0
+
+    fields = classify_download_visibility(
+        pre=pre,
+        settled=readable,
+        post=readable,
+        alt_pre=None,
+        alt_post=None,
+        listed_run_id="wr_1",
+        workflow_run_id="wr_1",
+        download_binding_kind=None,
+    )
+
+    assert fields["landed_during_settle"] is None
+    assert fields["landed_after_settle"] is False
+
+
+def test_classify_reports_unknown_alt_deltas_when_the_alternate_scan_failed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _keyed_fingerprints(monkeypatch)
+    listed = tmp_path / "listed"
+    listed.mkdir()
+    alt = tmp_path / "alt"
+    alt.mkdir()
+    (alt / _DOWNLOAD_ENTRY_SENTINEL).write_bytes(b"%PDF-1.4 sentinel")
+    os.chmod(alt, 0o000)
+    try:
+        alt_pre = observe_download_dir(alt)
+    finally:
+        os.chmod(alt, 0o700)
+    alt_post = observe_download_dir(alt)
+    listed_observation = observe_download_dir(listed)
+
+    assert alt_pre.read_failed is True
+    assert alt_post.entry_count == 1
+
+    fields = classify_download_visibility(
+        pre=listed_observation,
+        settled=listed_observation,
+        post=listed_observation,
+        alt_pre=alt_pre,
+        alt_post=alt_post,
+        listed_run_id="wr_dl_1",
+        workflow_run_id="wr_1",
+        download_binding_kind=None,
+    )
+
+    assert fields["alt_entry_delta"] is None
+    assert fields["alt_bytes_delta"] is None
+    assert fields["alt_moved"] is None
+
+
+def test_classify_reads_alternate_dir_as_a_delta_not_an_absolute_count(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _keyed_fingerprints(monkeypatch)
+    listed = tmp_path / "listed"
+    listed.mkdir()
+    alt = tmp_path / "alt"
+    alt.mkdir()
+    (alt / f"sibling-block-{_DOWNLOAD_ENTRY_SENTINEL}").write_bytes(b"left behind earlier")
+    listed_observation = observe_download_dir(listed)
+    alt_pre = observe_download_dir(alt)
+
+    def classify(alt_post):
+        return classify_download_visibility(
+            pre=listed_observation,
+            settled=listed_observation,
+            post=listed_observation,
+            alt_pre=alt_pre,
+            alt_post=alt_post,
+            listed_run_id="dr_1",
+            workflow_run_id="wr_1",
+            download_binding_kind=None,
+        )
+
+    stale_only = classify(observe_download_dir(alt))
+    assert stale_only["alt_entry_delta"] == 0
+    assert stale_only["alt_moved"] is False
+    assert stale_only["download_run_id_differs"] is True
+
+    (alt / _DOWNLOAD_ENTRY_SENTINEL).write_bytes(b"%PDF-1.4 sentinel")
+    moved = classify(observe_download_dir(alt))
+
+    assert moved["alt_entry_delta"] == 1
+    assert moved["alt_moved"] is True
+    assert moved["landed_during_settle"] is False
+    assert _DOWNLOAD_ENTRY_SENTINEL not in json.dumps(moved)
+    assert "sibling-block" not in json.dumps(moved)
+
+
+@pytest.mark.asyncio
+async def test_failed_row_lookup_still_lists_instead_of_reporting_no_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB blip must not be answered with an empty download list.
+
+    The cutover skip exists to avoid listing when a run provably has no rows; a lookup that
+    failed proves nothing, so the legitimate case has to keep its route through the listing.
+    """
+    listed = [FileInfo(url="https://example.test/real")]
+    storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
+    monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], True)))
+    skip = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", skip)
+    monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=listed))
+
+    assert await storage.get_downloaded_files("o_1", "wr_blip") == listed
+    skip.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_downloads_empty_read_reports_every_empty_read_for_a_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run reads empty once at block baseline and again after registration; both must be reported.
+
+    Suppressing the repeat would silence the post-registration read this signal exists to explain.
+    """
+    storage = _artifact_row_storage(monkeypatch, keyring="", file_infos=[])
+    monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
+
+    with capture_logs() as repeated:
+        await storage.get_downloaded_files("o_1", "wr_repeat")
+        await storage.get_downloaded_files("o_1", "wr_repeat")
+
+    assert len(_empty_read_rows(repeated)) == 2

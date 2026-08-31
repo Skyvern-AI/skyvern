@@ -1,6 +1,7 @@
 import pytest
 
 from skyvern.forge.sdk.encrypt.aes import AES
+from skyvern.forge.sdk.encrypt.base import TokenDecryptionError
 
 SECRET = "test-secret-key"
 PRIMARY_SALT = "primary_salt_value_xxxxxxxxxxxxxxx"
@@ -58,7 +59,8 @@ async def test_decrypt_raises_after_exhausting_all_keys() -> None:
         iv=PRIMARY_IV,
         fallback_decrypt_keys=[("another_salt_xxxxxxxxxxxx", "another_iv_xxxxxxxx")],
     )
-    with pytest.raises(Exception, match="Failed to decrypt token"):
+    # Typed so callers that poll can tell a terminal key mismatch from a transient failure.
+    with pytest.raises(TokenDecryptionError):
         await mismatched.decrypt(ciphertext)
 
 

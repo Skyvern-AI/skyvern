@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    BUILD_TEST_PACKET_KEY,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
@@ -597,8 +598,126 @@ def is_synthetic_user_message(item: Any) -> bool:
     return is_screenshot_message(item) or _is_nudge_message(item)
 
 
+_PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
+_PACKET_LIST_CAP = 6
+_PACKET_REASON_CAP = 200
+
+
+def _bounded_error_codes(codes: Any) -> list[str]:
+    return [str(c)[:64] for c in codes if isinstance(c, str)][:_PACKET_LIST_CAP]
+
+
+def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
+    """The packet's identity and failure scalars, bounded. Lists are tails, so they yield first."""
+    if not isinstance(packet, dict):
+        return None
+    kept: dict[str, Any] = {}
+    version = packet.get("contract_version")
+    if isinstance(version, str) and version:
+        kept["contract_version"] = version
+    run = packet.get("run")
+    if isinstance(run, dict):
+        run_id = run.get("workflow_run_id")
+        status = run.get("status")
+        bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
+        if bounded_run:
+            kept["run"] = bounded_run
+    failure = packet.get("failure")
+    if isinstance(failure, dict):
+        bounded: dict[str, Any] = {}
+        for field in _PACKET_FAILURE_SCALARS:
+            value = failure.get(field)
+            if value is None or value == "":
+                continue
+            bounded[field] = value if isinstance(value, (bool, int, float)) else str(value)[:_PACKET_REASON_CAP]
+        codes = failure.get("error_codes")
+        if isinstance(codes, list) and codes:
+            bounded["error_codes"] = _bounded_error_codes(codes)
+        if bounded:
+            kept["failure"] = bounded
+    return kept or None
+
+
 def _truncated_output_fallback(output: str) -> str:
     return output[:_TOOL_OUTPUT_SUMMARIZE_THRESHOLD] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+
+
+# Compacting page evidence to {"ok":true} tells the model it has evidence while leaving it none, so
+# raw excerpts and derived relations go first and the bounded facts describing what is on the page,
+# and which browser saw it, stay. An allowlist rather than a drop-list: an evidence field nobody has
+# classified yet is likelier to be raw page text than a fact worth keeping.
+_PAGE_EVIDENCE_IDENTITY = (
+    "source_tool",
+    "current_url",
+    "inspected_url",
+    "page_title",
+    "observation_step",
+    "source_browser_session_id",
+    "workflow_run_id",
+    "observed_after_workflow_run",
+)
+_PAGE_EVIDENCE_FACT_LISTS = (
+    "forms",
+    "navigation_targets",
+    "result_containers",
+    "clickable_controls",
+    "challenge_controls",
+    "modal_overlays",
+    "page_obstructions",
+)
+_PAGE_EVIDENCE_MAX_ENTRIES = 12
+_PAGE_EVIDENCE_ENTRY_CHARS = 400
+# Per-list bounds alone would let a page with many forms and links produce a compacted output as
+# large as an uncompacted one, defeating the pass whose job is keeping the turn inside the window.
+_PAGE_EVIDENCE_SUMMARY_CHARS = 4000
+
+
+def _is_page_evidence(data: dict[str, Any]) -> bool:
+    if data.get("source_tool") == "inspect_page_for_composition":
+        return True
+    return any(key in data for key in _PAGE_EVIDENCE_FACT_LISTS) and "inspected_url" in data
+
+
+def _compact_length(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":")))
+
+
+def _bounded_evidence_entries(value: list[Any], budget: int) -> list[Any]:
+    entries: list[Any] = []
+    for entry in value[:_PAGE_EVIDENCE_MAX_ENTRIES]:
+        blob = json.dumps(entry, separators=(",", ":"))
+        bounded = entry if len(blob) <= _PAGE_EVIDENCE_ENTRY_CHARS else blob[:_PAGE_EVIDENCE_ENTRY_CHARS]
+        budget -= _compact_length(bounded)
+        if budget < 0:
+            break
+        entries.append(bounded)
+    return entries
+
+
+def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    kept: dict[str, Any] = {}
+    for key in _PAGE_EVIDENCE_IDENTITY:
+        value = data.get(key, parsed.get(key))
+        if value not in (None, ""):
+            kept[key] = value
+    budget = _PAGE_EVIDENCE_SUMMARY_CHARS - _compact_length(kept)
+    for key in _PAGE_EVIDENCE_FACT_LISTS:
+        value = data.get(key)
+        if budget <= 0 or not isinstance(value, list) or not value:
+            continue
+        entries = _bounded_evidence_entries(value, budget)
+        if entries:
+            kept[key] = entries
+            budget -= _compact_length(entries)
+    challenge_state = data.get("challenge_state")
+    if isinstance(challenge_state, dict) and challenge_state.get("detected"):
+        kept["challenge_state"] = {
+            key: challenge_state.get(key) for key in ("detected", "kind", "source") if challenge_state.get(key)
+        }
+    indicators = data.get("anti_bot_indicators")
+    if isinstance(indicators, list) and indicators:
+        kept["anti_bot_indicators"] = indicators[:8]
+    return kept
 
 
 def _summarize_tool_output(output: str) -> str:
@@ -627,7 +746,21 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
 
     data = parsed.get("data")
+    if isinstance(data, dict) and _is_page_evidence(data):
+        synopsis["page_evidence"] = _summarize_page_evidence(parsed, data)
+        synopsis["_summarized"] = "older page evidence — bounded facts retained, raw excerpts dropped"
+        try:
+            return json.dumps(synopsis, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return _truncated_output_fallback(output)
+
     if isinstance(data, dict):
+        retained_packet = _retained_run_packet(data.get(BUILD_TEST_PACKET_KEY))
+        if retained_packet is not None:
+            synopsis[BUILD_TEST_PACKET_KEY] = retained_packet
+        failing_line = data.get("failing_code_line")
+        if type(failing_line) is int:
+            synopsis["failing_code_line"] = failing_line
         code = data.get("code")
         if isinstance(code, str) and code:
             synopsis["code_chars_elided"] = len(code)
@@ -636,6 +769,13 @@ def _summarize_tool_output(output: str) -> str:
             if val is None or val == "":
                 continue
             synopsis[key] = val if isinstance(val, (bool, int, float)) else str(val)[:200]
+
+        # An unresolved earlier failure survives compaction for the reason it is attached at all:
+        # the model may decide whether to repair several turns after the run that passed, and dropping
+        # it here would reproduce the loss it exists to prevent.
+        unresolved = data.get("unresolved_earlier_failure")
+        if isinstance(unresolved, dict) and unresolved:
+            synopsis["unresolved_earlier_failure"] = unresolved
 
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
@@ -652,6 +792,9 @@ def _summarize_tool_output(output: str) -> str:
                 entry: dict[str, Any] = {"label": block.get("label"), "status": block.get("status")}
                 if block.get("failure_reason"):
                     entry["failure_reason"] = str(block["failure_reason"])[:120]
+                codes = block.get("error_codes")
+                if isinstance(codes, list) and codes:
+                    entry["error_codes"] = _bounded_error_codes(codes)
                 block_summary.append(entry)
             if block_summary:
                 synopsis["blocks"] = block_summary

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 import structlog
 import yaml
@@ -46,7 +47,6 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
-from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
     build_recoverable_failure,
@@ -115,6 +115,7 @@ from skyvern.schemas.workflows import (
 from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.strings import escape_code_fences
+from skyvern.utils.url_validators import is_blocked_host
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
@@ -337,18 +338,6 @@ class RunInfo:
     html: str | None
 
 
-# New-copilot richer block shape (used only from the ENABLE_WORKFLOW_COPILOT_V2
-# dispatch path). Kept side-by-side with the old RunInfo so the old-copilot
-# body stays untouched; consolidation is SKY-8916's job.
-@dataclass(frozen=True)
-class BlockRunInfo:
-    block_label: str | None
-    block_type: str
-    block_status: str | None
-    failure_reason: str | None
-    output: str | None
-
-
 COPILOT_CANCEL_TTL = timedelta(minutes=5)
 # Polling cadence for the cancel-watcher sidecar. Worst-case latency from a
 # user's Stop click to ``handler_task.cancel()`` is one cadence period plus
@@ -450,7 +439,15 @@ def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None
     build never commits on the user's behalf; it lands as a pending proposal for
     the review gate.
     """
-    if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
+    terminal_envelope = getattr(agent_result, "terminal_envelope", None)
+    unresolved_failed_operation = (
+        isinstance(terminal_envelope, dict) and terminal_envelope.get("failed_operation") is not None
+    )
+    if (
+        getattr(agent_result, "cancelled", False) is True
+        or unresolved_failed_operation
+        or _proposal_disposition(agent_result) != "auto_applicable"
+    ):
         return False
     return auto_accept is True
 
@@ -1198,7 +1195,7 @@ async def _finalise_normal_turn(
             organization_id
         )
         replaced = False
-        if should_render_terminal_from_envelope:
+        if should_render_terminal_from_envelope and chat_request.product_action != "test_end_to_end":
             # rendered_from_envelope means "flag on, envelope is display
             # authority" for the FE — not that this turn's text was replaced.
             terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
@@ -1221,6 +1218,7 @@ async def _finalise_normal_turn(
         LOG.info(
             "copilot_terminal_render_decision",
             flag_enabled=should_render_terminal_from_envelope,
+            product_action=chat_request.product_action,
             replaced=replaced,
             run_verdict=terminal_envelope_model.run_verdict,
             next_state=terminal_envelope_model.next_state,
@@ -1425,42 +1423,6 @@ async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None)
         failure_reason=block.failure_reason,
         html=html,
     )
-
-
-async def _get_new_copilot_block_infos(
-    organization_id: str, workflow_run_id: str | None
-) -> tuple[list[BlockRunInfo], str | None]:
-    """Variant of _get_debug_run_info used by the ENABLE_WORKFLOW_COPILOT_V2 path.
-
-    Returns a list of per-block records plus the run's VISIBLE_ELEMENTS_TREE
-    HTML artifact. Coexists with _get_debug_run_info which returns the
-    simpler single-block shape used by the old-copilot path.
-    """
-    if not workflow_run_id:
-        return [], None
-
-    blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-        workflow_run_id=workflow_run_id, organization_id=organization_id
-    )
-    if not blocks:
-        return [], None
-
-    block_infos: list[BlockRunInfo] = []
-    for block in blocks:
-        block_type_name = block.block_type.name if hasattr(block.block_type, "name") else str(block.block_type)
-        block_infos.append(
-            BlockRunInfo(
-                block_label=block.label,
-                block_type=block_type_name,
-                block_status=block.status,
-                failure_reason=block.failure_reason,
-                output=truncate_output(getattr(block, "output", None)),
-            )
-        )
-
-    html = await _get_debug_html(organization_id, workflow_run_id)
-
-    return block_infos, html
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -1886,6 +1848,7 @@ async def _new_copilot_chat_post(
     organization: Organization,
     *,
     eval_mode: CopilotEvalMode | None = None,
+    eval_entrypoint_url: str | None = None,
 ) -> EventSourceResponse:
     """ENABLE_WORKFLOW_COPILOT_V2 dispatch target.
 
@@ -2118,24 +2081,6 @@ async def _new_copilot_chat_post(
                     )
                 chat_request.workflow_yaml = pending_proposal_yaml
 
-            block_infos, debug_html = await _get_new_copilot_block_infos(
-                organization.organization_id, chat_request.workflow_run_id
-            )
-
-            debug_run_info_text = ""
-            if block_infos:
-                parts: list[str] = []
-                for bi in block_infos:
-                    block_text = f"Block: {bi.block_label} ({bi.block_type}) — {bi.block_status}"
-                    if bi.failure_reason:
-                        block_text += f"\n  Failure Reason: {bi.failure_reason}"
-                    if bi.output:
-                        block_text += f"\n  Output: {bi.output}"
-                    parts.append(block_text)
-                debug_run_info_text = "\n".join(parts)
-                if debug_html:
-                    debug_run_info_text += f"\n\nVisible Elements Tree (HTML):\n{debug_html}"
-
             await stream.send(
                 WorkflowCopilotProcessingUpdate(
                     type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
@@ -2212,7 +2157,9 @@ async def _new_copilot_chat_post(
 
             copilot_config = (
                 await app.AGENT_FUNCTION.get_copilot_config_for_request(
-                    organization.organization_id, code_block_mode=chat_request.code_block
+                    organization.organization_id,
+                    code_block_mode=chat_request.code_block,
+                    composer_mode=chat_request.mode,
                 )
             ) or CopilotConfig()
 
@@ -2302,7 +2249,6 @@ async def _new_copilot_chat_post(
                     chat_history=convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
                     prior_user_messages=convert_to_history_messages(chat_messages),
                     global_llm_context=global_llm_context,
-                    debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
                     raw_secret_safety_handler=raw_secret_safety_handler,
                     api_key=api_key,
@@ -2320,6 +2266,7 @@ async def _new_copilot_chat_post(
                         request.headers.get("x-copilot-eval-case") if settings.ENV == "local" else None
                     ),
                     eval_mode=eval_mode,
+                    eval_entrypoint_url=eval_entrypoint_url,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
@@ -2635,12 +2582,53 @@ async def workflow_copilot_chat_audio(
     )
 
 
+def _validated_eval_entrypoint_url(
+    request: Request, chat_request: WorkflowCopilotChatRequest, organization: Organization
+) -> str | None:
+    """A silently dropped seed produces a benchmark run that looks seeded and never was, so every
+    rejected condition raises instead of falling back to the default resolution path."""
+    if chat_request.eval_entrypoint_url is None:
+        return None
+    eval_entrypoint_url = chat_request.eval_entrypoint_url
+    if (
+        not settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED
+        or organization.organization_id not in settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS
+        or request.headers.get("x-copilot-eval") != "odysseys"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="eval_entrypoint_url is not accepted on this deployment",
+        )
+    try:
+        parsed = urlparse(eval_entrypoint_url)
+        accepted = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and not any(char.isspace() for char in eval_entrypoint_url)
+            and (parsed.port is None or 0 < parsed.port < 65536)
+            # Same host policy every other URL-accepting entry point applies, so a metadata or
+            # RFC1918 host is refused here rather than only at the navigation guard. A local
+            # fixture lane passes by listing its own host in ALLOWED_HOSTS, as it already must.
+            and not is_blocked_host(parsed.hostname or "")
+        )
+    except ValueError:
+        accepted = False
+    if not accepted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="eval_entrypoint_url must be an http(s) URL",
+        )
+    return eval_entrypoint_url
+
+
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
+    eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
     raw_eval_mode = request.headers.get("x-copilot-eval-mode")
     if raw_eval_mode is not None:
         try:
@@ -2655,10 +2643,26 @@ async def workflow_copilot_chat_post(
             or organization.organization_id not in settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
-        return await _new_copilot_chat_post(request, chat_request, organization, eval_mode=eval_mode)
+        return await _new_copilot_chat_post(
+            request,
+            chat_request,
+            organization,
+            eval_mode=eval_mode,
+            eval_entrypoint_url=eval_entrypoint_url,
+        )
 
     if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id, mode=chat_request.mode):
-        return await _new_copilot_chat_post(request, chat_request, organization)
+        return await _new_copilot_chat_post(
+            request,
+            chat_request,
+            organization,
+            eval_entrypoint_url=eval_entrypoint_url,
+        )
+    if eval_entrypoint_url is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="eval_entrypoint_url requires the copilot v2 agent path",
+        )
 
     async def stream_handler(stream: EventSourceStream) -> None:
         turn_id = uuid.uuid4().hex

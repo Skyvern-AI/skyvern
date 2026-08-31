@@ -194,7 +194,56 @@ async def test_read_http_url_bytes_routes_main_frame_through_skyvern_frame_evalu
     kwargs = eval_mock.await_args.kwargs
     assert kwargs["frame"] is page  # main-frame targets the Page for main-world routing
     assert kwargs["expression"] == _SAME_ORIGIN_FETCH_JS
-    assert kwargs["arg"] == {"url": "https://host.example/api/StatementPdf?access_token=x", "maxSizeBytes": 1024}
+    assert kwargs["arg"] == {
+        "url": "https://host.example/api/StatementPdf?access_token=x",
+        "maxSizeBytes": 1024,
+        "redirect": "follow",
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_http_url_bytes_passes_optional_headers() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    page.main_frame = main_frame
+    evaluate = AsyncMock(return_value={"ok": True, "base64": ""})
+    with (
+        patch(f"{_MOD}._frames_for_origin", return_value=[main_frame]),
+        patch.object(SkyvernFrame, "evaluate", evaluate),
+    ):
+        await SkyvernFrame.read_http_url_bytes(page, "https://host.example/x.pdf", headers={"X-Test": "v"})
+    assert evaluate.await_args.kwargs["arg"] == {
+        "url": "https://host.example/x.pdf",
+        "maxSizeBytes": None,
+        "headers": {"X-Test": "v"},
+        "redirect": "follow",
+    }
+    evaluate.reset_mock()
+    with (
+        patch(f"{_MOD}._frames_for_origin", return_value=[main_frame]),
+        patch.object(SkyvernFrame, "evaluate", evaluate),
+    ):
+        await SkyvernFrame.read_http_url_bytes(page, "https://host.example/x.pdf")
+    assert evaluate.await_args.kwargs["arg"] == {
+        "url": "https://host.example/x.pdf",
+        "maxSizeBytes": None,
+        "redirect": "follow",
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_http_url_bytes_can_fail_on_redirects_for_recovery() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    page.main_frame = main_frame
+    evaluate = AsyncMock(return_value={"ok": False, "error": "redirect_failed"})
+    with (
+        patch(f"{_MOD}._frames_for_origin", return_value=[main_frame]),
+        patch.object(SkyvernFrame, "evaluate", evaluate),
+    ):
+        result = await SkyvernFrame.read_http_url_bytes(page, "https://host.example/x.pdf", redirect="error")
+    assert result is None
+    assert evaluate.await_args.kwargs["arg"]["redirect"] == "error"
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,7 @@ profile, so an extension is the only way to automate that browser directly.
 
 ## Requirements
 
-- Chrome 125 or later
+- Chrome 138 or later
 - A local Skyvern MCP server connected over stdio
 
 Hosted MCP is not supported yet.
@@ -39,8 +39,9 @@ and prints the remaining steps:
 skyvern browser extension-install
 ```
 
-Then enable **Developer mode**, click **Load unpacked**, and select the printed directory. Start your extension-mode MCP
-server and run `skyvern browser extension-pair` to open the pairing page.
+Then enable **Developer mode**, click **Load unpacked**, and select the printed directory. Open **Details** for
+**Skyvern Agent** and enable **Allow User Scripts**. Start your extension-mode MCP server and run
+`skyvern browser extension-pair` to open the pairing page.
 
 For manual setup:
 
@@ -54,6 +55,7 @@ For manual setup:
 3. Enable **Developer mode**.
 4. Click **Load unpacked**.
 5. Select the directory printed by the command.
+6. Open the extension's **Details** page and enable **Allow User Scripts**.
 
 ---
 
@@ -166,9 +168,15 @@ Skyvern's scope includes:
 - Tabs Skyvern creates and adds to **Skyvern Controlled**
 - Popups opened by a controlled tab and added to **Skyvern Controlled**
 
-When Skyvern attaches to a controlled tab, Chrome displays its debugger infobar; Skyvern never hides it. Clicking
-**Cancel** in that infobar immediately revokes access to the tab, and Skyvern does not automatically reattach. Skyvern
-also never closes or restarts your Chrome browser.
+The extension requests access to HTTP and HTTPS pages so `skyvern_evaluate` can run caller-supplied JavaScript through
+Chrome's User Scripts API. This direct path runs in the page's main context without depending on the page's content
+security policy. It verifies the exact tab-group identity before and after each command. The broker can keep
+`about:blank` as a controlled root tab while it waits for navigation, but direct evaluation refuses `about:blank` and
+every other non-HTTP(S) URL.
+
+Debugger-based commands display Chrome's debugger infobar; Skyvern never hides it. Clicking **Cancel** in that infobar
+immediately revokes debugger access to the tab, and Skyvern does not automatically reattach. Main-context JavaScript
+commands do not attach the debugger or display its infobar. Skyvern never closes or restarts your Chrome browser.
 
 The extension connects outbound to a bridge bound only to `127.0.0.1`. The default endpoint is
 `ws://127.0.0.1:19777/extension/v1`. On macOS and Linux, a persistent daemon owns this listener and MCP processes reach
@@ -185,7 +193,6 @@ The extension refuses to control `chrome://`, `chrome-untrusted://`, `chrome-ext
 - Downloads and file-chooser management are not supported yet.
 - Incognito windows are not supported.
 - Opening DevTools for a controlled tab detaches Skyvern and revokes access to that tab.
-- The current broker generation admits one local Skyvern MCP client at a time.
 - Hosted Skyvern MCP cannot use the extension yet.
 - Chrome internal pages, extension pages, DevTools, local files, the Chrome Web Store, and the other restricted targets
   listed above cannot be controlled.

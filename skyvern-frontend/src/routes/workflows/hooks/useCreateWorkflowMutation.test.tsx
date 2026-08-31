@@ -57,7 +57,7 @@ describe("useCreateWorkflowMutation", () => {
     });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(OnboardingTelemetry.flowCompleted).toHaveBeenCalledWith("dashboard");
+    expect(OnboardingTelemetry.flowCompleted).toHaveBeenCalledWith("discover");
   });
 
   it("does not emit flow_completed for non-onboarding creations", async () => {

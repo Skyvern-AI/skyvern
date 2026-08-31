@@ -105,6 +105,9 @@ class RealBrowserState(BrowserState):
         # A release retry after a transient DB failure must not repeat local CDP teardown.
         self._remote_driver_detached = False
         self._browser_state_diagnostic: BrowserStateDiagnostic | None = None
+        # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
+        # response). Read by the Task V3 loop to classify a dead/removed starting URL; v1 ignores it.
+        self.last_navigation_status: int | None = None
         self._ever_connected = browser_context is not None
         self._close_requested = False
         self._disconnect_listener_context: BrowserContext | None = None
@@ -332,7 +335,7 @@ class RealBrowserState(BrowserState):
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None:
-        await navigate_with_retry(
+        self.last_navigation_status = await navigate_with_retry(
             navigate=lambda strategy: page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
             url=url,
             retry_times=retry_times,
@@ -718,8 +721,11 @@ class RealBrowserState(BrowserState):
         if is_engine_timeout(error, self.engine_selection):
             skyvern_context.record_browser_timeout(BrowserOperation.RELOAD)
 
-    async def reload_page(self, degradation: bool = False) -> None:
-        page = await self.__assert_page()
+    async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None:
+        # A caller that pins its own page passes it, since the working-page accessor would reload
+        # (and repoint to) the newest tab instead.
+        if page is None:
+            page = await self.__assert_page()
         url = page.url
 
         if not degradation:

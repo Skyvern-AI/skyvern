@@ -168,6 +168,22 @@ describe("RunStopButton concurrency with a live block run", () => {
     expect(screen.queryByRole("button", { name: /Run/ })).toBeNull();
   });
 
+  test("an unavailable status replaces Stop with Run for its retained running payload", () => {
+    workflowRunQueryMock.mockReturnValue({
+      data: {
+        workflow_run_id: "wr_1",
+        status: Status.Running,
+        task_v2: null,
+        workflow: { deleted_at: null },
+      },
+      isError: true,
+    });
+
+    renderAt("/workflows/wpid_1/studio?wr=wr_1");
+    expect(screen.queryByRole("button", { name: /Stop/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
+  });
+
   test("a finalized workflow run reruns with the legacy navigation state", () => {
     mockRun(Status.Completed);
     renderAt("/workflows/wpid_1/studio?wr=wr_1");

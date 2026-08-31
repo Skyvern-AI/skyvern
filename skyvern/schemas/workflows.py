@@ -733,6 +733,7 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD  # type: ignore
     vault_id: str
     item_id: str
+    totp_field_name: str | None = None
 
 
 class AzureVaultCredentialParameterYAML(ParameterYAML):

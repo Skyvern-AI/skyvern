@@ -105,6 +105,11 @@ def redact_raw_secrets_for_structured_prompt(text: str) -> str:
     return json.dumps(_redact_string_values(payload), indent=2)
 
 
+def redact_raw_secrets_in_object(node: object) -> object:
+    """Redact every string inside a parsed structure, leaving its shape and non-string values."""
+    return _redact_string_values(node)
+
+
 def _redact_string_values(node: object) -> object:
     if isinstance(node, str):
         return redact_raw_secrets_for_prompt(node)

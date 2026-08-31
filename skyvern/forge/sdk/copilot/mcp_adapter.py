@@ -45,14 +45,20 @@ from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
+    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserSessionUnavailable,
+    bound_call_browser_session,
+    browser_evidence_commit_lock,
+    browser_page_custody_lock,
     close_browser_session_quietly,
+    current_call_browser_session_override,
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
     resolve_browser_state_for_context,
     retire_browser_session_id,
+    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -66,6 +72,20 @@ from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
+
+from skyvern.forge.sdk.copilot.browser_target import (
+    BROWSER_TARGET_PARAM,
+    BROWSER_TARGET_PARAM_NAME,
+    BrowserSessionBinding,
+    resolve_browser_session_binding,
+)
+
+__all__ = [
+    "BROWSER_TARGET_PARAM",
+    "BROWSER_TARGET_PARAM_NAME",
+    "BrowserSessionBinding",
+    "resolve_browser_session_binding",
+]
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -96,6 +116,9 @@ class _BrowserCallOutcome:
     response_truncated: bool
     payload_omitted: bool
     session_loss_disposition: _BrowserSessionLossDisposition | None = None
+    # Carried beside the disposition because the projection is the only thing the primary browser
+    # tools return, and it has no context to read the cause from.
+    session_loss_deadline_expired: bool = False
     replacement_browser_session_id: str | None = None
     completion_browser_session_id: str | None = None
     completion_browser_session_generation: int | None = None
@@ -255,6 +278,7 @@ def _not_dispatched_browser_call_outcome(
             error_kind="protocol",
         ),
         session_loss_disposition=session_loss_disposition,
+        session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
         replacement_browser_session_id=(
             ctx.browser_session_id if session_loss_disposition == "reestablished" else None
         ),
@@ -336,7 +360,11 @@ def _project_browser_call_outcome(
         raw_result = outcome.raw_result()
         result = mcp_to_copilot(raw_result) if raw_result else {}
     if outcome.session_loss_disposition is not None:
-        result = _browser_session_loss_result(result, disposition=outcome.session_loss_disposition)
+        result = _browser_session_loss_result(
+            result,
+            disposition=outcome.session_loss_disposition,
+            deadline_expired=outcome.session_loss_deadline_expired,
+        )
     return result
 
 
@@ -360,13 +388,21 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "post_run_page_observation_workflow_run_id",
     "post_run_page_observation_after_failed_test",
     "post_run_page_observation_generation",
+    "post_run_current_page_inspection_workflow_run_id",
+    "observed_browser_urls",
     "latest_recorded_build_test_outcome",
+    "recorded_build_test_outcome_history",
+    "recorded_persisted_block_run_workflow_run_id",
     "code_only_target_page_evidence_seen",
     "last_scout_observation_trajectory_index",
     "last_scout_observation_has_password_control",
+    "last_scout_act_observe_outcome",
+    "last_scout_act_observe_packet",
     "scouted_output_covered_paths",
     "scout_observed_terminal_criterion_ids",
     "scout_observation_contract",
+    "pending_scout_read_expression",
+    "pending_scout_read_output_path",
 )
 
 
@@ -415,6 +451,10 @@ _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
 _SESSION_LOST_USER_FACING_REASON = (
     "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
 )
+_SESSION_DEADLINE_EXPIRED_USER_FACING_REASON = (
+    "The browser session reached the time limit fixed for it and was ended, and I couldn't "
+    "re-establish it. Please retry this turn."
+)
 _FALLBACK_LOGGER = logging.getLogger(__name__)
 
 
@@ -431,6 +471,8 @@ class _BrowserSessionContinuityOutcome:
     root_session_id: str
     disposition: Literal["reestablished", "failed"]
     replacement_session_id: str | None
+    # The session reached the deadline its infrastructure fixes rather than failing unexplained.
+    deadline_expired: bool = False
 
 
 @dataclass
@@ -520,6 +562,7 @@ def _decode_continuity_outcome(raw: object) -> _BrowserSessionContinuityOutcome 
         root_session_id=data["root_session_id"],
         disposition=disposition,
         replacement_session_id=replacement,
+        deadline_expired=data.get("deadline_expired") is True,
     )
 
 
@@ -554,6 +597,7 @@ async def _store_continuity_outcome(organization_id: str, outcome: _BrowserSessi
                 "root_session_id": outcome.root_session_id,
                 "disposition": outcome.disposition,
                 "replacement_session_id": outcome.replacement_session_id,
+                "deadline_expired": outcome.deadline_expired,
             }
         ),
         ex=_CONTINUITY_COORDINATION_TTL,
@@ -713,12 +757,16 @@ def _log_mcp_timing(
 
 
 def _browser_session_loss_result(
-    result: dict[str, Any], *, disposition: Literal["reestablished", "failed"]
+    result: dict[str, Any],
+    *,
+    disposition: Literal["reestablished", "failed"],
+    deadline_expired: bool = False,
 ) -> dict[str, Any]:
     data = result.get("data")
     continuity = {
         "source": "direct_mcp",
         "disposition": disposition,
+        "cause": "fixed_deadline_expiry" if deadline_expired else "unknown",
         "fresh_state_required": disposition == "reestablished",
         "prior_action_effect": "unknown",
     }
@@ -726,11 +774,22 @@ def _browser_session_loss_result(
     result_data["browser_session_continuity"] = continuity
     if disposition == "reestablished":
         error = (
-            "The browser session was lost during this operation. A fresh browser session is ready; "
+            "The browser session reached the time limit fixed for it and was ended during this "
+            "operation. A fresh browser session is ready, on the same kind of time limit; inspect "
+            "the page before continuing because the prior operation's effect is unknown."
+            if deadline_expired
+            else "The browser session was lost during this operation. A fresh browser session is ready; "
             "inspect the page before continuing because the prior operation's effect is unknown."
         )
+    elif current_call_browser_session_override() is not None:
+        # The chat's browser is fine; the one this call was aimed at is gone. Retrying the turn,
+        # which is what the chat-flavoured wording asks for, would not bring it back.
+        error = (
+            "The browser this call targeted is no longer available, so its page cannot be observed. "
+            "Continue from the evidence the run already returned, or run the blocks again."
+        )
     else:
-        error = _SESSION_LOST_USER_FACING_REASON
+        error = _SESSION_DEADLINE_EXPIRED_USER_FACING_REASON if deadline_expired else _SESSION_LOST_USER_FACING_REASON
     return {
         **result,
         "ok": False,
@@ -741,15 +800,24 @@ def _browser_session_loss_result(
 
 
 def _browser_session_loss_blocker_signal(
-    *, tool_name: str, call_path: Literal["model", "internal"], lost_session_id: str
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+    deadline_expired: bool = False,
 ) -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=(
-            "The browser session was confirmed lost and one replacement attempt failed. "
+            "The browser session reached the time limit fixed for it and one replacement attempt "
+            "failed. End the turn from the recorded session-loss evidence."
+            if deadline_expired
+            else "The browser session was confirmed lost and one replacement attempt failed. "
             "End the turn from the recorded session-loss evidence."
         ),
-        user_facing_reason=_SESSION_LOST_USER_FACING_REASON,
+        user_facing_reason=(
+            _SESSION_DEADLINE_EXPIRED_USER_FACING_REASON if deadline_expired else _SESSION_LOST_USER_FACING_REASON
+        ),
         recovery_hint="report_blocker_to_user",
         preserves_workflow_draft=True,
         renders_final_reply=True,
@@ -764,6 +832,27 @@ def _browser_session_loss_blocker_signal(
     )
 
 
+async def _session_reached_its_fixed_deadline(organization_id: str, session_id: str) -> bool:
+    """Whether the lost session was ended by its own time limit rather than failing unexplained.
+
+    A session on infrastructure that pins the deadline at provisioning is killed on the clock while
+    it is still healthy, so the loss the turn sees is expected and periodic rather than a browser
+    fault (SKY-15044). Asked as "has that deadline passed?" rather than read off the row's status:
+    the worker writes the terminal status only after tearing the provider's browser down, so an
+    attach failing inside that window still finds a row marked running. The deadline is fixed when
+    the browser is handed over and never moves, so it answers correctly throughout.
+    """
+    reached = False
+    # Contained, comparison included: this only names a cause, and nothing about resolving it --
+    # including a manager that answers with something uncomparable -- may stop the replacement.
+    with contained_effect("resolve copilot browser session end reason", session_id=session_id):
+        remaining_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
+            session_id, organization_id
+        )
+        reached = remaining_seconds is not None and remaining_seconds <= 0
+    return reached
+
+
 async def _handle_browser_session_loss(
     ctx: AgentContext,
     *,
@@ -771,6 +860,19 @@ async def _handle_browser_session_loss(
     call_path: Literal["model", "internal"],
     lost_session_id: str,
 ) -> Literal["reestablished", "failed"]:
+    targeted_session_id = current_call_browser_session_override()
+    if targeted_session_id is not None and lost_session_id == targeted_session_id != ctx.browser_session_id:
+        # Continuity recovery closes the lost browser and rebinds the chat to a replacement, which
+        # is only ever right for the chat's own session. A call targeted at another browser reports
+        # that browser as gone; it must not tear it down, and must not swap the chat's out from
+        # under the turn because a browser it does not own died.
+        LOG.info(
+            "Browser session loss on a targeted session; leaving chat continuity untouched",
+            tool=tool_name,
+            call_path=call_path,
+        )
+        return "failed"
+
     local_replacements = getattr(ctx, "browser_session_replacements", {})
     if lost_session_id in local_replacements:
         return "reestablished" if local_replacements[lost_session_id] is not None else "failed"
@@ -782,6 +884,8 @@ async def _handle_browser_session_loss(
             return recorded.disposition
 
         root_session_id = await _get_continuity_root(ctx.organization_id, lost_session_id)
+        # Read before the close: the finalized row carries the reason, and closing it writes one.
+        deadline_expired = await _session_reached_its_fixed_deadline(ctx.organization_id, lost_session_id)
         _emit_continuity_event(
             ctx,
             tool_name=tool_name,
@@ -789,6 +893,7 @@ async def _handle_browser_session_loss(
             lost_session_id=lost_session_id,
             replacement_session_id=None,
             disposition="detected",
+            deadline_expired=deadline_expired,
         )
         await close_browser_session_quietly(ctx.organization_id, lost_session_id)
         retire_browser_session_id(ctx, lost_session_id)
@@ -799,6 +904,7 @@ async def _handle_browser_session_loss(
                 root_session_id=root_session_id,
                 disposition="failed",
                 replacement_session_id=None,
+                deadline_expired=deadline_expired,
             )
         else:
             try:
@@ -816,6 +922,7 @@ async def _handle_browser_session_loss(
                 root_session_id=lost_session_id,
                 disposition="reestablished" if replacement_session_id is not None else "failed",
                 replacement_session_id=replacement_session_id,
+                deadline_expired=deadline_expired,
             )
 
         await _store_continuity_outcome(ctx.organization_id, outcome)
@@ -827,6 +934,7 @@ async def _handle_browser_session_loss(
             lost_session_id=lost_session_id,
             replacement_session_id=outcome.replacement_session_id,
             disposition=outcome.disposition,
+            deadline_expired=outcome.deadline_expired,
         )
         return outcome.disposition
 
@@ -839,6 +947,7 @@ def _emit_continuity_event(
     lost_session_id: str,
     replacement_session_id: str | None,
     disposition: Literal["detected", "reestablished", "failed"],
+    deadline_expired: bool,
 ) -> None:
     # The payload is built inside the guard too: this emit sits ahead of the recovery
     # call, so a failure anywhere in it -- not just in the sink -- would leave
@@ -857,6 +966,7 @@ def _emit_continuity_event(
             "call_path": call_path,
             "continuity_source": "direct_mcp",
             "continuity_disposition": disposition,
+            "deadline_expired": deadline_expired,
             **_copilot_log_fields(cast("CopilotContext", ctx)),
         }
         log = LOG.info if disposition == "reestablished" else LOG.warning
@@ -885,6 +995,7 @@ def _apply_continuity_outcome(
     replacements[outcome.lost_session_id] = outcome.replacement_session_id
     ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
     ctx.browser_session_continuity_disposition = outcome.disposition
+    ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
     if outcome.disposition == "failed":
         stash_blocker_signal(
             ctx,
@@ -892,6 +1003,7 @@ def _apply_continuity_outcome(
                 tool_name=tool_name,
                 call_path=call_path,
                 lost_session_id=outcome.lost_session_id,
+                deadline_expired=outcome.deadline_expired,
             ),
         )
 
@@ -904,6 +1016,12 @@ async def _prepare_browser_session_for_dispatch(
     observed_generation: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _BrowserSessionLossDisposition | None]:
     """Verify the current session and return any error, continuity result, and fresh disposition."""
+    targeted_session_id = current_call_browser_session_override()
+    if targeted_session_id is not None and targeted_session_id != ctx.browser_session_id:
+        # This call acts in a browser the chat does not own, so the chat's continuity is not its
+        # precondition. The dispatch is the oracle for the targeted session; a dead one lands in
+        # _handle_browser_session_loss, which refuses the call without disturbing the chat.
+        return None, None, None
     async with _context_browser_session_recovery_lock(ctx):
         if getattr(ctx, "browser_session_continuity_generation", 0) != observed_generation:
             disposition: Literal["reestablished", "failed"] = (
@@ -911,7 +1029,15 @@ async def _prepare_browser_session_for_dispatch(
                 if getattr(ctx, "browser_session_continuity_disposition", None) == "reestablished"
                 else "failed"
             )
-            return None, _browser_session_loss_result({}, disposition=disposition), disposition
+            return (
+                None,
+                _browser_session_loss_result(
+                    {},
+                    disposition=disposition,
+                    deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                ),
+                disposition,
+            )
 
         prior_session_id = ctx.browser_session_id
         if not prior_session_id:
@@ -921,7 +1047,15 @@ async def _prepare_browser_session_for_dispatch(
             recorded = await _get_continuity_outcome(ctx.organization_id, prior_session_id)
             if recorded is not None:
                 _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
-                return None, _browser_session_loss_result({}, disposition=recorded.disposition), recorded.disposition
+                return (
+                    None,
+                    _browser_session_loss_result(
+                        {},
+                        disposition=recorded.disposition,
+                        deadline_expired=recorded.deadline_expired,
+                    ),
+                    recorded.disposition,
+                )
         # The attach in mcp_browser_context is the oracle; a lost session is handled where it is discovered.
         return None, None, None
 
@@ -1005,10 +1139,11 @@ def _transform_args(
 
 def _copilot_to_call_tool_result(
     copilot_result: dict[str, Any],
+    tool_name: str = "",
 ) -> CallToolResult:
     if not copilot_result:
         return CallToolResult(content=[], isError=True)
-    sanitized = sanitize_tool_result_for_llm("", copilot_result)
+    sanitized = sanitize_tool_result_for_llm(tool_name, copilot_result)
     marked = mark_mcp_result_untrusted_for_llm(sanitized)
     content: list[TextContent] = [TextContent(type="text", text=json.dumps(marked))]
     is_error = copilot_result.get("ok", True) is not True
@@ -1251,15 +1386,40 @@ class SkyvernOverlayMCPServer(MCPServer):
         meta: dict[str, Any] | None = None,
     ) -> CallToolResult:
         propagated_error: BaseException
+        copilot_ctx = self._context_provider()
+        overlay = self._overlays.get(tool_name, SchemaOverlay())
+        # Bound out here so one call's browser reaches everything it touches: pre-hooks, session
+        # preparation, dispatch and post-hooks. Binding only the dispatch would collect evidence
+        # from one browser, act in another, then record the result from the first.
+        # Resolved once. A sibling call in the same turn can record or clear the run session, so
+        # resolving again for dispatch could bind the hooks to one browser and the dispatch to another.
+        call_binding = (
+            resolve_browser_session_binding(copilot_ctx, arguments or {}) if overlay.requires_browser else None
+        )
         try:
-            with pending_operation(f"mcp.call_tool:{tool_name}"):
-                return await self._call_tool(tool_name, arguments, meta)
+            if overlay.requires_browser:
+                async with browser_page_custody_lock(
+                    copilot_ctx, session_id=call_binding.session_id_for(copilot_ctx) if call_binding else None
+                ):
+                    with (
+                        pending_operation(f"mcp.call_tool:{tool_name}"),
+                        bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                    ):
+                        return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
+            else:
+                with (
+                    pending_operation(f"mcp.call_tool:{tool_name}"),
+                    bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                ):
+                    return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
         except BaseException as exc:
             if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 LOG.warning("MCP tool dispatch failed")
                 return CallToolResult(content=[], isError=True)
             propagated_error = exc.with_traceback(None)
-            del self, tool_name, arguments, meta, exc
+            # Cancellation tracebacks retain this frame. Drop every local that can
+            # transitively reference parameter-bearing context before propagating it.
+            del self, tool_name, arguments, meta, copilot_ctx, overlay, call_binding, exc
         raise propagated_error from None
 
     async def _call_tool(
@@ -1267,6 +1427,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         tool_name: str,
         arguments: dict[str, Any] | None,
         meta: dict[str, Any] | None = None,
+        *,
+        binding: BrowserSessionBinding | None = None,
     ) -> CallToolResult:
         if not self._client:
             raise RuntimeError("Not connected — call connect() first")
@@ -1281,10 +1443,22 @@ class SkyvernOverlayMCPServer(MCPServer):
         if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
             raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
         observed_continuity_generation = copilot_ctx.browser_session_continuity_generation
-        attempt_browser_session_id = getattr(copilot_ctx, "browser_session_id", None)
+        attempt_browser_session_id = current_call_browser_session_override() or getattr(
+            copilot_ctx, "browser_session_id", None
+        )
         uses_shared_browser_outcome = mcp_name in _SHARED_BROWSER_OUTCOME_TOOLS
         dispatch_started = False
         phases = _PhaseClock()
+
+        if binding is None:
+            binding = resolve_browser_session_binding(copilot_ctx, arguments or {})
+
+        if overlay.requires_browser and binding.unavailable_reason:
+            # Refused before dispatch: a call aimed at the run's browser must not quietly act in
+            # the chat's, where a click or a fill would be a real side effect in the wrong place.
+            result = {"ok": False, "error": binding.unavailable_reason, **binding.provenance()}
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
+            return _copilot_to_call_tool_result(result, tool_name)
 
         policy = copilot_ctx.request_policy
         if overlay.requires_browser and isinstance(policy, RequestPolicy) and policy.raw_secret_detected:
@@ -1307,7 +1481,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 result = _scrub_tool_result(copilot_ctx, result)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
-            return _copilot_to_call_tool_result(result)
+            return _copilot_to_call_tool_result(result, tool_name)
 
         if overlay.pre_hook:
             try:
@@ -1338,7 +1512,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     hook_result = _scrub_tool_result(copilot_ctx, hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
-                return _copilot_to_call_tool_result(hook_result)
+                return _copilot_to_call_tool_result(hook_result, tool_name)
 
         mcp_args = _transform_args(arguments, overlay)
 
@@ -1391,7 +1565,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     err = _scrub_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-                return _copilot_to_call_tool_result(err)
+                return _copilot_to_call_tool_result(err, tool_name)
             if continuity_result is not None:
                 _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
                 if uses_shared_browser_outcome:
@@ -1409,9 +1583,9 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     continuity_result = _scrub_tool_result(copilot_ctx, continuity_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
-                return _copilot_to_call_tool_result(continuity_result)
-            mcp_args["session_id"] = copilot_ctx.browser_session_id
-        call_browser_session_id = copilot_ctx.browser_session_id if overlay.requires_browser else None
+                return _copilot_to_call_tool_result(continuity_result, tool_name)
+            mcp_args["session_id"] = binding.session_id_for(copilot_ctx)
+        call_browser_session_id = binding.session_id_for(copilot_ctx) if overlay.requires_browser else None
         call_browser_session_generation = copilot_ctx.browser_session_continuity_generation
 
         try:
@@ -1420,7 +1594,14 @@ class SkyvernOverlayMCPServer(MCPServer):
             # dispatch, where expiry can still truthfully report that no browser action started.
             if overlay.requires_browser:
                 phases.enter("context_enter")
-                async with mcp_browser_context(copilot_ctx):
+                # Only a call the model pointed elsewhere carries an override; the ordinary debug
+                # path resolves from the context, so a session re-established mid-dispatch applies.
+                browser_scope = (
+                    mcp_browser_context(copilot_ctx, session_id_override=binding.session_id_override)
+                    if binding.session_id_override
+                    else mcp_browser_context(copilot_ctx)
+                )
+                async with browser_scope:
                     phases.enter("dispatch")
                     dispatch_started = True
                     try:
@@ -1473,7 +1654,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 err = _scrub_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-            return _copilot_to_call_tool_result(err)
+            return _copilot_to_call_tool_result(err, tool_name)
         except CopilotBrowserSessionUnavailable as exc:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
             try:
@@ -1506,6 +1687,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 outcome = replace(
                     outcome,
                     session_loss_disposition=disposition,
+                    session_loss_deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
                     replacement_browser_session_id=(
                         copilot_ctx.browser_session_id if disposition == "reestablished" else None
                     ),
@@ -1520,10 +1702,14 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 err = _scrub_tool_result(
                     copilot_ctx,
-                    _browser_session_loss_result({}, disposition=disposition),
+                    _browser_session_loss_result(
+                        {},
+                        disposition=disposition,
+                        deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                    ),
                 )
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-            return _copilot_to_call_tool_result(err)
+            return _copilot_to_call_tool_result(err, tool_name)
         except asyncio.CancelledError:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
             if uses_shared_browser_outcome:
@@ -1560,7 +1746,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
-            return _copilot_to_call_tool_result(err)
+            return _copilot_to_call_tool_result(err, tool_name)
 
         browser_outcome: _BrowserCallOutcome | None = None
         if uses_shared_browser_outcome:
@@ -1622,12 +1808,17 @@ class SkyvernOverlayMCPServer(MCPServer):
                 browser_outcome = replace(
                     browser_outcome.with_raw_result(raw_mcp),
                     session_loss_disposition=disposition,
+                    session_loss_deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
                     replacement_browser_session_id=(
                         copilot_ctx.browser_session_id if disposition == "reestablished" else None
                     ),
                 )
             else:
-                copilot_result = _browser_session_loss_result(mcp_to_copilot(raw_mcp), disposition=disposition)
+                copilot_result = _browser_session_loss_result(
+                    mcp_to_copilot(raw_mcp),
+                    disposition=disposition,
+                    deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                )
 
         if browser_outcome is not None:
             if browser_outcome.session_loss_disposition is None:
@@ -1642,16 +1833,32 @@ class SkyvernOverlayMCPServer(MCPServer):
         elif not session_lost:
             copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
 
+        if overlay.requires_browser and isinstance(copilot_result, dict):
+            # Stamped before the post-hook, which is allowed to fail back to this base result: a
+            # browser answer whose provenance dropped is a silent cross-browser read.
+            copilot_result.update(binding.provenance())
+
         if overlay.post_hook and not session_lost:
-            base_copilot_result = deepcopy(copilot_result)
-            ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
-            try:
-                copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
-            except Exception:
-                # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
-                _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
-                copilot_result = base_copilot_result
+            async with browser_evidence_commit_lock(copilot_ctx):
+                base_copilot_result = deepcopy(copilot_result)
+                ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+                try:
+                    copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+                    # The adapter is the last disclosure boundary. Production custody changes share
+                    # this call's outer lock; this gate also fails closed if an unexpected producer
+                    # marks the exact session while an enrichment awaits.
+                    if overlay.requires_browser and sensitive_origin_page_is_tainted(copilot_ctx):
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        copilot_result = {
+                            "ok": False,
+                            "error": SENSITIVE_ORIGIN_PAGE_ERROR,
+                            **binding.provenance(),
+                        }
+                except Exception:
+                    # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                    _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                    LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
+                    copilot_result = base_copilot_result
 
         copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
@@ -1676,7 +1883,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 action_relation=ScreenshotActionRelation.TOOL_RESULT,
             ),
         )
-        return _copilot_to_call_tool_result(copilot_result)
+        return _copilot_to_call_tool_result(copilot_result, tool_name)
 
     async def call_internal_tool(
         self,
@@ -1736,7 +1943,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         if not isinstance(requested_session_id, str) or not requested_session_id:
             requested_session_id = None
         observed_continuity_generation = ctx.browser_session_continuity_generation
-        attempt_browser_session_id = requested_session_id or ctx.browser_session_id
+        call_session_override = current_call_browser_session_override()
+        attempt_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
         uses_shared_browser_outcome = mcp_tool_name in _SHARED_BROWSER_OUTCOME_TOOLS
         dispatch_started = False
         if not self._client:
@@ -1826,14 +2034,21 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _InternalToolCallResult(result=_scrub_tool_result(ctx, continuity_result))
         # An explicit session is a dispatch lease chosen before session preparation awaits. Do not
         # relabel that call with mutable ambient context if another concurrent tool replaces it.
-        call_browser_session_id = requested_session_id or ctx.browser_session_id
+        call_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
         merged_args = {**mcp_args, "session_id": call_browser_session_id}
         call_browser_session_generation = ctx.browser_session_continuity_generation
         browser_outcome: _BrowserCallOutcome | None = None
         post_dispatch_status: Literal["ok", "error", "session_error"] = "ok"
         try:
             phases.enter("context_enter")
-            async with mcp_browser_context(ctx):
+            # Only pass the override when there is one, as the model-facing path does: an
+            # unconditional keyword reaches callers that resolve the session themselves.
+            browser_scope = (
+                mcp_browser_context(ctx, session_id_override=call_session_override)
+                if call_session_override
+                else mcp_browser_context(ctx)
+            )
+            async with browser_scope:
                 phases.enter("dispatch")
                 dispatch_started = True
                 try:
@@ -1932,6 +2147,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 outcome = replace(
                     outcome,
                     session_loss_disposition=disposition,
+                    session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
                     replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
                     completion_browser_session_id=ctx.browser_session_id,
                     completion_browser_session_generation=ctx.browser_session_continuity_generation,
@@ -1943,7 +2159,14 @@ class SkyvernOverlayMCPServer(MCPServer):
                     browser_outcome=outcome,
                 )
             return _InternalToolCallResult(
-                result=_scrub_tool_result(ctx, _browser_session_loss_result({}, disposition=disposition))
+                result=_scrub_tool_result(
+                    ctx,
+                    _browser_session_loss_result(
+                        {},
+                        disposition=disposition,
+                        deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    ),
+                )
             )
         except Exception as exc:
             LOG.warning("Internal MCP tool call failed", tool=mcp_tool_name)
@@ -2014,6 +2237,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 browser_outcome = replace(
                     browser_outcome.with_raw_result(scrubbed),
                     session_loss_disposition=disposition,
+                    session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
                     replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
                 )
                 browser_outcome = replace(
@@ -2027,7 +2251,11 @@ class SkyvernOverlayMCPServer(MCPServer):
                     browser_outcome=browser_outcome,
                 )
             return _InternalToolCallResult(
-                result=_browser_session_loss_result(mcp_to_copilot(scrubbed), disposition=disposition)
+                result=_browser_session_loss_result(
+                    mcp_to_copilot(scrubbed),
+                    disposition=disposition,
+                    deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                )
             )
         if browser_outcome is not None:
             browser_outcome = replace(

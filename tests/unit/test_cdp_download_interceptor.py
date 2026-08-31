@@ -99,6 +99,22 @@ def test_successful_scope_rebind_restores_installed_browser_monitor(tmp_path: Pa
     assert interceptor.download_scope == "next"
 
 
+def test_scope_rebind_retains_recovery_tuples_and_marker_until_request_termination(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(
+        output_dir=str(tmp_path / "prior"), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior")
+    )
+    session = MagicMock()
+    interceptor._recovery_request_ids[(session, "r")] = interceptor._recovery_marker
+    old_marker = interceptor._recovery_marker
+    interceptor._active_recovery_markers.add(old_marker)
+    interceptor.rebind_download_scope(
+        download_dir=str(tmp_path / "next"), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next")
+    )
+    assert interceptor._recovery_request_ids[(session, "r")] == old_marker
+    assert interceptor._recovery_marker != old_marker
+    assert old_marker in interceptor._active_recovery_markers
+
+
 def test_invalidated_scope_cannot_publish_in_flight_artifact(tmp_path: Path) -> None:
     output_dir = tmp_path / "prior"
     interceptor = _make_interceptor(
@@ -168,6 +184,473 @@ async def test_browser_download_event_metadata_is_redacted_from_logs() -> None:
     assert secret_url not in rendered_logs
     assert secret_filename not in rendered_logs
     assert "suggested_filename_fp" in rendered_logs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"x-skyvern-recovery-marker": "TOKEN", "X-Other": "v"},
+        [{"name": "X-SKYVERN-RECOVERY-MARKER", "value": "TOKEN"}, {"name": "X-Other", "value": "v"}],
+    ],
+)
+async def test_response_stage_exact_marker_continues_without_download(tmp_path: Path, headers: Any) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    interceptor._recovery_marker = "TOKEN"
+    interceptor._active_recovery_markers.add("TOKEN")
+    session = MagicMock()
+    session.send = AsyncMock()
+    request_event = {
+        "requestId": "r",
+        "request": {"method": "GET", "url": "https://x/a", "headers": headers},
+        "resourceType": "Document",
+    }
+    with patch.object(interceptor, "_handle_download", new=AsyncMock()) as handle:
+        await interceptor._handle_request_paused(request_event, session)
+        assert session.send.await_args_list[-1].args == (
+            "Fetch.continueRequest",
+            {"requestId": "r", "headers": [{"name": "X-Other", "value": "v"}]},
+        )
+        response_event = {
+            "requestId": "r",
+            "responseStatusCode": 200,
+            "request": {"url": "https://x/a", "headers": {}},
+            "responseHeaders": [{"name": "Content-Type", "value": "application/pdf"}],
+            "resourceType": "Document",
+        }
+        await interceptor._handle_request_paused(response_event, session)
+    assert session.send.await_args_list[-1].args == ("Fetch.continueResponse", {"requestId": "r"})
+    handle.assert_not_awaited()
+    assert not interceptor._recovery_request_ids
+
+
+@pytest.mark.asyncio
+async def test_recovery_request_ids_are_scoped_to_cdp_session(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    interceptor._recovery_marker = "TOKEN"
+    session_a, session_b = MagicMock(), MagicMock()
+    session_a.send = AsyncMock()
+    session_b.send = AsyncMock()
+    for session in (session_a, session_b):
+        await interceptor._handle_request_paused(
+            {"requestId": "r", "request": {"url": "https://x/a", "headers": {"x-skyvern-recovery-marker": "TOKEN"}}},
+            session,
+        )
+    # Remove B's marker to model the collision: only A is an authorized recovery.
+    interceptor._recovery_request_ids = {(session_a, "r"): "TOKEN"}
+    response = {
+        "requestId": "r",
+        "responseStatusCode": 200,
+        "request": {"url": "https://x/a", "headers": {}},
+        "responseHeaders": [{"name": "Content-Type", "value": "application/pdf"}],
+        "resourceType": "Document",
+    }
+    with patch.object(interceptor, "_handle_download", new=AsyncMock()) as handle:
+        await interceptor._handle_request_paused(response, session_b)
+        handle.assert_awaited_once()
+        await interceptor._handle_request_paused(response, session_a)
+    assert not interceptor._recovery_request_ids
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_retains_marker_on_timeout_until_request_termination() -> None:
+    interceptor = _make_interceptor()
+    page, session = MagicMock(), MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    interceptor._active_request_interceptors[session] = (page, MagicMock())
+    interceptor._recovery_request_ids[(session, "r")] = interceptor._recovery_marker
+    interceptor._active_recovery_markers.add(interceptor._recovery_marker)
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") is None
+    assert interceptor._recovery_request_ids
+    assert interceptor._active_recovery_markers
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_keeps_marker_authorized_across_page_retries() -> None:
+    interceptor = _make_interceptor()
+    page1, page2 = MagicMock(), MagicMock()
+    session1, session2 = MagicMock(), MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page1, page2])
+    interceptor._active_request_interceptors.update({session1: (page1, MagicMock()), session2: (page2, MagicMock())})
+    marker = interceptor._recovery_marker
+
+    async def read(*, page: Any, **_: Any) -> bytes | None:
+        session = session1 if page is page1 else session2
+        request_id = "r1" if page is page1 else "r2"
+        assert marker in interceptor._active_recovery_markers
+        assert interceptor._register_recovery_request(session, request_id, marker)
+        interceptor._discard_recovery_request(session, request_id)
+        assert marker in interceptor._active_recovery_markers
+        return None if page is page1 else b"payload"
+
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", side_effect=read):
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") == b"payload"
+    assert not interceptor._active_recovery_call_markers
+    assert marker not in interceptor._active_recovery_markers
+    assert not interceptor._recovery_request_ids
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_continues_after_html_gate() -> None:
+    interceptor = _make_interceptor()
+    page1, page2 = MagicMock(), MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page1, page2])
+    gate = b"<!doctype html><html><body>login</body></html>"
+    payload = b"%PDF-1.7"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", side_effect=[gate, payload]) as read:
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") == payload
+    assert [call.kwargs["page"] for call in read.await_args_list] == [page1, page2]
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_returns_none_for_only_html_or_none_and_keeps_empty_terminal() -> None:
+    interceptor = _make_interceptor()
+    page1, page2 = MagicMock(), MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page1, page2])
+    gate = b"<html><body>login</body></html>"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", side_effect=[gate, None]) as read:
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") is None
+    assert read.await_count == 2
+
+    interceptor._browser_context = MagicMock(pages=[page1, page2])
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", side_effect=[b""]) as read:
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") == b""
+    assert read.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_releases_exact_marker_when_scope_rebinds(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path / "prior"))
+    page, session = MagicMock(), MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    interceptor._active_request_interceptors[session] = (page, MagicMock())
+    old_marker = interceptor._recovery_marker
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def read(*_args: Any, **_kwargs: Any) -> None:
+        entered.set()
+        await release.wait()
+        return None
+
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=read):
+        task = asyncio.create_task(interceptor._fetch_download_bytes_in_page("https://x/a"))
+        await entered.wait()
+        interceptor.rebind_download_scope(
+            download_dir=str(tmp_path / "next"), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next")
+        )
+        new_marker = interceptor._recovery_marker
+        release.set()
+        assert await task is None
+    assert old_marker not in interceptor._active_recovery_call_markers
+    assert old_marker not in interceptor._active_recovery_markers
+    assert new_marker not in interceptor._active_recovery_markers
+
+
+@pytest.mark.asyncio
+async def test_recovery_helper_preserves_mapped_old_marker_after_rebind(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path / "prior"))
+    page, session = MagicMock(), MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    interceptor._active_request_interceptors[session] = (page, MagicMock())
+    old_marker = interceptor._recovery_marker
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def read(*_args: Any, **_kwargs: Any) -> None:
+        interceptor._register_recovery_request(session, "r", old_marker)
+        entered.set()
+        await release.wait()
+        return None
+
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=read):
+        task = asyncio.create_task(interceptor._fetch_download_bytes_in_page("https://x/a"))
+        await entered.wait()
+        interceptor.rebind_download_scope(
+            download_dir=str(tmp_path / "next"), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next")
+        )
+        new_marker = interceptor._recovery_marker
+        release.set()
+        assert await task is None
+    assert interceptor._recovery_request_ids[(session, "r")] == old_marker
+    assert old_marker in interceptor._active_recovery_markers
+    assert new_marker not in interceptor._active_recovery_markers
+    interceptor._discard_recovery_request(session, "r")
+    assert old_marker not in interceptor._active_recovery_markers
+
+
+@pytest.mark.asyncio
+async def test_timeout_recovery_late_request_response_releases_exact_state(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    page, session = MagicMock(), MagicMock()
+    session.send = AsyncMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    interceptor._active_request_interceptors[session] = (page, MagicMock())
+    marker = interceptor._recovery_marker
+    gate = asyncio.Event()
+
+    async def timed_out(*_args: Any, **_kwargs: Any) -> None:
+        await gate.wait()
+
+    async def timed_out_read(*_args: Any, **_kwargs: Any) -> None:
+        assert interceptor._register_recovery_request(session, "r", marker)
+        return None
+
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=timed_out_read):
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") is None
+    assert marker in interceptor._active_recovery_markers
+    request = {"requestId": "r", "request": {"url": "https://x/a", "headers": {mod.RECOVERY_MARKER_HEADER: marker}}}
+    await interceptor._handle_request_paused(request, session)
+    assert (session, "r") in interceptor._recovery_request_ids
+    next_dir = tmp_path / "next"
+    interceptor.rebind_download_scope(
+        download_dir=str(next_dir), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next")
+    )
+    with patch.object(interceptor, "_handle_download", new=AsyncMock()) as handle:
+        await interceptor._handle_request_paused(
+            {
+                **request,
+                "responseStatusCode": 200,
+                "responseHeaders": [{"name": "Content-Type", "value": "application/pdf"}],
+            },
+            session,
+        )
+        handle.assert_not_awaited()
+    assert (session, "r") not in interceptor._recovery_request_ids
+    assert marker not in interceptor._active_recovery_markers
+    assert interceptor._run_download_bytes == 0
+    assert interceptor._run_download_file_count == 0
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_without_mapping_releases_marker_and_fails_late_request() -> None:
+    interceptor = _make_interceptor()
+    page, session = MagicMock(), MagicMock()
+    session.send = AsyncMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    interceptor._active_request_interceptors[session] = (page, MagicMock())
+    marker = interceptor._recovery_marker
+    blocker = asyncio.Event()
+
+    async def blocked(*_args: Any, **_kwargs: Any) -> bytes:
+        await blocker.wait()
+        return b"x"
+
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=blocked):
+        task = asyncio.create_task(interceptor._fetch_download_bytes_in_page("https://x/a"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert marker not in interceptor._active_recovery_markers
+    await interceptor._handle_request_paused(
+        {"requestId": "r", "request": {"url": "https://x/a", "headers": {mod.RECOVERY_MARKER_HEADER: marker}}}, session
+    )
+    session.send.assert_awaited_once_with("Fetch.failRequest", {"requestId": "r", "errorReason": "BlockedByClient"})
+    assert not interceptor._recovery_request_ids
+    assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+
+
+def test_recovery_caps_and_marker_collisions_preserve_existing_state() -> None:
+    interceptor = _make_interceptor()
+    session = MagicMock()
+    interceptor._recovery_request_ids[(session, "old")] = "old-marker"
+    interceptor._active_recovery_markers.add("old-marker")
+    interceptor._MAX_RECOVERY_REQUEST_IDS = 1
+    assert not interceptor._register_recovery_request(session, "new", "new-marker")
+    assert interceptor._recovery_request_ids == {(session, "old"): "old-marker"}
+    assert not interceptor._register_recovery_request(session, "old", "different")
+    interceptor._MAX_ACTIVE_RECOVERY_MARKERS = 1
+    assert not interceptor._register_recovery_marker("new-marker")
+
+
+def test_two_requests_sharing_marker_release_on_last_final_response() -> None:
+    interceptor = _make_interceptor()
+    a, b = MagicMock(), MagicMock()
+    interceptor._active_recovery_markers.add("m")
+    interceptor._recovery_request_ids = {(a, "1"): "m", (b, "2"): "m"}
+    interceptor._discard_recovery_request(a, "1")
+    assert "m" in interceptor._active_recovery_markers
+    interceptor._discard_recovery_request(b, "2")
+    assert "m" not in interceptor._active_recovery_markers
+
+
+def test_drop_session_recovery_state_preserves_other_session_marker() -> None:
+    interceptor = _make_interceptor()
+    a, b = MagicMock(), MagicMock()
+    interceptor._active_recovery_markers.update({"a", "shared"})
+    interceptor._recovery_request_ids = {(a, "1"): "shared", (a, "2"): "a", (b, "3"): "shared"}
+    interceptor._drop_session_recovery_state(a)
+    assert interceptor._recovery_request_ids == {(b, "3"): "shared"}
+    assert interceptor._active_recovery_markers == {"shared"}
+
+
+@pytest.mark.asyncio
+async def test_marked_redirect_response_discards_mapping_and_fails_closed() -> None:
+    interceptor = _make_interceptor()
+    session = MagicMock()
+    session.send = AsyncMock()
+    interceptor._recovery_request_ids[(session, "r")] = "m"
+    interceptor._active_recovery_markers.add("m")
+    await interceptor._handle_request_paused(
+        {
+            "requestId": "r",
+            "responseStatusCode": 302,
+            "request": {"url": "https://x"},
+            "responseHeaders": [],
+            "resourceType": "Document",
+        },
+        session,
+    )
+    assert (session, "r") not in interceptor._recovery_request_ids
+    assert session.send.await_args.args == ("Fetch.failRequest", {"requestId": "r", "errorReason": "BlockedByClient"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mapped", "reason"), [(True, "NameNotResolved"), (False, "Failed")])
+async def test_response_error_reason_fails_closed_without_egress_authorization(mapped: bool, reason: str) -> None:
+    monitor = MagicMock()
+    interceptor = _make_interceptor(network_egress_monitor=monitor)
+    session = MagicMock()
+    session.send = AsyncMock()
+    if mapped:
+        interceptor._recovery_request_ids[(session, "r")] = "m"
+        interceptor._active_recovery_markers.add("m")
+    await interceptor._handle_request_paused(
+        {"requestId": "r", "responseErrorReason": "NameNotResolved" if mapped else 42, "request": {"url": "https://x"}},
+        session,
+    )
+    monitor.authorize_request.assert_not_called()
+    assert (session, "r") not in interceptor._recovery_request_ids
+    assert session.send.await_args.args == ("Fetch.failRequest", {"requestId": "r", "errorReason": reason})
+
+
+@pytest.mark.asyncio
+async def test_request_stage_redirected_request_with_marker_fails_closed() -> None:
+    interceptor = _make_interceptor()
+    interceptor._active_recovery_markers.add("m")
+    session = MagicMock()
+    session.send = AsyncMock()
+    await interceptor._handle_request_paused(
+        {
+            "requestId": "new",
+            "redirectedRequestId": "old",
+            "request": {"url": "https://x", "headers": {mod.RECOVERY_MARKER_HEADER: "m"}},
+        },
+        session,
+    )
+    assert session.send.await_args.args == ("Fetch.failRequest", {"requestId": "new", "errorReason": "BlockedByClient"})
+
+
+@pytest.mark.asyncio
+async def test_request_stage_old_active_marker_is_stripped_until_fetch_cleanup(tmp_path: Path) -> None:
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = _make_interceptor(output_dir=str(tmp_path), network_egress_monitor=monitor)
+    session = MagicMock()
+    session.send = AsyncMock()
+    old_marker = interceptor._recovery_marker
+    interceptor._active_recovery_markers.add(old_marker)
+    interceptor.rebind_download_scope(
+        download_dir=str(tmp_path / "next"), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next")
+    )
+    assert interceptor._recovery_marker != old_marker
+    event = {"requestId": "r", "request": {"url": "https://x/a", "headers": {mod.RECOVERY_MARKER_HEADER: old_marker}}}
+    await interceptor._handle_request_paused(event, session)
+    assert session.send.await_args.args == ("Fetch.continueRequest", {"requestId": "r", "headers": []})
+    interceptor._active_recovery_markers.remove(old_marker)
+    session.send.reset_mock()
+    await interceptor._handle_request_paused(event, session)
+    assert session.send.await_args.args == ("Fetch.failRequest", {"requestId": "r", "errorReason": "BlockedByClient"})
+
+
+@pytest.mark.asyncio
+async def test_direct_download_recovery_rebind_does_not_mutate_new_scope_accounting(tmp_path: Path) -> None:
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    interceptor = _make_interceptor(
+        output_dir=str(old_dir), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("old")
+    )
+    interceptor._browser_context = TestDirectHttpDownloadAuthAndHtmlGuard._context()
+    gate = TestDirectHttpDownloadAuthAndHtmlGuard._LOGIN_HTML
+    with patch.object(
+        mod.file_api,
+        "fetch_file_bytes",
+        TestDirectHttpDownloadAuthAndHtmlGuard._guarded_fetch(gate, "text/html", "report.pdf"),
+        create=True,
+    ):
+        old_generation = interceptor._artifact_scope_generation
+
+        async def recover(*_args: Any, **_kwargs: Any) -> bytes:
+            interceptor.rebind_download_scope(
+                download_dir=str(new_dir), redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("new")
+            )
+            return b"%PDF recovered"
+
+        with patch.object(interceptor, "_fetch_download_bytes_in_page", side_effect=recover):
+            await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf", old_generation)
+    assert not list(old_dir.iterdir()) if old_dir.exists() else True
+    assert not list(new_dir.iterdir()) if new_dir.exists() else True
+    assert interceptor._run_download_bytes == 0
+    assert interceptor._run_download_file_count == 0
+    assert interceptor._run_download_bytes >= 0
+    assert interceptor._run_download_file_count >= 0
+    assert interceptor._active_download_attempts == {}
+
+
+@pytest.mark.asyncio
+async def test_request_stage_exact_marker_unauthorized_fails_closed() -> None:
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = False
+    interceptor = _make_interceptor(network_egress_monitor=monitor)
+    interceptor._recovery_marker = "TOKEN"
+    session = MagicMock()
+    session.send = AsyncMock()
+    await interceptor._handle_request_paused(
+        {"requestId": "r", "request": {"url": "https://x/a", "headers": {"x-skyvern-recovery-marker": "TOKEN"}}},
+        session,
+    )
+    session.send.assert_awaited_once_with("Fetch.failRequest", {"requestId": "r", "errorReason": "BlockedByClient"})
+    assert not interceptor._recovery_request_ids
+
+
+@pytest.mark.asyncio
+async def test_fetch_download_bytes_in_page_marker_only_for_active_page() -> None:
+    interceptor = _make_interceptor()
+    page = MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    interceptor._recovery_marker = "TOKEN"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=b"x")) as read:
+        interceptor._active_request_interceptors["p"] = (page, MagicMock())
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") == b"x"
+    assert read.await_args.kwargs["headers"] == {mod.RECOVERY_MARKER_HEADER: "TOKEN"}
+    assert read.await_args.kwargs["timeout_ms"] == mod.DOWNLOAD_RECOVERY_TIMEOUT_MS
+
+    interceptor._active_request_interceptors.clear()
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=b"x")) as read:
+        assert await interceptor._fetch_download_bytes_in_page("https://x/a") == b"x"
+    assert read.await_args.kwargs["headers"] is None
+    assert read.await_args.kwargs["timeout_ms"] == mod.DOWNLOAD_RECOVERY_TIMEOUT_MS
+
+
+@pytest.mark.asyncio
+async def test_response_stage_missing_or_wrong_marker_intercepts_download(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    interceptor._recovery_marker = "TOKEN"
+    for marker in (None, "WRONG"):
+        session = MagicMock()
+        session.send = AsyncMock()
+        headers = {} if marker is None else {"x-skyvern-recovery-marker": marker}
+        event = {
+            "requestId": "r",
+            "responseStatusCode": 200,
+            "request": {"url": "https://x/a", "headers": headers},
+            "responseHeaders": [{"name": "Content-Type", "value": "application/pdf"}],
+            "resourceType": "Document",
+        }
+        with patch.object(interceptor, "_handle_download", new=AsyncMock()) as handle:
+            await interceptor._handle_request_paused(event, session)
+        handle.assert_awaited_once()
 
 
 class TestIsDownloadResponse:
@@ -1540,6 +2023,7 @@ class TestCDPDownloadInterceptorProxyAuth:
         # Only one call: the original continueRequest that failed. No recovery attempt.
         assert cdp_session.send.call_count == 1
         assert cdp_session.send.call_args.args[0] == "Fetch.continueRequest"
+        assert not interceptor._recovery_request_ids
 
     @pytest.mark.asyncio
     async def test_malformed_event_missing_request_id(self) -> None:
@@ -2905,6 +3389,108 @@ class TestDataUrlDownloadCapture:
 
         assert not interceptor._cdp_handler_tasks
 
+    @pytest.mark.asyncio
+    async def test_disable_drains_owned_browser_download_before_cdp_teardown(self) -> None:
+        interceptor = _make_interceptor()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        marker = interceptor._recovery_marker
+        page_session = MagicMock(send=AsyncMock(), detach=AsyncMock())
+        browser_session = MagicMock(send=AsyncMock(), detach=AsyncMock())
+        interceptor._browser_session = browser_session
+        interceptor._cdp_sessions.append(page_session)
+
+        async def blocked_handler(event: dict[str, Any], generation: int) -> None:
+            interceptor._active_recovery_markers.add(marker)
+            interceptor._active_recovery_call_markers.add(marker)
+            interceptor._recovery_request_ids[(page_session, "request-1")] = marker
+            started.set()
+            await release.wait()
+            interceptor._recovery_request_ids.pop((page_session, "request-1"), None)
+            interceptor._active_recovery_call_markers.discard(marker)
+
+        with patch.object(interceptor, "_handle_browser_download_serialized", side_effect=blocked_handler):
+            interceptor._accepting_browser_downloads = True
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/file"})
+            await started.wait()
+            disabling = asyncio.create_task(interceptor.disable())
+            await asyncio.sleep(0)
+            assert not disabling.done()
+            assert interceptor._accepting_cdp_handlers
+            assert marker in interceptor._active_recovery_markers
+            assert interceptor._recovery_request_ids[(page_session, "request-1")] == marker
+            page_session.send.assert_not_awaited()
+            release.set()
+            await asyncio.wait_for(disabling, timeout=2)
+
+        assert not interceptor._browser_download_tasks
+        assert not interceptor._cdp_handler_tasks
+        assert not interceptor._active_recovery_markers
+        assert not interceptor._recovery_request_ids
+        assert not interceptor._accepting_cdp_handlers
+        page_session.send.assert_awaited_once_with("Fetch.disable")
+
+    @pytest.mark.asyncio
+    async def test_disable_clears_recorded_recovery_tuple_after_browser_task_terminal_response(self) -> None:
+        interceptor = _make_interceptor()
+        session = MagicMock(send=AsyncMock())
+        marker = interceptor._recovery_marker
+        interceptor._active_recovery_markers.add(marker)
+        interceptor._recovery_request_ids[(session, "request-1")] = marker
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def terminal_handler(event: dict[str, Any], generation: int) -> None:
+            started.set()
+            await release.wait()
+            interceptor._recovery_request_ids.pop((session, "request-1"), None)
+
+        with patch.object(interceptor, "_handle_browser_download_serialized", side_effect=terminal_handler):
+            interceptor._browser_session = MagicMock(detach=AsyncMock())
+            interceptor._accepting_browser_downloads = True
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/file"})
+            await started.wait()
+            disabling = asyncio.create_task(interceptor.disable())
+            await asyncio.sleep(0)
+            assert interceptor._recovery_request_ids[(session, "request-1")] == marker
+            release.set()
+            await asyncio.wait_for(disabling, timeout=2)
+
+        assert not interceptor._recovery_request_ids
+        assert not interceptor._active_recovery_markers
+
+    @pytest.mark.asyncio
+    async def test_disable_cancellation_finishes_owned_drain_and_teardown(self) -> None:
+        interceptor = _make_interceptor()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_safe_handler(event: dict[str, Any], generation: int) -> None:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                release.set()
+                raise
+
+        with patch.object(interceptor, "_handle_browser_download_serialized", side_effect=cancellation_safe_handler):
+            interceptor._browser_session = MagicMock(detach=AsyncMock())
+            interceptor._accepting_browser_downloads = True
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/file"})
+            await started.wait()
+            disabling = asyncio.create_task(interceptor.disable())
+            await asyncio.sleep(0)
+            disabling.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(disabling, timeout=2)
+
+        assert not interceptor._browser_download_tasks
+        assert not interceptor._cdp_handler_tasks
+        assert interceptor._browser_session is None
+        assert interceptor._browser_download_listener is None
+        assert not interceptor._active_recovery_markers
+        assert not interceptor._recovery_request_ids
+
 
 class TestDirectHttpDownloadAuthAndHtmlGuard:
     """Direct HTTP downloads fail closed without an enrolled backend and reject HTML login masquerades."""
@@ -2988,6 +3574,67 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             approved_initial_url="https://site.example/report.pdf?sig=secret",
         )
         assert (tmp_path / "report.pdf").read_bytes() == b"private report"
+
+    @pytest.mark.asyncio
+    async def test_html_gate_recovery_uses_post_replacement_run_budget(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        gate = self._LOGIN_HTML
+        recovered = b"%PDF" + b"R" * (1024 * 1024 - 4)
+        interceptor._run_download_bytes = mod.MAX_RUN_DOWNLOAD_BYTES - len(gate) - len(recovered)
+        guarded_fetch = self._guarded_fetch(gate, "text/html", "report.pdf")
+        in_page = AsyncMock(return_value=recovered)
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", in_page),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf")
+        in_page.assert_awaited_once_with(
+            "https://site.example/report.pdf", recovery_allowance_bytes=len(recovered) + len(gate)
+        )
+        assert len(list(tmp_path.iterdir())) == 1
+        assert next(tmp_path.iterdir()).read_bytes() == recovered
+        assert interceptor._browser_download_attempt is None
+        assert interceptor._active_download_attempts == {}
+        assert interceptor._unsolicited_download_failures == {}
+        assert interceptor._run_download_bytes == mod.MAX_RUN_DOWNLOAD_BYTES - len(gate) - len(recovered) + len(
+            recovered
+        )
+
+    @pytest.mark.asyncio
+    async def test_html_gate_empty_recovery_writes_one_zero_byte_artifact(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(self._LOGIN_HTML, "text/html", "report.pdf")
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=b"")) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf")
+        recovery.assert_awaited_once()
+        artifacts = list(tmp_path.iterdir())
+        assert len(artifacts) == 1
+        assert artifacts[0].read_bytes() == b""
+        assert interceptor._active_download_attempts == {}
+        assert interceptor._run_download_file_count == 1
+        assert interceptor._run_download_bytes == 0
+
+    @pytest.mark.asyncio
+    async def test_html_gate_none_recovery_fails_without_artifact(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(self._LOGIN_HTML, "text/html", "report.pdf"),
+                create=True,
+            ),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=None)),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf")
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._active_download_attempts == {}
 
     @pytest.mark.asyncio
     async def test_guarded_download_failure_does_not_log_url_or_exception_secret(self, tmp_path: Path) -> None:

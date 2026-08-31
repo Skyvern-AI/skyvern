@@ -13,6 +13,7 @@ import {
 // 4411 is emitted mid-session (page resolution or dispatch failed), so unlike a setup-time close it
 // leaves a channel the user still believes is live; without a reconnect, input is dead until reload.
 const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410, 4411]);
+const MOUSE_MOVE_BUFFER_THRESHOLD = 64 * 1024;
 
 interface UseCdpInputOptions {
   inputWsUrl: string | null;
@@ -21,6 +22,7 @@ interface UseCdpInputOptions {
   viewportHeight: number;
   onClipboardPaste?: (text: string) => void;
   onClipboardCopy?: () => void;
+  onInput?: () => void;
 }
 
 interface UseCdpInputReturn {
@@ -60,6 +62,7 @@ export function useCdpInput({
   viewportHeight,
   onClipboardPaste,
   onClipboardCopy,
+  onInput,
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
@@ -69,7 +72,6 @@ export function useCdpInput({
 
   const inputSocketRef = useRef<WebSocket | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const lastMouseMoveRef = useRef<number>(0);
   const userIsControllingRef = useRef(false);
   const inputReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -85,11 +87,22 @@ export function useCdpInput({
     modifiers: number;
   } | null>(null);
   const wheelAnimationFrameRef = useRef<number | null>(null);
+  const pendingMouseMoveRef = useRef<Record<string, unknown> | null>(null);
+  const mouseMoveAnimationFrameRef = useRef<number | null>(null);
+  const cancelPendingMouseMove = () => {
+    if (mouseMoveAnimationFrameRef.current !== null) {
+      cancelAnimationFrame(mouseMoveAnimationFrameRef.current);
+      mouseMoveAnimationFrameRef.current = null;
+    }
+    pendingMouseMoveRef.current = null;
+  };
   const interceptedClipboardKeysRef = useRef(new Set<string>());
   const onClipboardPasteRef = useRef(onClipboardPaste);
   const onClipboardCopyRef = useRef(onClipboardCopy);
+  const onInputRef = useRef(onInput);
   onClipboardPasteRef.current = onClipboardPaste;
   onClipboardCopyRef.current = onClipboardCopy;
+  onInputRef.current = onInput;
 
   useEffect(() => {
     if (!interactive || !inputWsUrl) return;
@@ -193,11 +206,15 @@ export function useCdpInput({
         inputSocketRef.current.close();
         inputSocketRef.current = null;
       }
+      cancelPendingMouseMove();
     };
   }, [interactive, inputWsUrl, credentialGetter, clientId]);
 
   useEffect(() => {
     userIsControllingRef.current = userIsControlling;
+    return () => {
+      cancelPendingMouseMove();
+    };
   }, [userIsControlling]);
 
   useEffect(() => {
@@ -313,11 +330,22 @@ export function useCdpInput({
       console.log("[cdp-input] Sending:", payload.type, payload.eventType);
       inputEventCountRef.current++;
     }
+    onInputRef.current?.();
     ws.send(JSON.stringify(payload));
   }, []);
 
+  const flushMouseMove = useCallback(() => {
+    mouseMoveAnimationFrameRef.current = null;
+    const payload = pendingMouseMoveRef.current;
+    pendingMouseMoveRef.current = null;
+    if (payload) {
+      sendInputEvent(payload);
+    }
+  }, [sendInputEvent]);
+
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
+      cancelPendingMouseMove();
       if (!interactive || !userIsControlling) return;
       const coords = mapMouseCoordinates(e, viewportWidth, viewportHeight);
       if (!coords) return;
@@ -342,6 +370,7 @@ export function useCdpInput({
 
   const handleMouseUp = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
+      cancelPendingMouseMove();
       if (!interactive || !userIsControlling) return;
       const coords = mapMouseCoordinates(e, viewportWidth, viewportHeight);
       if (!coords) return;
@@ -367,12 +396,9 @@ export function useCdpInput({
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
       if (!interactive || !userIsControlling) return;
-      const now = Date.now();
-      if (now - lastMouseMoveRef.current < 50) return;
-      lastMouseMoveRef.current = now;
       const coords = mapMouseCoordinates(e, viewportWidth, viewportHeight);
       if (!coords) return;
-      sendInputEvent({
+      const payload = {
         type: "mouseEvent",
         eventType: "mouseMoved",
         x: coords.x,
@@ -380,13 +406,28 @@ export function useCdpInput({
         button: "none",
         clickCount: 0,
         modifiers: getModifiers(e),
-      });
+      };
+      const ws = inputSocketRef.current;
+      if (
+        ws?.readyState === WebSocket.OPEN &&
+        ws.bufferedAmount > MOUSE_MOVE_BUFFER_THRESHOLD
+      ) {
+        pendingMouseMoveRef.current = payload;
+        if (mouseMoveAnimationFrameRef.current === null) {
+          mouseMoveAnimationFrameRef.current =
+            requestAnimationFrame(flushMouseMove);
+        }
+        return;
+      }
+      cancelPendingMouseMove();
+      sendInputEvent(payload);
     },
     [
       interactive,
       userIsControlling,
       viewportWidth,
       viewportHeight,
+      flushMouseMove,
       sendInputEvent,
     ],
   );

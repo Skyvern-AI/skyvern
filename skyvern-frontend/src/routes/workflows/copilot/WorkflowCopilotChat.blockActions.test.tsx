@@ -21,14 +21,6 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-const { mockCopilotUxV1Enabled } = vi.hoisted(() => ({
-  mockCopilotUxV1Enabled: vi.fn(),
-}));
-
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => mockCopilotUxV1Enabled(),
-}));
-
 const {
   streamCalls,
   postStreaming,
@@ -246,8 +238,6 @@ beforeEach(() => {
   releaseStudioRun.mockClear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
-  mockCopilotUxV1Enabled.mockReset();
-  mockCopilotUxV1Enabled.mockReturnValue(true);
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
@@ -362,24 +352,6 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
     streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "" }));
     streamCalls[0]!.onMessage(runOutcomeFrame({ workflow_run_id: "" }));
 
-    expect(timelineGet).not.toHaveBeenCalled();
-  });
-
-  it("never fetches the run timeline when copilot_ux_v1 is off", async () => {
-    mockCopilotUxV1Enabled.mockReturnValue(false);
-    await renderChat();
-    await submit("build a workflow");
-
-    // Cover every entry point: the early poll start, the evaluating fallback,
-    // and the terminal convergence fetch must all stay inert flag-off.
-    streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
-    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "evaluating" }));
-    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
-
-    // The terminal fetch is async (awaits getClient), so flush pending
-    // microtasks before asserting it never fired — a synchronous assert would
-    // pass even if the guard were missing.
-    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(timelineGet).not.toHaveBeenCalled();
   });
 
@@ -544,15 +516,12 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
       ],
     });
 
-    // A settled turn's card defaults to its rolled-up summary; expand it,
-    // then expand the block row, to reach the replay the fetch just patched
-    // in — this is the reviewer's "does the verify card ever receive it".
+    // The current settled turn remains expanded, so expand the block row to
+    // reach the replay the fetch just patched in — this is the reviewer's
+    // "does the verify card ever receive it".
     const statusRegion = await waitFor(() => screen.getByRole("status"));
-    fireEvent.click(
-      within(statusRegion).getByRole("button", { expanded: false }),
-    );
-    // uxV1 is on by default in this file, so the row's primary text is the
-    // humanized label ("block_1" -> "Block 1"), not the raw block label.
+    // The row's primary text is the humanized label ("block_1" -> "Block 1"),
+    // not the raw block label.
     fireEvent.click(within(statusRegion).getByText("Block 1"));
 
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());

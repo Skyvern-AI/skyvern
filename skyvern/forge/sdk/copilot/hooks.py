@@ -144,6 +144,27 @@ class CopilotRunHooks(RunHooksBase):
                 if resolved:
                     activity_entry["credentials"] = resolved
 
+            if tool_name == "list_integrations" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                listed = data.get("integrations", []) if isinstance(data, dict) else []
+                if not isinstance(listed, list):
+                    listed = []
+                integrations = [
+                    {
+                        "connection_id": integration.get("connection_id"),
+                        "provider": integration.get("provider"),
+                        "state": integration.get("state"),
+                        "scopes_granted": integration.get("scopes_granted"),
+                    }
+                    for integration in listed
+                    if isinstance(integration, dict)
+                    and isinstance(integration.get("connection_id"), str)
+                    and isinstance(integration.get("provider"), str)
+                    and isinstance(integration.get("state"), str)
+                    and isinstance(integration.get("scopes_granted"), list)
+                ]
+                activity_entry["integrations"] = integrations
+
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 blocks = data.get("blocks", []) if isinstance(data, dict) else []

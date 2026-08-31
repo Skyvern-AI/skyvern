@@ -32,10 +32,6 @@ from skyvern.forge.sdk.copilot.challenge_evidence import ANTI_BOT_CHALLENGE_ALIA
 _FAILURE_REASON_MAX_CHARS = 200
 _ROOT_CAUSE_SIGNATURE_VERSION = "repair_root_cause:v1"
 
-# Stable identifier for the per-tool budget failure category written into
-# ``failure_categories`` by the watchdog. Used by enforcement, reconciliation,
-# and signature normalization as a single source of truth.
-PER_TOOL_BUDGET_FAILURE_CATEGORY = "PER_TOOL_BUDGET"
 ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY = "ANTI_BOT_CHALLENGE"
 
 # Stable active-run terminal evidence identifiers. The category is stored in
@@ -47,7 +43,6 @@ _ROOT_CAUSE_CATEGORY_ALIASES = {
     # Self-mappings document categories whose noisy failure prose must not
     # affect repeat identity.
     "PARAMETER_BINDING_ERROR": "PARAMETER_BINDING_ERROR",
-    PER_TOOL_BUDGET_FAILURE_CATEGORY: PER_TOOL_BUDGET_FAILURE_CATEGORY,
 }
 ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES = frozenset(
     {
@@ -63,7 +58,6 @@ _CATEGORY_ONLY_ROOT_CAUSES = frozenset(
     {
         ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
         "PARAMETER_BINDING_ERROR",
-        PER_TOOL_BUDGET_FAILURE_CATEGORY,
     }
 )
 _LOCATOR_RE = re.compile(r"""(?:page\.)?locator\(\s*(["'])(?P<selector>.+?)\1""")

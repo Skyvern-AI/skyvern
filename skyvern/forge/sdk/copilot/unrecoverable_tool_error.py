@@ -34,6 +34,9 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "select_option",
         "press_key",
         "wait_for_either_state",
+        "skyvern_frame_list",
+        "skyvern_frame_switch",
+        "skyvern_frame_main",
     }
 )
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"

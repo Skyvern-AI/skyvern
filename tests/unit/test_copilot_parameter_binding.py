@@ -86,7 +86,7 @@ def test_analyze_run_blocks_returns_precomputed_categories() -> None:
             ],
         },
     }
-    anti_bot, empty_data, categories = _analyze_run_blocks(result)
+    anti_bot, empty_data, categories, _ = _analyze_run_blocks(result)
     assert categories is not None
     assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
     assert anti_bot is None
@@ -109,7 +109,7 @@ def test_analyze_run_blocks_does_not_classify_unstructured_failure_prose() -> No
             ],
         },
     }
-    _, _, categories = _analyze_run_blocks(result)
+    _, _, categories, _ = _analyze_run_blocks(result)
     assert categories is None
 
 

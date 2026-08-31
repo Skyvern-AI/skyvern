@@ -20,7 +20,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, bound_call_browser_session
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_pre_action,
     _click_post_hook,
@@ -238,6 +238,52 @@ async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
     await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
 
     assert "credentials" not in ctx.tool_activity[0]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_integrations_records_server_owned_binding_evidence() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "integrations": [
+                    {
+                        "connection_id": "goac_sheets",
+                        "provider": "google",
+                        "name": "Sheets account",
+                        "state": "active",
+                        "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+                    },
+                    {
+                        "connection_id": "msoac_mail",
+                        "provider": "microsoft",
+                        "name": "Mail account",
+                        "state": "active",
+                        "scopes_granted": [],
+                    },
+                ]
+            },
+        }
+    )
+
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_integrations"), output)
+
+    assert ctx.tool_activity[0]["integrations"] == [
+        {
+            "connection_id": "goac_sheets",
+            "provider": "google",
+            "state": "active",
+            "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+        },
+        {
+            "connection_id": "msoac_mail",
+            "provider": "microsoft",
+            "state": "active",
+            "scopes_granted": [],
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -540,7 +586,7 @@ class TestMCPFailedStepLoopDetection:
             ctx.browser_session_id = "pbs_copilot"
 
         @asynccontextmanager
-        async def fake_mcp_browser_context(ctx: Any) -> Any:
+        async def fake_mcp_browser_context(ctx: Any, *, session_id_override: str | None = None) -> Any:
             nonlocal in_context
             in_context = True
             try:
@@ -722,6 +768,9 @@ class TestMCPToolOverlayCompleteness:
             "select_option",
             "press_key",
             "wait_for_either_state",
+            "skyvern_frame_list",
+            "skyvern_frame_switch",
+            "skyvern_frame_main",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
@@ -799,7 +848,18 @@ class TestNewToolOverlayConfigs:
         overlay = _build_skyvern_mcp_overlays()["console_messages"]
         assert overlay.hide_params == frozenset({"session_id", "cdp_url"})
         assert overlay.requires_browser is True
-        assert overlay.post_hook is None
+        assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
+        assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
+
+    def test_frame_control_overlays_refuse_sensitive_origin_pages(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+
+        for name in ("skyvern_frame_list", "skyvern_frame_switch", "skyvern_frame_main"):
+            overlay = overlays[name]
+            assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
+            assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
 
     def test_select_option_overlay(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
@@ -1460,6 +1520,95 @@ class TestScoutedInteractionCapture:
 
         capture.assert_awaited_once()
         assert "next_step" not in result
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_page_refuses_screenshot_before_dispatch(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.codeblock_redaction_parameters = {}
+
+        assert await mcp_hooks._screenshot_pre_hook({}, ctx) is None
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._screenshot_pre_hook({}, ctx)
+
+        assert result is not None
+        assert result["ok"] is False
+        assert "specific named URL" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_page_refuses_evaluate_without_stashing_expression(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.pending_scout_read_expression = "stale"
+        ctx.pending_scout_read_output_path = "output.stale"
+
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._evaluate_pre_hook(
+                {"expression": "document.body.innerText", "output_path": "output.private"},
+                ctx,
+            )
+
+        assert result is not None
+        assert result["ok"] is False
+        assert ctx.pending_scout_read_expression is None
+        assert ctx.pending_scout_read_output_path is None
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_page_suppresses_an_in_flight_evaluate_result(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.pending_scout_read_expression = "document.body.innerText"
+        ctx.pending_scout_read_output_path = "output.private"
+        ctx.scout_observation_contract = {"kind": "stale"}
+
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._evaluate_post_hook(
+                {
+                    "ok": True,
+                    "data": {
+                        "result": "private page contents",
+                        "url": "https://private.example.test/account",
+                    },
+                },
+                {},
+                ctx,
+            )
+
+        assert result["ok"] is False
+        assert "data" not in result
+        assert ctx.pending_scout_read_expression is None
+        assert ctx.pending_scout_read_output_path is None
+        assert ctx.scout_observation_contract is None
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_successful_navigation_clears_taint_and_permits_inspection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+        ctx = self._ctx(source_url="https://private.example.test/account")
+        ctx.browser_session_id = "pbs-debug"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-run"}
+        ctx.codeblock_redaction_parameters = {}
+
+        with bound_call_browser_session("pbs-run"):
+            result = await mcp_hooks._navigate_post_hook(
+                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
+                {},
+                ctx,
+            )
+
+        assert result["ok"] is True
+        assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug"}
+        assert "source_url" not in ctx.scout_trajectory[0]
+        capture.assert_awaited_once()
+        assert await mcp_hooks._screenshot_pre_hook({}, ctx) is not None
+        with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._evaluate_pre_hook({"expression": "document.title"}, ctx) is None
 
     @pytest.mark.asyncio
     async def _click_with_attached_evidence(

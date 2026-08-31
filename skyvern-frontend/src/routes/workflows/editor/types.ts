@@ -37,6 +37,10 @@ export type OnePasswordCredential = {
   parameterType: "onepassword";
   vaultId: string;
   itemId: string;
+  // Item field id or label to treat as the TOTP secret, overriding 1Password's own
+  // field-type detection. Needed for items whose OTP lives in a plain field (e.g.
+  // named "digits") rather than a native 1Password one-time-password field.
+  totpFieldName?: string | null;
 };
 
 export type AzureVaultCredential = {

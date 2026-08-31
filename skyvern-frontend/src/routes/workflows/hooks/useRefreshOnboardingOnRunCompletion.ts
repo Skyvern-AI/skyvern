@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useAuth } from "@clerk/clerk-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Status } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
@@ -15,6 +16,7 @@ function useRefreshOnboardingOnRunCompletion(
   workflowRun: RunLike | undefined,
 ): void {
   const queryClient = useQueryClient();
+  const { userId } = useAuth();
   const refreshedRunRef = useRef<string | null>(null);
   const retryTimeoutRef = useRef<number | undefined>(undefined);
   const retriedMissingAssignmentRef = useRef(false);
@@ -53,6 +55,7 @@ function useRefreshOnboardingOnRunCompletion(
       }
       const assignment = queryClient.getQueryData<OnboardingStateResponse>([
         "userOnboarding",
+        userId,
       ])?.recovery_guidance_assignment;
       if (assignment?.eligible_run_id === runId) {
         return;
@@ -66,7 +69,7 @@ function useRefreshOnboardingOnRunCompletion(
         void queryClient.invalidateQueries({ queryKey: ["userOnboarding"] });
       }, 4_000);
     });
-  }, [workflowRun, queryClient]);
+  }, [workflowRun, queryClient, userId]);
 }
 
 export { useRefreshOnboardingOnRunCompletion };

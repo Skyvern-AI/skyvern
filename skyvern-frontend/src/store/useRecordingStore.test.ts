@@ -373,3 +373,51 @@ describe("applyInterpretationUpdate: snapshot vs delta", () => {
     expect(store().draftSteps.map((s) => s.step_id)).toEqual(["s1-0"]);
   });
 });
+
+describe("dismissCredentialPrompt", () => {
+  it("hides the prompt for one step and clears on a new recording", () => {
+    store().setIsRecording(true);
+    store().applyInterpretationUpdate(
+      update("s1", 1, [
+        { ...draft("pw", "input_text"), credential_kind: "password" },
+        { ...draft("otp", "input_text"), credential_kind: "totp" },
+      ]),
+    );
+
+    store().dismissCredentialPrompt("pw");
+    expect(store().dismissedCredentialStepIds).toEqual(["pw"]);
+
+    store().dismissCredentialPrompt("pw");
+    expect(store().dismissedCredentialStepIds).toEqual(["pw"]);
+
+    store().reset();
+    store().setIsRecording(true);
+    expect(store().dismissedCredentialStepIds).toEqual([]);
+  });
+
+  it("dismisses every secret step on the same url", () => {
+    store().setIsRecording(true);
+    store().applyInterpretationUpdate(
+      update("s1", 1, [
+        {
+          ...draft("pw", "input_text"),
+          credential_kind: "password",
+          url: "https://example.com/login",
+        },
+        {
+          ...draft("otp", "input_text"),
+          credential_kind: "totp",
+          url: "https://example.com/login",
+        },
+        {
+          ...draft("other", "input_text"),
+          credential_kind: "password",
+          url: "https://other.example/login",
+        },
+      ]),
+    );
+
+    store().dismissCredentialPromptsForUrl("https://example.com/login");
+    expect(store().dismissedCredentialStepIds).toEqual(["pw", "otp"]);
+  });
+});

@@ -825,23 +825,6 @@ class BrowserSessionsRepository(BaseRepository):
             )
             await session.commit()
 
-    @db_operation("mark_persistent_browser_session_cdp_unreachable")
-    async def mark_persistent_browser_session_cdp_unreachable(
-        self, session_id: str, unreachable_at: datetime | None = None
-    ) -> None:
-        """The CDP relay lost this session's browser. Unscoped like touch_last_activity: the relay
-        passes only the server-assigned id. Write-once via COALESCE; a no-op once the row completed."""
-        ts = to_naive_utc(unreachable_at) if unreachable_at is not None else naive_utc_now()
-        async with self.Session() as session:
-            await session.execute(
-                update(PersistentBrowserSessionModel)
-                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
-                .where(PersistentBrowserSessionModel.deleted_at.is_(None))
-                .where(PersistentBrowserSessionModel.completed_at.is_(None))
-                .values(cdp_unreachable_at=func.coalesce(PersistentBrowserSessionModel.cdp_unreachable_at, ts))
-            )
-            await session.commit()
-
     @db_operation("mark_persistent_browser_session_close_requested")
     async def mark_persistent_browser_session_close_requested(
         self, session_id: str, organization_id: str, close_requested_at: datetime | None = None

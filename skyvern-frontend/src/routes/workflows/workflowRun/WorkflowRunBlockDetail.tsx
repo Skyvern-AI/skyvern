@@ -47,6 +47,7 @@ type Props = {
   showDownloadedFiles?: boolean;
   workflowRunId?: string;
   onThoughtSelect?: (thought: ObserverThought) => void;
+  onViewScreenshot?: (workflowRunBlockId: string) => void;
 };
 
 function BlockDownloadedFiles({
@@ -152,6 +153,7 @@ function WorkflowRunBlockDetail({
   showDownloadedFiles = false,
   workflowRunId,
   onThoughtSelect,
+  onViewScreenshot,
 }: Props) {
   // activeIteration is a URL hint scoped to a specific selection. In
   // fallback mode (null or "stream") the resolved block may not be the
@@ -253,7 +255,15 @@ function WorkflowRunBlockDetail({
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div>
           {resolvedBlock && (
-            <BlockInspector block={resolvedBlock} action={selectedAction} />
+            <BlockInspector
+              block={resolvedBlock}
+              action={selectedAction}
+              onViewScreenshot={
+                onViewScreenshot
+                  ? () => onViewScreenshot(resolvedBlock.workflow_run_block_id)
+                  : undefined
+              }
+            />
           )}
           {resolvedBlock && (
             <BlockHealPanel

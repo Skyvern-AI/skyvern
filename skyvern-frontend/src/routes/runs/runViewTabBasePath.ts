@@ -19,3 +19,18 @@ export function runViewTabBasePath(
   }
   return undefined;
 }
+
+export function runOverviewScreenshotLocation(
+  runBasePath: string,
+  search: string,
+  workflowRunBlockId: string,
+) {
+  const params = new URLSearchParams(search);
+  params.set("active", workflowRunBlockId);
+  params.delete("iteration");
+  const nextSearch = params.toString();
+  return {
+    pathname: `${runBasePath}/overview`,
+    search: nextSearch ? `?${nextSearch}` : "",
+  };
+}

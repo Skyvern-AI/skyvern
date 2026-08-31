@@ -40,6 +40,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
     log_recent_tool_output_truncation,
     pending_screenshot_message,
 )
+from skyvern.forge.sdk.copilot.model_input_capture import (
+    clear_pending_model_input_capture,
+    register_pending_model_input_capture,
+)
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     PendingFrameLease,
     ScreenshotActionRelation,
@@ -241,6 +245,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
     includes page text and tool results, so writing takes both an explicit path and a local
     environment rather than the path alone.
     """
+    clear_pending_model_input_capture()
     dump_dir = os.getenv("COPILOT_DUMP_MODEL_INPUTS")
     if not dump_dir or settings.ENV != "local":
         return
@@ -262,7 +267,6 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
             "prompt_sha256": (
                 prompt_sha256(model_data.instructions) if isinstance(model_data.instructions, str) else None
             ),
-            "tool_surface_sha256": getattr(ctx, "eval_tool_surface_sha256", None),
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,
@@ -277,6 +281,11 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         if parameters:
             serialized = app.AGENT_FUNCTION.redact_codeblock_parameter_values(serialized, parameters)
         path.write_text(serialized if isinstance(serialized, str) else "")
+        register_pending_model_input_capture(
+            path=path,
+            payload=payload,
+            redaction_parameters=parameters,
+        )
     except Exception:
         LOG.warning("Failed to dump copilot model input")
 

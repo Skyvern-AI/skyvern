@@ -243,3 +243,78 @@ class TestAcceptancePreflight:
             browser_context.on = MagicMock()
             dialog_handler.set_dialog_handler(browser_context)
         assert len(registrations) == 1
+
+
+class _DriverError(Exception):
+    """Stands in for the deployed driver's error type, which is deliberately NOT the
+    ``playwright.async_api.Error`` the handler module imports — a class-based ``except`` would
+    miss every one of these, so the guard has to match on message text."""
+
+
+VANISHED_DIALOG_MESSAGES = (
+    "Dialog.accept: Protocol error (Page.handleJavaScriptDialog): No dialog is showing",
+    "Dialog.accept: Target page, context or browser has been closed",
+)
+
+
+class TestVanishedDialogGuard:
+    """SKY-15057: answering a dialog races the page. When the dialog is already gone, every
+    response path raises from inside a pyee listener, so an unguarded raise escapes into asyncio's
+    default exception handler — logged at error, stripped of every context field bound here."""
+
+    @pytest.mark.parametrize("message", VANISHED_DIALOG_MESSAGES)
+    @pytest.mark.asyncio
+    async def test_alert_accept_losing_the_race_does_not_propagate(
+        self, isolated_context: SkyvernContext, message: str
+    ) -> None:
+        # Driven through the registered listener, not the handler directly: the escape happens when
+        # the listener's coroutine raises, so the registration seam is part of what has to hold.
+        registered: dict[str, object] = {}
+        page = MagicMock()
+        page.on = lambda event, handler: registered.update({event: handler})
+        browser_context = MagicMock()
+        browser_context.pages = [page]
+        browser_context.on = MagicMock()
+        dialog_handler.set_dialog_handler(browser_context)
+
+        dialog = _make_dialog("alert", "The value of '47' is invalid.")
+        dialog.accept = AsyncMock(side_effect=_DriverError(message))
+
+        await registered["dialog"](dialog)
+
+    @pytest.mark.asyncio
+    async def test_a_respond_routed_accept_losing_the_race_does_not_propagate(
+        self, isolated_context: SkyvernContext
+    ) -> None:
+        dialog = _make_dialog("confirm", "Are you sure?")
+        dialog.accept = AsyncMock(side_effect=_DriverError(VANISHED_DIALOG_MESSAGES[0]))
+
+        await dialog_handler._handle_dialog(dialog, page=MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_driver_error_still_propagates(self, isolated_context: SkyvernContext) -> None:
+        # The guard names one expected outcome; it is not a blanket swallow of driver failures.
+        dialog = _make_dialog("alert", "message")
+        dialog.accept = AsyncMock(side_effect=_DriverError("Dialog.accept: Protocol error: something else"))
+
+        with pytest.raises(_DriverError):
+            await dialog_handler._handle_dialog(dialog, page=MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_dialog_is_not_retried_as_a_fallback_accept(
+        self, isolated_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The LLM path's error arm falls back to accept. A vanished dialog reaching it would answer
+        # a dialog we decided to DISMISS, log the race at error, and raise a second time on the way
+        # out — so the race has to skip the fallback rather than be caught by it.
+        isolated_context.navigation_goal = "goal"
+        monkeypatch.setattr(dialog_handler.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(
+            dialog_handler.app, "SECONDARY_LLM_API_HANDLER", AsyncMock(return_value={"action": "dismiss"})
+        )
+        dialog = _make_dialog("confirm", "Are you sure?")
+        dialog.dismiss = AsyncMock(side_effect=_DriverError(VANISHED_DIALOG_MESSAGES[0]))
+
+        await dialog_handler._handle_dialog(dialog, page=MagicMock())
+
+        dialog.accept.assert_not_awaited()

@@ -364,6 +364,433 @@ describe("deriveActivityLog", () => {
     expect(glyphsOf(log)).toEqual(["⟨⟩", "⟨⟩", "⟨⟩"]);
   });
 
+  it("keeps a failed browse action separate from preceding successful work", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "Opened the certificant search",
+          success: true,
+          iteration: 0,
+        }),
+        entry({
+          id: "n-1",
+          kind: "narration",
+          text: "Opening the search form",
+          iteration: 0,
+          activeLabel: "Opening the certificant search",
+          outcomeLabel: "Opened the certificant search",
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "get_page_evidence",
+          text: "The browser target crashed",
+          success: false,
+          iteration: 1,
+        }),
+        entry({
+          id: "n-2",
+          kind: "narration",
+          text: "Restoring the results page",
+          iteration: 1,
+          activeLabel: "Restoring access to the certification results",
+          outcomeLabel: "Restored the certification results",
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    expect(log.rows.map((row) => row.label)).toEqual([
+      "Opened the certificant search",
+      "Restoring access to the certification results",
+    ]);
+    expect(log.rows[0]?.entries[0]?.success).toBe(true);
+    expect(log.rows[1]?.entries[0]?.success).toBe(false);
+  });
+
+  it("coalesces differently implemented retries of one narrated browse activity", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The browser target was unavailable",
+          success: false,
+          iteration: 0,
+        }),
+        entry({
+          id: "n-1",
+          kind: "narration",
+          text: "Looking for the certification record",
+          iteration: 0,
+          activeLabel: "Searching for the certification record",
+          outcomeLabel: "Found the certification record",
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "get_page_evidence",
+          text: "The results page did not load",
+          success: false,
+          iteration: 1,
+        }),
+        entry({
+          id: "n-2",
+          kind: "narration",
+          text: "Trying the search again",
+          iteration: 1,
+          activeLabel: "Searching for the certification record",
+          outcomeLabel: "Found the certification record",
+        }),
+        entry({
+          id: "tc-3",
+          kind: "tool_call",
+          toolName: "click_element",
+          text: "Opening the search form",
+          iteration: 2,
+        }),
+        entry({
+          id: "n-3",
+          kind: "narration",
+          text: "Trying a direct search",
+          iteration: 2,
+          activeLabel: "Searching for the certification record",
+          outcomeLabel: "Found the certification record",
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]).toMatchObject({
+      id: "1",
+      label: "Searching for the certification record",
+      pending: true,
+      live: true,
+      startedAt: at(1),
+      endedAt: at(3),
+    });
+    expect(log.rows[0]?.entries).toHaveLength(3);
+    expect(log.rows[0]?.entries[2]?.attempts).toBe(3);
+  });
+
+  it("keeps overlapping browse siblings separate even with the same narrated intent", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-a",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The first page failed",
+          success: false,
+          iteration: 0,
+          activityStartedAt: "2026-01-01T00:00:10Z",
+          timestamp: "2026-01-01T00:00:20Z",
+        }),
+        entry({
+          id: "n-a",
+          kind: "narration",
+          text: "Checking the page",
+          iteration: 0,
+          activeLabel: "Searching the page",
+          timestamp: "2026-01-01T00:00:20Z",
+        }),
+        entry({
+          id: "tr-b",
+          kind: "tool_result",
+          toolName: "get_page_evidence",
+          text: "The parallel page opened",
+          success: true,
+          iteration: 1,
+          activityStartedAt: "2026-01-01T00:00:11Z",
+          timestamp: "2026-01-01T00:00:21Z",
+        }),
+        entry({
+          id: "n-b",
+          kind: "narration",
+          text: "Checking the same page",
+          iteration: 1,
+          activeLabel: "Searching the page",
+          timestamp: "2026-01-01T00:00:21Z",
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    expect(log.rows.map((row) => row.entries.length)).toEqual([1, 1]);
+    expect(log.rows.map((row) => row.id)).toEqual(["a", "b"]);
+  });
+
+  it("keeps browse tools from one iteration folded into one activity", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "Opened the search",
+          success: true,
+          iteration: 0,
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "get_page_evidence",
+          text: "Read the search form",
+          success: true,
+          iteration: 0,
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]?.entries).toHaveLength(2);
+  });
+
+  it("keeps a code write visible in the immediate test frontier", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-write",
+          kind: "tool_result",
+          toolName: "add_block",
+          text: "Added the cart block",
+          success: true,
+          iteration: 2,
+          codeDiffs: [
+            {
+              label: "add_to_cart",
+              added: 15,
+              removed: 0,
+              patch: "+await page.click('button.add-to-cart')",
+            },
+          ],
+        }),
+        entry({
+          id: "tc-run",
+          kind: "tool_call",
+          toolName: "run_blocks_and_collect_debug",
+          text: "Testing the cart block",
+          iteration: 3,
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]?.kind).toBe("run");
+    expect(log.rows[0]?.entries).toHaveLength(2);
+    expect(log.rows[0]?.codeDiffs).toMatchObject([
+      { label: "add_to_cart", added: 15, removed: 0 },
+    ]);
+    expect(log.focusIndex).toBe(0);
+  });
+
+  it("promotes an active block's repair diff into its frontier row", () => {
+    const log = deriveActivityLog(
+      turnWith(
+        [],
+        [
+          block({
+            label: "add_to_cart",
+            state: "running",
+            activity: [
+              entry({
+                id: "tc-repair",
+                kind: "tool_call",
+                toolName: "edit_block_and_run",
+                text: "Repairing and testing the cart block",
+                codeDiffs: [
+                  {
+                    label: "add_to_cart",
+                    added: 2,
+                    removed: 1,
+                    patch: "-old\n+new",
+                  },
+                ],
+              }),
+            ],
+          }),
+        ],
+      ),
+    );
+
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]?.codeDiffs).toMatchObject([
+      { label: "add_to_cart", added: 2, removed: 1, patch: "-old\n+new" },
+    ]);
+    expect(log.focusIndex).toBe(0);
+  });
+
+  it("does not merge an older parallel run into a later code write", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-write",
+          kind: "tool_result",
+          toolName: "add_block",
+          text: "Added the cart block",
+          success: true,
+          timestamp: at(4),
+          codeDiffs: [
+            {
+              label: "add_to_cart",
+              added: 15,
+              removed: 0,
+              patch: "+await page.click('button.add-to-cart')",
+            },
+          ],
+        }),
+        entry({
+          id: "tr-run",
+          kind: "tool_result",
+          toolName: "run_blocks_and_collect_debug",
+          text: "An earlier parallel run finished",
+          success: true,
+          timestamp: at(5),
+          activityStartedAt: at(2),
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    expect(log.rows.map((row) => row.kind)).toEqual(["author", "run"]);
+  });
+
+  it("anchors parallel block evidence by the run inside a combined write and test row", () => {
+    const log = deriveActivityLog(
+      turnWith(
+        [
+          entry({
+            id: "tr-prior-run",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            text: "Finished the prior run",
+            success: true,
+            activityStartedAt: at(1),
+            timestamp: at(3),
+          }),
+          entry({
+            id: "tr-write",
+            kind: "tool_result",
+            toolName: "add_block",
+            text: "Added a repaired block",
+            success: true,
+            timestamp: at(4),
+            codeDiffs: [
+              {
+                label: "repaired_block",
+                added: 3,
+                removed: 0,
+                patch: "+await page.goto(URL)",
+              },
+            ],
+          }),
+          entry({
+            id: "tc-new-run",
+            kind: "tool_call",
+            toolName: "run_blocks_and_collect_debug",
+            text: "Testing the repaired block",
+            timestamp: at(6),
+          }),
+        ],
+        [
+          block({
+            workflowRunBlockId: "wrb-prior",
+            label: "prior_block",
+            startedAt: at(5),
+          }),
+        ],
+      ),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    expect(labelsPerRow(log)).toEqual([["prior_block"], []]);
+  });
+
+  it("anchors a block to the latest qualifying run start regardless of completion order", () => {
+    const log = deriveActivityLog(
+      turnWith(
+        [
+          entry({
+            id: "tr-run-b",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            text: "Run B completed first",
+            success: true,
+            activityStartedAt: at(20),
+            timestamp: at(30),
+          }),
+          entry({
+            id: "tr-run-a",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            text: "Run A completed later",
+            success: true,
+            activityStartedAt: at(10),
+            timestamp: at(40),
+          }),
+        ],
+        [
+          block({
+            workflowRunBlockId: "wrb-b",
+            label: "run_b_block",
+            startedAt: at(25),
+          }),
+        ],
+      ),
+    );
+
+    expect(labelsPerRow(log)).toEqual([["run_b_block"], []]);
+  });
+
+  it("keeps exact failed retry evidence inside a recovered block", () => {
+    const log = deriveActivityLog(
+      turnWith(
+        [
+          entry({
+            id: "tr-run",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            text: "The block recovered",
+            success: true,
+          }),
+        ],
+        [
+          block({
+            workflowRunBlockId: "wrb-recovered",
+            label: "recovered_block",
+            state: "completed",
+            activity: [
+              entry({
+                id: "tr-attempt-1",
+                kind: "tool_result",
+                toolName: "navigate_browser",
+                text: "The browser target crashed",
+                success: false,
+                timestamp: at(2),
+              }),
+              entry({
+                id: "tr-attempt-2",
+                kind: "tool_result",
+                toolName: "navigate_browser",
+                text: "Opened the page after retrying",
+                success: true,
+                timestamp: at(3),
+              }),
+            ],
+          }),
+        ],
+      ),
+    );
+
+    expect(log.rows[0]?.blocks[0]?.activity.map((entry) => entry.text)).toEqual(
+      ["The browser target crashed", "Opened the page after retrying"],
+    );
+  });
+
   it("folds an adjacent same-tool retry into one row carrying the attempt count", () => {
     const log = deriveActivityLog(
       turnWith([
@@ -386,11 +813,13 @@ describe("deriveActivityLog", () => {
     );
 
     expect(log.rows).toHaveLength(1);
-    expect(log.rows[0]?.entries[0]?.attempts).toBe(2);
-    expect(log.rows[0]?.entries[0]?.text).toBe("Reached the confirmation page");
+    expect(log.rows[0]?.entries).toHaveLength(2);
+    expect(log.rows[0]?.entries[0]?.text).toBe("The login step timed out");
+    expect(log.rows[0]?.entries[1]?.attempts).toBe(2);
+    expect(log.rows[0]?.entries[1]?.text).toBe("Reached the confirmation page");
   });
 
-  it("re-keys a row when a retry folds into it, so a pin cannot survive the fold", () => {
+  it("keeps a row's identity stable when a retry folds into it", () => {
     const attempt = entry({
       id: "tr-1",
       kind: "tool_result",
@@ -414,7 +843,7 @@ describe("deriveActivityLog", () => {
     );
 
     expect(idsOf(before)).toEqual(["1"]);
-    expect(idsOf(after)).toEqual(["2"]);
+    expect(idsOf(after)).toEqual(["1"]);
   });
 
   it("derives the same rows from a hydrated narrative payload as from the live turn", () => {
@@ -514,6 +943,289 @@ describe("deriveActivityLog", () => {
 
     expect(log.rows.map((r) => r.kind)).toEqual(["browse"]);
     expect(log.rows[0]?.reason).toBe("Looking for the pricing table");
+  });
+
+  it("attaches narration to the action in flight when its iteration trails the tool", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "click",
+          text: "Opened the result",
+          success: true,
+          iteration: 2,
+          timestamp: "2026-01-01T00:00:24Z",
+        }),
+        entry({
+          id: "tc-inspect",
+          kind: "tool_call",
+          toolName: "inspect_page_for_composition",
+          text: "Inspecting page",
+          iteration: 3,
+          timestamp: "2026-01-01T00:00:31Z",
+        }),
+        entry({
+          id: "n-2",
+          kind: "narration",
+          text: "Reviewing the visible credential results",
+          iteration: 2,
+          activeLabel: "Reviewing the credential results",
+          outcomeLabel: "Reviewed the credential results",
+          timestamp: "2026-01-01T00:00:33Z",
+        }),
+        entry({
+          id: "tr-inspect",
+          kind: "tool_result",
+          toolName: "inspect_page_for_composition",
+          text: "The page could not be inspected",
+          success: false,
+          iteration: 3,
+          timestamp: "2026-01-01T00:00:51Z",
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    expect(log.rows[0]?.reason).toBeNull();
+    expect(log.rows[1]).toMatchObject({
+      label: "Reviewing the credential results",
+      reason: "Reviewing the visible credential results",
+    });
+  });
+
+  it("does not let a stale pending call capture narration for a settled sibling", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tc-stale",
+          kind: "tool_call",
+          toolName: "update_workflow",
+          text: "Opening the stale tab",
+          iteration: 0,
+          timestamp: "2026-01-01T00:00:10Z",
+        }),
+        entry({
+          id: "tc-settled",
+          kind: "tool_call",
+          toolName: "get_page_evidence",
+          text: "Inspecting the current page",
+          iteration: 1,
+          timestamp: "2026-01-01T00:00:20Z",
+        }),
+        entry({
+          id: "tr-settled",
+          kind: "tool_result",
+          toolName: "get_page_evidence",
+          text: "Read the current page",
+          success: true,
+          iteration: 1,
+          timestamp: "2026-01-01T00:00:25Z",
+        }),
+        entry({
+          id: "n-settled",
+          kind: "narration",
+          text: "Checking the current page for the result",
+          iteration: 1,
+          activeLabel: "Reviewing the current result",
+          timestamp: "2026-01-01T00:00:26Z",
+        }),
+      ]),
+    );
+
+    expect(log.rows[0]?.reason).toBeNull();
+    expect(log.rows[1]).toMatchObject({
+      label: "Reviewing the current result",
+      reason: "Checking the current page for the result",
+    });
+  });
+
+  it("uses iteration when parallel pending calls have overlapping time spans", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tc-first",
+          kind: "tool_call",
+          toolName: "update_workflow",
+          text: "Opening the first page",
+          iteration: 0,
+          timestamp: "2026-01-01T00:00:10Z",
+        }),
+        entry({
+          id: "tc-second",
+          kind: "tool_call",
+          toolName: "get_page_evidence",
+          text: "Inspecting the second page",
+          iteration: 1,
+          timestamp: "2026-01-01T00:00:20Z",
+        }),
+        entry({
+          id: "n-first",
+          kind: "narration",
+          text: "Still opening the first page",
+          iteration: 0,
+          activeLabel: "Opening the first page",
+          timestamp: "2026-01-01T00:00:21Z",
+        }),
+      ]),
+    );
+
+    expect(log.rows[0]).toMatchObject({
+      label: "Opening the first page",
+      reason: "Still opening the first page",
+    });
+    expect(log.rows[1]?.reason).toBeNull();
+  });
+
+  it("folds a technical recovery substep into the current narrated attempt", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-inspect",
+          kind: "tool_result",
+          toolName: "inspect_page_for_composition",
+          text: "The page could not be inspected",
+          success: false,
+          iteration: 3,
+        }),
+        entry({
+          id: "n-3",
+          kind: "narration",
+          text: "The result page stopped responding",
+          iteration: 3,
+          activeLabel: "Reviewing the credential results",
+        }),
+        entry({
+          id: "tr-evaluate",
+          kind: "tool_result",
+          toolName: "evaluate",
+          text: "The page was unavailable",
+          success: false,
+          iteration: 4,
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]).toMatchObject({
+      label: "Reviewing the credential results",
+      id: "inspect",
+    });
+    expect(log.rows[0]?.entries[1]?.attempts).toBe(2);
+  });
+
+  it("starts a new retry row after the prior narrated attempt recovered", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-failed",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The page did not open",
+          success: false,
+          iteration: 0,
+        }),
+        entry({
+          id: "n-failed",
+          kind: "narration",
+          text: "Trying the page",
+          iteration: 0,
+          activeLabel: "Opening the page",
+        }),
+        entry({
+          id: "tr-recovered",
+          kind: "tool_result",
+          toolName: "get_page_evidence",
+          text: "Read the page",
+          success: true,
+          iteration: 1,
+        }),
+        entry({
+          id: "n-recovered",
+          kind: "narration",
+          text: "The page is available",
+          iteration: 1,
+          activeLabel: "Opening the page",
+        }),
+        entry({
+          id: "tr-later",
+          kind: "tool_result",
+          toolName: "click_element",
+          text: "The next click failed",
+          success: false,
+          iteration: 2,
+        }),
+        entry({
+          id: "n-later",
+          kind: "narration",
+          text: "Trying the next control",
+          iteration: 2,
+          activeLabel: "Opening the page",
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    const recovered = log.rows[0]?.entries;
+    const later = log.rows[1]?.entries;
+    expect(recovered?.[recovered.length - 1]?.success).toBe(true);
+    expect(later?.[later.length - 1]?.success).toBe(false);
+  });
+
+  it("recomputes pending and live after an out-of-order narrated retry merge", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tr-first",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The first attempt failed",
+          success: false,
+          iteration: 0,
+        }),
+        entry({
+          id: "n-first",
+          kind: "narration",
+          text: "Trying the search",
+          iteration: 0,
+          activeLabel: "Searching the page",
+        }),
+        entry({
+          id: "tc-pending",
+          kind: "tool_call",
+          toolName: "get_page_evidence",
+          text: "Inspecting the page",
+          iteration: 1,
+        }),
+        entry({
+          id: "n-pending",
+          kind: "narration",
+          text: "Trying the search again",
+          iteration: 1,
+          activeLabel: "Searching the page",
+        }),
+        entry({
+          id: "tr-sibling",
+          kind: "tool_result",
+          toolName: "click_element",
+          text: "The sibling attempt failed",
+          success: false,
+          iteration: 2,
+        }),
+        entry({
+          id: "n-sibling",
+          kind: "narration",
+          text: "Still trying the search",
+          iteration: 2,
+          activeLabel: "Searching the page",
+        }),
+      ]),
+    );
+
+    expect(log.rows).toHaveLength(2);
+    expect(log.rows[0]).toMatchObject({ pending: true, live: true });
+    expect(log.rows[1]).toMatchObject({ pending: false, live: false });
+    expect(log.liveIndex).toBe(0);
   });
 
   it("drops a narration with no preceding row rather than rendering one", () => {
@@ -1114,6 +1826,142 @@ describe("deriveActivityLog", () => {
     expect(live.rows[0]!.label).toBe("Looking for the invoice list");
   });
 
+  it("keeps a failed row's active label instead of showing its predicted outcome", () => {
+    const log = deriveActivityLog({
+      ...turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "update_and_run_blocks",
+          text: "The submit button stayed disabled",
+          success: false,
+          iteration: 0,
+        }),
+        entry({
+          id: "n-1",
+          kind: "narration",
+          text: "Confirming the form can be submitted",
+          iteration: 0,
+          activeLabel: "Testing form submission",
+          outcomeLabel: "Confirmed the form submits successfully",
+        }),
+      ]),
+      terminal: "response",
+    });
+
+    expect(log.rows[0]!.label).toBe("Testing form submission");
+  });
+
+  it("uses the outcome label after a retry recovers while preserving its failure", () => {
+    const log = deriveActivityLog({
+      ...turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The page did not open",
+          success: false,
+          iteration: 0,
+        }),
+        entry({
+          id: "n-1",
+          kind: "narration",
+          text: "Trying the page",
+          iteration: 0,
+          activeLabel: "Opening the page",
+          outcomeLabel: "Opened the page",
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The page opened",
+          success: true,
+          iteration: 1,
+        }),
+        entry({
+          id: "n-2",
+          kind: "narration",
+          text: "The retry reached the page",
+          iteration: 1,
+          activeLabel: "Opening the page",
+          outcomeLabel: "Opened the page after retrying",
+        }),
+      ]),
+      terminal: "response",
+    });
+
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]?.label).toBe("Opened the page after retrying");
+    expect(log.rows[0]?.entries[0]?.text).toBe("The page did not open");
+    expect(log.rows[0]?.entries[1]?.text).toBe("The page opened");
+  });
+
+  it.each([
+    ["stopped", undefined],
+    ["completed", "evaluating"],
+    ["completed", "not_demonstrated"],
+  ] as const)(
+    "keeps the active label for a non-success %s block with outcome %s",
+    (state, outcome) => {
+      const log = deriveActivityLog({
+        ...turnWith(
+          [
+            entry({
+              id: "tr-run",
+              kind: "tool_result",
+              toolName: "run_blocks_and_collect_debug",
+              text: "The run returned",
+              success: true,
+              iteration: 0,
+            }),
+            entry({
+              id: "n-run",
+              kind: "narration",
+              text: "Checking the run result",
+              iteration: 0,
+              activeLabel: "Checking the workflow",
+              outcomeLabel: "Confirmed the workflow works",
+            }),
+          ],
+          [block({ state, outcome })],
+        ),
+        terminal: "response",
+      });
+
+      expect(log.rows[0]?.label).toBe("Checking the workflow");
+    },
+  );
+
+  it("uses the outcome label only when a block has a successful verdict", () => {
+    const log = deriveActivityLog({
+      ...turnWith(
+        [
+          entry({
+            id: "tr-run",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            text: "The run returned",
+            success: true,
+            iteration: 0,
+          }),
+          entry({
+            id: "n-run",
+            kind: "narration",
+            text: "Checking the run result",
+            iteration: 0,
+            activeLabel: "Checking the workflow",
+            outcomeLabel: "Confirmed the workflow works",
+          }),
+        ],
+        [block({ state: "completed", outcome: "demonstrated" })],
+      ),
+      terminal: "response",
+    });
+
+    expect(log.rows[0]?.label).toBe("Confirmed the workflow works");
+  });
+
   it("leaves the row label null when the narrator never spoke for the step", () => {
     const log = deriveActivityLog(
       turnWith([
@@ -1277,6 +2125,33 @@ describe("deriveActivityLog", () => {
     expect(log.focusIndex).toBe(log.rows.length - 1);
   });
 
+  it("keeps a live row focused when an empty drafted block follows it", () => {
+    const log = deriveActivityLog(
+      turnWith(
+        [
+          entry({
+            id: "tc-1",
+            kind: "tool_call",
+            toolName: "navigate_browser",
+            displayLabel: "Searching the catalogue",
+            iteration: 0,
+          }),
+        ],
+        [
+          block({
+            workflowRunBlockId: "",
+            label: "add_first_result",
+            state: "drafted",
+          }),
+        ],
+      ),
+    );
+
+    expect(log.rows[log.liveIndex]?.pending).toBe(true);
+    expect(log.rows[log.rows.length - 1]?.blocks[0]?.state).toBe("drafted");
+    expect(log.focusIndex).toBe(log.liveIndex);
+  });
+
   it("does not move focus back to an earlier row when a later one settles", () => {
     const log = deriveActivityLog(
       turnWith([
@@ -1413,6 +2288,33 @@ describe("deriveActivityLog", () => {
     expect(log.rows).toHaveLength(1);
     expect(log.rows[0]!.startedAt).toBe("2026-01-01T00:00:00+00:00");
     expect(log.rows[0]!.endedAt).toBe("2026-01-01T00:00:14+00:00");
+  });
+
+  it("spans a settled action from its call timestamp to its result timestamp", () => {
+    const log = deriveActivityLog(
+      turnWith([
+        entry({
+          id: "tc-1",
+          kind: "tool_call",
+          toolName: "navigate_browser",
+          text: "Opening page",
+          timestamp: "2026-01-01T00:00:04Z",
+        }),
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "The page did not open",
+          success: false,
+          timestamp: "2026-01-01T00:00:24Z",
+        }),
+      ]),
+    );
+
+    expect(log.rows[0]).toMatchObject({
+      startedAt: "2026-01-01T00:00:04Z",
+      endedAt: "2026-01-01T00:00:24Z",
+    });
   });
 
   it("leaves the span null against a backend that does not stamp entries", () => {

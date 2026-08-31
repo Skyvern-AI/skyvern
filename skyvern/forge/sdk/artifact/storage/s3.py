@@ -19,6 +19,7 @@ from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
+    dump_download_visibility_inputs,
     get_download_dir,
     get_skyvern_temp_dir,
     unzip_bytes_to_temp_directory,
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
     key_is_org_scoped,
     presign_with_sensitive_cap,
@@ -61,6 +63,35 @@ def _safe_get_file_size(path: str) -> int | None:
     except OSError:
         LOG.warning("Failed to get file size", path=path, exc_info=True)
         return None
+
+
+def empty_read_decision(
+    *,
+    download_row_count: int | None,
+    rows_lookup_failed: bool,
+    skip_fired: bool,
+    rows_present_but_unresolvable: bool,
+    listed: bool,
+) -> dict[str, int | bool | str | None]:
+    """Why a downloads read came back empty, from counts alone — never a listing."""
+    if rows_lookup_failed:
+        cause = "row_lookup_failed"
+    elif rows_present_but_unresolvable:
+        cause = "rows_present_but_unresolvable"
+    elif skip_fired:
+        cause = "listing_skipped_zero_rows"
+    elif download_row_count is None:
+        cause = "listed_rows_unqueried"
+    else:
+        cause = "listed_and_empty"
+    return {
+        "download_row_count": download_row_count,
+        "rows_lookup_failed": rows_lookup_failed,
+        "skip_fired": skip_fired,
+        "rows_present_but_unresolvable": rows_present_but_unresolvable,
+        "listed": listed,
+        "empty_read_cause": cause,
+    }
 
 
 class S3Storage(BaseStorage):
@@ -738,7 +769,7 @@ class S3Storage(BaseStorage):
             return
         already_saved = (
             download_checksums_by_uri(
-                await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+                (await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id))[0]
             )
             if run_id is not None
             else {}
@@ -833,16 +864,85 @@ class S3Storage(BaseStorage):
         # If HMAC signing isn't configured (self-hosted OSS default), the signed
         # endpoint requires an API key webhook consumers don't have, so we stay
         # on the legacy S3-list+presign path even when rows exist.
+
+        # ``download_row_count`` stays None when the rows were never queried (no keyring, no run id,
+        # or the lookup failed), so an unqueried read is never reported as a read that found nothing.
+        download_row_count: int | None = None
+        rows_lookup_failed = False
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
-            artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            artifacts, rows_lookup_failed = await self._list_download_artifacts_safe(
+                organization_id=organization_id, run_id=run_id
+            )
+            if not rows_lookup_failed:
+                download_row_count = len(artifacts)
+            artifacts = dedupe_run_scoped_download_artifacts(artifacts)
             if artifacts:
-                return await _file_infos_from_download_artifacts(artifacts)
-            if await self._skip_empty_downloads_listing(organization_id=organization_id, run_id=run_id):
+                file_infos = await _file_infos_from_download_artifacts(artifacts)
+                if not file_infos:
+                    self._log_empty_downloads_read(
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        download_row_count=download_row_count,
+                        rows_lookup_failed=rows_lookup_failed,
+                        skip_fired=False,
+                        rows_present_but_unresolvable=True,
+                        listed=False,
+                    )
+                return file_infos
+            if not rows_lookup_failed and await self._skip_empty_downloads_listing(
+                organization_id=organization_id, run_id=run_id
+            ):
+                self._log_empty_downloads_read(
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    download_row_count=download_row_count,
+                    rows_lookup_failed=rows_lookup_failed,
+                    skip_fired=True,
+                    rows_present_but_unresolvable=False,
+                    listed=False,
+                )
                 return []
 
         # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
         # OSS-default deployments without HMAC signing both arrive here.
-        return await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+        file_infos = await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+        if not file_infos:
+            self._log_empty_downloads_read(
+                organization_id=organization_id,
+                run_id=run_id,
+                download_row_count=download_row_count,
+                rows_lookup_failed=rows_lookup_failed,
+                skip_fired=False,
+                rows_present_but_unresolvable=False,
+                listed=True,
+            )
+        return file_infos
+
+    def _log_empty_downloads_read(
+        self,
+        *,
+        organization_id: str,
+        run_id: str | None,
+        download_row_count: int | None,
+        rows_lookup_failed: bool,
+        skip_fired: bool,
+        rows_present_but_unresolvable: bool,
+        listed: bool,
+    ) -> None:
+        decision = empty_read_decision(
+            download_row_count=download_row_count,
+            rows_lookup_failed=rows_lookup_failed,
+            skip_fired=skip_fired,
+            rows_present_but_unresolvable=rows_present_but_unresolvable,
+            listed=listed,
+        )
+        dump_download_visibility_inputs("empty_read", {"run_id": run_id, **decision})
+        LOG.info(
+            "downloads.empty_read",
+            organization_id=organization_id,
+            run_id=run_id,
+            **decision,
+        )
 
     async def _skip_empty_downloads_listing(self, *, organization_id: str, run_id: str) -> bool:
         """True when a run with zero DOWNLOAD rows may skip the legacy S3 LIST.
@@ -874,9 +974,13 @@ class S3Storage(BaseStorage):
             cutover = cutover.replace(tzinfo=timezone.utc)
         return created_at >= cutover
 
-    async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
+    async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> tuple[list[Artifact], bool]:
+        """The run's DOWNLOAD rows, plus whether the lookup itself failed.
+
+        The failure flag is what separates "this run has no download rows" from "we could not tell".
+        """
         try:
-            return await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+            artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
                 run_id=run_id,
                 organization_id=organization_id,
                 artifact_type=ArtifactType.DOWNLOAD,
@@ -888,7 +992,8 @@ class S3Storage(BaseStorage):
                 run_id=run_id,
                 exc_info=True,
             )
-            return []
+            return [], True
+        return artifacts, False
 
     async def _get_downloaded_files_via_s3_listing(self, *, organization_id: str, run_id: str | None) -> list[FileInfo]:
         bucket = settings.AWS_S3_BUCKET_UPLOADS

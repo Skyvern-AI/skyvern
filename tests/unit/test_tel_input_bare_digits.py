@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.constants import TEXT_INPUT_DELAY
+from skyvern.forge.sdk.event.default import DefaultInputStrategy
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.handler import (
     _is_tel_digit_fix_enabled,
@@ -170,6 +175,357 @@ async def test_input_sequentially_fill_splits_separator_formatted_value(monkeypa
     locator.fill.assert_awaited_once()
     assert locator.fill.await_args.args[0] == "(224"
     assert typed == [") 555-0199"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_clears_short_replacement_through_active_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    deadline_active = False
+
+    async def clear_field(*_args: object, **_kwargs: object) -> None:
+        assert deadline_active
+
+    async def type_text(*_args: object, **_kwargs: object) -> None:
+        assert deadline_active
+
+    clear_field_mock = AsyncMock(side_effect=clear_field)
+    type_text_mock = AsyncMock(side_effect=type_text)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", clear_field_mock)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text_mock)
+    timeout_calls: list[float | None] = []
+
+    @asynccontextmanager
+    async def record_timeout(delay: float | None) -> AsyncIterator[None]:
+        nonlocal deadline_active
+        timeout_calls.append(delay)
+        deadline_active = True
+        try:
+            yield
+        finally:
+            deadline_active = False
+
+    monkeypatch.setattr(handler_utils.asyncio, "timeout", record_timeout)
+
+    await handler_utils.strategy_aware_input(locator, "Noor", clear=True, timeout=4321)
+
+    clear_field_mock.assert_awaited_once_with(locator.page, locator, char_count=0, timeout=4321)
+    type_text_mock.assert_awaited_once_with(
+        locator.page,
+        locator,
+        "Noor",
+        timeout=4321,
+        allow_batched_playwright=True,
+    )
+    locator.fill.assert_not_awaited()
+    assert timeout_calls == [4.321]
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_dispatches_best_effort_commit_events_after_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations: list[str] = []
+
+    async def clear_field(*_args: object, **_kwargs: object) -> None:
+        operations.append("clear")
+
+    async def type_text(*_args: object, **_kwargs: object) -> None:
+        operations.append("type")
+
+    async def dispatch_event(event_name: str, **_kwargs: object) -> None:
+        operations.append(event_name)
+        if event_name == "change":
+            raise RuntimeError("dispatch failed")
+
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    locator.dispatch_event = AsyncMock(side_effect=dispatch_event)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", AsyncMock(side_effect=clear_field))
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", AsyncMock(side_effect=type_text))
+
+    await handler_utils.strategy_aware_input(
+        locator,
+        "Noor",
+        clear=True,
+        timeout=4321,
+        dispatch_change_and_blur=True,
+    )
+
+    assert operations == ["clear", "type", "change", "blur"]
+    assert locator.dispatch_event.await_args_list[0].kwargs == {"timeout": 4321}
+    assert locator.dispatch_event.await_args_list[1].kwargs == {"timeout": 4321}
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_preserves_explicit_null_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", clear_field)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text)
+    timeout_calls: list[float | None] = []
+
+    @asynccontextmanager
+    async def record_timeout(delay: float | None) -> AsyncIterator[None]:
+        timeout_calls.append(delay)
+        yield
+
+    monkeypatch.setattr(handler_utils.asyncio, "timeout", record_timeout)
+
+    await handler_utils.strategy_aware_input(locator, "Noor", clear=True, timeout=None)
+
+    assert timeout_calls == [None]
+    clear_field.assert_awaited_once_with(locator.page, locator, char_count=0, timeout=None)
+    type_text.assert_awaited_once_with(
+        locator.page,
+        locator,
+        "Noor",
+        timeout=None,
+        allow_batched_playwright=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_preserves_zero_as_no_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", clear_field)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text)
+    timeout_calls: list[float | None] = []
+
+    @asynccontextmanager
+    async def record_timeout(delay: float | None) -> AsyncIterator[None]:
+        timeout_calls.append(delay)
+        yield
+
+    monkeypatch.setattr(handler_utils.asyncio, "timeout", record_timeout)
+
+    await handler_utils.strategy_aware_input(locator, "Noor", clear=True, timeout=0)
+
+    assert timeout_calls == [None]
+    clear_field.assert_awaited_once_with(locator.page, locator, char_count=0, timeout=0)
+    type_text.assert_awaited_once_with(
+        locator.page,
+        locator,
+        "Noor",
+        timeout=0,
+        allow_batched_playwright=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_force_fill_preserves_atomic_playwright_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", clear_field)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text)
+
+    await handler_utils.strategy_aware_input(
+        locator,
+        "Noor",
+        clear=True,
+        timeout=4321,
+        force=True,
+        no_wait_after=True,
+    )
+
+    locator.fill.assert_awaited_once_with("Noor", timeout=4321, force=True, no_wait_after=True)
+    clear_field.assert_not_awaited()
+    type_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_type", "value"),
+    [
+        pytest.param("range", "42", id="range"),
+        pytest.param("date", "2026-08-30", id="date"),
+        pytest.param("datetime-local", "2026-08-30T12:34", id="datetime-local"),
+        pytest.param("month", "2026-08", id="month"),
+        pytest.param("time", "12:34", id="time"),
+        pytest.param("week", "2026-W35", id="week"),
+    ],
+)
+async def test_strategy_aware_fill_preserves_native_value_set_input_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    input_type: str,
+    value: str,
+) -> None:
+    locator = MagicMock()
+    locator.evaluate = AsyncMock(return_value=input_type)
+    locator.fill = AsyncMock()
+    locator.dispatch_event = AsyncMock()
+    clear_field = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", clear_field)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text)
+
+    await handler_utils.strategy_aware_input(
+        locator,
+        value,
+        clear=True,
+        timeout=4321,
+        force=False,
+        no_wait_after=True,
+        dispatch_change_and_blur=True,
+    )
+
+    locator.fill.assert_awaited_once_with(value, timeout=4321, force=False, no_wait_after=True)
+    clear_field.assert_not_awaited()
+    type_text.assert_not_awaited()
+    assert [call.args[0] for call in locator.dispatch_event.await_args_list] == ["change", "blur"]
+
+
+@pytest.mark.asyncio
+async def test_default_input_strategy_forwards_timeout_to_every_locator_operation() -> None:
+    page = MagicMock()
+    locator = MagicMock()
+    locator.type = AsyncMock()
+    locator.clear = AsyncMock()
+    strategy = DefaultInputStrategy()
+
+    await strategy.clear_field(page, locator, char_count=0, timeout=0)
+    await strategy.type_text(page, locator, "Noor", timeout=0)
+
+    locator.clear.assert_awaited_once_with(timeout=0)
+    assert locator.type.await_args_list == [call(char, delay=TEXT_INPUT_DELAY, timeout=0) for char in "Noor"]
+
+
+@pytest.mark.asyncio
+async def test_default_input_strategy_batches_when_copilot_surface_allows_it() -> None:
+    page = MagicMock()
+    locator = MagicMock()
+    locator.type = AsyncMock()
+    strategy = DefaultInputStrategy()
+
+    await strategy.type_text(
+        page,
+        locator,
+        "Noor",
+        timeout=4321,
+        allow_batched_playwright=True,
+    )
+
+    locator.type.assert_awaited_once_with("Noor", delay=TEXT_INPUT_DELAY, timeout=4321)
+
+
+@pytest.mark.asyncio
+async def test_default_input_strategy_preserves_supported_playwright_input_options() -> None:
+    page = MagicMock()
+    locator = MagicMock()
+    locator.type = AsyncMock()
+    locator.clear = AsyncMock()
+    strategy = DefaultInputStrategy()
+
+    await strategy.clear_field(page, locator, char_count=0, timeout=1234, force=True, no_wait_after=True)
+    await strategy.type_text(page, locator, "No", timeout=2345, delay=17, no_wait_after=True)
+
+    locator.clear.assert_awaited_once_with(timeout=1234, force=True, no_wait_after=True)
+    assert locator.type.await_args_list == [
+        call("N", delay=17, timeout=2345, no_wait_after=True),
+        call("o", delay=17, timeout=2345, no_wait_after=True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_raises_playwright_timeout_for_aggregate_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "clear_field", AsyncMock(side_effect=TimeoutError))
+
+    with pytest.raises(PlaywrightTimeoutError, match="4321ms"):
+        await handler_utils.strategy_aware_input(locator, "Noor", clear=True, timeout=4321)
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_keeps_long_prefix_and_tail_under_one_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline_active = False
+
+    async def fill(*_args: object, **_kwargs: object) -> None:
+        assert deadline_active
+
+    async def type_text(*_args: object, **_kwargs: object) -> None:
+        assert deadline_active
+
+    locator = MagicMock()
+    locator.fill = AsyncMock(side_effect=fill)
+    type_text_mock = AsyncMock(side_effect=type_text)
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text_mock)
+    timeout_calls: list[float | None] = []
+
+    @asynccontextmanager
+    async def record_timeout(delay: float | None) -> AsyncIterator[None]:
+        nonlocal deadline_active
+        timeout_calls.append(delay)
+        deadline_active = True
+        try:
+            yield
+        finally:
+            deadline_active = False
+
+    monkeypatch.setattr(handler_utils.asyncio, "timeout", record_timeout)
+    text = "x" * (handler_utils.TEXT_PRESS_MAX_LENGTH + 1)
+
+    await handler_utils.strategy_aware_input(locator, text, clear=True, timeout=4321)
+
+    locator.fill.assert_awaited_once_with("x", timeout=4321)
+    type_text_mock.assert_awaited_once_with(
+        locator.page,
+        locator,
+        text[-handler_utils.TEXT_PRESS_MAX_LENGTH :],
+        timeout=4321,
+        allow_batched_playwright=True,
+    )
+    assert timeout_calls == [4.321]
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_keeps_legacy_strategy_timeout_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text)
+    timeout_scope = MagicMock(side_effect=AssertionError("legacy input must not gain an aggregate deadline"))
+    monkeypatch.setattr(handler_utils.asyncio, "timeout", timeout_scope)
+
+    await handler_utils.input_sequentially(locator, "Noor", timeout=4321)
+
+    timeout_scope.assert_not_called()
+    type_text.assert_awaited_once_with(locator.page, locator, "Noor")
+
+
+@pytest.mark.asyncio
+async def test_strategy_aware_input_appends_without_atomic_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.fill = AsyncMock()
+    type_text = AsyncMock()
+    monkeypatch.setattr(handler_utils.EventStrategyFactory, "type_text", type_text)
+    text = "x" * (handler_utils.TEXT_PRESS_MAX_LENGTH + 1)
+
+    await handler_utils.strategy_aware_input(locator, text, clear=False, timeout=4321)
+
+    locator.fill.assert_not_awaited()
+    type_text.assert_awaited_once_with(
+        locator.page,
+        locator,
+        text,
+        timeout=4321,
+        allow_batched_playwright=True,
+    )
 
 
 @pytest.mark.asyncio

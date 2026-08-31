@@ -613,6 +613,15 @@ class ExtensionRelayServer:
             return None
         return dict(self.scoped_tabs[0])
 
+    async def list_scoped_tabs(self) -> list[dict]:
+        """Return current tab snapshots from the embedded single-owner extension."""
+        result = await self.request("tabs.list", {})
+        tabs = result.get("tabs")
+        if not isinstance(tabs, list):
+            raise ExtensionRequestError("INTERNAL", "The extension returned an invalid tab list")
+        self.scoped_tabs = [snapshot for tab in tabs if (snapshot := _tab_snapshot(tab)) is not None]
+        return [dict(tab) for tab in self.scoped_tabs]
+
     async def release_tab(self, tab_id: int) -> None:
         """Embedded single-owner relay keeps user tabs open when its CDP client closes."""
         await self.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
@@ -1223,8 +1232,11 @@ def _tab_snapshot(value: object) -> dict | None:
         return None
     url = value.get("url")
     title = value.get("title")
-    return {
+    snapshot = {
         "tabId": tab_id,
         "url": url if isinstance(url, str) else "",
         "title": title if isinstance(title, str) else "",
     }
+    if type(value.get("active")) is bool:
+        snapshot["active"] = value["active"]
+    return snapshot

@@ -11,6 +11,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     CopilotConfig,
+    block_authoring_policy_for_request,
     block_authoring_policy_from_code_only_mode,
     download_scout_act_required_for_policy,
 )
@@ -306,6 +307,14 @@ def test_code_block_settings_helper_selects_policy() -> None:
     assert block_authoring_policy_from_code_only_mode(False) == BlockAuthoringPolicy.STANDARD
 
 
+@pytest.mark.parametrize("fallback_code_block_mode", [False, True])
+def test_build_with_unspecified_code_mode_selects_task_v3_pure(fallback_code_block_mode: bool) -> None:
+    assert (
+        block_authoring_policy_for_request(None, "build", fallback_code_block_mode=fallback_code_block_mode)
+        == BlockAuthoringPolicy.TASK_V3_PURE
+    )
+
+
 def test_download_scout_act_requirement_follows_code_only_policy() -> None:
     assert download_scout_act_required_for_policy(BlockAuthoringPolicy.CODE_ONLY_BROWSER) is True
     assert download_scout_act_required_for_policy("code_only_browser") is True
@@ -330,3 +339,36 @@ async def test_base_agent_function_request_config_uses_env_policy(monkeypatch: p
 
     assert config is not None
     assert config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+
+@pytest.mark.asyncio
+async def test_base_agent_function_build_without_code_access_selects_task_v3_pure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", False)
+
+    config = await AgentFunction().get_copilot_config_for_request(
+        "o_test",
+        code_block_mode=None,
+        composer_mode="build",
+    )
+
+    assert config is not None
+    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
+
+
+@pytest.mark.asyncio
+async def test_base_request_config_preserves_get_copilot_config_override() -> None:
+    agent_function = AgentFunction()
+    delegated_config = CopilotConfig()
+    agent_function.get_copilot_config = MagicMock(return_value=delegated_config)  # type: ignore[method-assign]
+
+    config = await agent_function.get_copilot_config_for_request(
+        "o_test",
+        code_block_mode=False,
+        composer_mode="build",
+    )
+
+    assert config is delegated_config
+    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
+    agent_function.get_copilot_config.assert_called_once_with(False)

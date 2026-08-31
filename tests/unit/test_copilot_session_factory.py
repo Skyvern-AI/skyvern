@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -298,6 +299,9 @@ class TestModelInputCapture:
         assert list(tmp_path.iterdir()) == []
 
     def test_capture_records_instructions_and_input(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from agents import FunctionTool
+
+        from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
         from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 
         monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
@@ -313,6 +317,21 @@ class TestModelInputCapture:
                 context=SimpleNamespace(eval_capture_case_id="ask_or_build"),
             )
         )
+        attach_tool_surface_to_pending_capture(
+            [
+                FunctionTool(
+                    name="inspect_page",
+                    description="Return structured page evidence.",
+                    params_json_schema={
+                        "type": "object",
+                        "properties": {"selector": {"type": "string"}},
+                        "required": ["selector"],
+                    },
+                    on_invoke_tool=lambda _ctx, _args: None,
+                    strict_json_schema=False,
+                )
+            ]
+        )
 
         dumps = sorted(tmp_path.glob("call-*.json"))
         assert len(dumps) == 1
@@ -322,6 +341,27 @@ class TestModelInputCapture:
         assert payload["capture_case_id"] == "ask_or_build"
         # A context the derivation helper cannot read must not cost the run its model call.
         assert payload["requested_output_paths"] == []
+        assert payload["tool_surface"] == {
+            "version": "copilot-model-tool-surface-v1",
+            "tools": [
+                {
+                    "name": "inspect_page",
+                    "description": "Return structured page evidence.",
+                    "params_json_schema": {
+                        "type": "object",
+                        "properties": {"selector": {"type": "string"}},
+                        "required": ["selector"],
+                    },
+                    "strict_json_schema": False,
+                }
+            ],
+        }
+        assert (
+            payload["tool_surface_sha256"]
+            == hashlib.sha256(
+                json.dumps(payload["tool_surface"], sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
 
     def test_capture_records_a_call_whichever_shape_carries_the_context(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

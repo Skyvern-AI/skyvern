@@ -11,7 +11,7 @@ import {
 } from "@/util/onboarding/contextualHints";
 import type {
   OnboardingState,
-  OnboardingStatePatch,
+  LegacyOnboardingStatePatch,
 } from "@/store/onboarding/types";
 
 const SHOW_DELAY_MS = 800;
@@ -83,7 +83,7 @@ function useContextualHints(): void {
         // resurrect a dismissed hint (show-once frequency cap).
         onboarding?.updateState({
           [hint.seenKey]: true,
-        } as OnboardingStatePatch);
+        } as LegacyOnboardingStatePatch);
         OnboardingTelemetry.hintShown(hint.surface, hint.id);
       } catch {
         activeHintRef.current = null;

@@ -86,6 +86,39 @@ def test_legacy_streamlit_fix_removes_matching_deprecated_file(tmp_path: Path, m
     assert not legacy.exists()
 
 
+def test_llm_config_check_recognizes_openai_compatible_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_workspace(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_KEY", "OPENAI_COMPATIBLE")
+    monkeypatch.setenv("ENABLE_OPENAI_COMPATIBLE", "true")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_MODEL_NAME", "some-vision-model")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_BASE", "https://example.com/v1")
+
+    result = doctor._check_llm_config()
+
+    assert result.status == "ok"
+    assert "OPENAI_COMPATIBLE" in result.detail
+
+
+def test_llm_config_check_flags_incomplete_openai_compatible_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_workspace(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_KEY", "OPENAI_COMPATIBLE")
+    monkeypatch.setenv("ENABLE_OPENAI_COMPATIBLE", "true")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_COMPATIBLE_MODEL_NAME", raising=False)
+    monkeypatch.delenv("OPENAI_COMPATIBLE_API_BASE", raising=False)
+
+    result = doctor._check_llm_config()
+
+    assert result.status == "error"
+    assert "OPENAI_COMPATIBLE_MODEL_NAME" in result.detail
+    assert "OPENAI_COMPATIBLE_API_BASE" in result.detail
+
+
 def test_credential_placeholder_set_is_stable() -> None:
     assert CREDENTIAL_PLACEHOLDERS == ("", "PLACEHOLDER", "YOUR_API_KEY")
 

@@ -9,6 +9,7 @@ hold on an image shipping only stock Playwright.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -64,6 +65,20 @@ async def _run_scrape_and_capture(browser_state: SimpleNamespace, error: BaseExc
     return exc_info.value
 
 
+class _ScraperAsyncio:
+    """Stands in for ``scraper``'s own ``asyncio`` binding so only its sleeps are recorded.
+
+    ``setattr(scraper.asyncio, "sleep", ...)`` mutates the one process-global asyncio module,
+    so any coroutine sleeping on another thread lands in the same recorder.
+    """
+
+    def __init__(self, sleep: AsyncMock) -> None:
+        self.sleep = sleep
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(asyncio, name)
+
+
 def _scraped_page() -> ScrapedPage:
     return ScrapedPage(
         elements=[],
@@ -95,7 +110,7 @@ class TestScrapeWebsiteEmptyTreeRecovery:
         sleep = AsyncMock()
         log = MagicMock()
         monkeypatch.setattr(scraper, "scrape_web_unsafe", scrape_web_unsafe)
-        monkeypatch.setattr(scraper.asyncio, "sleep", sleep)
+        monkeypatch.setattr(scraper, "asyncio", _ScraperAsyncio(sleep))
         monkeypatch.setattr(scraper, "LOG", log)
 
         unsafe_kwargs = {

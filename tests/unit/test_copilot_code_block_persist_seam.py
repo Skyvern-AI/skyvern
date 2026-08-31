@@ -57,14 +57,16 @@ def _ctx(workflow_yaml: str = "") -> CopilotContext:
     return ctx
 
 
-def _code_yaml(code: str, *, label: str = "submit_search") -> str:
+def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = None) -> str:
     indented = "\n".join(f"          {line}" for line in textwrap.dedent(code).strip().splitlines())
+    prompt_line = f"    prompt: {json.dumps(prompt, ensure_ascii=False)}\n" if prompt is not None else ""
     return (
         "title: Search\n"
         "workflow_definition:\n"
         "  blocks:\n"
         "  - block_type: code\n"
         f"    label: {label}\n"
+        f"{prompt_line}"
         "    code: |\n"
         f"{indented}\n"
     )
@@ -187,6 +189,55 @@ async def test_accept_path_persists_model_yaml_and_code_exactly(monkeypatch: pyt
     assert 'page.locator("body").wait_for(state="visible", timeout=45000)' in _single_code(ctx.workflow_yaml)
     assert [finding["reason_code"] for finding in result["data"]["findings"]] == ["code_block_readiness_wait_advisory"]
     assert "imposed_substitutions" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_accept_path_preserves_model_authored_goal_prompt_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    authored_prompt = 'Open the result, then return its visible "Status" — unchanged.'
+    submitted = _code_yaml(
+        'return {"output": {"status": await page.get_by_role("status").inner_text()}}',
+        prompt=authored_prompt,
+    )
+    ctx = _ctx()
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    assert persisted[0].encode() == submitted.encode()
+    submitted_block = workflow_blocks(parse_workflow_yaml(submitted))[0]
+    persisted_block = workflow_blocks(parse_workflow_yaml(persisted[0]))[0]
+    assert submitted_block["prompt"] == authored_prompt
+    assert persisted_block["prompt"] == authored_prompt
+
+
+@pytest.mark.asyncio
+async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    submitted = _code_yaml('return {"output": {"status": "complete"}}')
+    assert "prompt:" not in submitted
+    ctx = _ctx()
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    assert persisted[0].encode() == submitted.encode()
+    submitted_block = workflow_blocks(parse_workflow_yaml(submitted))[0]
+    persisted_block = workflow_blocks(parse_workflow_yaml(persisted[0]))[0]
+    assert "prompt" not in submitted_block
+    assert "prompt" not in persisted_block
 
 
 @pytest.mark.asyncio

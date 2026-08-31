@@ -15,6 +15,11 @@ const SKYVERN_GROUP_COLOR = "purple";
 const TAB_GROUP_ID_NONE = -1;
 const ANY_GROUP_ID = Symbol("anyGroupId");
 const TAB_OPERATION_TIMEOUT_MS = 28_000;
+const SCOPE_REVOCATION_CODES = new Set([
+  ERROR_CODES.TAB_NOT_FOUND,
+  ERROR_CODES.TAB_NOT_SCOPED,
+  ERROR_CODES.RESTRICTED_URL,
+]);
 
 function tabUrl(tab) {
   return tab.pendingUrl || tab.url || "";
@@ -23,6 +28,12 @@ function tabUrl(tab) {
 function isTabRestricted(tab) {
   return (
     isRestrictedUrl(tab.pendingUrl || "") || isRestrictedUrl(tab.url || "")
+  );
+}
+
+function isScopeRevocation(error) {
+  return (
+    error instanceof ProtocolError && SCOPE_REVOCATION_CODES.has(error.code)
   );
 }
 
@@ -36,6 +47,7 @@ export class TabScope {
     this.expectedGroupTransitions = new Map();
     this.tabOperations = new Map();
     this.debuggerRouter = null;
+    this.tabOperationLeases = new Map();
     this.activeOperationCount = 0;
     this.operationGeneration = 0;
     this.operationLeases = new Set();
@@ -53,6 +65,13 @@ export class TabScope {
       void this.handleTabCreated(tab);
     });
     chrome.tabs.onRemoved.addListener((tabId) => {
+      this.cancelTabOperations(
+        tabId,
+        new ProtocolError(
+          ERROR_CODES.TAB_NOT_FOUND,
+          "The controlled tab was closed.",
+        ),
+      );
       void this.handleTabRemoved(tabId);
     });
     chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -63,6 +82,7 @@ export class TabScope {
         const expectedGroupTransition = Object.hasOwn(changeInfo, "groupId")
           ? this.getExpectedGroupTransition(tabId, changeInfo.groupId)
           : null;
+        this.cancelForTabUpdate(tabId, changeInfo, expectedGroupTransition);
         void this.handleTabUpdated(tabId, changeInfo, expectedGroupTransition);
       }
     });
@@ -102,7 +122,11 @@ export class TabScope {
     ) {
       for (const [tabId, groupId] of Object.entries(storedGroups)) {
         const numericTabId = Number(tabId);
-        if (this.scopedTabIds.has(numericTabId) && Number.isInteger(groupId)) {
+        if (
+          this.scopedTabIds.has(numericTabId) &&
+          Number.isInteger(groupId) &&
+          groupId >= 0
+        ) {
           this.scopedGroupIds.set(numericTabId, groupId);
         }
       }
@@ -182,6 +206,57 @@ export class TabScope {
     return this.quarantinedTabIds.has(tabId);
   }
 
+  cancelTabOperations(tabId, error) {
+    for (const lease of this.tabOperationLeases.get(tabId) ?? []) {
+      lease.cancel(error);
+    }
+  }
+  trackTabOperationLease(tabId, lease) {
+    const tabLeases = this.tabOperationLeases.get(tabId) ?? new Set();
+    tabLeases.add(lease);
+    this.tabOperationLeases.set(tabId, tabLeases);
+  }
+
+  untrackTabOperationLease(lease) {
+    for (const [tabId, tabLeases] of this.tabOperationLeases) {
+      tabLeases.delete(lease);
+      if (tabLeases.size === 0) {
+        this.tabOperationLeases.delete(tabId);
+      }
+    }
+  }
+
+  cancelForTabUpdate(tabId, changeInfo, expectedGroupTransition) {
+    if (!this.scopedTabIds.has(tabId)) {
+      return;
+    }
+    if (Object.hasOwn(changeInfo, "url")) {
+      const restricted = isRestrictedUrl(changeInfo.url);
+      this.cancelTabOperations(
+        tabId,
+        new ProtocolError(
+          restricted ? ERROR_CODES.RESTRICTED_URL : ERROR_CODES.COMMAND_TIMEOUT,
+          restricted
+            ? "Chrome does not allow controlling this URL."
+            : "The page changed while the extension operation was running.",
+        ),
+      );
+      return;
+    }
+    if (
+      Object.hasOwn(changeInfo, "groupId") &&
+      expectedGroupTransition === null &&
+      changeInfo.groupId !== this.scopedGroupIds.get(tabId)
+    ) {
+      this.cancelTabOperations(
+        tabId,
+        new ProtocolError(
+          ERROR_CODES.TAB_NOT_SCOPED,
+          "The tab left Skyvern Controlled.",
+        ),
+      );
+    }
+  }
   async assertScoped(tabId) {
     await this.ready;
     if (!this.scopedTabIds.has(tabId)) {
@@ -206,6 +281,23 @@ export class TabScope {
     }
     lease?.assertCurrent();
     await this.assertScoped(tabId);
+    const expectedGroupId = this.scopedGroupIds.get(tabId);
+    let controlledGroup = null;
+    if (expectedGroupId !== undefined && tab.groupId === expectedGroupId) {
+      controlledGroup = await this.getControlledGroup(tab.groupId);
+      lease?.assertCurrent();
+    }
+    if (
+      expectedGroupId === undefined ||
+      tab.groupId !== expectedGroupId ||
+      controlledGroup === null
+    ) {
+      await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+      throw new ProtocolError(
+        ERROR_CODES.TAB_NOT_SCOPED,
+        "The requested tab is no longer in Skyvern Controlled.",
+      );
+    }
     if (isTabRestricted(tab)) {
       await this.removeFromScopeLocked(tabId, "unshared", true, lease);
       throw new ProtocolError(
@@ -292,6 +384,8 @@ export class TabScope {
           "Chrome did not return a tab identifier.",
         );
       }
+      this.trackTabOperationLease(tab.id, lease);
+      lease.assertCurrent();
       this.createdTabIds.add(tab.id);
       await this.persistScope(lease);
       try {
@@ -405,6 +499,19 @@ export class TabScope {
   async list() {
     await this.ready;
     const tabs = await this.collectScopedTabs(true);
+    let focusedTabId = null;
+    try {
+      const [focusedTab] = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true,
+      });
+      if (Number.isInteger(focusedTab?.id)) {
+        focusedTabId = focusedTab.id;
+      }
+    } catch {}
+    for (const tab of tabs) {
+      tab.active = tab.tabId === focusedTabId;
+    }
     return { tabs };
   }
 
@@ -426,131 +533,161 @@ export class TabScope {
     if (!Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
       return;
     }
-    await this.runTabOperation(tab.id, async (lease) => {
-      if (!this.scopedTabIds.has(tab.openerTabId) || isTabRestricted(tab)) {
-        return;
-      }
-      lease.assertCurrent();
-      this.createdTabIds.add(tab.id);
-      await this.persistScope(lease);
+    await this.runTabOperation(tab.openerTabId, async (openerLease) => {
       try {
-        const scopedTab = await this.addToScopeLocked(tab, lease);
-        lease.assertCurrent();
-        this.sendEvent(EVENTS.TABS_CREATED, {
-          tabId: scopedTab.id,
-          openerTabId: tab.openerTabId,
-          url: tabUrl(scopedTab),
-        });
+        await this.assertControllableLocked(tab.openerTabId, openerLease);
       } catch (error) {
-        try {
-          await this.closeCreatedTab(tab.id);
-        } catch {
-          // Preserve the original setup error. The tab-removal event retries persistence.
+        if (isScopeRevocation(error)) {
+          return;
         }
         throw error;
       }
+      if (isTabRestricted(tab)) {
+        return;
+      }
+      await this.runTabOperation(tab.id, async (lease) => {
+        openerLease.assertCurrent();
+        await this.assertControllableLocked(tab.openerTabId, openerLease);
+        this.createdTabIds.add(tab.id);
+        await this.persistScope(lease);
+        try {
+          const scopedTab = await this.addToScopeLocked(tab, lease);
+          openerLease.assertCurrent();
+          await this.assertControllableLocked(tab.openerTabId, openerLease);
+          lease.assertCurrent();
+          this.sendEvent(EVENTS.TABS_CREATED, {
+            tabId: scopedTab.id,
+            openerTabId: tab.openerTabId,
+            url: tabUrl(scopedTab),
+          });
+        } catch (error) {
+          if (this.scopedTabIds.has(tab.id)) {
+            try {
+              await this.removeFromScopeLocked(tab.id, "unshared", true, lease);
+            } catch {
+              // Continue closing the child tab.
+            }
+          }
+          try {
+            await this.closeCreatedTab(tab.id);
+          } catch {
+            // Preserve the original setup error. The tab-removal event retries persistence.
+          }
+          throw error;
+        }
+      });
     });
   }
 
   async handleTabRemoved(tabId) {
     await this.ready;
-    await this.runTabOperation(tabId, async (lease) => {
-      lease.assertCurrent();
-      this.expectedGroupTransitions.delete(tabId);
-      const ownershipChanged = this.createdTabIds.delete(tabId);
-      if (this.scopedTabIds.has(tabId)) {
-        await this.removeFromScopeLocked(tabId, "closed", false, lease);
-      } else if (ownershipChanged) {
-        await this.persistScope(lease);
-      }
-    });
+    await this.runTabOperation(
+      tabId,
+      async (lease) => {
+        lease.assertCurrent();
+        this.expectedGroupTransitions.delete(tabId);
+        const ownershipChanged = this.createdTabIds.delete(tabId);
+        if (this.scopedTabIds.has(tabId)) {
+          await this.removeFromScopeLocked(tabId, "closed", false, lease);
+        } else if (ownershipChanged) {
+          await this.persistScope(lease);
+        }
+      },
+      this.operationGeneration,
+      false,
+    );
   }
 
   async handleTabUpdated(tabId, changeInfo, expectedGroupTransition = null) {
     await this.ready;
-    await this.runTabOperation(tabId, async (lease) => {
-      try {
-        lease.assertCurrent();
-        if (
-          this.scopedTabIds.has(tabId) &&
-          Object.hasOwn(changeInfo, "url") &&
-          isRestrictedUrl(changeInfo.url)
-        ) {
-          await this.removeFromScopeLocked(tabId, "unshared", true, lease);
-          return;
-        }
-        if (
-          !Object.hasOwn(changeInfo, "groupId") ||
-          expectedGroupTransition !== null
-        ) {
-          return;
-        }
-
-        let tab;
+    await this.runTabOperation(
+      tabId,
+      async (lease) => {
         try {
-          tab = await chrome.tabs.get(tabId);
-        } catch {
-          return;
-        }
-        lease.assertCurrent();
-        if (tab.groupId !== changeInfo.groupId) {
-          return;
-        }
-
-        const controlledGroup = await this.getControlledGroup(tab.groupId);
-        lease.assertCurrent();
-        if (this.scopedTabIds.has(tabId)) {
-          const expectedGroupId = this.scopedGroupIds.get(tabId);
-          if (tab.groupId === expectedGroupId) {
-            return;
-          }
-          if (controlledGroup !== null) {
-            this.scopedGroupIds.set(tabId, tab.groupId);
-            await this.persistScope(lease);
-            lease.assertCurrent();
-            await this.updateControlledGroup(tab.groupId);
-            return;
-          }
-          if (expectedGroupId !== undefined) {
-            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
-          }
-          return;
-        }
-
-        if (controlledGroup === null) {
-          return;
-        }
-        if (isTabRestricted(tab)) {
           lease.assertCurrent();
-          await this.ungroupTabLocked(tabId, tab.groupId);
-          return;
-        }
+          if (
+            this.scopedTabIds.has(tabId) &&
+            Object.hasOwn(changeInfo, "url") &&
+            isRestrictedUrl(changeInfo.url)
+          ) {
+            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+            return;
+          }
+          if (
+            !Object.hasOwn(changeInfo, "groupId") ||
+            expectedGroupTransition !== null
+          ) {
+            return;
+          }
 
-        if (this.quarantinedTabIds.has(tabId)) {
-          throw new ProtocolError(
-            ERROR_CODES.COMMAND_TIMEOUT,
-            "The requested tab is still being reconciled after reset.",
+          let tab;
+          try {
+            tab = await chrome.tabs.get(tabId);
+          } catch {
+            return;
+          }
+          lease.assertCurrent();
+          if (tab.groupId !== changeInfo.groupId) {
+            return;
+          }
+
+          const controlledGroup = await this.getControlledGroup(tab.groupId);
+          lease.assertCurrent();
+          if (this.scopedTabIds.has(tabId)) {
+            const expectedGroupId = this.scopedGroupIds.get(tabId);
+            if (tab.groupId === expectedGroupId) {
+              return;
+            }
+            if (controlledGroup !== null) {
+              this.scopedGroupIds.set(tabId, tab.groupId);
+              await this.persistScope(lease);
+              lease.assertCurrent();
+              await this.updateControlledGroup(tab.groupId);
+              return;
+            }
+            if (expectedGroupId !== undefined) {
+              await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+            }
+            return;
+          }
+
+          if (controlledGroup === null) {
+            return;
+          }
+          if (isTabRestricted(tab)) {
+            lease.assertCurrent();
+            await this.ungroupTabLocked(tabId, tab.groupId);
+            return;
+          }
+
+          if (this.quarantinedTabIds.has(tabId)) {
+            throw new ProtocolError(
+              ERROR_CODES.COMMAND_TIMEOUT,
+              "The requested tab is still being reconciled after reset.",
+            );
+          }
+          lease.assertCurrent();
+          await this.updateControlledGroup(tab.groupId);
+          lease.assertCurrent();
+          const scopedTab = await this.addGroupedTabToScopeLocked(
+            tab,
+            tab.groupId,
+            lease,
           );
+          lease.assertCurrent();
+          this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+            ...this.publicTab(scopedTab, false),
+            origin: "shared",
+          });
+        } finally {
+          if (expectedGroupTransition !== null) {
+            this.clearExpectedGroupTransition(tabId, expectedGroupTransition);
+          }
         }
-        lease.assertCurrent();
-        await this.updateControlledGroup(tab.groupId);
-        lease.assertCurrent();
-        const scopedTab = await this.addGroupedTabToScopeLocked(
-          tab,
-          tab.groupId,
-          lease,
-        );
-        lease.assertCurrent();
-        this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
-          ...this.publicTab(scopedTab, false),
-          origin: "shared",
-        });
-      } finally {
-        if (expectedGroupTransition !== null) {
-          this.clearExpectedGroupTransition(tabId, expectedGroupTransition);
-        }
-      }
-    });
+      },
+      this.operationGeneration,
+      false,
+    );
   }
 
   async closeCreatedTab(tabId) {
@@ -587,11 +724,18 @@ export class TabScope {
       );
     }
     this.scopedTabIds.add(tab.id);
-    await this.persistScope(lease);
-    lease?.assertCurrent();
-    await this.groupTabLocked(tab, lease);
-    lease?.assertCurrent();
-    return this.assertControllableLocked(tab.id, lease);
+    try {
+      await this.persistScope(lease);
+      lease?.assertCurrent();
+      await this.groupTabLocked(tab, lease);
+      lease?.assertCurrent();
+      return await this.assertControllableLocked(tab.id, lease);
+    } catch (error) {
+      this.scopedTabIds.delete(tab.id);
+      this.scopedGroupIds.delete(tab.id);
+      await this.persistScope(lease);
+      throw error;
+    }
   }
 
   async addGroupedTabToScopeLocked(tab, groupId, lease = null) {
@@ -644,7 +788,10 @@ export class TabScope {
   async groupTabLocked(tab, lease = null) {
     const tabId = tab.id;
     if (!Number.isInteger(tabId) || !Number.isInteger(tab.windowId)) {
-      return;
+      throw new ProtocolError(
+        ERROR_CODES.TAB_NOT_FOUND,
+        "Chrome returned an invalid tab for Skyvern Controlled.",
+      );
     }
     let groupId;
     try {
@@ -677,12 +824,23 @@ export class TabScope {
       if (error instanceof ProtocolError) {
         throw error;
       }
-      return;
+      throw new ProtocolError(
+        ERROR_CODES.INTERNAL,
+        "Chrome could not add the tab to Skyvern Controlled.",
+      );
     }
     lease?.assertCurrent();
     this.scopedGroupIds.set(tabId, groupId);
     await this.persistScope(lease);
-    await this.updateControlledGroup(groupId);
+    if (!(await this.updateControlledGroup(groupId))) {
+      await this.ungroupTabLocked(tabId, groupId);
+      this.scopedGroupIds.delete(tabId);
+      await this.persistScope(lease);
+      throw new ProtocolError(
+        ERROR_CODES.INTERNAL,
+        "Chrome could not label the Skyvern Controlled group.",
+      );
+    }
   }
 
   async ungroupTabLocked(tabId, scopedGroupId) {
@@ -730,8 +888,9 @@ export class TabScope {
         title: SKYVERN_GROUP_TITLE,
         color: SKYVERN_GROUP_COLOR,
       });
+      return true;
     } catch {
-      return;
+      return false;
     }
   }
 
@@ -769,20 +928,15 @@ export class TabScope {
           if (!this.scopedTabIds.has(tabId)) {
             return null;
           }
-          let scopedTab;
           try {
-            scopedTab = await chrome.tabs.get(tabId);
-          } catch {
-            lease.assertCurrent();
-            await this.removeFromScopeLocked(tabId, "closed", false, lease);
-            return null;
+            const scopedTab = await this.assertControllableLocked(tabId, lease);
+            return this.publicTab(scopedTab, includeActive);
+          } catch (error) {
+            if (isScopeRevocation(error)) {
+              return null;
+            }
+            throw error;
           }
-          lease.assertCurrent();
-          if (isTabRestricted(scopedTab)) {
-            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
-            return null;
-          }
-          return this.publicTab(scopedTab, includeActive);
         },
         generation,
       );
@@ -849,22 +1003,13 @@ export class TabScope {
           }
           const expectedGroupId = this.scopedGroupIds.get(tabId);
           if (
-            expectedGroupId !== undefined &&
+            expectedGroupId === undefined ||
             tab.groupId !== expectedGroupId
           ) {
-            const controlledGroup = await this.getControlledGroup(tab.groupId);
-            lease.assertCurrent();
-            if (controlledGroup === null) {
-              await this.removeFromScopeLocked(tabId, "unshared", true, lease);
-            } else {
-              this.scopedGroupIds.set(tabId, tab.groupId);
-              await this.persistScope(lease);
-              lease.assertCurrent();
-              await this.updateControlledGroup(tab.groupId);
-            }
-          } else if (expectedGroupId === undefined) {
-            await this.groupTabLocked(tab, lease);
+            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+            return;
           }
+          await this.assertControllableLocked(tabId, lease);
         },
         generation,
       );
@@ -875,6 +1020,7 @@ export class TabScope {
     tabId,
     operation,
     expectedGeneration = this.operationGeneration,
+    cancelOnTabEvent = true,
   ) {
     while (this.resetting) {
       await this.resetFinished;
@@ -905,6 +1051,9 @@ export class TabScope {
     }
     this.activeOperationCount += 1;
     this.operationLeases.add(lease);
+    if (cancelOnTabEvent) {
+      this.trackTabOperationLease(tabId, lease);
+    }
     const previous = this.tabOperations.get(tabId) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
@@ -917,6 +1066,7 @@ export class TabScope {
         this.tabOperations.delete(tabId);
       }
       this.operationLeases.delete(lease);
+      this.untrackTabOperationLease(lease);
       clearTimeout(timeoutId);
       this.activeOperationCount -= 1;
       if (this.activeOperationCount === 0) {

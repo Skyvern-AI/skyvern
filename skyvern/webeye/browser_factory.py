@@ -47,6 +47,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
     deny_unenrolled_redirect_hop,
@@ -68,6 +69,7 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.playwright_input import register_playwright_input_context
 from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
 LOG = structlog.get_logger()
@@ -243,6 +245,7 @@ async def _apply_origin_scoped_headers(
         else:
             await route.fallback()
 
+    app.AGENT_FUNCTION.on_origin_scoped_headers_route_installed(browser_context, target_origin)
     await browser_context.route("**/*", apply_headers)
 
 
@@ -421,7 +424,7 @@ def set_download_file_listener(
                     "Download artifact absent on this connection; skipping worker-side rename",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
-                    suggested_filename=download.suggested_filename,
+                    suggested_filename_fp=diagnostic_fingerprint(download.suggested_filename),
                 )
                 return
             if file_path.suffix:
@@ -431,7 +434,7 @@ def set_download_file_listener(
                 "No file extensions, going to add file extension automatically",
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
-                suggested_filename=download.suggested_filename,
+                suggested_filename_fp=diagnostic_fingerprint(download.suggested_filename),
                 url=_redact_url_query(download.url),
             )
             suffix = Path(download.suggested_filename).suffix
@@ -455,7 +458,7 @@ def set_download_file_listener(
                             "Add extension according to the parsed query params of download url",
                             workflow_run_id=workflow_run_id,
                             task_id=task_id,
-                            filename=value,
+                            filename_fp=diagnostic_fingerprint(value),
                         )
                         file_path.rename(str(file_path) + suffix)
                         return
@@ -805,6 +808,10 @@ class BrowserContextFactory:
                 target_url=cast(str | None, kwargs.get("url")),
                 headers=scoped_headers,
                 route_handlers_allowed=route_handlers_allowed,
+            )
+            register_playwright_input_context(
+                browser_context,
+                strict_selectors=cast(bool, kwargs.get("strict_selectors", False)),
             )
 
             proxy_location: ProxyLocationInput = kwargs.get("proxy_location")

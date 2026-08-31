@@ -17,6 +17,7 @@ ALLOWED_OPS = frozenset(
         "debugger.attach",
         "debugger.detach",
         "debugger.send",
+        "dom.evaluate",
         "tabs.create",
         "tabs.remove",
         "tabs.activate",

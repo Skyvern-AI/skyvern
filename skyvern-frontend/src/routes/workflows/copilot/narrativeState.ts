@@ -156,6 +156,37 @@ export interface TerminalEnvelopeFacts {
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type BlockCoverage =
+  | "current_source"
+  | "different_source"
+  | "never_run"
+  | "unknown";
+
+const BLOCK_COVERAGE: readonly BlockCoverage[] = [
+  "current_source",
+  "different_source",
+  "never_run",
+  "unknown",
+];
+
+// The canonical per-turn facts the backend publishes; card, pill and prose each
+// render a projection of this bundle rather than deriving their own verdict.
+export interface TurnFacts {
+  factsAvailable: boolean;
+  authoredBlockCount: number | null;
+  matchingSourceBlockCount: number | null;
+  evaluationState: BlockOutcome | null;
+  runId: string | null;
+  runCompleted: boolean | null;
+  terminalCause: string | null;
+  blocksRunThisTurn: number | null;
+  ranCleanOnCurrentSource: boolean;
+}
+
+// The backend decides the tested claim and publishes it here; no surface recomputes it.
+export function ranCleanOnCurrentSource(facts: TurnFacts | null): boolean {
+  return facts?.ranCleanOnCurrentSource === true;
+}
 
 export interface ReviewProjection {
   blocks: Array<{
@@ -163,6 +194,7 @@ export interface ReviewProjection {
     blockType: string;
     change: ReviewChange;
     neverTested?: boolean;
+    coverage?: BlockCoverage;
   }>;
   duplicateWrites: Array<{
     blockType: string;
@@ -242,6 +274,16 @@ export interface ActivityEntry {
   // Consecutive same-tool retries folded into this row by
   // condenseActivityEntries. Unset outside that transform.
   attempts?: number;
+  // First-attempt identity for the reader-visible retry row. The current
+  // entry keeps its real event id for correlation.
+  retryRootId?: string;
+  // Exact failed attempts hidden by retry condensation, retained for the
+  // expanded evidence view.
+  priorFailures?: ActivityEntry[];
+  // Server timestamp of the first call represented by this condensed entry.
+  // A settled tool_result otherwise retains only its completion timestamp,
+  // which makes real multi-second work render as 0:00.
+  activityStartedAt?: string;
   // Server clock read for this event, persisted so a hydrated turn reports the
   // same elapsed as the live one. Undefined against a backend that does not stamp.
   timestamp?: string;
@@ -325,6 +367,7 @@ export interface TurnNarrativeState {
   connectedAccountChoices: ConnectedAccountChoice[];
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
+  turnFacts: TurnFacts | null;
 }
 
 export interface GoogleConnectionNotice {
@@ -363,6 +406,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   connectedAccountChoices: [],
   googleConnectionNotices: [],
   review: null,
+  turnFacts: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -555,6 +599,9 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   press_key: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
+  skyvern_frame_list: "Finding embedded pages",
+  skyvern_frame_switch: "Opening embedded page",
+  skyvern_frame_main: "Returning to main page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
@@ -730,11 +777,19 @@ export function condenseActivityEntries(
       const idx = id !== undefined ? callIndexById.get(id) : undefined;
       if (idx !== undefined) {
         callIndexById.delete(id!);
+        const call = paired[idx];
+        const settled =
+          call?.timestamp === undefined
+            ? entry
+            : {
+                ...entry,
+                activityStartedAt: call.activityStartedAt ?? call.timestamp,
+              };
         if (idx === paired.length - 1) {
-          paired[idx] = entry;
+          paired[idx] = settled;
         } else {
           paired[idx] = null;
-          paired.push(entry);
+          paired.push(settled);
         }
       } else {
         // Its tool_call was evicted past the activity cap — keep the
@@ -751,6 +806,14 @@ export function condenseActivityEntries(
   let lastToolIdx = -1;
   for (const entry of ordered) {
     const prevTool = lastToolIdx >= 0 ? condensed[lastToolIdx] : undefined;
+    const previousEndedMs = parseUtcIsoMs(prevTool?.timestamp);
+    const currentStartedMs = parseUtcIsoMs(
+      entry.activityStartedAt ?? entry.timestamp,
+    );
+    const followsPreviousAttempt =
+      previousEndedMs === null ||
+      currentStartedMs === null ||
+      currentStartedMs >= previousEndedMs;
     if (
       prevTool &&
       entry.toolName !== undefined &&
@@ -758,13 +821,24 @@ export function condenseActivityEntries(
       (prevTool.displayLabel === undefined ||
         entry.displayLabel === undefined ||
         prevTool.displayLabel === entry.displayLabel) &&
-      prevTool.success === false
+      prevTool.success === false &&
+      followsPreviousAttempt
     ) {
+      const { priorFailures: earlierFailures, ...previousAttempt } = prevTool;
       condensed[lastToolIdx] = null;
       lastToolIdx =
         condensed.push({
           ...entry,
+          retryRootId: prevTool.retryRootId ?? prevTool.id,
+          priorFailures: [
+            ...(earlierFailures ?? []),
+            previousAttempt as ActivityEntry,
+          ],
           attempts: (prevTool.attempts ?? 1) + 1,
+          activityStartedAt:
+            prevTool.activityStartedAt ??
+            prevTool.timestamp ??
+            entry.activityStartedAt,
         }) - 1;
       continue;
     }
@@ -781,6 +855,12 @@ export function condenseActivityEntries(
 function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   const next = [...arr, entry];
   return next.length > cap ? next.slice(next.length - cap) : next;
+}
+
+function findActivityBlockIndex(blocks: BlockState[], entryId: string): number {
+  return blocks.findIndex((block) =>
+    block.activity.some((entry) => entry.id === entryId),
+  );
 }
 
 function appendActivity(
@@ -820,9 +900,7 @@ function appendActivity(
         ),
       };
     }
-    const callBlockIdx = blocks.findIndex((b) =>
-      b.activity.some((e) => e.id === callId),
-    );
+    const callBlockIdx = findActivityBlockIndex(blocks, callId);
     if (callBlockIdx !== -1) {
       const nextBlocks = blocks.slice();
       const callBlock = nextBlocks[callBlockIdx]!;
@@ -850,6 +928,38 @@ function appendActivity(
     ...active,
     activity: appendCapped(active.activity, entry, MAX_ACTIVITY_ENTRIES),
   };
+  return { blocks: nextBlocks, designActivity };
+}
+
+function attachCodeDiffsToActivity(
+  blocks: BlockState[],
+  designActivity: ActivityEntry[],
+  targetId: string,
+  codeDiffs: CodeWriteDiff[],
+): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
+  const designIndex = designActivity.findIndex(
+    (entry) => entry.id === targetId,
+  );
+  if (designIndex !== -1) {
+    const nextDesignActivity = designActivity.slice();
+    nextDesignActivity[designIndex] = {
+      ...nextDesignActivity[designIndex]!,
+      codeDiffs,
+    };
+    return { blocks, designActivity: nextDesignActivity };
+  }
+
+  const blockIndex = findActivityBlockIndex(blocks, targetId);
+  if (blockIndex === -1) return { blocks, designActivity };
+
+  const nextBlocks = blocks.slice();
+  const block = nextBlocks[blockIndex]!;
+  const activityIndex = block.activity.findIndex(
+    (entry) => entry.id === targetId,
+  );
+  const activity = block.activity.slice();
+  activity[activityIndex] = { ...activity[activityIndex]!, codeDiffs };
+  nextBlocks[blockIndex] = { ...block, activity };
   return { blocks: nextBlocks, designActivity };
 }
 
@@ -957,11 +1067,12 @@ export function applyNarrativeEvent(
         event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
       const withDiffs =
         draftDiffs === undefined || diffTarget === null
-          ? prev.designActivity
-          : prev.designActivity.map((entry) =>
-              entry.id === diffTarget
-                ? { ...entry, codeDiffs: draftDiffs }
-                : entry,
+          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          : attachCodeDiffsToActivity(
+              nextBlocks,
+              prev.designActivity,
+              diffTarget,
+              draftDiffs,
             );
 
       return {
@@ -971,8 +1082,8 @@ export function applyNarrativeEvent(
           blockLabels: event.block_labels,
           summary: event.summary,
         },
-        blocks: nextBlocks,
-        designActivity: withDiffs,
+        blocks: withDiffs.blocks,
+        designActivity: withDiffs.designActivity,
       };
     }
 
@@ -1330,6 +1441,34 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
   return out;
 }
 
+function parseTurnFacts(raw: unknown): TurnFacts | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.factsAvailable !== "boolean") return null;
+  const count = (key: string): number | null =>
+    typeof value[key] === "number" ? (value[key] as number) : null;
+  const text = (key: string): string | null =>
+    typeof value[key] === "string" ? (value[key] as string) : null;
+  const evaluationState = value.evaluationState;
+  return {
+    factsAvailable: value.factsAvailable,
+    authoredBlockCount: count("authoredBlockCount"),
+    matchingSourceBlockCount: count("matchingSourceBlockCount"),
+    evaluationState:
+      evaluationState === "demonstrated" ||
+      evaluationState === "not_demonstrated" ||
+      evaluationState === "not_evaluated"
+        ? evaluationState
+        : null,
+    runId: text("runId"),
+    runCompleted:
+      typeof value.runCompleted === "boolean" ? value.runCompleted : null,
+    terminalCause: text("terminalCause"),
+    blocksRunThisTurn: count("blocksRunThisTurn"),
+    ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
+  };
+}
+
 function parseReviewProjection(raw: unknown): ReviewProjection | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
@@ -1352,11 +1491,14 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
     ) {
       return null;
     }
+    // An unrecognised coverage value drops off this block rather than voiding the
+    // whole projection, so a newer backend vocabulary cannot blank the review.
     blocks.push({
       label: block.label,
       blockType: block.blockType,
       change: block.change,
       neverTested: block.neverTested,
+      coverage: BLOCK_COVERAGE.find((known) => known === block.coverage),
     });
   }
   const duplicateWrites: ReviewProjection["duplicateWrites"] = [];
@@ -1493,12 +1635,16 @@ export function hydrateNarrativeFromPayload(
   const endedAtIso =
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
+  const turnFacts = parseTurnFacts(payload.turnFacts);
+  // A deadline cuts a running block off; that is a stop, so it must not be swept
+  // to failed and then read back as the turn having failed.
+  const halted = cancelled || turnFacts?.terminalCause === "deadline_expired";
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: cancelled
+              state: halted
                 ? "stopped"
                 : terminal === "error"
                   ? "failed"
@@ -1564,6 +1710,7 @@ export function hydrateNarrativeFromPayload(
       payload.googleConnectionNotices,
     ),
     review: parseReviewProjection(payload.review),
+    turnFacts,
   };
 }
 
@@ -1735,17 +1882,15 @@ function adjudicatedSummaryParts(
     needsTestedProposalReview: boolean;
     hasEdited: boolean;
     hasDrafts: boolean;
-    hasCleanCompletedBuild: boolean;
   },
-  uxV1 = false,
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
   // Disposition-first (rule A): a pending draft review outranks why the turn
   // ended, regardless of responseKind (including non-build/clarify turns).
-  if (uxV1 && flags.needsUntestedProposalReview) {
+  if (flags.needsUntestedProposalReview) {
     return { headline: "Draft needs review", accent: "qa", glyph: "!" };
   }
-  if (uxV1 && flags.needsTestedProposalReview) {
+  if (flags.needsTestedProposalReview) {
     return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
   }
   if (turn.responseKind !== "build") {
@@ -1762,7 +1907,7 @@ function adjudicatedSummaryParts(
       return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
     }
     return {
-      headline: uxV1 ? "Needs your input" : "Question",
+      headline: "Needs your input",
       accent: "qa",
       glyph: "✦",
     };
@@ -1775,7 +1920,7 @@ function adjudicatedSummaryParts(
   }
   if (turn.responseType === "ASK_QUESTION") {
     return {
-      headline: uxV1 ? "Needs your input" : "Question",
+      headline: "Needs your input",
       accent: "qa",
       glyph: "✦",
     };
@@ -1783,25 +1928,35 @@ function adjudicatedSummaryParts(
   return null;
 }
 
-export function computeTurnSummary(
-  turn: TurnNarrativeState,
-  opts: { uxV1?: boolean } = {},
-): TurnSummary {
-  const uxV1 = opts.uxV1 ?? false;
+// A deadline exit stamps terminal="error" for budget reasons; that is a halt,
+// not a block failure, so no surface may give it failure's treatment.
+export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" &&
+    !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
+export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   // A cancelled turn's terminal is "error" purely because the user stopped it,
   // so that arm must not brand their own stop a failure.
+  const anyBlockFailed = rollupBlocks.some((b) => b.state === "failed");
+  const facts = turn.turnFacts;
+  const deadlineHalt = isDeadlineHalt(turn);
   const isFail =
     !turn.cancelled &&
-    (turn.terminal === "error" ||
-      rollupBlocks.some((b) => b.state === "failed"));
+    !deadlineHalt &&
+    (turn.terminal === "error" || anyBlockFailed);
   // A stop halts the turn without failing it — a user cancel, or a budget halt
   // that cancels a block mid-run. It suppresses a success verdict exactly like
   // a failure, but never wears failure's treatment. `turn.cancelled` is load
   // bearing on its own: a stop during the thinking phase, or on a QA turn,
   // touches no block at all and would otherwise read as a clean success.
   const isStopped =
-    turn.cancelled || rollupBlocks.some((b) => b.state === "stopped");
+    turn.cancelled ||
+    deadlineHalt ||
+    rollupBlocks.some((b) => b.state === "stopped");
   const mode = effectiveMode(turn);
   const needsInput = asksUserForInput(turn);
   const isQA =
@@ -1810,15 +1965,26 @@ export function computeTurnSummary(
     mode === "clarify" ||
     mode === "refuse";
   const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
+  const cleanFullCurrentSourceCoverage = ranCleanOnCurrentSource(facts);
   const needsUntestedProposalReview =
     hasDrafts && turn.proposalDisposition === "review_untested";
+  // The tested framing is a claim like any other, so it reads the published verdict
+  // rather than the disposition alone.
   const needsTestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_tested";
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-  const hasCleanCompletedBuild =
     hasDrafts &&
-    rollupBlocks.length > 0 &&
-    rollupBlocks.every((block) => isBlockOk(block));
+    turn.proposalDisposition === "review_tested" &&
+    cleanFullCurrentSourceCoverage;
+  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
+  const authoredBlockCount = facts?.factsAvailable
+    ? facts.authoredBlockCount
+    : null;
+  const matchingSourceBlockCount = facts?.factsAvailable
+    ? facts.matchingSourceBlockCount
+    : null;
+  const coverageKnown =
+    authoredBlockCount !== null &&
+    authoredBlockCount > 0 &&
+    matchingSourceBlockCount !== null;
   const hasReviewableDraft =
     hasDrafts &&
     (turn.proposalDisposition === "review_untested" ||
@@ -1830,17 +1996,12 @@ export function computeTurnSummary(
   const adjudicated =
     isStoppedWithDraft || isFail || isStopped
       ? null
-      : adjudicatedSummaryParts(
-          turn,
-          {
-            needsUntestedProposalReview,
-            needsTestedProposalReview,
-            hasEdited,
-            hasDrafts,
-            hasCleanCompletedBuild,
-          },
-          uxV1,
-        );
+      : adjudicatedSummaryParts(turn, {
+          needsUntestedProposalReview,
+          needsTestedProposalReview,
+          hasEdited,
+          hasDrafts,
+        });
 
   const headline = adjudicated
     ? adjudicated.headline
@@ -1850,40 +2011,24 @@ export function computeTurnSummary(
         ? "Run halted"
         : isStopped
           ? "Stopped"
-          : uxV1
-            ? needsUntestedProposalReview
-              ? "Draft needs review"
-              : needsTestedProposalReview
-                ? "Workflow ready for review"
-                : needsInput
-                  ? "Needs your input"
-                  : isQA
-                    ? mode === "refuse"
-                      ? "Declined"
-                      : mode === "clarify"
-                        ? "Needs your input"
-                        : "Answered"
+          : needsUntestedProposalReview
+            ? "Draft needs review"
+            : needsTestedProposalReview
+              ? "Workflow ready for review"
+              : needsInput
+                ? "Needs your input"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Needs your input"
+                      : "Answered"
+                  : cleanFullCurrentSourceCoverage
+                    ? "Every block ran clean on the current draft"
                     : hasEdited
-                      ? "Applied edits and re-tested"
+                      ? "Applied edits"
                       : hasDrafts
-                        ? "Built and tested the workflow"
-                        : "Completed the run"
-            : needsInput
-              ? "Question"
-              : needsUntestedProposalReview
-                ? "Draft needs review"
-                : needsTestedProposalReview
-                  ? "Workflow ready for review"
-                  : isQA
-                    ? mode === "refuse"
-                      ? "Declined"
-                      : mode === "clarify"
-                        ? "Question"
-                        : "Answered"
-                    : hasEdited
-                      ? "Applied edits and re-tested"
-                      : hasDrafts
-                        ? "Built and tested the workflow"
+                        ? "Built the workflow"
                         : "Completed the run";
 
   const stats: string[] = [];
@@ -1894,8 +2039,30 @@ export function computeTurnSummary(
     const failed = rollupBlocks.filter((b) => b.state === "failed").length;
     const stopped = rollupBlocks.filter((b) => b.state === "stopped").length;
     const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-    if (newBlocks) stats.push(`${newBlocks} new`);
+    if (coverageKnown) {
+      stats.push(
+        `${authoredBlockCount} block${authoredBlockCount === 1 ? "" : "s"} authored`,
+      );
+      stats.push(
+        `${matchingSourceBlockCount}/${authoredBlockCount} ran on current source`,
+      );
+      if (facts?.runCompleted === true) {
+        stats.push("run completed");
+      } else if (facts?.runCompleted === false) {
+        stats.push("run did not complete");
+      }
+      if (facts?.evaluationState === "not_evaluated") {
+        stats.push("outcome not evaluated");
+      } else if (facts?.evaluationState === "not_demonstrated") {
+        stats.push("outcome not confirmed");
+      }
+      if (facts?.terminalCause === "deadline_expired") {
+        stats.push("time limit reached");
+      }
+    } else {
+      if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
+      if (newBlocks) stats.push(`${newBlocks} new`);
+    }
     if (failed) stats.push(`${failed} failed`);
     if (stopped) stats.push(`${stopped} stopped`);
   }
@@ -1909,7 +2076,8 @@ export function computeTurnSummary(
         : isStopped ||
             needsUntestedProposalReview ||
             needsTestedProposalReview ||
-            isQA
+            isQA ||
+            (hasDrafts && !cleanFullCurrentSourceCoverage)
           ? "qa"
           : "ok";
   return {
@@ -1920,7 +2088,10 @@ export function computeTurnSummary(
       ? adjudicated.glyph
       : isStoppedWithDraft ||
           needsUntestedProposalReview ||
-          needsTestedProposalReview
+          needsTestedProposalReview ||
+          // A draft still awaiting review never wears a success tick, whether or not
+          // facts back its tested framing.
+          (hasDrafts && turn.proposalDisposition === "review_tested")
         ? "!"
         : isFail
           ? "✕"
