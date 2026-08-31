@@ -10,14 +10,17 @@ import pytest
 from mcp.types import CallToolResult
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM_NAME,
     SchemaOverlay,
     SkyvernOverlayMCPServer,
+    _apply_schema_overlay,
     _BrowserCallOutcome,
     _handle_browser_session_loss,
     _requested_output_path_choices,
@@ -33,6 +36,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_page_custody_lock,
     mcp_to_copilot,
 )
+from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -71,6 +75,107 @@ class TestRequestedOutputPathChoices:
 
     def test_a_turn_owing_no_output_leaves_the_schema_alone(self) -> None:
         assert _requested_output_path_choices(_schema(), []) == _schema()
+
+    def test_narrowing_the_path_choices_leaves_the_rest_of_the_contract_intact(self) -> None:
+        source = {**_schema(), "additionalProperties": False}
+
+        schema = _requested_output_path_choices(source, ["output.a"])
+
+        assert schema["additionalProperties"] is False
+        assert schema["properties"]["expression"] == source["properties"]["expression"]
+        assert schema["required"] == source["required"]
+
+
+def _closed_source_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "description": "Open a page.",
+        "$defs": {"Where": {"type": "string", "enum": ["chat", "last_run"]}},
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session id."},
+            "url": {"type": "string", "description": "URL to open."},
+            "where": {"$ref": "#/$defs/Where"},
+        },
+        "required": ["url"],
+    }
+
+
+async def _tab_new_overlay() -> SchemaOverlay:
+    surface = resolve_copilot_tool_surface(
+        mode=CopilotEvalMode.BROWSER_ABLATION,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        registered_mcp_tools=await mcp.list_tools(run_middleware=False),
+    )
+    return surface.overlays["skyvern_tab_new"]
+
+
+class TestSchemaOverlayPreservesTheSourceContract:
+    def test_an_empty_overlay_leaves_the_accepted_argument_contract_untouched(self) -> None:
+        source = _closed_source_schema()
+
+        assert _apply_schema_overlay(source, SchemaOverlay()) == source
+
+    @pytest.mark.parametrize(
+        ("overlay", "expected_properties", "expected_required"),
+        [
+            (SchemaOverlay(hide_params=frozenset({"session_id"})), {"url", "where"}, ["url"]),
+            (SchemaOverlay(forced_args={"session_id": "pbs_1"}), {"url", "where"}, ["url"]),
+            (SchemaOverlay(arg_transforms={"target": "where"}), {"session_id", "url", "target"}, ["url"]),
+            (
+                SchemaOverlay(copilot_params={"target": {"type": "string"}}),
+                {"session_id", "url", "where", "target"},
+                ["url"],
+            ),
+        ],
+    )
+    def test_an_overlay_edits_the_fields_it_names_and_nothing_else(
+        self,
+        overlay: SchemaOverlay,
+        expected_properties: set[str],
+        expected_required: list[str],
+    ) -> None:
+        source = _closed_source_schema()
+
+        schema = _apply_schema_overlay(source, overlay)
+
+        assert set(schema["properties"]) == expected_properties
+        assert schema["required"] == expected_required
+        assert schema["additionalProperties"] is False
+        assert schema["$defs"] == source["$defs"]
+        assert schema["description"] == source["description"]
+
+    def test_a_renamed_field_keeps_its_definition_reachable(self) -> None:
+        schema = _apply_schema_overlay(_closed_source_schema(), SchemaOverlay(arg_transforms={"target": "where"}))
+
+        assert schema["properties"]["target"] == {"$ref": "#/$defs/Where"}
+        assert schema["$defs"]["Where"]["enum"] == ["chat", "last_run"]
+
+
+@pytest.mark.asyncio
+async def test_a_valid_tab_creation_dispatches_only_the_tools_own_arguments() -> None:
+    overlay = await _tab_new_overlay()
+
+    mcp_args = _transform_args({"url": "https://example.com", BROWSER_TARGET_PARAM_NAME: "last_run"}, overlay)
+
+    assert mcp_args == {"url": "https://example.com"}
+
+
+@pytest.mark.asyncio
+async def test_an_argument_outside_the_contract_is_refused_rather_than_swallowed() -> None:
+    overlay = await _tab_new_overlay()
+
+    mcp_args = _transform_args({"url": "https://example.com", "settle_seconds": 30}, overlay)
+    result = await mcp.call_tool("skyvern_tab_new", mcp_args)
+    payload = result.structured_content
+
+    assert mcp_args["settle_seconds"] == 30
+    assert payload is not None
+    assert payload["ok"] is False
+    assert payload["error"]["message"] == "skyvern_tab_new was called with unsupported argument(s): settle_seconds."
+    assert payload["error"]["details"]["unsupported_arguments"] == ["settle_seconds"]
 
 
 def test_the_declared_path_says_the_expression_is_that_value() -> None:

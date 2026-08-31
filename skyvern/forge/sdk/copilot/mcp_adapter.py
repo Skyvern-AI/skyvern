@@ -1116,6 +1116,7 @@ def _apply_schema_overlay(
         required = overlay.required_overrides
 
     return {
+        **input_schema,
         "type": input_schema.get("type", "object"),
         "properties": props,
         "required": required,
