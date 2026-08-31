@@ -994,6 +994,7 @@ def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
 
 _PAGE_EVIDENCE_STATE_KEYS = (
     "page_title",
+    "size_compaction",
     "forms",
     "navigation_targets",
     "navigation_targets_truncated",
@@ -1431,7 +1432,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             continue
         seen_disclosures.add(identity)
         disclosure_controls.append(summary)
-    return {
+    page_summary: dict[str, Any] = {
         "page_title": _summary_text(evidence.get("page_title")),
         "forms": forms_summary,
         "navigation_target_count": len(nav_targets),
@@ -1449,6 +1450,10 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         "modal_dismiss_controls": dismiss_entries,
         "interaction_blocking_layers": interaction_blocking_layers,
     }
+    size_compaction = evidence.get("size_compaction")
+    if isinstance(size_compaction, dict):
+        page_summary["size_compaction"] = size_compaction
+    return page_summary
 
 
 def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
