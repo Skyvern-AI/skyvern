@@ -1358,6 +1358,7 @@ class ForgeAgent:
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
+            MAX_TOKENS_CEILING,
             MIN_ACTION_STEPS,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
@@ -1693,7 +1694,19 @@ class ForgeAgent:
                     )
                     return step, task
                 step_cap = min(step_cap, remaining_workflow_steps)
-        max_turns, max_tool_calls = taskv3_runaway_backstops(step_cap)
+        max_turns, max_tool_calls, max_tokens = taskv3_runaway_backstops(step_cap)
+        if max_tokens == MAX_TOKENS_CEILING:
+            # A step cap large enough to hit the token ceiling silently re-caps the run's tokens; make
+            # that observable so a recurrence of the flat-ceiling failure mode is found here, not by
+            # canary failure analysis.
+            LOG.info(
+                "task_v3 token backstop clamped at its ceiling",
+                log_code="taskv3_token_backstop_clamped",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                step_cap=step_cap,
+                max_tokens=max_tokens,
+            )
         # Per-action persistence (parity with the step engine): the loop hands us each successful
         # action round, and we persist one DB row per action + one screenshot per round, so the Task
         # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3. Additive and
@@ -1892,6 +1905,7 @@ class ForgeAgent:
                 max_action_steps=step_cap,
                 max_turns=max_turns,
                 max_tool_calls=max_tool_calls,
+                max_tokens=max_tokens,
                 step=step,
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
