@@ -774,9 +774,10 @@ async def _click_autocomplete_option_with_commit_evidence(
     """Click the LLM-selected option and return ``ActionSuccess``, enriched with commit evidence
     only when the target control's read-back changes into a value that — like the pre-click value —
     is a boundary-delimited fragment of the clicked option's label (see
-    ``_autocomplete_commit_evidence``) AND that transitioned value survives a single bounded settle
-    reread. The settle guards against an optimistic control that paints the selected label and then
-    reverts it after async validation/rerender, which would otherwise commit a transient value.
+    ``_autocomplete_commit_evidence``) AND that transitioned value survives a next-render settle
+    reread. The render-driven settle guards against an optimistic control that paints the selected
+    label and then reverts it after async validation/rerender, which would otherwise commit a
+    transient value.
 
     Evidence capture is best-effort and fail-closed: a failed read (before, after, or on the settle
     reread), a missing label, an unchanged control, an unrelated transform, a value that drifts on
@@ -808,10 +809,11 @@ async def _click_autocomplete_option_with_commit_evidence(
         if evidence is None:
             return ActionSuccess()
         # The candidate transition passed, but an optimistic control can paint the selected label and
-        # then revert it after async validation/rerender. Settle once (no loop) and reconfirm the
-        # value; only record evidence when the settled reread still holds the first post value, so a
-        # transient paint cannot be committed as stale evidence.
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.commit")
+        # then revert it after async validation/rerender. Reconcile on the next render turn via the
+        # existing render-settle helper (double-rAF, with a 250ms liveness cap) and reread once; only
+        # record evidence when the next-render reread still holds the first post value, so a transient
+        # paint cannot be committed as stale evidence.
+        await _wait_custom_select_render_settle(skyvern_element)
         confirm_value = await _read_autocomplete_control_value(skyvern_element, engine_selection)
         if confirm_value is None or _normalize_select_shadow_text(confirm_value) != _normalize_select_shadow_text(
             post_value
