@@ -1278,7 +1278,7 @@ async def run_agent_tool_loop(
     organization_id: str | None = None,
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]]], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
     deadline_seconds: float | None = None,
@@ -2617,7 +2617,7 @@ async def run_agent_tool_loop(
         # persistence hiccup must not abort an otherwise-good run, so failures are contained here.
         if round_actions and on_action_round is not None:
             try:
-                await on_action_round(round_actions)
+                await on_action_round(round_actions, text or None)
             except Exception:
                 LOG.warning("taskv3 on_action_round callback failed", turn=turns, exc_info=True)
 

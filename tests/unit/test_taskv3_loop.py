@@ -64,8 +64,11 @@ from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 class _ScriptedCaller:
     """Emits one queued turn per ``call``. Each turn is a list of (tool_name, args)."""
 
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], texts: list[str] | None = None) -> None:
         self._script = script
+        # Per-turn assistant text, indexed like `script`; falls back to a fixed placeholder so
+        # existing callers that don't care about the text still get a non-empty one.
+        self._texts = texts
         self.calls = 0
         self.message_history: list[dict[str, Any]] = []
         self.sent_tools: list[dict[str, Any]] | None = None
@@ -103,9 +106,11 @@ class _ScriptedCaller:
             if isinstance(part, dict) and part.get("type") in ("image_url", "image")
         )
         self.image_blocks_per_call.append(history_images + (len(screenshots) if screenshots else 0))
-        turn = self._script[self.calls] if self.calls < len(self._script) else []
+        idx = self.calls
+        turn = self._script[idx] if idx < len(self._script) else []
+        text = self._texts[idx] if self._texts and idx < len(self._texts) else "reasoning..."
         self.calls += 1
-        message: dict[str, Any] = {"content": "reasoning..."}
+        message: dict[str, Any] = {"content": text}
         if turn:
             message["tool_calls"] = [
                 {"id": f"call_{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
@@ -154,8 +159,14 @@ def _erroring_tool(
     )
 
 
-async def _run(script: list[list[tuple[str, dict[str, Any]]]], tools: list[ToolSpec], **kwargs: Any):
-    caller = _ScriptedCaller(script)
+async def _run(
+    script: list[list[tuple[str, dict[str, Any]]]],
+    tools: list[ToolSpec],
+    *,
+    texts: list[str] | None = None,
+    **kwargs: Any,
+):
+    caller = _ScriptedCaller(script, texts=texts)
     defaults = {"max_turns": 20, "max_tool_calls": 100}
     defaults.update(kwargs)
     outcome = await run_agent_tool_loop(
@@ -2305,11 +2316,14 @@ def test_budget_extension_gate_vetoes_fire_independently() -> None:
 @pytest.mark.asyncio
 async def test_on_action_round_fires_once_per_action_round() -> None:
     # The callback fires once per action ROUND (a turn with >=1 successful billable action), not per
-    # tool and not on perception-only turns, and receives that round's (name, args) list.
+    # tool and not on perception-only turns, and receives that round's (name, args) list plus the
+    # assistant text the SAME turn produced.
     rounds: list[list[tuple[str, dict[str, Any]]]] = []
+    round_texts: list[str | None] = []
 
-    async def _on_round(actions: list[tuple[str, dict[str, Any]]]) -> None:
+    async def _on_round(actions: list[tuple[str, dict[str, Any]]], turn_text: str | None) -> None:
         rounds.append(actions)
+        round_texts.append(turn_text)
 
     obs, clk, typ = [], [], []
     observe = _recording_tool("observe", obs)  # perception, not billable
@@ -2322,10 +2336,14 @@ async def test_on_action_round_fires_once_per_action_round() -> None:
         [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],  # 1 round, 2 tools -> 1 call
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
-    outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round)
+    texts = ["looking around", "clicking the field and typing into it", "done"]
+    outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round, texts=texts)
     assert outcome.status == "completed"
     assert len(rounds) == 1
     assert rounds[0] == [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)]
+    # The action round's text is the SECOND turn's ("clicking the field..."), not the first
+    # (perception-only) or third (finish) turn's text.
+    assert round_texts == [texts[1]]
 
 
 @pytest.mark.asyncio
@@ -2334,7 +2352,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
     # callback (flagged unsuccessful) so the round persists into the workflow-run step budget.
     rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
 
-    async def _on_round(actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+    async def _on_round(actions: list[tuple[str, dict[str, Any], bool]], _turn_text: str | None) -> None:
         rounds.append(actions)
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -2349,7 +2367,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
 
 @pytest.mark.asyncio
 async def test_on_action_round_failure_does_not_abort_run() -> None:
-    async def _boom(actions: list[tuple[str, dict[str, Any]]]) -> None:
+    async def _boom(actions: list[tuple[str, dict[str, Any]]], _turn_text: str | None) -> None:
         raise RuntimeError("persist boom")
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -5444,7 +5462,7 @@ async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
     script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
     recorded_rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
 
-    async def on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+    async def on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]], _turn_text: str | None) -> None:
         recorded_rounds.append(round_actions)
 
     outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
@@ -6421,7 +6439,7 @@ async def test_refresh_reload_is_recorded_in_the_action_round() -> None:
 
     rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
 
-    async def on_round(actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+    async def on_round(actions: list[tuple[str, dict[str, Any], bool]], _turn_text: str | None) -> None:
         rounds.append(list(actions))
 
     click_calls: list[tuple[str, dict[str, Any]]] = []

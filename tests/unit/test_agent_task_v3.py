@@ -49,6 +49,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ActionType,
@@ -68,6 +69,7 @@ async def _run_execute_task_v3(
     outcome: LoopOutcome,
     post_step_side_effect: BaseException | None = None,
     action_rounds: list[list[tuple[str, dict[str, Any]]]] | None = None,
+    action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
     task_block: BaseTaskBlock | None = None,
     validation_without_page_information: bool = False,
@@ -108,8 +110,9 @@ async def _run_execute_task_v3(
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
-            for round_actions in action_rounds:
-                await cb(round_actions)
+            for i, round_actions in enumerate(action_rounds):
+                turn_text = action_round_texts[i] if action_round_texts and i < len(action_round_texts) else None
+                await cb(round_actions, turn_text)
         if provider_probe_calls:
             provider = kwargs["page_provider"]
             loop_mock.resolved_pages = [await provider() for _ in range(provider_probe_calls)]
@@ -547,6 +550,36 @@ async def test_execute_task_v3_scrubs_registered_secret_from_extracted_informati
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_scrubs_registered_secret_from_persisted_action_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    # A long (>=8 char) secret glued to adjacent alphanumerics: only substring matching (the
+    # free-form-prose mode) catches it — a boundary-anchored scrub would leak it.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[("type", {"selector": "#otp", "text": "sk4829137765"}, True)]],
+        action_round_texts=["typing the keysk4829137765into the field"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert "sk4829137765" not in (persisted.reasoning or "")
+    assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_leaves_extraction_unscrubbed_when_redaction_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -762,10 +795,12 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
         [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)],
         [("click", {"selector": "#submit"}, True)],
     ]
+    round_texts = ["clicking the field then typing into it", "submitting the form"]
     step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
         action_rounds=rounds,
+        action_round_texts=round_texts,
         workflow_run_id="wr_v3test",
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -782,6 +817,11 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
     assert all(a.task_id == task.task_id and a.step_id == step.step_id for a in persisted)
     assert all(a.screenshot_artifact_id == "artifact-1" for a in persisted)
     assert [a.action_type for a in persisted] == [ActionType.CLICK, ActionType.INPUT_TEXT, ActionType.CLICK]
+    # Every action in a round carries that round's turn text as its reasoning -- neither
+    # intention nor response, which the turn has no per-action value for.
+    assert [a.reasoning for a in persisted] == [round_texts[0], round_texts[0], round_texts[1]]
+    assert all(a.intention is None for a in persisted)
+    assert all(a.response is None for a in persisted)
 
 
 @pytest.mark.asyncio
@@ -3318,3 +3358,72 @@ async def test_execute_task_v3_persisted_final_url_is_stripped_to_bare(monkeypat
         extracted_information_schema=None,
     )
     assert update_block_mock.await_args.kwargs["final_url"] == "https://example.test/callback"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_floors_runtime_secrets_when_redaction_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge import agent as agent_mod
+
+    # Org opted out of artifact redaction — runtime-resolved secrets (e.g. a verification code)
+    # must still be floored out of the persisted turn text.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+        lambda *_a, **_k: {"73914268"},
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[("type", {"selector": "#otp", "text": "73914268"}, True)]],
+        action_round_texts=["typing the verification code 73914268 into the field"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert "73914268" not in (persisted.reasoning or "")
+    assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_caps_persisted_reasoning_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[("click", {"selector": "#a"}, True)]],
+        action_round_texts=["x" * 5000],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert len(persisted.reasoning or "") == agent_mod._TASKV3_REASONING_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_reload_row_with_its_own_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge import agent as agent_mod
+
+    # Guards the reasoning kwarg-pop in the reload branch: a regression there raises inside the
+    # per-action try and the reload row silently vanishes behind a warning.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[("reload_page", {"reason": "a page-level handler requested a refresh"}, True)]],
+        action_round_texts=["retrying after the handler asked for a refresh"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 1
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert persisted.reasoning == "a page-level handler requested a refresh"
