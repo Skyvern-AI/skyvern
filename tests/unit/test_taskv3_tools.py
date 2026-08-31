@@ -595,6 +595,89 @@ async def test_navigate_same_url_reload_allowed_on_confirming_repeat(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_navigate_same_url_reload_is_flagged_in_result_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A confirmed same-URL reload is a state RESET, not progress: the result flags it so the loop
+    # clears (rather than stamps) budget-extension evidence, while a real navigation stays unflagged.
+    page, tools = _reload_guard_tools(monkeypatch, filled=2)
+    await _tool(tools, "navigate").handler({"url": page.url})  # refused; pending set
+    r2 = await _tool(tools, "navigate").handler({"url": page.url})  # confirmed reload
+    assert r2.status == "ok"
+    assert r2.data is not None and r2.data.get("page_state_changed") is True
+    assert r2.data.get("same_url_reload") is True
+    r3 = await _tool(tools, "navigate").handler({"url": "https://example.test/apply/step-2"})
+    assert r3.status == "ok"
+    assert r3.data is not None and r3.data.get("same_url_reload") is None
+
+
+@pytest.mark.asyncio
+async def test_navigate_redirect_back_to_current_url_is_flagged_as_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A different requested URL (an alias or redirect) that LANDS back on the current canonical URL
+    # is a reload in effect — flagged so the loop treats it as a reset, not fresh-page progress.
+    page, tools = _reload_guard_tools(monkeypatch, filled=0)
+
+    async def bounce(url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+        page.calls.append(("goto", {"url": url}))  # redirects back: page.url never changes
+
+    page.goto = bounce  # type: ignore[method-assign]
+    r = await _tool(tools, "navigate").handler({"url": "https://example.test/alias"})
+    assert r.status == "ok", r.content
+    assert r.data is not None and r.data.get("same_url_reload") is True
+
+
+@pytest.mark.asyncio
+async def test_navigate_same_url_request_redirecting_away_is_not_a_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Requesting the current URL but LANDING somewhere new (a login page redirecting into the app)
+    # is a real transition — classification depends on the landed URL, not the requested one.
+    page, tools = _reload_guard_tools(monkeypatch, filled=0)
+    requested = page.url
+
+    async def redirect_away(url: str, timeout: int | None = None, wait_until: str | None = None) -> None:
+        page.calls.append(("goto", {"url": url}))
+        page.url = "https://example.test/dashboard"
+
+    page.goto = redirect_away  # type: ignore[method-assign]
+    r = await _tool(tools, "navigate").handler({"url": requested})
+    assert r.status == "ok", r.content
+    assert r.data is not None and r.data.get("same_url_reload") is None
+
+
+@pytest.mark.asyncio
+async def test_navigate_hop_back_to_a_recent_url_is_flagged_as_revisit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An A->B->A hop lands on a page this run recently navigated through: flagged nav_revisit so
+    # the loop does not read known territory as fresh-page progress, while first visits stay clean.
+    page, tools = _reload_guard_tools(monkeypatch, filled=0)
+    a = page.url
+    r1 = await _tool(tools, "navigate").handler({"url": "https://example.test/results"})
+    assert r1.status == "ok" and r1.data is not None
+    assert r1.data.get("nav_revisit") is None  # first visit to B
+    r2 = await _tool(tools, "navigate").handler({"url": a})
+    assert r2.status == "ok" and r2.data is not None
+    assert r2.data.get("nav_revisit") is True  # back to A: revisit
+    r3 = await _tool(tools, "navigate").handler({"url": "https://example.test/item/3"})
+    assert r3.status == "ok" and r3.data is not None
+    assert r3.data.get("nav_revisit") is None  # fresh C stays clean
+
+
+@pytest.mark.asyncio
+async def test_navigate_back_to_a_click_reached_page_is_flagged_as_revisit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The first hop away need not use navigate: a click-driven transition feeds the same visited-URL
+    # ring, so a later navigate back to the click-departed page is a revisit, not fresh territory.
+    page, tools = _reload_guard_tools(monkeypatch, filled=0)
+    a = page.url
+
+    async def click_to_results(selector: str, timeout: int | None = None) -> None:
+        page.calls.append(("click", {"selector": selector}))
+        page.url = "https://example.test/results"
+
+    page.click = click_to_results  # type: ignore[method-assign]
+    r1 = await _tool(tools, "click").handler({"selector": "#go"})
+    assert r1.data is not None and r1.data.get("page_transitioned") is True
+    r2 = await _tool(tools, "navigate").handler({"url": a})
+    assert r2.status == "ok" and r2.data is not None
+    assert r2.data.get("nav_revisit") is True
+
+
+@pytest.mark.asyncio
 async def test_navigate_to_a_different_url_is_never_guarded(monkeypatch: pytest.MonkeyPatch) -> None:
     # NEGATIVE: the guard must not touch normal multi-page navigation — a DIFFERENT url proceeds even
     # with filled fields on the current page.

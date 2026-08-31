@@ -1793,6 +1793,65 @@ async def test_execute_task_v3_workflow_run_ceiling_still_beats_the_floor(
     )
     assert 7 < 10 < MIN_ACTION_STEPS
     assert loop_mock.await_args.kwargs["max_action_steps"] == 10
+    # The pool remainder is also handed to the loop as a HARD ceiling, so the in-loop budget
+    # extension can never grant rounds the org-wide pool cannot fund.
+    assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 10
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_workflow_ceiling_above_cap_passes_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A pool remainder larger than the block's own cap doesn't clamp the cap, but still flows to the
+    # loop as the ceiling so an extension can only grow into what the pool actually has left.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=(1, 30)))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_pool_above_cap",
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+    assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 30
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_atomic_block_ceiling_pinned_to_its_own_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A block that owns a deliberately small budget (action/validation) must not have it extended:
+    # the hard ceiling is pinned to the cap itself, so the in-loop extension is refused.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(ActionBlock, navigation_goal="Click the confirm button")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=5,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 5
+    assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 5
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_no_workflow_ceiling_without_a_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No org pool -> no hard ceiling: the loop's extension is bounded only by its own gate.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=None))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_no_pool",
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] is None
 
 
 @pytest.mark.asyncio

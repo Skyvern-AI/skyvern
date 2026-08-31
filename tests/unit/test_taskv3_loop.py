@@ -26,6 +26,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3.loop import (
+    ACTION_BUDGET_EXTENDED_EVENT,
+    ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
     ACTION_LOOP_REASON_PREFIX,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -48,6 +50,7 @@ from skyvern.forge.taskv3.loop import (
     ToolHandler,
     ToolResult,
     ToolSpec,
+    _budget_extension_gate,
     _canonical_perception_content,
     _PerceptionLedger,
     _ProgressLedger,
@@ -1461,6 +1464,644 @@ async def test_action_step_budget_counts_failed_action_rounds() -> None:
     assert outcome.status == "budget_exhausted"
     assert outcome.action_steps == 1  # the failed 1st round still consumed the budget
     assert len(click_calls) == 1  # 2nd round refused at the budget gate
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extends_once_for_a_progressing_run() -> None:
+    # A run whose page keeps changing (a repeated probe returning fresh content) at the cap earns
+    # ONE bounded extension instead of dying mid-progress on a genuinely long form.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", ["page 1", "page 2", "page 3"])
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],  # round 1
+        [("observe", {})],  # content changed -> progressed evidence
+        [("click", {"selector": "#b"})],  # round 2 == cap
+        [("observe", {})],  # fresh evidence again
+        [("click", {"selector": "#c"})],  # beyond cap: progress-gated extension (2 -> 3)
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "completed"
+    assert outcome.action_steps == 3
+    assert len(clicks) == 3
+    extended = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+    assert len(extended) == 1 and extended[0]["extension"] == 1 and extended[0]["original_cap"] == 2
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_no_extension_without_page_change_evidence() -> None:
+    # Absence of stall warnings is NOT progress: a run with no evidence the page ever changed is
+    # refused at the original cap exactly as before, and the refusal is a queryable event.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    script = [[("click", {"selector": "#a"})], [("click", {"selector": "#b"})], [("click", {"selector": "#c"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert len(refused) == 1 and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_is_granted_at_most_once() -> None:
+    # The grant is single: a run that exhausts cap + extension is refused for good, and the
+    # exhaustion reason names the in-effect (extended) cap.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 6)])
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],
+        [("click", {"selector": "#b"})],  # cap
+        [("observe", {})],
+        [("click", {"selector": "#c"})],  # extension: cap 2 -> 3
+        [("observe", {})],
+        [("click", {"selector": "#d"})],  # beyond the extended cap: refused for good
+    ]
+    outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=2, max_turns=30)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (3)" in outcome.reason
+    assert len(clicks) == 3
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_refused_without_turn_headroom() -> None:
+    # An extension the remaining turn budget cannot fund is refused — granting steps the runaway
+    # guards would immediately revoke converts an honest exhaustion into a worse one.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", ["page 1", "page 2", "page 3"])
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],
+        [("click", {"selector": "#b"})],
+        [("observe", {})],
+        [("click", {"selector": "#c"})],
+    ]
+    outcome, _ = await _run(
+        script,
+        [observe, click, make_finish_tool()],
+        max_action_steps=2,
+        max_turns=6,
+        activity=ActivityRecency(),
+    )
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_recovers_after_an_early_stall_window() -> None:
+    # The no-net-progress veto reads CURRENT stalled-ness, not the progress ledger's one-shot
+    # telemetry latch: a run that stalled early, then made sustained hard progress right up to the
+    # cap, earns the extension.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def plain_handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        return ToolResult.ok("click done")
+
+    async def transition_handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click_transition", args))
+        return ToolResult.ok("click done", data={"page_transitioned": True})
+
+    observe_n = {"n": 0}
+
+    async def observe_handler(args: dict[str, Any]) -> ToolResult:
+        # Same content while stalling; fresh content once the run recovers, so evidence comes from
+        # a content-confirmed progressed probe (URL-only transitions no longer stamp evidence).
+        observe_n["n"] += 1
+        content = "form page" if observe_n["n"] <= 2 else f"form page {observe_n['n']}"
+        return ToolResult.ok(content, data={"summary": {"invalid_fields": 3}})
+
+    click = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {}},
+        handler=plain_handler,
+        billable=True,
+    )
+    click_transition = ToolSpec(
+        name="click_transition",
+        description="c",
+        parameters={"type": "object", "properties": {}},
+        handler=transition_handler,
+        billable=True,
+    )
+    observe = ToolSpec(
+        name="observe",
+        description="o",
+        parameters={"type": "object", "properties": {}},
+        handler=observe_handler,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],  # arms the progress ledger (invalid_fields=3)
+        [("click", {"selector": f"#s{i}"}) for i in range(8)],  # one fruitless batch spanning the window
+        [("observe", {})],  # flat confirm -> the ledger's shadow latch fires
+    ]
+    for i in range(3):  # sustained recovery: hard progress plus content-confirmed fresh observes
+        script.append([("click_transition", {"selector": f"#p{i}"})])
+        script.append([("observe", {})])  # changed content -> progressed probe stamps evidence
+    script.append([("click", {"selector": "#final"})])  # beyond cap: extension must be granted
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, [click, click_transition, observe, make_finish_tool()], max_action_steps=4, max_turns=30
+        )
+    assert [entry for entry in logs if entry["event"] == PROGRESS_LEDGER_SHADOW_EVENT]  # the latch DID fire
+    assert outcome.status == "completed"
+    assert [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_not_granted_on_pre_reload_evidence() -> None:
+    # A reload re-baselines every ledger describing the old document, the evidence stamp included:
+    # pre-reload progress says nothing about the fresh page, so the run must re-demonstrate
+    # progress before it can earn an extension.
+    reload_calls: list[None] = []
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def click_handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        if args.get("selector") == "#refresh-trigger":
+            skyvern_context.current().refresh_working_page = True
+        return ToolResult.ok("clicked")
+
+    click = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {}},
+        handler=click_handler,
+        billable=True,
+    )
+    observe = _perception_tool("observe", ["page 1", "page 2"])
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],  # progressed -> evidence
+        [("click", {"selector": "#refresh-trigger"})],  # round 2 == cap; triggers a reload after
+        [("click", {"selector": "#b"})],  # beyond cap, right after the reload: must be refused
+    ]
+    ctx = SkyvernContext(task_id="tsk_ext_reload")
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome, _ = await _run(
+                script, [click, observe, make_finish_tool()], max_action_steps=2, max_turns=20, reload_page=reload_page
+            )
+    finally:
+        skyvern_context.reset()
+    assert len(reload_calls) == 1
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_respects_workflow_run_ceiling() -> None:
+    # An org's workflow-run-wide step pool is a HARD ceiling the extension must never breach: when
+    # the pool remainder supplied the effective cap, a progressing run is still refused.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", ["page 1", "page 2", "page 3"])
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],
+        [("click", {"selector": "#b"})],
+        [("observe", {})],
+        [("click", {"selector": "#c"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            max_action_steps=2,
+            max_action_steps_ceiling=2,
+            max_turns=20,
+        )
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "hard_step_ceiling"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_truncated_to_workflow_run_ceiling() -> None:
+    # A pool remainder above the cap but below cap+extension truncates the grant to what the pool
+    # can fund, rather than refusing outright or breaching it.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 8)])
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],
+        [("click", {"selector": "#b"})],
+        [("observe", {})],
+        [("click", {"selector": "#c"})],
+        [("observe", {})],
+        [("click", {"selector": "#d"})],  # cap 4
+        [("observe", {})],
+        [("click", {"selector": "#e"})],  # extension would be 2; ceiling 5 truncates to 1
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            max_action_steps=4,
+            max_action_steps_ceiling=5,
+            max_turns=40,
+        )
+    assert outcome.status == "completed"
+    assert outcome.action_steps == 5
+    extended = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+    assert extended and extended[0]["extension"] == 1
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_not_laundered_by_same_url_reload() -> None:
+    # A confirmed same-URL navigate reports page_state_changed (the retry ledger legitimately
+    # resets) but flags same_url_reload: a reset is not progress, so it must CLEAR the extension
+    # evidence exactly like the refresh-signal path, not stamp it.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+
+    async def nav_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("navigated", data={"page_state_changed": True, "same_url_reload": True})
+
+    navigate = ToolSpec(
+        name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=nav_handler
+    )
+    script = [
+        [("click", {"selector": "#a"})],
+        [("click", {"selector": "#b"})],  # cap
+        [("navigate", {"url": "https://example.test/apply"})],  # same-URL reload: not evidence
+        [("click", {"selector": "#c"})],  # beyond cap: must be refused
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [click, navigate, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_deferred_while_a_refresh_is_pending() -> None:
+    # A pending page-refresh signal voids the very action that would earn the grant and re-baselines
+    # the page: the gate must not race it and spend the extension on pre-reload evidence.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", ["page 1", "page 2"])
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],  # progressed -> evidence
+        [("click", {"selector": "#b"})],  # cap reached
+        [("click", {"selector": "#c"})],  # over cap; the refresh arrives DURING this model turn
+    ]
+
+    class _RefreshArmingCaller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 4:  # the turn whose tool call is the over-cap #c
+                skyvern_context.current().refresh_working_page = True
+            return await super().call(**kwargs)
+
+    ctx = SkyvernContext(task_id="tsk_ext_refresh_race")
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_agent_tool_loop(
+                llm_caller=_RefreshArmingCaller(script),
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[click, observe, make_finish_tool()],
+                max_action_steps=2,
+                max_turns=20,
+                max_tool_calls=100,
+            )
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "refresh_pending"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_not_stamped_by_nav_revisit() -> None:
+    # A hop back onto a recently-navigated URL (A->B->A) resets the retry ledger like any
+    # navigation but is known territory — it must not stamp fresh-page extension evidence.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+
+    async def nav_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("navigated", data={"page_state_changed": True, "nav_revisit": True})
+
+    navigate = ToolSpec(
+        name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=nav_handler
+    )
+    fresh_nav_calls: list[None] = []
+
+    async def fresh_nav_handler(args: dict[str, Any]) -> ToolResult:
+        fresh_nav_calls.append(None)
+        return ToolResult.ok("navigated", data={"page_state_changed": True})
+
+    fresh_navigate = ToolSpec(
+        name="goto", description="n", parameters={"type": "object", "properties": {}}, handler=fresh_nav_handler
+    )
+    # The real two-hop shape: the A->B hop stamps genuine fresh-page evidence, then the B->A
+    # revisit must CLEAR it — navigation is non-billable, so the action-round clock never advances
+    # and a surviving stamp would stay maximally recent forever.
+    script = [
+        [("click", {"selector": "#a"})],
+        [("click", {"selector": "#b"})],  # cap
+        [("goto", {"url": "https://example.test/results"})],  # A->B: stamps evidence
+        [("navigate", {"url": "https://example.test/apply"})],  # B->A revisit: clears it
+        [("click", {"selector": "#c"})],  # beyond cap: refused
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, [click, navigate, fresh_navigate, make_finish_tool()], max_action_steps=2, max_turns=20
+        )
+    assert len(fresh_nav_calls) == 1
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_not_laundered_by_post_reload_observe() -> None:
+    # A same-URL reload destroys the observed document: the perception ledgers must re-baseline
+    # (as the refresh path does), or the first post-reload observe diffs against the PRE-reload
+    # digest, reads as progressed, and stamps evidence without any progress on the fresh page.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", ["page 1", "page 2", "page 3 reloaded"])
+
+    async def nav_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("navigated", data={"page_state_changed": True, "same_url_reload": True})
+
+    navigate = ToolSpec(
+        name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=nav_handler
+    )
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#a"})],
+        [("observe", {})],  # progressed -> evidence
+        [("click", {"selector": "#b"})],  # cap
+        [("navigate", {"url": "https://example.test/apply"})],  # reload: clears stamp AND ledgers
+        [("observe", {})],  # post-reload first look: no baseline, must NOT read as progressed
+        [("click", {"selector": "#c"})],  # beyond cap: refused
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, [click, navigate, observe, make_finish_tool()], max_action_steps=2, max_turns=20
+        )
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_not_stamped_by_url_only_transitions() -> None:
+    # history.pushState moves the URL without changing the document: page_transitioned is a
+    # URL-only hint, and a stalled run varying such clicks (evading the retry-streak veto) must
+    # not launder evidence from it — content-confirmed signals are the evidence bar.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def push_state_click(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        return ToolResult.ok("clicked", data={"page_transitioned": True})
+
+    click = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {}},
+        handler=push_state_click,
+        billable=True,
+    )
+    script = [
+        [("click", {"selector": "#tab-1"})],
+        [("click", {"selector": "#tab-2"})],  # cap; varied selectors keep the retry ledger cold
+        [("click", {"selector": "#tab-3"})],  # beyond cap: URL-only hints are not evidence
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert len(clicks) == 2
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_granted_on_progressing_non_form_work() -> None:
+    # The no-net-progress veto reads the ledger's own confirmed form-stall state: on a page with no
+    # form, billable rounds still increment the raw counter, but a run demonstrating real progress
+    # (changing probe content) must not be vetoed by a counter the ledger itself refuses to judge.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"listing page {i}" for i in range(1, 12)])
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(8):  # window-many billable rounds on a form-less page, each with fresh content
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#item-{i}"})])
+    script.append([("observe", {})])
+    script.append([("click", {"selector": "#next"})])  # beyond cap 8: extension must be granted
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=8, max_turns=40)
+    assert outcome.status == "completed"
+    assert outcome.action_steps == 9
+    assert [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_survives_stale_perception_stall_flag() -> None:
+    # perception_stall_imminent armed on the PREVIOUS document must not veto an extension after a
+    # real page change invalidated that streak — positive page-change evidence clears the flag, as
+    # the refresh path already does.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+
+    async def nav_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("navigated", data={"page_state_changed": True})
+
+    navigate = ToolSpec(
+        name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=nav_handler
+    )
+    activity = ActivityRecency(perception_stall_imminent=True)
+    script = [
+        [("click", {"selector": "#a"})],
+        [("click", {"selector": "#b"})],  # cap
+        [("navigate", {"url": "https://example.test/step-2"})],  # fresh page: evidence + flag clear
+        [("click", {"selector": "#c"})],  # beyond cap: granted
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(
+        script, [click, navigate, make_finish_tool()], max_action_steps=2, max_turns=20, activity=activity
+    )
+    assert outcome.status == "completed"
+    assert outcome.action_steps == 3
+    assert activity.perception_stall_imminent is False
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_dries_up_on_content_oscillation() -> None:
+    # A page alternating between two known states (a panel toggling open and shut) is a cycle, not
+    # progress: only genuinely NEW content stamps evidence, so the stamp from the first flip goes
+    # stale and the oscillating run is refused at the cap.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    contents = ["panel closed", "panel open"]
+    observe = _perception_tool("observe", [contents[i % 2] for i in range(24)])
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    for i in range(10):
+        script.append([("click", {"selector": f"#toggle-{i}"})])  # varied: retry ledger stays cold
+        script.append([("observe", {})])  # alternating known content
+    script.append([("click", {"selector": "#over-cap"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=10, max_turns=60)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (10)" in outcome.reason
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_extension_not_stamped_by_replayed_download_notice() -> None:
+    # A compactable tool replaying a retained download notice (download_notice without download_new)
+    # re-clears the retry ledger but is not fresh progress: an old download must not keep the
+    # evidence stamp maximally recent forever.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+
+    async def replay_observe(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("page\nDownloaded: report.pdf (1.0 MB)", data={"download_notice": True})
+
+    observe = ToolSpec(
+        name="observe",
+        description="o",
+        parameters={"type": "object", "properties": {}},
+        handler=replay_observe,
+        compactable=True,
+    )
+    script = [
+        [("click", {"selector": "#a"})],
+        [("observe", {})],  # replayed notice: not evidence
+        [("click", {"selector": "#b"})],  # cap
+        [("observe", {})],  # replay again
+        [("click", {"selector": "#c"})],  # beyond cap: refused
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [click, observe, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+
+
+def test_content_only_perception_ignores_the_url_value() -> None:
+    # The URL is a hint, not content: the evidence lane's digest ignores a history.pushState URL
+    # flip (which under auto-observe would otherwise read as a progressed snapshot on a frozen
+    # document), while the full canonicalization keeps the URL so wizard pages that differ only by
+    # URL still clear the repeat guards.
+    from skyvern.forge.taskv3.loop import _content_only_perception
+
+    a = _content_only_perception("url=https://site.test/a title='T' (3 interactive elements)\nbutton#x")
+    b = _content_only_perception("url=https://site.test/b title='T' (3 interactive elements)\nbutton#x")
+    assert a == b
+    c = _content_only_perception("url=https://site.test/a title='T' (4 interactive elements)\nbutton#y")
+    assert a != c  # real content changes still differ
+    full_a = _canonical_perception_content("url=https://site.test/a title='T' (3 interactive elements)\nbutton#x")
+    full_b = _canonical_perception_content("url=https://site.test/b title='T' (3 interactive elements)\nbutton#x")
+    assert full_a != full_b  # the guard-clearing digest still sees the URL
+
+
+def test_budget_extension_gate_deadline_scales_with_observed_pace() -> None:
+    # Funding the extension in wall-clock: a run that burned ~30s per step cannot run a 5-step
+    # extension in 120s, even though the flat minimum headroom is met.
+    now = time.monotonic()
+    ok, _ = _budget_extension_gate(10, 9, set(), False, None, now + 1200, 5, seconds_per_step=30.0)
+    assert ok
+    assert _budget_extension_gate(10, 9, set(), False, None, now + 120, 5, seconds_per_step=30.0) == (
+        False,
+        "insufficient_deadline_headroom",
+    )
+
+
+def test_budget_extension_gate_vetoes_fire_independently() -> None:
+    ok, reason = _budget_extension_gate(
+        action_steps=10,
+        last_change_evidence_step=9,
+        action_warned=set(),
+        progress_stalled=False,
+        activity=None,
+        deadline_at=None,
+        extension=5,
+    )
+    assert ok and reason == "recent_page_change_evidence"
+    assert _budget_extension_gate(10, None, set(), False, None, None, 5) == (False, "no_recent_page_change_evidence")
+    assert _budget_extension_gate(10, 1, set(), False, None, None, 5) == (False, "no_recent_page_change_evidence")
+    assert _budget_extension_gate(10, 9, {("click", "{}")}, False, None, None, 5) == (
+        False,
+        "warned_action_retry_streak",
+    )
+    assert _budget_extension_gate(10, 9, set(), True, None, None, 5) == (False, "no_net_progress_window")
+    starving = ActivityRecency(turns_remaining=2)
+    assert _budget_extension_gate(10, 9, set(), False, starving, None, 5) == (False, "insufficient_turn_headroom")
+    # The turns requirement scales with the run's own observed turns-per-step burn.
+    thrashy = ActivityRecency(turn=40, turns_remaining=10)
+    assert _budget_extension_gate(10, 9, set(), False, thrashy, None, 5) == (False, "insufficient_turn_headroom")
+    lean = ActivityRecency(turn=12, turns_remaining=10)
+    assert _budget_extension_gate(10, 9, set(), False, lean, None, 5)[0]
+    # Fractional burn must not be floored away: 19 turns over 10 steps is 1.9/step, so a 5-step
+    # extension needs ~9.5 turns — 5 remaining cannot fund it.
+    fractional = ActivityRecency(turn=19, turns_remaining=5)
+    assert _budget_extension_gate(10, 9, set(), False, fractional, None, 5) == (
+        False,
+        "insufficient_turn_headroom",
+    )
+    call_starved = ActivityRecency(tool_calls_remaining=2)
+    assert _budget_extension_gate(10, 9, set(), False, call_starved, None, 5) == (
+        False,
+        "insufficient_tool_call_headroom",
+    )
+    # Exactly-extension calls left funds the actions but not the terminal finish call.
+    call_exact = ActivityRecency(tool_calls_remaining=5)
+    assert _budget_extension_gate(10, 9, set(), False, call_exact, None, 5) == (
+        False,
+        "insufficient_tool_call_headroom",
+    )
+    token_starved = ActivityRecency(tokens_remaining=100, last_turn_tokens=50)
+    assert _budget_extension_gate(10, 9, set(), False, token_starved, None, 5) == (
+        False,
+        "insufficient_token_headroom",
+    )
+    stalling = ActivityRecency(perception_stall_imminent=True)
+    assert _budget_extension_gate(10, 9, set(), False, stalling, None, 5) == (False, "perception_stall_imminent")
 
 
 @pytest.mark.asyncio
