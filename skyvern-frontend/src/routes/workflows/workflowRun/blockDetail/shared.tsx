@@ -25,6 +25,7 @@ import {
   failureSupportsScreenshot,
 } from "../codeBlockFailure";
 import { useBlockScreenshot } from "../useBlockScreenshot";
+import { formatFailureReason } from "../failureReasonFormat";
 import { stringifyTimelineValue } from "./formatValue";
 
 function TruncatedWithTooltip({
@@ -267,12 +268,36 @@ function BlockScreenshotAction({
 function BlockDetailFailure({
   block,
   onViewScreenshot,
+  statedFailureHeadline = null,
 }: {
   block: WorkflowRunBlock;
   onViewScreenshot?: () => void;
+  // The exact headline text the Studio strip already states (only set for
+  // the run's failing block). Compared by text, not just by block identity:
+  // the strip's headline comes from the RUN's failure_reason, which can
+  // differ from this block's own failure_reason even when this is the
+  // block the run failed on — suppressing on identity alone would drop an
+  // actionable reason the strip never actually showed.
+  statedFailureHeadline?: string | null;
 }) {
   const codeFailure = describeCodeBlockFailure(block);
-  if (!block.failure_reason && !codeFailure) return null;
+  // Non-code failures have no curated title/guidance split like codeFailure
+  // does, so borrow the strip's own headline/detail parser to find this
+  // block's own headline and compare it against what the strip stated.
+  const nonCodeReason =
+    !codeFailure && block.failure_reason
+      ? formatFailureReason(block.failure_reason)
+      : null;
+  const headlineElsewhere =
+    codeFailure !== null
+      ? statedFailureHeadline === codeFailure.title
+      : statedFailureHeadline !== null &&
+        nonCodeReason !== null &&
+        statedFailureHeadline === nonCodeReason.headline;
+  const nonCodeContent = headlineElsewhere
+    ? nonCodeReason?.detail
+    : block.failure_reason;
+  if (!codeFailure && !nonCodeContent) return null;
   return (
     <div className="space-y-1.5 duration-200 animate-in fade-in slide-in-from-top-2">
       <div className="text-[11px] font-medium uppercase tracking-wide text-destructive">
@@ -282,10 +307,17 @@ function BlockDetailFailure({
         <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
         {codeFailure ? (
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-semibold leading-5">
-              {codeFailure.title}
-            </div>
-            <p className="mt-1 break-words text-muted-foreground">
+            {headlineElsewhere ? null : (
+              <div className="text-sm font-semibold leading-5">
+                {codeFailure.title}
+              </div>
+            )}
+            <p
+              className={cn(
+                "break-words text-muted-foreground",
+                !headlineElsewhere && "mt-1",
+              )}
+            >
               {codeFailure.guidance}
             </p>
             <CodeBlockFailureDetails
@@ -301,9 +333,7 @@ function BlockDetailFailure({
             ) : null}
           </div>
         ) : (
-          <span className="min-w-0 flex-1 break-words">
-            {block.failure_reason}
-          </span>
+          <span className="min-w-0 flex-1 break-words">{nonCodeContent}</span>
         )}
       </div>
     </div>
