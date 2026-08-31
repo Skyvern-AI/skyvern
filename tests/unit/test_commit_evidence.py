@@ -54,23 +54,26 @@ async def _run_producer(
     static_element: dict | None = None,
     is_secret_value: bool = False,
     click: AsyncMock | None = None,
-    skyvern_frame: MagicMock | None = None,
+    settle: AsyncMock | None = None,
 ) -> ActionResult:
-    """Drive the real producer with light IO stubs; pre_values feeds get_input_value in order."""
+    """Drive the real producer with light IO stubs; pre_values feeds get_input_value in order.
+
+    The candidate-evidence confirmation reconciles on the next render turn via the existing
+    render-settle helper, so that seam is stubbed to a no-op here; pass ``settle`` to assert on it.
+    """
     click = click or AsyncMock()
-    if skyvern_frame is None:
-        skyvern_frame = MagicMock()
-        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+    settle = settle or AsyncMock()
     identity = {"label": option_label} if option_label is not None else None
     with (
         patch.object(handler, "get_input_value", AsyncMock(side_effect=pre_values)),
         patch.object(handler, "_read_autocomplete_option_identity", AsyncMock(return_value=identity)),
+        patch.object(handler, "_wait_custom_select_render_settle", settle),
     ):
         return await handler._click_autocomplete_option_with_commit_evidence(
             skyvern_element=_control(),
             option_locator=MagicMock(),
             option_static_element=static_element,
-            skyvern_frame=skyvern_frame,
+            skyvern_frame=MagicMock(),
             click=click,
             is_secret_value=is_secret_value,
         )
@@ -261,49 +264,35 @@ class TestCommitEvidenceProducer:
     async def test_optimistic_label_that_reverts_after_settle_no_evidence(self) -> None:
         # Codex r3892628198 regression: the control optimistically paints the selected label (a real
         # transition off the typed probe, so the candidate gate passes) and then reverts to the probe
-        # after async validation/rerender. The first post read looked committed; the settled reread
+        # after async validation/rerender. The first post read looked committed; the next-render reread
         # proves it was transient, so no stale evidence may be recorded.
-        skyvern_frame = MagicMock()
-        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+        settle = AsyncMock()
         result = await _run_producer(
             pre_values=[_TYPED_PRE, _COMPOSITE_LABEL, _TYPED_PRE],
             option_label=_COMPOSITE_LABEL,
-            skyvern_frame=skyvern_frame,
+            settle=settle,
         )
         assert isinstance(result, ActionSuccess)
         assert result.committed_option is None
         assert result.committed_value is None
-        skyvern_frame.safe_wait_for_animation_end.assert_awaited_once()
+        settle.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_timer_style_revert_within_settle_floor_withholds_evidence(self) -> None:
-        # Codex r3892846834 (P1): a non-animation revert — a ~300ms timer or async validation, not a
-        # CSS/Web Animation — leaves document.getAnimations() empty, so safe_wait_for_animation_end has
-        # nothing to await and only its before_wait_sec floor holds the confirm read back. A virtual
-        # clock advanced solely by that floor (the settle's own before_wait_sec) proves the outcome at
-        # an entry point above the wait: without a bounded floor the settled reread fires while the
-        # optimistic label is still painted and commits a value that vanishes at 300ms; a floor past
-        # 300ms observes the reverted probe and withholds evidence.
-        revert_at_ms = 300.0
-        clock = SimpleNamespace(ms=0.0)
-        reads = iter([_TYPED_PRE, _COMPOSITE_LABEL])
-
-        async def settle(*, before_wait_sec: float = 0, caller: str = "") -> None:
-            clock.ms += before_wait_sec * 1000
-
-        def read_control(*_args: object, **_kwargs: object) -> str:
-            try:
-                return next(reads)
-            except StopIteration:
-                return _TYPED_PRE if clock.ms >= revert_at_ms else _COMPOSITE_LABEL
-
+    async def test_candidate_path_confirms_on_next_render_not_fixed_wait(self) -> None:
+        # Codex r3892846834 (P1), re-scoped off the rejected fixed wall-clock horizon: the settled
+        # confirm read is render-driven. The candidate-evidence path reconciles on the next render turn
+        # via the existing render-settle helper — exactly one call, and never the fixed-wait animation
+        # seam — so an optimistic label that has reverted to the probe by the next render withholds
+        # evidence.
+        settle = AsyncMock()
         skyvern_frame = MagicMock()
-        skyvern_frame.safe_wait_for_animation_end = AsyncMock(side_effect=settle)
+        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
         with (
-            patch.object(handler, "get_input_value", AsyncMock(side_effect=read_control)),
+            patch.object(handler, "get_input_value", AsyncMock(side_effect=[_TYPED_PRE, _COMPOSITE_LABEL, _TYPED_PRE])),
             patch.object(
                 handler, "_read_autocomplete_option_identity", AsyncMock(return_value={"label": _COMPOSITE_LABEL})
             ),
+            patch.object(handler, "_wait_custom_select_render_settle", settle),
         ):
             result = await handler._click_autocomplete_option_with_commit_evidence(
                 skyvern_element=_control(),
@@ -316,6 +305,8 @@ class TestCommitEvidenceProducer:
         assert isinstance(result, ActionSuccess)
         assert result.committed_option is None
         assert result.committed_value is None
+        settle.assert_awaited_once()
+        skyvern_frame.safe_wait_for_animation_end.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_confirm_read_failure_after_candidate_no_evidence(self) -> None:
@@ -344,18 +335,74 @@ class TestCommitEvidenceProducer:
 
     @pytest.mark.asyncio
     async def test_stable_transition_survives_settle_emits(self) -> None:
-        # The transitioned value is reread identically after the single bounded settle, so the
+        # The transitioned value is reread identically after the single render-driven settle, so the
         # selection is stable and the evidence is recorded.
-        skyvern_frame = MagicMock()
-        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+        settle = AsyncMock()
         result = await _run_producer(
             pre_values=[_TYPED_PRE, _COMPOSITE_LABEL, _COMPOSITE_LABEL],
             option_label=_COMPOSITE_LABEL,
-            skyvern_frame=skyvern_frame,
+            settle=settle,
         )
         assert result.committed_option == _COMPOSITE_LABEL
         assert result.committed_value == _COMPOSITE_LABEL
-        skyvern_frame.safe_wait_for_animation_end.assert_awaited_once()
+        settle.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_pre_read_failure_click_still_succeeds_no_evidence(self) -> None:
+        # The pre-click control read raises. Capture is best-effort, so the exception is swallowed to a
+        # None pre-value and the click still lands; a missing pre-value withholds evidence, but the
+        # successful click must never regress to ActionFailure. Evidence is None before the settle.
+        click = AsyncMock()
+        settle = AsyncMock()
+        result = await _run_producer(
+            pre_values=[RuntimeError("pre read boom"), _COMPOSITE_LABEL],
+            option_label=_COMPOSITE_LABEL,
+            click=click,
+            settle=settle,
+        )
+        assert isinstance(result, ActionSuccess)
+        assert result.committed_option is None
+        assert result.committed_value is None
+        click.assert_awaited_once()
+        settle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_first_post_read_failure_click_still_succeeds_no_evidence(self) -> None:
+        # Pre-read succeeds, but the first post-click control read raises. The exception is swallowed to
+        # a None post-value, so no transition can be measured and the click stays a bare success; the
+        # gate fails before any settle reread.
+        click = AsyncMock()
+        settle = AsyncMock()
+        result = await _run_producer(
+            pre_values=[_TYPED_PRE, RuntimeError("post read boom")],
+            option_label=_COMPOSITE_LABEL,
+            click=click,
+            settle=settle,
+        )
+        assert isinstance(result, ActionSuccess)
+        assert result.committed_option is None
+        assert result.committed_value is None
+        click.assert_awaited_once()
+        settle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_settle_failure_after_candidate_gate_no_evidence(self) -> None:
+        # The candidate gate passes (pre->post is a selection-specific transition), then the render
+        # settle reconciliation raises. Settle runs inside the exception-isolated capture, so a
+        # successful click stays a bare success rather than regressing to ActionFailure.
+        click = AsyncMock()
+        settle = AsyncMock(side_effect=RuntimeError("settle boom"))
+        result = await _run_producer(
+            pre_values=[_TYPED_PRE, _COMPOSITE_LABEL],
+            option_label=_COMPOSITE_LABEL,
+            click=click,
+            settle=settle,
+        )
+        assert isinstance(result, ActionSuccess)
+        assert result.committed_option is None
+        assert result.committed_value is None
+        click.assert_awaited_once()
+        settle.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_label_read_failure_click_still_succeeds_no_evidence(self) -> None:
@@ -550,6 +597,7 @@ class TestChooseDropdownSeamWiring:
             ),
             patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=wired["inc"]),
             patch("skyvern.webeye.actions.handler.SkyvernElement", return_value=clicked_option),
+            patch("skyvern.webeye.actions.handler._wait_custom_select_render_settle", new=AsyncMock()),
             patch("skyvern.webeye.actions.handler.app") as mock_app,
             patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
             patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
