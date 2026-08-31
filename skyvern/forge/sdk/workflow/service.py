@@ -151,7 +151,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     compute_conditional_scopes,
     get_all_blocks,
     resolve_conditional_merge_edges,
-    run_is_eligible_for_v3_ab,
+    v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -5583,7 +5583,7 @@ class WorkflowService:
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
         # Resolve the workflow-block engine A/B once, before any block runs: eligibility is a
-        # property of the whole run (see run_is_eligible_for_v3_ab), and every block of a run must
+        # property of the whole run (see v3_ab_ineligibility_reason), and every block of a run must
         # share an arm. Covers the DAG executor too, which this method delegates to.
         current_context = skyvern_context.current()
         if current_context:
@@ -5592,7 +5592,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
-                run_is_eligible=run_is_eligible_for_v3_ab(all_blocks, is_script_run=is_script_run),
+                ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
             )
         else:
             LOG.warning(

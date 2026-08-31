@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.schemas.run_enums import RunEngine
+
+if TYPE_CHECKING:
+    # Runtime import would cycle: block.py imports workflow_block_engine_override from this module.
+    from skyvern.forge.sdk.workflow.models.block import V3AbIneligibleReason
 
 LOG = structlog.get_logger()
 
@@ -30,7 +36,7 @@ async def resolve_workflow_block_engine_arm(
     workflow_run_id: str,
     organization_id: str | None,
     workflow_permanent_id: str | None,
-    run_is_eligible: bool,
+    ineligibility_reason: V3AbIneligibleReason | None,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -53,6 +59,7 @@ async def resolve_workflow_block_engine_arm(
         if context.workflow_block_engine_resolved_run_id == workflow_run_id:
             return
         override: RunEngine | None = None
+        run_is_eligible = ineligibility_reason is None
         try:
             if run_is_eligible:
                 # The kill switch, shared with the dispatch gate via task_v3_disabled so both
@@ -84,6 +91,7 @@ async def resolve_workflow_block_engine_arm(
             workflow_permanent_id=workflow_permanent_id,
             arm="treatment" if override else "control",
             run_is_eligible=run_is_eligible,
+            ineligibility_reason=ineligibility_reason,
         )
 
 

@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
+from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
 from time import monotonic
@@ -15283,8 +15284,23 @@ def _task_block_supports_v3(task_block: BaseTaskBlock) -> bool:
     return task_block.block_type in _TASK_V3_SUPPORTED_BLOCK_TYPES
 
 
-def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
-    """Whether a whole workflow run may be rerouted onto v3 by the A/B.
+class V3AbIneligibleReason(StrEnum):
+    """The closed set of reasons a run is excluded from the workflow-block engine A/B.
+
+    Parity with the bare-task route reason (``RunRouteReason`` in ``cloud/agent_functions.py``):
+    a closed set an operator can slice logs by, instead of a bare boolean that answers "is
+    eligible" but not "why not."
+    """
+
+    script_run = "script_run"
+    pinned_engine = "pinned_engine"
+    unsupported_block = "unsupported_block"
+    block_totp_verification_url = "block_totp_verification_url"
+    no_reroutable_blocks = "no_reroutable_blocks"
+
+
+def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: bool) -> V3AbIneligibleReason | None:
+    """Why a whole workflow run may not be rerouted onto v3 by the A/B, or None if it may.
 
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
     engine would drive one browser session with two engines, so no per-run outcome would be
@@ -15305,7 +15321,7 @@ def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool
     execution.
     """
     if is_script_run:
-        return False
+        return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
         if not isinstance(block, BaseTaskBlock):
@@ -15313,18 +15329,25 @@ def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
             continue
         if block.engine != RunEngine.skyvern_v1:
-            return False
+            return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
-            return False
+            return V3AbIneligibleReason.unsupported_block
         # A/B rerouting never admits a run with a verification-URL block (a block explicitly pinned to
         # v3 is honored as requested); bare tasks with a verification URL are rerouted. Block-run
         # code/budget dynamics are unmeasured (SKY-14816).
         if block.totp_verification_url:
-            return False
+            return V3AbIneligibleReason.block_totp_verification_url
         reroutable_blocks += 1
     # A run with nothing to reroute would be bucketed and recorded as an exposure while both arms
     # execute identically, diluting the experiment.
-    return reroutable_blocks > 0
+    if reroutable_blocks == 0:
+        return V3AbIneligibleReason.no_reroutable_blocks
+    return None
+
+
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+    """Whether a whole workflow run may be rerouted onto v3 by the A/B; see v3_ab_ineligibility_reason."""
+    return v3_ab_ineligibility_reason(blocks, is_script_run=is_script_run) is None
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
