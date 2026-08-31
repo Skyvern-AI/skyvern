@@ -768,6 +768,9 @@ class TestMCPToolOverlayCompleteness:
             "select_option",
             "press_key",
             "wait_for_either_state",
+            "skyvern_frame_list",
+            "skyvern_frame_switch",
+            "skyvern_frame_main",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
@@ -847,6 +850,16 @@ class TestNewToolOverlayConfigs:
         assert overlay.requires_browser is True
         assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
         assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
+
+    def test_frame_control_overlays_refuse_sensitive_origin_pages(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+
+        for name in ("skyvern_frame_list", "skyvern_frame_switch", "skyvern_frame_main"):
+            overlay = overlays[name]
+            assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
+            assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
 
     def test_select_option_overlay(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays

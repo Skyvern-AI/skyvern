@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp.types import Tool as MCPTool
 
+from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.copilot import screenshot_utils
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BROWSER_ABLATION_MCP_TOOL_EXCLUSIONS,
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotStreamResponseUpdate,
@@ -37,6 +39,9 @@ _EXISTING_BROWSER_ALIASES = (
     "select_option",
     "press_key",
     "wait_for_either_state",
+    "skyvern_frame_list",
+    "skyvern_frame_switch",
+    "skyvern_frame_main",
 )
 _EXPECTED_BROWSER_ABLATION_MCP_TOOLS = (
     *_EXISTING_BROWSER_ALIASES,
@@ -47,6 +52,7 @@ _EXPECTED_BROWSER_ABLATION_MCP_TOOLS = (
     "skyvern_tab_wait_for_new",
     "skyvern_page",
 )
+_FRAME_TOOLS = ("skyvern_frame_list", "skyvern_frame_switch", "skyvern_frame_main")
 
 
 def _catalogs() -> tuple[list[SimpleNamespace], dict[str, str], dict[str, SchemaOverlay]]:
@@ -116,15 +122,33 @@ def test_browser_ablation_projects_registered_tab_and_page_tools_without_workflo
     assert "skyvern_workflow_run" not in surface.ordered_mcp_names
 
 
-@pytest.mark.asyncio
-async def test_browser_ablation_projects_the_app_registry_contract() -> None:
-    from skyvern.cli.mcp_tools import mcp
-    from skyvern.forge.sdk.copilot.tools import (
-        NATIVE_TOOLS,
-        _build_skyvern_mcp_overlays,
-        get_skyvern_mcp_alias_map,
+def test_normal_copilot_frame_contracts_are_shared_with_browser_ablation_and_hashed() -> None:
+    aliases = get_skyvern_mcp_alias_map()
+    overlays = _build_skyvern_mcp_overlays()
+    normal = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=[],
+        alias_map=aliases,
+        overlays=overlays,
+    )
+    aliases_without_frames = {name: transport for name, transport in aliases.items() if name not in _FRAME_TOOLS}
+    overlays_without_frames = {name: overlay for name, overlay in overlays.items() if name not in _FRAME_TOOLS}
+    old_surface = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=[],
+        alias_map=aliases_without_frames,
+        overlays=overlays_without_frames,
     )
 
+    assert all(aliases[name] == name for name in _FRAME_TOOLS)
+    assert set(_FRAME_TOOLS) <= set(normal.ordered_mcp_names)
+    assert all(overlays[name].requires_browser for name in _FRAME_TOOLS)
+    assert all(overlays[name].hide_params == {"session_id", "cdp_url"} for name in _FRAME_TOOLS)
+    assert normal.sha256 != old_surface.sha256
+
+
+@pytest.mark.asyncio
+async def test_browser_ablation_projects_the_app_registry_contract() -> None:
     registered_tools = await mcp.list_tools(run_middleware=False)
     surface = resolve_copilot_tool_surface(
         mode=CopilotEvalMode.BROWSER_ABLATION,
@@ -141,6 +165,7 @@ async def test_browser_ablation_projects_the_app_registry_contract() -> None:
         "skyvern_tab_wait_for_new",
         "skyvern_tab_close",
         "skyvern_page",
+        *_FRAME_TOOLS,
     }.issubset(surface.ordered_mcp_names)
     assert surface.ordered_mcp_names == _EXPECTED_BROWSER_ABLATION_MCP_TOOLS
     assert BROWSER_ABLATION_MCP_TOOL_EXCLUSIONS.isdisjoint(surface.alias_map.values())

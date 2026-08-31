@@ -197,6 +197,9 @@ def test_record_activity_non_run_tool_result_routes_live_not_pinned() -> None:
 def test_tool_activity_display_label_covers_discovery_tools() -> None:
     assert tool_activity_display_label("discover_workflow_entrypoint") == "Finding the entry page"
     assert tool_activity_display_label("inspect_page_for_composition") == "Inspecting the page"
+    assert tool_activity_display_label("skyvern_frame_list") == "Finding embedded pages"
+    assert tool_activity_display_label("skyvern_frame_switch") == "Opening embedded page"
+    assert tool_activity_display_label("skyvern_frame_main") == "Returning to main page"
 
 
 def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
