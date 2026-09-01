@@ -239,10 +239,18 @@ class CodeBlockEngineFailure:
     accepted_user_defined_error: UserDefinedError | None = None
 
 
+@dataclass(frozen=True)
+class CodeBlockDownloadOperationReceipt:
+    """Structured proof that the secure runner invoked the brokered download operation."""
+
+    operation: Literal["click_and_claim_download"] = "click_and_claim_download"
+
+
 @dataclass
 class CodeBlockEngineResult:
     block_result: BlockResult | None
     failure: CodeBlockEngineFailure | None
+    download_operation_receipt: CodeBlockDownloadOperationReceipt | None = None
 
 
 def _remove_rect(element: dict) -> None:

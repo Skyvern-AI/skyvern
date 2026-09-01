@@ -119,6 +119,31 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
     assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
 
 
+def test_registered_block_download_reaches_packet_without_parseable_artifact_evidence() -> None:
+    ctx = make_copilot_ctx()
+    ctx.registered_artifact_evidence = None
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "overall_status": "completed",
+            "requested_block_labels": ["download_statement"],
+            "executed_block_labels": ["download_statement"],
+            "blocks": [
+                {
+                    "label": "download_statement",
+                    "status": "completed",
+                    "extracted_data": {"downloaded_file_artifact_ids": ["a_dl_9"]},
+                }
+            ],
+        },
+    }
+
+    packet = build_test_evidence_packet(ctx, result)
+
+    assert [(download.artifact_id, download.file_name) for download in packet.downloads] == [("a_dl_9", None)]
+
+
 def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     ctx = make_copilot_ctx()
     ctx.workflow_yaml = "title: preserved draft"
