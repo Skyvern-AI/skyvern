@@ -135,6 +135,16 @@ def _extract_text(response: Any) -> str | None:
     return _get(message, "content")
 
 
+def _extract_reasoning_summary(response: Any) -> str | None:
+    """The provider's reasoning summary (message.reasoning_content), when litellm's chat->responses
+    bridge returned one -- surfaces the provider's reasoning summary where available; a tool call
+    with empty message.content on a continuation turn often has none either."""
+    message = _extract_message(response)
+    if message is None:
+        return None
+    return _get(message, "reasoning_content")
+
+
 def _extract_tool_calls(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
     message = _extract_message(response)
     if message is None:
@@ -1635,18 +1645,23 @@ async def run_agent_tool_loop(
     active_call_kwargs = dict(call_kwargs or {})
 
     def _degrade_tool_choice(exc: BaseException) -> bool:
-        """Drop tool_choice and report whether the turn is worth re-issuing.
+        """Drop the optional call parameters (tool_choice, the reasoning-summary dict) and report
+        whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
         on a run that was already failing. A context-window overflow is excluded because dropping a
-        parameter provably cannot fix it.
+        parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
+        value, so a provider that rejects the dict form cannot end the run on turn 1.
         """
         if isinstance(exc, SkyvernContextWindowExceededError):
             return False
-        if active_call_kwargs.pop("tool_choice", None) is None:
-            return False
-        LOG.warning("taskv3 loop retrying without tool_choice", turn=turns, exc_info=True)
-        return True
+        # One parameter per degrade, least-proven first: a provider that rejects only the summary
+        # dict keeps its independently supported tool_choice; a second rejection drops that too.
+        for key in ("reasoning_effort", "tool_choice"):
+            if active_call_kwargs.pop(key, None) is not None:
+                LOG.warning("taskv3 loop retrying without optional call param", dropped=key, turn=turns, exc_info=True)
+                return True
+        return False
 
     turns = 0
     no_tool_call_turns = 0
@@ -1766,6 +1781,7 @@ async def run_agent_tool_loop(
             activity.tokens_remaining = None if max_tokens is None else max_tokens - total_tokens
 
         text = _extract_text(response)
+        reasoning_summary = _extract_reasoning_summary(response)
         tool_calls = _extract_tool_calls(response)
 
         assistant_message: dict[str, Any] = {"role": "assistant", "content": text or None}
@@ -2617,7 +2633,7 @@ async def run_agent_tool_loop(
         # persistence hiccup must not abort an otherwise-good run, so failures are contained here.
         if round_actions and on_action_round is not None:
             try:
-                await on_action_round(round_actions, text or None)
+                await on_action_round(round_actions, text or reasoning_summary or None)
             except Exception:
                 LOG.warning("taskv3 on_action_round callback failed", turn=turns, exc_info=True)
 
