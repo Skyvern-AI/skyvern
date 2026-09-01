@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
 import structlog
 from PIL import Image, ImageDraw
 
+from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.core.script_generations.fuzzy_matcher import (
     match_option_exact_or_stem,
@@ -1588,6 +1589,45 @@ _FIND_CATEGORIES_JS = (
   pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
   cats.forEach((c, i) => c.el.setAttribute('data-tv3-menu', String(i + 1)));
   return { count: cats.length, categories: cats.map((c, i) => ({ n: i + 1, text: c.text })) };
+}"""
+)
+
+# Tier-1 semantic commit read (SKY-15322): ONE shape-invariant probe consulted before the shape
+# heuristics below. Decisive-ACCEPT-only — it answers {committed: true} or {committed: false}
+# ("unknown"), never a decisive negative, so an unresolvable widget always falls to the heuristics
+# unchanged. Every accept rests on a signal the tool did NOT author: raw value equality is NOT one
+# (the tool typed the intended string itself, so it holds on every dead click — the equal-value
+# impostor pair proves no black-box read can split that case).
+# Tier-1 semantic commit read (SKY-15322): the narrowed solid core. ONE decisive-accept rule —
+# the value TRANSFORM on a real form control: the widget rewrote what the tool typed into the
+# intended value (raw equality is never evidence; the tool authored the typed string). Everything
+# else is unknown by contract and falls to the shape heuristics unchanged: native selects (their own
+# tool verifies by value; selection state alone carries no click causality), contenteditable anchors
+# (three review rounds showed their text state cannot carry commit causality — completion, previews
+# and blur-expansion are all indistinguishable from selection at the DOM level), and ARIA selection
+# state (four distinct false-accept shapes across temporal, wiring, polarity and cross-root
+# dimensions — retired to a later phase rather than guarded a fifth time).
+_SEMANTIC_COMMIT_STATE_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
+  const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = nrm(arg.intended);
+  if (!want) return { committed: false };
+  let el = null;
+  try { el = pQS(arg.sel); } catch (e) { el = null; }
+  if (!el && arg.el && arg.el.isConnected) el = arg.el;
+  if (!el) return { committed: false };
+  if (el.tagName === 'SELECT') return { committed: false };
+  if (el.isContentEditable) return { committed: false };
+  // The typed baseline must have been READ from the element by the caller and is opt-in
+  // (typedTrusted !== true reads as untrusted), so a caller that forgets the key fails SAFE.
+  if (arg.typedTrusted !== true) return { committed: false };
+  const cur = el.value;
+  if (nrm(cur) === want && nrm(arg.typed) !== want) {
+    return { committed: true, via: 'value-transform', value: String(cur || '').trim() };
+  }
+  return { committed: false };
 }"""
 )
 
@@ -7416,6 +7456,29 @@ def build_browser_tools(
         except Exception:
             return False
 
+    async def _semantic_commit_read(
+        page: Any, selector: str, intended: str, typed: str, *, typed_trusted: bool
+    ) -> str | None:
+        # Decisive-accept-only: the committed value when the semantic probe proves the commit, else
+        # None ("unknown") — the caller's shape heuristics run unchanged on None, so this tier can
+        # never refuse a commit or swallow a failure. Unreadable probe = unknown for the same reason.
+        try:
+            read = await page.evaluate(
+                _SEMANTIC_COMMIT_STATE_JS,
+                {
+                    **(await _probe_arg(page, selector)),
+                    "intended": intended,
+                    "typed": typed,
+                    "typedTrusted": typed_trusted,
+                },
+            )
+        except Exception:
+            return None
+        if isinstance(read, dict) and read.get("committed") and str(read.get("value") or "").strip():
+            LOG.debug("taskv3 semantic commit accept", selector=selector, via=str(read.get("via") or ""))
+            return str(read.get("value")).strip()
+        return None
+
     async def _settled_commit_read(
         page: Any, selector: str, verify_args: dict[str, Any], chosen: str, pre_surface_hit: bool
     ) -> tuple[str, bool]:
@@ -7429,7 +7492,10 @@ def build_browser_tools(
             if attempt:
                 await asyncio.sleep(0.7)
             # Fail-closed: a list whose open-state cannot be read counts as still open, so the
-            # equal-value acceptance in the verify JS never rests on a failed probe.
+            # equal-value acceptance in the verify JS never rests on a failed probe. Read BEFORE the
+            # semantic tier: a dead click can REPLACE the live list (stamp and row tags die with the
+            # container) and render a fresh matching highlight, so a popup that survives — per the
+            # same vanished-stamp machinery the heuristics use — must suppress the aria accept too.
             sugg_list_open = True
             commit_evt = False
             if verify_args.get("suggTagged"):
@@ -7447,6 +7513,16 @@ def build_browser_tools(
                         commit_evt = bool(await page.evaluate("() => !!window.__tv3_commit_evt"))
                     except Exception:
                         commit_evt = False
+            if settings.TASK_V3_SEMANTIC_COMMIT_VERIFY:
+                semantic = await _semantic_commit_read(
+                    page,
+                    selector,
+                    chosen,
+                    str(verify_args.get("typed") or ""),
+                    typed_trusted=verify_args.get("typedTrusted") is True,
+                )
+                if semantic is not None:
+                    return semantic, True
             try:
                 read = await page.evaluate(
                     _VERIFY_COMMIT_JS,
@@ -7598,10 +7674,8 @@ def build_browser_tools(
                 pre_hidden = [str(v) for v in raw_hidden if isinstance(v, str)]
         except Exception:
             pre_hidden = []
-        try:
-            pre_value = str(await page.locator(selector).first.input_value(timeout=2000))
-        except Exception:
-            pre_value = value
+        pre_value_read = await _read_field_value(page, selector)
+        pre_value = pre_value_read if pre_value_read is not None else value
         clicked = False
         pre_surface_hit = await _surface_confirms(page, selector, best_txt)
         try:
@@ -7660,6 +7734,7 @@ def build_browser_tools(
             {
                 "field": selector,
                 "typed": pre_value if from_focus else (value if probe is None else probe),
+                "typedTrusted": (not from_focus) or pre_value_read is not None,
                 "chosen": best_txt,
                 "noSuggestionList": from_focus,
                 "suggTagged": True,
@@ -8406,10 +8481,17 @@ def build_browser_tools(
         # this (passed as `typed`, with noSuggestionList so the always-true listClosed cannot stand in for
         # one) — so leftover text a type attempt left in the field, whether or not a clear would succeed,
         # can never read back as the commit.
+        typed_trusted = True
         try:
-            pre_value = str(await page.eval_on_selector(selector, "el => (el.value || '')") or "")
+            pre_value = str(
+                await page.eval_on_selector(
+                    selector, "el => (el.isContentEditable ? (el.textContent || '') : (el.value || ''))"
+                )
+                or ""
+            )
         except Exception:
             pre_value = ""
+            typed_trusted = False
         pre_hidden: list[str] = []
         try:
             raw_hidden = await page.eval_on_selector(selector, _HIDDEN_VALUES_JS)
@@ -8478,6 +8560,7 @@ def build_browser_tools(
                 "chosen": matched,
                 "chosenValues": chosen_values,
                 "noSuggestionList": True,
+                "typedTrusted": typed_trusted,
                 "preHidden": pre_hidden,
                 "preSurface": pre_surface,
             },

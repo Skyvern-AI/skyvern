@@ -47,6 +47,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
     SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
+    CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
     bound_call_browser_session,
     browser_evidence_commit_lock,
@@ -73,6 +74,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.webeye.browser_retirement import BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
@@ -97,7 +99,7 @@ PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[di
 
 _SHARED_BROWSER_OUTCOME_TOOLS = frozenset({"skyvern_evaluate", "skyvern_screenshot"})
 _BrowserCallErrorKind = Literal["tool", "protocol"]
-_BrowserSessionLossDisposition = Literal["reestablished", "failed"]
+_BrowserSessionLossDisposition = Literal["reestablished", "generation_retired", "failed"]
 
 
 @dataclass(frozen=True)
@@ -453,6 +455,7 @@ class SchemaOverlay:
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 _SESSION_EXPIRED_ERROR_CODE = "SESSION_EXPIRED"
+_BROWSER_GENERATION_RETIRED_ERROR_CODE = "BROWSER_GENERATION_RETIRED"
 _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
 _SESSION_LOST_USER_FACING_REASON = (
     "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
@@ -679,6 +682,8 @@ class _PhaseClock:
         self._mark = self._started
         self._bucket: _MCPCallPhase | None = None
         self._wall: int | None = None
+        self._paused_at: float | None = None
+        self._excluded_seconds = 0.0
         self.current: _MCPCallPhase | None = None
         self.elapsed: dict[_MCPCallPhase, int] = {}
         self.drain_ms: int | None = None
@@ -689,7 +694,13 @@ class _PhaseClock:
         self._mark = now
 
     def enter(self, phase: _MCPCallPhase) -> None:
-        self._charge(time.monotonic())
+        now = time.monotonic()
+        if self._paused_at is not None:
+            self._excluded_seconds += now - self._paused_at
+            self._paused_at = None
+            self._mark = now
+        else:
+            self._charge(now)
         self._bucket = phase
         self.current = phase
 
@@ -698,12 +709,24 @@ class _PhaseClock:
         self._charge(time.monotonic())
         self._bucket = "context_exit"
 
+    def pause(self) -> None:
+        """Exclude result projection and evidence enrichment from server-call timing."""
+        now = time.monotonic()
+        self._charge(now)
+        self._bucket = None
+        self._paused_at = now
+
     def close(self) -> int:
         if self._wall is None:
             now = time.monotonic()
-            self._charge(now)
+            if self._paused_at is not None:
+                self._excluded_seconds += now - self._paused_at
+                self._paused_at = None
+                self._mark = now
+            else:
+                self._charge(now)
             self._bucket = None
-            self._wall = int((now - self._started) * 1000)
+            self._wall = int((now - self._started - self._excluded_seconds) * 1000)
         return self._wall
 
     def record_drain(self, started: float, *, failed: bool) -> None:
@@ -773,15 +796,21 @@ def _log_mcp_timing(
 def _browser_session_loss_result(
     result: dict[str, Any],
     *,
-    disposition: Literal["reestablished", "failed"],
+    disposition: _BrowserSessionLossDisposition,
     deadline_expired: bool = False,
 ) -> dict[str, Any]:
     data = result.get("data")
     continuity = {
         "source": "direct_mcp",
         "disposition": disposition,
-        "cause": "fixed_deadline_expiry" if deadline_expired else "unknown",
-        "fresh_state_required": disposition == "reestablished",
+        "cause": (
+            "fixed_deadline_expiry"
+            if deadline_expired
+            else "connection_generation_retired"
+            if disposition == "generation_retired"
+            else "unknown"
+        ),
+        "fresh_state_required": disposition in {"reestablished", "generation_retired"},
         "prior_action_effect": "unknown",
     }
     result_data = dict(data) if isinstance(data, dict) else {}
@@ -795,6 +824,11 @@ def _browser_session_loss_result(
             else "The browser session was lost during this operation. A fresh browser session is ready; "
             "inspect the page before continuing because the prior operation's effect is unknown."
         )
+    elif disposition == "generation_retired":
+        error = (
+            "The browser connection used by this operation was replaced during shared-session recovery. "
+            "Inspect the current page before retrying because the prior operation's effect is unknown."
+        )
     elif current_call_browser_session_override() is not None:
         # The chat's browser is fine; the one this call was aimed at is gone. Retrying the turn,
         # which is what the chat-flavoured wording asks for, would not bring it back.
@@ -807,7 +841,11 @@ def _browser_session_loss_result(
     return {
         **result,
         "ok": False,
-        "error_code": _SESSION_EXPIRED_ERROR_CODE,
+        "error_code": (
+            _BROWSER_GENERATION_RETIRED_ERROR_CODE
+            if disposition == "generation_retired"
+            else _SESSION_EXPIRED_ERROR_CODE
+        ),
         "error": error,
         "data": result_data,
     }
@@ -951,6 +989,26 @@ async def _handle_browser_session_loss(
             deadline_expired=outcome.deadline_expired,
         )
         return outcome.disposition
+
+
+async def _browser_session_error_disposition(
+    ctx: AgentContext,
+    error: CopilotBrowserGenerationRetired | CopilotBrowserSessionUnavailable,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+) -> _BrowserSessionLossDisposition:
+    if (
+        isinstance(error, CopilotBrowserGenerationRetired)
+        and error.retirement_reason is BrowserRetirementReason.replacement
+    ):
+        return "generation_retired"
+    return await _handle_browser_session_loss(
+        ctx,
+        tool_name=tool_name,
+        call_path=call_path,
+        lost_session_id=error.session_id,
+    )
 
 
 def _emit_continuity_event(
@@ -1498,7 +1556,9 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
-        if overlay.pre_hook:
+        async def _run_pre_hook() -> CallToolResult | None:
+            if overlay.pre_hook is None:
+                return None
             try:
                 hook_result = await overlay.pre_hook(arguments, copilot_ctx)
             except asyncio.CancelledError:
@@ -1528,6 +1588,12 @@ class SkyvernOverlayMCPServer(MCPServer):
                     hook_result = _scrub_tool_result(copilot_ctx, hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result, tool_name)
+            return None
+
+        if not overlay.requires_browser:
+            pre_hook_result = await _run_pre_hook()
+            if pre_hook_result is not None:
+                return pre_hook_result
 
         mcp_args = _transform_args(arguments, overlay)
 
@@ -1603,31 +1669,225 @@ class SkyvernOverlayMCPServer(MCPServer):
         call_browser_session_id = binding.session_id_for(copilot_ctx) if overlay.requires_browser else None
         call_browser_session_generation = copilot_ctx.browser_session_continuity_generation
 
+        async def _project_result(
+            raw_result: FastMCPCallToolResult,
+            *,
+            defer_evidence: bool = False,
+            evidence_lock_held: bool = False,
+        ) -> tuple[CallToolResult, dict[str, Any], bool, Callable[[], None]]:
+            browser_outcome: _BrowserCallOutcome | None = None
+            if uses_shared_browser_outcome:
+                browser_outcome = _normalize_browser_call_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    raw_result=raw_result,
+                )
+                raw_mcp = browser_outcome.raw_result()
+                failed = not browser_outcome.ok
+            else:
+                # Copy fastmcp's structured_content so mutations below stay local to
+                # this call — the client may reuse or cache the response object.
+                raw_mcp = dict(raw_result.structured_content or {})
+                if raw_result.is_error:
+                    raw_mcp["ok"] = False
+                    if not raw_result.structured_content and raw_result.content:
+                        text_parts = [c.text for c in raw_result.content if hasattr(c, "text")]
+                        raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+                    else:
+                        raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+                failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
+            phases.settle()
+            phases.pause()
+            # Scrub before the post hook so evidence the hooks record from raw_mcp
+            # (flow evidence, scout observations) is scrubbed too.
+            raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
+            session_lost = False
+            error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
+            if (
+                overlay.requires_browser
+                and copilot_ctx.turn_origin != TurnOrigin.runtime_self_heal
+                and isinstance(call_browser_session_id, str)
+                and call_browser_session_id
+                and error_code == _SESSION_EXPIRED_ERROR_CODE
+            ):
+                session_lost = True
+                try:
+                    disposition = await _handle_browser_session_loss(
+                        copilot_ctx,
+                        tool_name=tool_name,
+                        call_path="model",
+                        lost_session_id=call_browser_session_id,
+                    )
+                except asyncio.CancelledError:
+                    if browser_outcome is not None:
+                        cancelled_outcome = replace(
+                            browser_outcome,
+                            cancelled=True,
+                            ok=False,
+                            error_kind="protocol",
+                            completion_browser_session_id=copilot_ctx.browser_session_id,
+                            completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                        )
+                        _record_browser_call_outcome(copilot_ctx, cancelled_outcome, call_path="model")
+                    raise
+                if browser_outcome is not None:
+                    browser_outcome = replace(
+                        browser_outcome.with_raw_result(raw_mcp),
+                        session_loss_disposition=disposition,
+                        session_loss_deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                        replacement_browser_session_id=(
+                            copilot_ctx.browser_session_id if disposition == "reestablished" else None
+                        ),
+                    )
+                else:
+                    copilot_result = _browser_session_loss_result(
+                        mcp_to_copilot(raw_mcp),
+                        disposition=disposition,
+                        deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                    )
+
+            if browser_outcome is not None:
+                if browser_outcome.session_loss_disposition is None:
+                    browser_outcome = browser_outcome.with_raw_result(raw_mcp)
+                browser_outcome = replace(
+                    browser_outcome,
+                    completion_browser_session_id=copilot_ctx.browser_session_id,
+                    completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                )
+                copilot_result = _project_browser_call_outcome(browser_outcome, display_tool_name=tool_name)
+            elif not session_lost:
+                copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
+
+            if overlay.requires_browser and isinstance(copilot_result, dict):
+                # Stamped before the post-hook, which is allowed to fail back to this base result: a
+                # browser answer whose provenance dropped is a silent cross-browser read.
+                copilot_result.update(binding.provenance())
+
+            if overlay.post_hook and not session_lost:
+                async with AsyncExitStack() as evidence_stack:
+                    if not evidence_lock_held:
+                        await evidence_stack.enter_async_context(browser_evidence_commit_lock(copilot_ctx))
+                    base_copilot_result = deepcopy(copilot_result)
+                    ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+                    try:
+                        copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+                        # The adapter is the last disclosure boundary. Production custody changes share
+                        # this call's outer lock; this gate also fails closed if an unexpected producer
+                        # marks the exact session while an enrichment awaits.
+                        sensitive_result_is_scrubbable = (
+                            overlay.redacts_sensitive_origin_structured_result
+                            and not sensitive_origin_page_has_active_run(copilot_ctx)
+                            and register_matching_origin_run_redaction_values(copilot_ctx)
+                        )
+                        if (
+                            overlay.requires_browser
+                            and sensitive_origin_page_is_tainted(copilot_ctx)
+                            and not sensitive_result_is_scrubbable
+                        ):
+                            _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                            copilot_result = {
+                                "ok": False,
+                                "error": SENSITIVE_ORIGIN_PAGE_ERROR,
+                                **binding.provenance(),
+                            }
+                    except asyncio.CancelledError:
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        raise
+                    except Exception:
+                        # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
+                        copilot_result = base_copilot_result
+
+            copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
+
+            def _commit_evidence() -> None:
+                if browser_outcome is not None:
+                    _record_browser_call_outcome(copilot_ctx, browser_outcome, call_path="model")
+                record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
+                screenshot_data = copilot_result.get("data")
+                screenshot_data = screenshot_data if isinstance(screenshot_data, dict) else {}
+                captured_url = screenshot_data.get("url") or screenshot_data.get("current_url")
+                observation_step = copilot_result.get("observation_step")
+                if observation_step is None:
+                    observation_step = screenshot_data.get("observation_step")
+                workflow_run_id = copilot_result.get("workflow_run_id") or screenshot_data.get("workflow_run_id")
+                enqueue_screenshot_from_result(
+                    copilot_ctx,
+                    copilot_result,
+                    provenance=ScreenshotProvenance(
+                        source_tool=tool_name,
+                        captured_url=captured_url if isinstance(captured_url, str) and captured_url else None,
+                        observation_step=observation_step
+                        if isinstance(observation_step, int) and not isinstance(observation_step, bool)
+                        else None,
+                        browser_session_id=call_browser_session_id,
+                        workflow_run_id=workflow_run_id
+                        if isinstance(workflow_run_id, str) and workflow_run_id
+                        else None,
+                        action_relation=ScreenshotActionRelation.TOOL_RESULT,
+                    ),
+                )
+
+            if not defer_evidence:
+                _commit_evidence()
+            return _copilot_to_call_tool_result(copilot_result, tool_name), raw_mcp, failed, _commit_evidence
+
         try:
             # wait_for(timeout=None) is a plain await, so only overlays that declare an action
             # ceiling get one. Browser-state resolution has its own shared typed ceiling before
             # dispatch, where expiry can still truthfully report that no browser action started.
             if overlay.requires_browser:
                 phases.enter("context_enter")
-                # Only a call the model pointed elsewhere carries an override; the ordinary debug
-                # path resolves from the context, so a session re-established mid-dispatch applies.
-                browser_scope = (
-                    mcp_browser_context(copilot_ctx, session_id_override=binding.session_id_override)
-                    if binding.session_id_override
-                    else mcp_browser_context(copilot_ctx)
-                )
-                async with browser_scope:
-                    phases.enter("dispatch")
-                    dispatch_started = True
+                # The snapshot and its possible rollback are one transaction against the shared
+                # AgentContext. Holding this across the generation scope prevents a retired call
+                # from restoring over evidence committed by a concurrent sibling call.
+                async with browser_evidence_commit_lock(copilot_ctx):
+                    lease_context_snapshot = _snapshot_post_hook_context(copilot_ctx)
+                    # Only a call the model pointed elsewhere carries an override; the ordinary debug
+                    # path resolves from the context, so a session re-established mid-dispatch applies.
+                    browser_scope = (
+                        mcp_browser_context(copilot_ctx, session_id_override=binding.session_id_override)
+                        if binding.session_id_override
+                        else mcp_browser_context(copilot_ctx)
+                    )
                     try:
-                        raw_result = await asyncio.wait_for(
-                            self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
-                            timeout=overlay.timeout,
-                        )
-                    except BaseException:
-                        phases.unwind()
+                        async with browser_scope:
+                            pre_hook_result = await _run_pre_hook()
+                            if pre_hook_result is not None:
+                                return pre_hook_result
+                            phases.enter("dispatch")
+                            dispatch_started = True
+                            try:
+                                raw_result = await asyncio.wait_for(
+                                    self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                                    timeout=overlay.timeout,
+                                )
+                            except BaseException:
+                                phases.unwind()
+                                raise
+                            projected_result, timing_raw_mcp, failed, commit_evidence = await _project_result(
+                                raw_result,
+                                defer_evidence=True,
+                                evidence_lock_held=True,
+                            )
+                            phases.enter("context_exit")
+                    except (asyncio.CancelledError, CopilotBrowserGenerationRetired):
+                        _restore_post_hook_context(copilot_ctx, lease_context_snapshot)
                         raise
-                    phases.enter("context_exit")
+                    commit_evidence()
+                phases.settle()
+                _log_mcp_timing(
+                    copilot_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    timing_raw_mcp,
+                    "model",
+                    "error" if failed else "ok",
+                )
+                return projected_result
             else:
                 phases.enter("dispatch")
                 dispatch_started = True
@@ -1635,6 +1895,17 @@ class SkyvernOverlayMCPServer(MCPServer):
                     self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
                     timeout=overlay.timeout,
                 )
+                projected_result, timing_raw_mcp, failed, _ = await _project_result(raw_result)
+                _log_mcp_timing(
+                    copilot_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    timing_raw_mcp,
+                    "model",
+                    "error" if failed else "ok",
+                )
+                return projected_result
         except TimeoutError:
             LOG.warning("MCP tool call timed out", tool=tool_name, ceiling_seconds=overlay.timeout)
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "timeout")
@@ -1670,14 +1941,14 @@ class SkyvernOverlayMCPServer(MCPServer):
                 err = _scrub_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
-        except CopilotBrowserSessionUnavailable as exc:
+        except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
             try:
-                disposition = await _handle_browser_session_loss(
+                disposition = await _browser_session_error_disposition(
                     copilot_ctx,
+                    exc,
                     tool_name=tool_name,
                     call_path="model",
-                    lost_session_id=exc.session_id,
                 )
             except asyncio.CancelledError:
                 if uses_shared_browser_outcome:
@@ -1762,152 +2033,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                 err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
-
-        browser_outcome: _BrowserCallOutcome | None = None
-        if uses_shared_browser_outcome:
-            browser_outcome = _normalize_browser_call_outcome(
-                raw_tool_name=mcp_name,
-                source_browser_session_id=call_browser_session_id,
-                source_browser_session_generation=call_browser_session_generation,
-                raw_result=raw_result,
-            )
-            raw_mcp = browser_outcome.raw_result()
-            failed = not browser_outcome.ok
-        else:
-            # Copy fastmcp's structured_content so mutations below stay local to
-            # this call — the client may reuse or cache the response object.
-            raw_mcp = dict(raw_result.structured_content or {})
-            if raw_result.is_error:
-                raw_mcp["ok"] = False
-                if not raw_result.structured_content and raw_result.content:
-                    text_parts = [c.text for c in raw_result.content if hasattr(c, "text")]
-                    raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
-                else:
-                    raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
-            failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
-        phases.settle()
-        _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, raw_mcp, "model", "error" if failed else "ok")
-        # Scrub before the post hook so evidence the hooks record from raw_mcp
-        # (flow evidence, scout observations) is scrubbed too.
-        raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
-        session_lost = False
-        error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
-        if (
-            overlay.requires_browser
-            and copilot_ctx.turn_origin != TurnOrigin.runtime_self_heal
-            and isinstance(call_browser_session_id, str)
-            and call_browser_session_id
-            and error_code == _SESSION_EXPIRED_ERROR_CODE
-        ):
-            session_lost = True
-            try:
-                disposition = await _handle_browser_session_loss(
-                    copilot_ctx,
-                    tool_name=tool_name,
-                    call_path="model",
-                    lost_session_id=call_browser_session_id,
-                )
-            except asyncio.CancelledError:
-                if browser_outcome is not None:
-                    cancelled_outcome = replace(
-                        browser_outcome,
-                        cancelled=True,
-                        ok=False,
-                        error_kind="protocol",
-                        completion_browser_session_id=copilot_ctx.browser_session_id,
-                        completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
-                    )
-                    _record_browser_call_outcome(copilot_ctx, cancelled_outcome, call_path="model")
-                raise
-            if browser_outcome is not None:
-                browser_outcome = replace(
-                    browser_outcome.with_raw_result(raw_mcp),
-                    session_loss_disposition=disposition,
-                    session_loss_deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
-                    replacement_browser_session_id=(
-                        copilot_ctx.browser_session_id if disposition == "reestablished" else None
-                    ),
-                )
-            else:
-                copilot_result = _browser_session_loss_result(
-                    mcp_to_copilot(raw_mcp),
-                    disposition=disposition,
-                    deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
-                )
-
-        if browser_outcome is not None:
-            if browser_outcome.session_loss_disposition is None:
-                browser_outcome = browser_outcome.with_raw_result(raw_mcp)
-            browser_outcome = replace(
-                browser_outcome,
-                completion_browser_session_id=copilot_ctx.browser_session_id,
-                completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
-            )
-            _record_browser_call_outcome(copilot_ctx, browser_outcome, call_path="model")
-            copilot_result = _project_browser_call_outcome(browser_outcome, display_tool_name=tool_name)
-        elif not session_lost:
-            copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
-
-        if overlay.requires_browser and isinstance(copilot_result, dict):
-            # Stamped before the post-hook, which is allowed to fail back to this base result: a
-            # browser answer whose provenance dropped is a silent cross-browser read.
-            copilot_result.update(binding.provenance())
-
-        if overlay.post_hook and not session_lost:
-            async with browser_evidence_commit_lock(copilot_ctx):
-                base_copilot_result = deepcopy(copilot_result)
-                ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
-                try:
-                    copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
-                    # The adapter is the last disclosure boundary. Production custody changes share
-                    # this call's outer lock; this gate also fails closed if an unexpected producer
-                    # marks the exact session while an enrichment awaits.
-                    sensitive_result_is_scrubbable = (
-                        overlay.redacts_sensitive_origin_structured_result
-                        and not sensitive_origin_page_has_active_run(copilot_ctx)
-                        and register_matching_origin_run_redaction_values(copilot_ctx)
-                    )
-                    if (
-                        overlay.requires_browser
-                        and sensitive_origin_page_is_tainted(copilot_ctx)
-                        and not sensitive_result_is_scrubbable
-                    ):
-                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                        copilot_result = {
-                            "ok": False,
-                            "error": SENSITIVE_ORIGIN_PAGE_ERROR,
-                            **binding.provenance(),
-                        }
-                except Exception:
-                    # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
-                    _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                    LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
-                    copilot_result = base_copilot_result
-
-        copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
-        record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
-        screenshot_data = copilot_result.get("data")
-        screenshot_data = screenshot_data if isinstance(screenshot_data, dict) else {}
-        captured_url = screenshot_data.get("url") or screenshot_data.get("current_url")
-        observation_step = copilot_result.get("observation_step")
-        if observation_step is None:
-            observation_step = screenshot_data.get("observation_step")
-        workflow_run_id = copilot_result.get("workflow_run_id") or screenshot_data.get("workflow_run_id")
-        enqueue_screenshot_from_result(
-            copilot_ctx,
-            copilot_result,
-            provenance=ScreenshotProvenance(
-                source_tool=tool_name,
-                captured_url=captured_url if isinstance(captured_url, str) and captured_url else None,
-                observation_step=observation_step
-                if isinstance(observation_step, int) and not isinstance(observation_step, bool)
-                else None,
-                browser_session_id=call_browser_session_id,
-                workflow_run_id=workflow_run_id if isinstance(workflow_run_id, str) and workflow_run_id else None,
-                action_relation=ScreenshotActionRelation.TOOL_RESULT,
-            ),
-        )
-        return _copilot_to_call_tool_result(copilot_result, tool_name)
 
     async def call_internal_tool(
         self,
@@ -2139,14 +2264,14 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
                 _record_browser_call_outcome(ctx, outcome, call_path="internal")
             raise
-        except CopilotBrowserSessionUnavailable as exc:
+        except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             try:
-                disposition = await _handle_browser_session_loss(
+                disposition = await _browser_session_error_disposition(
                     ctx,
+                    exc,
                     tool_name=copilot_name,
                     call_path="internal",
-                    lost_session_id=exc.session_id,
                 )
             except asyncio.CancelledError:
                 if uses_shared_browser_outcome:

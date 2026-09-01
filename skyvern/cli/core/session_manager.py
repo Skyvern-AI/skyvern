@@ -115,7 +115,7 @@ _stdio_local_file_access_enabled = False
 # tenant's entry even when the browser session ID is known.
 # This bypasses ContextVar propagation issues when FastMCP runs tool handlers
 # in a separate task whose context snapshot predates scoped_session().
-_copilot_sessions: dict[tuple[str, str], SessionState] = {}
+_copilot_sessions: dict[tuple[str, str], list[SessionState]] = {}
 # Ref snapshots and their invalidation generations, FIFO-capped like _body_store.
 # Capacity eviction can drop a live session's refs early; that fails safe (unknown
 # ref → the caller re-observes), which is why the tool contract doesn't mention it.
@@ -380,12 +380,28 @@ def register_copilot_session(session_id: str, state: SessionState, *, organizati
             state._codeblock_redactor = redactor
     state.organization_id = organization_id
     state.tab_state_persists = True
-    _copilot_sessions[(organization_id, session_id)] = state
+    registrations = _copilot_sessions.setdefault((organization_id, session_id), [])
+    if not any(registered is state for registered in registrations):
+        registrations.append(state)
 
 
-def unregister_copilot_session(session_id: str, *, organization_id: str) -> None:
-    """Remove a copilot browser session from the process-local registry."""
-    _copilot_sessions.pop((organization_id, session_id), None)
+def unregister_copilot_session(
+    session_id: str,
+    *,
+    organization_id: str,
+    expected_state: SessionState | None = None,
+) -> None:
+    """Remove one exact registration, or every registration for explicit cleanup callers."""
+    key = (organization_id, session_id)
+    if expected_state is None:
+        _copilot_sessions.pop(key, None)
+        return
+    registrations = _copilot_sessions.get(key)
+    if registrations is None:
+        return
+    registrations[:] = [registered for registered in registrations if registered is not expected_state]
+    if not registrations:
+        _copilot_sessions.pop(key, None)
 
 
 def active_copilot_session_ids() -> set[str]:
@@ -394,7 +410,8 @@ def active_copilot_session_ids() -> set[str]:
 
 
 def _registered_copilot_session(session_id: str, *, organization_id: str) -> SessionState | None:
-    return _copilot_sessions.get((organization_id, session_id))
+    registrations = _copilot_sessions.get((organization_id, session_id))
+    return registrations[-1] if registrations else None
 
 
 def _explicit_cloud_session_can_access_localhost() -> bool:
@@ -766,7 +783,11 @@ async def _close_session_state(current: SessionState, *, close_via_active_client
             delete_session_trajectories(current.context.session_id)
             organization_id = _current_organization_id.get() or current.organization_id
             if organization_id is not None:
-                unregister_copilot_session(current.context.session_id, organization_id=organization_id)
+                unregister_copilot_session(
+                    current.context.session_id,
+                    organization_id=organization_id,
+                    expected_state=current,
+                )
 
 
 async def close_current_session() -> None:

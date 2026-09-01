@@ -45,6 +45,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
@@ -108,6 +109,20 @@ _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 # a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
 _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
+
+
+@dataclass(frozen=True)
+class _ActiveMcpBrowserContext:
+    task: asyncio.Task[Any]
+    ctx: AgentContext
+    session_id: str
+    retirement: BrowserRetirement
+
+
+_ACTIVE_MCP_BROWSER_CONTEXT: ContextVar[_ActiveMcpBrowserContext | None] = ContextVar(
+    "active_mcp_browser_context",
+    default=None,
+)
 CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
@@ -119,6 +134,18 @@ class CopilotBrowserSessionUnavailable(RuntimeError):
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         super().__init__("No browser context for copilot session")
+
+
+class CopilotBrowserGenerationRetired(RuntimeError):
+    def __init__(
+        self,
+        session_id: str,
+        retirement_reason: BrowserRetirementReason = BrowserRetirementReason.replacement,
+    ) -> None:
+        self.session_id = session_id
+        self.retirement_reason = retirement_reason
+        detail = "ended" if retirement_reason is BrowserRetirementReason.session_ending else "was replaced"
+        super().__init__(f"The browser connection used by this operation {detail}")
 
 
 class CopilotBrowserLivenessUndetermined(RuntimeError):
@@ -919,7 +946,12 @@ def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None
 
 
 @asynccontextmanager
-async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
+async def _mcp_browser_context_impl(
+    ctx: AgentContext,
+    *,
+    session_id_override: str | None = None,
+    resolved_browser_state: tuple[BrowserState | None] | None = None,
+) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls.
 
     ``session_id_override`` carries one call's resolved browser so a tool the model targeted at the
@@ -958,7 +990,11 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
         ctx.browser_session_id = browser_session_id
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
     else:
-        browser_state = await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
+        browser_state = (
+            resolved_browser_state[0]
+            if resolved_browser_state is not None
+            else await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
+        )
         attachability = (
             BrowserProbeOutcome.positively_unreachable
             if browser_state is None
@@ -1030,11 +1066,121 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
                 )
             else:
                 ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
-            unregister_copilot_session(browser_session_id, organization_id=ctx.organization_id)
+            unregister_copilot_session(
+                browser_session_id,
+                organization_id=ctx.organization_id,
+                expected_state=state,
+            )
             if is_self_heal_session_id(browser_session_id):
                 LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:
         reset_api_key_override(override_token)
+
+
+def _raise_if_browser_generation_retired(
+    operation_task: asyncio.Task[Any],
+    retirement: BrowserRetirement,
+    session_id: str,
+) -> None:
+    if not retirement.started.is_set():
+        return
+    retirement.consume_cancellation(operation_task)
+    if operation_task.cancelling():
+        raise asyncio.CancelledError
+    raise CopilotBrowserGenerationRetired(
+        session_id,
+        retirement.reason or BrowserRetirementReason.replacement,
+    )
+
+
+@asynccontextmanager
+async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
+    """Run one MCP browser dispatch on one admitted persistent-session generation."""
+    browser_session_id = session_id_override or ctx.browser_session_id
+    operation_task = asyncio.current_task()
+    active_context = _ACTIVE_MCP_BROWSER_CONTEXT.get()
+    if (
+        active_context is not None
+        and operation_task is active_context.task
+        and ctx is active_context.ctx
+        and browser_session_id == active_context.session_id
+    ):
+        _raise_if_browser_generation_retired(
+            active_context.task,
+            active_context.retirement,
+            active_context.session_id,
+        )
+        # Browser pre-hooks use an internal MCP read in the same task. The outer scope already
+        # owns the exact generation, API-key override, SessionState, and process registration.
+        # Re-entering those owners would let the inner exit unregister the real action.
+        yield
+        _raise_if_browser_generation_retired(
+            active_context.task,
+            active_context.retirement,
+            active_context.session_id,
+        )
+        return
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal or not browser_session_id or not ctx.api_key:
+        async with _mcp_browser_context_impl(ctx, session_id_override=session_id_override):
+            yield
+        return
+
+    browser_state = await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
+    if browser_state is None:
+        async with _mcp_browser_context_impl(
+            ctx,
+            session_id_override=browser_session_id,
+            resolved_browser_state=(None,),
+        ):
+            yield
+        return
+
+    async with app.PERSISTENT_SESSIONS_MANAGER.browser_operation(
+        browser_session_id,
+        browser_state,
+    ) as operation:
+        if operation is None:
+            raise CopilotBrowserGenerationRetired(
+                browser_session_id,
+                BrowserRetirementReason.session_ending,
+            )
+        if isinstance(operation, BrowserOperationRejected):
+            raise CopilotBrowserGenerationRetired(browser_session_id, operation.reason)
+        if operation_task is None:
+            raise RuntimeError("A Copilot browser context requires an asyncio task")
+        scope_token = _ACTIVE_MCP_BROWSER_CONTEXT.set(
+            _ActiveMcpBrowserContext(
+                task=operation_task,
+                ctx=ctx,
+                session_id=browser_session_id,
+                retirement=operation.retirement,
+            )
+        )
+        try:
+            try:
+                async with _mcp_browser_context_impl(
+                    ctx,
+                    session_id_override=browser_session_id,
+                    resolved_browser_state=(operation.browser_state,),
+                ):
+                    yield
+            except asyncio.CancelledError:
+                if not operation.retirement_started.is_set():
+                    raise
+                _raise_if_browser_generation_retired(operation_task, operation.retirement, browser_session_id)
+            _raise_if_browser_generation_retired(operation_task, operation.retirement, browser_session_id)
+        finally:
+            _ACTIVE_MCP_BROWSER_CONTEXT.reset(scope_token)
+
+
+async def _attach_current_browser_generation(ctx: AgentContext) -> None:
+    """Follow one exact-generation replacement while verifying a stable session id."""
+    try:
+        async with mcp_browser_context(ctx):
+            return
+    except CopilotBrowserGenerationRetired:
+        async with mcp_browser_context(ctx):
+            return
 
 
 async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> None:
@@ -1221,8 +1367,8 @@ async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, An
         return await ensure_browser_session(ctx)
     examined_session_id = ctx.browser_session_id
     try:
-        async with mcp_browser_context(ctx):
-            return None
+        await _attach_current_browser_generation(ctx)
+        return None
     except CopilotBrowserSessionUnavailable:
         retire_browser_session_id(ctx, examined_session_id)
         return await ensure_browser_session(ctx)
@@ -1253,8 +1399,8 @@ async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> d
         return await ensure_build_test_browser_session(ctx)
     examined_session_id = ctx.browser_session_id
     try:
-        async with mcp_browser_context(ctx):
-            return None
+        await _attach_current_browser_generation(ctx)
+        return None
     except CopilotBrowserSessionUnavailable:
         retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
