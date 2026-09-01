@@ -114,9 +114,16 @@ bridge.kick = async () => {{ alarmKicks += 1; }};
 alarmListeners.forEach((listener) => listener({{ name: BRIDGE_ALARM_NAME }}));
 await waitUntil(() => alarmKicks === 1);
 
+const allowedUrlChanges = [];
+let revokedUrlChangeCount = 0;
 const tabScope = {{
   async runTabOperation(_tabId, operation) {{
-    return operation({{ isCurrent: () => true, assertCurrent() {{}} }});
+    return operation({{
+      isCurrent: () => true,
+      assertCurrent() {{}},
+      allowUrlChange(expectedUrl = null) {{ allowedUrlChanges.push(expectedUrl); }},
+      revokeUrlChange() {{ revokedUrlChangeCount += 1; }},
+    }});
   }},
   async assertControllableLocked() {{}},
   async assertScoped() {{}},
@@ -193,6 +200,35 @@ if (!detached.includes(21) || router.attachedTabs.has(21)) {{
 const healthy = await router.send({{ tabId: 22, method: "Runtime.evaluate", params: {{ expression: "2+2" }} }});
 if (healthy.result.method !== "Runtime.evaluate") {{
   throw new Error("healthy tab command was blocked by a wedged tab");
+}}
+for (const [method, params] of [
+  ["Page.navigate", {{ url: "https://example.test/next" }}],
+  ["Page.navigateToHistoryEntry", {{ entryId: 1 }}],
+  ["Page.reload", {{}}],
+]) {{
+  const navigation = await router.send({{ tabId: 22, method, params }});
+  if (navigation.result.method !== method) {{
+    throw new Error(`${{method}} did not complete`);
+  }}
+}}
+if (JSON.stringify(allowedUrlChanges) !== JSON.stringify(["https://example.test/next", null, null])) {{
+  throw new Error(`URL-changing CDP methods granted the wrong URL bindings: ${{JSON.stringify(allowedUrlChanges)}}`);
+}}
+if (revokedUrlChangeCount !== 0) {{
+  throw new Error("successful navigations must not revoke their URL-change grants");
+}}
+chrome.debugger.sendCommand = () => Promise.reject(new Error("navigation rejected"));
+let failedNavigationError;
+try {{
+  await router.send({{ tabId: 22, method: "Page.navigate", params: {{ url: "https://example.test/failed" }} }});
+}} catch (error) {{
+  failedNavigationError = error;
+}}
+if (failedNavigationError?.code !== ERROR_CODES.CDP_ERROR) {{
+  throw new Error(`failed navigation was not structured: ${{failedNavigationError?.code}}`);
+}}
+if (revokedUrlChangeCount !== 1) {{
+  throw new Error("failed navigation did not revoke its URL-change grant");
 }}
 """
 
@@ -475,6 +511,167 @@ scope.scopedGroupIds.delete(19);
 tabs.delete(18);
 tabs.delete(19);
 
+
+// A navigation command may cause its own URL event without cancelling itself.
+tabs.set(23, {{ id: 23, windowId: 2, groupId: 700, url: "https://before.example" }});
+scope.scopedTabIds.add(23);
+scope.scopedGroupIds.set(23, 700);
+let expectedNavigationStarted = false;
+let releaseExpectedNavigation;
+const expectedNavigation = scope.runTabOperation(23, async (lease) => {{
+  lease.allowUrlChange("https://after.example");
+  expectedNavigationStarted = true;
+  await new Promise((resolve) => {{ releaseExpectedNavigation = resolve; }});
+  lease.assertCurrent();
+  return "navigated";
+}});
+await waitUntil(() => expectedNavigationStarted);
+tabs.get(23).url = "https://after.example";
+listeners.updated.forEach((listener) =>
+  listener(23, {{ url: "https://after.example" }}),
+);
+releaseExpectedNavigation();
+if ((await settleWithin(expectedNavigation)) !== "navigated") {{
+  throw new Error("expected navigation URL change cancelled its own operation");
+}}
+await waitUntil(() => !scope.tabOperations.has(23));
+scope.scopedTabIds.delete(23);
+scope.scopedGroupIds.delete(23);
+tabs.delete(23);
+
+// An unrelated operation must still fail when the page URL changes.
+tabs.set(24, {{ id: 24, windowId: 2, groupId: 700, url: "https://before.example" }});
+scope.scopedTabIds.add(24);
+scope.scopedGroupIds.set(24, 700);
+let unrelatedOperationStarted = false;
+const unrelatedOperation = scope.runTabOperation(24, async () => {{
+  unrelatedOperationStarted = true;
+  return new Promise(() => undefined);
+}}).then(() => null, (error) => error);
+await waitUntil(() => unrelatedOperationStarted);
+tabs.get(24).url = "https://after.example";
+listeners.updated.forEach((listener) =>
+  listener(24, {{ url: "https://after.example" }}),
+);
+const unrelatedOperationError = await settleWithin(unrelatedOperation);
+if (unrelatedOperationError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
+  throw new Error(`unrelated URL change did not cancel active work: ${{unrelatedOperationError?.code}}`);
+}}
+await waitUntil(() => !scope.tabOperations.has(24));
+scope.scopedTabIds.delete(24);
+scope.scopedGroupIds.delete(24);
+tabs.delete(24);
+
+// Restricted URLs cancel even an operation that expects a navigation event.
+tabs.set(25, {{ id: 25, windowId: 2, groupId: 700, url: "https://before.example" }});
+scope.scopedTabIds.add(25);
+scope.scopedGroupIds.set(25, 700);
+let restrictedNavigationStarted = false;
+const restrictedNavigation = scope.runTabOperation(25, async (lease) => {{
+  lease.allowUrlChange();
+  restrictedNavigationStarted = true;
+  return new Promise(() => undefined);
+}}).then(() => null, (error) => error);
+await waitUntil(() => restrictedNavigationStarted);
+tabs.get(25).url = "chrome://settings";
+listeners.updated.forEach((listener) =>
+  listener(25, {{ url: "chrome://settings" }}),
+);
+const restrictedNavigationError = await settleWithin(restrictedNavigation);
+if (restrictedNavigationError?.code !== ERROR_CODES.RESTRICTED_URL) {{
+  throw new Error(`restricted navigation did not cancel active work: ${{restrictedNavigationError?.code}}`);
+}}
+await waitUntil(() => !scope.scopedTabIds.has(25));
+tabs.delete(25);
+
+// A coalesced URL and group event must prioritize group revocation.
+tabs.set(26, {{ id: 26, windowId: 2, groupId: 700, url: "https://before.example" }});
+scope.scopedTabIds.add(26);
+scope.scopedGroupIds.set(26, 700);
+let coalescedNavigationStarted = false;
+const coalescedNavigation = scope.runTabOperation(26, async (lease) => {{
+  lease.allowUrlChange();
+  coalescedNavigationStarted = true;
+  return new Promise(() => undefined);
+}}).then(() => null, (error) => error);
+await waitUntil(() => coalescedNavigationStarted);
+tabs.get(26).url = "https://after.example";
+tabs.get(26).groupId = -1;
+listeners.updated.forEach((listener) =>
+  listener(26, {{ url: "https://after.example", groupId: -1 }}),
+);
+const coalescedNavigationError = await settleWithin(coalescedNavigation);
+if (coalescedNavigationError?.code !== ERROR_CODES.TAB_NOT_SCOPED) {{
+  throw new Error(`coalesced group revocation did not cancel active work: ${{coalescedNavigationError?.code}}`);
+}}
+await waitUntil(() => !scope.scopedTabIds.has(26));
+tabs.delete(26);
+
+
+// A URL-change grant is consumed by one URL event; a replay must cancel, not survive.
+tabs.set(27, {{ id: 27, windowId: 2, groupId: 700, url: "https://before.example" }});
+scope.scopedTabIds.add(27);
+scope.scopedGroupIds.set(27, 700);
+let consumedNavigationStarted = false;
+let releaseConsumedNavigation;
+const consumedNavigation = scope.runTabOperation(27, async (lease) => {{
+  lease.allowUrlChange("https://after.example");
+  consumedNavigationStarted = true;
+  await new Promise((resolve) => {{ releaseConsumedNavigation = resolve; }});
+  lease.assertCurrent();
+  return "survived";
+}}).then((value) => value, (error) => error);
+await waitUntil(() => consumedNavigationStarted);
+tabs.get(27).url = "https://after.example";
+listeners.updated.forEach((listener) =>
+  listener(27, {{ url: "https://after.example" }}),
+);
+listeners.updated.forEach((listener) =>
+  listener(27, {{ url: "https://after.example" }}),
+);
+releaseConsumedNavigation();
+const consumedNavigationOutcome = await settleWithin(consumedNavigation);
+if (consumedNavigationOutcome === "survived") {{
+  throw new Error("URL-change grant survived a second URL event instead of being consumed");
+}}
+if (consumedNavigationOutcome?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
+  throw new Error(`consumed grant replay was not structured: ${{consumedNavigationOutcome?.code}}`);
+}}
+await waitUntil(() => !scope.tabOperations.has(27));
+scope.scopedTabIds.delete(27);
+scope.scopedGroupIds.delete(27);
+tabs.delete(27);
+
+// A grant bound to one URL must not spare a navigation to a different URL.
+tabs.set(28, {{ id: 28, windowId: 2, groupId: 700, url: "https://before.example" }});
+scope.scopedTabIds.add(28);
+scope.scopedGroupIds.set(28, 700);
+let mismatchedNavigationStarted = false;
+let releaseMismatchedNavigation;
+const mismatchedNavigation = scope.runTabOperation(28, async (lease) => {{
+  lease.allowUrlChange("https://intended.example");
+  mismatchedNavigationStarted = true;
+  await new Promise((resolve) => {{ releaseMismatchedNavigation = resolve; }});
+  lease.assertCurrent();
+  return "survived";
+}}).then((value) => value, (error) => error);
+await waitUntil(() => mismatchedNavigationStarted);
+tabs.get(28).url = "https://user.example";
+listeners.updated.forEach((listener) =>
+  listener(28, {{ url: "https://user.example" }}),
+);
+releaseMismatchedNavigation();
+const mismatchedNavigationOutcome = await settleWithin(mismatchedNavigation);
+if (mismatchedNavigationOutcome === "survived") {{
+  throw new Error("URL-change grant spared a navigation it was not bound to");
+}}
+if (mismatchedNavigationOutcome?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
+  throw new Error(`mismatched URL change was not structured: ${{mismatchedNavigationOutcome?.code}}`);
+}}
+await waitUntil(() => !scope.tabOperations.has(28));
+scope.scopedTabIds.delete(28);
+scope.scopedGroupIds.delete(28);
+tabs.delete(28);
 
 // Closing a just-created tab must cancel its create operation after Chrome returns the tab id.
 const originalAddToScopeLocked = scope.addToScopeLocked.bind(scope);
