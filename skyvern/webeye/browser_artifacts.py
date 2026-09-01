@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 from enum import Enum
+from pathlib import Path
+from typing import Protocol
 
 import aiofiles
 import structlog
@@ -10,6 +12,28 @@ from playwright.async_api import Page
 from pydantic import BaseModel, PrivateAttr
 
 LOG = structlog.get_logger()
+
+
+class ActionDownloadObservation(Protocol):
+    """One action's view of a provider-owned remote download destination.
+
+    ``deadline`` is a ``time.monotonic()`` value: the same monotonic budget the ActionHandler uses
+    for its own download wait bounds every provider list and file transfer, so no single call gets a
+    fresh full timeout. Materialization lands only baseline-new completed files into ``destination_dir``.
+    """
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None: ...
+
+
+class ActionDownloadSource(Protocol):
+    """A provider-neutral factory for one browser's action-scoped download observation.
+
+    ``begin_observation`` freezes a pre-action baseline (metadata only) and returns the observation,
+    or ``None`` when the baseline is unavailable/incomplete so the ActionHandler disables provider
+    attribution for that action and preserves its existing event/local/PBS download paths.
+    """
+
+    async def begin_observation(self, *, deadline: float) -> ActionDownloadObservation | None: ...
 
 
 class DownloadBinding(str, Enum):
@@ -52,6 +76,11 @@ class BrowserArtifacts(BaseModel):
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
     applied_browser_profile_id: str | None = None
+    local_display_recording_eligible: bool = False
+    # ((input_w, input_h), (output_w, output_h)) for the whole-display recorder, resolved from the final
+    # launch --window-size at the configure seam and carried to the acquire seam. None → fixed full screen.
+    _display_capture_sizes: tuple[tuple[int, int], tuple[int, int]] | None = PrivateAttr(default=None)
+    _display_recorder: object | None = PrivateAttr(default=None)
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
@@ -68,6 +97,13 @@ class BrowserArtifacts(BaseModel):
     # _seed_capture_failed flips true when the seed fingerprint could not be captured — the guard then
     # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
     _seed_capture_failed: bool = PrivateAttr(default=False)
+    _action_download_source: ActionDownloadSource | None = PrivateAttr(default=None)
+
+    def attach_action_download_source(self, source: ActionDownloadSource | None) -> None:
+        self._action_download_source = source
+
+    def get_action_download_source(self) -> ActionDownloadSource | None:
+        return self._action_download_source
 
     def record_seed_profile_state(self, cookies: list[dict], etag: str | None) -> None:
         self._seed_cookie_snapshot = cookies

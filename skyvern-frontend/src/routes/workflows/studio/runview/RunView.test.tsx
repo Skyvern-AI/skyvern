@@ -1,12 +1,17 @@
 // @vitest-environment jsdom
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+} from "@tanstack/react-query";
 import {
   act,
   cleanup,
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -19,8 +24,14 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
-import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import {
+  ActionTypes,
+  ArtifactType,
+  Status,
+  type ActionsApiResponse,
+} from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
@@ -30,6 +41,7 @@ import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
 import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneViewToggles } from "./RunPaneHeader";
 import { RunView } from "./RunView";
@@ -39,6 +51,16 @@ const mocks = vi.hoisted(() => ({
   timeline: undefined as unknown,
   codeGenerating: false,
   isPlaceholderData: false,
+  statusUnavailable: false,
+  refetchRunStatus: vi.fn(),
+}));
+const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: async () => ({ get: getSpy }),
+}));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => undefined,
 }));
 
 vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -46,6 +68,8 @@ vi.mock("../../hooks/useWorkflowRunWithWorkflowQuery", () => ({
     data: mocks.workflowRun,
     isLoading: false,
     isPlaceholderData: mocks.isPlaceholderData,
+    isError: mocks.statusUnavailable,
+    refetch: mocks.refetchRunStatus,
   }),
 }));
 vi.mock("../../hooks/useWorkflowRunTimelineQuery", () => ({
@@ -79,6 +103,7 @@ vi.mock("@/components/ui/scroll-area", () => ({
 // The header's "…" menu (Radix DropdownMenu) scrolls its focused item into
 // view on open; jsdom implements neither that nor ResizeObserver.
 Element.prototype.scrollIntoView = () => {};
+Element.prototype.scrollTo = () => {};
 if (typeof globalThis.ResizeObserver === "undefined") {
   globalThis.ResizeObserver = class {
     observe() {}
@@ -223,6 +248,24 @@ function seedCompletedRun(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function sealedSavedRunReplayOverrides(): Record<string, unknown> {
+  const runId = process.env.SAVED_RUN_REPLAY_RUN_ID;
+  if (runId === undefined) {
+    return {};
+  }
+  expect(runId).toBe("wr_568303252034165152");
+  expect(process.env.SAVED_RUN_REPLAY_TERMINAL_STATUS).toBe(Status.Completed);
+  expect(process.env.SAVED_RUN_REPLAY_BLOCK_OUTPUT).toBe("null");
+  expect(process.env.SAVED_RUN_REPLAY_MISSING_FIELD).toBe(
+    "workflow_run_block_output",
+  );
+  return {
+    workflow_run_id: runId,
+    status: process.env.SAVED_RUN_REPLAY_TERMINAL_STATUS,
+    outputs: null,
+  };
+}
+
 function seedRunningRun() {
   mocks.timeline = [
     buildBlockItem(
@@ -254,6 +297,20 @@ function LocationSpy() {
   return <div data-testid="location-search">{location.search}</div>;
 }
 
+// Subscribes to the failure card's artifact query so a test can wait for its
+// result to reach the DOM instead of for the request to start.
+function ArtifactsQueryProbe({
+  workflowRunBlockId,
+}: {
+  workflowRunBlockId: string;
+}) {
+  const { status } = useQuery({
+    queryKey: ["workflowRunBlock", workflowRunBlockId, "artifacts"],
+    enabled: false,
+  });
+  return <div data-testid="artifacts-query">{status}</div>;
+}
+
 // Stands in for the editor canvas: selecting a block there mirrors the label
 // into ?selected-block= (useSelectedBlockUrlSync).
 function SelectBlockOnCanvas({ label }: { label: string }) {
@@ -267,6 +324,22 @@ function SelectBlockOnCanvas({ label }: { label: string }) {
       }}
     >
       canvas: select {label}
+    </button>
+  );
+}
+
+function ReleaseCopilotRunFocus() {
+  const [params, setParams] = useSearchParams();
+  return (
+    <button
+      onClick={() => {
+        const next = new URLSearchParams(params);
+        next.delete("wr");
+        next.delete("wrs");
+        setParams(next, { replace: true });
+      }}
+    >
+      release copilot focus
     </button>
   );
 }
@@ -322,8 +395,12 @@ afterEach(() => {
   mocks.timeline = undefined;
   mocks.codeGenerating = false;
   mocks.isPlaceholderData = false;
+  mocks.statusUnavailable = false;
+  mocks.refetchRunStatus.mockReset();
 });
 beforeEach(() => {
+  getSpy.mockReset();
+  getSpy.mockResolvedValue({ data: [] });
   useRunViewStore.getState().reset();
   useRunPaneViewStore.getState().reset();
   useStudioBrowserStore.setState({ view: "auto" });
@@ -712,6 +789,30 @@ describe("RunView cold-open selection", () => {
     expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
   });
 
+  test("a terminal Copilot-focused run stays unselected through release", () => {
+    seedTerminalRunWithActions();
+    const view = renderRunView(
+      {},
+      "/?wr=wr_1&wrs=copilot",
+      false,
+      <ReleaseCopilotRunFocus />,
+    );
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(view.getByTestId("location-search").textContent).not.toContain(
+      "active=",
+    );
+
+    fireEvent.click(
+      view.getByRole("button", { name: "release copilot focus" }),
+    );
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(view.getByTestId("location-search").textContent).not.toContain(
+      "active=",
+    );
+  });
+
   test("a still-running run keeps following the live edge", () => {
     seedRunningRun();
     renderRunView({}, "/?wr=wr_1");
@@ -872,6 +973,35 @@ describe("RunView live-watch terminal transition", () => {
     expect(useStudioBrowserStore.getState().view).toBe("auto");
   });
 
+  test("a Copilot-focused watched run stays unselected when it finishes", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(view.getByTestId("location-search").textContent).not.toContain(
+      "active=",
+    );
+  });
+
+  test("an explicit timeline pin still wins during Copilot focus", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+
+    act(() => useRunViewStore.getState().pinFrame("act_1"));
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
+    expect(view.getByTestId("location-search").textContent).toContain(
+      "active=act_1",
+    );
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
+  });
+
   test("a view pill pinned mid-watch is never overridden at run end", () => {
     seedWatchedRun(Status.Running);
     const view = renderRunView({}, "/?wr=wr_1");
@@ -896,29 +1026,58 @@ describe("RunView live-watch terminal transition", () => {
   });
 });
 
-describe("RunView failure banner", () => {
-  test("shows the failure reason with working Fix and Retry CTAs", () => {
+describe("RunView failure presentation", () => {
+  // A code block that killed the run, preceded in the (newest-first) timeline
+  // by a block that still ran after it — so the last frame is NOT the failure.
+  function seedFailedCodeRun(
+    blockFailureReason = "CodeBlock failed with NameError at line 6: name 'min' is not defined.",
+    errorCode = "user_code_error",
+  ) {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: `code block failed. failure reason: ${blockFailureReason}`,
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_cleanup",
+          label: "cleanup",
+          status: Status.Completed,
+          actions: [buildAction({ action_id: "act_cleanup", action_order: 0 })],
+        }),
+      ),
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_code",
+          label: "scrape-prices",
+          block_type: "code",
+          status: Status.Failed,
+          error_codes: [errorCode],
+          failure_reason: blockFailureReason,
+        }),
+      ),
+    ];
+  }
+
+  test("leads with the failure headline and working Fix and Retry CTAs", () => {
     seedCompletedRun({
       status: Status.Failed,
       failure_reason: "Login page rejected the credentials",
     });
     const onFix = vi.fn();
     const onRetry = vi.fn();
-    const { container } = renderRunView({ onFix, onRetry });
-    const scope = within(container);
+    const { container, getByTestId } = renderRunView({ onFix, onRetry });
+    const line = within(getByTestId("run-failure-line"));
 
     expect(
-      scope.getByText("Login page rejected the credentials"),
+      line.getByText("Login page rejected the credentials"),
     ).not.toBeNull();
-
-    fireEvent.click(scope.getByRole("button", { name: "Fix with Copilot" }));
+    fireEvent.click(line.getByRole("button", { name: "Fix with Copilot" }));
     expect(onFix).toHaveBeenCalledTimes(1);
-    expect(onFix.mock.calls[0]?.[0]).toContain(
-      "Login page rejected the credentials",
-    );
-
-    fireEvent.click(scope.getByRole("button", { name: "Retry" }));
+    fireEvent.click(line.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
+    // The card is gone: nothing on the page announces itself as an alert.
+    expect(within(container).queryByRole("alert")).toBeNull();
   });
 
   test("Fix passes the failing block's label alongside the seed message", () => {
@@ -945,64 +1104,64 @@ describe("RunView failure banner", () => {
     expect(onFix.mock.calls[0]?.[1]).toBe("checkout");
   });
 
-  test("splits the banner into a headline and de-emphasized detail", () => {
+  test("keeps the technical detail one hover away from the headline", () => {
     seedCompletedRun({
       status: Status.Failed,
       failure_reason:
-        "for_loop block failed. failure reason: Failed to execute code block. Reason: Exception: boom",
+        "for_loop block failed. failure reason: Failed to execute code block. Reason: Exception: boom\\n\\tstack trace",
     });
-    const { container } = renderRunView();
-    const scope = within(container);
+    const { getByTestId } = renderRunView();
+    const line = within(getByTestId("run-failure-line"));
 
-    const headline = scope.getByText("for_loop block failed");
-    expect(headline.className).toContain("font-semibold");
-    expect(
-      scope.getByText(/Failed to execute code block\. Reason: Exception: boom/),
-    ).not.toBeNull();
-    // Short detail → no expand toggle.
-    expect(scope.queryByRole("button", { name: "Show more" })).toBeNull();
+    const headline = line.getByText("for_loop block failed");
+    expect(headline.getAttribute("title")).toContain(
+      "Exception: boom\n  stack trace",
+    );
+    expect(headline.getAttribute("title")).not.toContain("\\n");
+    expect(headline.getAttribute("title")).not.toContain("\\t");
+    expect(line.queryByText(/Exception: boom/)).toBeNull();
   });
 
-  test("long failure detail clamps behind a Show more toggle", () => {
-    seedCompletedRun({
-      status: Status.Failed,
-      failure_reason: `for_loop block failed. failure reason: ${"x".repeat(300)}`,
-    });
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    const detail = scope.getByText(/^x+$/);
-    expect(detail.className).toContain("line-clamp-3");
-    fireEvent.click(scope.getByRole("button", { name: "Show more" }));
-    expect(scope.getByText(/^x+$/).className).not.toContain("line-clamp-3");
-    fireEvent.click(scope.getByRole("button", { name: "Show less" }));
-    expect(scope.getByText(/^x+$/).className).toContain("line-clamp-3");
-  });
-
-  test("dismiss hides the failure banner", () => {
-    seedCompletedRun({
-      status: Status.Failed,
-      failure_reason: "Something broke",
-    });
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    fireEvent.click(scope.getByRole("button", { name: "Dismiss" }));
-    expect(scope.queryByText("Something broke")).toBeNull();
-  });
-
-  test("no failure banner for a user-canceled run", () => {
+  test("shows no failure line for a user-canceled run", () => {
     seedCompletedRun({
       status: Status.Canceled,
       failure_reason: "canceled by user",
     });
-    const { container } = renderRunView();
+    const { container, queryByTestId } = renderRunView();
     const scope = within(container);
 
     expect(scope.queryByText("canceled by user")).toBeNull();
+    expect(queryByTestId("run-failure-line")).toBeNull();
   });
 
-  test("a code block failure leads with its error state, line and guidance", () => {
+  test("the block name jumps to the failing block, whose detail carries the expansion", () => {
+    seedFailedCodeRun();
+    const { container, getByTestId } = renderRunView({
+      onFix: vi.fn(),
+      onRetry: vi.fn(),
+    });
+    const line = within(getByTestId("run-failure-line"));
+
+    expect(
+      line.getByText("— The block's code raised NameError"),
+    ).not.toBeNull();
+    // One line at run level: badges and the disclosure live on the block.
+    expect(line.queryByText("Line 6")).toBeNull();
+    expect(line.queryByText("Technical details")).toBeNull();
+
+    fireEvent.click(line.getByRole("button", { name: "scrape-prices" }));
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
+    const scope = within(container);
+    expect(scope.getByText("Line 6")).not.toBeNull();
+    expect(scope.getByText("Error code user_code_error")).not.toBeNull();
+    expect(
+      scope.getByText(/Open the block and fix the line that raised/),
+    ).not.toBeNull();
+    expect(scope.getByText("Technical details")).not.toBeNull();
+  });
+
+  test("the detail expands the line without restating it", () => {
     seedCompletedRun({
       status: Status.Failed,
       failure_reason:
@@ -1012,67 +1171,210 @@ describe("RunView failure banner", () => {
       buildBlockItem(
         buildBlock({
           workflow_run_block_id: "wrb_code",
+          label: "scrape-prices",
           block_type: "code",
           status: Status.Failed,
           error_codes: ["user_code_error"],
           failure_reason:
             "CodeBlock failed with NameError at line 6: name 'min' is not defined.",
+          actions: [
+            buildAction({
+              action_id: "act_fail",
+              action_order: 1,
+              status: Status.Failed,
+            }),
+            buildAction({ action_id: "act_ok", action_order: 0 }),
+          ],
         }),
       ),
     ];
-    const { container } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
-    const banner = within(within(container).getByRole("alert"));
+    const { container } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/?wr=wr_1",
+    );
+    const scope = within(container);
 
+    // Pinned on the failing block: the title lives on the line only; the
+    // detail keeps guidance, badges and the disclosure.
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
     expect(
-      banner.getByText("The block's code raised NameError"),
+      scope.getByText("— The block's code raised NameError"),
     ).not.toBeNull();
-    expect(banner.getByText("Line 6")).not.toBeNull();
-    expect(banner.getByText("Error code user_code_error")).not.toBeNull();
+    expect(scope.queryByText("The block's code raised NameError")).toBeNull();
     expect(
-      banner.getByText(/Open the block and fix the line that raised/),
+      scope.getByText(/Open the block and fix the line that raised/),
     ).not.toBeNull();
-    expect(banner.getByText("Technical details")).not.toBeNull();
-    // A code defect is still the author's to fix, so both CTAs stay.
-    expect(
-      banner.getByRole("button", { name: "Fix with Copilot" }),
-    ).not.toBeNull();
+    expect(scope.getByText("Line 6")).not.toBeNull();
+
+    // Reached through one of its action rows, the block's failure still expands
+    // (SKY-12240 keeps it on every action's Summary) and still skips the title.
+    for (const actionId of ["act_ok", "act_fail"]) {
+      act(() => useRunViewStore.getState().pinFrame(actionId));
+      expect(scope.getByText("Failure")).not.toBeNull();
+      expect(scope.getByText("Line 6")).not.toBeNull();
+      expect(scope.queryByText("The block's code raised NameError")).toBeNull();
+    }
   });
 
-  test("a sandbox fault offers a retry instead of a copilot fix", () => {
+  test("a failed run's deep link lands on the failing block, not the last item", () => {
+    seedFailedCodeRun();
+    renderRunView({}, "/?wr=wr_1");
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
+  });
+
+  test("a failed Copilot-focused run does not auto-pin its failing block", () => {
+    seedFailedCodeRun();
+    const { getByTestId } = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(getByTestId("location-search").textContent).not.toContain("active=");
+  });
+
+  test("a Copilot-focused latest failed run does not auto-pin its failing block", () => {
+    seedFailedCodeRun();
+    const { getByTestId } = renderRunView({}, "/?wrs=copilot");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(getByTestId("location-search").textContent).not.toContain("active=");
+  });
+
+  test("a failed latest-run Studio open lands on the failing block", () => {
+    seedFailedCodeRun();
+    const { getByTestId } = renderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
+    expect(getByTestId("location-search").textContent).toContain(
+      "active=wrb_code",
+    );
+  });
+
+  test("a finally-only failure keeps its strip label and jump", () => {
     seedCompletedRun({
       status: Status.Failed,
-      failure_reason:
-        "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry.",
+      failure_reason: "cleanup failed: Invalid master password",
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: "cleanup" },
+      },
     });
     mocks.timeline = [
       buildBlockItem(
         buildBlock({
-          workflow_run_block_id: "wrb_code",
-          block_type: "code",
+          workflow_run_block_id: "wrb_cleanup",
+          label: "cleanup",
           status: Status.Failed,
-          error_codes: ["runner_unavailable"],
-          failure_reason:
-            "Secure CodeBlock runner is unavailable. Please retry.",
+          failure_reason: "cleanup failed: Invalid master password",
         }),
       ),
     ];
+
+    const { getByTestId } = renderRunView();
+    const line = within(getByTestId("run-failure-line"));
+    fireEvent.click(line.getByRole("button", { name: "cleanup" }));
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_cleanup");
+  });
+
+  test("the block detail's screenshot action opens the Browser pane and pins the block", async () => {
+    getSpy.mockResolvedValue({
+      data: [
+        {
+          artifact_id: "art_screenshot",
+          artifact_type: ArtifactType.ActionScreenshot,
+          created_at: "2026-08-27T00:00:00Z",
+          modified_at: "2026-08-27T00:00:00Z",
+          organization_id: "org_1",
+          task_id: "task_1",
+          step_id: "step_1",
+          uri: "s3://bucket/screenshot.png",
+        },
+      ],
+    });
+    seedFailedCodeRun(
+      "CodeBlock failed because a browser operation failed at line 4.",
+      "browser_operation_failed",
+    );
+    const { container, getByTestId } = renderRunView({}, "/?wr=wr_1");
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
+
+    fireEvent.click(
+      await within(container).findByRole("button", {
+        name: "View block screenshot",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(getByTestId("location-search").textContent).toContain("browser"),
+    );
+    await waitFor(() =>
+      expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code"),
+    );
+  });
+
+  test("hides the screenshot link when the failed block has no capture", async () => {
+    getSpy.mockResolvedValue({ data: [] });
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "code block failed. failure reason: CodeBlock failed because a browser operation failed at line 4.",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_failed",
+          block_type: "code",
+          status: Status.Failed,
+          error_codes: ["browser_operation_failed"],
+          failure_reason:
+            "CodeBlock failed because a browser operation failed at line 4.",
+        }),
+      ),
+    ];
+
+    const { container, getByTestId } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/?wr=wr_1",
+      false,
+      <ArtifactsQueryProbe workflowRunBlockId="wrb_failed" />,
+    );
+    const line = within(getByTestId("run-failure-line"));
+    const scope = within(container);
+    // The link is also absent while the artifact query is in flight, so wait
+    // for the empty result to reach the DOM, not just for the request to start.
+    await waitFor(() =>
+      expect(getByTestId("artifacts-query").textContent).toBe("success"),
+    );
+
+    // Absent from the a11y tree entirely, disabled included: a link into an
+    // empty Browser pane is worse than no link.
+    expect(
+      scope.queryByRole("button", {
+        name: "View block screenshot",
+        hidden: true,
+      }),
+    ).toBeNull();
+    expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
+  });
+
+  test("a sandbox fault offers a retry instead of a copilot fix", () => {
+    seedFailedCodeRun(
+      "Secure CodeBlock runner is unavailable. Please retry.",
+      "runner_unavailable",
+    );
     const onFix = vi.fn();
     const onRetry = vi.fn();
-    const { container } = renderRunView({ onFix, onRetry });
-    const banner = within(within(container).getByRole("alert"));
+    const { getByTestId } = renderRunView({ onFix, onRetry });
+    const line = within(getByTestId("run-failure-line"));
 
-    expect(banner.getByText("The code sandbox was unreachable")).not.toBeNull();
-    expect(
-      banner.queryByRole("button", { name: "Fix with Copilot" }),
-    ).toBeNull();
+    expect(line.getByText("— The code sandbox was unreachable")).not.toBeNull();
+    expect(line.queryByRole("button", { name: "Fix with Copilot" })).toBeNull();
 
-    const retry = banner.getByRole("button", { name: "Retry" });
+    const retry = line.getByRole("button", { name: "Retry" });
     expect(retry.className).toContain("bg-cta");
     fireEvent.click(retry);
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
-  test("a code block that continued on failure does not retitle the banner", () => {
+  test("a code block that continued on failure does not retitle the line", () => {
     seedCompletedRun({
       status: Status.Failed,
       failure_reason: "task block failed. failure reason: Login rejected",
@@ -1090,33 +1392,157 @@ describe("RunView failure banner", () => {
         }),
       ),
     ];
-    const { container } = renderRunView();
-    const banner = within(within(container).getByRole("alert"));
+    const { getByTestId } = renderRunView();
+    const line = within(getByTestId("run-failure-line"));
 
-    expect(banner.getByText("task block failed")).not.toBeNull();
-    expect(banner.queryByText("The code sandbox was unreachable")).toBeNull();
+    expect(line.getByText("task block failed")).not.toBeNull();
+    expect(line.queryByText(/code sandbox was unreachable/)).toBeNull();
   });
 
-  test("hides the run failure banner outside the Timeline view", () => {
+  test("hides the failure line outside the Timeline view", () => {
     seedCompletedRun({
       status: Status.Failed,
       failure_reason: "Login page rejected the credentials",
     });
-    const { container } = renderRunView();
+    const { container, queryByTestId } = renderRunView();
     const scope = within(container);
 
-    // Visible on the default Timeline view.
     expect(
       scope.getByText("Login page rejected the credentials"),
     ).not.toBeNull();
 
-    // Switching to another tab hides the run-level failure banner.
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+    expect(queryByTestId("run-failure-line")).toBeNull();
     expect(scope.queryByText("Login page rejected the credentials")).toBeNull();
+  });
+
+  test("an unlabeled failed block remains the deep-link and strip recovery target", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Login page rejected the credentials",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_unlabeled",
+          label: null,
+          status: Status.Failed,
+          failure_reason: "Login page rejected the credentials",
+        }),
+      ),
+    ];
+    const { container, getByTestId } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/?wr=wr_1",
+    );
+    const line = within(getByTestId("run-failure-line"));
+    const scope = within(container);
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_unlabeled");
+    expect(
+      line.getByRole("button", { name: "Fix with Copilot" }),
+    ).not.toBeNull();
+    expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
+    // The pinned block's own reason is identical to the run's, so it's fully
+    // stated on the strip already: the block detail must not repeat it.
+    expect(
+      scope.getAllByText("Login page rejected the credentials"),
+    ).toHaveLength(1);
+    expect(scope.queryByText("Failure")).toBeNull();
+  });
+
+  test("a block reason that diverges from the run's own headline is never dropped", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Task failed",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_mismatch",
+          label: "submit-form",
+          status: Status.Failed,
+          failure_reason: "POST returned 401. The token expired.",
+        }),
+      ),
+    ];
+    const { container } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/?wr=wr_1",
+    );
+    const scope = within(container);
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_mismatch");
+    // The strip states the run's own generic headline ("Task failed"); the
+    // pinned block's more specific reason was never actually shown there,
+    // so the detail panel must still say it in full.
+    expect(
+      scope.getByText("POST returned 401. The token expired."),
+    ).not.toBeNull();
+  });
+
+  test("a non-culprit failed block is never suppressed just because its headline text matches", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Network timeout",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_early",
+          label: "flaky-request",
+          status: Status.Failed,
+          continue_on_failure: true,
+          failure_reason: "Network timeout",
+        }),
+      ),
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_last",
+          label: "final-request",
+          status: Status.Failed,
+          failure_reason: "Network timeout",
+        }),
+      ),
+    ];
+    const { container } = renderRunView(
+      { onFix: vi.fn(), onRetry: vi.fn() },
+      "/?wr=wr_1",
+    );
+
+    // Auto-pin lands on the culprit — the strip's headline is about this
+    // block, so its own identical reason is correctly suppressed.
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_last");
+    expect(within(container).queryByText("Failure")).toBeNull();
+
+    // Navigating to the earlier continue_on_failure block, whose parsed
+    // headline happens to be the same text, must NOT suppress it: the
+    // strip never actually described this block.
+    act(() => useRunViewStore.getState().pinFrame("wrb_early"));
+    const scope = within(container);
+    expect(scope.getByText("Failure")).not.toBeNull();
+    expect(scope.getByText("Network timeout")).not.toBeNull();
   });
 });
 
 describe("RunView live affordances", () => {
+  test("an unavailable status quietly removes live claims while polling recovers", () => {
+    seedRunningRun();
+    mocks.statusUnavailable = true;
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(scope.queryByText("Run status unavailable")).toBeNull();
+    expect(scope.queryByText("Status unavailable")).toBeNull();
+    expect(scope.queryByText("running", { exact: false })).toBeNull();
+    expect(
+      scope.queryByRole("button", { name: "Watch live in the Browser pane" }),
+    ).toBeNull();
+
+    expect(scope.queryByRole("button", { name: "Retry status" })).toBeNull();
+    expect(mocks.refetchRunStatus).not.toHaveBeenCalled();
+  });
+
   test("a running run shows the Live chip; clicking hands off to the Browser pane", () => {
     seedRunningRun();
     useRunViewStore.getState().pinFrame("act_1");
@@ -1368,6 +1794,7 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("No outputs for this run")).toBeNull();
     expect(scope.getByText("Run outputs")).not.toBeNull();
     expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
+    expect(scope.getByText("22600")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {
@@ -1384,8 +1811,8 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("Errors")).toBeNull();
   });
 
-  test("shows the Outputs empty state when run signals are absent", () => {
-    seedCompletedRun();
+  test("renders a genuinely omitted output as an empty Outputs state", () => {
+    seedCompletedRun(sealedSavedRunReplayOverrides());
 
     const { container } = renderRunView();
     const scope = within(container);
@@ -1394,5 +1821,53 @@ describe("RunView output signals", () => {
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
     expect(scope.queryByText("Errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
+  });
+
+  test("does not substitute persisted Copilot prose for a genuinely omitted output", async () => {
+    const corroboratingProse =
+      "Copilot found 22.9k stars, matching the value visible in the source.";
+    getSpy.mockImplementation((path: string) => {
+      if (path === "/workflow/copilot/chat-history") {
+        return Promise.resolve({
+          data: {
+            workflow_copilot_chat_id: "chat_1",
+            chat_history: [
+              {
+                sender: "ai",
+                content: corroboratingProse,
+                created_at: "2026-08-29T11:01:20Z",
+              },
+            ],
+            proposed_workflow: null,
+            auto_accept: false,
+          },
+        });
+      }
+      return Promise.resolve({ data: [] });
+    });
+    seedCompletedRun(sealedSavedRunReplayOverrides());
+    const copilotPortal = document.createElement("div");
+    document.body.appendChild(copilotPortal);
+
+    const { container } = renderRunView(
+      {},
+      "/",
+      false,
+      <WorkflowPermanentIdContext.Provider value="wpid_1">
+        <WorkflowCopilotChat docked portalTarget={copilotPortal} />
+      </WorkflowPermanentIdContext.Provider>,
+    );
+    const runView = within(container);
+
+    await waitFor(() =>
+      expect(screen.getByText(corroboratingProse)).not.toBeNull(),
+    );
+    fireEvent.click(runView.getByRole("button", { name: "Outputs" }));
+
+    expect(runView.getByText("No outputs for this run")).not.toBeNull();
+    expect(runView.queryByText(corroboratingProse)).toBeNull();
+    expect(runView.queryByText("22.9k")).toBeNull();
+
+    copilotPortal.remove();
   });
 });

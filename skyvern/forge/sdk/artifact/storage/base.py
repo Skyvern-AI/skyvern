@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import BinaryIO, cast
@@ -103,6 +104,29 @@ def download_checksums_by_uri(artifacts: list[Artifact]) -> dict[str, str]:
     (SKY-14752). Rows without a checksum are omitted: they cannot vouch for content.
     """
     return {artifact.uri: artifact.checksum for artifact in artifacts if artifact.uri and artifact.checksum}
+
+
+def dedupe_run_scoped_download_artifacts(artifacts: list[Artifact]) -> list[Artifact]:
+    """Collapse the two representations of one persistent-session download in a run's DOWNLOAD set.
+
+    A download can be registered both session-produced (``browser_session_id`` set — run-bound at
+    insert, or claimed later) and run-scoped by the local save (``browser_session_id`` NULL); when both
+    carry the same non-null checksum they are the same bytes, so drop the session-produced row and keep
+    the run-scoped one as canonical. Pairing is one-for-one: a checksum with N run-scoped rows drops at
+    most N session rows, so two legitimate same-content session downloads backed by a single run-scoped
+    row keep one. Order is preserved; distinct/absent checksums, twinless session rows, and multiple
+    run-scoped rows are all kept. Run-scoped only — never call on a session listing.
+    """
+    run_scoped_checksums = Counter(a.checksum for a in artifacts if a.browser_session_id is None and a.checksum)
+    if not run_scoped_checksums:
+        return artifacts
+    kept: list[Artifact] = []
+    for a in artifacts:
+        if a.browser_session_id is not None and a.checksum and run_scoped_checksums[a.checksum] > 0:
+            run_scoped_checksums[a.checksum] -= 1
+            continue
+        kept.append(a)
+    return kept
 
 
 async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:

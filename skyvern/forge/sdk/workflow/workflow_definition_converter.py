@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     WorkflowTriggerBlock,
 )
+from skyvern.forge.sdk.workflow.models.data_export_block import DataExportBlock
 from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
@@ -187,6 +188,7 @@ def convert_workflow_definition(
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
+                totp_field_name=parameter.totp_field_name,
                 created_at=now,
                 modified_at=now,
             )
@@ -891,6 +893,15 @@ def block_yaml_to_block(
         return WaitBlock(
             **base_kwargs,
             wait_sec=block_yaml.wait_sec,
+        )
+
+    elif block_yaml.block_type == BlockType.DATA_EXPORT:
+        return DataExportBlock(
+            **base_kwargs,
+            data=block_yaml.data,
+            data_schema=block_yaml.data_schema,
+            file_name=block_yaml.file_name,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:

@@ -82,7 +82,7 @@ async def test_credential_returns_value_skipping_poll_even_when_url_configured()
         result = await resolve_otp_value(task)
 
     assert result is credential_value
-    credential.assert_called_once_with(task.workflow_run_id)
+    credential.assert_called_once_with(task.workflow_run_id, None)
     poll.assert_not_called()
 
 
@@ -326,7 +326,7 @@ async def test_credential_check_runs_even_when_workflow_run_id_missing(monkeypat
         result = await resolve_otp_value(task)
 
     assert result is None
-    credential.assert_called_once_with(None)
+    credential.assert_called_once_with(None, None)
     db_get.assert_not_awaited()
     poll.assert_awaited_once()
 

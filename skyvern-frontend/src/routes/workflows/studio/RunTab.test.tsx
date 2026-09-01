@@ -31,11 +31,15 @@ vi.mock("./runview/RunView", () => ({
   RunView: (props: {
     onFix?: (seedMessage?: string, failingLabel?: string | null) => void;
     onRetry?: () => void;
+    milestoneRerun?: Readonly<{ to: string; state?: unknown }>;
     runIdPending?: boolean;
   }) => (
     <div
       data-testid="runview"
       data-has-retry={props.onRetry ? "yes" : "no"}
+      data-has-milestone-rerun={props.milestoneRerun ? "yes" : "no"}
+      data-milestone-rerun-to={props.milestoneRerun?.to}
+      data-milestone-rerun-state={String(props.milestoneRerun?.state)}
       data-run-id-pending={props.runIdPending ? "yes" : "no"}
     >
       {props.onRetry ? (
@@ -129,6 +133,33 @@ describe("RunTab block-scoped retry", () => {
     renderAt("/workflows/wpid_abc/studio?wr=run_1");
     expect(screen.getByTestId("runview").getAttribute("data-has-retry")).toBe(
       "yes",
+    );
+  });
+});
+
+describe("RunTab milestone rerun", () => {
+  test("provides rerun navigation for a completed workflow run", () => {
+    mockWorkflowRun({ status: Status.Completed });
+    renderAt("/workflows/wpid_abc/studio?wr=run_1");
+
+    expect(
+      screen.getByTestId("runview").getAttribute("data-has-milestone-rerun"),
+    ).toBe("yes");
+  });
+
+  test("provides state-less fresh-run navigation for completed task_v2", () => {
+    mockWorkflowRun({
+      status: Status.Completed,
+      task_v2: { task_id: "task_synthetic" },
+    });
+    renderAt("/workflows/wpid_abc/studio?wr=run_1");
+
+    const runView = screen.getByTestId("runview");
+    expect(runView.getAttribute("data-milestone-rerun-to")).toBe(
+      "/agents/wpid_abc/run",
+    );
+    expect(runView.getAttribute("data-milestone-rerun-state")).toBe(
+      "undefined",
     );
   });
 });

@@ -3128,7 +3128,10 @@ def _ctx_with_blocks(*block_types: str) -> CopilotContext:
 
 def _set_workflow_labels(ctx: CopilotContext, *labels: str) -> None:
     ctx.last_workflow = SimpleNamespace(
-        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=label) for label in labels])
+        workflow_definition=SimpleNamespace(
+            parameters=[],
+            blocks=[SimpleNamespace(label=label) for label in labels],
+        )
     )
 
 
@@ -4487,9 +4490,7 @@ def test_current_workflow_has_evidence_block() -> None:
 # can observe was reached, and recognition must not be suppressed by run status.
 
 
-def _canceled_budget_result() -> dict:
-    # The watchdog budget-cancel result shape: ok=False, no "blocks" list (the
-    # result is returned before block harvest), only the reached URL survives.
+def _canceled_run_result() -> dict:
     return {
         "ok": False,
         "data": {
@@ -4497,7 +4498,6 @@ def _canceled_budget_result() -> dict:
             "overall_status": "canceled",
             "current_url": "https://example.com/cart",
             "failure_reason": "Task wr_cancel was canceled",
-            "failure_categories": [{"category": "PER_TOOL_BUDGET", "confidence_float": 1.0, "reasoning": "budget"}],
         },
     }
 
@@ -4674,7 +4674,7 @@ def test_artifact_health_skips_when_anti_bot_category_is_carrier_backed() -> Non
 
 def test_unfinished_run_verification_candidate_admits_canceled_with_evidence() -> None:
     ctx = _run_ctx()
-    assert _is_unfinished_run_verification_candidate(ctx, _canceled_budget_result()) is True
+    assert _is_unfinished_run_verification_candidate(ctx, _canceled_run_result()) is True
     # ok=True belongs to the clean-success candidate path, not this one.
     assert _is_unfinished_run_verification_candidate(ctx, _clean_success_result()) is False
     # ok=False with no reached runtime URL leaves nothing to judge.
@@ -4731,7 +4731,7 @@ async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatc
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    result = await _maybe_run_completion_verification(ctx, _canceled_budget_result(), time.monotonic())
+    result = await _maybe_run_completion_verification(ctx, _canceled_run_result(), time.monotonic())
     assert result is not None
     assert result.status == "evaluated"
     assert result.is_fully_satisfied() is True

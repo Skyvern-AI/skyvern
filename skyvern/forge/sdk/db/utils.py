@@ -881,6 +881,7 @@ def convert_to_workflow_run_block(
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
         final_url=workflow_run_block_model.final_url,
+        finish_reason=workflow_run_block_model.finish_reason,
         error_codes=workflow_run_block_model.error_codes or [],
         engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,

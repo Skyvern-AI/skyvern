@@ -189,6 +189,12 @@ def _known_drift_definition(block_type: str) -> dict[str, object]:
         block["file_url"] = "{{ source_pdf }}"
         block["prompt"] = "Fill the PDF using the payload."
         block["payload"] = {"name": "{{ applicant.name }}"}
+    elif block_type == "data_export":
+        block["data"] = "{{ extract_output.extracted_information }}"
+        block["data_schema"] = {
+            "type": "array",
+            "items": {"type": "object", "properties": {"id": {"type": "integer"}}},
+        }
     else:
         raise ValueError(f"Unsupported known drift block type: {block_type}")
 
@@ -251,7 +257,7 @@ def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dic
     }
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill"])
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export"])
 @pytest.mark.asyncio
 async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
@@ -269,11 +275,13 @@ async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
     assert sent_block["block_type"] == block_type
     if block_type.startswith("google_sheets"):
         assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    elif block_type == "data_export":
+        assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill"])
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export"])
 @pytest.mark.asyncio
 async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
@@ -308,6 +316,8 @@ async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
     assert sent_block["block_type"] == block_type
     if block_type.startswith("google_sheets"):
         assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    elif block_type == "data_export":
+        assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 

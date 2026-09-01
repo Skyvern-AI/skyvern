@@ -151,7 +151,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     compute_conditional_scopes,
     get_all_blocks,
     resolve_conditional_merge_edges,
-    run_is_eligible_for_v3_ab,
+    v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -186,6 +186,7 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     grade_completion_contract,
     parse_completion_contract,
 )
+from skyvern.forge.sdk.workflow.runtime_secret_bridge import publish_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.secret_encryption import encrypt_workflow_definition_secrets
 from skyvern.forge.sdk.workflow.sequential_key import (
     REUSE_ADMISSION_OFF_DISABLED,
@@ -245,6 +246,7 @@ from skyvern.services.webhook_delivery import (
     describe_delivery_error,
 )
 from skyvern.services.workflow_script_service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
@@ -613,6 +615,7 @@ UNBOUNDED_BLOCK_TEXT_LIST_FIELDS = (
 UNBOUNDED_BLOCK_TEXT_FIELDS = (
     "description",
     "failure_reason",
+    "finish_reason",
     "navigation_goal",
     "data_extraction_goal",
     "terminate_criterion",
@@ -925,17 +928,18 @@ def truncate_oversized_response_value(
 
 @dataclass(frozen=True)
 class DebugSessionProfileDecision:
-    """Asymmetric decision for LoginBlock credential-profile flow.
+    """Decision for LoginBlock credential-profile flow.
 
     attach_browser_session_id: the PBS id to thread into
-        BROWSER_MANAGER.get_or_create_for_workflow_run so the visible browser
-        is the one the agent acts on. None for non-debug runs (preserve
-        existing behavior — credential-profile launches a fresh browser).
+        BROWSER_MANAGER.get_or_create_for_workflow_run so the visible/supplied
+        browser is the one the agent acts on. None when the run has no explicit
+        browser_session_id (preserve existing behavior — credential-profile
+        launches a fresh browser).
 
-    incompatible_reason: None when compatible / non-debug; otherwise the
-        structured reason for the warning emit. Callers branch on this:
+    incompatible_reason: None when compatible / no explicit session; otherwise
+        the structured reason for the warning emit. Callers branch on this:
         None → take the existing skip-login fast path, set → emit the
-        structured warning, attach the PBS, fall through to ordinary login.
+        structured warning, attach the session, fall through to ordinary login.
     """
 
     attach_browser_session_id: str | None
@@ -1675,35 +1679,34 @@ class WorkflowService:
         self,
         *,
         organization_id: str,
-        candidates: Sequence[WorkflowScript],
+        workflow_permanent_id: str,
         block_labels_to_disable: Sequence[str],
     ) -> tuple[list[CachedScriptBlocks], list[CachedScriptBlocks]]:
-        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared."""
+        """Split cached scripts into published vs draft buckets and collect blocks that should be cleared.
+
+        Looks up matching blocks by label directly in SQL (``get_cached_block_groups_by_labels``)
+        rather than loading every cached script for the workflow — some workflows accumulate tens
+        of thousands of cached scripts, and loading them all to filter in Python made saves time
+        out (SKY-15102).
+        """
         cached_groups: list[CachedScriptBlocks] = []
         published_groups: list[CachedScriptBlocks] = []
-        target_labels = set(block_labels_to_disable)
         seen_group_keys: set[tuple[ScriptStatus | str, str, tuple[str, ...]]] = set()
 
-        scripts_by_id = await app.DATABASE.scripts.get_latest_scripts_by_ids(
+        rows = await app.DATABASE.scripts.get_cached_block_groups_by_labels(
             organization_id=organization_id,
-            script_ids=[candidate.script_id for candidate in candidates],
-        )
-        blocks_by_revision = await app.DATABASE.scripts.get_script_blocks_by_script_revision_ids(
-            organization_id=organization_id,
-            script_revision_ids=[script.script_revision_id for script in scripts_by_id.values()],
+            workflow_permanent_id=workflow_permanent_id,
+            block_labels=block_labels_to_disable,
         )
 
-        for candidate in candidates:
-            script = scripts_by_id.get(candidate.script_id)
-            if not script:
-                continue
+        blocks_by_candidate: dict[str, list[Any]] = {}
+        candidate_by_id: dict[str, tuple[Any, Any]] = {}
+        for workflow_script, script, script_block in rows:
+            blocks_by_candidate.setdefault(workflow_script.workflow_script_id, []).append(script_block)
+            candidate_by_id[workflow_script.workflow_script_id] = (workflow_script, script)
 
-            script_blocks = blocks_by_revision.get(script.script_revision_id, [])
-            blocks_to_clear = [
-                block for block in script_blocks if block.script_block_label in target_labels and block.run_signature
-            ]
-            if not blocks_to_clear:
-                continue
+        for workflow_script_id, (candidate, script) in candidate_by_id.items():
+            blocks_to_clear = blocks_by_candidate[workflow_script_id]
 
             group_key = (
                 candidate.status,
@@ -2189,6 +2192,38 @@ class WorkflowService:
             if isinstance(parameter, CredentialParameter)
             and (bool(parameter.credential_ids) or bool(parameter.fallback_credential_ids))
         ]
+
+    def _rotating_credential_profile_segment(self, workflow: Workflow, parameter_values: dict[str, Any]) -> str | None:
+        """Segment folded into a managed browser profile's key so each credential in a rotation pool
+        gets its own profile automatically, even when browser_profile_key doesn't reference it or
+        isn't set (SKY-15192). Reads the resolved selection already in parameter_values; a parameter
+        with no resolved selection (fail-open legacy pool) is skipped, not guessed. Joining multiple
+        selections with "," is unambiguous because a resolved value is always a generate_credential_id
+        row (cred_<int>), never free text that could itself contain a comma."""
+        segments = [
+            selected
+            for parameter in self._get_rotating_credential_parameters(workflow)
+            if isinstance(selected := parameter_values.get(parameter.key), str) and selected
+        ]
+        return ",".join(segments) or None
+
+    def _managed_browser_profile_digest_key(
+        self, workflow: Workflow, parameter_values: dict[str, Any], rendered_key: str | None
+    ) -> tuple[str | None, str | None]:
+        """(digest_key, credential_segment) for a managed browser profile. rendered_key is an
+        unrestricted Jinja render of workflow-parameter values (browser_profile_key.py) — it can
+        contain any character, so joining it with credential_segment by a plain delimiter would let
+        two different (key, credential) pairs collide onto the same digest (e.g. key renders
+        "acct|1" with no credential vs. key "acct" with credential "1"). Collapse rendered_key to its
+        fixed-width digest before combining, so the split point is never ambiguous. When the two are
+        already identical (the customer's key already IS the credential value), skip combining
+        entirely and keep today's exact digest rather than gratuitously reseeding."""
+        credential_segment = self._rotating_credential_profile_segment(workflow, parameter_values)
+        if not credential_segment or rendered_key == credential_segment:
+            return rendered_key or credential_segment, credential_segment
+        if not rendered_key:
+            return credential_segment, credential_segment
+        return f"{build_browser_profile_key_digest(rendered_key)}:{credential_segment}", credential_segment
 
     def _get_run_credential_parameter_overrides(
         self,
@@ -3308,14 +3343,21 @@ class WorkflowService:
                 browser_profile_key=workflow.browser_profile_key,
             )
             rendered_key = None
-        digest = build_browser_profile_key_digest(rendered_key)
+        digest_key, credential_segment = self._managed_browser_profile_digest_key(
+            workflow, parameter_values, rendered_key
+        )
+        digest = build_browser_profile_key_digest(digest_key)
         profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
             organization_id=workflow_run.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             browser_profile_key_digest=digest,
-            name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+            name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
         )
-        if created:
+        # A credential-segmented profile has no legacy counterpart (the wpid_ archive predates
+        # per-credential rotation and was never scoped to one credential) — seeding it would risk
+        # loading a different credential's saved state onto this one, the exact bug this segment
+        # exists to prevent. Skip seeding; the profile just starts empty and accumulates normally.
+        if created and not credential_segment:
             try:
                 await self._seed_managed_browser_profile_from_legacy_session(
                     workflow=workflow,
@@ -3511,23 +3553,30 @@ class WorkflowService:
             if not workflow.persist_browser_session or workflow_request.browser_profile_id:
                 return None
 
+            parameter_values = self._profile_key_render_values(workflow, workflow_request)
+            if extra_parameter_values:
+                parameter_values.update(extra_parameter_values)
+
             rendered_key = None
             if workflow.browser_profile_key:
-                parameter_values = self._profile_key_render_values(workflow, workflow_request)
-                if extra_parameter_values:
-                    parameter_values.update(extra_parameter_values)
                 rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
                 if not rendered_key:
                     return None
 
-            digest = build_browser_profile_key_digest(rendered_key)
+            digest_key, credential_segment = self._managed_browser_profile_digest_key(
+                workflow, parameter_values, rendered_key
+            )
+            digest = build_browser_profile_key_digest(digest_key)
             profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 browser_profile_key_digest=digest,
-                name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+                name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
             )
-            if created:
+            # See _ensure_managed_browser_profile: a credential-segmented profile has no legacy
+            # counterpart, so seeding it from the un-credentialed archive would risk leaking a
+            # different credential's saved state onto it.
+            if created and not credential_segment:
                 try:
                     await self._seed_managed_browser_profile_from_legacy_session(
                         workflow=workflow,
@@ -5437,6 +5486,20 @@ class WorkflowService:
                         exc_info=True,
                     )
 
+            if getattr(workflow_run, "copilot_session_id", None):
+                with contained_effect(
+                    "publish Copilot origin-run runtime secrets",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                ):
+                    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                        workflow_run.workflow_run_id
+                    )
+                    await publish_copilot_runtime_secret_values(
+                        organization_id=workflow_run.organization_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_context=workflow_run_context,
+                    )
+
             if renewal_task is not None and not renewal_task.done():
                 renewal_task.cancel()
                 try:
@@ -5523,6 +5586,9 @@ class WorkflowService:
         workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
+        run_context_for_selection = skyvern_context.current()
+        if run_context_for_selection is not None:
+            run_context_for_selection.run_block_labels = block_labels
 
         # Load script blocks if script is provided
         script_blocks_by_label: dict[str, Any] = {}
@@ -5533,7 +5599,7 @@ class WorkflowService:
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
         # Resolve the workflow-block engine A/B once, before any block runs: eligibility is a
-        # property of the whole run (see run_is_eligible_for_v3_ab), and every block of a run must
+        # property of the whole run (see v3_ab_ineligibility_reason), and every block of a run must
         # share an arm. Covers the DAG executor too, which this method delegates to.
         current_context = skyvern_context.current()
         if current_context:
@@ -5542,7 +5608,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
-                run_is_eligible=run_is_eligible_for_v3_ab(all_blocks, is_script_run=is_script_run),
+                ineligibility_reason=v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run),
             )
         else:
             LOG.warning(
@@ -7090,14 +7156,14 @@ class WorkflowService:
             )
 
             if decision.incompatible_reason is not None:
-                # Debug session whose visible PBS is profile-incompatible.
-                # Stream fidelity wins: attach the visible PBS so the user
-                # can watch the action, but DO NOT write
+                # The run's explicit browser session is profile-incompatible.
+                # Live-session fidelity wins: attach that session so the run (or
+                # the user watching a debug session) sees it, but DO NOT write
                 # workflow_run.browser_profile_id, DO NOT rewrite the
                 # navigation_goal, and DO NOT emit "skipping login agent".
                 # Fall through to ordinary LoginBlock execution below.
                 LOG.warning(
-                    "Debug session profile incompatible with LoginBlock credential",
+                    "Explicit browser session profile incompatible with LoginBlock credential",
                     code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
                     reason=decision.incompatible_reason,
                     workflow_run_id=workflow_run_id,
@@ -7592,16 +7658,13 @@ class WorkflowService:
         resolved_browser_profile_id: str,
         organization_id: str,
     ) -> DebugSessionProfileDecision:
-        """Asymmetric LoginBlock credential-profile decision: debug-session runs
-        attach the visible PBS only when its saved profile matches the credential
-        profile; mismatches surface a reason for downstream warning + fall-through."""
-        is_debug_run = workflow_run.is_debug_session
-        if not is_debug_run:
-            return DebugSessionProfileDecision(
-                attach_browser_session_id=None,
-                incompatible_reason=None,
-            )
-
+        """LoginBlock credential-profile decision: a run with an explicit
+        browser_session_id (a debug session, or one supplied by a caller such as
+        MCP's skyvern_login) attaches that live session and only skips the
+        login agent when its saved profile matches the credential profile;
+        mismatches surface a reason for downstream warning + fall-through. A
+        run with no explicit session keeps the legacy behavior: the credential
+        profile boots a fresh browser."""
         if not browser_session_id:
             return DebugSessionProfileDecision(
                 attach_browser_session_id=None,
@@ -7841,7 +7904,7 @@ class WorkflowService:
             block_type=block.block_type,
             block_label=block.label,
             block_status=block_result.status,
-            workflow_status=target_status,
+            resolved_terminal_status=target_status,
             deferred=defer_status_write,
         )
         if defer_status_write:
@@ -8708,15 +8771,11 @@ class WorkflowService:
                 previous_blocks=current_definition.get("blocks", []),
                 new_blocks=new_definition.get("blocks", []),
             )
-            candidates = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
-                organization_id=organization_id,
-                workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-            )
 
             if plan.has_targets:
                 cached_groups, published_groups = await self._partition_cached_blocks(
                     organization_id=organization_id,
-                    candidates=candidates,
+                    workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
                     block_labels_to_disable=plan.block_labels_to_disable,
                 )
 
@@ -8777,7 +8836,10 @@ class WorkflowService:
                 )
                 return
 
-            to_delete = candidates
+            to_delete = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
+                organization_id=organization_id,
+                workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
+            )
 
             if len(to_delete) > 0:
                 try:
@@ -9436,7 +9498,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as completed",
             workflow_run_id=workflow_run_id,
-            workflow_status="completed",
         )
 
         # Add workflow completion tag to trace
@@ -9633,7 +9694,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as failed",
             workflow_run_id=workflow_run_id,
-            workflow_status="failed",
             failure_reason=failure_reason,
         )
 
@@ -9651,7 +9711,6 @@ class WorkflowService:
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
-            workflow_status="failed",
             failure_category=failure_category,
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source=failure_category_source,
@@ -9705,7 +9764,6 @@ class WorkflowService:
         LOG.info(
             f"Marked workflow run {workflow_run_id} as failed (conditional)",
             workflow_run_id=workflow_run_id,
-            workflow_status="failed",
             failure_category=failure_category,
         )
         if cascade_children:
@@ -9754,7 +9812,6 @@ class WorkflowService:
         LOG.info(
             f"Marked workflow run {workflow_run_id} as running",
             workflow_run_id=workflow_run_id,
-            workflow_status="running",
             run_with=run_with,
             queued_seconds=queued_seconds,
         )
@@ -9770,7 +9827,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as terminated",
             workflow_run_id=workflow_run_id,
-            workflow_status="terminated",
             failure_reason=failure_reason,
         )
 
@@ -9790,7 +9846,6 @@ class WorkflowService:
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
-            workflow_status="terminated",
             failure_category=failure_category,
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source=failure_category_source,
@@ -9818,7 +9873,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as canceled",
             workflow_run_id=workflow_run_id,
-            workflow_status="canceled",
         )
 
         updated = await self.mark_workflow_run_as_canceled_if_not_final(
@@ -9858,7 +9912,6 @@ class WorkflowService:
         LOG.info(
             f"Marked workflow run {workflow_run_id} as canceled (conditional)",
             workflow_run_id=workflow_run_id,
-            workflow_status="canceled",
         )
         otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.canceled)
 
@@ -9928,7 +9981,6 @@ class WorkflowService:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as timed out",
             workflow_run_id=workflow_run_id,
-            workflow_status="timed_out",
         )
 
         failure_category = self._classify_workflow_terminal_failure(
@@ -9938,7 +9990,6 @@ class WorkflowService:
         LOG.info(
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
-            workflow_status="timed_out",
             failure_category=failure_category,
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source="code_level",
@@ -10079,6 +10130,7 @@ class WorkflowService:
     async def get_output_parameter_workflow_run_output_parameter_tuples(
         workflow_id: str,
         workflow_run_id: str,
+        workflow: Workflow | None = None,
     ) -> list[tuple[OutputParameter, WorkflowRunOutputParameter]]:
         workflow_run_output_parameters = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
             workflow_run_id=workflow_run_id
@@ -10090,11 +10142,18 @@ class WorkflowService:
             ]
         )
 
+        output_parameters_by_id = {
+            output_parameter.output_parameter_id: output_parameter for output_parameter in output_parameters
+        }
+        if workflow is not None:
+            for parameter in workflow.workflow_definition.parameters:
+                if isinstance(parameter, OutputParameter):
+                    output_parameters_by_id.setdefault(parameter.output_parameter_id, parameter)
+
         return [
-            (output_parameter, workflow_run_output_parameter)
+            (output_parameters_by_id[workflow_run_output_parameter.output_parameter_id], workflow_run_output_parameter)
             for workflow_run_output_parameter in workflow_run_output_parameters
-            for output_parameter in output_parameters
-            if output_parameter.output_parameter_id == workflow_run_output_parameter.output_parameter_id
+            if workflow_run_output_parameter.output_parameter_id in output_parameters_by_id
         ]
 
     async def get_last_task_for_workflow_run(self, workflow_run_id: str) -> Task | None:
@@ -10483,7 +10542,9 @@ class WorkflowService:
                 workflow_run_tasks=workflow_run_tasks,
             ),
             self.get_output_parameter_workflow_run_output_parameter_tuples(
-                workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+                workflow_id=workflow_run.workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow=workflow,
             ),
             self._fetch_recording_urls(workflow_run, task_v2, organization_id),
             self._fetch_downloaded_files(workflow_run, task_v2),

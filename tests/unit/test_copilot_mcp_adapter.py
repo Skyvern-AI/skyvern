@@ -4,32 +4,49 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import quote
 
 import pytest
 from mcp.types import CallToolResult
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.mcp_adapter import (
+    BROWSER_TARGET_PARAM_NAME,
     SchemaOverlay,
     SkyvernOverlayMCPServer,
+    _apply_schema_overlay,
     _BrowserCallOutcome,
     _handle_browser_session_loss,
     _requested_output_path_choices,
+    _transform_args,
+    resolve_browser_session_binding,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserLivenessUndetermined,
     CopilotBrowserSessionUnavailable,
+    OriginRunRedactionRegistry,
+    bound_call_browser_session,
+    browser_page_custody_lock,
     mcp_to_copilot,
 )
+from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.webeye.persistent_sessions_manager import (
+    BrowserOperation,
+    BrowserRetirement,
+    BrowserRetirementReason,
+)
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.test_copilot_secret_scrub import _make_server
 
@@ -43,6 +60,49 @@ def _schema() -> dict:
         },
         "required": ["expression"],
     }
+
+
+def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "magic+link@example.test?token=one&next=/done"
+    encoded = quote(secret, safe="")
+    seen_parameters: list[dict[str, Any]] = []
+
+    def redact(value: Any, parameters: dict[str, Any]) -> Any:
+        seen_parameters.append(parameters)
+
+        def walk(node: Any) -> Any:
+            if isinstance(node, str):
+                return node.replace(encoded, "[redacted]")
+            if isinstance(node, dict):
+                return {key: walk(item) for key, item in node.items()}
+            return node
+
+        return walk(value)
+
+    ctx = make_copilot_ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {"magic_link": secret},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    monkeypatch.setattr(
+        mcp_adapter.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(redact_codeblock_parameter_values=redact),
+    )
+
+    scrubbed = mcp_adapter._scrub_tool_result(
+        ctx,
+        {"ok": True, "data": {"url": f"https://example.test/callback?payload={encoded}"}},
+    )
+
+    assert scrubbed["ok"] is True
+    assert secret not in str(scrubbed)
+    assert encoded not in str(scrubbed)
+    assert "[redacted]" in str(scrubbed)
+    assert seen_parameters == [{"magic_link": secret}]
 
 
 class TestRequestedOutputPathChoices:
@@ -66,6 +126,107 @@ class TestRequestedOutputPathChoices:
 
     def test_a_turn_owing_no_output_leaves_the_schema_alone(self) -> None:
         assert _requested_output_path_choices(_schema(), []) == _schema()
+
+    def test_narrowing_the_path_choices_leaves_the_rest_of_the_contract_intact(self) -> None:
+        source = {**_schema(), "additionalProperties": False}
+
+        schema = _requested_output_path_choices(source, ["output.a"])
+
+        assert schema["additionalProperties"] is False
+        assert schema["properties"]["expression"] == source["properties"]["expression"]
+        assert schema["required"] == source["required"]
+
+
+def _closed_source_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "description": "Open a page.",
+        "$defs": {"Where": {"type": "string", "enum": ["chat", "last_run"]}},
+        "properties": {
+            "session_id": {"type": "string", "description": "Browser session id."},
+            "url": {"type": "string", "description": "URL to open."},
+            "where": {"$ref": "#/$defs/Where"},
+        },
+        "required": ["url"],
+    }
+
+
+async def _tab_new_overlay() -> SchemaOverlay:
+    surface = resolve_copilot_tool_surface(
+        mode=CopilotEvalMode.BROWSER_ABLATION,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        registered_mcp_tools=await mcp.list_tools(run_middleware=False),
+    )
+    return surface.overlays["skyvern_tab_new"]
+
+
+class TestSchemaOverlayPreservesTheSourceContract:
+    def test_an_empty_overlay_leaves_the_accepted_argument_contract_untouched(self) -> None:
+        source = _closed_source_schema()
+
+        assert _apply_schema_overlay(source, SchemaOverlay()) == source
+
+    @pytest.mark.parametrize(
+        ("overlay", "expected_properties", "expected_required"),
+        [
+            (SchemaOverlay(hide_params=frozenset({"session_id"})), {"url", "where"}, ["url"]),
+            (SchemaOverlay(forced_args={"session_id": "pbs_1"}), {"url", "where"}, ["url"]),
+            (SchemaOverlay(arg_transforms={"target": "where"}), {"session_id", "url", "target"}, ["url"]),
+            (
+                SchemaOverlay(copilot_params={"target": {"type": "string"}}),
+                {"session_id", "url", "where", "target"},
+                ["url"],
+            ),
+        ],
+    )
+    def test_an_overlay_edits_the_fields_it_names_and_nothing_else(
+        self,
+        overlay: SchemaOverlay,
+        expected_properties: set[str],
+        expected_required: list[str],
+    ) -> None:
+        source = _closed_source_schema()
+
+        schema = _apply_schema_overlay(source, overlay)
+
+        assert set(schema["properties"]) == expected_properties
+        assert schema["required"] == expected_required
+        assert schema["additionalProperties"] is False
+        assert schema["$defs"] == source["$defs"]
+        assert schema["description"] == source["description"]
+
+    def test_a_renamed_field_keeps_its_definition_reachable(self) -> None:
+        schema = _apply_schema_overlay(_closed_source_schema(), SchemaOverlay(arg_transforms={"target": "where"}))
+
+        assert schema["properties"]["target"] == {"$ref": "#/$defs/Where"}
+        assert schema["$defs"]["Where"]["enum"] == ["chat", "last_run"]
+
+
+@pytest.mark.asyncio
+async def test_a_valid_tab_creation_dispatches_only_the_tools_own_arguments() -> None:
+    overlay = await _tab_new_overlay()
+
+    mcp_args = _transform_args({"url": "https://example.com", BROWSER_TARGET_PARAM_NAME: "last_run"}, overlay)
+
+    assert mcp_args == {"url": "https://example.com"}
+
+
+@pytest.mark.asyncio
+async def test_an_argument_outside_the_contract_is_refused_rather_than_swallowed() -> None:
+    overlay = await _tab_new_overlay()
+
+    mcp_args = _transform_args({"url": "https://example.com", "settle_seconds": 30}, overlay)
+    result = await mcp.call_tool("skyvern_tab_new", mcp_args)
+    payload = result.structured_content
+
+    assert mcp_args["settle_seconds"] == 30
+    assert payload is not None
+    assert payload["ok"] is False
+    assert payload["error"]["message"] == "skyvern_tab_new was called with unsupported argument(s): settle_seconds."
+    assert payload["error"]["details"]["unsupported_arguments"] == ["settle_seconds"]
 
 
 def test_the_declared_path_says_the_expression_is_that_value() -> None:
@@ -135,7 +296,7 @@ def _stub_browser_session(monkeypatch: pytest.MonkeyPatch, _fake_clock: list[flo
         return None
 
     @asynccontextmanager
-    async def _no_session_scope(_ctx: AgentContext) -> AsyncIterator[None]:
+    async def _no_session_scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
         _fake_clock[0] += _BROWSER_BOOT_SECONDS
         yield
 
@@ -146,7 +307,7 @@ def _stub_browser_session(monkeypatch: pytest.MonkeyPatch, _fake_clock: list[flo
 
 def _install_timed_context(monkeypatch: pytest.MonkeyPatch, clock: list[float]) -> None:
     @asynccontextmanager
-    async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+    async def _scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
         clock[0] += _BROWSER_BOOT_SECONDS + _CONTEXT_ENTER_SECONDS
         try:
             yield
@@ -174,6 +335,280 @@ def _browser_outcome_records(captured: list[dict[str, Any]]) -> list[dict[str, A
     return [record for record in captured if record.get("event") == "copilot_browser_call_outcome"]
 
 
+@pytest.mark.asyncio
+async def test_generation_retirement_reports_replacement_without_expiring_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_replaced")
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _retired(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        raise mcp_adapter.CopilotBrowserGenerationRetired("pbs_replaced")
+        yield
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _retired)
+    server = _make_server(ctx, {"ok": True}, SchemaOverlay(requires_browser=True))
+
+    result = await server.call_tool("evaluate", {})
+    surfaced = json.loads(result.content[0].text)
+
+    assert surfaced["error_code"] == "BROWSER_GENERATION_RETIRED"
+    assert surfaced["data"]["browser_session_continuity"] == {
+        "source": "direct_mcp",
+        "disposition": "generation_retired",
+        "cause": "connection_generation_retired",
+        "fresh_state_required": True,
+        "prior_action_effect": "unknown",
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_retirement_uses_session_loss_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_closed")
+    retired_error = mcp_adapter.CopilotBrowserGenerationRetired(
+        "pbs_closed",
+        BrowserRetirementReason.session_ending,
+    )
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _retired(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        raise retired_error
+        yield
+
+    handle_loss = AsyncMock(return_value="failed")
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _retired)
+    monkeypatch.setattr(mcp_adapter, "_handle_browser_session_loss", handle_loss)
+    server = _make_server(ctx, {"ok": True}, SchemaOverlay(requires_browser=True))
+
+    result = await server.call_tool("evaluate", {})
+    surfaced = json.loads(result.content[0].text)
+
+    assert surfaced["error_code"] == "SESSION_EXPIRED"
+    handle_loss.assert_awaited_once_with(
+        ctx,
+        tool_name="evaluate",
+        call_path="model",
+        lost_session_id="pbs_closed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_post_hook_finishes_inside_the_exact_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_post_hook")
+    scope_active = False
+    post_hook_saw_scope = False
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        nonlocal scope_active
+        scope_active = True
+        try:
+            yield
+        finally:
+            scope_active = False
+
+    async def _post_hook(
+        copilot_result: dict[str, Any], _raw_mcp: dict[str, Any], _ctx: AgentContext
+    ) -> dict[str, Any]:
+        nonlocal post_hook_saw_scope
+        post_hook_saw_scope = scope_active
+        return copilot_result
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True, post_hook=_post_hook),
+    )
+
+    result = await server.call_tool("evaluate", {})
+
+    assert result.isError is False
+    assert post_hook_saw_scope is True
+    assert scope_active is False
+
+
+@pytest.mark.asyncio
+async def test_retirement_after_post_hook_rolls_back_context_and_defers_success_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_retired_post_hook")
+    original_evidence = {"step": 1, "evidence": {"source_tool": "before"}}
+    ctx.flow_evidence = [original_evidence]
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        yield
+        raise mcp_adapter.CopilotBrowserGenerationRetired("pbs_retired_post_hook")
+
+    async def _post_hook(
+        copilot_result: dict[str, Any], _raw_mcp: dict[str, Any], hook_ctx: AgentContext
+    ) -> dict[str, Any]:
+        hook_ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "evaluate"}})
+        await asyncio.sleep(0)
+        return copilot_result
+
+    record_outcome = MagicMock()
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+    monkeypatch.setattr(mcp_adapter, "_record_browser_call_outcome", record_outcome)
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True, post_hook=_post_hook),
+        alias_map={"evaluate": "skyvern_evaluate"},
+    )
+
+    result = await server.call_tool("evaluate", {})
+
+    assert result.isError is True
+    assert ctx.flow_evidence == [original_evidence]
+    assert record_outcome.call_count == 1
+    assert record_outcome.call_args.args[1].ok is False
+
+
+@pytest.mark.asyncio
+async def test_retirement_rollback_preserves_concurrent_sibling_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_shared_context")
+    ctx.flow_evidence = []
+    allow_retiring_dispatch = asyncio.Event()
+    retiring_dispatch_started = asyncio.Event()
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        yield
+        if asyncio.current_task() is retiring_task:
+            raise mcp_adapter.CopilotBrowserGenerationRetired("pbs_shared_context")
+
+    class _ConcurrentClient:
+        async def call_tool(
+            self,
+            _name: str,
+            _args: dict[str, Any],
+            raise_on_error: bool = False,
+        ) -> Any:
+            if asyncio.current_task() is retiring_task:
+                retiring_dispatch_started.set()
+                await allow_retiring_dispatch.wait()
+                tag = "retiring"
+            else:
+                tag = "sibling"
+            return SimpleNamespace(structured_content={"ok": True, "tag": tag}, is_error=False, content=[])
+
+    async def _post_hook(
+        copilot_result: dict[str, Any], raw_mcp: dict[str, Any], hook_ctx: AgentContext
+    ) -> dict[str, Any]:
+        hook_ctx.flow_evidence.append({"source": raw_mcp["tag"]})
+        await asyncio.sleep(0)
+        return copilot_result
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True, post_hook=_post_hook),
+    )
+    server._client = _ConcurrentClient()
+
+    retiring_task = asyncio.create_task(server._call_tool("evaluate", {}))
+    await retiring_dispatch_started.wait()
+    sibling_task = asyncio.create_task(server._call_tool("evaluate", {}))
+    await asyncio.sleep(0)
+    allow_retiring_dispatch.set()
+
+    results = await asyncio.gather(retiring_task, sibling_task, return_exceptions=True)
+
+    assert isinstance(results[0], CallToolResult)
+    assert results[0].isError is True
+    assert not isinstance(results[1], BaseException)
+    assert ctx.flow_evidence == [{"source": "sibling"}]
+
+
+@pytest.mark.asyncio
+async def test_browser_pre_hook_internal_read_reuses_the_outer_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_nested_hook")
+    ctx.api_key = "test-api-key"
+    browser = MagicMock()
+    browser.is_connected.return_value = True
+    browser_context = MagicMock()
+    browser_context.browser = browser
+    browser_context._impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+    browser_state = MagicMock(browser_context=browser_context)
+    operation_entries = 0
+
+    @asynccontextmanager
+    async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
+        nonlocal operation_entries
+        operation_entries += 1
+        yield BrowserOperation(resolved_state, BrowserRetirement())
+
+    manager = MagicMock()
+    manager.get_browser_state = AsyncMock(return_value=browser_state)
+    manager.browser_operation = _operation
+    monkeypatch.setattr(copilot_runtime.app, "PERSISTENT_SESSIONS_MANAGER", manager)
+    monkeypatch.setattr(copilot_runtime, "get_skyvern", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(copilot_runtime, "SkyvernBrowser", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(copilot_runtime, "get_active_api_key", MagicMock(return_value="test-api-key"))
+    monkeypatch.setattr(copilot_runtime, "set_api_key_override", MagicMock(return_value=object()))
+    monkeypatch.setattr(copilot_runtime, "reset_api_key_override", MagicMock())
+    register = MagicMock()
+    unregister = MagicMock()
+    monkeypatch.setattr(copilot_runtime, "register_copilot_session", register)
+    monkeypatch.setattr(copilot_runtime, "unregister_copilot_session", unregister)
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    server: SkyvernOverlayMCPServer
+
+    async def _pre_hook(_args: dict[str, Any], _ctx: AgentContext) -> None:
+        internal = await server.call_internal_tool("skyvern_evaluate", {"expression": "source()"})
+        assert internal["ok"] is True
+
+    server = _make_server(
+        ctx,
+        {"ok": True, "data": {"result": "done"}},
+        SchemaOverlay(requires_browser=True, pre_hook=_pre_hook),
+        alias_map={"evaluate": "skyvern_evaluate"},
+    )
+
+    result = await server.call_tool("evaluate", {"expression": "action()"})
+
+    assert result.isError is False
+    assert operation_entries == 1
+    manager.get_browser_state.assert_awaited_once()
+    register.assert_called_once()
+    unregister.assert_called_once()
+
+
 async def _call(server: SkyvernOverlayMCPServer, call_path: str) -> CallToolResult | dict[str, Any]:
     if call_path == "model":
         return await server.call_tool("evaluate", {"expression": "scan()"})
@@ -186,6 +621,21 @@ def _surfaced_error(result: CallToolResult | dict[str, Any], call_path: str) -> 
         return result.content[0].text
     assert isinstance(result, dict)
     return str(result.get("error"))
+
+
+@pytest.mark.asyncio
+async def test_sensitive_run_custody_does_not_block_an_unrelated_browser_session() -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs-debug")
+    run_lock = browser_page_custody_lock(ctx, session_id="pbs-run")
+    debug_lock = browser_page_custody_lock(ctx, session_id="pbs-debug")
+    await run_lock.acquire()
+    try:
+        await asyncio.wait_for(debug_lock.acquire(), timeout=0.1)
+        debug_lock.release()
+        assert browser_page_custody_lock(ctx, session_id="pbs-run") is run_lock
+        assert browser_page_custody_lock(ctx, session_id="pbs-debug") is debug_lock
+    finally:
+        run_lock.release()
 
 
 def _server_whose_call_takes_time(
@@ -236,7 +686,7 @@ async def test_internal_call_preserves_explicit_session_across_session_prepare(
         return None, None, None
 
     @asynccontextmanager
-    async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+    async def _scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
         yield
 
     server._client = _CapturingClient()
@@ -555,7 +1005,7 @@ class TestSharedBrowserCallOutcome:
         self, call_path: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         @asynccontextmanager
-        async def _failed_context(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _failed_context(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             raise RuntimeError("context unavailable")
             yield
 
@@ -735,6 +1185,198 @@ class TestMCPToolTiming:
         assert "timing_ms" not in result.content[0].text
 
     @pytest.mark.asyncio
+    async def test_adapter_rolls_back_post_hook_facts_when_session_becomes_sensitive_in_flight(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        existing_flow = {"step": 1, "evidence": {"source_tool": "existing"}}
+        ctx.flow_evidence = [existing_flow]
+        ctx.scouted_output_covered_paths = {"output.existing"}
+
+        async def _tainted_post_hook(
+            copilot_result: dict[str, Any], raw_mcp: dict[str, Any], hook_ctx: AgentContext
+        ) -> dict[str, Any]:
+            await asyncio.sleep(0)
+            hook_ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "evaluate"}})
+            hook_ctx.scouted_output_covered_paths.add("output.private")
+            hook_ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+            return copilot_result
+
+        server = _make_server(
+            ctx,
+            {"ok": True, "data": {"result": "private page contents", "url": "https://private.test"}},
+            SchemaOverlay(requires_browser=True, post_hook=_tainted_post_hook),
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert "data" not in surfaced
+        assert ctx.flow_evidence == [existing_flow]
+        assert ctx.scouted_output_covered_paths == {"output.existing"}
+
+    @pytest.mark.asyncio
+    async def test_evaluate_on_sensitive_origin_redacts_matching_run_registry_before_disclosure(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_sensitive",
+            {
+                "credential": {"username": "private-user", "password": "private-pass"},
+                "copilot_run_runtime_secret_values": ("654321",),
+            },
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=True,
+        )
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        overlay = _build_skyvern_mcp_overlays()["evaluate"]
+        server = _make_server(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "form": {"selector": "#otp-form", "field": "#totp"},
+                        "echo": "private-user:private-pass:654321",
+                    },
+                    "url": "https://example.test/otp",
+                    "title": "Verification for private-user",
+                },
+            },
+            overlay,
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is True
+        assert surfaced["data"]["result"]["form"] == {"selector": "#otp-form", "field": "#totp"}
+        assert "private-user" not in result.content[0].text
+        assert "private-pass" not in result.content[0].text
+        assert "654321" not in result.content[0].text
+        assert "[REDACTED_SECRET]" in result.content[0].text
+        retained = json.dumps(
+            {
+                "composition_page_evidence": ctx.composition_page_evidence,
+                "flow_evidence": ctx.flow_evidence,
+                "scout_trajectory": ctx.scout_trajectory,
+            },
+            default=str,
+        )
+        assert "private-user" not in retained
+        assert "private-pass" not in retained
+        assert "654321" not in retained
+
+    @pytest.mark.asyncio
+    async def test_evaluate_on_sensitive_origin_stays_withheld_when_matching_registry_is_incomplete(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_sensitive",
+            {"credential": {"username": "private-user"}},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=False,
+        )
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        server = _make_server(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "result": "private-user:unregistered-pass",
+                    "url": "https://example.test/otp",
+                },
+            },
+            _build_skyvern_mcp_overlays()["evaluate"],
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert "private-user" not in result.content[0].text
+        assert "unregistered-pass" not in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_evaluate_stays_withheld_while_the_sensitive_origin_run_is_active(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+            "wr_sensitive",
+            {"password": "private-pass"},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=True,
+        )
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        ctx.active_sensitive_origin_browser_session_ids.add("pbs_1")
+        server = _make_server(
+            ctx,
+            {"ok": True, "data": {"result": "private-pass"}},
+            _build_skyvern_mcp_overlays()["evaluate"],
+            alias_map=get_skyvern_mcp_alias_map(),
+        )
+
+        result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert "private-pass" not in result.content[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tool_name", "args"),
+        [
+            ("skyvern_frame_list", {}),
+            ("skyvern_frame_switch", {"selector": "#payment-frame"}),
+            ("skyvern_frame_main", {}),
+        ],
+    )
+    async def test_frame_controls_refuse_tainted_browser_sessions_before_dispatch(
+        self,
+        _stub_browser_session: None,
+        tool_name: str,
+        args: dict[str, str],
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        ctx.sensitive_origin_browser_session_ids.add("pbs_1")
+        dispatched: list[str] = []
+
+        class _CapturingClient:
+            async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> Any:
+                dispatched.append(name)
+                return SimpleNamespace(structured_content={"ok": True}, is_error=False, content=[])
+
+        aliases = get_skyvern_mcp_alias_map()
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={tool_name: _build_skyvern_mcp_overlays()[tool_name]},
+            alias_map={tool_name: aliases[tool_name]},
+            allowlist=frozenset({aliases[tool_name]}),
+            context_provider=lambda: ctx,
+        )
+        server._client = _CapturingClient()
+
+        result = await server.call_tool(tool_name, args)
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert dispatched == []
+
+    @pytest.mark.asyncio
     async def test_a_call_that_exceeds_its_ceiling_reports_its_wall_time(self, _fake_clock: list[float]) -> None:
         overlay = SchemaOverlay(requires_browser=True, timeout=30)
         server = _server_whose_call_takes_time(TimeoutError(), overlay, _fake_clock)
@@ -780,7 +1422,7 @@ class TestMCPToolTiming:
         self, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
     ) -> None:
         @asynccontextmanager
-        async def _cancelled(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _cancelled(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             _fake_clock[0] += _BROWSER_BOOT_SECONDS
             raise asyncio.CancelledError
             yield
@@ -833,7 +1475,7 @@ class TestMCPToolTiming:
         self, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
     ) -> None:
         @asynccontextmanager
-        async def _attach_raises(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _attach_raises(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             _fake_clock[0] += _BROWSER_BOOT_SECONDS
             raise RuntimeError("adoption failed")
             yield
@@ -977,7 +1619,7 @@ class TestMCPToolTiming:
         self, cancel_at: str, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
     ) -> None:
         @asynccontextmanager
-        async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             _fake_clock[0] += _CONTEXT_ENTER_SECONDS
             if cancel_at == "context_enter":
                 raise asyncio.CancelledError
@@ -1137,6 +1779,13 @@ class TestMCPToolTiming:
         assert record["timing_phase"] is None
 
 
+def _async_return(value: Any) -> Callable[..., Any]:
+    async def _call(*_args: Any, **_kwargs: Any) -> Any:
+        return value
+
+    return _call
+
+
 class TestBrowserSessionContinuity:
     @pytest.fixture(autouse=True)
     def _isolated_coordination(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1255,6 +1904,73 @@ class TestBrowserSessionContinuity:
         assert ctx.blocker_signal is not None
 
     @pytest.mark.asyncio
+    async def test_a_deadline_expiry_is_named_rather_than_reported_as_a_browser_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SKY-15044: a vendor session killed on its fixed deadline mid-turn reached the user as a
+        generic lost-session message, so a periodic, expected expiry read as a browser fault. The
+        finalized row says which happened, and the surfaced error has to say so too."""
+        ctx = make_copilot_ctx(browser_session_id="pbs_expired")
+
+        async def _ensure(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
+            recovery_ctx.browser_session_id = "pbs_replacement"
+
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
+        monkeypatch.setattr(
+            mcp_adapter,
+            "app",
+            SimpleNamespace(
+                PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(seconds_until_fixed_deadline=_async_return(-3.0)),
+                CACHE=mcp_adapter.app.CACHE,
+            ),
+        )
+
+        disposition = await _handle_browser_session_loss(
+            ctx, tool_name="evaluate", call_path="model", lost_session_id="pbs_expired"
+        )
+
+        assert disposition == "reestablished"
+        assert ctx.browser_session_continuity_deadline_expired is True
+        # The primary browser tools return only the projection of a shared outcome, so the cause
+        # has to survive that hop or evaluate and screenshot still report a generic failure.
+        projected = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._not_dispatched_browser_call_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_expired",
+                source_browser_session_generation=0,
+                raw_result={},
+                ctx=ctx,
+                session_loss_disposition=disposition,
+            ),
+            display_tool_name="evaluate",
+        )
+        assert "time limit" in projected["error"]
+        assert projected["data"]["browser_session_continuity"]["cause"] == "fixed_deadline_expiry"
+
+    @pytest.mark.asyncio
+    async def test_an_unexplained_loss_is_not_named_a_deadline_expiry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The cause has to discriminate: a session that died well inside its deadline died for some
+        other reason, and reporting that as an expected expiry makes the signal meaningless."""
+        ctx = make_copilot_ctx(browser_session_id="pbs_dead")
+
+        async def _ensure(recovery_ctx: AgentContext, **_kwargs: Any) -> None:
+            recovery_ctx.browser_session_id = "pbs_replacement"
+
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
+        monkeypatch.setattr(
+            mcp_adapter,
+            "app",
+            SimpleNamespace(
+                PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(seconds_until_fixed_deadline=_async_return(742.0)),
+                CACHE=mcp_adapter.app.CACHE,
+            ),
+        )
+
+        await _handle_browser_session_loss(ctx, tool_name="evaluate", call_path="model", lost_session_id="pbs_dead")
+
+        assert ctx.browser_session_continuity_deadline_expired is False
+
+    @pytest.mark.asyncio
     async def test_observability_failure_does_not_abort_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_log_failure")
 
@@ -1328,7 +2044,7 @@ class TestBrowserSessionContinuity:
                 recovery_ctx.browser_session_id = "pbs_replacement"
 
         @asynccontextmanager
-        async def _lost_scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _lost_scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             raise CopilotBrowserSessionUnavailable("pbs_lost")
             yield
 
@@ -1352,7 +2068,7 @@ class TestBrowserSessionContinuity:
             await asyncio.sleep(0)
 
         @asynccontextmanager
-        async def _undetermined(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _undetermined(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             raise CopilotBrowserLivenessUndetermined()
             yield
 
@@ -1419,7 +2135,7 @@ class TestBrowserSessionContinuity:
                 recovery_ctx.browser_session_id = "pbs_replacement"
 
         @asynccontextmanager
-        async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             yield
 
         monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
@@ -1462,7 +2178,7 @@ class TestBrowserSessionContinuity:
             return None
 
         @asynccontextmanager
-        async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        async def _scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
             yield
 
         monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
@@ -1490,3 +2206,189 @@ def test_reestablish_lock_budget_is_derived_from_the_managers_startup_bound(monk
 
     assert mcp_adapter._reestablish_lock_seconds() == 85
     assert not hasattr(mcp_adapter, "_SESSION_REESTABLISH_TIMEOUT_SECONDS")
+
+
+def _binding_ctx(*, debug: str | None, run: str | None, run_id: str | None = "wr_1") -> SimpleNamespace:
+    return SimpleNamespace(
+        browser_session_id=debug,
+        last_run_blocks_browser_session_id=run,
+        last_run_blocks_workflow_run_id=run_id,
+    )
+
+
+def test_default_target_binds_the_debug_browser() -> None:
+    binding = resolve_browser_session_binding(_binding_ctx(debug="pbs_debug", run="pbs_run"), {})
+
+    assert (binding.target, binding.session_id_override) == ("debug", None)
+    assert binding.provenance() == {"browser_target": "debug", "source_matches_target": True}
+
+
+def test_last_run_target_binds_the_run_browser() -> None:
+    binding = resolve_browser_session_binding(_binding_ctx(debug="pbs_debug", run="pbs_run"), {"target": "last_run"})
+
+    assert binding.session_id_override == "pbs_run"
+    assert binding.provenance()["browser_target_workflow_run_id"] == "wr_1"
+    assert binding.source_matches_target is True
+
+
+def test_last_run_without_a_recorded_run_session_is_disclosed_not_silently_served() -> None:
+    # last_run is a promise about which browser answered, so an unknown run session has to be
+    # reported rather than quietly satisfied from the debug browser.
+    binding = resolve_browser_session_binding(_binding_ctx(debug="pbs_debug", run=None), {"target": "last_run"})
+
+    assert binding.session_id_override is None
+    assert binding.source_matches_target is False
+    assert "No test run" in binding.provenance()["browser_target_unavailable"]
+
+
+def test_an_unknown_target_value_is_refused_rather_than_served_from_the_debug_browser() -> None:
+    # Coercing an off-enum target to the chat's browser would run a click or a fill in a browser the
+    # model did not name, and stamp the result as if it had landed where it was aimed.
+    binding = resolve_browser_session_binding(_binding_ctx(debug="pbs_debug", run="pbs_run"), {"target": "whatever"})
+
+    assert binding.session_id_override is None
+    assert binding.source_matches_target is False
+    assert binding.unavailable_reason is not None
+    assert "whatever" in binding.unavailable_reason
+
+
+def test_a_run_that_shared_the_chats_browser_binds_no_override() -> None:
+    # There is nothing to redirect, and an override would pin the call to a recorded id that a later
+    # session re-establishment leaves behind.
+    binding = resolve_browser_session_binding(_binding_ctx(debug="pbs_same", run="pbs_same"), {"target": "last_run"})
+
+    assert (binding.target, binding.session_id_override) == ("last_run", None)
+    assert binding.unavailable_reason is None
+
+
+def test_every_browser_overlay_offers_the_target_param() -> None:
+    overlays = _build_skyvern_mcp_overlays(BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    browser_overlays = {name: overlay for name, overlay in overlays.items() if overlay.requires_browser}
+
+    assert {
+        "skyvern_frame_list",
+        "skyvern_frame_switch",
+        "skyvern_frame_main",
+    } <= set(browser_overlays)
+    assert len(browser_overlays) == 13
+    assert all(BROWSER_TARGET_PARAM_NAME in overlay.copilot_params for overlay in browser_overlays.values())
+    # inspect_page_for_composition owns target_url semantics; a second target would overload it.
+    assert "inspect_page_for_composition" not in browser_overlays
+
+
+def test_the_target_param_never_reaches_the_underlying_tool() -> None:
+    overlay = _build_skyvern_mcp_overlays(BlockAuthoringPolicy.CODE_ONLY_BROWSER)["evaluate"]
+
+    mcp_args = _transform_args({"expression": "1+1", BROWSER_TARGET_PARAM_NAME: "last_run"}, overlay)
+
+    assert mcp_args == {"expression": "1+1"}
+
+
+def test_a_dead_targeted_browser_does_not_tear_down_the_chats_session() -> None:
+    # Continuity recovery closes the lost browser and rebinds the chat to a replacement. Routing a
+    # targeted browser's death through it would destroy the page the model asked to look at and
+    # swap the chat's browser because a browser it does not own died.
+    ctx = SimpleNamespace(
+        organization_id="org",
+        browser_session_id="pbs_chat",
+        browser_session_replacements={},
+    )
+
+    async def _run() -> str:
+        with bound_call_browser_session("pbs_run"):
+            return await _handle_browser_session_loss(
+                ctx,  # type: ignore[arg-type]
+                tool_name="evaluate",
+                call_path="model",
+                lost_session_id="pbs_run",
+            )
+
+    assert asyncio.run(_run()) == "failed"
+    assert ctx.browser_session_id == "pbs_chat"
+    assert ctx.browser_session_replacements == {}
+
+
+@pytest.mark.asyncio
+async def test_internal_probes_inside_a_targeted_call_read_the_targeted_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A tool call is a dispatch wrapped in pre/post-hook probes. Sending the dispatch to the run's
+    # browser while the probes read the chat's would verify the action against a different page and
+    # stamp the result with the browser it did not observe.
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True),
+        alias_map=get_skyvern_mcp_alias_map(),
+    )
+    dispatched: list[dict[str, Any]] = []
+    scoped: list[str | None] = []
+
+    class _CapturingClient:
+        async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> Any:
+            dispatched.append(dict(args))
+            return SimpleNamespace(structured_content={"ok": True}, is_error=False, content=[])
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
+        scoped.append(session_id_override)
+        yield
+
+    server._client = _CapturingClient()
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+
+    with bound_call_browser_session("pbs_run"):
+        result = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
+
+    assert result["ok"] is True
+    assert dispatched == [{"expression": "scan()", "session_id": "pbs_run"}]
+    assert scoped == ["pbs_run"]
+    assert ctx.browser_session_id == "pbs_chat"
+
+
+@pytest.mark.asyncio
+async def test_a_targeted_call_is_not_gated_on_the_chats_own_browser() -> None:
+    # The chat's continuity is not a precondition for a call acting in a browser the chat does not
+    # own; a dead debug browser must not refuse a look at the run's page.
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+
+    with bound_call_browser_session("pbs_run"):
+        prepared = await mcp_adapter._prepare_browser_session_for_dispatch(
+            ctx,
+            tool_name="evaluate",
+            call_path="model",
+            observed_generation=ctx.browser_session_continuity_generation,
+        )
+
+    assert prepared == (None, None, None)
+    assert ctx.browser_session_id == "pbs_chat"
+
+
+@pytest.mark.asyncio
+async def test_a_call_aimed_at_an_unavailable_browser_never_dispatches() -> None:
+    """The no-silent-fallback property: a click or a fill aimed at the run's browser must not land
+    in the chat's, so the refusal has to happen before the underlying tool is reached."""
+    dispatched: list[bool] = []
+
+    # The api key matters: without one the call cannot dispatch anyway, and the dispatch assertion
+    # below would hold whether or not the refusal exists.
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat", api_key="sk-test")
+    ctx.last_run_blocks_browser_session_id = None
+    ctx.last_run_blocks_workflow_run_id = None
+
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True),
+        on_call=lambda: dispatched.append(True),
+    )
+
+    result = await server.call_tool("evaluate", {"expression": "1+1", BROWSER_TARGET_PARAM_NAME: "last_run"})
+
+    assert dispatched == []
+    payload = json.loads(result.content[0].text)
+    assert payload["ok"] is False
+    # The refusal names the target it could not honour; a later failure would not.
+    assert payload.get("browser_target") == "last_run"
+    assert "recorded a browser" in payload["error"]

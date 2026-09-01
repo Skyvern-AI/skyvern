@@ -29,9 +29,11 @@ from typing import Any, Awaitable, Callable
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.taskv3.auto_observe import AutoObserveDecision
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
@@ -69,6 +71,16 @@ MAX_TOOL_CALLS_PER_ACTION_STEP = 25
 # 24 is the lowest cap with a measured success rate, and it clears the p95 of rounds that successful
 # runs actually consume (15-18) with margin for the runs a lower cap silently suppressed.
 MIN_ACTION_STEPS = 24
+# Token need grows with the action-step budget (every extra round re-sends the transcript), so the
+# token backstop scales like the turn/tool-call guards. Anchored to the action-step floor: a budget
+# at or below MIN_ACTION_STEPS keeps exactly DEFAULT_MAX_TOKENS; only larger budgets rise, so a long
+# block's raised step cap isn't silently nullified by the flat token ceiling.
+MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
+# The scaling clamps here: the token guard is a runaway backstop, not a budget, and a caller's step
+# cap is not bounded at the route layer, so an extreme value must not carry the ceiling away with
+# it. 4x covers every observed legitimate long-block need (~2x) with margin. Deliberately asymmetric:
+# turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
+MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
@@ -102,17 +114,22 @@ DOWNLOAD_REQUIRED_GUIDANCE = """
 
 This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
 
+AUTO_OBSERVE_GUIDANCE = """
 
-def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int]:
-    """Return (max_turns, max_tool_calls) anti-runaway guards for an action-step budget.
+When an action result already ends with an auto-observe block, act from that snapshot instead of calling observe again. If an action changes only styling or focus (hover menus, toggles), the result may say no markup change was detected — observe if you expect something new to be visible. If the next action on the same page does not depend on seeing this one's result, put it in the same turn (the button that advances the form included); type a whole value or key sequence in one `type`/`press_key`, never one character per turn."""
+
+
+def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
+    """Return (max_turns, max_tool_calls, max_tokens) anti-runaway guards for an action-step budget.
 
     Generous enough that a productive run is bounded by max_action_steps, not by these guards; with
     no action-step budget, fall back to the engine's fixed defaults."""
     if not max_action_steps:
-        return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS
+        return DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOKENS
     return (
         max(DEFAULT_MAX_TURNS, max_action_steps * MAX_TURNS_PER_ACTION_STEP),
         max(DEFAULT_MAX_TOOL_CALLS, max_action_steps * MAX_TOOL_CALLS_PER_ACTION_STEP),
+        min(MAX_TOKENS_CEILING, max(DEFAULT_MAX_TOKENS, max_action_steps * MAX_TOKENS_PER_ACTION_STEP)),
     )
 
 
@@ -165,7 +182,34 @@ def _build_call_kwargs(step: Any, llm_caller: Any) -> dict[str, Any] | None:
         call_kwargs["step"] = step
     if settings.TASK_V3_TOOL_CHOICE_REQUIRED and llm_caller.supports_tool_choice():
         call_kwargs["tool_choice"] = "required"
+    reasoning_with_summary = _reasoning_effort_with_summary(llm_caller)
+    if reasoning_with_summary is not None:
+        call_kwargs["reasoning_effort"] = reasoning_with_summary
     return call_kwargs or None
+
+
+def _reasoning_effort_with_summary(llm_caller: Any) -> dict[str, str] | None:
+    """A call-level reasoning_effort override that adds a summary request, for Task V3 loop calls
+    only: `{"effort": <the effort the config would otherwise send>, "summary": "auto"}`. Passed as
+    an LLMCaller.call() kwarg, which is applied after (and so wins over) the config-derived
+    parameters -- this never changes how hard the model reasons, only whether litellm's
+    chat->responses bridge joins a readable summary into message.reasoning_content.
+
+    Only gpt-5.6 models routed through that bridge accept the dict form; a plain dict sent to any
+    other model 400s ("Unknown parameter: 'reasoning'" observed), so this is gated to those models
+    and returns None otherwise -- surfacing the provider's reasoning summary where available, since
+    a continuation turn's tool call often carries empty message.content and no summary either.
+    """
+    llm_config = getattr(llm_caller, "llm_config", None)
+    if llm_config is None:
+        return None
+    effort = getattr(llm_config, "reasoning_effort", None)
+    # The caller-level check also covers the raw-client dispatch branches (custom/BYO models),
+    # which never bridge regardless of the model's name.
+    bridge_check = getattr(llm_caller, "uses_openai_responses_bridge", None)
+    if effort is None or bridge_check is None or not bridge_check():
+        return None
+    return {"effort": effort, "summary": "auto"}
 
 
 async def run_task_v3_agent_loop(
@@ -177,13 +221,16 @@ async def run_task_v3_agent_loop(
     starting_url: str | None = None,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
+    task_id: str | None = None,
+    workflow_permanent_id: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_action_steps: int | None = None,
+    max_action_steps_ceiling: int | None = None,
     prompt_name: str = "taskv3-agent-loop",
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]]], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",
@@ -199,6 +246,8 @@ async def run_task_v3_agent_loop(
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
+    page_probe: Callable[[], Awaitable[str | None]] | None = None,
+    reload_page: Callable[[], Awaitable[None]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -208,7 +257,9 @@ async def run_task_v3_agent_loop(
     `page_fingerprint` sampler is provided, a finish(completed) on an unsettled page IS forced back
     for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
     only. `max_settle_deferrals=0` disables that completed-side re-verification while leaving the
-    failure-evidence gate, which shares the sampler, intact."""
+    failure-evidence gate, which shares the sampler, intact. `page_probe` is a separate sampler (URL
+    plus fingerprint) the loop uses to detect whether a failed batched call moved the page; a
+    page-free run has no page to probe."""
     # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
@@ -283,6 +334,24 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
+    # Resolved through the AgentFunction seam so cloud can bucket the run into an A/B; a page-free
+    # run has no observe to append, so it is never resolved and never bands as an arm.
+    auto_observe_decision = (
+        AutoObserveDecision(enabled=False, arm="default")
+        if page_free
+        else await app.AGENT_FUNCTION.resolve_task_v3_auto_observe(
+            task_id=task_id, organization_id=organization_id, workflow_permanent_id=workflow_permanent_id
+        )
+    )
+    auto_observe = auto_observe_decision.enabled
+    if not page_free:
+        LOG.info(
+            "taskv3 auto-observe resolved",
+            task_id=task_id,
+            organization_id=organization_id,
+            auto_observe=auto_observe,
+            auto_observe_arm=auto_observe_decision.arm,
+        )
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
@@ -290,36 +359,50 @@ async def run_task_v3_agent_loop(
         extra_system_guidance = extra_system_guidance + DOWNLOAD_COMPLETION_GUIDANCE
     elif completion_blocker is not None and completion_probe is None:
         extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
+    if auto_observe:
+        extra_system_guidance = extra_system_guidance + AUTO_OBSERVE_GUIDANCE
     system_prompt = base_system_prompt + extra_system_guidance
     system_prompt += datetime.now(ctx.tz_info if ctx and ctx.tz_info else UTC).strftime(
         "\n\nToday's date is %Y-%m-%d (%A), %Z."
     )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
-    outcome = await run_agent_tool_loop(
-        llm_caller=llm_caller,
-        system_prompt=system_prompt,
-        user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
-        tools=tools,
-        max_turns=max_turns,
-        max_tool_calls=max_tool_calls,
-        max_action_steps=max_action_steps,
-        prompt_name=prompt_name,
-        organization_id=organization_id,
-        call_kwargs=_build_call_kwargs(step, llm_caller),
-        should_cancel=should_cancel,
-        on_action_round=on_action_round,
-        on_pre_action=on_pre_action,
-        max_tokens=max_tokens,
-        deadline_seconds=deadline_seconds,
-        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
-        max_call_retries=DEFAULT_MAX_CALL_RETRIES,
-        activity=activity,
-        submit_watch=None if page_free else submit_watch,
-        completion_probe=completion_probe,
-        staged_downloads=staged_downloads,
-        initial_navigation_status=initial_navigation_status,
-    )
+    try:
+        outcome = await run_agent_tool_loop(
+            llm_caller=llm_caller,
+            system_prompt=system_prompt,
+            user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
+            tools=tools,
+            max_turns=max_turns,
+            max_tool_calls=max_tool_calls,
+            max_action_steps=max_action_steps,
+            max_action_steps_ceiling=max_action_steps_ceiling,
+            prompt_name=prompt_name,
+            organization_id=organization_id,
+            call_kwargs=_build_call_kwargs(step, llm_caller),
+            should_cancel=should_cancel,
+            on_action_round=on_action_round,
+            on_pre_action=on_pre_action,
+            max_tokens=max_tokens,
+            deadline_seconds=deadline_seconds,
+            retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+            max_call_retries=DEFAULT_MAX_CALL_RETRIES,
+            activity=activity,
+            submit_watch=None if page_free else submit_watch,
+            completion_probe=completion_probe,
+            staged_downloads=staged_downloads,
+            initial_navigation_status=initial_navigation_status,
+            page_probe=None if page_free else page_probe,
+            page_fingerprint=None if page_free else page_fingerprint,
+            reload_page=None if page_free else reload_page,
+            auto_observe=auto_observe,
+        )
+    finally:
+        # The context outlives this run; a signal raised as the loop was cancelled must not fire
+        # on the next block's first action.
+        _exit_ctx = skyvern_context.current()
+        if _exit_ctx is not None and _exit_ctx.refresh_working_page:
+            _exit_ctx.refresh_working_page = False
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)
@@ -331,6 +414,7 @@ async def run_task_v3_agent_loop(
         tool_seconds=outcome.tool_seconds,
         action_steps=outcome.action_steps,
         no_tool_call_turns=outcome.no_tool_call_turns,
+        auto_observe_arm=auto_observe_decision.arm,
         tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,
         tool_choice_in_effect=outcome.tool_choice_in_effect,
     )

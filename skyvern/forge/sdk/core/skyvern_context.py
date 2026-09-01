@@ -362,6 +362,8 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
+    # Caller-selected block labels for a partial workflow run; None/empty = full run.
+    run_block_labels: list[str] | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None

@@ -258,6 +258,8 @@ type Props = {
   // tested_url and matches later hostname-keyed asks. Create mode only; leaving
   // it undefined (every non-copilot caller) keeps the field empty as before.
   defaultTestUrl?: string;
+  defaultTotpType?: PasswordCredential["totp_type"];
+  heading?: string;
   /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
   onStartBackgroundTest?: (
     credentialId: string,
@@ -295,6 +297,8 @@ function CredentialsModal({
   editingCredential,
   overrideType,
   defaultTestUrl,
+  defaultTotpType,
+  heading,
   onStartBackgroundTest,
 }: Props) {
   const credentialGetter = useCredentialGetter();
@@ -703,6 +707,7 @@ function CredentialsModal({
       setPasswordCredentialValues((prev) => ({
         ...prev,
         name: defaultName,
+        totp_type: defaultTotpType ?? prev.totp_type,
       }));
       setCreditCardCredentialValues((prev) => ({
         ...prev,
@@ -717,7 +722,14 @@ function CredentialsModal({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- ref-guarded one-time init; reset and the setters are intentionally omitted so a background refetch can't re-run it
-  }, [isOpen, credentials, isEditMode, editingCredential, defaultTestUrl]);
+  }, [
+    isOpen,
+    credentials,
+    isEditMode,
+    editingCredential,
+    defaultTestUrl,
+    defaultTotpType,
+  ]);
 
   function reset() {
     setVaultType("default");
@@ -2222,7 +2234,7 @@ function CredentialsModal({
         <DialogContent className="max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
           <DialogHeader>
             <DialogTitle className="font-bold">
-              {isEditMode ? "Edit Credential" : "Add Credential"}
+              {isEditMode ? "Edit Credential" : (heading ?? "Add Credential")}
             </DialogTitle>
           </DialogHeader>
           {isEditMode && editingGroups.values && (

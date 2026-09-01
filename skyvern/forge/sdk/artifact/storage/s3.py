@@ -32,6 +32,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
     key_is_org_scoped,
     presign_with_sensitive_cap,
@@ -874,6 +875,7 @@ class S3Storage(BaseStorage):
             )
             if not rows_lookup_failed:
                 download_row_count = len(artifacts)
+            artifacts = dedupe_run_scoped_download_artifacts(artifacts)
             if artifacts:
                 file_infos = await _file_infos_from_download_artifacts(artifacts)
                 if not file_infos:
@@ -935,7 +937,7 @@ class S3Storage(BaseStorage):
             listed=listed,
         )
         dump_download_visibility_inputs("empty_read", {"run_id": run_id, **decision})
-        LOG.info(
+        LOG.debug(
             "downloads.empty_read",
             organization_id=organization_id,
             run_id=run_id,

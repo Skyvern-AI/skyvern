@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   userId: "user-a",
   confirmed: vi.fn<(patch: ConfirmedPatch) => Promise<ConfirmedWriteResult>>(),
   createWorkflow: vi.fn(),
+  legacyUpdate: vi.fn<(patch: LegacyOnboardingStatePatch) => void>(),
   telemetry: {
     registerVariant: vi.fn(),
     flowStarted: vi.fn(),
@@ -43,6 +44,10 @@ vi.mock("posthog-js/react", () => ({
 }));
 vi.mock("@clerk/clerk-react", () => ({
   useAuth: () => ({ userId: mocks.userId }),
+  useUser: () => ({
+    isLoaded: true,
+    user: { createdAt: new Date("2026-08-28T00:00:00Z") },
+  }),
 }));
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
   useGlobalWorkflowsQuery: () => ({ data: [], isLoading: false }),
@@ -187,6 +192,7 @@ function TestModal({
 }) {
   const [state, setState] = useState(initialState);
   function updateState(patch: LegacyOnboardingStatePatch) {
+    mocks.legacyUpdate(patch);
     setState((current) => ({
       ...current,
       ...patch,
@@ -232,7 +238,7 @@ afterEach(() => {
 });
 
 describe("GetStartedModal", () => {
-  it("reserves once and dismisses recommendations without another write", async () => {
+  it("reserves once, completes, stamps dismissal, and closes", async () => {
     const reservation = deferred<ConfirmedWriteResult>();
     const completion = deferred<OnboardingStateResponse>();
     mocks.confirmed
@@ -262,6 +268,7 @@ describe("GetStartedModal", () => {
     expect(mocks.telemetry.questionnaireShown).toHaveBeenCalledWith(
       expect.objectContaining({ primaryIntent: null, promptReason: "initial" }),
     );
+    expect(screen.getByText("STEP 1 OF 2")).toBeTruthy();
     fireEvent.click(
       await screen.findByRole("button", { name: /Fill out forms/ }),
     );
@@ -283,93 +290,12 @@ describe("GetStartedModal", () => {
       ),
     );
     expect(mocks.telemetry.questionnaireCompleted).toHaveBeenCalledOnce();
-    expect(await screen.findByText("Your next three steps")).toBeTruthy();
-    expect(screen.getAllByRole("listitem")).toHaveLength(3);
-    expect(
-      screen.queryAllByText(/Pick a template to start|copilot-header/),
-    ).toEqual([]);
-
-    fireEvent.click(screen.getByRole("button", { name: "Skip" }));
-
     expect(mocks.confirmed).toHaveBeenCalledTimes(3);
-    expect(mocks.telemetry.modalSkipped).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("returns through a matching response, updates, and closes on action", async () => {
-    const completed = questionnaire();
-    const updated = questionnaire({
-      revision: 2,
-      last_mutation_id: "mutation-update-1",
+    expect(mocks.legacyUpdate).toHaveBeenCalledWith({
+      modal_dismissed_at: expect.any(String),
     });
-    const updateWrite = deferred<OnboardingStateResponse>();
-    mocks.confirmed
-      .mockResolvedValueOnce(reservedResponse())
-      .mockResolvedValueOnce(
-        response({
-          user_intent: "fill_forms",
-          questionnaire_prompted_at: promptedAt,
-        }),
-      )
-      .mockResolvedValueOnce(
-        response({
-          user_intent: "fill_forms",
-          questionnaire_prompted_at: promptedAt,
-          questionnaire: completed,
-        }),
-      )
-      .mockResolvedValueOnce(
-        response({
-          user_intent: "fill_forms",
-          questionnaire_prompted_at: promptedAt,
-          questionnaire: completed,
-        }),
-      )
-      .mockReturnValueOnce(updateWrite.promise);
-    render(<TestModal />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: /Fill out forms/ }),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
-    fireEvent.click(await screen.findByText("details-submit"));
-    expect(await screen.findByText("Your next three steps")).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Back" }));
-    expect(await screen.findByText("details-update-1")).toBeTruthy();
-    fireEvent.click(screen.getByText("details-back"));
-    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
-    expect(await screen.findByText("Your next three steps")).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Back" }));
-    fireEvent.click(await screen.findByText("details-submit"));
-    await waitFor(() => expect(mocks.confirmed).toHaveBeenCalledTimes(5));
-    fireEvent.keyDown(document, { key: "Escape" });
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    expect(screen.getByRole("dialog")).toBeTruthy();
     expect(mocks.telemetry.modalSkipped).not.toHaveBeenCalled();
-    expect(mocks.telemetry.questionnaireUpdated).not.toHaveBeenCalled();
-    await act(async () =>
-      updateWrite.resolve(
-        response({
-          user_intent: "fill_forms",
-          questionnaire_prompted_at: promptedAt,
-          questionnaire: updated,
-        }),
-      ),
-    );
-    expect(await screen.findByText("Your next three steps")).toBeTruthy();
-    expect(mocks.confirmed.mock.calls[4]?.[0].questionnaire).toEqual(
-      expect.objectContaining({
-        action: "update",
-        expected_revision: 1,
-      }),
-    );
-    expect(mocks.telemetry.questionnaireUpdated).toHaveBeenCalledOnce();
-
-    fireEvent.click(screen.getByRole("link", { name: "Open integrations" }));
-
-    expect(mocks.confirmed).toHaveBeenCalledTimes(5);
-    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
   it("closes when Intent Continue first sees a foreign response", async () => {
@@ -390,10 +316,6 @@ describe("GetStartedModal", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(mocks.confirmed).toHaveBeenCalledTimes(2);
-    expect(screen.queryByText("Your next three steps")).toBeNull();
-    expect(
-      screen.queryAllByText(/Pick a template to start|copilot-header/),
-    ).toEqual([]);
   });
 
   it("reserves and opens the questionnaire for an initially dismissed editor", async () => {

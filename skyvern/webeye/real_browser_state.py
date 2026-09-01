@@ -36,6 +36,7 @@ from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFac
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
+from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
@@ -253,6 +254,7 @@ class RealBrowserState(BrowserState):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         download_binding: DownloadBinding | None = None,
+        display_recording_owner_id: str | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -284,6 +286,7 @@ class RealBrowserState(BrowserState):
                 browser_profile_id=browser_profile_id,
                 engine_selection=self.engine_selection,
                 download_binding=effective_download_binding,
+                display_recording_owner_id=display_recording_owner_id,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -655,6 +658,11 @@ class RealBrowserState(BrowserState):
         prior_download_binding = (
             self.browser_artifacts.download_binding if self.browser_artifacts else DownloadBinding.RUN_DIR
         )
+        # Preserve the active whole-display recorder's owner across the rebuild, derived from THIS state's own
+        # recorder (never a caller id), so a standalone task/script reconnect re-acquires the SAME recorder
+        # instead of a fresh Playwright recording. A different run cannot inherit it (id is this run's own).
+        recorder = self.browser_artifacts._display_recorder if self.browser_artifacts else None
+        display_recording_owner_id = recorder.owner_id if isinstance(recorder, DisplayRecorder) else None
         self.browser_context = None
         await self.set_working_page(None)
         # Reconnect on the SAME engine this state was pinned to at creation; never silently switch
@@ -675,6 +683,7 @@ class RealBrowserState(BrowserState):
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
                 download_binding=prior_download_binding,
+                display_recording_owner_id=display_recording_owner_id,
             )
         except Exception:
             # The caller abandons this state on failure, so stop the just-started driver too or it leaks.
@@ -721,8 +730,11 @@ class RealBrowserState(BrowserState):
         if is_engine_timeout(error, self.engine_selection):
             skyvern_context.record_browser_timeout(BrowserOperation.RELOAD)
 
-    async def reload_page(self, degradation: bool = False) -> None:
-        page = await self.__assert_page()
+    async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None:
+        # A caller that pins its own page passes it, since the working-page accessor would reload
+        # (and repoint to) the newest tab instead.
+        if page is None:
+            page = await self.__assert_page()
         url = page.url
 
         if not degradation:
@@ -844,10 +856,27 @@ class RealBrowserState(BrowserState):
                 BROWSER_CLOSE_TIMEOUT,
                 "browser context teardown",
             )
+            # The display recorder is stopped/finalized on its own, decoupled from context teardown:
+            # ``recording_finalized`` reports only that the browser context closed, which is what gates
+            # profile persistence. A recorder that exited non-zero mid-run (or needed a forced kill)
+            # must not clear that flag and suppress an otherwise-clean run's profile write-back, and a
+            # context-teardown failure must not stop us from finalizing the WebM for upload. The stop
+            # runs even when teardown failed above, so the recording is always finalized best-effort.
+            recorder = self.browser_artifacts._display_recorder if self.browser_artifacts else None
+            if isinstance(recorder, DisplayRecorder):
+                await self._run_bounded_detachable(
+                    self._stop_display_recorder(recorder),
+                    BROWSER_CLOSE_TIMEOUT,
+                    "whole-display recorder stop",
+                )
             await self._run_browser_cleanup_bounded()
 
         await self._stop_driver_bounded(release_driver)
         return recording_finalized
+
+    async def _stop_display_recorder(self, recorder: DisplayRecorder) -> None:
+        if not await release_display_recorder(recorder):
+            raise RuntimeError("Whole-display recorder required forced termination")
 
     async def detach_remote_driver(self) -> None:
         """Release this process's adopted-remote resources without closing the remote browser.

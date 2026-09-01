@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 
+import bundles from "./narrativeState.turnFacts.fixture.json";
+import { getReviewGateVerdict } from "./cards/ReviewGateCard";
 import {
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   applyNarrativeEvent,
+  computeTurnSummary,
   hydrateNarrativeFromPayload,
   isBlockOk,
   notConfirmedOutcome,
+  ranCleanOnCurrentSource,
 } from "./narrativeState";
 import {
   WorkflowCopilotBlockProgressUpdate,
@@ -395,6 +399,7 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(withEnvelope.terminalEnvelope).toEqual({
       runVerdict: "not_demonstrated",
       runDisplayReason: "Checkout never reached confirmation.",
+      connectFailure: null,
     });
 
     const legacy = hydrateNarrativeFromPayload(payload([]))!;
@@ -407,7 +412,50 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(malformed.terminalEnvelope).toEqual({
       runVerdict: null,
       runDisplayReason: null,
+      connectFailure: null,
     });
+
+    const typedConnect = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        connect_failure: {
+          state: "already_closed",
+          retry_action: "test_end_to_end",
+          browser_session_id: "pbs_1",
+        },
+      },
+    })!;
+    expect(typedConnect.terminalEnvelope?.connectFailure).toEqual({
+      state: "already_closed",
+      retryAction: "test_end_to_end",
+      workflowRunId: null,
+      workflowRunBlockId: null,
+      taskId: null,
+      browserSessionId: "pbs_1",
+    });
+
+    const futureConnectState = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        connect_failure: {
+          state: "future_manager_state",
+          retry_action: "test_end_to_end",
+          browser_session_id: "pbs_2",
+        },
+      },
+    })!;
+    expect(futureConnectState.terminalEnvelope?.connectFailure).toBeNull();
+
+    const missingRetryContract = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        connect_failure: {
+          state: "already_closed",
+          browser_session_id: "pbs_3",
+        },
+      },
+    })!;
+    expect(missingRetryContract.terminalEnvelope?.connectFailure).toBeNull();
   });
 });
 
@@ -483,5 +531,353 @@ describe("notConfirmedOutcome — envelope-first", () => {
       verdict: "not_demonstrated",
       displayReason: "Legacy pointer reason.",
     });
+  });
+});
+
+// A recorded terminal-surface packet: one authored block, one clean run against
+// the staged source.
+const CLEAN_RECORDED_TURN = "surface-20260820T082523349904";
+
+describe("canonical turn facts — card, pill and prose over one bundle", () => {
+  const surfaces = (leg: keyof typeof bundles) => {
+    const turn = hydrateNarrativeFromPayload(
+      bundles[leg] as unknown as Record<string, unknown>,
+    );
+    if (!turn) throw new Error(`fixture ${leg} did not hydrate`);
+    return {
+      turn,
+      card: computeTurnSummary(turn),
+      pill: getReviewGateVerdict(turn, null),
+      prose: turn.terminalMessage ?? "",
+    };
+  };
+
+  it("states coverage and evaluation as independent facts when one of three blocks ran", () => {
+    const { card, pill, prose } = surfaces("partial-coverage");
+
+    expect(card.headline).not.toBe("Built and tested the workflow");
+    expect(card.stats).toContain("3 blocks authored");
+    expect(card.stats).toContain("1/3 ran on current source");
+    expect(card.stats).toContain("outcome not evaluated");
+    expect(card.stats.join(" ")).not.toContain("wr_");
+    expect(card.accent).not.toBe("ok");
+    expect(card.isFail).toBe(false);
+    expect(pill).toBe("untested");
+    expect(prose).not.toContain("tested draft");
+  });
+
+  it("reports a deadline halt without a failure row or a tested pill", () => {
+    const { card, pill, prose } = surfaces("deadline-after-one-clean-run");
+
+    expect(card.isFail).toBe(false);
+    expect(card.accent).not.toBe("fail");
+    expect(card.stats).toContain("time limit reached");
+    expect(pill).toBe("untested");
+    expect(prose).toContain("1 block ran this turn");
+    expect(prose).toContain("outcome was not evaluated");
+    expect(prose).toContain("reached its time limit");
+  });
+
+  it("marks an edited block as run against different source, never as failed", () => {
+    const { turn, card, pill } = surfaces("different-source-edit-one-of-two");
+
+    expect(
+      turn.review?.blocks.map((block) => [block.label, block.coverage]),
+    ).toEqual([
+      ["extract_github_star_count", "different_source"],
+      ["append_star_count_to_sheet", "never_run"],
+      ["append_star_count_to_sales_marketing", "never_run"],
+    ]);
+    expect(card.isFail).toBe(false);
+    expect(pill).toBe("untested");
+  });
+
+  it("excludes a removed block from the authored count", () => {
+    const { card } = surfaces("mixed-edit-and-delete");
+
+    expect(card.stats).toContain("2 blocks authored");
+    expect(card.stats).toContain("1/2 ran on current source");
+  });
+
+  it("names clean lifecycle plus full current-source coverage on the satisfaction path", () => {
+    const { card, pill, prose } = surfaces("satisfaction");
+
+    expect(card.stats).toContain("3 blocks authored");
+    expect(card.stats).toContain("3/3 ran on current source");
+    expect(card.stats).toContain("run completed");
+    expect(card.headline).toBe("Every block ran clean on the current draft");
+    expect(card.accent).toBe("ok");
+    expect(card.isFail).toBe(false);
+    expect(pill).toBe("tested");
+    for (const claim of [/verified/i, /demonstrated/i, /goal/i, /confirm/i]) {
+      expect(card.headline).not.toMatch(claim);
+    }
+    expect(prose).not.toMatch(/verified|demonstrated/i);
+  });
+
+  it("states its counts without a completion claim when no run is anchored to the turn", () => {
+    const { turn, card } = surfaces(CLEAN_RECORDED_TURN);
+
+    expect(turn.blocks.map((block) => block.state)).toEqual(["completed"]);
+    expect(turn.turnFacts?.runCompleted).toBeNull();
+    expect(card.stats).toContain("1 block authored");
+    expect(card.stats).toContain("1/1 ran on current source");
+    expect(card.stats).not.toContain("run completed");
+    expect(card.stats).not.toContain("run did not complete");
+    expect(card.isFail).toBe(false);
+  });
+
+  it("withholds the satisfaction headline when the recorded run did not complete", () => {
+    const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
+      turnFacts: Record<string, unknown>;
+    };
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles[CLEAN_RECORDED_TURN] as unknown as Record<string, unknown>),
+      turnFacts: {
+        ...recorded.turnFacts,
+        runCompleted: false,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(card.stats).toContain("run did not complete");
+    expect(card.headline).not.toBe(
+      "Every block ran clean on the current draft",
+    );
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+    expect(card.isFail).toBe(false);
+  });
+
+  it("withholds success from a fully covered turn whose recorded run failed", () => {
+    const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
+      blocks: Array<Record<string, unknown>>;
+    };
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles[CLEAN_RECORDED_TURN] as unknown as Record<string, unknown>),
+      blocks: recorded.blocks.map((block) => ({ ...block, state: "failed" })),
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(card.headline).not.toBe(
+      "Every block ran clean on the current draft",
+    );
+    expect(card.isFail).toBe(true);
+    expect(card.accent).toBe("fail");
+  });
+
+  it("says a renamed block is untested under this name across card and pill", () => {
+    const { turn, card, pill } = surfaces("renamed-block");
+
+    expect(
+      turn.review?.blocks.map((block) => [block.label, block.coverage]),
+    ).toEqual([
+      ["extract_github_star_count_v2", "unknown"],
+      ["append_star_count_to_sheet", "current_source"],
+      ["append_star_count_to_sales_marketing", "current_source"],
+      ["extract_github_star_count", undefined],
+    ]);
+    expect(card.stats).toContain("2/3 ran on current source");
+    expect(card.isFail).toBe(false);
+    expect(pill).toBe("untested");
+  });
+
+  it("settles a block still running at the deadline as stopped, not failed", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+        string,
+        unknown
+      >),
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "append_star_count_to_sheet",
+          blockType: "code",
+          state: "running",
+          lastSeenIteration: 0,
+          activity: [],
+        },
+      ],
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(turn.blocks.map((block) => block.state)).toEqual(["stopped"]);
+    expect(card.isFail).toBe(false);
+    expect(card.accent).not.toBe("fail");
+  });
+
+  it("does not call a deadline halt that delivered nothing a completed run", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+        string,
+        unknown
+      >),
+      proposalDisposition: "no_proposal",
+      draft: null,
+      terminal: "error",
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "append_star_count_to_sheet",
+          blockType: "code",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+        },
+      ],
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    // Suppressing the failure treatment for a deadline must not promote the turn
+    // into a success: it ran out of time and handed nothing back.
+    expect(card.isFail).toBe(false);
+    expect(card.accent).not.toBe("ok");
+    expect(card.headline).not.toMatch(/completed the run/i);
+  });
+
+  it("keeps a failed block a failure even when the deadline expired", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+        string,
+        unknown
+      >),
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "append_star_count_to_sheet",
+          blockType: "code",
+          state: "failed",
+          lastSeenIteration: 0,
+          activity: [],
+        },
+      ],
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(turn.turnFacts?.terminalCause).toBe("deadline_expired");
+    expect(card.isFail).toBe(true);
+    expect(card.stats).toContain("1 failed");
+  });
+
+  it("makes no tested claim for a turn that published no facts or coverage", () => {
+    const legacy = bundles[CLEAN_RECORDED_TURN] as unknown as Record<
+      string,
+      unknown
+    >;
+    const review = legacy.review as { blocks: Array<Record<string, unknown>> };
+    const turn = hydrateNarrativeFromPayload({
+      ...legacy,
+      turnFacts: undefined,
+      review: {
+        ...review,
+        blocks: review.blocks.map((block) => {
+          const withoutCoverage = { ...block };
+          delete withoutCoverage.coverage;
+          return withoutCoverage;
+        }),
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(turn.turnFacts).toBeNull();
+    expect(turn.review?.blocks[0]?.coverage).toBeUndefined();
+    expect(card.headline).not.toMatch(/tested/i);
+    expect(card.accent).not.toBe("ok");
+    expect(card.stats.join(" ")).not.toMatch(/ran on current source|authored/);
+  });
+
+  it("keeps the review when the backend sends a coverage value it does not know", () => {
+    const known = bundles[CLEAN_RECORDED_TURN] as unknown as Record<
+      string,
+      unknown
+    >;
+    const review = known.review as { blocks: Array<Record<string, unknown>> };
+    const turn = hydrateNarrativeFromPayload({
+      ...known,
+      review: {
+        ...review,
+        blocks: review.blocks.map((block) => ({
+          ...block,
+          coverage: "some_future_value",
+        })),
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.review?.blocks).toHaveLength(1);
+    expect(turn.review?.blocks[0]?.coverage).toBeUndefined();
+  });
+
+  it("refuses a tested pill for a pre-fix payload that carries no fact bundle", () => {
+    const turn = hydrateNarrativeFromPayload(
+      bundles["facts-absent"] as unknown as Record<string, unknown>,
+    );
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(turn.turnFacts).toBeNull();
+    expect(turn.proposalDisposition).toBe("review_tested");
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+    // The tested branch is named "Workflow ready for review", which contains no literal
+    // "tested" — assert the branch, not the substring.
+    expect(card.headline).not.toBe("Workflow ready for review");
+    expect(card.headline).toBe("Built the workflow");
+    expect(card.glyph).not.toBe("\u2713");
+    expect(card.accent).not.toBe("ok");
+  });
+
+  it("keeps card and pill telling one story when the envelope is missing", () => {
+    const full = bundles["full-coverage"] as unknown as Record<string, unknown>;
+    const facts = full.turnFacts as Record<string, unknown>;
+    const turn = hydrateNarrativeFromPayload({
+      ...full,
+      turnFacts: {
+        ...facts,
+        evaluationState: null,
+        runId: null,
+        runCompleted: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(turn.turnFacts?.factsAvailable).toBe(true);
+    expect(turn.turnFacts?.authoredBlockCount).toBe(facts.authoredBlockCount);
+    expect(card.stats).toContain(
+      `${facts.matchingSourceBlockCount}/${facts.authoredBlockCount} ran on current source`,
+    );
+    expect(card.stats).not.toContain("run completed");
+    expect(card.isFail).toBe(false);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(true);
+    expect(getReviewGateVerdict(turn, null)).toBe("tested");
+  });
+
+  it("stays non-committal when the turn published no facts", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles["full-coverage"] as unknown as Record<string, unknown>),
+      review: undefined,
+      proposalDisposition: "auto_applicable",
+      turnFacts: {
+        factsAvailable: false,
+        evaluationState: null,
+        runId: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+    expect(computeTurnSummary(turn).headline).not.toBe(
+      "Every block ran clean on the current draft",
+    );
   });
 });

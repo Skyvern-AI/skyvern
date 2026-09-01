@@ -22,6 +22,18 @@ from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error, _u
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _SCREEN_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
+_ACCESS_LINK_VALUE = "A1B2C3D4E5F6"
+_EXPLICIT_ACCESS_LINK_PROMPT = (
+    "Make an agent that goes to "
+    f"https://portal.example/?accesskey={_ACCESS_LINK_VALUE}#projects/123/dashboard\n\n"
+    "and downloads all available files"
+)
+_EXPLICIT_TOKEN_LINK_PROMPT = (
+    "Make an agent that downloads from https://portal.example/download?token=A1B2C3D4E5F6&signature=Z9Y8X7W6V5U4"
+)
+_STANDALONE_ACCESS_MATERIAL_PROMPT = (
+    f"My access key is {_ACCESS_LINK_VALUE}. Use it as authentication material when drafting the workflow."
+)
 
 
 async def _build(
@@ -110,6 +122,183 @@ async def test_semantic_secret_is_redacted_without_discarding_the_turn() -> None
 
 
 @pytest.mark.asyncio
+async def test_explicit_access_link_destination_keeps_full_authoring_and_run_authority() -> None:
+    policy, _ = await _build(
+        _EXPLICIT_ACCESS_LINK_PROMPT,
+        {"version": "1", "state": "clean", "citations": []},
+    )
+
+    agent_message, _ = _request_policy_agent_inputs(
+        policy,
+        user_message=_EXPLICIT_ACCESS_LINK_PROMPT,
+        chat_history_text="",
+        previous_user_message=None,
+    )
+
+    assert policy.raw_secret_safety_status == "clean"
+    assert policy.raw_secret_safety_failure_kind == "none"
+    assert policy.raw_secret_handling == "none"
+    assert policy.canonical_user_message == _EXPLICIT_ACCESS_LINK_PROMPT
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is True
+    assert policy.user_response_policy == "proceed"
+    assert policy.clarification_question is None
+    assert agent_message == _EXPLICIT_ACCESS_LINK_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_explicit_destination_with_scoped_capability_parameters_reaches_model_unchanged() -> None:
+    policy, handler = await _build(
+        _EXPLICIT_TOKEN_LINK_PROMPT,
+        {"version": "1", "state": "clean", "citations": []},
+    )
+
+    handler.assert_awaited_once()
+    assert _EXPLICIT_TOKEN_LINK_PROMPT in handler.await_args.kwargs["prompt"]
+    assert policy.raw_secret_safety_status == "clean"
+    assert policy.canonical_user_message == _EXPLICIT_TOKEN_LINK_PROMPT
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is True
+
+
+@pytest.mark.asyncio
+async def test_secret_assignment_whose_value_is_a_url_keeps_deterministic_redaction() -> None:
+    message = "api_key=https://portal.example/k/ABCDEF"
+    policy, handler = await _build(
+        message,
+        {"version": "1", "state": "clean", "citations": []},
+    )
+
+    handler.assert_awaited_once()
+    prompt = handler.await_args.kwargs["prompt"]
+    assert message not in prompt
+    assert "[REDACTED_SECRET]" in prompt
+    assert policy.raw_secret_safety_status == "clean"
+    assert policy.canonical_user_message == "[REDACTED_SECRET]"
+
+
+@pytest.mark.asyncio
+async def test_secret_assignment_starting_inside_url_and_ending_after_it_is_redacted() -> None:
+    message = "Open https://portal.example/?api_key= ABCDEF"
+    policy, handler = await _build(
+        message,
+        {"version": "1", "state": "clean", "citations": []},
+    )
+
+    handler.assert_awaited_once()
+    prompt = handler.await_args.kwargs["prompt"]
+    assert message not in prompt
+    assert "[REDACTED_SECRET]" in prompt
+    assert policy.canonical_user_message == "Open https://portal.example/?[REDACTED_SECRET]"
+
+
+@pytest.mark.asyncio
+async def test_account_row_pair_whose_value_is_a_url_keeps_deterministic_redaction() -> None:
+    message = "Use user@example.test:www.portal.example"
+    policy, handler = await _build(
+        message,
+        {"version": "1", "state": "clean", "citations": []},
+    )
+
+    handler.assert_awaited_once()
+    prompt = handler.await_args.kwargs["prompt"]
+    assert message not in prompt
+    assert "[REDACTED_SECRET]" in prompt
+    assert policy.canonical_user_message == "Use [REDACTED_SECRET]"
+
+
+@pytest.mark.asyncio
+async def test_url_auth_material_not_delegated_as_destination_remains_redacted() -> None:
+    message = "Use the token from https://portal.example/account?token=A1B2C3D4E5F6 as authentication material."
+    policy, handler = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": ["A1B2C3D4E5F6"]},
+    )
+
+    assert message in handler.await_args.kwargs["prompt"]
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.canonical_user_message == (
+        "Use the token from https://portal.example/account?token=[REDACTED_SECRET] as authentication material."
+    )
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is False
+
+
+@pytest.mark.asyncio
+async def test_reusable_password_inside_delegated_url_is_redacted_and_update_only() -> None:
+    message = "Download from https://portal.example/export?password=Hunter2Portal!"
+    policy, handler = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]},
+    )
+
+    assert message in handler.await_args.kwargs["prompt"]
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.canonical_user_message == ("Download from https://portal.example/export?password=[REDACTED_SECRET]")
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is False
+
+
+@pytest.mark.asyncio
+async def test_reusable_password_in_url_userinfo_is_accepted_as_complete_citation() -> None:
+    message = "Download from https://portal-user:Hunter2Portal!@portal.example/export"
+    policy, _ = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.raw_secret_safety_failure_kind == "none"
+    assert policy.canonical_user_message == (
+        "Download from https://portal-user:[REDACTED_SECRET]@portal.example/export"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_url_userinfo_password_citation_still_fails_closed() -> None:
+    message = "Download from https://portal-user:Hunter2Portal!@portal.example/export"
+    policy, _ = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": ["Portal!"]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separator", ["@", ":"])
+async def test_userinfo_delimiters_do_not_validate_partial_query_value_citations(separator: str) -> None:
+    message = f"Download from https://portal.example/export?password=Hunter2{separator}Pass"
+    policy, _ = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": ["Hunter2"]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+
+
+@pytest.mark.asyncio
+async def test_standalone_access_material_remains_redacted_and_update_only() -> None:
+    policy, _ = await _build(
+        _STANDALONE_ACCESS_MATERIAL_PROMPT,
+        {"version": "1", "state": "detected", "citations": [_ACCESS_LINK_VALUE]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.raw_secret_safety_failure_kind == "none"
+    assert policy.raw_secret_handling == "redacted_draft"
+    assert policy.canonical_user_message == (
+        "My access key is [REDACTED_SECRET]. Use it as authentication material when drafting the workflow."
+    )
+    assert policy.allow_update_workflow is True
+    assert policy.allow_run_blocks is False
+
+
+@pytest.mark.asyncio
 async def test_multiple_semantic_secret_citations_are_each_redacted() -> None:
     first = "Hunter2Portal!"
     second = "BillingKey-8391!"
@@ -143,6 +332,104 @@ async def test_partial_semantic_secret_citation_fails_closed() -> None:
     policy, _ = await _build(
         "The password is Hunter2Portal1234!",
         {"version": "1", "state": "detected", "citations": ["1234"]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+
+
+@pytest.mark.asyncio
+async def test_complete_uri_query_value_citation_is_accepted_and_redacted() -> None:
+    policy, _ = await _build(
+        _EXPLICIT_ACCESS_LINK_PROMPT,
+        {"version": "1", "state": "detected", "citations": [_ACCESS_LINK_VALUE]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.raw_secret_safety_failure_kind == "none"
+    assert policy.canonical_user_message == (
+        "Make an agent that goes to "
+        "https://portal.example/?accesskey=[REDACTED_SECRET]#projects/123/dashboard\n\n"
+        "and downloads all available files"
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_uri_query_value_between_ampersands_is_accepted_and_redacted() -> None:
+    message = f"Open https://portal.example/?view=all&accesskey={_ACCESS_LINK_VALUE}&project=123"
+    policy, _ = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": [_ACCESS_LINK_VALUE]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.raw_secret_safety_failure_kind == "none"
+    assert policy.canonical_user_message == (
+        "Open https://portal.example/?view=all&accesskey=[REDACTED_SECRET]&project=123"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            f'Open "https://portal.example/?accesskey={_ACCESS_LINK_VALUE}"',
+            'Open "https://portal.example/?accesskey=[REDACTED_SECRET]"',
+        ),
+        (
+            f"Open https://portal.example/?accesskey={_ACCESS_LINK_VALUE}.",
+            "Open https://portal.example/?accesskey=[REDACTED_SECRET].",
+        ),
+    ],
+)
+async def test_complete_uri_query_value_before_sentence_boundary_is_accepted(
+    message: str,
+    expected: str,
+) -> None:
+    policy, _ = await _build(
+        message,
+        {"version": "1", "state": "detected", "citations": [_ACCESS_LINK_VALUE]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert policy.canonical_user_message == expected
+
+
+@pytest.mark.asyncio
+async def test_partial_uri_query_value_citation_still_fails_closed() -> None:
+    policy, _ = await _build(
+        _EXPLICIT_ACCESS_LINK_PROMPT,
+        {"version": "1", "state": "detected", "citations": ["B2C3D4E5"]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separator", ["&", "#"])
+async def test_uri_delimiter_does_not_validate_partial_citation_outside_url(separator: str) -> None:
+    literal = f"A1B2C3D4{separator}E5F6"
+    policy, _ = await _build(
+        f"Use {literal} as authentication material.",
+        {"version": "1", "state": "detected", "citations": ["A1B2C3D4"]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separator", ["&", "#"])
+async def test_uri_delimiter_does_not_validate_partial_citation_after_delimiter_outside_url(separator: str) -> None:
+    literal = f"Abc{separator}Def123"
+    policy, _ = await _build(
+        f"My password is {literal} ok",
+        {"version": "1", "state": "detected", "citations": ["Def123"]},
     )
 
     assert policy.raw_secret_safety_status == "blocked"
@@ -319,6 +606,7 @@ async def test_clean_verdict_keeps_deterministic_redaction_without_withdrawing_a
             {"version": "1", "state": "detected", "citations": ["not-in-turn-8391!"]},
             "invalid_citation",
         ),
+        ({"version": "1", "state": "detected", "citations": []}, "contradictory_verdict"),
         ({"state": "detected", "citations": ["Hunter2Portal!"]}, "malformed_output"),
         ("not-json", "malformed_output"),
     ],
@@ -401,6 +689,24 @@ async def test_safety_timeout_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert policy.raw_secret_safety_status == "blocked"
     assert policy.raw_secret_safety_failure_kind == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_safety_provider_failure_blocks() -> None:
+    handler = AsyncMock(side_effect=RuntimeError("provider unavailable"))
+    policy = await build_request_policy_trust_floor(
+        user_message="Hello",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "provider_error"
+    assert policy.allow_update_workflow is False
+    assert policy.allow_run_blocks is False
 
 
 @pytest.mark.asyncio

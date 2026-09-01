@@ -24,7 +24,7 @@ function WorkingExampleInspector({
         <h2
           id="working-example-heading"
           tabIndex={-1}
-          className="text-base font-semibold"
+          className="scroll-mt-24 text-base font-semibold"
         >
           {title}
         </h2>
@@ -34,7 +34,7 @@ function WorkingExampleInspector({
       </header>
       <div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-3">
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold">Workflow structure</h3>
+          <h3 className="text-sm font-semibold">Agent structure</h3>
           <ol className="mt-3 list-decimal space-y-3 pl-4 marker:text-muted-foreground">
             {structure.map((step) => (
               <li key={step.title} className="break-words pl-1">
@@ -47,7 +47,7 @@ function WorkingExampleInspector({
           </ol>
         </div>
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold">Example playback</h3>
+          <h3 className="text-sm font-semibold">Agent playback</h3>
           <ol className="mt-3 list-decimal space-y-2 pl-4 marker:text-muted-foreground">
             {playback.map((detail) => (
               <li
@@ -81,6 +81,7 @@ function WorkingExampleInspector({
       <footer className="flex justify-end border-t border-border px-5 py-4 sm:px-6">
         <Button
           type="button"
+          variant="outline"
           className="h-11 w-full touch-manipulation sm:w-auto"
           disabled={isPending}
           aria-busy={isPending}

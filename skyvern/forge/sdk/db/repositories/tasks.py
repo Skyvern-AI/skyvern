@@ -415,29 +415,32 @@ class TasksRepository(BaseRepository):
     ) -> list[Action]:
         """Return the most recent *per_task_limit* actions per task for the given task IDs.
 
-        Uses a single query with application-level grouping to enforce the per-task cap.
+        Uses a windowed query so the database enforces the per-task cap.
         Results are newest-first within each task.
         """
         if not task_ids:
             return []
         unique_ids = list(dict.fromkeys(task_ids))
         async with self.Session() as session:
+            ranked_actions = (
+                select(
+                    ActionModel.action_id.label("action_id"),
+                    func.row_number()
+                    .over(partition_by=ActionModel.task_id, order_by=ActionModel.created_at.desc())
+                    .label("task_rank"),
+                )
+                .where(ActionModel.organization_id == organization_id)
+                .where(ActionModel.task_id.in_(unique_ids))
+                .subquery()
+            )
             query = (
                 select(ActionModel)
-                .filter(ActionModel.organization_id == organization_id)
-                .filter(ActionModel.task_id.in_(unique_ids))
+                .join(ranked_actions, ActionModel.action_id == ranked_actions.c.action_id)
+                .where(ranked_actions.c.task_rank <= per_task_limit)
                 .order_by(ActionModel.task_id, ActionModel.created_at.desc())
             )
             rows = (await session.scalars(query)).all()
-
-        counts: dict[str, int] = {}
-        results: list[Action] = []
-        for row in rows:
-            tid = row.task_id
-            if counts.get(tid, 0) < per_task_limit:
-                results.append(hydrate_action(row))
-                counts[tid] = counts.get(tid, 0) + 1
-        return results
+        return [hydrate_action(row) for row in rows]
 
     @db_operation("get_action_count_for_step")
     async def get_action_count_for_step(self, step_id: str, task_id: str, organization_id: str) -> int:

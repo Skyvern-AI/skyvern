@@ -330,14 +330,16 @@ _EXTRACTION_ENVELOPE_CASES: list[tuple[str, dict[str, Any], bool]] = [
     ids=[case_id for case_id, _, _ in _EXTRACTION_ENVELOPE_CASES],
 )
 def test_analyze_extraction_envelope(overrides: dict[str, Any], expected_empty: bool) -> None:
-    _, empty, _ = _analyze_run_blocks(_run_result([_extraction_block(_envelope(**overrides))]))
+    _, empty, _, _ = _analyze_run_blocks(_run_result([_extraction_block(_envelope(**overrides))]))
     assert empty is expected_empty
 
 
 def test_analyze_text_prompt_default_schema_is_not_empty() -> None:
     # TEXT_PROMPT blocks return the raw LLM response dict (no Task envelope).
     # Default schema is {"llm_response": "<text>"}.
-    _, empty, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"llm_response": "the sentiment is positive"})]))
+    _, empty, _, _ = _analyze_run_blocks(
+        _run_result([_text_prompt_block({"llm_response": "the sentiment is positive"})])
+    )
     assert empty is False
 
 
@@ -346,14 +348,14 @@ def test_analyze_text_prompt_user_schema_named_extracted_information_is_not_slic
     # top-level field "extracted_information". The helper must not mistake
     # that for an EXTRACTION envelope and discard sibling fields.
     block = _text_prompt_block({"extracted_information": "ignored because this is TEXT_PROMPT", "summary": "x"})
-    _, empty, _ = _analyze_run_blocks(_run_result([block]))
+    _, empty, _, _ = _analyze_run_blocks(_run_result([block]))
     assert empty is False
 
 
 def test_analyze_text_prompt_all_null_is_empty() -> None:
     # Symmetric to {"price": None} — a text-prompt response with all-null
     # fields counts as no meaningful output.
-    _, empty, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"summary": None})]))
+    _, empty, _, _ = _analyze_run_blocks(_run_result([_text_prompt_block({"summary": None})]))
     assert empty is True
 
 
@@ -1244,3 +1246,55 @@ class TestPageEvidenceCompaction:
 
         assert len(compacted) < 5000, f"compacted output was {len(compacted)} chars"
         assert json.loads(compacted)["page_evidence"]["forms"], "the first facts still survive"
+
+
+def test_the_run_packets_typed_failure_facts_survive_compaction() -> None:
+    # Retention is an allowlist, so a field added after it was written is dropped in silence. A
+    # repair conversation of any length outlives three tool outputs.
+    payload = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_cold",
+            "overall_status": "failed",
+            "failing_code_line": 6,
+            "blocks": [
+                {
+                    "label": "extract_failure_rate",
+                    "status": "failed",
+                    "failure_reason": "code error at line 6",
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+            "build_test_packet": {
+                "contract_version": "build_test_evidence_packet_v1",
+                "run": {"workflow_run_id": "wr_cold", "status": "failed"},
+                "failure": {
+                    "block_label": "extract_failure_rate",
+                    "error_codes": ["user_code_error"],
+                    "failing_line": 6,
+                    "locator_observations": [{"authored_selector": "x", "match_count": 0}] * 40,
+                },
+            },
+            "page_text": "x" * 6000,
+        },
+    }
+
+    parsed = json.loads(_summarize_tool_output(json.dumps(payload)))
+
+    assert parsed["failing_code_line"] == 6
+    assert parsed["blocks"][0]["error_codes"] == ["user_code_error"]
+    retained = parsed["build_test_packet"]
+    assert retained["run"]["workflow_run_id"] == "wr_cold"
+    assert retained["failure"]["error_codes"] == ["user_code_error"]
+    assert retained["failure"]["failing_line"] == 6
+    # The list tail is what yields, not the scalars a repair acts on.
+    assert "locator_observations" not in retained["failure"]
+
+
+def test_a_compacted_output_without_a_packet_gains_no_empty_one() -> None:
+    payload = {"ok": True, "data": {"workflow_run_id": "wr_1", "overall_status": "completed", "pad": "y" * 6000}}
+
+    parsed = json.loads(_summarize_tool_output(json.dumps(payload)))
+
+    assert "build_test_packet" not in parsed
+    assert "failing_code_line" not in parsed

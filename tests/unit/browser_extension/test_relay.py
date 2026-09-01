@@ -842,6 +842,40 @@ async def test_disconnect_fails_pending_requests_clears_tabs_and_calls_callback(
 
 
 @pytest.mark.asyncio
+async def test_hello_build_hash_is_captured_and_cleared_on_disconnect(
+    relay_harness: RelayHarness,
+) -> None:
+    async with ClientSession() as session:
+        websocket = await authenticate(session, relay_harness, send_hello=False)
+        relay_harness.event_received.clear()
+        await websocket.send_json(
+            {
+                "v": 1,
+                "type": "event",
+                "event": "extension.hello",
+                "params": {
+                    "extensionVersion": "1.0.0",
+                    "buildHash": "abc123",
+                    "scopedTabs": [],
+                },
+            }
+        )
+        await asyncio.wait_for(relay_harness.event_received.wait(), 1)
+        assert relay_harness.server.extension_build_hash == "abc123"
+
+        await websocket.close()
+        await asyncio.wait_for(relay_harness.disconnect_called.wait(), 1)
+        assert relay_harness.server.extension_build_hash is None
+
+
+@pytest.mark.asyncio
+async def test_hello_without_build_hash_leaves_it_unset(relay_harness: RelayHarness) -> None:
+    async with ClientSession() as session:
+        await authenticate(session, relay_harness)
+        assert relay_harness.server.extension_build_hash is None
+
+
+@pytest.mark.asyncio
 async def test_extension_ping_receives_pong(relay_harness: RelayHarness) -> None:
     async with ClientSession() as session:
         websocket = await authenticate(session, relay_harness)

@@ -516,13 +516,10 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
       ],
     });
 
-    // A settled turn's card defaults to its rolled-up summary; expand it,
-    // then expand the block row, to reach the replay the fetch just patched
-    // in — this is the reviewer's "does the verify card ever receive it".
+    // The current settled turn remains expanded, so expand the block row to
+    // reach the replay the fetch just patched in — this is the reviewer's
+    // "does the verify card ever receive it".
     const statusRegion = await waitFor(() => screen.getByRole("status"));
-    fireEvent.click(
-      within(statusRegion).getByRole("button", { expanded: false }),
-    );
     // The row's primary text is the humanized label ("block_1" -> "Block 1"),
     // not the raw block label.
     fireEvent.click(within(statusRegion).getByText("Block 1"));

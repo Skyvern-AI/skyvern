@@ -565,9 +565,13 @@ function getDiagnosticsPath(
 function BlockInspector({
   block,
   action,
+  onViewScreenshot,
+  statedFailureHeadline = null,
 }: {
   block: WorkflowRunBlock;
   action?: ActionsApiResponse | null;
+  onViewScreenshot?: () => void;
+  statedFailureHeadline?: string | null;
 }) {
   const inputFields = useMemo(
     () => getInputFields(block, action),
@@ -656,7 +660,11 @@ function BlockInspector({
           )}
         </TabsList>
         <TabsContent value="summary" className="m-0 space-y-3">
-          <BlockDetailFailure block={block} />
+          <BlockDetailFailure
+            block={block}
+            onViewScreenshot={onViewScreenshot}
+            statedFailureHeadline={statedFailureHeadline}
+          />
           <FieldList
             fields={summaryFields}
             emptyText="No additional summary data."

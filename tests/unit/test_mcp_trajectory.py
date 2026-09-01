@@ -83,9 +83,11 @@ def _patch_browser_page(
     locator = SimpleNamespace(press=AsyncMock(), select_option=AsyncMock(), evaluate=AsyncMock(return_value=False))
     locator.first = locator
     raw_page = SimpleNamespace(locator=MagicMock(return_value=locator))
+    locator.page = raw_page
     page = SimpleNamespace(
         url=source_url,
         page=raw_page,
+        locator_scope=raw_page,
         click=AsyncMock(return_value="#resolved-submit"),
         evaluate=AsyncMock(return_value=False),
         fill=AsyncMock(),
@@ -97,6 +99,7 @@ def _patch_browser_page(
     context = BrowserContext(mode=mode, session_id=session_id)
     set_current_session(SessionState(context=context, api_key_hash=api_key_hash))
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(mcp_browser, "strategy_aware_input", AsyncMock(return_value=None))
     monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", AsyncMock(return_value=None))
     monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
     return page

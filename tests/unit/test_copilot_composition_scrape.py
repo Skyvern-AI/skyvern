@@ -6,15 +6,23 @@ served in a real scout because the agent acts between inspects.)
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools
-from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_structured
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    composition_page_evidence_error,
+    has_bounded_page_schema,
+    parse_composition_structured,
+)
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
+from skyvern.forge.sdk.copilot.tools import _shared as shared_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
 from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -430,3 +438,317 @@ async def test_structured_evidence_error_is_bounded_and_redacted() -> None:
     assert error is not None
     assert "zzzz1111yyyy2222" not in error
     assert len(error) < 400
+
+
+# The delay sits strictly between the two deadlines, so the only difference between the arms is
+# which deadline governs the same server response and the same packet bytes.
+_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS = 0.05
+_SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS = 0.2
+_SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS = 2.0
+
+
+def _bounded_example_page_payload() -> dict:
+    return {
+        "page_title": "Example Domain",
+        "forms": [
+            {
+                "id": "lookupForm",
+                "name": "",
+                "action": "/results",
+                "method": "get",
+                "fields": [
+                    {
+                        "name": "q",
+                        "id": "q",
+                        "label": "Search term",
+                        "type": "text",
+                        "value": "",
+                        "class": [],
+                        "placeholder": "search",
+                        "required": True,
+                        "disabled": False,
+                        "checked": False,
+                        "options": [],
+                        "selector": "#q",
+                    }
+                ],
+                "submit_controls": [{"text": "Search", "selector": "#go"}],
+            }
+        ],
+    }
+
+
+def _slow_structured_server() -> SimpleNamespace:
+    async def call_internal_tool(_tool_name: str, _arguments: dict) -> dict:
+        await asyncio.sleep(_SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS)
+        return {"ok": True, "data": {"result": json.dumps(_bounded_example_page_payload())}}
+
+    return SimpleNamespace(call_internal_tool=call_internal_tool)
+
+
+@pytest.mark.asyncio
+async def test_structured_timeout_arm_a_nested_deadline_discards_a_slow_read() -> None:
+    """A nested deadline shorter than the response discards the whole packet."""
+    assert _SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS < _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
+
+    started = time.monotonic()
+    evidence, error = await _composition_get_structured_evidence_result(
+        SimpleNamespace(discovery_mcp_server=_slow_structured_server()),
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+        timeout_seconds=_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert evidence is None
+    assert error == (
+        f"skyvern_evaluate timed out after {_SLOW_EXTRACTOR_INNER_DEADLINE_SECONDS:g}s "
+        "while capturing structured page evidence"
+    )
+    assert elapsed < _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
+
+
+class _WaitForRecorder:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def __getattr__(self, name: str):
+        return getattr(asyncio, name)
+
+    def wait_for(self, awaitable, timeout):  # type: ignore[no-untyped-def]
+        self.timeouts.append(timeout)
+        return asyncio.wait_for(awaitable, timeout)
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_arm_b_same_slow_read_completes_under_the_outer_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The identical response and bytes, governed only by an owning outer deadline."""
+    assert _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS < _SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS
+    recorder = _WaitForRecorder()
+    monkeypatch.setattr(shared_module, "asyncio", recorder)
+
+    started = time.monotonic()
+    evidence, error = await asyncio.wait_for(
+        _composition_get_structured_evidence_result(
+            SimpleNamespace(discovery_mcp_server=_slow_structured_server()),
+            inspected_url="https://example.com/",
+            current_url="https://example.com/",
+        ),
+        timeout=_SLOW_EXTRACTOR_OUTER_DEADLINE_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert recorder.timeouts == []
+    assert error is None
+    assert evidence == parse_composition_structured(
+        _bounded_example_page_payload(),
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+    )
+    assert evidence["forms"][0]["fields"][0]["label"] == "Search term"
+    assert elapsed >= _SLOW_EXTRACTOR_RESPONSE_DELAY_SECONDS
+
+
+def _bounded_packet(url: str) -> dict:
+    packet = parse_composition_structured(
+        {"page_title": "Results", "forms": [{"fields": [{"selector": "#q", "name": "q"}], "submit_controls": []}]},
+        inspected_url=url,
+        current_url=url,
+    )
+    assert packet is not None
+    return packet
+
+
+def _scout_interaction_packet(url: str) -> dict:
+    return {
+        "inspected_url": url,
+        "current_url": url,
+        "source_tool": "scout_interaction",
+        "interaction_tool": "click",
+        "interaction_selector": "#go",
+    }
+
+
+def _flow_entry(packet: dict, *, reached_via: str, step: int) -> dict:
+    return {
+        "evidence": packet,
+        "reached_via": reached_via,
+        "had_bounded_schema": has_bounded_page_schema(packet),
+        "step": step,
+    }
+
+
+def _patch_inspection_seam(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    current_url: str,
+    packet: dict,
+    navigations: list[str],
+) -> None:
+    async def _page_info(_ctx: object, _session_id: str | None = None) -> tuple[str, str]:
+        return current_url, "Page"
+
+    async def _navigate(_ctx: object, url: str, **_kwargs: object) -> dict[str, object]:
+        navigations.append(url)
+        return {"ok": True, "data": {"url": url}}
+
+    async def _capture(_ctx: object, **_kwargs: object) -> tuple[dict, None]:
+        return dict(packet), None
+
+    monkeypatch.setattr(tools.composition_capture, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools.composition_capture, "_fallback_page_info", _page_info)
+    monkeypatch.setattr(tools.composition_capture, "_discovery_navigate", _navigate)
+    monkeypatch.setattr(tools.composition_capture, "_capture_composition_evidence", _capture)
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspect_after_schema_less_interaction_grounds_a_page_dependent_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reached_url = "https://example.com/results"
+    ctx = make_copilot_ctx()
+    ctx.flow_evidence = [
+        _flow_entry(_bounded_packet("https://example.com/"), reached_via="navigate", step=0),
+        _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=1),
+    ]
+    navigations: list[str] = []
+    _patch_inspection_seam(
+        monkeypatch,
+        current_url=reached_url,
+        packet=_bounded_packet(reached_url),
+        navigations=navigations,
+    )
+
+    result = await tools.composition_capture._inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    observation_step = ctx.flow_evidence[-1]["step"]
+    assert isinstance(observation_step, int)
+    assert result["observation_step"] == observation_step
+    assert navigations == []
+
+    workflow_yaml = yaml.safe_dump(
+        {
+            "title": "wf",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+                    {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+                    {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+                ],
+            },
+        }
+    )
+    assert (
+        composition_page_evidence_error(
+            ctx,
+            workflow_yaml,
+            block_observation_refs={"open_results": 1, "read_results": observation_step},
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_non_current_url_refuses_and_names_the_schema_less_reached_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reached_url = "https://example.com/cart"
+    ctx = make_copilot_ctx()
+    ctx.flow_evidence = [
+        _flow_entry(_bounded_packet("https://example.com/results"), reached_via="interaction", step=0),
+        _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=1),
+    ]
+    navigations: list[str] = []
+    _patch_inspection_seam(
+        monkeypatch,
+        current_url=reached_url,
+        packet=_bounded_packet(reached_url),
+        navigations=navigations,
+    )
+
+    result = await tools.composition_capture._inspect_page_for_composition_impl(
+        ctx,
+        "https://example.com/checkout",
+    )
+
+    assert result["ok"] is False
+    assert navigations == []
+    assert result["data"]["current_url"] == reached_url
+    assert result["data"]["observation_step"] == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_non_current_url_after_a_current_page_reread_still_names_the_reached_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reached_url = "https://example.com/results"
+    ctx = make_copilot_ctx()
+    ctx.flow_evidence = [
+        _flow_entry(_bounded_packet("https://example.com/"), reached_via="navigate", step=0),
+        _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=1),
+    ]
+    navigations: list[str] = []
+    _patch_inspection_seam(
+        monkeypatch,
+        current_url=reached_url,
+        packet=_bounded_packet(reached_url),
+        navigations=navigations,
+    )
+
+    reread = await tools.composition_capture._inspect_page_for_composition_impl(ctx, "current_page")
+    assert reread["ok"] is True
+    assert reread["observation_step"] == ctx.flow_evidence[-1]["step"]
+
+    refused = await tools.composition_capture._inspect_page_for_composition_impl(
+        ctx,
+        "https://example.com/checkout",
+    )
+
+    assert refused["ok"] is False
+    assert navigations == []
+    assert refused["data"]["current_url"] == reached_url
+    assert refused["data"]["observation_step"] == 1
+
+
+@pytest.mark.parametrize(
+    "reached_packet",
+    [_scout_interaction_packet("https://example.com/results"), _bounded_packet("https://example.com/results")],
+    ids=["schema_less", "bounded"],
+)
+def test_inspection_regression_guard_ignores_a_reached_page_left_by_a_navigation(reached_packet: dict) -> None:
+    ctx = SimpleNamespace(
+        flow_evidence=[
+            _flow_entry(reached_packet, reached_via="interaction", step=0),
+            _flow_entry(_bounded_packet("https://example.com/cart"), reached_via="navigate", step=1),
+        ]
+    )
+
+    assert (
+        tools.composition_capture._non_current_inspection_regression_error(ctx, entry_url="https://example.com/cart")
+        is None
+    )
+
+
+def test_inspection_regression_guard_uses_current_location_after_leave_and_return() -> None:
+    reached_url = "https://example.com/results"
+    ctx = SimpleNamespace(
+        flow_evidence=[
+            _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=0),
+            _flow_entry(_bounded_packet("https://example.com/cart"), reached_via="navigate", step=1),
+            _flow_entry(_bounded_packet(reached_url), reached_via="navigate", step=2),
+            _flow_entry(_bounded_packet(reached_url), reached_via="current_page", step=3),
+        ]
+    )
+
+    refusal = tools.composition_capture._non_current_inspection_regression_error(
+        ctx,
+        entry_url="https://example.com/checkout",
+    )
+
+    assert refusal is not None
+    assert refusal["data"]["current_url"] == reached_url
+    assert refusal["data"]["observation_step"] == 0

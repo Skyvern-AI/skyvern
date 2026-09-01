@@ -20,9 +20,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     CONSENT_OBSTRUCTION_KIND,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
+    interaction_evidence_is_bindable,
     merge_visual_composition_evidence,
     model_visible_composition_evidence,
     page_evidence_needs_visual_fallback,
+    page_records_share_location,
     parse_composition_html,
     stamp_page_evidence_provenance,
 )
@@ -30,7 +32,16 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
+    SENSITIVE_ORIGIN_PAGE_ERROR,
+    AgentContext,
+    browser_evidence_commit_lock,
+    browser_page_custody_lock,
+    clear_sensitive_origin_page_taint,
+    sensitive_origin_page_has_active_run,
+    sensitive_origin_page_is_tainted,
+)
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
     post_run_inspection_cleanly_matches,
@@ -42,6 +53,10 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot,
     screenshot_result_facts,
+)
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    register_matching_origin_run_redaction_values,
+    scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -303,8 +318,9 @@ async def _augment_composition_evidence_with_visual_fallback(
     screenshot_result = await _composition_get_screenshot(ctx, dispatch_session_id=capture_session_id)
     if not screenshot_result.get("ok"):
         return (
-            _composition_add_evidence_omission(
+            _composition_add_visual_capture_omission(
                 evidence,
+                "screenshot_capture_failed",
                 f"screenshot_capture_failed: {screenshot_result.get('error', 'unknown')}",
             ),
             None,
@@ -344,6 +360,22 @@ def _composition_add_evidence_omission(evidence: dict[str, Any], message: str) -
     if message:
         omissions.append(message[:160])
     merged["visual_evidence_omissions"] = list(dict.fromkeys(omissions))[:5]
+    return merged
+
+
+def _composition_add_visual_capture_omission(
+    evidence: dict[str, Any],
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    """Record a bounded typed capture fact alongside its operator-facing detail."""
+    merged = _composition_add_evidence_omission(evidence, message)
+    omission_codes = [
+        item for item in merged.get("visual_capture_omissions") or [] if item in {"screenshot_capture_failed"}
+    ]
+    if code == "screenshot_capture_failed":
+        omission_codes.append(code)
+    merged["visual_capture_omissions"] = list(dict.fromkeys(omission_codes))[:1]
     return merged
 
 
@@ -442,8 +474,25 @@ def _inspection_reached_via(*, use_current_page: bool, post_run: bool, earned_in
 
 
 def _latest_interaction_reached_flow_evidence(copilot_ctx: Any) -> tuple[int, str, dict[str, Any]] | None:
+    """Return interaction evidence for the browser's latest observed location.
+
+    This powers a live-page protection, so it answers where the browser is now rather than whether
+    the trajectory ever left that page. Historical authoring continuity is evaluated separately.
+    """
     trajectory = getattr(copilot_ctx, "flow_evidence", None)
     if not isinstance(trajectory, list):
+        return None
+    latest_observed_evidence = next(
+        (
+            entry["evidence"]
+            for entry in reversed(trajectory)
+            if isinstance(entry, dict)
+            and isinstance(entry.get("evidence"), dict)
+            and _composition_evidence_page_url(entry["evidence"])
+        ),
+        None,
+    )
+    if latest_observed_evidence is None:
         return None
     for entry in reversed(trajectory):
         if not isinstance(entry, dict):
@@ -455,7 +504,9 @@ def _latest_interaction_reached_flow_evidence(copilot_ctx: Any) -> tuple[int, st
         step = entry.get("step")
         if isinstance(step, bool) or not isinstance(step, int) or not isinstance(evidence, dict):
             continue
-        if not has_bounded_page_schema(evidence):
+        if not interaction_evidence_is_bindable(evidence):
+            continue
+        if not page_records_share_location(evidence, latest_observed_evidence):
             continue
         observed_url = _composition_evidence_page_url(evidence)
         if observed_url:
@@ -793,6 +844,18 @@ async def _inspect_page_for_composition_impl(
     copilot_ctx: Any,
     target_url: str,
 ) -> dict[str, Any]:
+    # Named navigation is the only route that may release sensitive-page custody. Keep navigation,
+    # release, capture, and evidence admission atomic with sensitive-run registration so this call
+    # cannot clear a newer run's taint after its navigation returns.
+    async with browser_page_custody_lock(copilot_ctx):
+        async with browser_evidence_commit_lock(copilot_ctx):
+            return await _inspect_page_for_composition_under_custody(copilot_ctx, target_url)
+
+
+async def _inspect_page_for_composition_under_custody(
+    copilot_ctx: Any,
+    target_url: str,
+) -> dict[str, Any]:
     """Inspect a known target page and store form/search evidence on ctx.
 
     This is composition context, not workflow YAML. It is intentionally separate
@@ -805,12 +868,18 @@ async def _inspect_page_for_composition_impl(
         result = {"ok": False, "error": authority_error}
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
+    if sensitive_origin_page_has_active_run(copilot_ctx):
+        result = {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
     capture_session_id = copilot_ctx.browser_session_id if isinstance(copilot_ctx, AgentContext) else None
     capture_session_generation = (
         copilot_ctx.browser_session_continuity_generation if isinstance(copilot_ctx, AgentContext) else None
     )
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
+    run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+    sensitive_same_turn_run = register_matching_origin_run_redaction_values(copilot_ctx, run_id)
     if not use_current_page:
         _clear_pending_browser_interaction_observation(copilot_ctx)
     bypass_budget_for_post_run_current_page = _allows_post_run_current_page_inspection_budget_bypass(
@@ -818,7 +887,6 @@ async def _inspect_page_for_composition_impl(
         use_current_page=use_current_page,
     )
 
-    run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     entry_url: str
     kind: str
     run_page_source_session_id: str | None = None
@@ -850,6 +918,11 @@ async def _inspect_page_for_composition_impl(
     if use_current_page:
         inspect_target_url = current_url
         on_target_page = True
+    elif sensitive_same_turn_run:
+        # Do not inspect the sensitive run page merely to decide whether navigation can be skipped.
+        # A named URL is the legitimate route: navigate first, then inspect the resulting page.
+        inspect_target_url = entry_url
+        on_target_page = False
     else:
         live_url, _ = await _fallback_page_info(copilot_ctx)
         on_target_page = _same_inspect_target(live_url, entry_url)
@@ -892,6 +965,16 @@ async def _inspect_page_for_composition_impl(
             )
             if not nav_result.get("ok"):
                 nav_error = str(nav_result.get("error") or "unknown")
+                if sensitive_same_turn_run:
+                    # Navigation failure may leave the browser on the sensitive origin page.
+                    # Do not inspect that page through the ordinary failure fallback.
+                    result = {
+                        "ok": False,
+                        "data": None,
+                        "error": f"inspect_page_for_composition could not navigate: {nav_error}",
+                    }
+                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+                    return result
                 failure_capture = await _composition_evidence_after_navigation_failure(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -909,10 +992,16 @@ async def _inspect_page_for_composition_impl(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
+                clear_sensitive_origin_page_taint(copilot_ctx)
                 capture = await _capture_composition_evidence(
                     copilot_ctx, inspected_url=entry_url, current_url=current_url
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
+
+    if sensitive_origin_page_is_tainted(copilot_ctx) and not sensitive_same_turn_run:
+        result = {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
 
     if (
         isinstance(copilot_ctx, AgentContext)
@@ -948,6 +1037,11 @@ async def _inspect_page_for_composition_impl(
         }
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
+
+    if sensitive_same_turn_run:
+        evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
+        # Exact-value scrubbing applies to structured evidence, not pixels.
+        visual_fallback_frame = None
 
     if isinstance(run_id, str) and run_id:
         session_provenance = evidence.get("browser_session_provenance")

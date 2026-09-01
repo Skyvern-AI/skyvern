@@ -193,6 +193,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           parameterType: WorkflowEditorParameterTypes.OnePassword,
           vaultId: parameter.vault_id,
           itemId: parameter.item_id,
+          totpFieldName: parameter.totp_field_name,
           description: parameter.description,
         };
       } else if (

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     MCP_RESULT_PROVENANCE_KEY,
@@ -166,6 +167,7 @@ def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_proven
                 "obstruction_summaries": [],
             },
         },
+        "action_observations": ["observed " + "x" * 500 for _ in range(8)],
         "registered_outputs": [
             {"output_parameter_key": f"output_{index}", "value": "v" * 1_300} for index in range(13)
         ],
@@ -185,6 +187,7 @@ def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_proven
     assert projected["canonical_workflow_yaml_complete"] is False
     assert len(projected["attempted_block_labels"]) == 24
     assert len(projected["failure"]["action_trace"]) == 6
+    assert len(projected["action_observations"]) == 6
     assert len(projected["failure"]["page_state"]["form_summaries"]) == 8
     assert len(projected["registered_outputs"]) == 12
     assert projected["registered_outputs"][0]["value_complete"] is False
@@ -196,6 +199,128 @@ def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_proven
     assert len(json.dumps(projected)) <= 47_000
     assert next(iter(sanitized)) == "data"
     assert next(iter(sanitized["data"])) == "build_test_packet"
+
+
+@pytest.mark.parametrize("provider_surface", ["native", "mcp"])
+def test_provider_bound_build_test_packet_omits_raw_registered_output_copies(provider_surface: str) -> None:
+    secret = "registered-runtime-secret"
+    packet = {
+        "contract_version": "build_test_evidence_packet_v1",
+        "canonical_workflow_source": "accepted_write_readback",
+        "run": {"workflow_run_id": "wr_secret", "status": "completed"},
+        "registered_outputs": [
+            {
+                "workflow_run_id": "wr_secret",
+                "output_parameter_key": "result",
+                "block_label": "read_result",
+                "value": "[REDACTED_SECRET]",
+            }
+        ],
+        "screenshot": {"present": False},
+    }
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_secret",
+            "build_test_packet": packet,
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_secret",
+                    "output_parameter_key": "result",
+                    "block_label": "read_result",
+                    "value": secret,
+                }
+            ],
+            "workflow_run_output_parameters": [
+                {
+                    "workflow_run_id": "wr_secret",
+                    "output_parameter_key": "result",
+                    "block_label": "read_result",
+                    "value": secret,
+                }
+            ],
+            "blocks": [
+                {
+                    "label": "read_result",
+                    "status": "completed",
+                    "extracted_data": {"result": secret, "ordinary_fact": "safe"},
+                }
+            ],
+        },
+    }
+
+    if provider_surface == "native":
+        provider_payload = json.loads(json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)))
+    else:
+        provider_result = _copilot_to_call_tool_result(result, "run_blocks_and_collect_debug")
+        provider_payload = json.loads(provider_result.content[0].text)
+
+    serialized = json.dumps(provider_payload)
+    assert secret not in serialized
+    assert "registered_output_parameter_values" not in provider_payload["data"]
+    assert "workflow_run_output_parameters" not in provider_payload["data"]
+    assert provider_payload["data"]["blocks"][0]["extracted_data"] == "Extracted object with keys: ordinary_fact"
+    assert provider_payload["data"]["build_test_packet"]["registered_outputs"][0]["value"] == "[REDACTED_SECRET]"
+
+
+@pytest.mark.parametrize("provider_surface", ["native", "mcp"])
+@pytest.mark.parametrize("packet_valid", [True, False], ids=("projected-packet", "rejected-packet"))
+def test_provider_bound_build_test_result_omits_raw_action_trace_copies(
+    provider_surface: str, packet_valid: bool
+) -> None:
+    secret = "registered-action-secret"
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_action_trace",
+            "build_test_packet": {
+                "contract_version": "build_test_evidence_packet_v1",
+                "canonical_workflow_source": "accepted_write_readback",
+                "run": {"workflow_run_id": "wr_action_trace", "status": "completed"},
+                "action_observations": ["clicked submit"],
+                "registered_outputs": [
+                    {
+                        "workflow_run_id": "wr_action_trace",
+                        "output_parameter_key": "result",
+                        "block_label": "submit",
+                        "value": "[REDACTED_SECRET]",
+                    }
+                ],
+                "screenshot": {"present": False},
+            },
+            "action_observations": [f"clicked submit response={secret}"],
+            "action_trace_summary": [f"click submit failed element={secret} description={secret} response={secret}"],
+            "blocks": [
+                {
+                    "label": "submit",
+                    "status": "completed",
+                    "action_trace": [{"reasoning": secret, "element": secret}],
+                    "reasoning": secret,
+                    "element": secret,
+                }
+            ],
+        },
+    }
+    if not packet_valid:
+        result["data"]["build_test_packet"] = {"contract_version": "invalid"}
+
+    if provider_surface == "native":
+        provider_payload = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    else:
+        provider_result = _copilot_to_call_tool_result(result, "run_blocks_and_collect_debug")
+        provider_payload = json.loads(provider_result.content[0].text)
+
+    serialized = json.dumps(provider_payload)
+    assert secret not in serialized
+    assert "action_observations" not in provider_payload["data"]
+    assert "action_trace_summary" not in provider_payload["data"]
+    assert provider_payload["data"]["blocks"] == [{"label": "submit", "status": "completed"}]
+    if packet_valid:
+        assert provider_payload["data"]["build_test_packet"]["action_observations"] == ["clicked submit"]
+        assert provider_payload["data"]["build_test_packet"]["registered_outputs"][0]["value"] == "[REDACTED_SECRET]"
+    else:
+        assert "build_test_packet" not in provider_payload["data"]
+        assert provider_payload["data"]["build_test_packet_omitted"] == "The internal packet failed typed validation."
 
 
 def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
@@ -214,6 +339,15 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
             "block_status": long_identifier,
             "reason": "r" * 1_300,
             "action_trace": [long_summary for _ in range(8)],
+            "locator_observations": [
+                {
+                    "authored_selector": f"button.item-{index}",
+                    "match_count": 3,
+                    "match_index": 0,
+                    "observed_candidates": [f"button#item-{index}"],
+                }
+                for index in range(4)
+            ],
             "page_state": {
                 "current_origin": "https://" + "o" * 2_000,
                 "current_url": "https://" + "u" * 2_000,
@@ -227,6 +361,7 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
                 "obstruction_summaries": [long_summary for _ in range(10)],
             },
         },
+        "action_observations": [long_summary for _ in range(8)],
         "registered_outputs": [
             {
                 "workflow_run_id": long_identifier,
@@ -263,7 +398,14 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
     assert len(projected["attempted_block_labels"]) == 12
     assert len(projected["executed_block_labels"]) == 12
     assert len(projected["failure"]["action_trace"]) == 2
+    assert len(projected["action_observations"]) == 2
     assert len(projected["failure"]["page_state"]["form_summaries"]) == 2
+    assert len(projected["failure"]["locator_observations"]) == 2
+    assert projected["failure"]["locator_observations"][0]["observed_candidates"] == ["button#item-0"]
+    assert any(
+        notice == "failure.locator_observations shortened at the aggregate packet limit: 2 item(s) omitted."
+        for notice in projected["omission_notices"]
+    )
     assert len(projected["registered_outputs"]) == 6
     assert projected["registered_outputs"][0]["value_complete"] is False
     assert len(projected["downloads"]) == 6

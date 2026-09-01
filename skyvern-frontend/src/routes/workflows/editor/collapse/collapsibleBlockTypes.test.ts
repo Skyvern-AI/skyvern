@@ -22,4 +22,10 @@ describe("collapsibleBlockTypes — loop registration", () => {
   test("toWorkflowBlockType translates loop -> for_loop", () => {
     expect(toWorkflowBlockType("loop")).toBe("for_loop");
   });
+
+  test("data export is collapsible", () => {
+    expect(collapsibleRfNodeTypes.has("dataExport")).toBe(true);
+    expect(collapsibleWorkflowBlockTypes.has("data_export")).toBe(true);
+    expect(toWorkflowBlockType("dataExport")).toBe("data_export");
+  });
 });

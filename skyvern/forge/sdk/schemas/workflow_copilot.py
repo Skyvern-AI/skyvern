@@ -293,7 +293,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     response_type: ResponseType = Field("REPLY", description="Agent response classification")
     resolved_model: str | None = Field(
         None,
-        description="Model name the attempt that produced this turn ran on (primary or fallback); None when unknown.",
+        description=(
+            "Model name for the terminal attempt (primary or fallback), including an interrupted attempt; "
+            "None when unknown."
+        ),
     )
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",

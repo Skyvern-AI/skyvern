@@ -46,6 +46,7 @@ from skyvern.webeye.cdp_frame_publisher import (
     stream_key_for_task,
     stream_key_for_workflow_run,
 )
+from skyvern.webeye.display_recorder import DisplayRecorder
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -1128,12 +1129,10 @@ class RealBrowserManager(BrowserManager):
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
-        if task.workflow_run_id and task.workflow_run_id in self.pages:
-            self.pages[task.workflow_run_id].browser_artifacts.video_artifacts = artifacts
-            return
-        if task.task_id in self.pages:
-            self.pages[task.task_id].browser_artifacts.video_artifacts = artifacts
-            return
+        for run_key in (task.workflow_run_id, task.task_id):
+            if run_key and run_key in self.pages:
+                self.pages[run_key].browser_artifacts.video_artifacts = artifacts
+                return
 
         raise MissingBrowserState(
             task_id=task.task_id,
@@ -1163,24 +1162,31 @@ class RealBrowserManager(BrowserManager):
             )
             return []
 
-        for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
+        display_recorder = browser_state.browser_artifacts._display_recorder
+        display_video_artifact = (
+            display_recorder.video_artifact if isinstance(display_recorder, DisplayRecorder) else None
+        )
+        # The whole-display recording is the legacy index-0 recording: per-step syncs read its current
+        # (growing) bytes and terminal finalize remuxes the SAME artifact/id, exactly like a Playwright
+        # per-page recording. It additionally finalizes once its recorder has stopped even when a deferred
+        # stream left finalize=False, so the deferred-close upload is finalized rather than a partial prefix.
+        display_recorder_stopped = isinstance(display_recorder, DisplayRecorder) and display_recorder.is_stopped
+
+        for video_artifact in browser_state.browser_artifacts.video_artifacts:
+            finalize_this = finalize or (video_artifact is display_video_artifact and display_recorder_stopped)
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
                 is_webm = path.lower().endswith(".webm")
-                if finalize and is_webm:
+                if finalize_this and is_webm:
                     async with prepare_recording_for_upload(path) as prepared:
                         with open(prepared.path, "rb") as f:
-                            browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
-                        browser_state.browser_artifacts.video_artifacts[
-                            i
-                        ].video_file_extension = prepared.file_extension
+                            video_artifact.video_data = f.read()
+                        video_artifact.video_file_extension = prepared.file_extension
                 else:
                     # Non-WebM sources are already container-valid; per-step WebM snapshots are still incomplete.
                     with open(path, "rb") as f:
-                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
-                    browser_state.browser_artifacts.video_artifacts[i].video_file_extension = (
-                        os.path.splitext(path)[1].lstrip(".").lower() or "webm"
-                    )
+                        video_artifact.video_data = f.read()
+                    video_artifact.video_file_extension = os.path.splitext(path)[1].lstrip(".").lower() or "webm"
             else:
                 LOG.debug(
                     "Video path not found",
@@ -1439,6 +1445,11 @@ class RealBrowserManager(BrowserManager):
                 # eventual ``close(True)`` fires the on-close callback that
                 # stops it; ``close(False)`` is covered by the publisher's
                 # own disconnect-driven self-termination.
+                # The whole-display recording is per-run and decoupled from the deferred browser close, so
+                # finalize it now: the run is terminal and the activity finally will unlink the file, so
+                # without this the terminal video persist would run finalize=False and the recording would
+                # be unlinked before it was ever uploaded.
+                await self._finalize_deferred_display_recording(browser_state_to_close, workflow_run_id, task_ids)
             else:
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
@@ -1511,6 +1522,33 @@ class RealBrowserManager(BrowserManager):
             browser_state=browser_state_to_close,
             recording_finalized=recording_finalized,
         )
+
+    async def _finalize_deferred_display_recording(
+        self, browser_state: BrowserState, workflow_run_id: str, task_ids: list[str]
+    ) -> None:
+        """Finalize this run's whole-display recorder when its browser close is deferred for an active stream.
+
+        Stops the ffmpeg so the WebM is complete/uploadable, but KEEPS the display reserved to this owner:
+        the browser is still mapped on the shared display, so freeing it now would let a later different-owner
+        run acquire the display and capture this tenant's window. The reservation is released only when the
+        deferred browser is actually torn down (real_browser_state.close -> release_display_recorder) or at
+        process death. Gated on the workflow-tree-owned task set (workflow_run_id or one of its task_ids — a
+        task-created browser owns its recorder under the task id) so an inherited/shared browser never has a
+        sibling run's recording stopped out from under it. Best-effort and never raising (cancellation still
+        propagates, preserving cancellation ownership)."""
+        recorder = browser_state.browser_artifacts._display_recorder
+        if not isinstance(recorder, DisplayRecorder) or recorder.owner_id not in {workflow_run_id, *task_ids}:
+            return
+        try:
+            await recorder.finalize_keeping_reservation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning(
+                "Failed to finalize whole-display recording on deferred close",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
 
     async def get_or_create_for_script(
         self,

@@ -112,6 +112,7 @@ export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "onepassword";
   vault_id: string;
   item_id: string;
+  totp_field_name?: string | null;
 };
 
 export type AzureVaultCredentialParameterYAML = ParameterYAMLBase & {
@@ -154,6 +155,7 @@ export type BlockYAML =
   | ConditionalBlockYAML
   | ValidationBlockYAML
   | HumanInteractionBlockYAML
+  | DataExportBlockYAML
   | ActionBlockYAML
   | NavigationBlockYAML
   | ExtractionBlockYAML
@@ -233,6 +235,14 @@ export type HumanInteractionBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+};
+
+export type DataExportBlockYAML = BlockYAMLBase & {
+  block_type: "data_export";
+  data: string;
+  data_schema: Record<string, unknown>;
+  file_name: string | null;
+  parameter_keys?: Array<string> | null;
 };
 
 export type ActionBlockYAML = BlockYAMLBase & {

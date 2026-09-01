@@ -25,10 +25,19 @@ from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
 )
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    BROWSER_TARGET_PARAM,
+    BROWSER_TARGET_PARAM_NAME,
+    SchemaOverlay,
+    _scrub_tool_result,
+)
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     requested_output_designation_capability,
     unbound_candidate_relations,
+)
+from skyvern.forge.sdk.copilot.output_utils import (
+    mark_mcp_result_untrusted_for_llm,
+    sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
@@ -38,9 +47,22 @@ from skyvern.forge.sdk.copilot.request_policy import (
     resolve_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction, ScoutedSelectorCandidate
+from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
+    SENSITIVE_ORIGIN_PAGE_ERROR,
+    AgentContext,
+    ScoutedInteraction,
+    ScoutedSelectorCandidate,
+    clear_sensitive_origin_page_taint,
+    sensitive_origin_page_has_active_run,
+    sensitive_origin_page_is_tainted,
+)
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    register_matching_origin_run_redaction_values,
+    registered_scrub_values,
+    scrub_secrets_from_structure,
+)
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.schemas.workflows import TaskBlockYAML
 
@@ -72,6 +94,7 @@ from .page_observation import (
     _resolve_url_title,
 )
 from .scouting import (
+    _SCOUT_RESULT_CHAR_CAP,
     _arm_scout_download_listener,
     _arm_scout_popup_listener,
     _attach_evaluate_page_facts,
@@ -86,6 +109,7 @@ from .scouting import (
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
+    _page_evidence_location_fingerprint,
     _page_evidence_names_obstruction,
     _prenav_ambiguity_for_selector,
     _prenav_role_name_for_selector,
@@ -93,10 +117,33 @@ from .scouting import (
     _record_scouted_interaction,
     _register_scout_interaction_observation,
     _resolve_scout_role_name,
+    _scout_act_observe_page_evidence,
     _scout_session_download_names,
+    _shed_scout_page_summary_section,
 )
 
 LOG = structlog.get_logger()
+
+
+def _sensitive_origin_page_refusal(ctx: AgentContext) -> dict[str, Any] | None:
+    if not sensitive_origin_page_is_tainted(ctx):
+        return None
+    return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+
+
+async def _sensitive_origin_page_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _sensitive_origin_page_refusal(ctx)
+
+
+async def _sensitive_origin_page_post_hook(
+    result: dict[str, Any],
+    _raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    return _sensitive_origin_page_refusal(ctx) or result
 
 
 def _selector_from_tool_data(data: dict[str, Any], *, prefer_resolved_when_empty: bool = False) -> str:
@@ -154,6 +201,120 @@ def _effective_target_text(selector: str, role: str = "", accessible_name: str =
     if label and role_text:
         return f"{role_text} {label}"
     return label or selector
+
+
+def _failed_click_attempted_control(
+    *,
+    selector: str,
+    selector_candidates: list[ScoutedSelectorCandidate] | None,
+    selector_match_count: int | None,
+    role: str,
+    accessible_name: str,
+    role_name_match_count: int | None,
+    ambiguous: bool,
+) -> dict[str, Any]:
+    control: dict[str, Any] = {
+        "selector": selector,
+        "effective_target": _effective_target_text(selector, role, accessible_name),
+    }
+    if selector_candidates:
+        control["selector_candidates"] = selector_candidates
+    if selector_match_count is not None:
+        control["selector_match_count"] = selector_match_count
+    if role:
+        control["role"] = role
+    if accessible_name:
+        control["accessible_name"] = accessible_name
+    if role_name_match_count is not None:
+        control["role_name_match_count"] = role_name_match_count
+    if ambiguous:
+        control["ambiguous"] = True
+    return control
+
+
+_FAILED_CLICK_ENRICHMENT_TEXT_MAX_CHARS = 160
+_FAILED_CLICK_TRUNCATION_SUFFIX = "... [truncated]"
+
+
+def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> None:
+    """Bound the complete model-visible failure while retaining typed control/error facts."""
+
+    scrubbed = _scrub_tool_result(ctx, result)
+    if isinstance(scrubbed, dict) and scrubbed is not result:
+        result.clear()
+        result.update(scrubbed)
+
+    def model_visible_size() -> int:
+        sanitized = sanitize_tool_result_for_llm("click", result)
+        return len(json.dumps(mark_mcp_result_untrusted_for_llm(sanitized)))
+
+    def bound_enrichment_text(
+        container: dict[str, Any],
+        key: str,
+        max_chars: int = _FAILED_CLICK_ENRICHMENT_TEXT_MAX_CHARS,
+    ) -> None:
+        value = container.get(key)
+        if not isinstance(value, str) or len(value) <= max_chars:
+            return
+        prefix_chars = max_chars - len(_FAILED_CLICK_TRUNCATION_SUFFIX)
+        container[key] = value[:prefix_chars] + _FAILED_CLICK_TRUNCATION_SUFFIX
+
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return
+    attempted_control = data.get("attempted_control")
+    if not isinstance(attempted_control, dict):
+        return
+    if model_visible_size() <= _SCOUT_RESULT_CHAR_CAP:
+        return
+
+    # Page facts are optional enrichment. Shed their detail before reducing the attempted-control
+    # packet or typed failure, including the minimal shed marker left by the summary builder.
+    page = data.get("page")
+    if isinstance(page, dict):
+        raw_shed = page.get("shed")
+        shed = [value for value in raw_shed if isinstance(value, str)] if isinstance(raw_shed, list) else []
+        while model_visible_size() > _SCOUT_RESULT_CHAR_CAP:
+            section = _shed_scout_page_summary_section(page)
+            if section is None:
+                data.pop("page", None)
+                break
+            shed.append(section)
+            page["shed"] = shed
+    result.pop("warnings", None)
+    for key in (
+        "selector_candidates",
+        "role_name_match_count",
+        "selector_match_count",
+        "ambiguous",
+        "accessible_name",
+        "role",
+    ):
+        if model_visible_size() <= _SCOUT_RESULT_CHAR_CAP:
+            return
+        attempted_control.pop(key, None)
+
+    # The typed failure is the tool's authoritative result and must remain unchanged. Compact only
+    # enriched control/location detail, retaining stable prefixes and explicit truncation markers.
+    compactable_enrichment_fields = (
+        (attempted_control, "selector"),
+        (attempted_control, "effective_target"),
+        (data, "url"),
+    )
+    for container, key in compactable_enrichment_fields:
+        bound_enrichment_text(container, key)
+
+    minimum_chars = len(_FAILED_CLICK_TRUNCATION_SUFFIX) + 1
+    while model_visible_size() > _SCOUT_RESULT_CHAR_CAP:
+        remaining = [
+            (container, key, value)
+            for container, key in compactable_enrichment_fields
+            if isinstance((value := container.get(key)), str) and len(value) > minimum_chars
+        ]
+        if not remaining:
+            break
+        container, key, value = max(remaining, key=lambda item: len(item[2]))
+        bound_enrichment_text(container, key, max(minimum_chars, len(value) // 2))
 
 
 async def _get_block_schema_pre_hook(
@@ -490,6 +651,14 @@ async def _evaluate_pre_hook(
     # call's post-hook to consume.
     ctx.pending_scout_read_expression = None
     ctx.pending_scout_read_output_path = None
+    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
+    sensitive_page_refusal = None
+    if sensitive_origin_page_has_active_run(ctx) or (
+        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
+    ):
+        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     raw_expression = params.get("expression")
     if isinstance(raw_expression, str) and raw_expression.strip():
         ctx.pending_scout_read_expression = raw_expression
@@ -502,14 +671,14 @@ async def _evaluate_pre_hook(
 async def _screenshot_pre_hook(_params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
     if ctx.codeblock_redaction_parameters:
         return {"ok": False, "error": "Screenshots are unavailable during runtime self-heal."}
-    return None
+    return _sensitive_origin_page_refusal(ctx)
 
 
 async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
     intent = params.get("intent")
     if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
         return {"ok": False, "error": "AI-assisted scrolling is unavailable during runtime self-heal."}
-    return None
+    return _sensitive_origin_page_refusal(ctx)
 
 
 def _code_only_has_target_page_evidence(data: object) -> bool:
@@ -537,6 +706,9 @@ async def _click_pre_hook(
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
     await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
@@ -554,9 +726,12 @@ async def _type_text_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    await _capture_scout_source_url(ctx)
     _clear_pending_scout_selector_facts(ctx)
     ctx.pending_scout_input_value = None
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
+    await _capture_scout_source_url(ctx)
     text = params.get("text")
     selector = str(params.get("selector") or "")
     # A value already registered as a credential is known to be secret, so it is rejected on that
@@ -582,6 +757,9 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     await _capture_scout_pre_action(ctx, params.get("selector", ""))
     return None
@@ -591,6 +769,9 @@ async def _press_key_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     await _capture_scout_pre_action(ctx, params.get("selector"))
     return None
@@ -657,10 +838,14 @@ async def _navigate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    source_url = _consume_scout_source_url(ctx)
+    sensitive_origin_page_was_tainted = sensitive_origin_page_is_tainted(ctx)
+    captured_source_url = _consume_scout_source_url(ctx)
+    source_url = None if sensitive_origin_page_was_tainted else captured_source_url
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
+        if sensitive_origin_page_was_tainted:
+            clear_sensitive_origin_page_taint(ctx)
         _record_scouted_interaction(
             ctx,
             tool_name="navigate_browser",
@@ -678,7 +863,7 @@ async def _navigate_post_hook(
             f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
             "page's structure or selectors before responding."
         )
-    else:
+    elif not sensitive_origin_page_was_tainted:
         await _capture_post_interaction_screenshot(
             ctx,
             source_tool="navigate_browser",
@@ -691,6 +876,12 @@ async def _navigate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    if sensitive_origin_page_has_active_run(ctx):
+        ctx.pending_scout_source_url = None
+        return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
+    if sensitive_origin_page_is_tainted(ctx):
+        ctx.pending_scout_source_url = None
+        return None
     await _capture_scout_source_url(ctx)
     return None
 
@@ -700,6 +891,9 @@ async def _wait_for_either_state_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     data = result.get("data")
     if not isinstance(data, dict):
         return result
@@ -727,6 +921,9 @@ async def _screenshot_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
@@ -750,6 +947,9 @@ async def _click_post_hook(
     captured_url: str | None = None
     observation_step: int | None = None
     _clear_pending_browser_interaction_observation(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
     ctx.pending_scout_role_name = None
@@ -762,6 +962,7 @@ async def _click_post_hook(
     pending_selector_candidates = getattr(ctx, "pending_scout_selector_candidates", None)
     ctx.pending_scout_selector_candidates = None
     ctx.pending_scout_reanchor = None
+    pending_click_selector = ctx.pending_scout_click_selector
     ctx.pending_scout_click_selector = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
@@ -837,6 +1038,46 @@ async def _click_post_hook(
                     "The page observation did not change after the click; no post-click page evidence was attached."
                 ),
             }
+    elif not result.get("ok") and isinstance(pending_click_selector, str) and pending_click_selector.strip():
+        selector = pending_click_selector.strip()
+        role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        selector_match_count = (
+            pending_selector_match_count[1]
+            if isinstance(pending_selector_match_count, tuple)
+            and len(pending_selector_match_count) == 2
+            and pending_selector_match_count[0] == selector
+            else None
+        )
+        role_name_match_count = (
+            pending_role_name_match_count[3]
+            if isinstance(pending_role_name_match_count, tuple)
+            and len(pending_role_name_match_count) == 4
+            and pending_role_name_match_count[:3] == (selector, role, accessible_name)
+            else None
+        )
+        attempted_control = _failed_click_attempted_control(
+            selector=selector,
+            selector_candidates=pending_selector_candidates,
+            selector_match_count=selector_match_count,
+            role=role,
+            accessible_name=accessible_name,
+            role_name_match_count=role_name_match_count,
+            ambiguous=_prenav_ambiguity_for_selector(pending_ambiguous, selector),
+        )
+        url, _ = await _resolve_url_title(raw, ctx)
+        result["data"] = {
+            "attempted_control": attempted_control,
+            "url": safe_page_origin(url) or "",
+        }
+        location_fingerprint = _page_evidence_location_fingerprint(url)
+        if location_fingerprint is not None:
+            result["data"]["current_url_location_fingerprint"] = location_fingerprint
+        captured_url = url or None
+        if url:
+            page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+            if page_evidence is not None:
+                _attach_scout_page_summary(ctx, result, page_evidence)
+        _bound_failed_click_result(ctx, result)
     # The round-trip is skipped only when the evidence positively names the obstruction a frame
     # would have shown; evidence that merely parsed is not a substitute for looking at the page.
     if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
@@ -1024,6 +1265,10 @@ async def _type_text_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        ctx.pending_scout_input_value = None
+        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = getattr(ctx, "pending_scout_role_name", None)
     ctx.pending_scout_role_name = None
@@ -1269,6 +1514,18 @@ async def _evaluate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     ctx.scout_observation_contract = None
+    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
+    sensitive_page_refusal = None
+    if sensitive_origin_page_has_active_run(ctx) or (
+        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
+    ):
+        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        ctx.pending_scout_read_expression = None
+        ctx.pending_scout_read_output_path = None
+        return sensitive_page_refusal
+    if matching_registry_is_scrubbable:
+        result = scrub_secrets_from_structure(ctx, result)
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
         return result
@@ -1367,6 +1624,9 @@ async def _scroll_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
@@ -1384,6 +1644,9 @@ async def _select_option_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = getattr(ctx, "pending_scout_role_name", None)
     ctx.pending_scout_role_name = None
@@ -1464,6 +1727,9 @@ async def _press_key_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    if sensitive_page_refusal is not None:
+        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = getattr(ctx, "pending_scout_role_name", None)
     ctx.pending_scout_role_name = None
@@ -1556,6 +1822,10 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
         "wait_for_either_state": "skyvern_wait_for_either_state",
+        # These frame controls already use their user-facing MCP names.
+        "skyvern_frame_list": "skyvern_frame_list",
+        "skyvern_frame_switch": "skyvern_frame_switch",
+        "skyvern_frame_main": "skyvern_frame_main",
     }
 
 
@@ -1632,6 +1902,7 @@ def _build_skyvern_mcp_overlays(
                 "Use this to reset browser state or navigate to a starting page before running blocks."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_navigate_pre_hook,
             post_hook=_navigate_post_hook,
@@ -1644,6 +1915,7 @@ def _build_skyvern_mcp_overlays(
             ),
             hide_params=frozenset({"session_id", "cdp_url", "selector"}),
             forced_args={"inline": True},
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_screenshot_pre_hook,
             post_hook=_screenshot_post_hook,
@@ -1663,9 +1935,11 @@ def _build_skyvern_mcp_overlays(
                         "find it again; an expression that gathers candidates is exploration, so "
                         "leave the path off and name it on the follow-up read of the value itself."
                     ),
-                }
+                },
+                BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM,
             },
             requires_browser=True,
+            redacts_sensitive_origin_structured_result=True,
             timeout=30,
             pre_hook=_evaluate_pre_hook,
             post_hook=_evaluate_post_hook,
@@ -1686,6 +1960,7 @@ def _build_skyvern_mcp_overlays(
             ),
             hide_params=frozenset({"session_id", "cdp_url", "button", "click_count", "intent"}),
             forced_args={"selector_mode": "direct"},
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             timeout=15,
             pre_hook=_click_pre_hook,
@@ -1693,8 +1968,9 @@ def _build_skyvern_mcp_overlays(
         ),
         "type_text": SchemaOverlay(
             description=(
-                "Type text into an input element by CSS selector. The type is instant and "
-                "deterministic. Derive the selector from page evidence; if it does not resolve, "
+                "Type text into an input element with Skyvern's active input event strategy while "
+                "targeting the supplied CSS selector directly. Derive the selector from page evidence; "
+                "if it does not resolve, "
                 "inspect the page again and derive a better one. "
                 "Optionally clear the field first. Use this for form filling. "
                 "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
@@ -1706,6 +1982,7 @@ def _build_skyvern_mcp_overlays(
             forced_args={"selector_mode": "direct"},
             required_overrides=["text"],
             arg_transforms={"clear_first": "clear"},
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             timeout=15,
             pre_hook=_type_text_pre_hook,
@@ -1718,6 +1995,7 @@ def _build_skyvern_mcp_overlays(
                 "Use this to reveal content below the fold."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_scroll_pre_hook,
             post_hook=_scroll_post_hook,
@@ -1729,7 +2007,10 @@ def _build_skyvern_mcp_overlays(
                 "This is a read-only diagnostic tool."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
         ),
         "select_option": SchemaOverlay(
             description=(
@@ -1740,6 +2021,7 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url", "timeout", "intent"}),
             forced_args={"selector_mode": "direct"},
             required_overrides=["value"],
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             timeout=15,
             pre_hook=_select_option_pre_hook,
@@ -1753,13 +2035,37 @@ def _build_skyvern_mcp_overlays(
             ),
             hide_params=frozenset({"session_id", "cdp_url", "intent"}),
             required_overrides=["key"],
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
         ),
         "wait_for_either_state": SchemaOverlay(
             hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
             post_hook=_wait_for_either_state_post_hook,
+        ),
+        "skyvern_frame_list": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_frame_switch": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_frame_main": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
         ),
     }

@@ -816,7 +816,6 @@ _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
         "CREDENTIAL_ERROR",
         "INFRASTRUCTURE_ERROR",
         "NAVIGATION_FAILURE",
-        "PER_TOOL_BUDGET",
         "PROXY_ERROR",
     }
 )
@@ -849,7 +848,7 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
     if not bool(result.get("ok", False)):
         return False
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
-    anti_bot, _empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
+    anti_bot, _empty_data_blocks, _categories, _goal_path_omissions = _analyze_run_blocks(result, copilot_ctx)
     if structured_blocker and (anti_bot or _artifact_challenge_flag_from_result(result, copilot_ctx)):
         return False
     return True

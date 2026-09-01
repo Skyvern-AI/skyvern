@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    effective_browser_session_id,
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
@@ -100,18 +101,6 @@ _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType
 # inner poll loop leaves a 10 s headroom below this ceiling for orderly
 # cleanup before the SDK cancels.
 RUN_BLOCKS_SAFETY_CEILING_SECONDS = 1200  # 20 min
-
-
-# Per-tool-call budget for active block runs — caps a single tool invocation
-# below the session-level wall clock (``enforcement.TOTAL_TIMEOUT_SECONDS``,
-# 900 s) so a long chain cannot consume the whole budget without giving the
-# copilot a chance to issue a smaller chain. Quiet-block runs keep the longer
-# ``RUN_BLOCKS_SAFETY_CEILING_SECONDS`` above.
-PER_TOOL_CALL_BUDGET_SECONDS = 240
-
-
-# Reserve final-reply room; active block runs shrink their own budget near the deadline.
-COPILOT_FINAL_REPLY_RESERVE_SECONDS = 90
 
 
 def _workflow_definition_as_dict(workflow_definition: Any) -> dict[str, Any]:
@@ -484,7 +473,7 @@ def _valid_runtime_anchor_url(value: object) -> str | None:
 async def _fallback_page_info(
     ctx: AgentContext, session_id_override: str | None = None, *, read_title: bool = True
 ) -> tuple[str, str]:
-    session_id = session_id_override or ctx.browser_session_id
+    session_id = session_id_override or effective_browser_session_id(ctx)
     if not session_id:
         return "", ""
 
@@ -508,7 +497,7 @@ async def _fallback_page_info(
     # no url. Without the bound, one unreachable page deadlocks the whole turn.
     try:
         title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
         return url, ""
     except Exception:
@@ -619,7 +608,7 @@ async def _discovery_navigate(
             server.call_internal_tool("skyvern_navigate", nav_args),
             timeout=cap,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"ok": False, "error": f"skyvern_navigate timed out after {timeout_seconds:g}s"}
 
 
@@ -637,7 +626,7 @@ async def _discovery_get_html(ctx: CopilotContext) -> dict[str, Any]:
             server.call_internal_tool("skyvern_get_html", {"selector": "body"}),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"ok": False, "error": f"skyvern_get_html timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
 
 
@@ -789,26 +778,33 @@ async def _composition_get_structured_evidence_result(
     *,
     inspected_url: str,
     current_url: str,
-    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Capture composition evidence and preserve why the observation failed."""
+    """Capture composition evidence and preserve why the observation failed.
+
+    This read carries no deadline of its own. The whole-turn deadline owns ordinary authoring and
+    scout calls and the post-run capture deadline owns run-session failure capture, so a nested
+    ceiling here only discarded slow-but-returning observations inside a budget that had not expired.
+    """
     server = getattr(copilot_ctx, "discovery_mcp_server", None)
     if server is None:
         return None, "structured page evidence failed: discovery MCP server not attached to context"
     with copilot_span("composition_structured_extract"):
         try:
-            result, outcome = await asyncio.wait_for(
-                _call_internal_browser_tool(
-                    server,
-                    "skyvern_evaluate",
-                    {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
-                ),
-                timeout=timeout_seconds,
+            evaluate = _call_internal_browser_tool(
+                server,
+                "skyvern_evaluate",
+                {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
             )
-        except asyncio.TimeoutError:
+            if timeout_seconds is None:
+                result, outcome = await evaluate
+            else:
+                result, outcome = await asyncio.wait_for(evaluate, timeout=timeout_seconds)
+        except TimeoutError:
+            elapsed = f" after {timeout_seconds:g}s" if timeout_seconds is not None else ""
             return (
                 None,
-                f"skyvern_evaluate timed out after {timeout_seconds:g}s while capturing structured page evidence",
+                f"skyvern_evaluate timed out{elapsed} while capturing structured page evidence",
             )
         except Exception as exc:
             # Read the message once, through the guard: an unguarded str(exc) here would raise on a
@@ -870,7 +866,7 @@ async def _composition_get_structured_evidence(
     *,
     inspected_url: str,
     current_url: str,
-    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     """Compatibility wrapper for best-effort scout observers that intentionally ignore failures."""
     evidence, _ = await _composition_get_structured_evidence_result(

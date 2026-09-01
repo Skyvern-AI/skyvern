@@ -295,6 +295,54 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
+  it("reserves inline space for a user-message timestamp", async () => {
+    const content = "How would I loop the same block over a list of websites?";
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content,
+          created_at: "2026-05-25T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    const message = screen.getByText(content);
+    const row = message.parentElement!;
+    const timestamp = row.querySelector("span")!;
+    expect(message.className).toContain("min-w-0");
+    expect(message.className).toContain("flex-1");
+    expect(row.className).toContain("items-end");
+    expect(timestamp.className).toContain("shrink-0");
+    expect(timestamp.className).not.toContain("absolute");
+  });
+
+  it("wraps long unbroken text inside the user-message bubble", async () => {
+    const content = `https://example.test/logs?query=${"encoded-query-segment".repeat(20)}`;
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content,
+          created_at: "2026-05-25T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    const message = screen.getByText(content);
+    expect(message.className).toContain("[overflow-wrap:anywhere]");
+  });
+
   it("leaves the input enabled while a turn is in flight", async () => {
     await renderChat();
     await submit("build me a workflow");
@@ -607,7 +655,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Run halted")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(screen.getByText("Copilot hit an internal error.")).toBeTruthy();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -633,7 +682,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText(/Cancelled\. I have a draft workflow/),
+    ).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -670,7 +722,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(screen.getByText(/draft made progress/)).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -758,7 +811,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText(/Cancelled\. I have a draft workflow/),
+    ).toBeTruthy();
     expect(screen.queryByText("Run halted")).toBeNull();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -942,7 +998,8 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Needs your input")).toBeTruthy();
+    expect(screen.getByTestId("copilot-terminal-prose")).toBeTruthy();
+    expect(screen.queryByText("Needs your input")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });
 
@@ -954,7 +1011,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     const call = streamCalls[0];
     if (!call) throw new Error("no pending stream to complete");
     const longInputRequest =
-      "Please provide the exact BACB lookup/registry URL you want the workflow to use. I will build a general workflow with a person_name input after you provide it.";
+      "Please provide the **exact registry URL** you want the workflow to use. I will build a general workflow with a `person_name` input after you provide it.";
 
     await act(async () => {
       call.onMessage({
@@ -979,8 +1036,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       call.resolve();
     });
 
-    expect(screen.getByText("Needs your input")).toBeTruthy();
-    expect(screen.getByText(longInputRequest)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Collapse turn" })).toBeNull();
+    expect(
+      screen.getByText("exact registry URL", { selector: "strong" }),
+    ).toBeTruthy();
+    expect(screen.getByText("person_name", { selector: "code" })).toBeTruthy();
     expect(screen.queryByText("Answered")).toBeNull();
     expect(screen.queryByText("Completed the run")).toBeNull();
   });

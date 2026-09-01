@@ -85,6 +85,7 @@ def make_skyvern_page(page: MagicMock) -> MagicMock:
         wrapper.locator = page.locator
     if "context" in page.__dict__:
         wrapper.context = page.context
+    wrapper.locator_scope = wrapper
     return wrapper
 
 

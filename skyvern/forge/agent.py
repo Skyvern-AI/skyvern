@@ -13,7 +13,7 @@ from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Literal, Tuple, cast
+from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -105,7 +105,10 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
-from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
+from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
+    YutoriNavigatorLLMCaller,
+    derive_navigator_pending_result,
+)
 from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_response_to_actions
 from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
@@ -124,6 +127,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -191,6 +195,7 @@ from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
+    TASK_V3_ACTION_DESCRIPTION_PREFIX,
     Action,
     ActionStatus,
     ClickAction,
@@ -209,7 +214,6 @@ from skyvern.webeye.actions.actions import (
     TerminateAction,
     UploadFileAction,
     VerificationStatus,
-    WaitAction,
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
@@ -344,6 +348,7 @@ _TASKV3_TOOL_ACTION_TYPES = {
     "scroll": ActionType.SCROLL,
     "wait": ActionType.WAIT,
     "solve_captcha": ActionType.SOLVE_CAPTCHA,
+    "reload_page": ActionType.RELOAD_PAGE,
 }
 
 
@@ -364,6 +369,11 @@ def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
     if isinstance(value, (str, int, float)) and not isinstance(value, bool):
         return redact_secrets_from_text(str(value), secret_values, boundary_all_lengths=True)
     return value
+
+
+# Cap on the persisted turn text: actions is a high-traffic table and readers clamp far lower for
+# display; a runaway multi-paragraph turn must not become a per-row payload.
+_TASKV3_REASONING_MAX_CHARS = 1000
 
 
 def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields: Any) -> Action:
@@ -387,6 +397,12 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
         return UploadFileAction(element_id=selector, file_url=str(args.get("file") or ""), **fields)
     if tool_name == "navigate":
         return GotoUrlAction(url=str(args.get("url") or ""), **fields)
+    if tool_name == "reload_page":
+        # fields carries reasoning=turn_reasoning; popped to avoid a duplicate kwarg. Loop-injected
+        # reloads always set a "reason" arg, so the turn-text fallback is future-proofing only.
+        turn_reasoning = fields.pop("reasoning", None)
+        reload_reason = str(args.get("reason") or "") or (turn_reasoning or "")
+        return ReloadPageAction(reasoning=reload_reason, **fields)
     return Action(action_type=_TASKV3_TOOL_ACTION_TYPES.get(tool_name, ActionType.CLICK), **fields)
 
 
@@ -491,6 +507,30 @@ def _has_multi_field_totp_shape(observations: Iterable[tuple[str, Any]]) -> bool
     return False
 
 
+def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_run_id: str | None) -> list[str] | None:
+    """The originating block's linked credential parameter keys — the only credentials a task
+    created from that block may draw an OTP from (SKY-15181). None (no block, no run context, or a
+    script-mode run) means unrestricted: bare tasks and cached scripts keep the run-scoped legacy
+    behavior."""
+    if task_block is None or not workflow_run_id:
+        return None
+    context = skyvern_context.current()
+    if context is not None and context.script_mode:
+        # Script-built blocks are constructed without parameters=, so deriving from them would
+        # yield an empty scope that silently disables credential-TOTP for cached-script logins.
+        return None
+    if not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        # A block-originated task always executes inside a registered run context; if it is ever
+        # missing, fail closed (no credential-TOTP) rather than open to the whole run's credentials.
+        return []
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    return [
+        parameter.key
+        for parameter in task_block.parameters
+        if workflow_run_context.is_registered_credential_parameter_key(parameter.key)
+    ]
+
+
 def _first_plan_carries_consumable_totp(actions: list[Any], multi_field_secret_ready: bool) -> bool:
     """Whether the first-pass plan already carries a shape the existing runtime materializes into a
     credential TOTP at DOM-write time: a multi-field single-digit sequence backed by a runtime secret
@@ -512,9 +552,18 @@ def _first_plan_carries_consumable_totp(actions: list[Any], multi_field_secret_r
 
 
 def _first_plan_carries_single_field_credential_totp(
-    actions: list[Any], workflow_run_context: WorkflowRunContext | None, active_credential_parameter_key: str | None
+    actions: list[Any],
+    workflow_run_context: WorkflowRunContext | None,
+    active_credential_parameter_key: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> bool:
-    """Recognize the single-field credential placeholder consumed by the input handler at runtime."""
+    """Recognize the single-field credential placeholder consumed by the input handler at runtime.
+
+    ``allowed_credential_parameter_keys`` closes the SKY-15181 seam here too: the placeholder is
+    resolved against the whole run context, and the active-key gate alone is exactly the stale
+    cross-block key this restriction exists to ignore — so a plan whose credential is not linked
+    to the originating block must fall through to the deterministic resolver, which is scoped.
+    """
     if not workflow_run_context or not actions:
         return False
     if any(not isinstance(action, dict) for action in actions):
@@ -530,6 +579,8 @@ def _first_plan_carries_single_field_credential_totp(
         return False
     key = workflow_run_context.find_credential_parameter_key_for_secret(text)
     if not key or workflow_run_context.values.get(key, {}).get("totp") != text:
+        return False
+    if allowed_credential_parameter_keys is not None and key not in allowed_credential_parameter_keys:
         return False
     if active_credential_parameter_key is not None and active_credential_parameter_key != key:
         return False
@@ -1328,6 +1379,7 @@ class ForgeAgent:
         close_browser_on_completion: bool,
         browser_session_id: str | None,
         task_block: BaseTaskBlock | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -1341,9 +1393,18 @@ class ForgeAgent:
             validate_and_fill_extraction_result,
         )
         from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
+        from skyvern.forge.taskv3.block_context import (
+            MAX_PERSISTED_FINISH_REASON_CHARS,
+            PreviousBlockHandoff,
+            mask_signed_urls_in_text,
+            render_block_context,
+            sanitize_handoff_url,
+            select_previous_block,
+        )
         from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             DEFAULT_DEADLINE_SECONDS,
+            MAX_TOKENS_CEILING,
             MIN_ACTION_STEPS,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
@@ -1352,6 +1413,7 @@ class ForgeAgent:
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import pending_marker
+        from skyvern.utils.token_counter import approx_count_tokens
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
@@ -1435,46 +1497,36 @@ class ForgeAgent:
                 page_free_validation = bool(router_result.effective_without_page_information)
             except Exception:
                 LOG.warning("task_v3 validation evidence router failed; staying page-aware", task_id=task.task_id)
-        if task_block is not None and not page_free_validation:
-            # A block resumes mid-workflow: an earlier block may already have satisfied this one's
-            # criterion (the step engine's per-step goal check gives it this for free).
-            goal = (
-                f"{goal}\n\nThis task is one block of a larger workflow and starts mid-flow. First read "
-                "the full page text (get_html) and check whether the completion criterion is ALREADY "
-                "satisfied by the page's settled, loaded content - a loading indicator, skeleton, or "
-                "empty container does NOT satisfy a criterion about visible content."
-                + (
-                    " When the goal names an action (open/click/submit), perform it unless the page "
-                    "already shows that action's RESULT."
-                    if task.task_type != TaskType.validation
-                    else ""
+        workflow_run_context = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+            if task.workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id)
+            else None
+        )
+        handoff_enabled = bool(settings.TASK_V3_BLOCK_HANDOFF and task_block is not None and task.workflow_run_id)
+        previous_block: PreviousBlockHandoff | None = None
+        if handoff_enabled and task.workflow_run_id:
+            # Read the durable block rows, not a process-local cache: a Temporal worker can restart
+            # between blocks. Fail open — a lookup error must not fail a healthy run.
+            try:
+                run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+                    workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
                 )
-                + " If the criterion is genuinely satisfied, finish with status=completed "
-                "immediately without acting. Stay "
-                "within this block's goal: never sign out, navigate away from the current flow, or undo "
-                "prior progress unless the goal explicitly asks for it."
-            ).strip()
-        if page_free_validation:
-            # This mode judges only durable inputs/prior outputs; any perception instruction would
-            # contradict it, so it replaces (not extends) the read-the-page framing above.
-            goal = (
-                f"{goal}\n\nThis is a page-free assessment task: judge ONLY from the information already "
-                "provided above and prior workflow context. Do not call observe or get_html, and do not "
-                "modify page state. Evaluate the completion and termination criteria and finish with the "
-                "matching status."
-            ).strip()
-        elif task_block is not None and task.task_type == TaskType.validation:
-            # ValidationBlock tasks judge, not act; without this the loop can treat the criteria
-            # above as something to accomplish by interacting with the page.
-            goal = (
-                f"{goal}\n\nThis is an assessment task: do not modify page state. Evaluate the completion "
-                "and termination criteria above and finish with the matching status. Ground the judgment "
-                "in the page's actual content: read the full page text (get_html) before concluding, and "
-                "never finish with status=terminated on element summaries alone — absence must be "
-                "confirmed against the full text."
-            ).strip()
-        elif task_block is not None and task.task_type == TaskType.action:
-            goal = f"{goal}\n\nThis is a single, focused action: perform it and finish.".strip()
+                previous_block = select_previous_block(run_blocks, task.task_id)
+            except Exception:
+                LOG.warning("task_v3 previous-block handoff lookup failed", task_id=task.task_id, exc_info=True)
+        framing, block_context_section = render_block_context(
+            task,
+            task_block,
+            workflow_run_context,
+            page_free_validation=page_free_validation,
+            handoff_enabled=handoff_enabled,
+            previous_block=previous_block,
+            selected_block_labels=context.run_block_labels if context else None,
+        )
+        if framing:
+            goal = f"{goal}\n\n{framing}".strip()
+        if block_context_section:
+            goal = f"{goal}\n\n{block_context_section}".strip()
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
@@ -1656,6 +1708,7 @@ class ForgeAgent:
                     floored_step_cap=floored_step_cap,
                 )
             step_cap = floored_step_cap
+        workflow_step_ceiling: int | None = None
         if task_block is not None:
             # The org's workflow-run-wide step ceiling binds v3 blocks too: an action round is the
             # budget unit (round-stamped action rows make prior v3 rounds count exactly).
@@ -1688,7 +1741,24 @@ class ForgeAgent:
                     )
                     return step, task
                 step_cap = min(step_cap, remaining_workflow_steps)
-        max_turns, max_tool_calls = taskv3_runaway_backstops(step_cap)
+                workflow_step_ceiling = remaining_workflow_steps
+        if atomic_block_budget:
+            # A block that owns a deliberately small budget (action/validation) keeps it: the
+            # in-loop extension is refused by pinning the hard ceiling to the cap itself.
+            workflow_step_ceiling = step_cap if workflow_step_ceiling is None else min(workflow_step_ceiling, step_cap)
+        max_turns, max_tool_calls, max_tokens = taskv3_runaway_backstops(step_cap)
+        if max_tokens == MAX_TOKENS_CEILING:
+            # A step cap large enough to hit the token ceiling silently re-caps the run's tokens; make
+            # that observable so a recurrence of the flat-ceiling failure mode is found here, not by
+            # canary failure analysis.
+            LOG.info(
+                "task_v3 token backstop clamped at its ceiling",
+                log_code="taskv3_token_backstop_clamped",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                step_cap=step_cap,
+                max_tokens=max_tokens,
+            )
         # Per-action persistence (parity with the step engine): the loop hands us each successful
         # action round, and we persist one DB row per action + one screenshot per round, so the Task
         # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3. Additive and
@@ -1699,7 +1769,9 @@ class ForgeAgent:
         v3_persisted_actions: list[Action] = []
         v3_round_index = 0
 
-        async def _on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+        async def _on_action_round(
+            round_actions: list[tuple[str, dict[str, Any], bool]], turn_reasoning: str | None
+        ) -> None:
             nonlocal v3_round_index
             screenshot_artifact_id: str | None = None
             try:
@@ -1709,9 +1781,19 @@ class ForgeAgent:
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
-            secret_values: set[str] = set()
-            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id):
-                secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+            # Opted-out runs still floor runtime-resolved secrets (e.g. verification codes),
+            # matching the recording/HAR finalization sites.
+            secret_values = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+                else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            )
+            if turn_reasoning:
+                if secret_values:
+                    # Default (substring) matching: turn text is free-form prose, where a long secret
+                    # can be glued to adjacent alphanumerics — boundary anchoring would let it through.
+                    turn_reasoning = redact_secrets_from_text(turn_reasoning, secret_values)
+                turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
             for name, args, succeeded in round_actions:
                 try:
                     tool_args = _redact_tool_args(args if isinstance(args, dict) else {}, secret_values)
@@ -1728,8 +1810,9 @@ class ForgeAgent:
                         # as one unit of the workflow-run step budget (distinct (task, order) pairs).
                         step_order=v3_round_index,
                         action_order=len(v3_persisted_actions),
-                        description=f"task_v3 {name} {selector}".strip(),
+                        description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
+                        reasoning=turn_reasoning,
                     )
                     v3_persisted_actions.append(action)
                     await app.DATABASE.workflow_params.create_action(action=action)
@@ -1777,16 +1860,59 @@ class ForgeAgent:
         # the gate, not here. Built for both populations — the failure-evidence gate needs a sampler
         # to run at all — over the same page accessor each population's tools use, so the evidence
         # is sampled from the page the model actually acted on.
+        # Field values are hashed separately: typing sets the value IDL property, which innerHTML
+        # serialization does not reflect, so a form being filled would otherwise read as frozen.
+        # Open shadow roots are traversed for the same reason — the tools pierce them, so work
+        # inside a shadow widget must move the fingerprint too (closed roots stay invisible).
+        _PAGE_FINGERPRINT_PROBE_JS = (
+            "() => { if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
+            " const mix = (str, seed) => { let x = seed;"
+            " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
+            " const walk = (root) => { h = mix(root.innerHTML || '', h);"
+            " const all = root.querySelectorAll('*'); elems += all.length;"
+            " for (const el of root.querySelectorAll('input, textarea, select'))"
+            " v = mix(String(el.value || '') + '|' + (el.checked === true ? '1' : '0'), v);"
+            " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
+            " walk(document.body);"
+            " return h + ':' + elems + ':' + v; }"
+        )
+
+        _DOCUMENT_NONCE_JS = (
+            "() => { if (!window.__skyvern_doc_nonce) window.__skyvern_doc_nonce = String(Math.random());"
+            " return window.__skyvern_doc_nonce; }"
+        )
+
         async def _page_fingerprint() -> str | None:
             peek = await _fingerprint_page()
             if peek is None:
                 return None
-            probe_js = (
-                "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
-                " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
-                " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
+            return await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+
+        # Document identity, not content: a failed call's leftover text or open menu changes the DOM
+        # without re-mapping other selectors, while a navigation or reload (which does) wipes the nonce.
+        async def _page_probe() -> str | None:
+            peek = await _fingerprint_page()
+            if peek is None:
+                return None
+            nonce = await peek.evaluate(_DOCUMENT_NONCE_JS)
+            return f"{peek.url}|{nonce}"
+
+        async def _reload_page() -> None:
+            # Observed by the action policy like the legacy internal refresh; the loop records it in
+            # the action round. A bare task pins one page, so it is passed explicitly.
+            pinned = None if task_block is not None else await _page_provider()
+            preflight_action(
+                ReloadPageAction(
+                    reasoning="a page-level handler requested a refresh",
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                ),
+                pinned if pinned is not None else await _fingerprint_page(),
+                site="internal_refresh",
             )
-            return await peek.evaluate(probe_js)
+            await browser_state.reload_page(page=pinned)
 
         # Whether the control the run CLICKED is still in flight. Scoped to that one control on
         # purpose: "is anything on this page busy?" strands a finished run on an unrelated upload
@@ -1817,7 +1943,10 @@ class ForgeAgent:
             # structurally never touches the live DOM must not be offered it.
             verification_state = VerificationState()
             auth_tools, auth_guidance = build_auth_tools(
-                task, None if page_free_validation else _page_provider, state=verification_state
+                task,
+                None if page_free_validation else _page_provider,
+                state=verification_state,
+                allowed_credential_parameter_keys=block_credential_parameter_keys(task_block, task.workflow_run_id),
             )
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
@@ -1829,11 +1958,26 @@ class ForgeAgent:
                 captcha_tools, captcha_guidance = build_captcha_tools(
                     task, _page_provider, organization_id=organization.organization_id
                 )
+            # Withheld in page-free mode: form-filling defaults must not bias a data-only judgment.
+            ats_guidance = None
+            if not page_free_validation:
+                try:
+                    ats_guidance = await app.AGENT_FUNCTION.resolve_task_v3_extra_guidance(
+                        task=task, organization=organization
+                    )
+                except Exception:
+                    LOG.warning(
+                        "resolve_task_v3_extra_guidance failed; continuing without it",
+                        task_id=task.task_id,
+                        exc_info=True,
+                    )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                page_probe=_page_probe,
+                reload_page=_reload_page,
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
@@ -1849,16 +1993,28 @@ class ForgeAgent:
                 starting_url=task.url,
                 downloads_dir=get_download_dir(download_id),
                 organization_id=organization.organization_id,
+                task_id=task.task_id,
+                # Task.workflow_permanent_id is never populated on the execution path (get_task
+                # builds Task without it); the caller sources it from the WorkflowRun row.
+                workflow_permanent_id=workflow_permanent_id,
                 max_action_steps=step_cap,
+                max_action_steps_ceiling=workflow_step_ceiling,
                 max_turns=max_turns,
                 max_tool_calls=max_tool_calls,
+                max_tokens=max_tokens,
                 step=step,
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 extra_tools=auth_tools + captcha_tools,
+                # ats_guidance before workflow_system_prompt keeps the customer's own text later in
+                # the message; position in one system message is a weak signal, not precedence — the
+                # real contract is the guidance's own scoping prose (its NEVER list and the explicit
+                # link to the base stop-don't-guess rule).
                 extra_system_guidance="\n\n".join(
-                    part for part in (auth_guidance, captcha_guidance, task.workflow_system_prompt) if part
+                    part
+                    for part in (auth_guidance, captcha_guidance, ats_guidance, task.workflow_system_prompt)
+                    if part
                 ),
                 completion_probe=completion_probe,
                 completion_blocker=completion_blocker,
@@ -1886,6 +2042,7 @@ class ForgeAgent:
             turns=outcome.turns,
             tool_calls=outcome.tool_calls,
             action_steps=outcome.action_steps,
+            taskv3_block_context_tokens=approx_count_tokens(block_context_section),
         )
         completion_vetoed = False
         if outcome.status == "completed":
@@ -2047,6 +2204,51 @@ class ForgeAgent:
             )
             if refreshed:
                 task = refreshed
+        if task_block is not None and workflow_run_context is not None:
+            # Record this block's own account and final page for the next block's handoff, now that
+            # the task row is finalized (a vetoed "completed", a reaper timeout, or a cancel that won
+            # the update race must not hand a success story to the next block). Bounded like the frame
+            # persist above so a stalled page or DB read cannot hold up cleanup. Skipped without a run
+            # context: both fields are persisted and API-visible, and masking needs the run's secrets.
+            with contained_effect("task_v3 block handoff persist", task_id=task.task_id):
+                async with asyncio.timeout(30):
+                    try:
+                        own_block = await app.DATABASE.observer.get_workflow_run_block_by_task_id(
+                            task_id=task.task_id, organization_id=organization.organization_id
+                        )
+                    except NotFoundError:
+                        own_block = None
+                    if own_block is not None:
+                        handoff_page = await _fingerprint_page()
+                        raw_final_url = (
+                            handoff_page.url if handoff_page is not None and not handoff_page.is_closed() else None
+                        )
+                        # A login/MFA/OAuth block can leave credentials or server-minted tokens in
+                        # userinfo, query, or fragment, and this column is persisted and API-visible:
+                        # mask registered secrets, then keep only scheme://host/path.
+                        final_url = (
+                            sanitize_handoff_url(workflow_run_context.mask_secrets_in_data(raw_final_url))
+                            if raw_final_url
+                            else None
+                        )
+                        # Mask BEFORE truncating so a secret straddling the cap cannot survive as a
+                        # partial, unmatchable prefix.
+                        handoff_reason = task.failure_reason if task.status != TaskStatus.completed else outcome.reason
+                        finish_reason = (
+                            mask_signed_urls_in_text(str(workflow_run_context.mask_secrets_in_data(handoff_reason)))[
+                                :MAX_PERSISTED_FINISH_REASON_CHARS
+                            ]
+                            if handoff_reason
+                            # An empty string explicitly clears a stale reason left by an earlier
+                            # attempt on the same row (retries reuse the workflow_run_block row).
+                            else ""
+                        )
+                        await app.DATABASE.observer.update_workflow_run_block(
+                            workflow_run_block_id=own_block.workflow_run_block_id,
+                            organization_id=organization.organization_id,
+                            finish_reason=finish_reason,
+                            final_url=final_url,
+                        )
         # A probe-finalized run must not be finalized again (double rename); otherwise the fallback
         # finalize still has to exclude tool-staged inputs from what counts as a download.
         cleanup_list_files_before: list[str] | None = None
@@ -2275,6 +2477,7 @@ class ForgeAgent:
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                         task_block=task_block,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
@@ -2954,6 +3157,7 @@ class ForgeAgent:
                 reuse_speculative_llm_response=reuse_speculative_llm_response,
                 speculative_llm_metadata=speculative_llm_metadata,
                 context=context,
+                allowed_credential_parameter_keys=block_credential_parameter_keys(task_block, task.workflow_run_id),
             )
 
             detailed_agent_step_output.actions = actions
@@ -3427,20 +3631,7 @@ class ForgeAgent:
                 for action, results in detailed_agent_step_output.actions_and_results:
                     if not results or not action.tool_call_id:
                         continue
-                    r = results[-1]
-                    result_str: str | None
-                    if isinstance(action, WaitAction):
-                        # Skyvern's handle_wait_action always returns ActionFailure by
-                        # design (to discourage v1/v2 engines from leaning on wait), but
-                        # Navigator emits wait as a deliberate cooperative pause —
-                        # surface a positive tool result so the model sees WaitAction success.
-                        result_str = f"Waited {action.seconds}s"
-                    elif r.success:
-                        # Use actual data when available (JS output, etc.)
-                        result_str = str(r.data) if r.data is not None else None
-                    else:
-                        # Provide error details so the model can recover
-                        result_str = f"ERROR: {r.exception_message or 'Action failed'}"
+                    result_str = derive_navigator_pending_result(action, results[-1])
                     nav_caller.update_pending_result(action.tool_call_id, result_str)
 
         # Check if Skyvern already returned a complete action, if so, don't run user goal check
@@ -3524,6 +3715,7 @@ class ForgeAgent:
         reuse_speculative_llm_response: bool,
         speculative_llm_metadata: SpeculativeLLMMetadata | None,
         context: SkyvernContext | None,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> tuple[list[Action], str | None, bool]:
         pdf_auto_download_src: str | None = None
         pdf_auto_download_used_bytes = False
@@ -3550,6 +3742,7 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 previous_response=cua_response,
                 engine=engine,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
             detailed_agent_step_output.cua_response = new_cua_response
         elif engine == RunEngine.anthropic_cua:
@@ -3560,6 +3753,7 @@ class ForgeAgent:
                 step=step,
                 scraped_page=scraped_page,
                 llm_caller=llm_caller,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
         elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "DISABLE_UI_TARS_CUA",
@@ -3700,7 +3894,12 @@ class ForgeAgent:
                         pdf_auto_download_used_bytes = pdf_bytes is not None
                     else:
                         otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
-                            task, step, scraped_page, browser_state, json_response
+                            task,
+                            step,
+                            scraped_page,
+                            browser_state,
+                            json_response,
+                            allowed_credential_parameter_keys=allowed_credential_parameter_keys,
                         )
                         if otp_actions:
                             detailed_agent_step_output.llm_response = otp_json_response
@@ -3777,6 +3976,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         previous_response: OpenAIResponse | None = None,
         engine: RunEngine = RunEngine.openai_cua,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> tuple[list[Action], OpenAIResponse | None]:
         cua_model = app.OPENAI_CUA_MODEL
         # The CUA tool must declare the browser's real viewport so returned coordinates land in the
@@ -3968,7 +4168,9 @@ class ForgeAgent:
             incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
         )
 
-        return await parse_cua_actions(task, step, current_response), current_response
+        return await parse_cua_actions(
+            task, step, current_response, allowed_credential_parameter_keys
+        ), current_response
 
     async def _generate_anthropic_actions(
         self,
@@ -3976,6 +4178,7 @@ class ForgeAgent:
         step: Step,
         scraped_page: ScrapedPage,
         llm_caller: LLMCaller,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> list[Action]:
         LOG.info(
             "Anthropic CU call starts",
@@ -4070,6 +4273,7 @@ class ForgeAgent:
             assistant_content,
             window_dimension or llm_caller.browser_window_dimension,
             llm_caller.get_screenshot_resize_target_dimension(window_dimension),
+            allowed_credential_parameter_keys,
         )
         return actions
 
@@ -8024,6 +8228,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> tuple[dict[str, Any], list[Action]]:
         if not task.organization_id:
             return json_response, []
@@ -8071,6 +8276,10 @@ class ForgeAgent:
         workflow_run_context = None
         if workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
             workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        # The {task_id}_secret stash is populated only from this task's navigation payload, which is
+        # built from the originating block's own parameters — so the multi-field skip below cannot
+        # carry an out-of-scope credential's secret (SKY-15181 provenance; single write site is
+        # _process_totp over final_navigation_payload).
         multi_field_secret_ready = bool(runtime_context and runtime_context.totp_codes.get(f"{task.task_id}_secret"))
         first_plan_actions = json_response.get("actions")
         if (
@@ -8094,6 +8303,7 @@ class ForgeAgent:
                 first_plan_actions,
                 workflow_run_context,
                 getattr(runtime_context, "active_credential_parameter_key", None),
+                allowed_credential_parameter_keys,
             )
             and extract_totp_from_navigation_inputs(task.navigation_payload) is None
         ):
@@ -8102,7 +8312,12 @@ class ForgeAgent:
 
         if should_resolve_verification_code:
             json_response = await self.handle_potential_verification_code(
-                task, step, scraped_page, browser_state, json_response
+                task,
+                step,
+                scraped_page,
+                browser_state,
+                json_response,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
             )
             actions = parse_actions(
                 task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response)
@@ -8170,6 +8385,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         browser_state: BrowserState,
         json_response: dict[str, Any],
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         # The caller decides when to resolve; place_to_enter_verification_code alone is sufficient.
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
@@ -8177,7 +8393,11 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
+        otp_value = await resolve_otp_value(
+            task,
+            expected_otp_type=OTPType.TOTP,
+            allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+        )
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response

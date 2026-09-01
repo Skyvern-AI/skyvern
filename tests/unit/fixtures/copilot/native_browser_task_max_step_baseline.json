@@ -1,0 +1,23 @@
+{
+  "schema": "native-build-test-baseline-output-v1",
+  "baseline_rev": "abd64f94cfc9989e8cf485a6dfbd77247834d7ee",
+  "fixture_sha256": "4adf55dac6a546295b02af9667dc75ba075a041cad5961d0cbdb728efbd6f129",
+  "facts": {
+    "workflow_run_id": "wr_568309678132841130",
+    "workflow_run_block_id": null,
+    "task_id": null,
+    "step_id": null,
+    "block_label": "inspect_target_record",
+    "block_type": null,
+    "block_status": "failed",
+    "failure_reason": "Reached the maximum steps (30)",
+    "action_observations": [
+      "click completed"
+    ],
+    "action_omission": null,
+    "page_state_omissions": [
+      "failure.page_state omitted: no bounded same-run page state was recorded."
+    ]
+  },
+  "recorded_outcome_structural_key": "5cfe64e77f7ad1d3a84c534aa1ca86588305fb48bdca153adefb6068f44c53d4"
+}

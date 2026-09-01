@@ -76,6 +76,7 @@ import {
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
+import { CopilotMarkdown } from "./CopilotMarkdown";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
@@ -506,8 +507,17 @@ const MessageItem = memo(
     if (message.sender === "user") {
       return (
         <div className="flex justify-end">
-          <div className="relative max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
-            <p className="whitespace-pre-wrap pr-12">{message.content}</p>
+          <div className="max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
+            <div className="flex items-end gap-2">
+              <p className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">
+                {message.content}
+              </p>
+              {!queuedStatus && message.timestamp ? (
+                <span className="pointer-events-none shrink-0 rounded bg-slate-elevation1/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                  {formatChatTimestamp(message.timestamp)}
+                </span>
+              ) : null}
+            </div>
             {queuedStatus ? (
               <div className="mt-2 flex items-center gap-1.5 border-t border-white/10 pt-2 text-[11.5px] text-muted-foreground">
                 <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
@@ -524,10 +534,6 @@ const MessageItem = memo(
                   <Cross2Icon className="h-3 w-3" />
                 </button>
               </div>
-            ) : message.timestamp ? (
-              <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-elevation1/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                {formatChatTimestamp(message.timestamp)}
-              </span>
             ) : null}
           </div>
         </div>
@@ -535,9 +541,9 @@ const MessageItem = memo(
     }
     return (
       <div className="flex flex-col gap-2">
-        <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-          {message.content}
-        </p>
+        <div className="pl-1 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
+          <CopilotMarkdown text={message.content} />
+        </div>
         {footer ? (
           <div className="flex flex-wrap gap-2 pl-1">{footer}</div>
         ) : null}

@@ -8,6 +8,7 @@ const base = {
   scrubbing: false,
   inspectingRun: false,
   blockRunInDebugSession: false,
+  systemFocused: false,
   running: false,
   hasRecording: false,
   failed: false,
@@ -82,6 +83,40 @@ describe("resolveBrowserPaneView", () => {
         ...base,
         scrubbing: true,
         running: true,
+      }),
+    ).toBe("screenshots");
+  });
+
+  it("keeps a system-focused run live after it finishes", () => {
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        systemFocused: true,
+        inspectingRun: true,
+        hasRecording: true,
+      }),
+    ).toBe("live");
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        systemFocused: true,
+        inspectingRun: true,
+        failed: true,
+      }),
+    ).toBe("live");
+  });
+
+  it("keeps explicit replay authoritative during system focus", () => {
+    for (const intent of ["recording", "screenshots"] as const) {
+      expect(
+        resolveBrowserPaneView({ ...base, systemFocused: true, intent }),
+      ).toBe(intent);
+    }
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        systemFocused: true,
+        scrubbing: true,
       }),
     ).toBe("screenshots");
   });

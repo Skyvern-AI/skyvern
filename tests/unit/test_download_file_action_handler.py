@@ -1,22 +1,33 @@
 import asyncio
+import contextlib
+import io
+import logging
 import os
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+import structlog
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import BaseModel, ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import BlockedHost
 from skyvern.forge.sdk.models import StepStatus
-from skyvern.webeye.actions.actions import ActionStatus, ClickAction, DownloadFileAction
+from skyvern.webeye.actions.actions import (
+    ActionStatus,
+    ClickAction,
+    DownloadFileAction,
+    SelectOption,
+    SelectOptionAction,
+)
 from skyvern.webeye.actions.handler import (
     _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
     _INLINE_IFRAME_SRC_JS,
@@ -33,7 +44,7 @@ from skyvern.webeye.actions.handler import (
     _remove_download_listener,
     handle_download_file_action,
 )
-from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
+from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import BlobActionFreshness
@@ -804,6 +815,9 @@ def _make_download_click_context(
     page.is_closed.return_value = False
     page.context.browser = None
     browser_state = MagicMock()
+    # A real browser attaches no vendor download source unless a cloud factory did; mirror that default
+    # so the provider-observation seam stays inert for the local/PBS/event paths these cases exercise.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
     scraped_page = ScrapedPage(
         elements=[],
@@ -1529,6 +1543,43 @@ async def test_handle_action_aborted_download_is_reported_as_failure_not_success
     assert results[-1].download_triggered is True
     assert not results[-1].downloaded_files
     assert "canceled" in (results[-1].exception_message or "")
+
+
+@pytest.mark.asyncio
+async def test_handle_action_stale_abort_skips_explicit_download_observation() -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    stale_abort = ActionAbort()
+    stale_abort.skip_remaining_actions = True
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+
+    with (
+        patch.object(ActionHandler, "_handle_action", new=AsyncMock(return_value=[stale_abort])),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=tempfile.gettempdir()),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+            new=AsyncMock(side_effect=AssertionError("stale abort entered download observation")),
+        ),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        results = await ActionHandler.handle_action(
+            scraped_page=scraped_page,
+            task=task,
+            step=step,
+            page=page,
+            action=action,
+        )
+
+    assert results == [stale_abort]
+    assert results[-1].skip_remaining_actions is True
 
 
 @pytest.mark.asyncio
@@ -2269,6 +2320,8 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
     page.url = original_url
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     # Same page count before and after (no extra tab opened by the print action)
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
     browser_state.navigate_to_url = AsyncMock()
@@ -3289,6 +3342,8 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     scraped_page = ScrapedPage(
@@ -3394,6 +3449,8 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     scraped_page = ScrapedPage(
@@ -3505,6 +3562,8 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
+    # No cloud factory attached a vendor download source here; keep the provider seam inert.
+    browser_state.browser_artifacts.get_action_download_source.return_value = None
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     scraped_page = ScrapedPage(
@@ -3586,6 +3645,102 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
     assert span_attrs["download_signal_source"] == "browser_download_event"
     assert span_attrs["download_signal_poll_iterations"] == 1
     assert span_attrs["download_signal_elapsed_seconds"] == 1.2
+
+
+@pytest.mark.asyncio
+async def test_observed_download_zero_artifacts_reports_needs_followup() -> None:
+    # A download event was observed and credited (download_triggered=True), but finalization saved no
+    # file and the browser reported no abort reason. Returning a plain success implies a file exists;
+    # the action must instead flag needs_followup so the agent keeps trying rather than declaring the
+    # goal complete against a file that was never captured.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr-1",
+        browser_session_id=None,
+        download_timeout=0.01,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.url = "https://example.com/download"
+    page.context.browser = None
+    download_callbacks: dict[str, Callable[[object], None]] = {}
+    page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="download-link",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    download = MagicMock()
+    download.suggested_filename = "report.pdf"
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(1.2)
+
+    async def save_empty_download(target_path: str | os.PathLike[str]) -> None:
+        open(target_path, "w").close()
+
+    download.save_as = AsyncMock(side_effect=save_empty_download)
+
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        download_callbacks["download"](download)
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+            patch("skyvern.webeye.actions.handler.DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS", 0),
+            patch("skyvern.webeye.actions.handler.time", clock),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files is None
+    assert isinstance(results[-1], ActionSuccess)
+    assert results[-1].needs_followup is True
+    assert results[-1].followup_message is not None
 
 
 @pytest.mark.asyncio
@@ -5145,6 +5300,7 @@ async def test_recover_passes_recovery_timeout_to_read_http_url_bytes(tmp_path: 
 
     assert result is not None
     assert read_mock.await_args.kwargs["timeout_ms"] == _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS * 1000
+    assert "redirect" not in read_mock.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -6326,15 +6482,40 @@ class TestRecoverAdoptedSessionBlobPdfIframe:
             assert "portal.example" not in rendered
 
 
-async def _run_download_action_for_wiring(*, browser_session_id: str | None) -> tuple:
+async def _run_download_action_for_wiring(
+    *,
+    browser_session_id: str | None,
+    has_interceptor: bool = False,
+    inner_side_effect: Callable | None = None,
+    action=None,
+) -> dict:
     now = datetime.now(UTC)
     organization = make_organization(now)
-    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+    task, step, page, browser_state, scraped_page, default_action = _make_download_click_context(
         now=now,
         organization=organization,
         page_url="https://example.com/download",
     )
+    action = action if action is not None else default_action
     task = task.model_copy(update={"download_timeout": 0.01, "browser_session_id": browser_session_id})
+
+    call_log: list[str] = []
+
+    async def _install(*_args: object, **_kwargs: object) -> None:
+        call_log.append("install")
+
+    async def _teardown(*_args: object, **_kwargs: object) -> None:
+        call_log.append("teardown")
+
+    async def _inner(*args: object, **kwargs: object):
+        call_log.append("handle_action")
+        if inner_side_effect is not None:
+            return await inner_side_effect(*args, **kwargs)
+        return [ActionSuccess()]
+
+    install = AsyncMock(side_effect=_install)
+    teardown = AsyncMock(side_effect=_teardown)
+    captured_exc: BaseException | None = None
 
     with tempfile.TemporaryDirectory() as temp_dir:
         mock_app = MagicMock()
@@ -6345,46 +6526,480 @@ async def _run_download_action_for_wiring(*, browser_session_id: str | None) -> 
         storage.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
         mock_app.STORAGE = storage
 
-        install = AsyncMock()
-        teardown = AsyncMock()
         with (
-            patch.object(ActionHandler, "_handle_action", side_effect=AsyncMock(return_value=[ActionSuccess()])),
+            patch.object(ActionHandler, "_handle_action", side_effect=_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
             patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
-            patch("skyvern.webeye.utils.page.install_blob_url_retention", install),
+            patch("skyvern.webeye.actions.handler.install_blob_url_retention", install, create=True),
             patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", teardown),
+            patch(
+                "skyvern.webeye.actions.handler.has_download_interceptor_for_context",
+                return_value=has_interceptor,
+                create=True,
+            ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
-            await ActionHandler.handle_action(
-                scraped_page=scraped_page,
-                task=task,
-                step=step,
-                page=page,
-                action=action,
-            )
-    return install, teardown, page
+            try:
+                await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
+            except BaseException as exc:  # noqa: BLE001 - teardown-on-failure is under test
+                captured_exc = exc
+    return {
+        "install": install,
+        "teardown": teardown,
+        "page": page,
+        "call_log": call_log,
+        "exc": captured_exc,
+    }
 
 
 @pytest.mark.asyncio
-async def test_adopted_session_download_no_longer_installs_retention_but_still_tears_down() -> None:
-    # Activation moved to the targeted cloud click setup; the generic handler keeps only the teardown.
-    install, teardown, page = await _run_download_action_for_wiring(browser_session_id="pbs-1")
+async def test_browser_session_download_arms_retention_before_action_and_tears_down() -> None:
+    result = await _run_download_action_for_wiring(browser_session_id="pbs-1")
 
-    install.assert_not_awaited()
-    teardown.assert_awaited_once()
-    assert teardown.await_args.args[0] is page
+    result["install"].assert_awaited_once()
+    result["teardown"].assert_awaited_once()
+    assert result["teardown"].await_args.args[0] is result["page"]
+    # Retention must be installed before the interaction that mints the blob, otherwise a page that
+    # revokes synchronously at click has already dropped the object URL by the time it is patched.
+    assert result["call_log"].index("install") < result["call_log"].index("handle_action")
+
+
+@pytest.mark.asyncio
+async def test_interceptor_bound_context_arms_retention_when_no_browser_session() -> None:
+    result = await _run_download_action_for_wiring(browser_session_id=None, has_interceptor=True)
+
+    result["install"].assert_awaited_once()
+    result["teardown"].assert_awaited_once()
+    assert result["call_log"].index("install") < result["call_log"].index("handle_action")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    [
+        pytest.param(
+            SelectOptionAction(
+                element_id="download-select",
+                option=SelectOption(label="statement", value="statement"),
+                download=True,
+            ),
+            id="select-option",
+        ),
+        pytest.param(
+            DownloadFileAction(file_name="statement.pdf", download=True),
+            id="download-file",
+        ),
+    ],
+)
+async def test_typed_download_actions_arm_retention_beyond_click(action) -> None:
+    # The arming gate must cover the full trigger_download_action set, not just ClickAction.
+    result = await _run_download_action_for_wiring(browser_session_id="pbs-1", action=action)
+
+    result["install"].assert_awaited_once()
+    result["teardown"].assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_managed_session_download_does_not_touch_blob_retention() -> None:
-    install, teardown, _ = await _run_download_action_for_wiring(browser_session_id=None)
+    result = await _run_download_action_for_wiring(browser_session_id=None, has_interceptor=False)
 
-    install.assert_not_awaited()
-    teardown.assert_not_awaited()
+    result["install"].assert_not_awaited()
+    result["teardown"].assert_not_awaited()
 
 
-def test_handler_module_no_longer_imports_blob_retention_install() -> None:
+@pytest.mark.asyncio
+async def test_retention_torn_down_when_action_raises() -> None:
+    async def _boom(*_args: object, **_kwargs: object):
+        raise RuntimeError("click failed mid-action")
+
+    result = await _run_download_action_for_wiring(
+        browser_session_id=None, has_interceptor=True, inner_side_effect=_boom
+    )
+
+    assert isinstance(result["exc"], RuntimeError)
+    result["install"].assert_awaited_once()
+    result["teardown"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_retention_torn_down_on_cancelled() -> None:
+    async def _cancel(*_args: object, **_kwargs: object):
+        raise asyncio.CancelledError()
+
+    result = await _run_download_action_for_wiring(
+        browser_session_id=None, has_interceptor=True, inner_side_effect=_cancel
+    )
+
+    assert isinstance(result["exc"], asyncio.CancelledError)
+    result["install"].assert_awaited_once()
+    result["teardown"].assert_awaited_once()
+
+
+class _FakeActionDownloadObservation:
+    """Neutral provider observation: drops completed remote files into the run dir on its first poll,
+    honoring the ``deadline`` (monotonic) contract strictly (a handler passing per-call ``timeout_seconds``
+    materializes nothing -- the anti-terminal-cleanup RED)."""
+
+    def __init__(self, files: list[tuple[str, bytes]]) -> None:
+        self._pending = list(files)
+        self.poll_deadlines: list[float] = []
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
+        self.poll_deadlines.append(deadline)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for name, data in self._pending:
+            (destination_dir / name).write_bytes(data)
+        self._pending = []
+
+
+class _RaisingActionDownloadObservation:
+    """Provider observation whose poll raises a schema/validation error embedding a presigned URL, mirroring
+    the real leak surface (the vendor list body is parsed into typed rows). When ``materialize_first`` is
+    set, the first poll drops a completed file (so the handler reaches its final poll) and a later poll raises."""
+
+    def __init__(self, error: Exception, *, materialize_first: tuple[str, bytes] | None = None) -> None:
+        self._error = error
+        self._materialize_first = materialize_first
+        self.calls = 0
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
+        self.calls += 1
+        if self._materialize_first is not None and self.calls == 1:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            name, data = self._materialize_first
+            (destination_dir / name).write_bytes(data)
+            return
+        raise self._error
+
+
+class _StallingActionDownloadObservation:
+    """Provider observation whose poll never returns on its own -- only the handler's deadline can end it, so
+    if the handler polls it once a local artifact already accounts for the action the stalled provider would
+    consume the whole download deadline; the fix must never poll it in that case."""
+
+    def __init__(self) -> None:
+        self.poll_calls = 0
+
+    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
+        self.poll_calls += 1
+        await asyncio.Event().wait()
+
+
+class _ActionDownloadSource:
+    """Neutral provider source: hands back a fixed observation and records begin bookkeeping."""
+
+    def __init__(self, observation: object, *, begin_error: Exception | None = None) -> None:
+        self._observation = observation
+        self._begin_error = begin_error
+        self.begin_calls = 0
+        self.begin_deadline: float | None = None
+
+    async def begin_observation(self, *, deadline: float) -> object:
+        self.begin_calls += 1
+        self.begin_deadline = deadline
+        if self._begin_error is not None:
+            raise self._begin_error
+        return self._observation
+
+
+def _secret_bearing_validation_error(presigned_url: str) -> ValidationError:
+    class _Row(BaseModel):
+        size: int
+
+    try:
+        _Row.model_validate({"size": presigned_url})
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+@contextlib.contextmanager
+def _capture_handler_logs() -> Iterator[io.StringIO]:
     import skyvern.webeye.actions.handler as handler_module
 
-    assert not hasattr(handler_module, "install_blob_url_retention")
+    buf = io.StringIO()
+    previous_config = structlog.get_config()
+    structlog.configure(
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+        logger_factory=structlog.PrintLoggerFactory(file=buf),
+        cache_logger_on_first_use=False,
+    )
+    saved_log = handler_module.LOG
+    handler_module.LOG = structlog.get_logger()
+    try:
+        yield buf
+    finally:
+        handler_module.LOG = saved_log
+        structlog.configure(**previous_config)
+
+
+async def _run_download_action_with_provider_source(
+    source: _ActionDownloadSource, *, inner: Callable[[Path], None] | None = None
+) -> tuple[list[object], object]:
+    """Drive ``handle_action`` with ``source`` wired as the vendor download seam.
+
+    ``inner`` (given the run dir) simulates whatever the click itself produces locally before the
+    provider poll runs; by default the click yields no local file and no download event.
+    """
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    task.download_timeout = 0.2
+
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    browser_state.browser_artifacts.get_action_download_source = MagicMock(return_value=source)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            if inner is not None:
+                inner(Path(temp_dir))
+            return [ActionSuccess()]
+
+        settle = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.get_run_temp_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=settle,
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await asyncio.wait_for(
+                ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                ),
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+            )
+    return results, action
+
+
+# Short enough that pydantic embeds it verbatim (long inputs are truncated), so the full presigned URL is
+# present in the exception the handler catches.
+_PRESIGNED_URL = "https://s3.aws/f?sig=SECRETSIGMARKER"
+
+
+@pytest.mark.asyncio
+async def test_handle_action_credits_provider_download_materialized_during_poll() -> None:
+    # PBS-like timing for a provider-owned download: with a pre-click baseline frozen, a completed remote file
+    # appears only during the post-action poll (no download event, no cleanup), and the SAME action is credited.
+    observation = _FakeActionDownloadObservation([("report.pdf", b"ready")])
+    source = _ActionDownloadSource(observation)
+    results, action = await _run_download_action_with_provider_source(source)
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["report.pdf"]
+    # Baseline was frozen exactly once before the click.
+    assert source.begin_calls == 1
+    assert source.begin_deadline is not None
+    # Every provider poll shared one monotonic deadline (no fresh per-call full timeout).
+    assert observation.poll_deadlines
+    assert all(isinstance(d, float) for d in observation.poll_deadlines)
+    assert len(set(observation.poll_deadlines)) == 1
+
+
+@pytest.mark.asyncio
+async def test_baseline_failure_never_logs_secret_bearing_url_and_stays_fail_open() -> None:
+    # begin_observation parses the vendor list into typed rows; a schema error there carries the raw presigned
+    # URL. The baseline catch must log only error_type and stay fail-open (provider-diff off, local download counts).
+    error = _secret_bearing_validation_error(_PRESIGNED_URL)
+    assert "SECRETSIGMARKER" in str(error)  # the exception itself carries the secret
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]), begin_error=error)
+
+    with _capture_handler_logs() as buf:
+        results, action = await _run_download_action_with_provider_source(
+            source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+        )
+
+    rendered = buf.getvalue()
+    assert source.begin_calls == 1
+    assert "Provider download baseline unavailable" in rendered  # the failure is still surfaced
+    assert "ValidationError" in rendered  # as non-secret metadata (error_type)
+    assert _PRESIGNED_URL not in rendered
+    assert "SECRETSIGMARKER" not in rendered
+    assert "s3.aws" not in rendered
+    # Fail-open: the failed baseline never disturbs the existing local download path.
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["local.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_baseline_cancellation_propagates() -> None:
+    # A CancelledError from begin_observation must propagate unchanged, never be swallowed by the catch.
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]), begin_error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _run_download_action_with_provider_source(source)
+
+
+@pytest.mark.asyncio
+async def test_mid_poll_failure_never_logs_secret_bearing_url() -> None:
+    # A schema/validation error while paging the provider list embeds the raw presigned URL. The mid-poll
+    # catch must record only non-secret metadata (error_type), never the exception/traceback, so it can't leak.
+    error = _secret_bearing_validation_error(_PRESIGNED_URL)
+    assert "SECRETSIGMARKER" in str(error)  # the exception itself carries the secret
+    observation = _RaisingActionDownloadObservation(error)
+    source = _ActionDownloadSource(observation)
+
+    with _capture_handler_logs() as buf:
+        await _run_download_action_with_provider_source(source)
+
+    rendered = buf.getvalue()
+    assert observation.calls >= 1
+    assert "Provider download poll failed" in rendered  # the failure is still surfaced
+    assert "ValidationError" in rendered  # as non-secret metadata (error_type)
+    assert _PRESIGNED_URL not in rendered
+    assert "SECRETSIGMARKER" not in rendered
+    assert "s3.aws" not in rendered
+
+
+class _RampingMonotonic:
+    """A monotonic clock that advances a fixed step on every read, so the download-event grace elapses
+    deterministically without real sleeps. Non-monotonic attributes defer to the real ``time`` module."""
+
+    def __init__(self, step: float) -> None:
+        self._t = 0.0
+        self._step = step
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        current = self._t
+        self._t += self._step
+        return current
+
+
+@pytest.mark.asyncio
+async def test_final_poll_failure_never_logs_secret_bearing_url() -> None:
+    # download_triggered arrives with NO local artifact: a download event fires but persists empty, so the run
+    # dir stays empty -- the "signal but no artifact" case the finalize poll must service. Here it raises the secret.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    # Keep the hard timeout far above the event grace (min(60, timeout)) so the empty-persist path fires.
+    task.download_timeout = 3600.0
+
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+
+    error = _secret_bearing_validation_error(_PRESIGNED_URL)
+    observation = _RaisingActionDownloadObservation(error)
+    source = _ActionDownloadSource(observation)
+    browser_state.browser_artifacts.get_action_download_source = MagicMock(return_value=source)
+
+    clock = _RampingMonotonic(step=100.0)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            # Fire the browser download event the handler registered before the inner action, so a
+            # download signal exists without any file landing in the run directory.
+            for call in page.on.call_args_list:
+                if call.args and call.args[0] == "download":
+                    call.args[1](_download())
+                    break
+            return [ActionSuccess()]
+
+        settle = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        with _capture_handler_logs() as buf:
+            with (
+                patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+                patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+                patch("skyvern.webeye.actions.handler.get_run_temp_dir", return_value=temp_dir),
+                patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+                patch("skyvern.webeye.actions.handler.time", clock),
+                patch(
+                    "skyvern.webeye.actions.handler._persist_captured_download",
+                    new=AsyncMock(return_value=SimpleNamespace(path=None, outcome="empty")),
+                ),
+                patch(
+                    "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                    new=settle,
+                ),
+                patch("skyvern.webeye.actions.handler.app", mock_app),
+            ):
+                results = await asyncio.wait_for(
+                    ActionHandler.handle_action(
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                        page=page,
+                        action=action,
+                    ),
+                    timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+                )
+
+    rendered = buf.getvalue()
+    assert results[-1].download_triggered is True  # a signal existed with no local artifact
+    assert observation.calls >= 2  # the mid-wait poll and the finalize poll both ran and raised
+    assert "Final provider download poll failed" in rendered
+    assert "ValidationError" in rendered
+    assert _PRESIGNED_URL not in rendered
+    assert "SECRETSIGMARKER" not in rendered
+    assert "s3.aws" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_local_signal_skips_provider_poll_and_stalled_provider_cannot_consume_deadline() -> None:
+    # The existing CDP/local path saves the file before the wait loop runs. The handler must evaluate that local
+    # delta first and never poll the provider (a stalled one cannot consume the deadline); the local file is credited.
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+    results, action = await _run_download_action_with_provider_source(
+        source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+    )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["local.pdf"]
+    assert observation.poll_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_local_artifact_skips_provider_at_finalization_without_duplicate() -> None:
+    # A local artifact already accounts for the action before finalization, so the finalize-time provider poll
+    # must be skipped -- else a second materialization credits an extra, collision-suffixed copy (a distinct file).
+    observation = _FakeActionDownloadObservation([("provider_extra.pdf", b"provider")])
+    source = _ActionDownloadSource(observation)
+    results, action = await _run_download_action_with_provider_source(
+        source, inner=lambda run_dir: (run_dir / "report.pdf").write_bytes(b"local")
+    )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["report.pdf"]
+    assert observation.poll_deadlines == []

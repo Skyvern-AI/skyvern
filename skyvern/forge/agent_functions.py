@@ -70,6 +70,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.taskv3.auto_observe import AutoObserveDecision, auto_observe_from_setting
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
@@ -238,10 +239,18 @@ class CodeBlockEngineFailure:
     accepted_user_defined_error: UserDefinedError | None = None
 
 
+@dataclass(frozen=True)
+class CodeBlockDownloadOperationReceipt:
+    """Structured proof that the secure runner invoked the brokered download operation."""
+
+    operation: Literal["click_and_claim_download"] = "click_and_claim_download"
+
+
 @dataclass
 class CodeBlockEngineResult:
     block_result: BlockResult | None
     failure: CodeBlockEngineFailure | None
+    download_operation_receipt: CodeBlockDownloadOperationReceipt | None = None
 
 
 def _remove_rect(element: dict) -> None:
@@ -881,6 +890,17 @@ class AgentFunction:
         ab_eligible: bool = True,
     ) -> RunEngine:
         return requested_engine
+
+    # OSS resolves auto-observe from the static setting; cloud overrides to bucket a run per task_id.
+    async def resolve_task_v3_auto_observe(
+        self, *, task_id: str | None, organization_id: str | None, workflow_permanent_id: str | None = None
+    ) -> AutoObserveDecision:
+        return auto_observe_from_setting()
+
+    # OSS has no ATS-scoped guidance; cloud overrides to supply pre-authorized eligibility defaults
+    # behind a flag when the task targets a gated application-tracking-system host.
+    async def resolve_task_v3_extra_guidance(self, *, task: Task, organization: Organization) -> str | None:
+        return None
 
     async def record_run_duration(
         self,
@@ -1841,6 +1861,7 @@ class AgentFunction:
         ``required_scopes`` gates use of a credential whose grant does not cover
         the API the caller is about to use.
         """
+        credential_id = await self.resolve_google_credential_id(organization_id, credential_id)
         try:
             secrets = await google_oauth_service.load_credential_secrets(
                 organization_id=organization_id,

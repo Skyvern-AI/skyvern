@@ -511,6 +511,30 @@ async def test_resolve_browser_requires_matching_organization_and_credential_for
     fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_copilot")
 
 
+def test_copilot_session_registry_preserves_each_parallel_registration() -> None:
+    first = session_manager.SessionState()
+    second = session_manager.SessionState()
+
+    session_manager.register_copilot_session("pbs_shared", first, organization_id="org_shared")
+    session_manager.register_copilot_session("pbs_shared", second, organization_id="org_shared")
+
+    assert session_manager._registered_copilot_session("pbs_shared", organization_id="org_shared") is second
+
+    session_manager.unregister_copilot_session(
+        "pbs_shared",
+        organization_id="org_shared",
+        expected_state=second,
+    )
+    assert session_manager._registered_copilot_session("pbs_shared", organization_id="org_shared") is first
+
+    session_manager.unregister_copilot_session(
+        "pbs_shared",
+        organization_id="org_shared",
+        expected_state=first,
+    )
+    assert session_manager._registered_copilot_session("pbs_shared", organization_id="org_shared") is None
+
+
 @pytest.mark.asyncio
 async def test_resolve_browser_stateless_mode_does_not_write_global_session(monkeypatch: pytest.MonkeyPatch) -> None:
     global_state = session_manager.SessionState(

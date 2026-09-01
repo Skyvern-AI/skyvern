@@ -17,12 +17,6 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import contains_internal_machinery_leak
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
-from skyvern.forge.sdk.copilot.output_policy import (
-    CopilotOutputKind,
-    OutputPolicyReason,
-    evaluate_output_policy,
-)
 
 _ANTI_RERUN_GUARD_TEXT = (
     "The prior PER_TOOL_BUDGET run for run wr_538488327000571062 advanced the live browser at "
@@ -73,15 +67,6 @@ class TestInternalMachineryLeakPredicate:
     def test_product_language_is_clean(self, text: str) -> None:
         assert contains_internal_machinery_leak(text) is False
 
-    def test_output_policy_hard_blocks_guard_text(self) -> None:
-        verdict = evaluate_output_policy(
-            request_policy=None,
-            response_type="REPLY",
-            user_response=_ANTI_RERUN_GUARD_TEXT,
-            output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        )
-        assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
-
 
 class TestRecordedFailureReply:
     def test_guard_text_renders_observed_facts_not_test_failed(self) -> None:
@@ -103,20 +88,6 @@ class TestRecordedFailureReply:
         assert "ran out of time" in reply
         assert "1-block draft" in reply
         assert "https://www.example.com/registry" in reply
-
-    def test_budget_paced_run_does_not_render_as_test_failed(self) -> None:
-        ctx = _ctx()
-        ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[object()]))
-        ctx.last_update_block_count = 1
-        ctx.last_test_ok = False
-        ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
-        ctx.last_test_failure_reason = "The run was canceled while still making progress."
-
-        reply = _recorded_failure_reply(ctx)
-
-        assert reply is not None
-        assert "the test failed" not in reply
-        assert "ran out of time" in reply
 
     def test_fragment_cleaner_substitutes_guard_text(self) -> None:
         cleaned = _clean_recorded_failure_text(_ANTI_RERUN_GUARD_TEXT)

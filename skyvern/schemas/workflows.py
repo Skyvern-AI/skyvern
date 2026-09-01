@@ -502,6 +502,7 @@ class BlockType(StrEnum):
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
     EMAIL_INBOX = "email_inbox"
+    DATA_EXPORT = "data_export"
 
 
 class AIFallbackMode(StrEnum):
@@ -733,6 +734,7 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD  # type: ignore
     vault_id: str
     item_id: str
+    totp_field_name: str | None = None
 
 
 class AzureVaultCredentialParameterYAML(ParameterYAML):
@@ -1272,6 +1274,15 @@ class HumanInteractionBlockYAML(BlockYAML):
     body: str = "Your interaction is required for a workflow run!"
 
 
+class DataExportBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.DATA_EXPORT] = BlockType.DATA_EXPORT  # type: ignore
+
+    data: str
+    data_schema: dict[str, Any]
+    file_name: str | None = None
+    parameter_keys: list[str] | None = None
+
+
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
@@ -1493,6 +1504,7 @@ BLOCK_YAML_SUBCLASSES = (
     | WaitBlockYAML
     | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
+    | DataExportBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML

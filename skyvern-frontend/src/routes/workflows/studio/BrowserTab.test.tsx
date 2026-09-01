@@ -305,10 +305,27 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("hero-recording")).toBeTruthy();
   });
 
+  it("keeps a finished Copilot-focused run on the live debug browser", () => {
+    seedRun({ status: Status.Completed });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          actions: [buildAction({ screenshot_artifact_id: null })],
+        }),
+      ),
+    ];
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
+
+    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+    expect(screen.queryByTestId("hero-screenshot")).toBeNull();
+  });
+
   it("shows the inspected step's screenshot when ?active= is set", () => {
     seedRun({ status: Status.Completed });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=act_1`);
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot&active=act_1`);
 
     const shot = screen.getByTestId("hero-screenshot");
     expect(JSON.parse(shot.getAttribute("data-selection") ?? "{}")).toEqual({
@@ -424,6 +441,23 @@ describe("BrowserTab view machine", () => {
 });
 
 describe("BrowserTab pills and selection sync", () => {
+  it("keeps explicit view controls authoritative during Copilot focus", () => {
+    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
+
+    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Screenshots" }));
+    expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    expect(screen.getByTestId("hero-recording")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Debug browser" }));
+    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+  });
+
   it("switches views from the header pills", () => {
     seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
     mocks.debugSession = { browser_session_id: "pbs_test" };

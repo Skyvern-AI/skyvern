@@ -1,12 +1,10 @@
 import {
   CheckIcon,
   CursorArrowIcon,
-  EnterFullScreenIcon,
   PauseIcon,
   Pencil1Icon,
   PlayIcon,
   TrashIcon,
-  ZoomInIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
@@ -22,15 +20,18 @@ import {
 } from "@/components/ui/dialog";
 import { useRecordingElapsedSeconds } from "@/hooks/useRecordingElapsedSeconds";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
+import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
+import {
+  CredentialModalTypes,
+  type CredentialModalType,
+} from "@/routes/credentials/useCredentialModalState";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   applyDraftStepOverlays,
-  findScreenshotForStep,
   useRecordingStore,
   type RecordingActionKind,
   type RecordingDraftStep,
-  type RecordingScreenshot,
 } from "@/store/useRecordingStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import { formatRecordingClock } from "@/util/recordingClock";
@@ -83,69 +84,73 @@ function formatDraftStepDisplayTitle(step: RecordingDraftStep): string {
   return step.label;
 }
 
-function StepScreenshot({ screenshot }: { screenshot: RecordingScreenshot }) {
-  const [showFullPage, setShowFullPage] = useState(false);
-  const xp = screenshot.xp ?? 0.5;
-  const yp = screenshot.yp ?? 0.5;
+function credentialPromptForKind(
+  kind: NonNullable<RecordingDraftStep["credential_kind"]>,
+): {
+  type: CredentialModalType;
+  defaultTotpType?: "authenticator" | "email";
+  heading: string;
+  buttonLabel: string;
+} {
+  switch (kind) {
+    case "credit_card":
+      return {
+        type: CredentialModalTypes.CREDIT_CARD,
+        heading: "Add Credit Card",
+        buttonLabel: "Add credit card",
+      };
+    case "secret":
+      return {
+        type: CredentialModalTypes.SECRET,
+        heading: "Add Secret",
+        buttonLabel: "Add secret",
+      };
+    case "totp":
+      return {
+        type: CredentialModalTypes.PASSWORD,
+        defaultTotpType: "authenticator",
+        heading: "Add Two-Factor Authentication",
+        buttonLabel: "Add two-factor authentication",
+      };
+    case "magic_link":
+      return {
+        type: CredentialModalTypes.PASSWORD,
+        defaultTotpType: "email",
+        heading: "Add Magic Link",
+        buttonLabel: "Add magic link",
+      };
+  }
 
-  return (
-    <div className="group/shot relative h-36 overflow-hidden rounded-md border bg-black">
-      <div
-        className="absolute inset-0"
-        style={
-          showFullPage
-            ? {
-                backgroundImage: `url(${screenshot.dataUrl})`,
-                backgroundSize: "contain",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: "center",
-              }
-            : {
-                // background-position p% pins image point p% to container
-                // point p%, keeping the zoomed crop in-bounds with the click
-                // point at the same relative spot as the ring below.
-                backgroundImage: `url(${screenshot.dataUrl})`,
-                backgroundSize: "250% auto",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: `${xp * 100}% ${yp * 100}%`,
-              }
-        }
-      />
-      <button
-        type="button"
-        className="absolute bottom-2 right-2 inline-flex items-center gap-1 rounded bg-black/70 px-2 py-1 text-[10.5px] text-slate-200 opacity-0 transition-opacity group-hover/shot:opacity-100"
-        onClick={() => setShowFullPage(!showFullPage)}
-      >
-        {showFullPage ? (
-          <>
-            <ZoomInIcon className="h-3 w-3" />
-            Zoom to action
-          </>
-        ) : (
-          <>
-            <EnterFullScreenIcon className="h-3 w-3" />
-            Full page
-          </>
-        )}
-      </button>
-    </div>
-  );
+  // "password", plus any kind a backend one deploy ahead sends that this bundle has never
+  // seen. This runs during render, so falling off the end would throw on `.buttonLabel`
+  // and unmount the editor rather than degrade the single button.
+  return {
+    type: CredentialModalTypes.PASSWORD,
+    heading: "Add Password",
+    buttonLabel: "Add password",
+  };
 }
 
 function DraftStepCard({
   step,
   index,
   baselineMs,
-  screenshot,
   onDelete,
   onRename,
+  showCredentialPrompt,
+  addCredentialLabel,
+  onAddCredentials,
+  onDismissCredential,
 }: {
   step: RecordingDraftStep;
   index: number;
   baselineMs: number | null;
-  screenshot: RecordingScreenshot | null;
   onDelete: () => void;
   onRename: (value: string) => void;
+  showCredentialPrompt: boolean;
+  addCredentialLabel: string;
+  onAddCredentials: () => void;
+  onDismissCredential: () => void;
 }) {
   const beginDraftEdit = useRecordingStore((state) => state.beginDraftEdit);
   const endDraftEdit = useRecordingStore((state) => state.endDraftEdit);
@@ -262,9 +267,25 @@ function DraftStepCard({
           </button>
         </div>
       </div>
-      {screenshot && (
-        <div className="pl-8">
-          <StepScreenshot screenshot={screenshot} />
+      {showCredentialPrompt && (
+        <div className="flex flex-wrap items-center gap-2 pl-8">
+          <Button
+            type="button"
+            size="sm"
+            className="h-7"
+            onClick={onAddCredentials}
+          >
+            {addCredentialLabel}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7"
+            onClick={onDismissCredential}
+          >
+            Dismiss
+          </Button>
         </div>
       )}
     </div>
@@ -335,6 +356,14 @@ function RecordingPanel({ browserSessionId }: Props) {
   // the mutation guard throw.
   const browserSessionMissing = !browserSessionId;
   const [confirmDiscardOpen, setConfirmDiscardOpen] = useState(false);
+  const [credentialModal, setCredentialModal] = useState<{
+    type: CredentialModalType;
+    testUrl: string | null;
+    url: string | null;
+    stepId: string;
+    defaultTotpType?: "authenticator" | "email";
+    heading: string;
+  } | null>(null);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
   const committedRef = useRef(false);
 
@@ -345,7 +374,7 @@ function RecordingPanel({ browserSessionId }: Props) {
     draftSteps,
     deletedStepIds,
     stepPatches,
-    screenshots,
+    dismissedCredentialStepIds,
     sessionRevision,
     optimisticSteps: rawOptimisticSteps,
     workflowPermanentId,
@@ -360,7 +389,7 @@ function RecordingPanel({ browserSessionId }: Props) {
       draftSteps: state.draftSteps,
       deletedStepIds: state.deletedStepIds,
       stepPatches: state.stepPatches,
-      screenshots: state.screenshots,
+      dismissedCredentialStepIds: state.dismissedCredentialStepIds,
       sessionRevision: state.sessionRevision,
       optimisticSteps: state.optimisticSteps,
       workflowPermanentId: state.workflowPermanentId,
@@ -552,7 +581,34 @@ function RecordingPanel({ browserSessionId }: Props) {
               step={step}
               index={index}
               baselineMs={baselineMs}
-              screenshot={findScreenshotForStep(step, screenshots)}
+              showCredentialPrompt={
+                Boolean(step.credential_kind) &&
+                !dismissedCredentialStepIds.includes(step.step_id)
+              }
+              addCredentialLabel={
+                step.credential_kind
+                  ? credentialPromptForKind(step.credential_kind).buttonLabel
+                  : "Add to credentials"
+              }
+              onAddCredentials={() => {
+                if (!step.credential_kind) {
+                  return;
+                }
+                const prompt = credentialPromptForKind(step.credential_kind);
+                setCredentialModal({
+                  type: prompt.type,
+                  defaultTotpType: prompt.defaultTotpType,
+                  heading: prompt.heading,
+                  testUrl: step.url ?? null,
+                  url: step.url ?? null,
+                  stepId: step.step_id,
+                });
+              }}
+              onDismissCredential={() =>
+                useRecordingStore
+                  .getState()
+                  .dismissCredentialPrompt(step.step_id)
+              }
               onDelete={() =>
                 useRecordingStore.getState().deleteDraftStep(step.step_id)
               }
@@ -671,6 +727,29 @@ function RecordingPanel({ browserSessionId }: Props) {
           </DialogContent>
         </Dialog>
       )}
+      {credentialModal ? (
+        <CredentialsModal
+          isOpen
+          overrideType={credentialModal.type}
+          defaultTestUrl={credentialModal.testUrl ?? undefined}
+          defaultTotpType={credentialModal.defaultTotpType}
+          heading={credentialModal.heading}
+          onOpenChange={(open) => {
+            if (!open) {
+              setCredentialModal(null);
+            }
+          }}
+          onCredentialCreated={() => {
+            const store = useRecordingStore.getState();
+            if (credentialModal.url) {
+              store.dismissCredentialPromptsForUrl(credentialModal.url);
+            } else {
+              store.dismissCredentialPrompt(credentialModal.stepId);
+            }
+            setCredentialModal(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

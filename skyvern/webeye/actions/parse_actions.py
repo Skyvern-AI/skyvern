@@ -1,6 +1,6 @@
 import ast
 import re
-from typing import Any, Dict, Match
+from typing import Any, Dict, Match, Sequence
 from urllib.parse import urlparse
 
 import structlog
@@ -453,6 +453,7 @@ async def parse_cua_actions(
     task: Task,
     step: Step,
     response: OpenAIResponse,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> list[Action]:
     computer_calls = [item for item in response.output if item.type == "computer_call"]
     reasonings = [item for item in response.output if item.type == "reasoning"]
@@ -598,7 +599,9 @@ async def parse_cua_actions(
         )
         reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
         assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
-        actions = await generate_cua_fallback_actions(task, step, assistant_message, reasoning)
+        actions = await generate_cua_fallback_actions(
+            task, step, assistant_message, reasoning, allowed_credential_parameter_keys
+        )
     return actions
 
 
@@ -608,6 +611,7 @@ async def parse_anthropic_actions(
     assistant_content: list[dict[str, Any]],
     browser_window_dimension: Resolution,
     screenshot_resize_target_dimension: Resolution,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> list[Action]:
     tool_calls = [block for block in assistant_content if block["type"] == "tool_use" and block["name"] == "computer"]
     reasonings = [block for block in assistant_content if block["type"] == "thinking"]
@@ -932,7 +936,9 @@ async def parse_anthropic_actions(
         reasoning = reasonings[0]["thinking"] if reasonings else None
         assistant_messages = [block for block in assistant_content if block["type"] == "text"]
         assistant_message = assistant_messages[0]["text"] if assistant_messages else None
-        actions = await generate_cua_fallback_actions(task, step, assistant_message, reasoning)
+        actions = await generate_cua_fallback_actions(
+            task, step, assistant_message, reasoning, allowed_credential_parameter_keys
+        )
     return actions
 
 
@@ -956,6 +962,7 @@ async def generate_cua_fallback_actions(
     step: Step,
     assistant_message: str | None,
     reasoning: str | None,
+    allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> list[Action]:
     fallback_action_prompt = prompt_engine.load_prompt(
         "cua-fallback-action",
@@ -1078,7 +1085,11 @@ async def generate_cua_fallback_actions(
 
     elif skyvern_action_type == "get_verification_code":
         try:
-            otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
+            otp_value = await resolve_otp_value(
+                task,
+                expected_otp_type=OTPType.TOTP,
+                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+            )
         except NoTOTPVerificationCodeFound as e:
             otp_value = None
             reasoning_suffix = f"No verification code found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
@@ -1101,7 +1112,7 @@ async def generate_cua_fallback_actions(
             # Three-way classification: missing config, configured-but-empty (any of
             # URL / identifier / credential), or wrong-type otp_value. Each gets a
             # distinct customer-visible signal so webhook consumers can branch.
-            has_credential = has_credential_totp_candidate(task.workflow_run_id)
+            has_credential = has_credential_totp_candidate(task.workflow_run_id, allowed_credential_parameter_keys)
             no_source_configured = (
                 otp_value is None and not task.totp_verification_url and not task.totp_identifier and not has_credential
             )

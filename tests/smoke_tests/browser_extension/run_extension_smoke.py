@@ -29,6 +29,7 @@ EXPECTED_EXTENSION_ID = EXTENSION_ID
 TOKEN_ENV = "SKYVERN_BROWSER_EXTENSION_TOKEN"
 PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
 BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
+CHROME_FOR_TESTING_PATH_ENV = "CHROME_FOR_TESTING_PATH"
 SMOKE_TEXT = "Skyvern extension bridge smoke"
 CHECKS = (
     "setup",
@@ -325,6 +326,17 @@ async def _wait_for_popup_connection(popup_page: Page, timeout_seconds: float = 
     raise TimeoutError(f"extension did not reconnect to MCP relay; popup error: {error or 'none'}")
 
 
+async def _wait_for_popup_disconnection(popup_page: Page, timeout_seconds: float = 15.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        status = (await popup_page.locator("#status-label").text_content() or "").strip()
+        if status not in {"Connected", "Client attached"}:
+            return
+        await asyncio.sleep(0.1)
+    raise TimeoutError("extension popup did not observe relay shutdown")
+
+
 async def _wait_for_fixture_page(context: BrowserContext, fixture_url: str, timeout_seconds: float = 15.0) -> Page:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
@@ -596,9 +608,15 @@ async def run_smoke(*, legacy_mode: bool) -> int:
         playwright = await async_playwright().start()
         profile_dir = tempfile.TemporaryDirectory(prefix="skyvern-extension-smoke-profile-")
         extension_path = str(extension_dir)
+        chrome_path_value = os.environ.get(CHROME_FOR_TESTING_PATH_ENV)
+        if not chrome_path_value:
+            raise RuntimeError(f"{CHROME_FOR_TESTING_PATH_ENV} must point to Chrome for Testing 138 or later")
+        chrome_path = Path(chrome_path_value).expanduser().resolve()
+        if not chrome_path.is_file() or not os.access(chrome_path, os.X_OK):
+            raise RuntimeError(f"{CHROME_FOR_TESTING_PATH_ENV} is not an executable file: {chrome_path}")
         persistent_context = await playwright.chromium.launch_persistent_context(
             profile_dir.name,
-            channel="chromium",
+            executable_path=str(chrome_path),
             headless=False,
             args=[
                 f"--disable-extensions-except={extension_path}",
@@ -652,11 +670,13 @@ async def run_smoke(*, legacy_mode: bool) -> int:
         report.pass_check("chrome survives disconnect")
 
         await runtime.shutdown()
+        await _wait_for_popup_disconnection(popup_page)
         runtime = None
+        mcp_fixture_url = f"{fixture_servers.outer_url}?phase=mcp"
         await _run_mcp_phase(
             persistent_context,
             popup_page,
-            fixture_servers.outer_url,
+            mcp_fixture_url,
             relay_port,
             pairing_token,
             legacy_mode,

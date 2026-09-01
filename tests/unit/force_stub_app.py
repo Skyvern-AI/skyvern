@@ -45,6 +45,11 @@ def create_forge_stub_app() -> ForgeApp:
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
+    # Auto-mocked, its truthy MagicMock decision would switch auto-observe on for every engine test.
+    fake_app_module.AGENT_FUNCTION.resolve_task_v3_auto_observe = base_agent_function.resolve_task_v3_auto_observe
+    # Same footgun: _LazyNamespace's truthy AsyncMock would inject extra guidance text into every
+    # v3 task's extra_system_guidance join.
+    fake_app_module.AGENT_FUNCTION.resolve_task_v3_extra_guidance = base_agent_function.resolve_task_v3_extra_guidance
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
     fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
         base_agent_function.redact_codeblock_parameter_values

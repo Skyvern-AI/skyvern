@@ -37,6 +37,18 @@ function isScopeRevocation(error) {
   );
 }
 
+// Unparseable URLs fail closed: the change cancels the operation.
+function urlChangeMatchesExpected(expectedUrl, url) {
+  if (expectedUrl === null || expectedUrl === url) {
+    return true;
+  }
+  try {
+    return new URL(expectedUrl).href === new URL(url).href;
+  } catch {
+    return false;
+  }
+}
+
 export class TabScope {
   constructor({ sendEvent, operationTimeoutMs = TAB_OPERATION_TIMEOUT_MS }) {
     this.sendEvent = sendEvent;
@@ -206,9 +218,11 @@ export class TabScope {
     return this.quarantinedTabIds.has(tabId);
   }
 
-  cancelTabOperations(tabId, error) {
+  cancelTabOperations(tabId, error, shouldCancel = null) {
     for (const lease of this.tabOperationLeases.get(tabId) ?? []) {
-      lease.cancel(error);
+      if (shouldCancel === null || shouldCancel(lease)) {
+        lease.cancel(error);
+      }
     }
   }
   trackTabOperationLease(tabId, lease) {
@@ -240,8 +254,10 @@ export class TabScope {
             ? "Chrome does not allow controlling this URL."
             : "The page changed while the extension operation was running.",
         ),
+        restricted
+          ? null
+          : (lease) => !lease.consumeUrlChangeGrant(changeInfo.url),
       );
-      return;
     }
     if (
       Object.hasOwn(changeInfo, "groupId") &&
@@ -1081,6 +1097,7 @@ export class TabScope {
     let rejectInvalidated;
     let cancelled = false;
     let cancellationError = null;
+    let pendingUrlChangeGrant = null;
     const invalidated = new Promise((_, reject) => {
       rejectInvalidated = reject;
     });
@@ -1089,6 +1106,21 @@ export class TabScope {
       invalidated,
       isCurrent: () => !cancelled && generation === this.operationGeneration,
       remainingMs: () => Math.max(0, deadlineMs - Date.now()),
+      // One grant per commanded navigation: consumed by the first URL-change
+      // decision, revoked when the command fails, never carried past either.
+      allowUrlChange: (expectedUrl = null) => {
+        pendingUrlChangeGrant = { expectedUrl };
+      },
+      revokeUrlChange: () => {
+        pendingUrlChangeGrant = null;
+      },
+      consumeUrlChangeGrant: (url) => {
+        const grant = pendingUrlChangeGrant;
+        pendingUrlChangeGrant = null;
+        return (
+          grant !== null && urlChangeMatchesExpected(grant.expectedUrl, url)
+        );
+      },
       assertCurrent: () => {
         if (cancelled || generation !== this.operationGeneration) {
           throw (

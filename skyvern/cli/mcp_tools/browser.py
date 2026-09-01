@@ -77,6 +77,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
+from skyvern.webeye.actions.handler_utils import strategy_aware_input
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
@@ -1331,80 +1332,114 @@ async def skyvern_type(
     )
     source_url = _trajectory_source_url(page)
 
-    # DOM-level guard: check if the target element is a password field
-    if selector:
-        try:
-            is_password_field = await page.evaluate(
-                "(s) => { const el = document.querySelector(s); return el && el.type === 'password' }",
-                selector,
-            )
-        except Exception as exc:
-            # Selector may not be a valid CSS selector (e.g. xpath=...) or page may
-            # not be ready. Fall through to the existing regex guard in that case.
-            LOG.debug("DOM password check failed for selector %r: %s", selector, exc)
-            is_password_field = False
-        if is_password_field:
-            return action_result(
-                "skyvern_type",
-                ok=False,
-                error=make_error(
-                    ErrorCode.INVALID_INPUT,
-                    TYPE_PASSWORD_REFUSAL_MESSAGE,
-                    CREDENTIAL_HINT,
-                ),
-            )
-
     clear_content = clear if clear_first is None else clear_first
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
     skip_element_prep = selector is not None and ai_mode is None and not deterministic
+    aggregate_timeout_seconds = action_timeout / 1000 if direct_action and action_timeout > 0 else None
 
     with Timer() as timer:
         try:
-            # selector_mode="direct" pins the selector with no AI fall-back. Resilient (default) and
-            # intent-only calls keep AI; emitted scripts keep the selector+prompt fallback via
-            # sdk_equivalent for DOM-drift resilience.
-            if coordinate_target is not None:
-                assert x is not None and y is not None
-                await do_type_at(
-                    page,
-                    x,
-                    y,
-                    text,
-                    clear_first=clear_content,
-                    press_enter=press_enter,
-                )
-            elif clear_content:
-                if deterministic:
-                    assert selector is not None
-                    await page.fill(selector, text, mode="direct", timeout=action_timeout)
-                elif ai_mode is not None:
-                    await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=action_timeout)  # type: ignore[arg-type]
+            async with asyncio.timeout(aggregate_timeout_seconds):
+                # DOM-level guard: inspect the same active-scope first match used by direct strategy typing.
+                scoped_first_locator = None
+                if selector:
+                    try:
+                        scoped_first_locator = page.locator_scope.locator(selector).first
+                        is_password_field = await scoped_first_locator.evaluate(
+                            "el => el.tagName === 'INPUT' && "
+                            "(el.getAttribute('type') || '').toLowerCase() === 'password'"
+                        )
+                    except Exception as exc:
+                        # Selector may be invalid or the page may not be ready. Fall through to the
+                        # existing credential-intent guard in that case.
+                        LOG.debug("DOM password check failed for selector %r: %s", selector, exc)
+                        is_password_field = False
+                    if is_password_field:
+                        return action_result(
+                            "skyvern_type",
+                            ok=False,
+                            error=make_error(
+                                ErrorCode.INVALID_INPUT,
+                                TYPE_PASSWORD_REFUSAL_MESSAGE,
+                                CREDENTIAL_HINT,
+                            ),
+                        )
+
+                # selector_mode="direct" pins the selector with no AI fall-back. Resilient (default) and
+                # intent-only calls keep AI; emitted scripts keep the selector+prompt fallback via
+                # sdk_equivalent for DOM-drift resilience.
+                if coordinate_target is not None:
+                    assert x is not None and y is not None
+                    await do_type_at(
+                        page,
+                        x,
+                        y,
+                        text,
+                        clear_first=clear_content,
+                        press_enter=press_enter,
+                    )
+                elif clear_content:
+                    if deterministic:
+                        assert selector is not None
+                        locator = (
+                            scoped_first_locator
+                            if scoped_first_locator is not None
+                            else page.locator_scope.locator(selector).first
+                        )
+                        await strategy_aware_input(
+                            locator,
+                            text,
+                            clear=True,
+                            timeout=action_timeout,
+                            dispatch_change_and_blur=True,
+                        )
+                    elif ai_mode is not None:
+                        assert intent is not None
+                        await page.fill(
+                            selector=selector,
+                            value=text,
+                            prompt=intent,
+                            ai=ai_mode,
+                            timeout=action_timeout,
+                        )
+                    else:
+                        assert selector is not None
+                        fill_kwargs: dict[str, Any] = {"timeout": action_timeout}
+                        if isinstance(page, SkyvernPage):
+                            fill_kwargs["_skip_element_prep"] = skip_element_prep
+                        await page.fill(selector, text, **fill_kwargs)
                 else:
-                    assert selector is not None
-                    fill_kwargs: dict[str, Any] = {"timeout": action_timeout}
-                    if isinstance(page, SkyvernPage):
-                        fill_kwargs["_skip_element_prep"] = skip_element_prep
-                    await page.fill(selector, text, **fill_kwargs)
-            else:
-                kwargs: dict[str, Any] = {"timeout": action_timeout}
-                if delay is not None:
-                    kwargs["delay"] = delay
-                if deterministic:
-                    await page.type(selector, text, ai=None, **kwargs)
-                elif ai_mode is not None:
-                    loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
-                    await loc.type(text, **kwargs)
-                else:
-                    assert selector is not None
-                    if isinstance(page, SkyvernPage):
-                        kwargs["_skip_element_prep"] = skip_element_prep
-                    await page.type(selector, text, **kwargs)
-            if coordinate_target is None and press_enter:
-                raw_page = page.page if hasattr(page, "page") else page
-                await raw_page.keyboard.press("Enter")
-            timer.mark("sdk")
+                    kwargs: dict[str, Any] = {"timeout": action_timeout}
+                    if delay is not None:
+                        kwargs["delay"] = delay
+                    if deterministic:
+                        assert selector is not None
+                        locator = (
+                            scoped_first_locator
+                            if scoped_first_locator is not None
+                            else page.locator_scope.locator(selector).first
+                        )
+                        await strategy_aware_input(
+                            locator,
+                            text,
+                            clear=False,
+                            timeout=action_timeout,
+                            delay=delay,
+                        )
+                    elif ai_mode is not None:
+                        loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+                        await loc.type(text, **kwargs)
+                    else:
+                        assert selector is not None
+                        if isinstance(page, SkyvernPage):
+                            kwargs["_skip_element_prep"] = skip_element_prep
+                        await page.type(selector, text, **kwargs)
+                if coordinate_target is None and press_enter:
+                    raw_page = page.page if hasattr(page, "page") else page
+                    await raw_page.keyboard.press("Enter")
+                timer.mark("sdk")
         except GuardError as e:
             return action_result(
                 "skyvern_type",
@@ -1413,7 +1448,9 @@ async def skyvern_type(
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
             )
-        except PlaywrightTimeoutError as e:
+        except (TimeoutError, PlaywrightTimeoutError) as e:
+            if isinstance(e, TimeoutError):
+                e = PlaywrightTimeoutError(f"Timeout {action_timeout}ms exceeded.")
             if coordinate_target is not None:
                 return action_result(
                     "skyvern_type",
@@ -2496,7 +2533,7 @@ async def skyvern_evaluate(
 
     with Timer() as timer:
         try:
-            result = await page.evaluate(js)
+            result = await page.locator_scope.evaluate(js)
             timer.mark("sdk")
         except Exception as e:
             return action_result(
@@ -2510,7 +2547,7 @@ async def skyvern_evaluate(
     return action_result(
         "skyvern_evaluate",
         browser_context=ctx,
-        data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
+        data={"result": result, "sdk_equivalent": f"await page.locator_scope.evaluate({expression[:80]!r})"},
         timing_ms=timer.timing_ms,
     )
 

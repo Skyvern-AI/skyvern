@@ -70,6 +70,14 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.display_recorder import (
+    acquire_display_recorder,
+    configure_local_display_recording,
+    release_display_recorder,
+    resolve_display_capture_sizes,
+    resolve_owner_id,
+)
+from skyvern.webeye.playwright_input import register_playwright_input_context
 from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
 LOG = structlog.get_logger()
@@ -752,6 +760,7 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         cleanup_func: BrowserCleanupFunc = None
+        started_display_recorder = None
         browser_internal_headers, scoped_headers = _partition_browser_headers(kwargs.get("extra_http_headers"))
         creator_kwargs = {**kwargs, "extra_http_headers": browser_internal_headers}
         try:
@@ -788,7 +797,7 @@ class BrowserContextFactory:
             # producer of video_artifacts it took the main page's recording with it, not just popups.
             # The thing that genuinely cannot record is the attach-only worker, which is what
             # is_enforcing() names.
-            if not attach_only_enforcing():
+            if not attach_only_enforcing() and not browser_artifacts.local_display_recording_eligible:
                 set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
@@ -809,14 +818,41 @@ class BrowserContextFactory:
                 headers=scoped_headers,
                 route_handlers_allowed=route_handlers_allowed,
             )
+            register_playwright_input_context(
+                browser_context,
+                strict_selectors=cast(bool, kwargs.get("strict_selectors", False)),
+            )
 
             proxy_location: ProxyLocationInput = kwargs.get("proxy_location")
             if isinstance(proxy_location, ProxyLocation):
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
+            if browser_artifacts.local_display_recording_eligible:
+                owner_id_override = cast(str | None, kwargs.get("display_recording_owner_id"))
+                owner_id = resolve_owner_id(
+                    owner_id_override=owner_id_override,
+                    workflow_run_id=cast(str | None, kwargs.get("workflow_run_id")),
+                    task_id=cast(str | None, kwargs.get("task_id")),
+                    script_id=cast(str | None, kwargs.get("script_id")),
+                )
+                display = os.environ.get("DISPLAY")
+                if owner_id and display and settings.VIDEO_PATH:
+                    video_dir = Path(settings.VIDEO_PATH) / datetime.utcnow().strftime("%Y-%m-%d")
+                    acquisition = await acquire_display_recorder(
+                        display, owner_id, video_dir, owner_id_override, browser_artifacts._display_capture_sizes
+                    )
+                    if acquisition.recorder is not None and acquisition.video_artifact is not None:
+                        browser_artifacts._display_recorder = acquisition.recorder
+                        browser_artifacts.video_artifacts = [acquisition.video_artifact]
+                        if acquisition.started:
+                            started_display_recorder = acquisition.recorder
+
             return browser_context, browser_artifacts, cleanup_func
         except BaseException as e:
+            if started_display_recorder is not None:
+                with suppress(Exception):
+                    await release_display_recorder(started_display_recorder)
             if browser_context is not None:
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
@@ -995,7 +1031,6 @@ async def _create_headless_chromium(
             "downloads_path": download_dir,
         }
     )
-
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
@@ -1093,12 +1128,24 @@ async def _create_headful_chromium(
             "headless": False,
         }
     )
+    local_display_recording_eligible = configure_local_display_recording(
+        browser_args,
+        owner_id_override=cast(str | None, kwargs.get("display_recording_owner_id")),
+        workflow_run_id=cast(str | None, kwargs.get("workflow_run_id")),
+        task_id=cast(str | None, kwargs.get("task_id")),
+        script_id=cast(str | None, kwargs.get("script_id")),
+    )
+    # Derive the capture rectangle from the final launch args (post viewport override); reused unchanged by
+    # the corruption-fallback rebuild below since that changes only the user-data-dir, not --window-size.
+    capture_sizes = resolve_display_capture_sizes(browser_args) if local_display_recording_eligible else None
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
     if loaded_from_saved_profile:
         browser_artifacts.applied_browser_profile_id = browser_profile_id
+    browser_artifacts.local_display_recording_eligible = local_display_recording_eligible
+    browser_artifacts._display_capture_sizes = capture_sizes
     try:
         browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     except Exception as launch_error:
@@ -1120,6 +1167,8 @@ async def _create_headful_chromium(
                 browser_session_dir=fallback_dir,
             )
             browser_artifacts.mark_seed_load_failed()
+            browser_artifacts.local_display_recording_eligible = local_display_recording_eligible
+            browser_artifacts._display_capture_sizes = capture_sizes
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
         else:
             raise

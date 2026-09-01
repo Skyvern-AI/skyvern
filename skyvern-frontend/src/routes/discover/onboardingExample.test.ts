@@ -24,14 +24,22 @@ it("keeps the copy payload to one passive public task", () => {
   assertNoSensitiveKeys(example.onboardingExampleRequest);
 });
 it("labels playback and result data as synthetic examples", () => {
-  const { provenance, playback, result } =
+  const { title, provenance, playback, result } =
     example.onboardingExamplePresentation;
+  expect(title).toBe("See how an agent run is organized");
   expect(provenance).toBe("Example data, not your run");
-  expect(playback[0]).toMatch(/static example/);
-  expect(playback[2]).toMatch(/example result/);
-  expect(result.title).toMatch(/synthetic.*example/i);
+  expect(playback[0]).toMatch(/static agent example/);
+  expect(playback[2]).toMatch(/agent result/);
+  expect(result.title).toMatch(/synthetic.*agent/i);
   expect(result.fields.map(({ label }) => label)).toEqual([
     "Headline",
     "Product summary",
   ]);
+  expect(
+    JSON.stringify({
+      presentation: example.onboardingExamplePresentation,
+      title: example.onboardingExampleRequest.title,
+      description: example.onboardingExampleRequest.description,
+    }),
+  ).not.toMatch(/workflow/i);
 });

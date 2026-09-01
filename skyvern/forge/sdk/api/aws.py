@@ -535,7 +535,7 @@ class AsyncAWSClient:
 
         return await self._s3_with_retry("list_files", _op, uri=uri)
 
-    async def delete_files(self, bucket: str, keys: list[str]) -> None:
+    async def delete_files(self, bucket: str, keys: list[str]) -> list[str]:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_objects.html
         """
         Delete multiple objects from S3 bucket.
@@ -543,11 +543,17 @@ class AsyncAWSClient:
         Args:
             bucket: The S3 bucket name
             keys: List of object keys to delete
+
+        Returns:
+            The keys S3 refused to delete. DeleteObjects reports per-object failures in the
+            response body rather than raising, so a caller that reads "no exception" as "all
+            deleted" will believe objects are gone while they are still there.
         """
         if not keys:
-            return
+            return []
 
-        async def _op() -> None:
+        async def _op() -> list[str]:
+            failed: list[str] = []
             async with self._s3_client() as client:
                 objects = [{"Key": key} for key in keys]
                 response = await client.delete_objects(
@@ -566,9 +572,11 @@ class AsyncAWSClient:
                             code=error.get("Code"),
                             message=error.get("Message"),
                         )
+                        failed.append(error["Key"])
+            return failed
 
         try:
-            await self._s3_with_retry("delete_files", _op, bucket=bucket)
+            return await self._s3_with_retry("delete_files", _op, bucket=bucket)
         except Exception as e:
             LOG.exception("Failed to delete files from S3", bucket=bucket, keys_count=len(keys))
             raise e

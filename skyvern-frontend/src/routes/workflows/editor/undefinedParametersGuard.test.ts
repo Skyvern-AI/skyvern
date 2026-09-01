@@ -2,7 +2,11 @@ import { describe, expect, test } from "vitest";
 
 import { ProxyLocation, RunEngine } from "@/api/types";
 
-import type { WorkflowBlock, WorkflowSettings } from "../types/workflowTypes";
+import type {
+  DataExportBlock,
+  WorkflowBlock,
+  WorkflowSettings,
+} from "../types/workflowTypes";
 
 import { getElements, getWorkflowBlocks } from "./workflowEditorUtils";
 
@@ -71,5 +75,46 @@ describe("engine round-trips through node data", () => {
 
     const [savedBlock] = getWorkflowBlocks(nodes, edges);
     expect(savedBlock).toMatchObject({ engine: "skyvern-3.0" });
+  });
+});
+
+describe("data export blocks", () => {
+  test("an API-authored export block loads and saves without changing its contract", () => {
+    const block = {
+      label: "export_records",
+      block_type: "data_export",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      parameters: [],
+      data: "{{ extraction_output.extracted_information }}",
+      data_schema: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { id: { type: "integer" } },
+        },
+      },
+      file_name: "records",
+    } as unknown as DataExportBlock;
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const exportNode = nodes.find(
+      (node) => node.data.label === "export_records",
+    );
+
+    expect(exportNode?.type).toBe("dataExport");
+    expect(exportNode?.data).toMatchObject({
+      data: "{{ extraction_output.extracted_information }}",
+      fileName: "records",
+    });
+    expect(getWorkflowBlocks(nodes, edges)).toEqual([
+      expect.objectContaining({
+        block_type: "data_export",
+        data: "{{ extraction_output.extracted_information }}",
+        data_schema: block.data_schema,
+        file_name: "records",
+      }),
+    ]);
   });
 });

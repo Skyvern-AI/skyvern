@@ -4,8 +4,16 @@ import {
   QueryClientProvider,
   QueryObserver,
 } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, expect, it, vi } from "vitest";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { OnboardingProgressBand } from "@/components/onboarding/OnboardingProgressBand";
 const mocks = vi.hoisted<{
   get: ReturnType<typeof vi.fn>;
   flag: boolean | undefined;
@@ -47,6 +55,23 @@ const validPayload = () => ({
     { key: "first_successful_run", completed_at: null },
   ],
 });
+const completedPayload = () => ({
+  ...validPayload(),
+  state: "completed",
+  completed_count: 2,
+  next_action_key: null,
+  items: [
+    { key: "first_agent_created", completed_at: "2026-08-20T12:00:00Z" },
+    { key: "first_successful_run", completed_at: "2026-08-20T12:01:00Z" },
+  ],
+});
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 function renderProgress(client = new QueryClient()) {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -54,12 +79,34 @@ function renderProgress(client = new QueryClient()) {
   const hook = renderHook(() => useOnboardingProgress(), { wrapper });
   return { client, ...hook };
 }
+function ProgressBand() {
+  const { progress, isPending, dismiss, restore } = useOnboardingProgress();
+  return (
+    <OnboardingProgressBand
+      progress={progress}
+      isPending={isPending}
+      onDismiss={dismiss}
+      onRestore={restore}
+      onDescribeAgent={vi.fn()}
+    />
+  );
+}
+function renderProgressBand(client: QueryClient) {
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <ProgressBand />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.flag = true;
   mocks.org = "org-test";
   mocks.user = "user-test";
 });
+afterEach(() => vi.useRealTimers());
 it.each([
   [false, "org-test", "user-test"],
   [undefined, "org-test", "user-test"],
@@ -123,6 +170,58 @@ it("refetches fresh cached progress when Discover remounts", async () => {
     expect(secondMount.result.current.progress?.completed_count).toBe(1),
   );
   expect(secondMount.result.current.progress).toEqual(refreshedPayload);
+});
+it("celebrates only cached active progress completing on remount", async () => {
+  const freshClient = new QueryClient();
+  mocks.get.mockResolvedValueOnce({ data: completedPayload() });
+  const freshMount = renderProgressBand(freshClient);
+
+  await waitFor(() => expect(mocks.get).toHaveBeenCalledOnce());
+  await waitFor(() =>
+    expect(
+      freshClient.getQueryData([
+        "onboarding-progress",
+        "user-test",
+        "org-test",
+      ]),
+    ).toEqual(completedPayload()),
+  );
+  expect(screen.queryByText("First agent ready")).toBeNull();
+  expect(screen.queryByRole("status")).toBeNull();
+  freshMount.unmount();
+
+  const client = new QueryClient();
+  mocks.get.mockResolvedValueOnce({ data: validPayload() });
+  const activeMount = renderProgressBand(client);
+  expect(await screen.findByText("Build your first agent")).toBeTruthy();
+  activeMount.unmount();
+
+  const completedRequest = deferred<{ data: unknown }>();
+  mocks.get.mockReturnValueOnce(completedRequest.promise);
+  vi.useFakeTimers();
+  const completionMount = renderProgressBand(client);
+  expect(screen.getByText("Build your first agent")).toBeTruthy();
+
+  completedRequest.resolve({ data: completedPayload() });
+  await completedRequest.promise;
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  expect(screen.getAllByText("First agent ready")).toHaveLength(1);
+  expect(screen.getByRole("status").textContent).toContain("3 of 3 complete");
+
+  act(() => vi.advanceTimersByTime(1799));
+  expect(screen.getByText("First agent ready")).toBeTruthy();
+  act(() => vi.advanceTimersByTime(1));
+  expect(screen.queryByText("First agent ready")).toBeNull();
+  completionMount.unmount();
+
+  const finalRequest = deferred<{ data: unknown }>();
+  mocks.get.mockReturnValueOnce(finalRequest.promise);
+  const finalMount = renderProgressBand(client);
+  expect(finalMount.container.innerHTML).toBe("");
+  finalRequest.resolve({ data: completedPayload() });
+  await finalRequest.promise;
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  expect(finalMount.container.innerHTML).toBe("");
 });
 it("isolates progress cache entries by authenticated user", async () => {
   mocks.flag = true;

@@ -152,8 +152,11 @@ function WorkflowRunTimeline({
   onThoughtItemSelected,
   onIterationSelected,
 }: Props) {
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery({ workflowRunId });
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isError: statusUnavailable,
+  } = useWorkflowRunWithWorkflowQuery({ workflowRunId });
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery({ workflowRunId });
@@ -172,9 +175,10 @@ function WorkflowRunTimeline({
       ),
     [workflowRun],
   );
-  const workflowRunIsNotFinalized = workflowRun
-    ? statusIsNotFinalized(workflowRun)
-    : false;
+  const workflowRunIsNotFinalized =
+    workflowRun && !statusUnavailable
+      ? statusIsNotFinalized(workflowRun)
+      : false;
   const workflowRunIsFinalized = workflowRun
     ? statusIsFinalized(workflowRun)
     : false;

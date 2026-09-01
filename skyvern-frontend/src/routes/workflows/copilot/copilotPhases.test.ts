@@ -79,6 +79,15 @@ describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
     expect(toolActivityDisplayLabel("inspect_page_for_composition")).toBe(
       "Inspecting the page",
     );
+    expect(toolActivityDisplayLabel("skyvern_frame_list")).toBe(
+      "Finding embedded pages",
+    );
+    expect(toolActivityDisplayLabel("skyvern_frame_switch")).toBe(
+      "Opening embedded page",
+    );
+    expect(toolActivityDisplayLabel("skyvern_frame_main")).toBe(
+      "Returning to main page",
+    );
   });
 
   it("labels fill_credential_field without naming any credential", () => {
@@ -308,6 +317,83 @@ describe("derivePhases — terminal", () => {
       designEnded: true,
       draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
       blocks: [block({ state: "failed" })],
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "test").status).toBe("fail");
+    expect(phase(rows, "test").stub).toBe("1 block · failed");
+  });
+
+  it("a deadline halt after a clean run stops the rail instead of failing it", () => {
+    const t = turn({
+      terminal: "error",
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [block()],
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: "not_evaluated",
+        runId: "wr_1",
+        runCompleted: true,
+        terminalCause: "deadline_expired",
+        blocksRunThisTurn: 1,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "test").status).toBe("stopped");
+    expect(phase(rows, "test").stub).toBe("1 block · time limit");
+    expect(phase(rows, "done").status).toBe("stopped");
+    expect(rows.map((r) => r.status)).not.toContain("fail");
+  });
+
+  it("a deadline halt with no block receipts never paints a green Test row", () => {
+    const t = turn({
+      terminal: "error",
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      designActivity: [
+        entry({
+          id: "1",
+          kind: "tool_call",
+          toolName: "update_and_run_blocks",
+        }),
+      ],
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 0,
+        evaluationState: null,
+        runId: null,
+        runCompleted: null,
+        terminalCause: "deadline_expired",
+        blocksRunThisTurn: 0,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "test").status).toBe("stopped");
+    expect(phase(rows, "test").stub).toBe("time limit");
+  });
+
+  it("a deadline halt with a failed block keeps the failure row", () => {
+    const t = turn({
+      terminal: "error",
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [block({ state: "failed" })],
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: "not_demonstrated",
+        runId: "wr_1",
+        runCompleted: false,
+        terminalCause: "deadline_expired",
+        blocksRunThisTurn: 1,
+        ranCleanOnCurrentSource: false,
+      },
     });
     const rows = derivePhases(t);
     expect(phase(rows, "test").status).toBe("fail");

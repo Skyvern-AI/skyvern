@@ -78,6 +78,8 @@ Action = ActionClick | ActionHover | ActionInputText | ActionUrlChange | ActionW
 
 ActionBlockable = ActionClick | ActionHover | ActionInputText
 
+CredentialKind = Literal["password", "totp", "credit_card", "secret", "magic_link"]
+
 
 class ActionTarget(BaseModel):
     class_name: str | None = None
@@ -92,6 +94,7 @@ class ActionTarget(BaseModel):
     role: str | None = None
     accessible_name: str | None = None
     input_type: str | None = None
+    autocomplete: str | None = None
 
 
 class Mouse(BaseModel):
@@ -129,10 +132,9 @@ class RecordingDraftStep(BaseModel):
     editable_fields: list[RecordingDraftStepEditableField] = Field(default_factory=list)
     parameters: list[dict[str, t.Any]] = Field(default_factory=list)
     parameter_keys: list[str] = Field(default_factory=list)
-    # Source-action event timestamps (ms epoch), so clients can correlate
-    # locally-captured artifacts (e.g. stream screenshots) with each step.
     timestamp_start: float | None = None
     timestamp_end: float | None = None
+    credential_kind: CredentialKind | None = None
 
 
 class RecordingInterpretationUpdate(BaseModel):
@@ -195,6 +197,7 @@ class EventTarget(BaseModel):
     role: str | None = None
     accessibleName: str | None = None
     inputType: str | None = None
+    autocomplete: str | None = None
 
 
 class MousePosition(BaseModel):

@@ -50,6 +50,7 @@ class EventRelay:
         self.on_disconnect = on_disconnect
         self.pending_request_count = 0
         self.extension_protocol_version: int | None = 2
+        self.extension_build_hash: str | None = None
         self.extension_connection_generation = 1
 
     async def start(self) -> None:
@@ -581,6 +582,93 @@ async def test_failed_reauthentication_never_falls_back_to_enrollment(monkeypatc
     authenticate.assert_awaited_once()
     assert client._client_id == "stored-client"
     assert client._recovery_secret == "stored-secret"
+
+
+def _mock_pre_upgrade_daemon(monkeypatch: pytest.MonkeyPatch, client: BrokerClient) -> list[int]:
+    """Wire read_broker_state/process_identity_matches/psutil.Process so the client sees a
+    live daemon at BROKER_GENERATION - 1, pid 555_555, until FakeProcess.terminate() runs."""
+    terminated_pids: list[int] = []
+    alive = [True]
+
+    monkeypatch.setattr(
+        broker_client_module,
+        "read_broker_state",
+        lambda _paths: SimpleNamespace(
+            lifecycle="ready",
+            externalPort=19778,
+            controlEndpoint=str(client.paths.control_socket),
+            protocolMin=1,
+            protocolMax=1,
+            brokerGeneration=BROKER_GENERATION - 1,
+            pid=555_555,
+            processStart="stale-marker",
+        ),
+    )
+    monkeypatch.setattr(broker_client_module, "process_identity_matches", lambda _pid, _marker: alive[0])
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def terminate(self) -> None:
+            terminated_pids.append(self.pid)
+            alive[0] = False
+
+    monkeypatch.setattr(broker_client_module.psutil, "Process", FakeProcess)
+    return terminated_pids
+
+
+@pytest.mark.asyncio
+async def test_operator_client_never_terminates_a_pre_upgrade_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status/stop/grant/revoke construct auto_spawn=False clients that never bring a
+    replacement broker back up, so on a generation mismatch they must leave the still-
+    functioning daemon alone and report INCOMPATIBLE_BROKER rather than kill it out from
+    under whoever depends on it."""
+    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
+
+    with pytest.raises(BrowserExtensionBrokerError) as exc_info:
+        await client._connect()
+
+    assert exc_info.value.code == "INCOMPATIBLE_BROKER"
+    assert terminated_pids == []
+
+
+@pytest.mark.asyncio
+async def test_start_terminates_incompatible_daemon_and_reaches_compatible_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-place upgrade leaves an old-generation daemon running when a new client
+    starts. start() must terminate it and reach the auto-spawn/reconnect path within
+    one call, not merely fail with INCOMPATIBLE_BROKER and leave the caller stuck."""
+    client = BrokerClient(19778, _ignore_event, auto_spawn=True)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
+    monkeypatch.setattr(broker_client_module, "_ensure_broker_process", lambda _port, _paths: None)
+    connect_after_spawn = AsyncMock()
+    monkeypatch.setattr(client, "_connect_with_retry", connect_after_spawn)
+
+    await client.start()
+
+    assert terminated_pids == [555_555]
+    connect_after_spawn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_broker_terminates_a_pre_upgrade_daemon_despite_auto_spawn_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop is explicitly destructive, unlike status/grant/revoke: even with
+    auto_spawn=False, stop_broker() must terminate a mismatched-generation daemon
+    directly rather than surface INCOMPATIBLE_BROKER and leave it running forever."""
+    client = BrokerClient(19778, _ignore_event, auto_spawn=False)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, client)
+
+    result = await client.stop_broker()
+
+    assert result == {"stopping": True}
+    assert terminated_pids == [555_555]
 
 
 @pytest.mark.asyncio

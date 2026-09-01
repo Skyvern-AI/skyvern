@@ -4,22 +4,43 @@ import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingError
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { PromptBox } from "../tasks/create/PromptBox";
+import {
+  PromptBox,
+  type ExamplePromptKey,
+  type PromptBoxHandle,
+} from "../tasks/create/PromptBox";
 import { WorkflowTemplates } from "./WorkflowTemplates";
 import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
 import { WorkingExampleInspector } from "@/components/onboarding/WorkingExampleInspector";
-import { OnboardingProgressCard } from "@/components/onboarding/OnboardingProgressCard";
+import { OnboardingProgressBand } from "@/components/onboarding/OnboardingProgressBand";
 import { useOnboardingProgress } from "./useOnboardingProgress";
 import { onboardingExampleRequest } from "./onboardingExample";
+
+function getIntentExampleKey(
+  intent: string | null | undefined,
+): ExamplePromptKey {
+  switch (intent) {
+    case "fill_forms":
+      return "contact_us_forms";
+    case "extract_data":
+      return "hackernews";
+    case "monitor_website":
+      return "AAPLStockPrice";
+    default:
+      return "finditparts";
+  }
+}
 
 function DiscoverPage() {
   const enableCopilotHandoff =
     useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
   const createWorkflowMutation = useCreateWorkflowMutation();
   const createInFlight = useRef(false);
+  const promptBoxRef = useRef<PromptBoxHandle>(null);
+  const onboarding = useOnboardingStateOptional();
   const {
     progress,
     isPending: onboardingProgressPending,
@@ -46,13 +67,20 @@ function DiscoverPage() {
     });
   };
 
-  const onboarding = useOnboardingStateOptional();
+  const handleDescribeAgent = () => {
+    promptBoxRef.current?.focusAndPrefillExample(
+      getIntentExampleKey(onboarding?.state?.user_intent),
+    );
+  };
 
   return (
     <div className="space-y-10">
       <h1 className="sr-only">Create an agent</h1>
       <div className="space-y-3">
-        <PromptBox enableCopilotHandoff={enableCopilotHandoff} />
+        <PromptBox
+          ref={promptBoxRef}
+          enableCopilotHandoff={enableCopilotHandoff}
+        />
         <div className="flex justify-end">
           <Button
             variant="ghost"
@@ -76,33 +104,22 @@ function DiscoverPage() {
           </Button>
         </div>
       </div>
-      {progress?.state === "active" && (
-        <WorkingExampleInspector
-          isPending={createWorkflowMutation.isPending}
-          onMakeCopy={handleExampleCopy}
-        />
-      )}
-      {progress?.state === "active" &&
-      (progress.completed_count === 0 || progress.completed_count === 1) &&
-      progress.next_action_key !== null ? (
-        <OnboardingProgressCard
-          state="active"
-          completedCount={progress.completed_count}
-          firstMilestoneComplete={progress.items.some(
-            (item) =>
-              item.key === "first_agent_created" && item.completed_at !== null,
-          )}
-          nextActionKey={progress.next_action_key}
-          isPending={onboardingProgressPending}
-          onDismiss={dismiss}
-        />
-      ) : progress?.state === "dismissed" ? (
-        <OnboardingProgressCard
-          state="dismissed"
-          isPending={onboardingProgressPending}
-          onRestore={restore}
-        />
-      ) : null}
+      <OnboardingProgressBand
+        progress={progress}
+        isPending={onboardingProgressPending}
+        onDismiss={dismiss}
+        onRestore={restore}
+        onDescribeAgent={handleDescribeAgent}
+      >
+        {progress?.state === "active" ? (
+          <WorkingExampleInspector
+            isPending={
+              createWorkflowMutation.isPending || onboardingProgressPending
+            }
+            onMakeCopy={handleExampleCopy}
+          />
+        ) : null}
+      </OnboardingProgressBand>
       <WorkflowTemplates />
       {onboarding ? (
         <OnboardingErrorBoundary
