@@ -695,6 +695,9 @@ class _TypeaheadPick(NamedTuple):
     clicked: bool
     declared: bool
     note: str | None = None
+    # Whether the commit surface already vouched for the chosen label BEFORE the pick click — such a
+    # surface proves nothing about the commit and must not vouch for it downstream either.
+    pre_surface_hit: bool = False
 
 
 # The smallest query many closed-vocabulary pickers need before they render candidates. Read by the
@@ -997,6 +1000,19 @@ _PIERCED_QUERY_JS = (
 # that appeared (or became visible) IN REACTION to typing can be treated as a suggestion — static page
 # text that merely happens to share a word with the value (a nearby card, nav item, prior answer) is
 # never eligible. This is what makes "detect by the page's reaction" rigorous rather than a claim.
+# The clause a committed-selection label may carry after its value ("…, press delete to clear
+# value.") — recognized before any comma-clause strip, so a bare comma-bearing label never loses its
+# tail to the matcher.
+# Actual instruction SYNTAX, not a keyword alone: a proper-name suffix that merely contains an
+# action word ("Austin, Clear Lake") must never read as a clearing instruction.
+_INSTRUCTION_CLAUSE_RE = re.compile(
+    r"\b(?:press|tap|click|hit)\s+(?:delete|backspace|enter|escape)\b"
+    r"|\bto\s+(?:delete|remove|clear|dismiss|deselect)\b"
+    r"|\b(?:delete|remove|clear|dismiss|deselect|backspace)\s+(?:the\s+)?"
+    r"(?:value|values|selection|selections|item|items|option|options|entry|entries|choice|choices|tag|tags|this|it|all)\b",
+    re.IGNORECASE,
+)
+
 _PRESNAPSHOT_JS = (
     r"""() => {"""
     + _PIERCED_QUERY_JS
@@ -1548,7 +1564,21 @@ _FIND_CATEGORIES_JS = (
         if (CHILD_ROLES.has(kid.getAttribute('role'))) childCount++;
       }
     }
-    if (!hasPopup && !hasExpanded && childCount < 2) continue;
+    // A drill-down prompt with NO popup ARIA at all marks its category rows with a TRAILING icon (a
+    // chevron at the row's far edge) — the one affordance a person drills by. Trailing only: a leading
+    // icon is a radio/checkbox/avatar and marks a selectable leaf, and an aria-selected row's icon is
+    // its checkmark. (LTR assumption: RTL pages mirror the chevron and are not caught here.)
+    let sideCharm = false;
+    if (!hasPopup && !hasExpanded && childCount < 2 && CHILD_ROLES.has(role)
+        && el.getAttribute('aria-selected') !== 'true') {
+      for (const ic of el.querySelectorAll('svg,[class*="icon" i]')) {
+        // An icon inside a button is the row's own affordance (a clear/remove control), not a drill marker.
+        if (ic.closest('button,[role="button"]')) continue;
+        const ir = ic.getBoundingClientRect();
+        if (ir.width > 0 && ir.height > 0 && ir.left >= r.left + r.width * 0.6) { sideCharm = true; break; }
+      }
+    }
+    if (!hasPopup && !hasExpanded && childCount < 2 && !sideCharm) continue;
     const label = el.getAttribute('aria-label') || (el.innerText || '').trim().split('\n')[0];
     const text = label.trim().slice(0, 80);
     if (!text) continue;
@@ -1588,7 +1618,18 @@ _VERIFY_COMMIT_JS = (
   // The open->observe->pick path tags no suggestion, so `listClosed` would be unconditionally true and
   // defeat the change check — the caller sets noSuggestionList so the el.value branch rests on an actual
   // change from the pre-click value (passed as `typed`), never leftover text the tool itself put there.
-  const listClosed = args.noSuggestionList ? false : (!tagged || tagged.getBoundingClientRect().height === 0);
+  const tagsGone = !tagged || tagged.getBoundingClientRect().height === 0;
+  // Row tags vanish on ANY re-render; the stamped list container (suggListOpen, read by the caller)
+  // survives one. Closure normally needs both: tags gone AND the stamped container gone/hidden — a
+  // dead click whose re-render strips tags must not read as a commit. The one exemption is a widget
+  // whose FIELD declares its list (fieldDeclared) with declared rows AND whose click fired an input
+  // event on the field (commitEvt, armed just before the click): its commit legitimately leaves a
+  // re-searching list open, and the declared close-and-verify (Escape + value survival) that runs
+  // downstream can see and manage that popup. A dead click fires no input event, so a re-render
+  // alone never qualifies.
+  const listClosed = args.noSuggestionList
+    ? false
+    : (tagsGone && ((args.declaredRows && args.fieldDeclared && args.commitEvt) || !args.suggListOpen));
   // A short normalized value ("New York" -> "NY", "United States" -> "US") has no >=3-char token to
   // overlap, so accept it on causality alone (it changed / the list closed). Longer values must still
   // relate to the chosen suggestion so an unrelated change can't read as a successful commit.
@@ -1598,6 +1639,12 @@ _VERIFY_COMMIT_JS = (
     // resets the input to "N/A" changes cur but does not commit the chosen option.
     const declared = Array.isArray(args.chosenValues) ? args.chosenValues : [];
     if (cur && cur !== typed && (eqi(cur, chosen) || overlaps(cur, chosen) || declared.some((d) => eqi(d, cur)))) return cur;
+    // typed == chosen == cur is unreadable by value alone (a dead row click leaves the same string in
+    // the field). The click's own reaction discriminates: the caller tagged real suggestion rows
+    // (suggTagged) and the LIST ITSELF is gone/hidden now (read off the stamped list
+    // container — a re-render that merely replaces row nodes strips the row tags but keeps the
+    // container, and must not read as a commit; suggListOpen). Exact equality with the CHOSEN label only.
+    if (args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
   } else if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) {
     return cur;
   }
@@ -1698,6 +1745,227 @@ _ANCHOR_SURFACE_JS = (
   if (!el) return '';
   const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
   return nrm(el.getAttribute('aria-label')) + '\u0001' + nrm(el.textContent);
+}"""
+)
+
+# Whether the field's own widget container shows `chosen` as a committed-selection surface: a pill /
+# selected-item row (its leading aria-label clause or leaf text IS the label), or a bare label node the
+# widget renders beside a field that commits an opaque id into its value. Scope stops BELOW <body> on
+# purpose: a portalled menu hangs off <body>, so its still-open rows can never vouch for a commit.
+_COMMIT_SURFACE_JS = (
+    r"""(args) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
+  const el = pQS(args.sel) || (args.el && args.el.isConnected ? args.el : null);
+  if (!el) return false;
+  const nrm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = nrm(args.chosen);
+  if (!want) return false;
+  const visible = (n) => {
+    const r = n.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    try { const cs = getComputedStyle(n); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (e) { return true; }
+  };
+  // "<label>, press delete to clear value." — the instruction is ONE trailing comma-clause, and the
+  // committed label may itself contain commas. Strip the trailing clause ONLY when it reads as a
+  // widget instruction (press/delete/clear/…): an unconditional strip would let a bare "Korea" read
+  // as holding a suffix-less "Korea, Republic of" label.
+  // Actual instruction SYNTAX, not a keyword alone ("Austin, Clear Lake" is a place, not an
+  // instruction) — mirror of the Python _INSTRUCTION_CLAUSE_RE.
+  const INSTRUCTION_RE = /\b(?:press|tap|click|hit)\s+(?:delete|backspace|enter|escape)\b|\bto\s+(?:delete|remove|clear|dismiss|deselect)\b|\b(?:delete|remove|clear|dismiss|deselect|backspace)\s+(?:the\s+)?(?:value|values|selection|selections|item|items|option|options|entry|entries|choice|choices|tag|tags|this|it|all)\b/i;
+  const clauseHolds = (raw) => {
+    const own = nrm(raw).split('|')[0].trim();
+    if (!own) return false;
+    if (own === want) return true;
+    const cut = own.lastIndexOf(',');
+    if (cut <= 0 || !INSTRUCTION_RE.test(own.slice(cut + 1))) return false;
+    return own.slice(0, cut).trim() === want;
+  };
+  // The stamped [data-tv3-sugglist] container is the LIVE option list of the pick in flight: its
+  // rows are offers, never commits, and a re-render that strips row tags keeps the container stamp.
+  // An explicit aria-selected="false" likewise marks an offered row.
+  const excluded = (cand) =>
+    cand === el || cand.contains(el)
+    || !!cand.closest('[data-tv3-sugg],[data-tv3-menu],[data-tv3-sugglist]')
+    || !!cand.querySelector('[data-tv3-sugg],[data-tv3-menu],[data-tv3-sugglist]')
+    || cand.getAttribute('aria-selected') === 'false'
+    || !!cand.closest('[aria-selected="false"]');
+  // Only the field's OWN container may vouch for its commit: the walk stops before any ancestor that
+  // holds a second field anchor, so a sibling field's pill (a two-column form, a shared fieldset) or
+  // stray page text can never confirm THIS field — mirrors the single-trigger scope the react-select
+  // surface read in _VERIFY_COMMIT_JS enforces.
+  const FIELD_SEL = 'input:not([type=hidden]),textarea,select,[role="combobox"],[aria-haspopup="listbox"],[aria-haspopup="menu"],button[aria-expanded]';
+  const fieldCount = (root) => {
+    let n = 0;
+    for (const f of root.querySelectorAll(FIELD_SEL)) {
+      const fr = f.getBoundingClientRect();
+      if (fr.width > 0 && fr.height > 0 && ++n >= 2) break;
+    }
+    return n;
+  };
+  // One step up the COMPOSED scope chain: a field at the top level of an open shadow root has a
+  // null parentElement, but its committed pill can sit beside it in the same root — the walk
+  // continues through the root (a DocumentFragment that still answers querySelectorAll) and out
+  // via its host, instead of stopping blind at the boundary.
+  const scopeUp = (s) => {
+    if (!s) return null;
+    if (s.host) {
+      const h = s.host;
+      if (h.parentElement) return h.parentElement;
+      return h.parentNode && h.parentNode.host ? h.parentNode : null;
+    }
+    if (s.parentElement) return s.parentElement;
+    return s.parentNode && s.parentNode.host ? s.parentNode : null;
+  };
+  let scope = scopeUp(el);
+  for (let hops = 0; scope && hops < 4; hops++, scope = scopeUp(scope)) {
+    if (scope === document.body || scope === document.documentElement) break;
+    if (fieldCount(scope) >= 2) break;
+    for (const cand of scope.querySelectorAll('[role="option"],[role="listitem"],li,[class*="pill" i],[class*="chip" i],[class*="token" i]')) {
+      if (excluded(cand) || !visible(cand)) continue;
+      const t = (cand.textContent || '').trim();
+      if (t.length > 160) continue;
+      if (clauseHolds(t) || clauseHolds(cand.getAttribute('aria-label'))) return true;
+    }
+    // Bare label surface: a small childless node whose whole text IS the label (the widget shows the
+    // committed label beside a field whose own value is an opaque id). Exact match only.
+    for (const cand of scope.querySelectorAll('*')) {
+      if (cand.children.length > 0 || excluded(cand) || !visible(cand)) continue;
+      if (nrm(cand.textContent) === want || nrm(cand.getAttribute('aria-label')) === want) return true;
+    }
+  }
+  return false;
+}"""
+)
+
+# Stamp the suggestion list CONTAINER before the pick click, so the commit-verify can ask whether the
+# LIST survived — row tags vanish on any re-render, but the container persists unless the widget truly
+# closed. Clears prior stamps first.
+_STAMP_SUGG_LIST_JS = (
+    r"""(args) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + r"""
+  pQSA('[data-tv3-sugglist]').forEach((e) => e.removeAttribute('data-tv3-sugglist'));
+  const row = pQS('[data-tv3-' + args.attr + '="' + args.n + '"]');
+  if (!row) return false;
+  // Never stamp <body>/<html> — that would read the PAGE as the list and it never closes. With no
+  // declared list ancestor and a body-level parent, the tagged node itself is the best stand-in.
+  let list = composedClosest(row, LIST_SEL);
+  if (!list || list === document.body || list === document.documentElement) {
+    const parent = composedParentElement(row);
+    list = parent && parent.nodeType === 1 && parent !== document.body && parent !== document.documentElement
+      ? parent
+      : row;
+  }
+  if (!list || list.nodeType !== 1) return false;
+  list.setAttribute('data-tv3-sugglist', '1');
+  return true;
+}"""
+)
+
+# One-shot 'input'-event probe on the anchor, armed just before the pick click so keystrokes cannot
+# pre-satisfy it: a committing widget writes the value back through an input dispatch, a dead click
+# fires nothing. 'change' deliberately does not count — Chromium fires a native change for user-typed
+# text the moment the row click steals focus, committed or not.
+_ARM_COMMIT_EVENT_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
+  let el = null;
+  try { el = pQS(arg.sel); } catch (e) { el = null; }
+  if (!el && arg.el && arg.el.isConnected) el = arg.el;
+  window.__tv3_commit_evt = false;
+  if (!el) return false;
+  el.addEventListener('input', () => { window.__tv3_commit_evt = true; }, { once: true });
+  return true;
+}"""
+)
+
+# Whether the stamped suggestion list container is still on the page and visible. A stamp that
+# VANISHED is ambiguous, not proof of closure: a widget that closes by unmounting destroys the
+# stamped node, but so does a dead click's re-render when the stamp had to sit on a replaceable row
+# (nothing durable enclosed it). Disambiguated by the dropdown band below the field: fresh visible
+# content that postdates the pre-type snapshot means the list is still open; a band holding only
+# pre-existing content means it closed. An unreadable anchor fails closed (open).
+_SUGG_LIST_STILL_OPEN_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
+  const list = pQS('[data-tv3-sugglist]');
+  if (list) {
+    const r = list.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    try { const cs = getComputedStyle(list); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (e) { return true; }
+  }
+  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return true;
+  const fr = el.getBoundingClientRect();
+  for (const cand of pScopeAll()) {
+    if (cand === el || pContains(cand, el) || pContains(el, cand)) continue;
+    if (preHas(cand)) continue;
+    const r = cand.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) continue;
+    // Vertical INTERSECTION with the anchor's neighborhood, not a strict above/below split: a list
+    // flips above the field near the viewport bottom, and a sloppily-positioned popup can overlap
+    // the field's own line — both must still read as open.
+    if (r.bottom < fr.top - 400 || r.top > fr.bottom + 400) continue;
+    // But content sitting ENTIRELY inside the field's own line (an inline Clear, a saved badge, a
+    // currency suffix a commit renders) is commit-adjacent decoration, never an open list.
+    if (r.top > fr.top + 2 && r.bottom < fr.bottom - 2) continue;
+
+    if (r.left > fr.right || r.right < fr.left) continue;
+    let vis = true;
+    try { const cs = getComputedStyle(cand); vis = cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (e) { vis = true; }
+    if (!vis) continue;
+    // Text keeps empty decorative shells from reading as an open list — but a dead click can swap
+    // the rows for a TEXTLESS css spinner (an async widget mid-flight), so busy-shaped fresh
+    // content counts without it.
+    const busyish = cand.getAttribute('aria-busy') === 'true' || cand.getAttribute('role') === 'progressbar'
+      || /load|spinner|progress|busy/i.test(cand.className && cand.className.baseVal !== undefined ? cand.className.baseVal : String(cand.className || ''));
+    if (!(cand.textContent || '').trim() && !busyish) continue;
+    return true;
+  }
+  return false;
+}"""
+)
+
+# A visible in-flight indicator (a busy row, a spinner) NEAR the anchor — the widget is still
+# fetching its rows, so a row poll that would otherwise give up is allowed to keep waiting a little
+# longer. Bounded to the anchor's dropdown region so an unrelated page spinner (a chat widget, an
+# autosave indicator) cannot extend every poll on the page.
+_MENU_BUSY_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
+  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  const a0 = el ? el.getBoundingClientRect() : null;
+  // A hidden (zero-rect) anchor would pin the window to the viewport origin; treat it like an
+  // unresolvable one.
+  const a = a0 && a0.width > 0 && a0.height > 0 ? a0 : null;
+  // With no resolvable anchor (a cascading click detached the clicked row), geometry cannot bound the
+  // check — require the busy node to sit in a FLOATING container instead (the replaced menu's own busy
+  // row does; an in-flow page spinner does not).
+  const floating = (n) => {
+    for (let x = n, hops = 0; x && x.nodeType === 1 && hops < 8; hops++, x = composedParentElement(x)) {
+      let pos = '';
+      try { pos = getComputedStyle(x).position; } catch (e) { return false; }
+      if (pos === 'absolute' || pos === 'fixed') return true;
+    }
+    return false;
+  };
+  // Conventional CSS spinner classes count like the ARIA signals — same recognition the vanished-
+  // stamp band check applies. Still bounded to the anchor's region, so a stray "download" link
+  // elsewhere cannot extend every poll.
+  for (const n of pQSA('[aria-busy="true"],[role="progressbar"],[class*="load" i],[class*="spinner" i],[class*="progress" i],[class*="busy" i]')) {
+    const r = n.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) continue;
+    if (!a) { if (floating(n)) return true; continue; }
+    if (r.top < a.top - 200 || r.top > a.bottom + 500) continue;
+    if (r.right < a.left - 200 || r.left > a.right + 200) continue;
+    return true;
+  }
+  return false;
 }"""
 )
 
@@ -3579,9 +3847,13 @@ _FIND_MENU_JS = (
     + _MENU_ROW_ROLES_JS
     + r""";
   const vis = (r) => r.width > 0 && r.height > 0;
+  // `cascade`: the caller just clicked a row that DETACHED (a category replacing the list with its
+  // children). The trigger is gone, so trigger-anchored geometry/ARIA is waived — new rows in a
+  // FLOATING container carry the claim instead (enforced below).
+  const cascade = !!arg.cascade;
   let trigger = null;
   try { trigger = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { return null; }
-  if (!trigger) return null;
+  if (!trigger && !cascade) return null;
   // Clear the previous scan's tags once the trigger (which may itself be a tagged row) is resolved:
   // an early null below (menu closed since) must not leave stale data-tv3-menu / scroller marks for
   // _MENU_OPTION_TEXTS_JS to read as a live window.
@@ -3591,11 +3863,19 @@ _FIND_MENU_JS = (
   // A navigation destroys window, so an absent snapshot here means the page under us is not the page
   // we clicked on, and every row would read as new. Refuse: "cannot judge" beats naming three
   // ordinary links on a fresh document as a menu and telling the model to pick one.
-  if (!preReady()) return null;
-  const tr = trigger.getBoundingClientRect();
+  // `reuse: 'any'` weakens that gate for a list that is ALREADY open instead of one a click just
+  // rendered: it admits every visible row but then only accepts a FLOATING container (a positioned
+  // popup) — an in-flow static list (a form's own radio group, a sidebar of links) never qualifies as
+  // an open menu without reaction evidence.
+  const reuse = arg.reuse === 'any' ? arg.reuse : null;
+  if (!preReady() && reuse !== 'any') return null;
+  const tr0 = trigger ? trigger.getBoundingClientRect() : null;
+  // A cascading widget may HIDE its old stage instead of detaching it: a connected trigger with a
+  // zeroed rect anchors geometry at the viewport origin and would reject legitimate children.
+  const tr = cascade && tr0 && !(tr0.width > 0 && tr0.height > 0) ? null : tr0;
   const rows = [];
   for (const el of pScopeAll()) {
-    if (preHas(el) || focusHas(el)) continue;
+    if (reuse !== 'any' && (preHas(el) || focusHas(el))) continue;
     const tag = el.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
     if (el.children.length > 8) continue;
@@ -3625,8 +3905,8 @@ _FIND_MENU_JS = (
   // Role-less lists are grouped only on the trigger's own ARIA word: its aria-controls target, or —
   // when it declares a listbox/combobox — the rows' nearest shared ancestor. A plain button gives
   // no such word, and guessing would merge unrelated option sets on the page.
-  const trigDeclares = /(^|\s)combobox(\s|$)/i.test(trigger.getAttribute('role') || '')
-    || (trigger.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox';
+  const trigDeclares = !!trigger && (/(^|\s)combobox(\s|$)/i.test(trigger.getAttribute('role') || '')
+    || (trigger.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox');
   let controlled = null;
   try {
     // A plain toggle's aria-controls names a revealed panel, not a list: only a declared picker's
@@ -3703,8 +3983,20 @@ _FIND_MENU_JS = (
     // (or a container inside it) that expanded to reveal leaves which pre-existed hidden — there the
     // container is old but the leaves are the new reaction. Scoped to within the clicked row so an
     // unrelated pre-existing list that merely gained rows elsewhere is still rejected.
-    const withinClicked = p === trigger || pContains(trigger, p);
-    if (!boundaryStandIns.has(p) && preHas(p) && !withinClicked) continue;
+    const withinClicked = !!trigger && (p === trigger || pContains(trigger, p));
+    if (reuse === null && !cascade && !boundaryStandIns.has(p) && preHas(p) && !withinClicked) continue;
+    // Under `reuse: 'any'` the reaction evidence is gone, so structure must carry the claim alone: an
+    // open menu floats (its container or a near ancestor is absolutely/fixed positioned). An in-flow
+    // candidate is static page content and is never admitted on this path.
+    if (reuse === 'any' || (cascade && !withinClicked)) {
+      let floating = false;
+      for (let a = p, hops = 0; a && a.nodeType === 1 && hops < 8; hops++, a = composedParentElement(a)) {
+        let pos = '';
+        try { pos = getComputedStyle(a).position; } catch (e) { break; }
+        if (pos === 'absolute' || pos === 'fixed') { floating = true; break; }
+      }
+      if (!floating) continue;
+    }
     // A dialog is a page mode, not a menu — mislabeling its action buttons invites a wrong "pick an
     // option" move. But a real option list legitimately renders inside a modal (an application form's
     // select in a dialog), so exclude a dialog group ONLY when its rows are not explicit menu options:
@@ -3719,8 +4011,8 @@ _FIND_MENU_JS = (
     } catch (e) {}
     const pr = p.getBoundingClientRect();
     if (!vis(pr) || pr.height > 500) continue;
-    if (pr.top < tr.top - 200 || pr.top > tr.bottom + 400) continue;
-    if (pr.right < tr.left - 100 || pr.left > tr.right + 100) continue;
+    if (tr && (pr.top < tr.top - 200 || pr.top > tr.bottom + 400)) continue;
+    if (tr && (pr.right < tr.left - 100 || pr.left > tr.right + 100)) continue;
     const tops = new Set(g.map((c) => Math.round(c.r.top)));
     if (tops.size < 2) continue;
     if (!best || g.length > best.g.length || (g.length === best.g.length && pr.height < best.h)) best = { p, g, h: pr.height };
@@ -6473,6 +6765,35 @@ def build_browser_tools(
                     return _menu_open_note(found, selector, clicked_row=True)
                 return None
 
+            async def _cascade_child_note() -> str | None:
+                # The clicked row DETACHED: a cascading category replaces the whole list with its
+                # children, which reads as "the menu closed" off the row alone — a false verdict
+                # exactly when the model must keep drilling. New rows in a floating container are those
+                # children. A real commit that closed the menu pays one probe; the wait extends only
+                # while the widget shows a busy indicator for the children it is still fetching.
+                baseline = time.monotonic() + 0.8
+                deadline = time.monotonic() + 2.4
+                while True:
+                    try:
+                        found = await page.evaluate(_FIND_MENU_JS, {"sel": selector, "el": None, "cascade": True})
+                    except Exception:
+                        return None
+                    if isinstance(found, dict) and found.get("count"):
+                        return _menu_open_note(found, selector, clicked_row=True)
+                    now = time.monotonic()
+                    if now < baseline:
+                        # Children scheduled on a timer may announce nothing (no busy row) for a beat:
+                        # a short unconditional settling window before the busy signal is required.
+                        await asyncio.sleep(0.25)
+                        continue
+                    try:
+                        busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                    except Exception:
+                        busy = False
+                    if not busy or now >= deadline:
+                        return None
+                    await asyncio.sleep(0.3)
+
             async def _state_change_note(opt_text: str, after: dict[str, Any]) -> str:
                 picked = f"Selected option {opt_text!r} — its state changed (the menu stayed open)."
                 # A row that did not grow cannot have expanded into itself, so nothing competes with
@@ -6510,6 +6831,9 @@ def build_browser_tools(
             if after is None and navigated:
                 return f"Selected option {opt!r} — the page navigated.", None
             if after is not None and not after.get("stillOpen"):
+                child = await _cascade_child_note()
+                if child:
+                    return child, None
                 return f"Selected option {opt!r} — the menu closed.", None
             if after is not None and _committed_state(after):
                 held, failure = await _state_holds(after.get("optState") or "")
@@ -6529,6 +6853,9 @@ def build_browser_tools(
                     return f"Selected option {opt!r} — the page navigated.", None
                 return _unverified("post-click" if after is None else "settle")
             if not settled.get("stillOpen"):
+                child = await _cascade_child_note()
+                if child:
+                    return child, None
                 return f"Selected option {opt!r} — the menu closed.", None
             if _committed_state(settled):
                 held, failure = await _state_holds(settled.get("optState") or "")
@@ -6545,8 +6872,9 @@ def build_browser_tools(
                 return late_child, None
             return None, (
                 f"clicked option {opt!r} ({selector}) but the selection did not commit — the menu is "
-                "still open and unchanged. Do not repeat this click; press Enter on the option, or "
-                "re-observe and try a different control."
+                "still open and unchanged. Do not repeat this click; re-observe and try a different "
+                "control. (Do NOT press Enter on the FIELD as a shortcut: on many widgets that commits "
+                "whichever row is highlighted, not the one you want.)"
             )
         if pre.get("menuOpen"):
             if pre.get("containsMenu"):
@@ -7047,6 +7375,99 @@ def build_browser_tools(
             await page.focus(selector, timeout=15000)
         return True, None
 
+    def _occluder_labels_hold(occluder: dict[str, Any] | None, value: str) -> bool:
+        # The covering layer IS the committed-selection surface only when its own accessible naming
+        # carries the value ("<label>, press delete to clear value." style) — read off the occluder
+        # dict the covered-probe already built, no extra DOM round trip.
+        def norm(t: str) -> str:
+            return " ".join(str(t or "").split()).casefold()
+
+        want = norm(value)
+        if not want:
+            return False
+
+        def holds(raw: object) -> bool:
+            # The committed label may itself contain commas ("Korea, Republic of"); the widget's
+            # instruction ("press delete to clear value.") is ONE trailing comma-clause. Strip it
+            # only when the trailing clause reads as an instruction — an unconditional strip would
+            # let a bare "Korea" read as holding a suffix-less "Korea, Republic of" label.
+            own = norm(str(raw or "")).split("|")[0].strip()
+            if not own:
+                return False
+            if own == want:
+                return True
+            head, _, tail = own.rpartition(",")
+            if not head or not _INSTRUCTION_CLAUSE_RE.search(tail):
+                return False
+            return head.strip() == want
+
+        if holds((occluder or {}).get("name")):
+            return True
+        for control in (occluder or {}).get("controls") or []:
+            if isinstance(control, dict) and holds(control.get("label")):
+                return True
+        return False
+
+    async def _surface_confirms(page: Any, selector: str, chosen: str) -> bool:
+        try:
+            return bool(
+                await page.evaluate(_COMMIT_SURFACE_JS, {**(await _probe_arg(page, selector)), "chosen": chosen})
+            )
+        except Exception:
+            return False
+
+    async def _settled_commit_read(
+        page: Any, selector: str, verify_args: dict[str, Any], chosen: str, pre_surface_hit: bool
+    ) -> tuple[str, bool]:
+        # One read at the settle beat, then a short bounded poll: a widget that commits after an async
+        # round trip (a server-registered selection, a re-render that lands the label in a pill while
+        # the input keeps an opaque id or nothing) must not be refused on a single instant's read. A
+        # surface that already showed this label BEFORE the click proves nothing and is never consulted.
+        readable = False
+        committed = ""
+        for attempt in range(4):
+            if attempt:
+                await asyncio.sleep(0.7)
+            # Fail-closed: a list whose open-state cannot be read counts as still open, so the
+            # equal-value acceptance in the verify JS never rests on a failed probe.
+            sugg_list_open = True
+            commit_evt = False
+            if verify_args.get("suggTagged"):
+                try:
+                    sugg_list_open = bool(
+                        await page.evaluate(_SUGG_LIST_STILL_OPEN_JS, await _probe_arg(page, selector))
+                    )
+                except Exception:
+                    sugg_list_open = True
+                # Read fresh each poll: an async widget may dispatch the committing input event a
+                # beat after the click. Fail-closed on an unreadable probe, and never consult the
+                # window flag when arming failed — it could hold a previous field's stale true.
+                if verify_args.get("commitEvtArmed"):
+                    try:
+                        commit_evt = bool(await page.evaluate("() => !!window.__tv3_commit_evt"))
+                    except Exception:
+                        commit_evt = False
+            try:
+                read = await page.evaluate(
+                    _VERIFY_COMMIT_JS,
+                    {
+                        **verify_args,
+                        "suggListOpen": sugg_list_open,
+                        "commitEvt": commit_evt,
+                        "el": (await _probe_arg(page, selector))["el"],
+                    },
+                )
+                readable = readable or read is not None
+                committed = str(read or "").strip()
+            except Exception as e:
+                LOG.debug("taskv3 commit-verify read failed", selector=selector, error=str(e))
+                committed = ""
+            if committed:
+                return committed, readable
+            if not pre_surface_hit and await _surface_confirms(page, selector, chosen):
+                return chosen, True
+        return committed, readable
+
     async def _commit_typeahead(
         page: Any, selector: str, value: str, rounds: int, *, exact_only: bool = False, probe: str | None = None
     ) -> _TypeaheadPick:
@@ -7121,12 +7542,27 @@ def build_browser_tools(
                 info = None
             return info if isinstance(info, dict) else {}
 
+        # The base poll extends while the widget shows a visible in-flight indicator — the same
+        # bounded busy extension the open->observe path applies: production pods run at a fraction
+        # of a vCPU, so a fetch that renders instantly on a laptop lands seconds later there.
         found: dict[str, Any] | None = None
-        for _ in range(rounds):
+        soft_deadline = time.monotonic() + 0.4 * rounds
+        hard_deadline = time.monotonic() + 8.0
+        while True:
             await asyncio.sleep(0.4)
             found = await _find()
             if found is not None:
                 break
+            now = time.monotonic()
+            if now >= hard_deadline:
+                break
+            if now >= soft_deadline:
+                try:
+                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                except Exception:
+                    busy = False
+                if not busy:
+                    break
         if found is None:
             return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
         declared_rows, rows, idx, overflow = await _resolve(found)
@@ -7167,6 +7603,18 @@ def build_browser_tools(
         except Exception:
             pre_value = value
         clicked = False
+        pre_surface_hit = await _surface_confirms(page, selector, best_txt)
+        try:
+            await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "sugg", "n": idx})
+        except Exception:
+            LOG.debug("taskv3 suggestion list stamp failed", selector=selector)
+        # A failed arm must read as "no event", not as whatever a PREVIOUS field's probe left in the
+        # window flag — the reset lives inside the arm JS, so its success is tracked here.
+        commit_evt_armed = False
+        try:
+            commit_evt_armed = bool(await page.evaluate(_ARM_COMMIT_EVENT_JS, await _probe_arg(page, selector)))
+        except Exception:
+            LOG.debug("taskv3 commit-event arm failed", selector=selector)
         try:
             if not await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
@@ -7182,6 +7630,18 @@ def build_browser_tools(
                         info = await _row_info(idx)
                         from_focus = bool(info.get("fromFocus"))
                         declared = [str(v) for v in (info.get("declared") or []) if isinstance(v, str)]
+                        pre_surface_hit = await _surface_confirms(page, selector, best_txt)
+                        try:
+                            await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "sugg", "n": idx})
+                        except Exception:
+                            LOG.debug("taskv3 suggestion list stamp failed", selector=selector)
+                        commit_evt_armed = False
+                        try:
+                            commit_evt_armed = bool(
+                                await page.evaluate(_ARM_COMMIT_EVENT_JS, await _probe_arg(page, selector))
+                            )
+                        except Exception:
+                            LOG.debug("taskv3 commit-event arm failed", selector=selector)
                         clicked = await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000)
             except Exception:
                 clicked = False
@@ -7190,31 +7650,37 @@ def build_browser_tools(
             LOG.debug("taskv3 typeahead could not click suggestion", selector=selector, suggestion=best_txt)
             return _TypeaheadPick(None, best_txt, False, None, clicked=False, declared=declared_rows)
         await asyncio.sleep(0.3)
-        readable = False
-        try:
-            # A row the FOCUS click revealed was offered, not filtered: verify it under the pick
-            # contract (the value must BE the chosen label), not the typeahead's change-based one.
-            # `typed` must be what the field actually HELD, which under a reduced query is the rung —
-            # comparing against the fuller request would let leftover rung text read as the commit.
-            read = await page.evaluate(
-                _VERIFY_COMMIT_JS,
-                {
-                    "field": selector,
-                    "typed": pre_value if from_focus else (value if probe is None else probe),
-                    "chosen": best_txt,
-                    "noSuggestionList": from_focus,
-                    "preHidden": pre_hidden,
-                    "chosenValues": declared,
-                    "el": (await _probe_arg(page, selector))["el"],
-                },
-            )
-            # null means the field could not be read at all; '' means it was read and holds nothing.
-            readable = read is not None
-            committed = str(read or "").strip()
-        except Exception as e:
-            LOG.debug("taskv3 typeahead commit-verify failed", selector=selector, error=str(e))
-            committed = ""
-        return _TypeaheadPick(committed or None, best_txt, readable, None, clicked=True, declared=declared_rows)
+        # A row the FOCUS click revealed was offered, not filtered: verify it under the pick
+        # contract (the value must BE the chosen label), not the typeahead's change-based one.
+        # `typed` must be what the field actually HELD, which under a reduced query is the rung —
+        # comparing against the fuller request would let leftover rung text read as the commit.
+        committed, readable = await _settled_commit_read(
+            page,
+            selector,
+            {
+                "field": selector,
+                "typed": pre_value if from_focus else (value if probe is None else probe),
+                "chosen": best_txt,
+                "noSuggestionList": from_focus,
+                "suggTagged": True,
+                "commitEvtArmed": commit_evt_armed,
+                "declaredRows": declared_rows,
+                "fieldDeclared": await _field_declares_list(page, selector),
+                "preHidden": pre_hidden,
+                "chosenValues": declared,
+            },
+            best_txt,
+            pre_surface_hit,
+        )
+        return _TypeaheadPick(
+            committed or None,
+            best_txt,
+            readable,
+            None,
+            clicked=True,
+            declared=declared_rows,
+            pre_surface_hit=pre_surface_hit,
+        )
 
     async def _read_field_value(page: Any, selector: str) -> str | None:
         try:
@@ -7292,7 +7758,9 @@ def build_browser_tools(
             return _TypeaheadPick(None, None, False, None, clicked=False, declared=False), pre_value
         return await _commit_typeahead(page, selector, value, rounds), pre_value
 
-    async def _close_lingering_typeahead_list(page: Any, selector: str, committed: str | None) -> ToolResult | None:
+    async def _close_lingering_typeahead_list(
+        page: Any, selector: str, committed: str | None, *, surface_vouched_pre_click: bool = False
+    ) -> ToolResult | None:
         # A declared field's widget can re-search on the value it just committed and leave its list
         # open, covering whatever the form has below it. Close it with Escape, best-effort: None means
         # the caller's own OK stands; a ToolResult means closing was not safe to treat as a no-op.
@@ -7322,11 +7790,16 @@ def build_browser_tools(
             except Exception:
                 after = None
         if committed is not None and after is not None and after.strip() != committed.strip():
-            return ToolResult.error(
-                f"selected {committed!r} for {selector}, but its still-open list did not just sit there: "
-                f"closing it with Escape changed the value to {after!r} — the commit did not survive; "
-                "re-observe and retry"
-            )
+            # A pill/side-surface commit keeps an opaque id (or nothing) in the input, so a raw value
+            # mismatch is not a revert while the committed surface still holds the label after Escape.
+            # A surface that already vouched BEFORE the pick click proves nothing about survival —
+            # only a click-caused surface may absorb the mismatch (mirrors pre_surface_hit upstream).
+            if surface_vouched_pre_click or not await _surface_confirms(page, selector, committed):
+                return ToolResult.error(
+                    f"selected {committed!r} for {selector}, but its still-open list did not just sit there: "
+                    f"closing it with Escape changed the value to {after!r} — the commit did not survive; "
+                    "re-observe and retry"
+                )
         try:
             if bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector))):
                 LOG.debug("taskv3 typeahead list stayed open after Escape", selector=selector)
@@ -7448,7 +7921,9 @@ def build_browser_tools(
                 verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
                 if verdict is CommitStatus.OK:
                     if pick.declared:
-                        closed = await _close_lingering_typeahead_list(page, selector, pick.committed)
+                        closed = await _close_lingering_typeahead_list(
+                            page, selector, pick.committed, surface_vouched_pre_click=pick.pre_surface_hit
+                        )
                         if closed is not None:
                             return closed
                     return ToolResult.ok(
@@ -7574,7 +8049,13 @@ def build_browser_tools(
                     f"could not click {selector} to open its option list — the field is NOT filled; "
                     "re-observe and retry"
                 )
-            for _ in range(6):
+            # 2.4s of polling normally; while the widget shows a visible in-flight indicator (a busy
+            # row, a spinner) the rows are still coming, so the poll wait extends — production pods run
+            # at a fraction of a vCPU and a fetch that renders instantly on a laptop lands seconds later
+            # there. The extension is bounded: a permanently-busy page stops at the hard cap.
+            soft_deadline = time.monotonic() + 2.4
+            hard_deadline = time.monotonic() + 8.0
+            while True:
                 await asyncio.sleep(0.4)
                 try:
                     menu = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
@@ -7583,7 +8064,16 @@ def build_browser_tools(
                     menu = None
                 if isinstance(menu, dict) and menu.get("count"):
                     return menu, None
-            return None, None
+                now = time.monotonic()
+                if now >= hard_deadline:
+                    return None, None
+                if now >= soft_deadline:
+                    try:
+                        busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                    except Exception:
+                        busy = False
+                    if not busy:
+                        return None, None
 
         found, err = await _open_and_enumerate()
         if err is not None:
@@ -7596,11 +8086,23 @@ def build_browser_tools(
             if err is not None:
                 return err
         if not isinstance(found, dict) or not found.get("count"):
+            # Last resort before declaring no list: a menu whose rows survive close (kept-alive nodes the
+            # snapshots keep reading as pre-existing) never shows up as a reaction however often we
+            # reopen it. After two open-clicks on the anchor, a FLOATING row list next to it is its own;
+            # 'any' still refuses in-flow static content, and the pick below still exact-matches and
+            # commit-verifies before anything is reported filled.
+            try:
+                found = await page.evaluate(_FIND_MENU_JS, {**(await _probe_arg(page, selector)), "reuse": "any"})
+            except Exception:
+                found = None
+        if not isinstance(found, dict) or not found.get("count"):
             # The open-click rendered no enumerable option list (portalled/closed-root, or not a menu).
             # Truthful did-not-commit; the model's vision handles it from here.
             return ToolResult.error(
                 f"opened {selector} but no option list rendered to pick {value!r} from — the field is NOT "
-                "filled; look() at the control and click the option you want"
+                "filled; if the field accepts free text, fill it with type() instead (select_combobox is "
+                "only for fields that commit from a list); otherwise look() at the control and click the "
+                "option you want"
             )
         # Read the whole tagged list at full length so the match is neither missed on a >60-char label
         # nor computed over a truncated ≤15 slice (which would let "unique in the first 15" stand in for
@@ -7953,6 +8455,11 @@ def build_browser_tools(
                 chosen_values = [str(v) for v in raw_values if isinstance(v, str)]
         except Exception:
             chosen_values = []
+        pre_surface_hit = await _surface_confirms(page, selector, matched)
+        try:
+            await page.evaluate(_STAMP_SUGG_LIST_JS, {"attr": "menu", "n": idx})
+        except Exception:
+            LOG.debug("taskv3 menu list stamp failed", selector=selector)
         try:
             if not await _click_stamped_row(page, f'[data-tv3-menu="{idx}"]', matched, 5000):
                 raise RuntimeError("stamped menu row is no longer the matched row")
@@ -7962,27 +8469,21 @@ def build_browser_tools(
                 f'[data-tv3-menu="{idx}"]'
             )
         await asyncio.sleep(0.3)
-        readable = False
-        committed = ""
-        try:
-            read = await page.evaluate(
-                _VERIFY_COMMIT_JS,
-                {
-                    "field": selector,
-                    "typed": pre_value,
-                    "chosen": matched,
-                    "chosenValues": chosen_values,
-                    "noSuggestionList": True,
-                    "preHidden": pre_hidden,
-                    "preSurface": pre_surface,
-                    "el": (await _probe_arg(page, selector))["el"],
-                },
-            )
-            readable = read is not None
-            committed = str(read or "").strip()
-        except Exception as e:
-            LOG.debug("taskv3 open-observe-pick commit-verify failed", selector=selector, error=str(e))
-            committed = ""
+        committed, readable = await _settled_commit_read(
+            page,
+            selector,
+            {
+                "field": selector,
+                "typed": pre_value,
+                "chosen": matched,
+                "chosenValues": chosen_values,
+                "noSuggestionList": True,
+                "preHidden": pre_hidden,
+                "preSurface": pre_surface,
+            },
+            matched,
+            pre_surface_hit,
+        )
         verdict, matches = await _typeahead_commit_verdict(page, selector, committed or None, readable)
         if verdict is CommitStatus.OK:
             return ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})")
@@ -8036,12 +8537,19 @@ def build_browser_tools(
         # leaving raw typed text a widget won't accept (a false "filled" — the failure mode this prevents).
 
         async def _typeahead_verdict_result(
-            opt_txt: str, committed: str | None, readable: bool, *, declared: bool
+            opt_txt: str,
+            committed: str | None,
+            readable: bool,
+            *,
+            declared: bool,
+            surface_vouched_pre_click: bool = False,
         ) -> ToolResult:
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
             if verdict is CommitStatus.OK:
                 if declared:
-                    closed = await _close_lingering_typeahead_list(page, selector, committed)
+                    closed = await _close_lingering_typeahead_list(
+                        page, selector, committed, surface_vouched_pre_click=surface_vouched_pre_click
+                    )
                     if closed is not None:
                         return closed
                 return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
@@ -8103,7 +8611,11 @@ def build_browser_tools(
                 rung_pick = await _commit_typeahead(page, selector, value, rounds=4, exact_only=True, probe=rung)
                 if rung_pick.suggestion is not None:
                     return await _typeahead_verdict_result(
-                        rung_pick.suggestion, rung_pick.committed, rung_pick.readable, declared=rung_pick.declared
+                        rung_pick.suggestion,
+                        rung_pick.committed,
+                        rung_pick.readable,
+                        declared=rung_pick.declared,
+                        surface_vouched_pre_click=rung_pick.pre_surface_hit,
                     )
                 if rung_pick.candidates:
                     return rung_pick.candidates
@@ -8141,6 +8653,18 @@ def build_browser_tools(
             try:
                 pick, pre_value = await _type_and_commit(page, selector, value, rounds=8)
             except _FieldCovered as exc:
+                # A widget that renders its committed selection as a pill list OVER its own input is
+                # not blocked — it is DONE when a pill in its own container already carries the
+                # requested value. Refusing it as covered loops the model on a field that already
+                # holds what it asked for. Two independent anchors must BOTH carry the value: the
+                # field's own single-field container (so a sibling field's pill cannot vouch) AND the
+                # covering layer's own name/control labels (so an unrelated overlay over a field whose
+                # open inline list merely OFFERS the value cannot read as committed).
+                if _occluder_labels_hold(exc.occluder, value) and await _surface_confirms(page, selector, value):
+                    return ToolResult.ok(
+                        f"{selector} already holds {value!r} — the requested value is already committed; "
+                        "no action was needed"
+                    )
                 return _covered_error(exc.selector, exc.occluder)
             except _FieldNotEditable as exc:
                 return _not_editable_error(exc)
@@ -8258,7 +8782,11 @@ def build_browser_tools(
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
             return await _typeahead_verdict_result(
-                pick.suggestion, pick.committed, pick.readable, declared=pick.declared
+                pick.suggestion,
+                pick.committed,
+                pick.readable,
+                declared=pick.declared,
+                surface_vouched_pre_click=pick.pre_surface_hit,
             )
         # A non-typeable anchor (a button/div that only opens a list on click): open, observe, pick.
         return await _open_observe_pick(page, selector, value)
