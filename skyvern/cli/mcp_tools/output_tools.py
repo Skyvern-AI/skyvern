@@ -346,7 +346,11 @@ async def skyvern_finish(
     status: Annotated[str, Field(description="Terminal status: completed, terminated, or failed")],
     output: Annotated[
         Any,
-        Field(description="Optional final JSON value: object, array, string, number, boolean, or null"),
+        Field(
+            description="Optional final JSON value: object, array, string, number, boolean, or null",
+            # Any generates an empty schema; directory listing requires every param to carry a type.
+            json_schema_extra={"type": ["object", "array", "string", "number", "boolean", "null"]},
+        ),
     ] = None,
     schema: Annotated[str | None, Field(description="Optional JSON Schema string for output validation")] = None,
     reason: Annotated[str | None, Field(description="Optional concise reason for the declared status")] = None,
