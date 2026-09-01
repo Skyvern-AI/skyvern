@@ -12,14 +12,16 @@ Covers the three acceptance behaviors:
 import asyncio
 import hashlib
 import json
+import logging
 import os
-from collections.abc import Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 from structlog.testing import capture_logs
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
@@ -2707,6 +2709,20 @@ def _empty_read_rows(logs: list[dict]) -> list[dict]:
     return [entry for entry in logs if entry.get("event") == "downloads.empty_read"]
 
 
+@contextmanager
+def _capture_empty_read_logs() -> Iterator[list[dict]]:
+    # downloads.empty_read logs at DEBUG; the suite's bound logger filters at INFO and
+    # capture_logs only swaps processors, not the level gate, so lower the level for the
+    # capture window and restore it after.
+    previous_config = structlog.get_config()
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+    try:
+        with capture_logs() as logs:
+            yield logs
+    finally:
+        structlog.configure(**previous_config)
+
+
 def _artifact_row_storage(
     monkeypatch: pytest.MonkeyPatch, *, keyring: str | None, file_infos: list[FileInfo]
 ) -> S3Storage:
@@ -2740,7 +2756,7 @@ async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytes
         AsyncMock(return_value=([SimpleNamespace(browser_session_id=None, checksum=None)], False)),
     )
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2759,7 +2775,7 @@ async def test_downloads_empty_read_reports_listing_skip(monkeypatch: pytest.Mon
     listing = AsyncMock(return_value=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", listing)
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2782,7 +2798,7 @@ async def test_downloads_empty_read_reports_failed_row_lookup_as_unknown_count(
     monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=False))
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2796,7 +2812,7 @@ async def test_downloads_empty_read_reports_unqueried_rows_on_legacy_path(monkey
     storage = _artifact_row_storage(monkeypatch, keyring="", file_infos=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
-    with capture_logs() as logs:
+    with _capture_empty_read_logs() as logs:
         assert await storage.get_downloaded_files("o_1", "wr_1") == []
 
     row = _empty_read_rows(logs)[0]
@@ -2969,7 +2985,7 @@ async def test_downloads_empty_read_reports_every_empty_read_for_a_run(monkeypat
     storage = _artifact_row_storage(monkeypatch, keyring="", file_infos=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
-    with capture_logs() as repeated:
+    with _capture_empty_read_logs() as repeated:
         await storage.get_downloaded_files("o_1", "wr_repeat")
         await storage.get_downloaded_files("o_1", "wr_repeat")
 
