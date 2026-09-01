@@ -1451,6 +1451,44 @@ class LLMAPIHandlerFactory:
         return check_model
 
     @staticmethod
+    def uses_openai_responses_bridge(llm_config: LLMConfig | LLMRouterConfig) -> bool:
+        """Whether calls built from this config land on an OpenAI gpt-5.6 model, which litellm
+        silently bridges from /v1/chat/completions to /v1/responses when tools are present (see
+        _record_served_service_tier's docstring). Only the responses bridge accepts the dict form
+        of reasoning_effort (mapped to Reasoning(**dict)); a plain chat-completions model 400s on
+        it ("Unknown parameter: 'reasoning'" observed).
+
+        A router deployment can hide the model behind an opaque alias (e.g. an Azure deployment
+        name) in its dispatched litellm model string, so this also checks the deployment's
+        declared model_info label -- router configs set that to the real model name for exactly
+        this kind of identification.
+        """
+
+        def _is_bridge_model(candidate: Any) -> bool:
+            return isinstance(candidate, str) and candidate.rsplit("/", 1)[-1].lower().startswith(
+                _OPENAI_GPT5_6_MODEL_PREFIX
+            )
+
+        # litellm decides the bridge from the DISPATCHED model string alone, so this check reads
+        # exactly that and nothing else (a model_info label saying gpt-5.6 would answer True where
+        # litellm will not bridge, sending the dict to a chat-completions endpoint).
+        if isinstance(llm_config, LLMRouterConfig):
+            # EVERY deployment that can serve the call (main + fallback groups, same filter as
+            # _resolve_tool_choice_support) must be a bridge model: a mixed router could hand the
+            # dict reasoning_effort to a non-bridge fallback, which rejects it.
+            groups = {llm_config.main_model_group}
+            fallback_group = llm_config.fallback_model_group
+            if isinstance(fallback_group, str):
+                groups.add(fallback_group)
+            elif fallback_group:
+                groups.update(fallback_group)
+            deployments = [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+            if not deployments:
+                return False
+            return all(_is_bridge_model(deployment.litellm_params.get("model")) for deployment in deployments)
+        return _is_bridge_model(llm_config.model_name)
+
+    @staticmethod
     def is_github_copilot_endpoint() -> bool:
         """Check if the OPENAI_COMPATIBLE endpoint is GitHub Copilot."""
         return (
@@ -3208,6 +3246,29 @@ class LLMCaller:
 
     def clear_tool_results(self) -> None:
         self.current_tool_results = []
+
+    def uses_openai_responses_bridge(self) -> bool:
+        """Whether THIS caller's calls actually go through litellm's chat->responses bridge. The
+        raw AsyncOpenAI/openrouter dispatch branches never bridge, whatever the model is named --
+        a dict reasoning_effort there is a schema violation on every call."""
+        if self.openai_client is not None or self._custom_openrouter:
+            return False
+        # Custom/BYO keys (openrouter or openai-compatible) point litellm at an arbitrary api_base
+        # that is not guaranteed to implement /v1/responses, whatever the model is named.
+        if is_custom_llm_key(self.original_llm_key):
+            return False
+        # Same risk for any built-in openai-provider config with an explicit api_base (e.g. the
+        # OPENAI_COMPATIBLE registration, whose key name is configurable): only real OpenAI and
+        # Azure endpoints are known to serve the bridge, and real OpenAI needs no api_base.
+        litellm_params = getattr(self.llm_config, "litellm_params", None)
+        if (
+            isinstance(self.llm_config, LLMConfig)
+            and litellm_params is not None
+            and litellm_params.get("api_base")
+            and not self.llm_config.model_name.startswith("azure/")
+        ):
+            return False
+        return LLMAPIHandlerFactory.uses_openai_responses_bridge(self.llm_config)
 
     def supports_tool_choice(self) -> bool:
         """Whether the resolved model can be sent a ``tool_choice`` parameter.
