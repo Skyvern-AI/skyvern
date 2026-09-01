@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _summary_disclosure_control,
     _summary_entry,
 )
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_readback_outcome_cases.yaml").read_text())[
@@ -653,8 +655,14 @@ class TestMCPFailedStepLoopDetection:
             browser=SimpleNamespace(is_connected=lambda: True),
         )
         browser_state = SimpleNamespace(browser_context=browser_context)
+
+        @asynccontextmanager
+        async def _browser_operation(_session_id: str, state: Any) -> AsyncIterator[BrowserOperation]:
+            yield BrowserOperation(state, BrowserRetirement())
+
         persistent_session_manager = SimpleNamespace(
             get_browser_state=AsyncMock(return_value=browser_state),
+            browser_operation=_browser_operation,
         )
         monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", persistent_session_manager)
         monkeypatch.setattr(runtime.settings, "ENV", "local")

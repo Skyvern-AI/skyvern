@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,6 +17,7 @@ from skyvern.cli.core.session_manager import SessionState, scoped_session
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, mcp_to_copilot
 from skyvern.forge.sdk.copilot.tools import _same_page_ignoring_fragment
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserOperationRejected, BrowserRetirement
 
 
 @pytest.fixture(autouse=True)
@@ -158,10 +161,22 @@ class TestMcpBrowserContextBridge:
         browser_state.browser_context = MagicMock()
         manager = MagicMock()
         manager.get_browser_state = AsyncMock(return_value=browser_state)
+
+        @asynccontextmanager
+        async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
+            yield BrowserOperation(resolved_state, BrowserRetirement())
+
+        manager.browser_operation = _operation
         monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", manager)
 
         monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
-        monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *a, **kw: MagicMock())
+
+        def _skyvern_browser(_client: Any, browser_context: Any, **_kwargs: Any) -> MagicMock:
+            browser = MagicMock()
+            browser.browser_context = browser_context
+            return browser
+
+        monkeypatch.setattr(runtime, "SkyvernBrowser", _skyvern_browser)
         monkeypatch.setattr(runtime, "get_active_api_key", lambda: "sk-test-key")
         monkeypatch.setattr(runtime, "hash_api_key_for_cache", lambda k: "hash_" + k)
 
@@ -178,6 +193,127 @@ class TestMcpBrowserContextBridge:
         monkeypatch.setattr(runtime, "unregister_copilot_session", unregister_mock)
 
         return manager, register_mock, unregister_mock, browser_state, override_calls
+
+    @pytest.mark.asyncio
+    async def test_nested_context_reuses_the_outer_generation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot.runtime import mcp_browser_context
+
+        manager, register_mock, unregister_mock, browser_state, _ = self._install_happy_path_mocks(monkeypatch)
+        operation_entries = 0
+
+        @asynccontextmanager
+        async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
+            nonlocal operation_entries
+            operation_entries += 1
+            yield BrowserOperation(resolved_state, BrowserRetirement())
+
+        manager.browser_operation = _operation
+        ctx = _make_ctx()
+
+        async with mcp_browser_context(ctx):
+            async with mcp_browser_context(ctx):
+                pass
+
+        manager.get_browser_state.assert_awaited_once_with(
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        assert operation_entries == 1
+        register_mock.assert_called_once()
+        assert register_mock.call_args.args[1].browser.browser_context is browser_state.browser_context
+        unregister_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retirement_surfaces_when_inner_dispatch_suppresses_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+
+        manager, _, _, _, _ = self._install_happy_path_mocks(monkeypatch)
+        retirement = BrowserRetirement()
+        entered = asyncio.Event()
+
+        @asynccontextmanager
+        async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
+            yield BrowserOperation(resolved_state, retirement)
+
+        manager.browser_operation = _operation
+        ctx = _make_ctx()
+        stale_dispatch_started = False
+
+        async def _dispatch() -> str:
+            nonlocal stale_dispatch_started
+            try:
+                async with runtime.mcp_browser_context(ctx):
+                    async with runtime.mcp_browser_context(ctx):
+                        entered.set()
+                        try:
+                            await asyncio.Future()
+                        except asyncio.CancelledError:
+                            pass
+                    stale_dispatch_started = True
+            except runtime.CopilotBrowserGenerationRetired:
+                return "retired"
+            return "completed"
+
+        dispatch_task = asyncio.create_task(_dispatch())
+        await entered.wait()
+        retirement.begin(runtime.BrowserRetirementReason.replacement)
+        retirement.cancel(dispatch_task)
+
+        assert await dispatch_task == "retired"
+        assert stale_dispatch_started is False
+
+    @pytest.mark.asyncio
+    async def test_external_cancel_is_not_consumed_by_generation_retirement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+
+        manager, _, _, _, _ = self._install_happy_path_mocks(monkeypatch)
+        retirement = BrowserRetirement()
+        entered = asyncio.Event()
+
+        @asynccontextmanager
+        async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
+            yield BrowserOperation(resolved_state, retirement)
+
+        manager.browser_operation = _operation
+
+        async def _dispatch() -> None:
+            async with runtime.mcp_browser_context(_make_ctx()):
+                entered.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    pass
+
+        dispatch_task = asyncio.create_task(_dispatch())
+        await entered.wait()
+        retirement.begin(runtime.BrowserRetirementReason.replacement)
+        retirement.cancel(dispatch_task)
+        dispatch_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch_task
+
+    @pytest.mark.asyncio
+    async def test_rejected_admission_preserves_terminal_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+
+        manager, _, _, _, _ = self._install_happy_path_mocks(monkeypatch)
+
+        @asynccontextmanager
+        async def _operation(_session_id: str, _resolved_state: Any) -> AsyncIterator[BrowserOperationRejected]:
+            yield BrowserOperationRejected(runtime.BrowserRetirementReason.session_ending)
+
+        manager.browser_operation = _operation
+
+        with pytest.raises(runtime.CopilotBrowserGenerationRetired) as error:
+            async with runtime.mcp_browser_context(_make_ctx()):
+                pass
+
+        assert error.value.retirement_reason is runtime.BrowserRetirementReason.session_ending
 
     @pytest.mark.asyncio
     async def test_happy_path_registers_session_and_balances_unregister(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,7 +335,11 @@ class TestMcpBrowserContextBridge:
 
         assert register_mock.call_count == 1
         assert unregister_mock.call_count == 1
-        unregister_mock.assert_called_with(ctx.browser_session_id, organization_id=ctx.organization_id)
+        unregister_mock.assert_called_with(
+            ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+            expected_state=registered_state,
+        )
         # Override installed then reset.
         assert [c[0] for c in override_calls] == ["set", "reset"]
 

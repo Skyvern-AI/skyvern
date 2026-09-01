@@ -29,6 +29,7 @@ import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.forge.taskv3.tools import (
     _ALIAS_SELECTOR_RE,
     _OPAQUE_ID_RUN_RE,
+    _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
     _annotate_screenshot,
@@ -19224,3 +19225,604 @@ async def test_select_combobox_declared_reactive_rows_behind_a_css_only_spinner_
         )
         assert picked.status == "ok", picked.content
         assert await page.eval_on_selector("#city8", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+# Tier-1 semantic commit probe (SKY-15322): decisive-accept-only contract. Every accept must rest on
+# a signal the tool did not author; everything else is `unknown` and falls to the shape heuristics.
+_SEMANTIC_PROBE_SHAPES: dict[str, tuple[str, str, str, bool]] = {
+    # (html, intended, typed, expect_committed)
+    # Native selects return unknown by contract: selection state alone carries no click causality,
+    # and their own tool already verifies by value. Deferred to the phase that adds pre-state plumbing.
+    "native-select-is-unknown": (
+        '<select id="f"><option>Austin</option><option selected>Springfield, Sangamon, IL</option></select>',
+        "Springfield, Sangamon, IL",
+        "",
+        False,
+    ),
+    "value-transform": (
+        '<input id="f" value="Springfield, Sangamon, IL">',
+        "Springfield, Sangamon, IL",
+        "spring",
+        True,
+    ),
+    # The tool typed the intended string itself — equality alone is the impostor case, never a commit.
+    "value-authored-is-not-a-commit": (
+        '<input id="f" value="Springfield, Sangamon, IL">',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # ARIA selection state is retired from tier-1 (four distinct false-accept shapes across
+    # temporal, wiring, polarity and cross-root dimensions) — always unknown, heuristics decide.
+    "aria-selected-is-unknown": (
+        '<input id="f" aria-controls="sl"><div id="sl" role="listbox">'
+        '<div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div>',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # aria-selected inside the stamped LIVE suggestion list marks the highlighted offer, not a commit.
+    "aria-selected-live-list-highlight": (
+        '<input id="f" aria-controls="sl"><div id="sl" role="listbox" data-tv3-sugglist="1">'
+        '<div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div>',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # A sibling field's selection (unreferenced, outside this field's own container) can never vouch.
+    "aria-selected-sibling-container": (
+        '<div><input id="f"></div><div><input id="g" aria-controls="sl"><div id="sl" role="listbox">'
+        '<div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div></div>',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # Exact accessible-name equality only — 'Austin, Clear Lake' never reads as holding 'Austin'.
+    "aria-selected-exact-only": (
+        '<input id="f" aria-controls="sl"><div id="sl" role="listbox">'
+        '<div role="option" aria-selected="true" style="height:20px">Austin, Clear Lake</div></div>',
+        "Austin",
+        "Austin",
+        False,
+    ),
+    # An id resolves in exactly one root: another component's internal id must not cross-vouch.
+    "aria-selected-foreign-shadow-id": (
+        """<div id="hostA"></div><div id="hostB"></div>
+<script>
+var ra = document.getElementById('hostA').attachShadow({mode: 'open'});
+ra.innerHTML = '<div id="sl" role="listbox">'
+  + '<div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div>';
+var rb = document.getElementById('hostB').attachShadow({mode: 'open'});
+rb.innerHTML = '<input id="f" aria-controls="sl"><div id="sl" role="listbox"></div>';
+</script>""",
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # A flat wrapper holding a SECOND field: the container fallback may not vouch across fields.
+    "aria-selected-flat-form-second-field": (
+        '<div><input id="f"><input id="g"><div role="listbox">'
+        '<div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div></div>',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # The anchor reports its popup OPEN: aria-selected in it is the highlight, not a commit.
+    "aria-selected-while-popup-open": (
+        '<input id="f" aria-controls="sl" aria-expanded="true"><div id="sl" role="listbox">'
+        '<div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div>',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # visibility:hidden keeps the layout box — the rect check alone must not pass it.
+    "aria-selected-visibility-hidden": (
+        '<input id="f" aria-controls="sl"><div id="sl" role="listbox">'
+        '<div role="option" aria-selected="true" style="height:20px;visibility:hidden">'
+        "Springfield, Sangamon, IL</div></div>",
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # Sibling fields hidden inside custom-element shadow roots must still trip the second-field
+    # stop — the pierced probe may not go blind exactly there.
+    "aria-selected-shadow-sibling-field": (
+        """<div id="wrap">
+<x-field id="hostF"></x-field><x-field id="hostG"></x-field>
+<div role="listbox"><div role="option" aria-selected="true" style="height:20px">Springfield, Sangamon, IL</div></div>
+</div>
+<script>
+document.getElementById('hostF').attachShadow({mode: 'open'}).innerHTML = '<input id="f">';
+document.getElementById('hostG').attachShadow({mode: 'open'}).innerHTML = '<input id="g">';
+</script>""",
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+    # A contenteditable anchor has no el.value, so a value-only typed baseline reads empty and the
+    # transform guard could never fail — without a trustworthy baseline the branch must be unknown.
+    "contenteditable-empty-baseline-is-unknown": (
+        '<div id="f" contenteditable="true" style="width:300px;height:26px">Springfield, Sangamon, IL</div>',
+        "Springfield, Sangamon, IL",
+        "",
+        False,
+    ),
+    # A baseline the caller could not actually read makes no causality claim.
+    "untrusted-baseline-is-unknown": (
+        '<input id="f" value="Springfield, Sangamon, IL" data-tv3-test-untrusted="1">',
+        "Springfield, Sangamon, IL",
+        "springf",
+        False,
+    ),
+    # A contenteditable transform needs CLICK-caused evidence: a widget that expands the prefix on
+    # blur fires no input event, and the expansion alone is not a selection.
+    "contenteditable-transform-without-click-event": (
+        '<div id="f" contenteditable="true" data-tv3-test-commitevt="0">Springfield, Sangamon, IL</div>',
+        "Springfield, Sangamon, IL",
+        "springf",
+        False,
+    ),
+    # Contenteditable is retired from tier-1 (completion, previews and blur-expansion are all
+    # indistinguishable from selection at the DOM level) — always unknown, heuristics decide.
+    "contenteditable-with-click-event-still-unknown": (
+        '<div id="f" contenteditable="true" data-tv3-test-commitevt="1">Springfield, Sangamon, IL</div>',
+        "Springfield, Sangamon, IL",
+        "springf",
+        False,
+    ),
+    "aria-selected-zero-rect": (
+        '<input id="f" aria-controls="sl"><div id="sl" role="listbox">'
+        '<div role="option" aria-selected="true" style="display:none">Springfield, Sangamon, IL</div></div>',
+        "Springfield, Sangamon, IL",
+        "Springfield, Sangamon, IL",
+        False,
+    ),
+}
+
+
+# A PRE-EXISTING aria-selected summary node carrying the intended label (a "current selection"
+# decoration) beside a typeahead whose row click is dead: state that predates the click must not be
+# read as the click's commit.
+_PRE_SELECTED_DECOR_DEAD_CLICK_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrap" style="position:absolute;top:0;left:0;width:340px">
+  <label for="cityp">City</label>
+  <div role="option" aria-selected="true" style="height:18px;font-size:12px">Springfield, Sangamon, IL</div>
+  <input id="cityp" type="text" autocomplete="off" style="width:300px;height:26px">
+</div>
+<div id="dd" style="position:absolute;top:80px;left:0;width:300px;background:#fff"></div>
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('cityp');
+var dd = document.getElementById('dd');
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  dd.innerHTML = '';
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+    var row = document.createElement('div');
+    row.style.cssText = 'height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () {
+      var fresh = row.cloneNode(true);
+      fresh.addEventListener('click', function () {});
+      dd.replaceChild(fresh, row);
+    });
+    dd.appendChild(row);
+  });
+});
+</script>
+</body></html>
+"""
+
+
+# Codex round-2: a dead click that REPLACES the referenced live list (stamp and row tags die with
+# the container) and only then renders a matching aria-selected highlight — with no aria-expanded to
+# bail on — must not read that post-click highlight as a commit.
+_REPLACED_LIST_HIGHLIGHT_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="cityr">City</label>
+<input id="cityr" type="text" autocomplete="off" aria-controls="rl"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<div id="rl" role="listbox"
+     style="position:absolute;top:30px;left:0;width:300px;background:#fff"></div>
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('cityr');
+function currentList() { return document.getElementById('rl'); }
+function render(q, highlight) {
+  var old = currentList();
+  var fresh = document.createElement('div');
+  fresh.id = 'rl';
+  fresh.setAttribute('role', 'listbox');
+  fresh.style.cssText = old.style.cssText;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'option');
+    if (highlight) { row.setAttribute('aria-selected', 'true'); }
+    row.style.cssText = 'height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () { render(q, true); });
+    fresh.appendChild(row);
+  });
+  old.parentNode.replaceChild(fresh, old);
+}
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  if (!q) return;
+  render(q, false);
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_replaced_list_post_click_highlight_is_not_a_commit() -> None:
+    # The highlight exists only AFTER the dead click replaced the list, so the pre-click snapshot
+    # cannot catch it — the surviving-popup read has to.
+    async with _content_page(_REPLACED_LIST_HIGHLIGHT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityr", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+
+
+# The open->observe->pick twin of the replaced-list case: a NON-typeable anchor's dead menu-row
+# click replaces the popup with an unstamped matching aria-selected row.
+_MENU_REPLACED_LIST_HIGHLIGHT_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label id="lbl">City</label>
+<div id="anchor" role="combobox" aria-haspopup="listbox" aria-controls="ml" aria-labelledby="lbl"
+     tabindex="0" style="position:absolute;top:0;left:0;width:300px;height:26px;border:1px solid #999"></div>
+<div id="ml" role="listbox"
+     style="position:absolute;top:30px;left:0;width:300px;background:#fff"></div>
+<script>
+var DATA = ['Springfield, Sangamon, IL', 'Chicago, Cook, IL'];
+function render(highlight) {
+  var old = document.getElementById('ml');
+  var fresh = document.createElement('div');
+  fresh.id = 'ml';
+  fresh.setAttribute('role', 'listbox');
+  fresh.style.cssText = old.style.cssText;
+  DATA.forEach(function (d, i) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'option');
+    if (highlight && i === 0) { row.setAttribute('aria-selected', 'true'); }
+    row.style.cssText = 'height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () { render(true); });
+    fresh.appendChild(row);
+  });
+  old.parentNode.replaceChild(fresh, old);
+}
+document.getElementById('anchor').addEventListener('click', function () { render(false); });
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_menu_path_replaced_list_highlight_is_not_a_commit() -> None:
+    # The popup-survival suppression must cover the open->observe->pick path too, not only the
+    # suggTagged typeahead flow.
+    async with _content_page(_MENU_REPLACED_LIST_HIGHLIGHT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#anchor", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+
+
+# Menu-path pin for the pre-click snapshot: the decoration already carried the label before the
+# dead menu-row click, and the click CLOSES the popup (so popup-survival cannot be the guard).
+_MENU_PRE_SELECTED_DECOR_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrapm" style="position:absolute;top:0;left:0;width:340px">
+  <label id="lblm">City</label>
+  <div id="selboxm"><div role="option" aria-selected="true" style="height:18px;font-size:12px">Springfield, Sangamon, IL</div></div>
+  <div id="anchorm" role="combobox" aria-haspopup="listbox" aria-controls="selboxm" aria-labelledby="lblm"
+       tabindex="0" style="width:300px;height:26px;border:1px solid #999"></div>
+</div>
+<div id="mlm" style="position:absolute;top:80px;left:0;width:300px;background:#fff"></div>
+<script>
+var DATA = ['Springfield, Sangamon, IL', 'Chicago, Cook, IL'];
+var list = document.getElementById('mlm');
+document.getElementById('anchorm').addEventListener('click', function () {
+  list.innerHTML = '';
+  var box = document.createElement('div');
+  box.setAttribute('role', 'listbox');
+  DATA.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'option');
+    row.style.cssText = 'height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () { list.innerHTML = ''; });
+    box.appendChild(row);
+  });
+  list.appendChild(box);
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_menu_path_pre_existing_decoration_is_not_a_click_commit() -> None:
+    async with _content_page(_MENU_PRE_SELECTED_DECOR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#anchorm", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+
+
+# winton round-4: on a combobox that sets aria-expanded, the accept-path bail used to fire during
+# the PRE-CLICK snapshot too (taken while the list is open), permanently blinding it — a dead click
+# that closes the list then let the pre-existing decoration vouch.
+_EXPANDED_PRE_SELECTED_DECOR_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrapx" style="position:absolute;top:0;left:0;width:340px">
+  <label for="cityx2">City</label>
+  <div id="selx"><div role="option" aria-selected="true" style="height:18px;font-size:12px">Springfield, Sangamon, IL</div></div>
+  <input id="cityx2" type="text" autocomplete="off" aria-controls="selx dxl" aria-expanded="false"
+         style="width:300px;height:26px">
+</div>
+<div id="dxl" role="listbox"
+     style="position:absolute;top:80px;left:0;width:300px;background:#fff"></div>
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('cityx2');
+var list = document.getElementById('dxl');
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  list.innerHTML = '';
+  if (!q) { input.setAttribute('aria-expanded', 'false'); return; }
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'option');
+    row.style.cssText = 'height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () {
+      list.innerHTML = '';
+      input.value = '';
+      input.setAttribute('aria-expanded', 'false');
+    });
+    list.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', list.children.length ? 'true' : 'false');
+});
+</script>
+</body></html>
+"""
+
+
+class _SnapshotEvalBomb:
+    """Delegating page wrapper whose evaluate raises only for the pre-click snapshot call."""
+
+    def __init__(self, page: Any) -> None:
+        self._page = page
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._page, name)
+
+    async def evaluate(self, script: Any, arg: Any = None) -> Any:
+        if isinstance(arg, dict) and arg.get("snapshot"):
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        if arg is None:
+            return await self._page.evaluate(script)
+        return await self._page.evaluate(script, arg)
+
+
+# Aron round-5: a contenteditable whose widget PREVIEWS the full label into the field during typing
+# (inline completion). input_value() throws on contenteditable, and the old fallback fabricated the
+# baseline from the requested string — making the previewed text read as a click-caused transform.
+_CONTENTEDITABLE_PREVIEW_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label id="lblce">City</label>
+<div id="ce" contenteditable="true" role="combobox" aria-labelledby="lblce"
+     style="position:absolute;top:0;left:0;width:300px;height:26px;border:1px solid #999"></div>
+<div id="cel" style="position:absolute;top:30px;left:0;width:300px;background:#fff"></div>
+<script>
+var FULL = 'Springfield, Sangamon, IL';
+var ce = document.getElementById('ce');
+var list = document.getElementById('cel');
+function renderRows() {
+  list.innerHTML = '';
+  var box = document.createElement('div');
+  var row = document.createElement('div');
+  row.style.cssText = 'height:24px;background:#eee';
+  row.textContent = FULL;
+  row.addEventListener('click', function () { renderRows(); });
+  box.appendChild(row);
+  list.appendChild(box);
+}
+ce.addEventListener('focus', renderRows);
+ce.addEventListener('input', function () {
+  var q = (ce.textContent || '').trim().toLowerCase();
+  if (q && FULL.toLowerCase().indexOf(q) === 0) { ce.textContent = FULL; }
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_contenteditable_preview_is_not_a_click_transform() -> None:
+    # The field held the previewed full label BEFORE the pick click; a fabricated baseline must not
+    # convert that pre-existing text into click-caused transform evidence on a dead click.
+    async with _content_page(_CONTENTEDITABLE_PREVIEW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler({"selector": "#ce", "value": "Springfield"})
+        assert picked.status == "error", picked.content
+
+
+# Codex round-6: a contenteditable widget that expands the typed prefix to the full label on BLUR —
+# which the dead suggestion click itself triggers — must not read the expansion as a commit.
+_CONTENTEDITABLE_BLUR_EXPAND_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label id="lblbe">City</label>
+<div id="be" contenteditable="true" role="combobox" aria-labelledby="lblbe"
+     style="position:absolute;top:0;left:0;width:300px;height:26px;border:1px solid #999"></div>
+<div id="bel" style="position:absolute;top:30px;left:0;width:300px;background:#fff"></div>
+<script>
+var FULL = 'Springfield, Sangamon, IL';
+var be = document.getElementById('be');
+var list = document.getElementById('bel');
+be.addEventListener('input', function () {
+  var q = (be.textContent || '').trim().toLowerCase();
+  list.innerHTML = '';
+  if (!q || FULL.toLowerCase().indexOf(q) !== 0) return;
+  var row = document.createElement('div');
+  row.style.cssText = 'height:24px;background:#eee';
+  row.textContent = FULL;
+  row.addEventListener('click', function () {});
+  list.appendChild(row);
+});
+be.addEventListener('blur', function () {
+  var q = (be.textContent || '').trim().toLowerCase();
+  if (q && FULL.toLowerCase().indexOf(q) === 0) { be.textContent = FULL; }
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_contenteditable_blur_expansion_is_not_a_commit() -> None:
+    # The dead click blurs the field and the widget expands the prefix — text completion without a
+    # selection event is not click-caused commit evidence.
+    async with _content_page(_CONTENTEDITABLE_BLUR_EXPAND_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler({"selector": "#be", "value": "Springfield"})
+        assert picked.status == "error", picked.content
+
+
+# The prod asymmetry the corpus otherwise never models: the tool types a PREFIX and the widget
+# rewrites the input to the fuller committed label — the one accept tier-1 ships.
+_PREFIX_COMPLETION_COMMIT_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="cityc">City</label>
+<input id="cityc" type="text" autocomplete="off"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<div id="ddc" style="position:absolute;top:30px;left:0;width:300px;background:#fff"></div>
+<script>
+var FULL = 'Springfield, Sangamon, IL';
+var input = document.getElementById('cityc');
+var dd = document.getElementById('ddc');
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  dd.innerHTML = '';
+  if (!q || FULL.toLowerCase().indexOf(q) !== 0) return;
+  var row = document.createElement('div');
+  row.style.cssText = 'height:24px;background:#eee';
+  row.textContent = FULL;
+  row.addEventListener('click', function () {
+    input.value = FULL;
+    input.setAttribute('data-committed', FULL);
+    dd.innerHTML = '';
+  });
+  dd.appendChild(row);
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_prefix_completion_commit_is_accepted() -> None:
+    # Positive-accept proof for the shipped tier-1 path: the widget rewrote the typed prefix into
+    # the fuller committed label, and the tool reports the commit (not merely a non-error).
+    async with _content_page(_PREFIX_COMPLETION_COMMIT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler({"selector": "#cityc", "value": "Springfield"})
+        assert picked.status == "ok", picked.content
+        assert "Springfield, Sangamon, IL" in picked.content, picked.content
+        assert await page.eval_on_selector("#cityc", "el => el.getAttribute('data-committed')") == (
+            "Springfield, Sangamon, IL"
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_errored_pre_click_snapshot_fails_closed() -> None:
+    # An unreadable snapshot must suppress like a hit would: its question is "did matching evidence
+    # exist before the click", and on doubt the answer is yes — the accept-path unknown polarity
+    # would un-blind the pre-existing decoration exactly when the page rerenders under the probe.
+    async with _content_page(_EXPANDED_PRE_SELECTED_DECOR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(_SnapshotEvalBomb(page)))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityx2", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_expanded_combobox_pre_existing_decoration_is_not_a_click_commit() -> None:
+    # The snapshot must see the decoration even though the list was open (aria-expanded=true) when
+    # the snapshot ran — the accept-path bail may not blind it.
+    async with _content_page(_EXPANDED_PRE_SELECTED_DECOR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityx2", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_pre_existing_selected_decoration_is_not_a_click_commit() -> None:
+    # The decoration already carried the label BEFORE the pick click, so it proves nothing about the
+    # click — the dead click must be reported, not converted into a commit by pre-existing state.
+    async with _content_page(_PRE_SELECTED_DECOR_DEAD_CLICK_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityp", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", list(_SEMANTIC_PROBE_SHAPES), ids=list(_SEMANTIC_PROBE_SHAPES))
+async def test_semantic_commit_probe_contract(shape: str) -> None:
+    html, intended, typed, expect = _SEMANTIC_PROBE_SHAPES[shape]
+    async with _content_page(f"<!doctype html><html><body>{html}</body></html>") as page:
+        untrusted = "data-tv3-test-untrusted" in html
+        commit_evt = 'data-tv3-test-commitevt="1"' in html
+        read = await page.evaluate(
+            _SEMANTIC_COMMIT_STATE_JS,
+            {
+                "sel": "#f",
+                "el": None,
+                "intended": intended,
+                "typed": typed,
+                "typedTrusted": not untrusted,
+                "commitEvt": commit_evt,
+            },
+        )
+        assert bool(read.get("committed")) is expect, read
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_semantic_verify_kill_switch_keeps_commits_working(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The flag is a kill switch, not a dependency: with it OFF the heuristics still accept a
+    # legitimate declared-list commit end to end.
+    from skyvern.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "TASK_V3_SEMANTIC_COMMIT_VERIFY", False)
+    async with _content_page(_declared_list_lingers_html(revert_on_escape=False)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content

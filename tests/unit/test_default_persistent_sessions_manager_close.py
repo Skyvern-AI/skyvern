@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -62,6 +63,7 @@ def manager() -> DefaultPersistentSessionsManager:
     DefaultPersistentSessionsManager.instance = None
     DefaultPersistentSessionsManager._browser_sessions = {}
     DefaultPersistentSessionsManager._background_tasks = set()
+    DefaultPersistentSessionsManager._close_cleanup_tasks = {}
     DefaultPersistentSessionsManager._reaper_task = None
     db = MagicMock()
     db.browser_sessions.get_persistent_browser_session = AsyncMock()
@@ -123,10 +125,11 @@ async def test_close_session_exports_and_closes_for_matching_org(
     persisted_session.should_export_profile.return_value = True
     manager.database.browser_sessions.get_persistent_browser_session.return_value = persisted_session
 
-    manager._browser_sessions["pbs_owned"] = BrowserSession(
+    cached = BrowserSession(
         browser_state=browser_state,
         organization_id="org_owner",
     )
+    manager._browser_sessions["pbs_owned"] = cached
 
     with (
         patch.object(manager_mod, "app", SimpleNamespace(STORAGE=storage)),
@@ -146,11 +149,70 @@ async def test_close_session_exports_and_closes_for_matching_org(
         directory="/tmp/pbs_owned",
     )
     browser_state.close.assert_awaited_once()
+    assert cached.retirement.reason == "session_ending"
     assert "pbs_owned" not in manager._browser_sessions
     manager.database.browser_sessions.close_persistent_browser_session.assert_awaited_once_with(
         "pbs_owned",
         "org_owner",
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_retains_browser_and_port_cleanup(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    persist_started = asyncio.Event()
+    allow_persist = asyncio.Event()
+
+    async def _persist(*_args: object) -> None:
+        persist_started.set()
+        await allow_persist.wait()
+
+    browser_state = MagicMock()
+    browser_state.close = AsyncMock()
+    browser_state.browser_context = MagicMock()
+    browser_state.browser_artifacts = SimpleNamespace(
+        browser_session_dir="/tmp/pbs_cancelled",
+        video_artifacts=[],
+    )
+    persisted_session = MagicMock()
+    persisted_session.should_export_profile.return_value = False
+    manager.database.browser_sessions.get_persistent_browser_session.return_value = persisted_session
+    manager._browser_sessions["pbs_cancelled"] = BrowserSession(
+        browser_state=browser_state,
+        organization_id="org_owner",
+        cdp_port=9234,
+    )
+
+    with (
+        patch.object(manager_mod, "app", SimpleNamespace(STORAGE=MagicMock())),
+        patch.object(manager_mod, "persist_session_cookies", new=AsyncMock(side_effect=_persist)),
+        patch.object(manager_mod, "_release_cdp_port") as release_cdp_port,
+        patch.object(manager_mod.settings, "BROWSER_STREAMING_MODE", "vnc"),
+    ):
+        close_task = asyncio.create_task(manager.close_session("org_owner", "pbs_cancelled"))
+        await persist_started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        retry_task = asyncio.create_task(manager.close_session("org_owner", "pbs_cancelled"))
+        await asyncio.sleep(0)
+        assert not retry_task.done()
+
+        allow_persist.set()
+        await retry_task
+        for _ in range(10):
+            if browser_state.close.await_count:
+                break
+            await asyncio.sleep(0)
+
+        browser_state.close.assert_awaited_once_with()
+        release_cdp_port.assert_called_once_with(9234)
+        manager.database.browser_sessions.close_persistent_browser_session.assert_awaited_once_with(
+            "pbs_cancelled",
+            "org_owner",
+        )
 
 
 @pytest.mark.asyncio
