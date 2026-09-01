@@ -18,6 +18,11 @@ const LEAF_TARGET_TYPES = new Set([
   "shared_worker",
   "worker",
 ]);
+const URL_CHANGING_CDP_METHODS = new Set([
+  "Page.navigate",
+  "Page.navigateToHistoryEntry",
+  "Page.reload",
+]);
 
 function debuggerErrorReason(error) {
   const reason = error instanceof Error ? error.message.trim() : "";
@@ -309,6 +314,19 @@ export class DebuggerRouter {
           "CDP parameters must be an object.",
         );
       }
+      let urlChangeGranted = false;
+      if (URL_CHANGING_CDP_METHODS.has(values.method)) {
+        // Page.navigate binds the grant to its target URL; history/reload
+        // navigations have no knowable target, so their grant matches any
+        // single URL change.
+        lease.allowUrlChange(
+          values.method === "Page.navigate" &&
+            typeof values.params?.url === "string"
+            ? values.params.url
+            : null,
+        );
+        urlChangeGranted = true;
+      }
       const childTarget = this.childTargets.get(values.sessionId);
       if (
         values.method === "Target.setAutoAttach" &&
@@ -347,6 +365,9 @@ export class DebuggerRouter {
               commandTimeoutMs,
             ));
       } catch (error) {
+        if (urlChangeGranted) {
+          lease.revokeUrlChange();
+        }
         if (
           error instanceof ProtocolError &&
           error.code === ERROR_CODES.COMMAND_TIMEOUT
