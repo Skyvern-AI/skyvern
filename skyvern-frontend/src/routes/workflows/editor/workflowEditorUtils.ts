@@ -29,6 +29,7 @@ import {
   BlockYAML,
   CodeBlockYAML,
   ConditionalBlockYAML,
+  DataExportBlockYAML,
   DownloadToS3BlockYAML,
   FileUrlParserBlockYAML,
   ForLoopBlockYAML,
@@ -74,6 +75,7 @@ import {
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
+import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
   isFileParserNode,
@@ -1002,6 +1004,20 @@ function convertToNode(
           ...commonData,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "data_export": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "dataExport",
+        data: {
+          ...commonData,
+          data: block.data,
+          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          fileName: block.file_name ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -2617,6 +2633,17 @@ function createNode(
         },
       };
     }
+    case "dataExport": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "dataExport",
+        data: {
+          ...dataExportNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "download": {
       return {
         ...identifiers,
@@ -3276,6 +3303,16 @@ function getWorkflowBlock(
         ) as Record<string, string> | null,
         prompt: node.data.prompt,
         steps: node.data.steps,
+      };
+    }
+    case "dataExport": {
+      return {
+        ...base,
+        block_type: "data_export",
+        data: node.data.data,
+        data_schema: JSONParseSafe(node.data.dataSchema) ?? {},
+        file_name: node.data.fileName || null,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "download": {
@@ -4704,6 +4741,17 @@ function convertBlocksToBlockYAML(
           llm_key: block.llm_key,
           prompt: block.prompt,
           json_schema: block.json_schema,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "data_export": {
+        const blockYaml: DataExportBlockYAML = {
+          ...base,
+          block_type: "data_export",
+          data: block.data,
+          data_schema: block.data_schema,
+          file_name: block.file_name,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
