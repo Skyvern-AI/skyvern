@@ -18522,3 +18522,705 @@ async def test_select_combobox_closes_a_declared_list_a_commit_leaves_open(rever
         unblocked = await _tool(tools, "type").handler({"selector": "#region", "text": "Sangamon"})
         assert unblocked.status == "ok", unblocked.content
         assert "covered by" not in unblocked.content, unblocked.content
+
+
+# The dead twin of the declared-lingers widget: the row click re-renders the (still-open) grid and
+# commits NOTHING — no value write, no input event. The declared-field closure exemption must not
+# read the unchanged typed text as a commit.
+_DECLARED_DEAD_RERENDER_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city">City</label>
+<input id="city" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"
+       aria-haspopup="grid" aria-controls="city-grid" aria-expanded="false"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<div id="city-grid" role="grid"
+     style="position:absolute;top:30px;left:0;width:300px;z-index:1000;background:#fff"></div>
+
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city');
+var grid = document.getElementById('city-grid');
+
+function renderRows() {
+  var q = input.value.trim().toLowerCase();
+  grid.innerHTML = '';
+  var rows = q ? DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }) : [];
+  rows.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'row');
+    var cell = document.createElement('div');
+    cell.setAttribute('role', 'gridcell');
+    cell.style.cssText = 'height:60px;background:#eee';
+    cell.textContent = d;
+    cell.addEventListener('click', function () { renderRows(); });
+    row.appendChild(cell);
+    grid.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
+}
+
+input.addEventListener('input', renderRows);
+input.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  grid.innerHTML = '';
+  input.setAttribute('aria-expanded', 'false');
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_declared_dead_click_that_rerenders_is_not_a_commit() -> None:
+    # A declared field's dead row click that re-renders fresh rows (menu open, no input event, no
+    # value write) must fail loud, not read the unchanged typed text as the committed value.
+    async with _content_page(_DECLARED_DEAD_RERENDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None
+
+
+# A roleless list PORTALLED as direct children of <body>: the list stamp can only land on the
+# replaceable row node itself, so a dead click that swaps the row destroys the stamp with it —
+# closure evidence must fail closed, not read the vanished stamp as the list closing.
+_BODY_PORTALLED_DEAD_RERENDER_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city2">City</label>
+<input id="city2" type="text" autocomplete="off"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city2');
+var rows = [];
+function renderRows() {
+  rows.forEach(function (r) { r.remove(); });
+  rows = [];
+  var q = input.value.trim().toLowerCase();
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d, i) {
+    var row = document.createElement('div');
+    row.style.cssText = 'position:absolute;top:' + (30 + i * 24) + 'px;left:0;width:300px;height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () { renderRows(); });
+    document.body.appendChild(row);
+    rows.push(row);
+  });
+}
+input.addEventListener('input', renderRows);
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_body_portalled_dead_rerender_is_not_a_commit() -> None:
+    # Body-level rows leave nothing durable to stamp; a dead click replacing the row must not turn
+    # "the stamp is gone" into "the list closed" and accept the unchanged typed text.
+    async with _content_page(_BODY_PORTALLED_DEAD_RERENDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city2", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#city2", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+# The upward twin of the body-portalled case: near the viewport bottom a list flips ABOVE the field,
+# so the destroyed stamp's disambiguation band must look on both sides of the anchor.
+_BODY_PORTALLED_UPWARD_DEAD_RERENDER_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city3" style="position:absolute;top:470px;left:0">City</label>
+<input id="city3" type="text" autocomplete="off"
+       style="position:absolute;top:500px;left:0;width:300px;height:26px">
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city3');
+var rows = [];
+function renderRows() {
+  rows.forEach(function (r) { r.remove(); });
+  rows = [];
+  var q = input.value.trim().toLowerCase();
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d, i) {
+    var row = document.createElement('div');
+    row.style.cssText = 'position:absolute;top:' + (474 - i * 24) + 'px;left:0;width:300px;height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () { renderRows(); });
+    document.body.appendChild(row);
+    rows.push(row);
+  });
+}
+input.addEventListener('input', renderRows);
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_upward_portalled_dead_rerender_is_not_a_commit() -> None:
+    # A dead click on an upward-flipped body-portalled row must fail loud like the downward case —
+    # the vanished-stamp band check may not assume the list sits below the field.
+    async with _content_page(_BODY_PORTALLED_UPWARD_DEAD_RERENDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city3", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#city3", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+# A declared combobox that commits through a PILL while its input keeps an opaque id, and re-renders
+# its list open: the lingering-list close must not compare the pill's label against the raw id and
+# call a surviving commit a revert.
+_OPAQUE_ID_PILL_LINGERS_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="city-wrap" style="position:absolute;top:0;left:0;width:300px">
+  <div id="city-pills"></div>
+  <input id="city4" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"
+         aria-haspopup="grid" aria-controls="city-grid4" aria-expanded="false"
+         style="width:300px;height:26px">
+</div>
+<div id="city-grid4" role="grid"
+     style="position:absolute;top:60px;left:0;width:300px;z-index:1000;background:#fff"></div>
+
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city4');
+var grid = document.getElementById('city-grid4');
+
+function renderRows() {
+  var q = input.value.trim().toLowerCase();
+  grid.innerHTML = '';
+  var rows = q && q.indexOf('fc77') !== 0
+    ? DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; })
+    : (q ? DATA : []);
+  rows.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'row');
+    var cell = document.createElement('div');
+    cell.setAttribute('role', 'gridcell');
+    cell.style.cssText = 'height:60px;background:#eee';
+    cell.textContent = d;
+    cell.addEventListener('click', function () {
+      var pill = document.createElement('span');
+      pill.className = 'pill';
+      pill.textContent = d;
+      document.getElementById('city-pills').appendChild(pill);
+      input.value = 'fc77a91e';
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+    });
+    row.appendChild(cell);
+    grid.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
+}
+
+input.addEventListener('input', renderRows);
+input.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  grid.innerHTML = '';
+  input.setAttribute('aria-expanded', 'false');
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_pill_commit_with_opaque_id_survives_the_lingering_list_close() -> None:
+    # The commit was proven off the pill surface; comparing that label against the raw opaque input
+    # value after Escape must not report the surviving commit as reverted.
+    async with _content_page(_OPAQUE_ID_PILL_LINGERS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city4", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#city-pills", "el => el.textContent") == "Springfield, Sangamon, IL"
+        assert await page.eval_on_selector("#city4", "el => el.getAttribute('aria-expanded')") == "false"
+
+
+# The overlap twin of the portalled cases: a sloppily-positioned list whose rows START a few px
+# above the field's bottom edge sit in neither a strict "below" nor "above" band — the vanished-stamp
+# check must classify by intersection with the anchor's neighborhood, not by side.
+_BODY_PORTALLED_OVERLAP_DEAD_RERENDER_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city5">City</label>
+<input id="city5" type="text" autocomplete="off"
+       style="position:absolute;top:40px;left:0;width:300px;height:26px">
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city5');
+var rows = [];
+function renderRows() {
+  rows.forEach(function (r) { r.remove(); });
+  rows = [];
+  var q = input.value.trim().toLowerCase();
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d, i) {
+    var row = document.createElement('div');
+    row.style.cssText = 'position:absolute;top:' + (58 + i * 24) + 'px;left:0;width:300px;height:24px;'
+      + 'background:#eee;z-index:10';
+    row.textContent = d;
+    row.addEventListener('click', function () { renderRows(); });
+    document.body.appendChild(row);
+    rows.push(row);
+  });
+}
+input.addEventListener('input', renderRows);
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_overlapping_portalled_dead_rerender_is_not_a_commit() -> None:
+    # Rows whose top edge overlaps the field's own band (58 < field bottom 66) must still read as a
+    # still-open list after a dead re-render destroys the stamp.
+    async with _content_page(_BODY_PORTALLED_OVERLAP_DEAD_RERENDER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city5", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#city5", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+# Aron's round-6 construction: the escape-revert widget plus one PRE-EXISTING childless node beside
+# the field carrying the chosen label. The lingering-close surface re-validation must not let that
+# stale node vouch for a commit the Escape genuinely reverted.
+_STALE_SURFACE_REVERT_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrap" style="position:absolute;top:0;left:0;width:300px">
+  <label for="city6">City</label>
+  <span id="stale">Springfield, Sangamon, IL</span>
+  <input id="city6" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"
+         aria-haspopup="grid" aria-controls="city-grid6" aria-expanded="false"
+         style="width:300px;height:26px">
+</div>
+<div id="city-grid6" role="grid"
+     style="position:absolute;top:70px;left:0;width:300px;z-index:1000;background:#fff"></div>
+
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city6');
+var grid = document.getElementById('city-grid6');
+
+function renderRows() {
+  var q = input.value.trim().toLowerCase();
+  grid.innerHTML = '';
+  var rows = q ? DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }) : [];
+  rows.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'row');
+    var cell = document.createElement('div');
+    cell.setAttribute('role', 'gridcell');
+    cell.style.cssText = 'height:60px;background:#eee';
+    cell.textContent = d;
+    cell.addEventListener('click', function () {
+      input.value = d;
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+    });
+    row.appendChild(cell);
+    grid.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
+}
+
+input.addEventListener('input', renderRows);
+input.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  if (input.getAttribute('aria-expanded') !== 'true') return;
+  input.value = 'Springfield';
+  grid.innerHTML = '';
+  input.setAttribute('aria-expanded', 'false');
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_stale_pre_click_surface_does_not_mask_an_escape_revert() -> None:
+    # The surface vouched BEFORE the click, so it proves nothing about the commit surviving Escape —
+    # the genuine revert must still be reported.
+    async with _content_page(_STALE_SURFACE_REVERT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city6", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#city6", "el => el.value") == "Springfield"
+
+
+# A typeable field sharing a wrapper with a BUTTON-based sibling picker (no input of its own): the
+# sibling's committed pill must not vouch for this field, so the covered-field "already holds" read
+# may not escape the shared wrapper.
+_SIBLING_BUTTON_PICKER_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrap" style="position:absolute;top:0;left:0;width:340px">
+  <label for="city7">City</label>
+  <input id="city7" type="text" autocomplete="off"
+         style="width:300px;height:26px">
+  <div id="overlay" style="position:absolute;top:0;left:0;width:340px;height:60px;background:#fffc;z-index:50">Springfield, Sangamon, IL</div>
+  <div class="sibling-picker">
+    <button type="button" aria-haspopup="listbox" aria-expanded="false">Region</button>
+    <span class="pill">Springfield, Sangamon, IL</span>
+  </div>
+</div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_sibling_pickers_pill_does_not_vouch_for_a_covered_field() -> None:
+    # The overlay text and the SIBLING's pill both hold the value, but this field committed nothing —
+    # the covered refusal must stand rather than reading the neighbor's pill as this field's commit.
+    async with _content_page(_SIBLING_BUTTON_PICKER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city7", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#city7", "el => el.value") == ""
+
+
+# A DECLARED reactive typeahead whose rows land only after a slow (4.5s) fetch behind a visible
+# progress row — past the reaction poll's base budget, within its busy-extended cap.
+_DECLARED_SLOW_BUSY_TYPEAHEAD_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city8">City</label>
+<input id="city8" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"
+       aria-haspopup="listbox" aria-controls="city-list8" aria-expanded="false"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<div id="city-list8" role="listbox"
+     style="position:absolute;top:30px;left:0;width:300px;z-index:1000;background:#fff"></div>
+
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city8');
+var list = document.getElementById('city-list8');
+var timer = null;
+
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  if (timer) { clearTimeout(timer); timer = null; }
+  list.innerHTML = '';
+  if (!q) { input.setAttribute('aria-expanded', 'false'); return; }
+  var busy = document.createElement('div');
+  busy.setAttribute('role', 'progressbar');
+  busy.style.cssText = 'height:24px;background:#eee';
+  busy.textContent = 'Loading suggestions…';
+  list.appendChild(busy);
+  input.setAttribute('aria-expanded', 'true');
+  timer = setTimeout(function () {
+    list.innerHTML = '';
+    DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+      var row = document.createElement('div');
+      row.setAttribute('role', 'option');
+      row.style.cssText = 'height:24px;background:#eee';
+      row.textContent = d;
+      row.addEventListener('click', function () {
+        input.value = d;
+        list.innerHTML = '';
+        input.setAttribute('aria-expanded', 'false');
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+      });
+      list.appendChild(row);
+    });
+  }, 4500);
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_declared_reactive_rows_behind_a_slow_busy_fetch_commit() -> None:
+    # The busy row extends the reaction poll past its base budget — a declared slow-fetch typeahead
+    # must commit, not report a false no-match at the fixed poll's end.
+    async with _content_page(_DECLARED_SLOW_BUSY_TYPEAHEAD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city8", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#city8", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+def _body_portalled_dead_fixture(row_extra_css: str, *, dead_render: str = "renderRows", body_attrs: str = "") -> str:
+    # Shared body-portalled dead-click skeleton: rows are direct <body> children (nothing durable to
+    # stamp), the click runs `dead_render` and commits nothing.
+    return (
+        """
+<!doctype html><html><body """
+        + body_attrs
+        + """ style="margin:0;font:14px sans-serif">
+<label for="cityx">City</label>
+<input id="cityx" type="text" autocomplete="off"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('cityx');
+var nodes = [];
+function clearNodes() { nodes.forEach(function (r) { r.remove(); }); nodes = []; }
+function renderSpinner() {
+  clearNodes();
+  var s = document.createElement('div');
+  s.className = 'spinner';
+  s.style.cssText = 'position:absolute;top:34px;left:0;width:24px;height:24px;'
+    + 'border:3px solid #ccc;border-top-color:#333;border-radius:50%';
+  document.body.appendChild(s);
+  nodes.push(s);
+}
+function renderRows() {
+  clearNodes();
+  var q = input.value.trim().toLowerCase();
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d, i) {
+    var row = document.createElement('div');
+    row.style.cssText = 'position:absolute;top:' + (30 + i * 24) + 'px;height:24px;background:#eee;'
+      + '"""
+        + row_extra_css
+        + """';
+    row.textContent = d;
+    row.addEventListener('click', function () { """
+        + dead_render
+        + """(); });
+    document.body.appendChild(row);
+    nodes.push(row);
+  });
+}
+input.addEventListener('input', renderRows);
+</script>
+</body></html>
+"""
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offset_portalled_dead_rerender_is_not_a_commit() -> None:
+    # A flyout rendered BESIDE the field (no horizontal overlap, within the anchor neighborhood):
+    # the vanished-stamp band check must not require x-overlap the busy probe itself does not.
+    html = _body_portalled_dead_fixture("left:340px;width:300px")
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityx", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#cityx", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_dead_click_to_textless_spinner_is_not_a_commit() -> None:
+    # A dead click that swaps the rows for a TEXTLESS css spinner (async widget stuck mid-flight):
+    # fresh busy-shaped content in the band must read as still-open even without text.
+    html = _body_portalled_dead_fixture("left:0;width:300px", dead_render="renderSpinner")
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityx", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#cityx", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_body_with_listbox_role_dead_rerender_is_not_a_commit() -> None:
+    # A page that puts role=listbox on <body> itself must not become the stamped "list" (it never
+    # closes) nor evade the vanished-stamp band check.
+    html = _body_portalled_dead_fixture("left:0;width:300px", body_attrs='role="listbox"')
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityx", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "error", picked.content
+        assert await page.eval_on_selector("#cityx", "el => el.value") == "Springfield, Sangamon, IL"
+
+
+# Aron's round-7 edge, inverted to the LEGIT side: a genuine equal-value commit that closes its
+# portalled list and renders an inline check-badge INSIDE the field's own line — fresh content on
+# the field's row is commit-adjacent decoration, not a still-open list.
+_BADGE_ON_COMMIT_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="cityb">City</label>
+<input id="cityb" type="text" autocomplete="off"
+       style="position:absolute;top:0;left:0;width:300px;height:26px">
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('cityb');
+var rows = [];
+function renderRows() {
+  rows.forEach(function (r) { r.remove(); });
+  rows = [];
+  var q = input.value.trim().toLowerCase();
+  if (!q) return;
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d, i) {
+    var row = document.createElement('div');
+    row.style.cssText = 'position:absolute;top:' + (30 + i * 24) + 'px;left:0;width:300px;height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () {
+      input.value = d;
+      input.setAttribute('data-committed', d);
+      rows.forEach(function (r) { r.remove(); });
+      rows = [];
+      var badge = document.createElement('span');
+      badge.textContent = '\\u2713 saved';
+      badge.style.cssText = 'position:absolute;top:5px;left:250px;height:16px;line-height:16px;font-size:12px';
+      document.body.appendChild(badge);
+    });
+    document.body.appendChild(row);
+    rows.push(row);
+  });
+}
+input.addEventListener('input', renderRows);
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commit_badge_on_the_fields_own_line_is_not_a_still_open_list() -> None:
+    async with _content_page(_BADGE_ON_COMMIT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityb", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#cityb", "el => el.getAttribute('data-committed')") == (
+            "Springfield, Sangamon, IL"
+        )
+
+
+# Codex's round-7 case: the field sits at the TOP LEVEL of an open shadow root, so its committed
+# pill (a sibling in the same root) is invisible to a parentElement-only ancestor walk.
+_SHADOW_PILL_OPAQUE_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="host"></div>
+<script>
+var root = document.getElementById('host').attachShadow({mode: 'open'});
+root.innerHTML = '<label for="city9">City</label>'
+  + '<div id="pills9"></div>'
+  + '<input id="city9" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"'
+  + ' aria-haspopup="grid" aria-controls="city-grid9" aria-expanded="false"'
+  + ' style="position:absolute;top:0;left:0;width:300px;height:26px">'
+  + '<div id="city-grid9" role="grid"'
+  + ' style="position:absolute;top:60px;left:0;width:300px;z-index:1000;background:#fff"></div>';
+var DATA = ['Springfield, Sangamon, IL'];
+var input = root.getElementById('city9');
+var grid = root.getElementById('city-grid9');
+
+function renderRows() {
+  var q = input.value.trim().toLowerCase();
+  grid.innerHTML = '';
+  var rows = q && q.indexOf('fc77') !== 0
+    ? DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; })
+    : (q ? DATA : []);
+  rows.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'row');
+    var cell = document.createElement('div');
+    cell.setAttribute('role', 'gridcell');
+    cell.style.cssText = 'height:60px;background:#eee';
+    cell.textContent = d;
+    cell.addEventListener('click', function () {
+      var pill = document.createElement('span');
+      pill.className = 'pill';
+      pill.textContent = d;
+      root.getElementById('pills9').appendChild(pill);
+      input.value = 'fc77a91e';
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+    });
+    row.appendChild(cell);
+    grid.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
+}
+
+input.addEventListener('input', renderRows);
+input.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  grid.innerHTML = '';
+  input.setAttribute('aria-expanded', 'false');
+});
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_pill_commit_inside_a_shadow_root_verifies_off_the_sibling_pill() -> None:
+    # The commit surface lives in the same open root as the field; the surface walk must cross the
+    # root boundary instead of reporting an opaque-id commit as did-not-commit.
+    async with _content_page(_SHADOW_PILL_OPAQUE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city9", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#city9", "el => el.value") == "fc77a91e"
+
+
+# Codex round-8: a proper-name suffix that merely CONTAINS an action word ("Austin, Clear Lake")
+# must not be stripped as a widget instruction — the field holds a DIFFERENT value than requested,
+# and "already holds" would be a false success.
+_ACTION_WORD_SUFFIX_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrap" style="position:absolute;top:0;left:0;width:340px">
+  <label for="city10">City</label>
+  <input id="city10" type="text" autocomplete="off"
+         style="width:300px;height:26px">
+  <span class="pill">Austin, Clear Lake</span>
+</div>
+<div id="overlay" style="position:absolute;top:0;left:0;width:340px;height:60px;background:#fffc;z-index:50">Austin, Clear Lake</div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_action_word_place_name_suffix_is_not_an_instruction_clause() -> None:
+    # The committed surface holds 'Austin, Clear Lake'; requesting 'Austin' must not read that as
+    # already-committed by stripping 'Clear Lake' as if it were a clearing instruction.
+    async with _content_page(_ACTION_WORD_SUFFIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler({"selector": "#city10", "value": "Austin"})
+        assert picked.status == "error", picked.content
+        assert "already holds" not in picked.content, picked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_declared_reactive_rows_behind_a_css_only_spinner_commit() -> None:
+    # Same slow fetch, but the loading state is a conventional CSS spinner class with no ARIA — the
+    # busy probe must recognize it like the band check already does.
+    html = _DECLARED_SLOW_BUSY_TYPEAHEAD_HTML.replace(
+        "busy.setAttribute('role', 'progressbar');",
+        "busy.className = 'spinner';",
+    ).replace("busy.textContent = 'Loading suggestions…';", "")
+    assert "progressbar" not in html
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city8", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#city8", "el => el.value") == "Springfield, Sangamon, IL"
