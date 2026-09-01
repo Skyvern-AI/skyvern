@@ -881,6 +881,28 @@ def _is_scout_interaction_evidence(evidence: dict[str, Any]) -> bool:
     return isinstance(selector, str) and bool(selector.strip())
 
 
+def interaction_evidence_is_bindable(evidence: dict[str, Any]) -> bool:
+    """Whether an interaction- or post_run-reached entry can ground a page-dependent block."""
+    return _is_scout_interaction_evidence(evidence) or has_bounded_page_schema(evidence)
+
+
+def interaction_page_state_continues(
+    interaction_evidence: dict[str, Any],
+    later_evidence: Iterable[tuple[dict[str, Any], str]],
+) -> bool:
+    """Whether later observations preserve the state produced by an interaction.
+
+    A read on the same location preserves that state. An explicit navigation does not, even when
+    it reopens the same URL, because navigation can discard DOM and session state created by the
+    interaction. A different observed location also breaks continuity.
+    """
+    return all(
+        reached_via != "navigate"
+        and (not _evidence_observed_url(later) or page_records_share_location(interaction_evidence, later))
+        for later, reached_via in later_evidence
+    )
+
+
 def _evidence_matches_target(
     evidence: dict[str, Any] | None,
     target_url: str | None,
@@ -1087,39 +1109,41 @@ def _current_page_evidence_has_reached_page_credit(
     evidence: dict[str, Any],
     reached_via: str,
     *,
+    step: int,
     flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
-) -> bool:
+) -> int | None:
+    """Return the earlier interaction step whose page this current-page read re-observes."""
     if reached_via != "current_page" or not has_bounded_page_schema(evidence):
-        return False
-    observed_url = _evidence_observed_url(evidence)
-    if not observed_url:
-        return False
-    for prior_evidence, prior_reached_via in flow_evidence_by_step.values():
-        if prior_reached_via not in {"interaction", "post_run"}:
+        return None
+    if not _evidence_observed_url(evidence):
+        return None
+    intervening: list[tuple[dict[str, Any], str]] = []
+    for prior_step in sorted(flow_evidence_by_step, reverse=True):
+        if prior_step >= step:
             continue
-        if not has_bounded_page_schema(prior_evidence):
-            continue
-        if page_records_share_location(evidence, prior_evidence):
-            return True
-    return False
+        prior_evidence, prior_reached_via = flow_evidence_by_step[prior_step]
+        if (
+            prior_reached_via in {"interaction", "post_run"}
+            and interaction_evidence_is_bindable(prior_evidence)
+            and page_records_share_location(evidence, prior_evidence)
+            and interaction_page_state_continues(prior_evidence, intervening)
+        ):
+            return prior_step
+        intervening.append((prior_evidence, prior_reached_via))
+    return None
 
 
 def _auto_credit_interaction_observation(
     flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
-    consumed_steps: set[int],
 ) -> bool:
-    # Bind by trajectory recency, never by source_url: a SPA holds one URL across
-    # interactions, so URL identity would mis-bind. Consume-once keeps each block on a
-    # distinct interaction.
+    # A page observation is a reusable fact, not a consume-once authority token. Bind by
+    # trajectory recency, never by source_url: a SPA can hold one URL across interactions.
     for step in sorted(flow_evidence_by_step, reverse=True):
-        if step in consumed_steps:
-            continue
         evidence, reached_via = flow_evidence_by_step[step]
         if reached_via != "interaction":
             continue
-        if not (_is_scout_interaction_evidence(evidence) or has_bounded_page_schema(evidence)):
+        if not interaction_evidence_is_bindable(evidence):
             continue
-        consumed_steps.add(step)
         LOG.info(
             "copilot_gate_auto_credited_interaction",
             observation_step=step,
@@ -1137,7 +1161,6 @@ def _block_has_observed_page(
     allow_post_run: bool,
     flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
     block_observation_refs: dict[str, int],
-    consumed_steps: set[int],
 ) -> bool:
     label = str(block.get("label") or "")
     if label and label in block_observation_refs:
@@ -1145,15 +1168,13 @@ def _block_has_observed_page(
         evidence_entry = flow_evidence_by_step.get(step)
         if evidence_entry is not None:
             evidence, reached_via = evidence_entry
-            effective_reached_via = (
-                "interaction"
-                if _current_page_evidence_has_reached_page_credit(
-                    evidence,
-                    reached_via,
-                    flow_evidence_by_step=flow_evidence_by_step,
-                )
-                else reached_via
+            crediting_step = _current_page_evidence_has_reached_page_credit(
+                evidence,
+                reached_via,
+                step=step,
+                flow_evidence_by_step=flow_evidence_by_step,
             )
+            effective_reached_via = "interaction" if crediting_step is not None else reached_via
             if _associated_observation_satisfies_block(
                 evidence,
                 block.get("target_url"),
@@ -1162,12 +1183,14 @@ def _block_has_observed_page(
                 requires_observation_ref=block.get("requires_observation_ref") is True,
                 allow_post_run=allow_post_run,
             ):
-                if effective_reached_via == "interaction":
-                    consumed_steps.add(step)
                 return True
+        if block.get("requires_observation_ref") is True:
+            # An explicit observation ref is the model's factual citation. Do not silently replace
+            # a stale or invalid citation with unrelated trajectory evidence.
+            return False
 
     if block.get("requires_observation_ref") is True:
-        return _auto_credit_interaction_observation(flow_evidence_by_step, consumed_steps)
+        return _auto_credit_interaction_observation(flow_evidence_by_step)
     return _page_observed(ctx, block.get("target_url"), allow_post_run=allow_post_run)
 
 
@@ -1227,10 +1250,14 @@ def _wrong_reached_via_observation_ref(
     evidence, reached_via = evidence_entry
     if reached_via in {"interaction", "post_run"}:
         return None
-    if _current_page_evidence_has_reached_page_credit(
-        evidence,
-        reached_via,
-        flow_evidence_by_step=flow_evidence_by_step,
+    if (
+        _current_page_evidence_has_reached_page_credit(
+            evidence,
+            reached_via,
+            step=step,
+            flow_evidence_by_step=flow_evidence_by_step,
+        )
+        is not None
     ):
         return None
     return step, reached_via or "<missing>"
@@ -1243,7 +1270,7 @@ def composition_page_evidence_error(
     block_observation_refs: dict[str, int] | None = None,
     raw_block_observation_refs: Any | None = None,
 ) -> str | None:
-    """Return a mutation error when a build adds page-acting blocks before observation.
+    """Return a non-blocking authoring finding when page-acting blocks lack observation.
 
     Deliberately structural rather than semantic: every block that acts on a page
     — block-type-agnostic, including goto_url/code blocks that carry a url, and
@@ -1272,7 +1299,6 @@ def composition_page_evidence_error(
         )
     if block_observation_refs is None:
         block_observation_refs = _block_observation_refs(ctx)
-    consumed_steps: set[int] = set()
     for block in gated_blocks:
         target_url = block["target_url"]
         if not _block_has_observed_page(
@@ -1281,7 +1307,6 @@ def composition_page_evidence_error(
             allow_post_run=allow_post_run,
             flow_evidence_by_step=flow_evidence_by_step,
             block_observation_refs=block_observation_refs,
-            consumed_steps=consumed_steps,
         ):
             missing_step = _missing_observation_ref_step(
                 block,
