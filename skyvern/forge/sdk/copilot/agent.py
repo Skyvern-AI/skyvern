@@ -2764,13 +2764,7 @@ def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
     text = clean_recorded_failure_text(value, max_chars=max_chars).rstrip(".")
     if not text:
         return ""
-    verdict = evaluate_output_policy(
-        request_policy=None,
-        response_type="REPLY",
-        user_response=text,
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-    )
-    if OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes:
+    if contains_internal_machinery_leak(text):
         return "The previous workflow run did not finish before the turn budget expired"
     return text
 
@@ -2804,13 +2798,7 @@ def _recorded_failure_is_internal_tool_instruction(ctx: CopilotContext) -> bool:
         # Evaluate the redacted form at the same truncation the reply embeds:
         # standard redaction already neutralizes browser-session references,
         # so flag only what would still leak.
-        verdict = evaluate_output_policy(
-            request_policy=None,
-            response_type="REPLY",
-            user_response=clean_recorded_failure_text(value, max_chars=240),
-            output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        )
-        if OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes:
+        if contains_internal_machinery_leak(clean_recorded_failure_text(value, max_chars=240)):
             return True
     return False
 
