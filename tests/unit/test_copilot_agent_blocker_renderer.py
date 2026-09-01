@@ -295,7 +295,7 @@ def test_output_policy_generic_block_uses_only_safety_and_draft_evidence() -> No
     _seed_terminal_evidence(ctx)
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
 
-    result = _blocked_result(ctx, OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
+    result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
     assert result.response_type == "ASK_QUESTION"
     assert result.updated_workflow is fake_workflow
@@ -323,7 +323,7 @@ def test_output_policy_recorded_evidence_does_not_create_a_policy_recheck(monkey
 
     result = _blocked_result(
         ctx,
-        OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
+        OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         output_kind=CopilotOutputKind.REFUSAL,
     )
 
@@ -337,7 +337,7 @@ def test_output_policy_generic_block_requires_clean_terminal_evidence() -> None:
     adversarial.last_run_blocks_workflow_run_id = "wr_hidden"
 
     for ctx in (no_recorded, adversarial):
-        result = _blocked_result(ctx, OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
+        result = _blocked_result(ctx, OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
         assert (
             result.user_response
             == "I could not safely return that chat reply. Please adjust the request and try again."

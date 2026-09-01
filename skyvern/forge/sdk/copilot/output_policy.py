@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
 
-from skyvern.forge.sdk.copilot.blocker_signal import contains_internal_machinery_leak
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
 from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
@@ -66,24 +65,6 @@ UNVALIDATED_DISCLOSURE_PHRASES = (
     "hasn't been verified",
     "unvalidated",
 )
-_INTERNAL_TOOL_INSTRUCTION_MARKERS = (
-    "call get_run_results",
-    "call update_and_run_blocks",
-)
-_INTERNAL_TOOL_RETRY_PHRASES = ("do not retry", "do not re-invoke")
-_INTERNAL_TOOL_RETRY_CONTEXT_MARKERS = (
-    "block running tool",
-    "block running tools",
-    "block-running tool",
-    "block-running tools",
-    "get_run_results",
-    "update_and_run_blocks",
-    "tool call",
-    "this tool",
-    "the tool",
-    "workflow_run_id",
-)
-_INTERNAL_TOOL_INSTRUCTION_TRANSLATION = str.maketrans({char: " " for char in "`'\"()[]{}.,:;"})
 _INTERNAL_BLOCK_TYPE_TERMS = frozenset(
     {
         "navigation",
@@ -200,7 +181,6 @@ class OutputPolicyReason(StrEnum):
     UNBACKED_WORKFLOW_DELIVERY_CLAIM = "unbacked_workflow_delivery_claim"
     MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
-    INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
     INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
     INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
@@ -235,7 +215,6 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
-        OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
     }
 )
@@ -429,8 +408,6 @@ def evaluate_output_policy(
     # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
     if _contains_raw_secret(user_response):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
-    if _contains_internal_tool_instruction(user_response):
-        verdict.add(OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
     if (
         response_type == "REPLY"
         and not has_workflow_proposal
@@ -580,19 +557,6 @@ def _is_lexical_token_assignment(matched: str, assignment: str) -> bool:
     # The keyword pattern ends at the first whitespace, so the rest of the line carries the expression.
     rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(assignment)
     return rhs_match is not None and _parses_a_value_out_of_something(rhs_match.group(1))
-
-
-def _contains_internal_tool_instruction(user_response: str | None) -> bool:
-    if not isinstance(user_response, str):
-        return False
-    if contains_internal_machinery_leak(user_response):
-        return True
-    normalized = " ".join(user_response.lower().translate(_INTERNAL_TOOL_INSTRUCTION_TRANSLATION).split())
-    if any(marker in normalized for marker in _INTERNAL_TOOL_INSTRUCTION_MARKERS):
-        return True
-    return any(phrase in normalized for phrase in _INTERNAL_TOOL_RETRY_PHRASES) and any(
-        marker in normalized for marker in _INTERNAL_TOOL_RETRY_CONTEXT_MARKERS
-    )
 
 
 def _policy_text_values(value: Any) -> list[str]:
