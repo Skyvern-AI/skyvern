@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import socket
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -15,6 +16,7 @@ import pytest
 from skyvern.browser_extension import broker_server as broker_server_module
 from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.broker_protocol import (
+    BROKER_GENERATION,
     CONTROL_FRAME_LIMIT,
     MAX_CLIENT_OUTPUT_BYTES,
     MAX_ENCODED_CONTROL_FRAME_BYTES,
@@ -30,12 +32,14 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.package_extension import EXTENSION_DIR, compute_extension_source_hash
 from skyvern.browser_extension.relay import ExtensionRelayServer
 
 
 class FakeExtension:
     def __init__(self) -> None:
         self.protocol_version = 2
+        self.build_hash: str | None = None
         self.scoped_tabs: list[dict] = []
         self.attached_tabs: set[int] = set()
         self.detach_fails = False
@@ -165,6 +169,7 @@ class FakeRelay:
         self.requests: list[tuple[str, dict]] = []
         self.connection_cycles = 0
         self.extension_protocol_version: int | None = self.extension.protocol_version
+        self.extension_build_hash: str | None = self.extension.build_hash
         self.extension_connection_generation = 1
         self.reset_frames: list[dict] = []
         self.reset_tasks: set[asyncio.Task[None]] = set()
@@ -221,12 +226,14 @@ class FakeRelay:
     async def hello(self) -> None:
         self.connected = True
         self.extension_protocol_version = self.extension.protocol_version
+        self.extension_build_hash = self.extension.build_hash
         self._scoped_tabs = list(self.extension.scoped_tabs)
         await self.on_event(
             "extension.hello",
             {
                 "protocolVersion": self.extension_protocol_version,
                 "extensionVersion": "test",
+                "buildHash": self.extension_build_hash,
                 "scopeEventOrigins": True,
                 "scopedTabs": list(self._scoped_tabs),
             },
@@ -532,7 +539,7 @@ async def test_cached_client_reenrolls_after_broker_restart(
             controlEndpoint=str(client.paths.control_socket),
             protocolMin=1,
             protocolMax=1,
-            brokerGeneration=1,
+            brokerGeneration=BROKER_GENERATION,
             pid=123,
             processStart="marker",
         ),
@@ -589,7 +596,7 @@ async def test_cached_client_surfaces_broker_busy_when_fresh_enrollment_hits_cap
             controlEndpoint=str(stale_client.paths.control_socket),
             protocolMin=1,
             protocolMax=1,
-            brokerGeneration=1,
+            brokerGeneration=BROKER_GENERATION,
             pid=123,
             processStart="marker",
         ),
@@ -667,6 +674,69 @@ async def test_operator_client_can_status_pair_and_stop_while_mcp_is_active() ->
         await mcp.stop()
         await asyncio.wait_for(operator_server_task, 1.0)
         await asyncio.wait_for(mcp_server_task, 1.0)
+        await server.stop()
+
+
+def test_local_extension_build_hash_reflects_source_edits_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An editable-install daemon can outlive edits to its own extension source; the
+    local build hash must not cache a value from before the process started."""
+    extension_dir = tmp_path / "extension"
+    shutil.copytree(EXTENSION_DIR, extension_dir)
+    monkeypatch.setattr(broker_server_module, "EXTENSION_DIR", extension_dir)
+
+    baseline = broker_server_module._local_extension_build_hash()
+
+    (extension_dir / "service_worker.js").write_text(
+        (extension_dir / "service_worker.js").read_text() + "\n// edited\n"
+    )
+
+    assert broker_server_module._local_extension_build_hash() != baseline
+
+
+@pytest.mark.asyncio
+async def test_broker_status_reports_extension_build_currency() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay(
+        "extension-secret", 19777, server._handle_extension_event, server._handle_disconnect, auto_connect=False
+    )
+    server._relay = relay
+    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    operator_server_task = await _connect_over_socketpair(server, operator)
+    try:
+        unknown_status = await operator.broker_status()
+        assert unknown_status["extensionConnected"] is False
+        assert unknown_status["extensionBuild"] == "unknown"
+        assert unknown_status["extensionReportedBuildHash"] is None
+        local_short_hash = unknown_status["extensionBuildHash"]
+        assert local_short_hash == compute_extension_source_hash(EXTENSION_DIR)[:12]
+
+        # A connected, current-protocol extension that reports no hash predates
+        # build_hash.json entirely - the same-version-different-bytes skew this
+        # check exists to catch - and must be flagged, not shrugged off as unknown.
+        assert relay.extension.build_hash is None
+        await relay.hello()
+        legacy_hello_status = await operator.broker_status()
+        assert legacy_hello_status["extensionConnected"] is True
+        assert legacy_hello_status["extensionBuild"] == "stale"
+        assert legacy_hello_status["extensionReportedBuildHash"] is None
+
+        relay.extension.build_hash = compute_extension_source_hash(EXTENSION_DIR)
+        await relay.hello()
+        current_status = await operator.broker_status()
+        assert current_status["extensionBuild"] == "current"
+        assert current_status["extensionReportedBuildHash"] == local_short_hash
+
+        relay.extension.build_hash = "0" * 64
+        await relay.hello()
+        stale_status = await operator.broker_status()
+        assert stale_status["extensionBuild"] == "stale"
+        assert stale_status["extensionReportedBuildHash"] == "0" * 12
+        assert stale_status["extensionBuildHash"] == local_short_hash
+    finally:
+        await operator.stop()
+        await asyncio.wait_for(operator_server_task, 1.0)
         await server.stop()
 
 
