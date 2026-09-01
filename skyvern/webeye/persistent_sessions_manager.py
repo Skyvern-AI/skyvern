@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -11,12 +14,31 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserType,
 )
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_retirement import (
+    BrowserOperationRejected,
+    BrowserRetirement,
+    BrowserRetirementReason,
+)
 from skyvern.webeye.browser_state import BrowserState
 
 # Not a RunType member, so the reaper cannot resolve it by matching that enum. Both the writer of
 # a standalone-task lease and the reaper's liveness check must agree on this exact string, or the
 # reaper protects the row forever.
 PBS_TASK_RUNNABLE_TYPE = "task"
+
+
+@dataclass(frozen=True)
+class BrowserOperation:
+    browser_state: BrowserState
+    retirement: BrowserRetirement
+
+    @property
+    def retirement_started(self) -> asyncio.Event:
+        return self.retirement.started
+
+    @property
+    def retirement_reason(self) -> BrowserRetirementReason | None:
+        return self.retirement.reason
 
 
 class PersistentSessionsManager(Protocol):
@@ -97,6 +119,14 @@ class PersistentSessionsManager(Protocol):
         """Get the browser state for a session."""
         ...
 
+    def browser_operation(
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+    ) -> AbstractAsyncContextManager[BrowserOperation | BrowserOperationRejected]:
+        """Admit one browser operation on the exact current cached generation."""
+        ...
+
     def get_cached_browser_state_for_release(
         self,
         session_id: str,
@@ -126,7 +156,7 @@ class PersistentSessionsManager(Protocol):
     async def set_browser_state(
         self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
     ) -> None:
-        """Set the browser state for a session."""
+        """Set the browser state, or raise when the session has stopped accepting generations."""
         ...
 
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:

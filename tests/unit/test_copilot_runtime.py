@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.test_copilot_secret_scrub import _make_server
 
 
@@ -110,6 +111,14 @@ def _make_ctx(*, api_key: str | None = "test-api-key") -> AgentContext:
         stream=stream,
         api_key=api_key,
     )
+
+
+def _admit_mock_browser_operations(manager: MagicMock) -> None:
+    @asynccontextmanager
+    async def _operation(_session_id: str, browser_state: Any) -> AsyncIterator[BrowserOperation]:
+        yield BrowserOperation(browser_state, BrowserRetirement())
+
+    manager.browser_operation = _operation
 
 
 def _manager_reporting_fixed_deadline(remaining_seconds: float | None) -> MagicMock:
@@ -343,6 +352,7 @@ async def test_attach_retires_session_id_when_context_is_not_attachable(
 
     mock_manager = MagicMock()
     mock_manager.get_browser_state = AsyncMock(return_value=dead_state)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -388,6 +398,7 @@ async def test_attach_does_not_retire_a_session_replaced_underneath_it(
         ctx.browser_session_id = "bs_replacement"
 
     mock_manager.get_browser_state = AsyncMock(side_effect=_replace_then_report_dead)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -424,6 +435,7 @@ async def test_attach_keeps_session_when_health_signal_is_unavailable(
 
     mock_manager = MagicMock()
     mock_manager.get_browser_state = AsyncMock(return_value=state)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
     monkeypatch.setattr(runtime, "app", mock_app)
@@ -449,6 +461,7 @@ async def test_an_undetermined_attach_is_not_read_as_session_loss(monkeypatch: p
     undetermined_state = MagicMock()
     undetermined_state.browser_context = _UnreachableSignalContext()
     mock_manager.get_browser_state = AsyncMock(return_value=undetermined_state)
+    _admit_mock_browser_operations(mock_manager)
     ctx = _make_ctx()
     ctx.browser_session_id = "bs_live"
     with pytest.raises(RuntimeError) as undetermined:
@@ -565,6 +578,7 @@ def _install_dispatch_stack(
     mock_manager = MagicMock()
     mock_manager.get_browser_state = lookup
     mock_manager.create_session = AsyncMock(return_value=created)
+    _admit_mock_browser_operations(mock_manager)
     mock_app = MagicMock()
     mock_app.DATABASE.browser_sessions.get_persistent_browser_session = MagicMock(return_value=None)
     mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
@@ -894,6 +908,38 @@ async def test_the_verified_caller_attaches_once_and_reports_what_the_attach_sai
         assert result is not None and result["ok"] is False
         assert result["probe_error_type"] == expected_error_type
         assert "not evidence the browser is dead" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verify",
+    [
+        pytest.param(runtime.verify_browser_session_by_attaching, id="run"),
+        pytest.param(runtime.verify_build_test_browser_session_by_attaching, id="build-test"),
+    ],
+)
+async def test_attach_verification_follows_one_concurrent_generation_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    verify: Any,
+) -> None:
+    attach_attempts = 0
+
+    @asynccontextmanager
+    async def _attach(_ctx: AgentContext) -> AsyncIterator[None]:
+        nonlocal attach_attempts
+        attach_attempts += 1
+        if attach_attempts == 1:
+            raise runtime.CopilotBrowserGenerationRetired("bs_live")
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+
+    assert await verify(ctx) is None
+    assert attach_attempts == 2
+    assert ctx.browser_session_id == "bs_live"
 
 
 @pytest.mark.asyncio

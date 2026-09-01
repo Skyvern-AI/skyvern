@@ -37,7 +37,6 @@ import {
 } from "./templateUtils";
 import { CopilotCTAStep } from "./CopilotCTAStep";
 import { QuestionnaireDetailsStep } from "./QuestionnaireDetailsStep";
-import { QuestionnaireNextStepsCard } from "./QuestionnaireNextStepsCard";
 import { OnboardingOptionRow } from "./OnboardingOptionRow";
 import { OnboardingStepProgress } from "./OnboardingStepProgress";
 import { OnboardingStepShell } from "./OnboardingStepShell";
@@ -63,11 +62,6 @@ type DiscoverOnboardingOwner =
   | { kind: "deciding" }
   | { kind: "questionnaire"; step: "intent" }
   | { kind: "questionnaire"; step: "details" }
-  | {
-      kind: "questionnaire";
-      step: "recommendations";
-      answers: QuestionnaireAnswersV1;
-    }
   | { kind: "editor" }
   | { kind: "closed" };
 
@@ -126,18 +120,6 @@ function answersFromQuestionnaire(
   return role && company_context && scale_intent && referral_source
     ? { role, company_context, scale_intent, referral_source }
     : null;
-}
-
-function questionnaireTerminalOwner(
-  questionnaire: QuestionnaireStateV1,
-): DiscoverOnboardingOwner {
-  const answers =
-    questionnaire.status === "completed"
-      ? answersFromQuestionnaire(questionnaire)
-      : null;
-  return answers
-    ? { kind: "questionnaire", step: "recommendations", answers }
-    : { kind: "closed" };
 }
 
 function GetStartedModalForUser() {
@@ -420,7 +402,7 @@ function GetStartedModalForUser() {
           return;
         }
         setQuestionnaire(confirmedQuestionnaire);
-        setOwner(questionnaireTerminalOwner(confirmedQuestionnaire));
+        setOwner({ kind: "closed" });
         return;
       }
       setOwner({ kind: "questionnaire", step: "details" });
@@ -435,11 +417,7 @@ function GetStartedModalForUser() {
 
   function handleBack() {
     if (owner.kind === "questionnaire") {
-      setOwner(
-        owner.step === "recommendations"
-          ? { kind: "questionnaire", step: "details" }
-          : { kind: "questionnaire", step: "intent" },
-      );
+      setOwner({ kind: "questionnaire", step: "intent" });
       return;
     }
     setStep("intent");
@@ -552,11 +530,10 @@ function GetStartedModalForUser() {
         response.onboarding_state.user_intent,
       );
       setQuestionnaire(nextQuestionnaire);
-      setOwner(
-        patch.action === "skip"
-          ? { kind: "closed" }
-          : questionnaireTerminalOwner(nextQuestionnaire),
-      );
+      if (patch.action === "complete") {
+        updateState({ modal_dismissed_at: new Date().toISOString() });
+      }
+      setOwner({ kind: "closed" });
     } finally {
       setQuestionnairePending(false);
     }
@@ -582,7 +559,7 @@ function GetStartedModalForUser() {
     selectedIntent && globalTemplates.length > 0
       ? getTemplatesForIntent(globalTemplates, selectedIntent)
       : [];
-  const stepCount = questionnaireOwner ? 3 : 2;
+  const stepCount = 2;
   const view =
     owner.kind === "questionnaire"
       ? owner.step
@@ -675,17 +652,6 @@ function GetStartedModalForUser() {
             isPending={questionnairePending}
             onAction={handleQuestionnaireAction}
             onBack={handleBack}
-          />
-        ) : owner.kind === "questionnaire" &&
-          owner.step === "recommendations" ? (
-          <QuestionnaireNextStepsCard
-            answers={owner.answers}
-            onAction={() => {
-              updateState({ modal_dismissed_at: new Date().toISOString() });
-              setOwner({ kind: "closed" });
-            }}
-            onBack={handleBack}
-            onSkip={handleSkip}
           />
         ) : variant === VARIANTS.COPILOT_FIRST ? (
           <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-4">

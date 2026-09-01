@@ -28,6 +28,7 @@ from skyvern.webeye.browser_engine import (
     BrowserEngineSelection,
 )
 from skyvern.webeye.browser_factory import set_popup_video_listener
+from skyvern.webeye.browser_retirement import BrowserStatePublicationRejected
 from skyvern.webeye.display_recorder import DisplayRecorder
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -585,6 +586,29 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
 
 
 @pytest.mark.asyncio
+async def test_task_does_not_cache_a_browser_rejected_by_terminal_session() -> None:
+    manager = RealBrowserManager()
+    task = make_task("tsk_rejected")
+    candidate = MagicMock()
+    candidate.get_or_create_page = AsyncMock()
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock(
+            side_effect=BrowserStatePublicationRejected("pbs_rejected")
+        )
+        with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=candidate)):
+            with pytest.raises(BrowserStatePublicationRejected):
+                await manager.get_or_create_for_task(task=task, browser_session_id="pbs_rejected")
+
+    assert task.task_id not in manager.pages
+    candidate.get_or_create_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -> None:
     manager = RealBrowserManager()
     task = make_task("tsk_1", proxy_location="RESIDENTIAL")
@@ -672,6 +696,32 @@ async def test_workflow_run_browser_inherits_session_proxy_when_no_browser_state
         mock_create.assert_awaited_once()
         _, kwargs = mock_create.call_args
         assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_workflow_does_not_cache_a_browser_rejected_by_terminal_session() -> None:
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_rejected")
+    candidate = MagicMock()
+    candidate.get_or_create_page = AsyncMock()
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock(
+            side_effect=BrowserStatePublicationRejected("pbs_rejected")
+        )
+        with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=candidate)):
+            with pytest.raises(BrowserStatePublicationRejected):
+                await manager.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url="https://example.com",
+                    browser_session_id="pbs_rejected",
+                )
+
+    assert workflow_run.workflow_run_id not in manager.pages
+    candidate.get_or_create_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio

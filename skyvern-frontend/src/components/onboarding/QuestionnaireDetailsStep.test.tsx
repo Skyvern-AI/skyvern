@@ -82,11 +82,13 @@ afterEach(() => {
 });
 
 describe("QuestionnaireDetailsStep", () => {
-  it("renders direction A as one optional labelled form", () => {
+  it("renders the optional details form as the final step", () => {
     const { onBack } = renderDetails();
     expect(
       screen.getByRole("heading", { name: "Tell us about your setup" }),
     ).toBeTruthy();
+    expect(screen.getByText("STEP 2 OF 2")).toBeTruthy();
+    expect(screen.getByText("FINAL STEP")).toBeTruthy();
     expect(
       screen.getByText(/Optional\. Your answers help us recommend/),
     ).toBeTruthy();

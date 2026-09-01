@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote
 
 import pytest
@@ -15,6 +15,7 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.mcp_adapter import (
@@ -41,6 +42,11 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.webeye.persistent_sessions_manager import (
+    BrowserOperation,
+    BrowserRetirement,
+    BrowserRetirementReason,
+)
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.test_copilot_secret_scrub import _make_server
 
@@ -327,6 +333,280 @@ def _timing_records(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _browser_outcome_records(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in captured if record.get("event") == "copilot_browser_call_outcome"]
+
+
+@pytest.mark.asyncio
+async def test_generation_retirement_reports_replacement_without_expiring_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_replaced")
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _retired(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        raise mcp_adapter.CopilotBrowserGenerationRetired("pbs_replaced")
+        yield
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _retired)
+    server = _make_server(ctx, {"ok": True}, SchemaOverlay(requires_browser=True))
+
+    result = await server.call_tool("evaluate", {})
+    surfaced = json.loads(result.content[0].text)
+
+    assert surfaced["error_code"] == "BROWSER_GENERATION_RETIRED"
+    assert surfaced["data"]["browser_session_continuity"] == {
+        "source": "direct_mcp",
+        "disposition": "generation_retired",
+        "cause": "connection_generation_retired",
+        "fresh_state_required": True,
+        "prior_action_effect": "unknown",
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_retirement_uses_session_loss_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_closed")
+    retired_error = mcp_adapter.CopilotBrowserGenerationRetired(
+        "pbs_closed",
+        BrowserRetirementReason.session_ending,
+    )
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _retired(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        raise retired_error
+        yield
+
+    handle_loss = AsyncMock(return_value="failed")
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _retired)
+    monkeypatch.setattr(mcp_adapter, "_handle_browser_session_loss", handle_loss)
+    server = _make_server(ctx, {"ok": True}, SchemaOverlay(requires_browser=True))
+
+    result = await server.call_tool("evaluate", {})
+    surfaced = json.loads(result.content[0].text)
+
+    assert surfaced["error_code"] == "SESSION_EXPIRED"
+    handle_loss.assert_awaited_once_with(
+        ctx,
+        tool_name="evaluate",
+        call_path="model",
+        lost_session_id="pbs_closed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_post_hook_finishes_inside_the_exact_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_post_hook")
+    scope_active = False
+    post_hook_saw_scope = False
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        nonlocal scope_active
+        scope_active = True
+        try:
+            yield
+        finally:
+            scope_active = False
+
+    async def _post_hook(
+        copilot_result: dict[str, Any], _raw_mcp: dict[str, Any], _ctx: AgentContext
+    ) -> dict[str, Any]:
+        nonlocal post_hook_saw_scope
+        post_hook_saw_scope = scope_active
+        return copilot_result
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True, post_hook=_post_hook),
+    )
+
+    result = await server.call_tool("evaluate", {})
+
+    assert result.isError is False
+    assert post_hook_saw_scope is True
+    assert scope_active is False
+
+
+@pytest.mark.asyncio
+async def test_retirement_after_post_hook_rolls_back_context_and_defers_success_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_retired_post_hook")
+    original_evidence = {"step": 1, "evidence": {"source_tool": "before"}}
+    ctx.flow_evidence = [original_evidence]
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        yield
+        raise mcp_adapter.CopilotBrowserGenerationRetired("pbs_retired_post_hook")
+
+    async def _post_hook(
+        copilot_result: dict[str, Any], _raw_mcp: dict[str, Any], hook_ctx: AgentContext
+    ) -> dict[str, Any]:
+        hook_ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "evaluate"}})
+        await asyncio.sleep(0)
+        return copilot_result
+
+    record_outcome = MagicMock()
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+    monkeypatch.setattr(mcp_adapter, "_record_browser_call_outcome", record_outcome)
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True, post_hook=_post_hook),
+        alias_map={"evaluate": "skyvern_evaluate"},
+    )
+
+    result = await server.call_tool("evaluate", {})
+
+    assert result.isError is True
+    assert ctx.flow_evidence == [original_evidence]
+    assert record_outcome.call_count == 1
+    assert record_outcome.call_args.args[1].ok is False
+
+
+@pytest.mark.asyncio
+async def test_retirement_rollback_preserves_concurrent_sibling_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_shared_context")
+    ctx.flow_evidence = []
+    allow_retiring_dispatch = asyncio.Event()
+    retiring_dispatch_started = asyncio.Event()
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext, **_kwargs: Any) -> AsyncIterator[None]:
+        yield
+        if asyncio.current_task() is retiring_task:
+            raise mcp_adapter.CopilotBrowserGenerationRetired("pbs_shared_context")
+
+    class _ConcurrentClient:
+        async def call_tool(
+            self,
+            _name: str,
+            _args: dict[str, Any],
+            raise_on_error: bool = False,
+        ) -> Any:
+            if asyncio.current_task() is retiring_task:
+                retiring_dispatch_started.set()
+                await allow_retiring_dispatch.wait()
+                tag = "retiring"
+            else:
+                tag = "sibling"
+            return SimpleNamespace(structured_content={"ok": True, "tag": tag}, is_error=False, content=[])
+
+    async def _post_hook(
+        copilot_result: dict[str, Any], raw_mcp: dict[str, Any], hook_ctx: AgentContext
+    ) -> dict[str, Any]:
+        hook_ctx.flow_evidence.append({"source": raw_mcp["tag"]})
+        await asyncio.sleep(0)
+        return copilot_result
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True, post_hook=_post_hook),
+    )
+    server._client = _ConcurrentClient()
+
+    retiring_task = asyncio.create_task(server._call_tool("evaluate", {}))
+    await retiring_dispatch_started.wait()
+    sibling_task = asyncio.create_task(server._call_tool("evaluate", {}))
+    await asyncio.sleep(0)
+    allow_retiring_dispatch.set()
+
+    results = await asyncio.gather(retiring_task, sibling_task, return_exceptions=True)
+
+    assert isinstance(results[0], CallToolResult)
+    assert results[0].isError is True
+    assert not isinstance(results[1], BaseException)
+    assert ctx.flow_evidence == [{"source": "sibling"}]
+
+
+@pytest.mark.asyncio
+async def test_browser_pre_hook_internal_read_reuses_the_outer_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_nested_hook")
+    ctx.api_key = "test-api-key"
+    browser = MagicMock()
+    browser.is_connected.return_value = True
+    browser_context = MagicMock()
+    browser_context.browser = browser
+    browser_context._impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+    browser_state = MagicMock(browser_context=browser_context)
+    operation_entries = 0
+
+    @asynccontextmanager
+    async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
+        nonlocal operation_entries
+        operation_entries += 1
+        yield BrowserOperation(resolved_state, BrowserRetirement())
+
+    manager = MagicMock()
+    manager.get_browser_state = AsyncMock(return_value=browser_state)
+    manager.browser_operation = _operation
+    monkeypatch.setattr(copilot_runtime.app, "PERSISTENT_SESSIONS_MANAGER", manager)
+    monkeypatch.setattr(copilot_runtime, "get_skyvern", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(copilot_runtime, "SkyvernBrowser", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(copilot_runtime, "get_active_api_key", MagicMock(return_value="test-api-key"))
+    monkeypatch.setattr(copilot_runtime, "set_api_key_override", MagicMock(return_value=object()))
+    monkeypatch.setattr(copilot_runtime, "reset_api_key_override", MagicMock())
+    register = MagicMock()
+    unregister = MagicMock()
+    monkeypatch.setattr(copilot_runtime, "register_copilot_session", register)
+    monkeypatch.setattr(copilot_runtime, "unregister_copilot_session", unregister)
+
+    async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    server: SkyvernOverlayMCPServer
+
+    async def _pre_hook(_args: dict[str, Any], _ctx: AgentContext) -> None:
+        internal = await server.call_internal_tool("skyvern_evaluate", {"expression": "source()"})
+        assert internal["ok"] is True
+
+    server = _make_server(
+        ctx,
+        {"ok": True, "data": {"result": "done"}},
+        SchemaOverlay(requires_browser=True, pre_hook=_pre_hook),
+        alias_map={"evaluate": "skyvern_evaluate"},
+    )
+
+    result = await server.call_tool("evaluate", {"expression": "action()"})
+
+    assert result.isError is False
+    assert operation_entries == 1
+    manager.get_browser_state.assert_awaited_once()
+    register.assert_called_once()
+    unregister.assert_called_once()
 
 
 async def _call(server: SkyvernOverlayMCPServer, call_path: str) -> CallToolResult | dict[str, Any]:

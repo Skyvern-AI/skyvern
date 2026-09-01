@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +14,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 
 _UNSET_UPSTREAM = "<unset>"
 
@@ -24,6 +27,11 @@ class _FakeBrowser:
 class _FakeBrowserContext:
     browser = _FakeBrowser()
     _impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+
+
+@asynccontextmanager
+async def _browser_operation(_session_id: str, state: object) -> AsyncIterator[BrowserOperation]:
+    yield BrowserOperation(state, BrowserRetirement())
 
 
 def _request(browser_session_id: str | None = None, wpid: str = "wpid-1") -> WorkflowCopilotChatRequest:
@@ -329,6 +337,7 @@ async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatc
         SimpleNamespace(
             get_browser_state=get_browser_state_mock,
             create_session=create_session_mock,
+            browser_operation=_browser_operation,
         ),
     )
 

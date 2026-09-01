@@ -99,7 +99,8 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
     monkeypatch.setattr(runtime, "set_api_key_override", lambda _key: "token")
     monkeypatch.setattr(runtime, "reset_api_key_override", lambda _token: None)
     unregister_mock = MagicMock()
-    monkeypatch.setattr(runtime, "register_copilot_session", MagicMock())
+    register_mock = MagicMock()
+    monkeypatch.setattr(runtime, "register_copilot_session", register_mock)
     monkeypatch.setattr(runtime, "unregister_copilot_session", unregister_mock)
 
     ctx = _make_ctx(
@@ -115,6 +116,7 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
     unregister_mock.assert_called_once_with(
         make_self_heal_session_id("wr_777"),
         organization_id=ctx.organization_id,
+        expected_state=register_mock.call_args.args[1],
     )
 
 
@@ -160,7 +162,11 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
             assert register_mock.call_args.args[0] == expected_session_id
             assert register_mock.call_args.kwargs == {"organization_id": ctx.organization_id}
 
-    unregister_mock.assert_called_once_with(expected_session_id, organization_id=ctx.organization_id)
+    unregister_mock.assert_called_once_with(
+        expected_session_id,
+        organization_id=ctx.organization_id,
+        expected_state=register_mock.call_args.args[1],
+    )
     manager.get_browser_state.assert_not_awaited()
     registered = [entry for entry in logs if entry["event"] == "registered self-heal browser session"]
     unregistered = [entry for entry in logs if entry["event"] == "unregistered self-heal browser session"]
