@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from skyvern.browser_extension.errors import BrowserExtensionError
-from skyvern.browser_extension.package_extension import package_extension
+from skyvern.browser_extension.package_extension import (
+    EXTENSION_DIR,
+    compute_extension_source_hash,
+    package_extension,
+    write_build_hash,
+)
 from skyvern.browser_extension.protocol import (
     ALLOWED_CDP_METHOD_PREFIXES,
     ALLOWED_EVENTS,
@@ -136,9 +141,38 @@ def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:
     assert "service_worker.js" in names
     assert "dom_router.js" in names
     assert "README.md" not in names
+    assert "build_hash.json" in names
 
     second_path = package_extension(tmp_path / "skyvern-agent-second.zip")
     assert output_path.read_bytes() == second_path.read_bytes()
+
+
+def test_committed_build_hash_matches_current_sources() -> None:
+    """Regenerate with `python -m skyvern.browser_extension.package_extension --write-build-hash`
+    and commit the result whenever extension/** changes, or the broker will report every
+    freshly loaded extension as stale."""
+    committed = json.loads((EXTENSION_DIR / "build_hash.json").read_text())
+    assert committed["sha256"] == compute_extension_source_hash(EXTENSION_DIR)
+
+
+def test_compute_extension_source_hash_reacts_to_content_and_ignores_itself(tmp_path: Path) -> None:
+    extension_dir = tmp_path / "extension"
+    shutil.copytree(EXTENSION_DIR, extension_dir)
+
+    baseline = compute_extension_source_hash(extension_dir)
+    assert compute_extension_source_hash(extension_dir) == baseline
+
+    (extension_dir / "build_hash.json").write_text(json.dumps({"sha256": "deliberately-wrong"}))
+    assert compute_extension_source_hash(extension_dir) == baseline
+
+    service_worker = extension_dir / "service_worker.js"
+    service_worker.write_text(service_worker.read_text() + "\n// changed\n")
+    assert compute_extension_source_hash(extension_dir) != baseline
+
+    assert write_build_hash(extension_dir) == compute_extension_source_hash(extension_dir)
+    assert json.loads((extension_dir / "build_hash.json").read_text())["sha256"] == compute_extension_source_hash(
+        extension_dir
+    )
 
 
 def test_build_request_checks_operation_allowlist() -> None:

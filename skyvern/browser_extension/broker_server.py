@@ -71,6 +71,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.package_extension import EXTENSION_DIR, compute_extension_source_hash
 from skyvern.browser_extension.protocol import ALLOWED_OPS, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.workstation_grant import (
@@ -98,12 +99,20 @@ _LEASED_OPS = frozenset(
 _WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
 _APPROVAL_SOURCE_INTERACTIVE = "interactive"
 _APPROVAL_SOURCE_GRANT = "grant"
+_BUILD_HASH_SHORT_LENGTH = 12
+
+
+def _local_extension_build_hash() -> str:
+    # Recomputed per status call (not cached): an editable-install daemon can outlive
+    # edits to its own extension source, and status is not a hot path.
+    return compute_extension_source_hash(EXTENSION_DIR)
 
 
 class Relay(Protocol):
     bound_port: int
     scoped_tabs: list[dict[str, Any]]
     extension_protocol_version: int | None
+    extension_build_hash: str | None
     extension_connection_generation: int
 
     @property
@@ -849,21 +858,41 @@ class BrowserExtensionBrokerServer:
                     tab_id for tab_id, lease in self._leases.items() if lease.client_id == connection.client_id
                 )
             approved = connection.operator or self._client_approved(connection)
+            extension_ready = (
+                approved
+                and relay.connected
+                and relay.extension_protocol_version == PROTOCOL_VERSION
+                and not self._extension_reset_quarantined
+            )
+            local_build_hash = _local_extension_build_hash()
+            remote_build_hash = relay.extension_build_hash
+            if not extension_ready:
+                # No completed hello to compare yet - not an upgrade signal, just no data.
+                extension_build = "unknown"
+            elif remote_build_hash is None:
+                # A connected, current-protocol extension that reports no hash predates
+                # build_hash.json entirely - exactly the same-version-different-bytes skew
+                # this check exists to catch, so it gets the same actionable "stale" label.
+                extension_build = "stale"
+            elif remote_build_hash == local_build_hash:
+                extension_build = "current"
+            else:
+                extension_build = "stale"
             return {
                 "protocol": BROKER_PROTOCOL_VERSION,
                 "generation": BROKER_GENERATION,
                 "buildFingerprint": BROKER_BUILD_FINGERPRINT,
                 "lifecycle": "draining" if self._stopping else "ready",
-                "extensionConnected": (
-                    approved
-                    and relay.connected
-                    and relay.extension_protocol_version == PROTOCOL_VERSION
-                    and not self._extension_reset_quarantined
-                ),
+                "extensionConnected": extension_ready,
                 "approved": approved,
                 "clientCount": len(self._clients),
                 "tabIds": tab_ids,
                 "quarantines": [],
+                "extensionBuild": extension_build,
+                "extensionBuildHash": local_build_hash[:_BUILD_HASH_SHORT_LENGTH],
+                "extensionReportedBuildHash": (
+                    remote_build_hash[:_BUILD_HASH_SHORT_LENGTH] if remote_build_hash is not None else None
+                ),
             }
         if op == "workstation.grant":
             if args:

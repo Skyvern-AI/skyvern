@@ -16,6 +16,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli import run_commands
@@ -24,6 +25,8 @@ from skyvern.cli.commands.browser import browser_app
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import session as mcp_session
+
+from .test_broker_client import _ignore_event, _mock_pre_upgrade_daemon
 
 _PAIRING_OPENED_GUIDANCE = (
     "Skyvern browser extension is not connected. A pairing tab was opened in Chrome. Approve pairing in "
@@ -266,8 +269,72 @@ async def test_session_create_extension_connected_returns_safe_success_payload(
     assert result["browser_context"]["mode"] == "extension"
     assert result["data"]["browser"] == "extension"
     assert result["data"]["session"] == "implicit"
+    assert result["warnings"] == []
     assert runtime.cdp_ws_url not in repr(result)
     assert runtime.pairing_token not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_session_create_names_stale_extension_build_instead_of_failing_generically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = SimpleNamespace(
+        wait_for_extension=AsyncMock(return_value=True),
+        broker_build_status=AsyncMock(
+            return_value={
+                "extensionBuild": "stale",
+                "extensionBuildHash": "aaaaaaaaaaaa",
+                "extensionReportedBuildHash": "bbbbbbbbbbbb",
+            }
+        ),
+    )
+    monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
+    monkeypatch.setattr(mcp_session.BrowserExtensionRuntime, "get_or_start", AsyncMock(return_value=runtime))
+    monkeypatch.setattr(
+        mcp_session,
+        "resolve_browser",
+        AsyncMock(return_value=(MagicMock(), BrowserContext(mode="extension"))),
+    )
+
+    result = await mcp_session.skyvern_browser_session_create()
+
+    assert result["ok"] is True
+    assert len(result["warnings"]) == 1
+    warning = result["warnings"][0]
+    assert "aaaaaaaaaaaa" in warning
+    assert "bbbbbbbbbbbb" in warning
+
+
+@pytest.mark.asyncio
+async def test_session_create_names_stale_extension_build_with_no_hash_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connected extension that predates build_hash.json reports no hash at all;
+    the warning must still read as actionable, not print the literal word None."""
+    runtime = SimpleNamespace(
+        wait_for_extension=AsyncMock(return_value=True),
+        broker_build_status=AsyncMock(
+            return_value={
+                "extensionBuild": "stale",
+                "extensionBuildHash": "aaaaaaaaaaaa",
+                "extensionReportedBuildHash": None,
+            }
+        ),
+    )
+    monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
+    monkeypatch.setattr(mcp_session.BrowserExtensionRuntime, "get_or_start", AsyncMock(return_value=runtime))
+    monkeypatch.setattr(
+        mcp_session,
+        "resolve_browser",
+        AsyncMock(return_value=(MagicMock(), BrowserContext(mode="extension"))),
+    )
+
+    result = await mcp_session.skyvern_browser_session_create()
+
+    assert result["ok"] is True
+    warning = result["warnings"][0]
+    assert "None" not in warning
+    assert "aaaaaaaaaaaa" in warning
 
 
 @pytest.mark.asyncio
@@ -542,6 +609,42 @@ def test_browser_extension_status_is_informational_when_bridge_is_not_running(
     assert result.exit_code == 0
     assert "pairing token: not configured" in result.stdout
     assert "bridge not running (start your MCP server with --browser-extension)" in result.stdout
+
+
+def test_extension_broker_status_never_kills_a_pre_upgrade_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """extension-broker-status builds an auto_spawn=False operator client, same as
+    extension-approve-workstation/revoke-workstation. On a broker generation mismatch
+    it must report the incompatibility, not kill the still-running, otherwise healthy
+    daemon out from under whoever depends on it. (extension-broker-stop is the one
+    auto_spawn=False command that IS allowed to terminate one - see below.)"""
+    monkeypatch.setattr(browser_commands.BrowserExtensionRuntime, "configured_port", lambda: 19778)
+    path_probe = BrokerClient(19778, _ignore_event)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, path_probe)
+
+    result = CliRunner().invoke(browser_app, ["extension-broker-status"])
+
+    assert result.exit_code == 0
+    assert "broker not running (INCOMPATIBLE_BROKER" in result.stdout
+    assert terminated_pids == []
+
+
+def test_extension_broker_stop_terminates_a_pre_upgrade_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlike status/grant/revoke, extension-broker-stop is explicitly destructive and
+    doesn't need to bring a replacement back up, so it must still be able to remove a
+    mismatched-generation daemon that a normal wire-level stop can't reach."""
+    monkeypatch.setattr(browser_commands.BrowserExtensionRuntime, "configured_port", lambda: 19778)
+    path_probe = BrokerClient(19778, _ignore_event)
+    terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, path_probe)
+
+    result = CliRunner().invoke(browser_app, ["extension-broker-stop"])
+
+    assert result.exit_code == 0
+    assert "stop requested" in result.stdout
+    assert terminated_pids == [555_555]
 
 
 def test_browser_extension_pair_exits_with_guidance_when_bridge_is_not_running(

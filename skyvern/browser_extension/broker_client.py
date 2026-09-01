@@ -16,6 +16,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import psutil
+
 from skyvern.browser_extension.auth import compute_broker_proof, compute_client_proof
 from skyvern.browser_extension.broker_protocol import (
     BROKER_GENERATION,
@@ -247,7 +249,16 @@ class BrokerClient:
         return await self._control_request("workstation.revoke", args, 5.0)
 
     async def stop_broker(self) -> dict[str, Any]:
-        await self.start()
+        try:
+            await self.start()
+        except BrowserExtensionBrokerError as exc:
+            state = read_broker_state(self.paths)
+            if exc.code != "INCOMPATIBLE_BROKER" or state is None or state.brokerGeneration == BROKER_GENERATION:
+                raise
+            # Unlike status/grant/revoke, stop is explicitly destructive and doesn't need
+            # to bring a replacement back up - terminate the unreachable daemon directly.
+            await _terminate_incompatible_daemon(state.pid, state.processStart)
+            return {"stopping": True}
         return await self._control_request("broker.stop", {}, 5.0)
 
     async def _connect_with_retry(self) -> None:
@@ -269,14 +280,23 @@ class BrokerClient:
             state = read_broker_state(self.paths)
             if state is None or state.lifecycle != "ready":
                 raise BrowserExtensionNotConnectedError("Browser-extension broker is not running")
-            if (
-                state.externalPort != self.port
-                or state.protocolMin > 1
-                or state.protocolMax < 1
-                or state.brokerGeneration != BROKER_GENERATION
-            ):
+            if state.externalPort != self.port or state.protocolMin > 1 or state.protocolMax < 1:
                 raise BrowserExtensionBrokerError(
                     "INCOMPATIBLE_BROKER", "Running browser-extension broker is incompatible"
+                )
+            if state.brokerGeneration != BROKER_GENERATION:
+                if not self._auto_spawn:
+                    # An operator-only client (status/stop/grant/revoke) never spawns a
+                    # replacement, so it must not kill a daemon it can't bring back either.
+                    raise BrowserExtensionBrokerError(
+                        "INCOMPATIBLE_BROKER", "Running browser-extension broker is incompatible"
+                    )
+                # The auth proof is generation-scoped (see compute_client_proof below), so a
+                # mismatched daemon can't be asked over the wire to stop itself - replace it
+                # directly and let start()'s auto-spawn path start a compatible one.
+                await _terminate_incompatible_daemon(state.pid, state.processStart)
+                raise BrowserExtensionNotConnectedError(
+                    "Browser-extension broker was running an incompatible generation and has been replaced"
                 )
             if not process_identity_matches(state.pid, state.processStart):
                 raise BrowserExtensionNotConnectedError("Browser-extension broker is not running")
@@ -852,6 +872,23 @@ def _terminate_spawned_process(process: subprocess.Popen[bytes]) -> None:
         process.kill()
     with suppress(subprocess.TimeoutExpired):
         process.wait(timeout=2.0)
+
+
+async def _terminate_incompatible_daemon(pid: int, process_start: str) -> None:
+    """Terminate a daemon this client did not spawn (no Popen handle to wait on),
+    verifying identity via the same pid+start-time marker liveness checks already
+    used to detect a crashed daemon elsewhere in this module."""
+    if not process_identity_matches(pid, process_start):
+        return
+    loop = asyncio.get_running_loop()
+    for method_name in ("terminate", "kill"):
+        with suppress(psutil.Error):
+            getattr(psutil.Process(pid), method_name)()
+        deadline = loop.time() + 2.0
+        while loop.time() < deadline:
+            if not process_identity_matches(pid, process_start):
+                return
+            await asyncio.sleep(0.05)
 
 
 def _broker_is_reachable(paths: BrokerPaths) -> bool:

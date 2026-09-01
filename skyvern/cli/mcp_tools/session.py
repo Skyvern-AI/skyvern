@@ -67,6 +67,16 @@ def _broker_extension_not_connected_hint() -> str:
     )
 
 
+def _extension_build_mismatch_warning(status: dict[str, Any] | None) -> str | None:
+    if status is None or status.get("extensionBuild") != "stale":
+        return None
+    reported = BrowserExtensionRuntime.describe_reported_build_hash(status)
+    return (
+        f"Skyvern browser extension build is stale (extension {reported} vs "
+        f"broker {status.get('extensionBuildHash')}). Reload the unpacked extension in chrome://extensions."
+    )
+
+
 def _browser_extension_start_hint(error: Exception) -> str:
     if isinstance(error, BrowserExtensionBrokerError):
         if error.code in {"INVALID_READINESS", "STARTUP_TIMEOUT"}:
@@ -246,6 +256,11 @@ async def skyvern_browser_session_create(
                         _broker_extension_not_connected_hint() if broker_mode else "",
                     ),
                 )
+        try:
+            build_status = await runtime.broker_build_status()
+        except Exception:
+            build_status = None
+        build_warning = _extension_build_mismatch_warning(build_status)
         return make_result(
             "skyvern_browser_session_create",
             browser_context=ctx,
@@ -254,6 +269,7 @@ async def skyvern_browser_session_create(
                 "session": "implicit",
                 "note": "Extension sessions are implicit; call browser tools without a session_id.",
             },
+            warnings=[build_warning] if build_warning else None,
             timing_ms=timer.timing_ms,
         )
 
