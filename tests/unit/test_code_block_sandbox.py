@@ -84,6 +84,54 @@ class TestIsSafeCodeRejectsDunderAccess:
             CodeBlock.is_safe_code("x.__builtins__")
 
 
+_MATCH_CLASS_POSITIONAL_BYPASS_CODE = (
+    'M = type("M", (type,), {"__instancecheck__": lambda s, o: True})\n'
+    'R = M("R", (), {"__match_args__": ("__globals__",)})\n'
+    "match sleep:\n    case R(g):\n        result = g\n"
+)
+_MATCH_CLASS_CHECKERS = (CodeBlock.is_safe_code, is_safe_script_code)
+
+
+@pytest.mark.parametrize(
+    ("checker", "error"),
+    [(CodeBlock.is_safe_code, "private"), (is_safe_script_code, "globals")],
+    ids=["codeblock", "script"],
+)
+def test_match_class_private_keyword_attribute_is_rejected(checker, error: str) -> None:
+    with pytest.raises(InsecureCodeDetected, match=error):
+        checker("match obj:\n    case type(__globals__=g):\n        result = g\n")
+
+
+@pytest.mark.parametrize("checker", _MATCH_CLASS_CHECKERS, ids=["codeblock", "script"])
+@pytest.mark.parametrize(
+    ("code", "error"),
+    [
+        ("match obj:\n    case Session(_nonce=n):\n        result = n\n", "private"),
+        ("match obj:\n    case Thing(popen=p):\n        result = p\n", "popen"),
+        (_MATCH_CLASS_POSITIONAL_BYPASS_CODE, "positional"),
+        ("match obj:\n    case Thing(x, y):\n        result = x\n", "positional"),
+        ("match obj:\n    case Thing(x, attr=y):\n        result = x\n", "positional"),
+    ],
+    ids=["private-keyword", "blocked-keyword", "dynamic-positional", "positional", "mixed-positional"],
+)
+def test_match_class_attribute_bypasses_are_rejected(checker, code: str, error: str) -> None:
+    with pytest.raises(InsecureCodeDetected, match=error):
+        checker(code)
+
+
+@pytest.mark.parametrize("checker", _MATCH_CLASS_CHECKERS, ids=["codeblock", "script"])
+@pytest.mark.parametrize(
+    "code",
+    [
+        "match point:\n    case Point(x=0, y=0):\n        result = 1\n",
+        "match obj:\n    case Thing():\n        result = 1\n",
+    ],
+    ids=["keyword", "bare"],
+)
+def test_safe_match_class_patterns_are_accepted(checker, code: str) -> None:
+    checker(code)
+
+
 class TestIsSafeCodeRejectsBareDunderIdentifiers:
     """Bare dunder names (not attribute access) must also be blocked."""
 

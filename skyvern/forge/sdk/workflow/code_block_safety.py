@@ -439,6 +439,18 @@ def _validate_tree(
             )
             if not is_allowed_read and not is_self_super_private:
                 raise error_factory("Not allowed to access private methods or attributes")
+        # MatchClass keyword patterns read attributes without creating ast.Attribute nodes.
+        if isinstance(node, ast.MatchClass):
+            for attr in node.kwd_attrs:
+                if attr in blocked_private_attrs:
+                    raise error_factory(f"Not allowed to access '{attr}'")
+                if attr.startswith("_") and attr not in allowed_dunder_reads and attr not in allowed_private_reads:
+                    raise error_factory("Not allowed to access private methods or attributes")
+                if attr in blocked_attrs:
+                    raise error_factory(f"Not allowed to access '{attr}'")
+            # Positional patterns hide attribute names behind runtime-defined __match_args__.
+            if node.patterns:
+                raise error_factory("Not allowed to use positional patterns in match statements")
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in blocked_names:
             raise error_factory(f"Not allowed to use '{node.id}'")
         if (
