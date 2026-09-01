@@ -218,7 +218,7 @@ describe("NarrativeView terminal prose", () => {
     );
   });
 
-  it("keeps an unconfirmed clarification on the structured evidence path", () => {
+  it("keeps the run outcome fallback when a clarification has no owning row", () => {
     const { container } = render(
       <NarrativeView
         turn={terminalTurn({
@@ -236,10 +236,45 @@ describe("NarrativeView terminal prose", () => {
     expect(screen.queryByTestId("copilot-terminal-prose")).toBeNull();
     expect(screen.getByText("login", { selector: "strong" })).toBeTruthy();
     expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
+    expect(
+      screen.getByText(/The sign-in flow did not reach the expected page/),
+    ).toBeTruthy();
     expect(container.querySelector(".rounded-xl")).toBeNull();
   });
 
-  it("shows a run-level unconfirmed outcome when completed blocks have no verdict", () => {
+  it("moves a run-level unconfirmed reason into its failed activity row", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "build",
+          terminalMessage: "I built and tested the navigation block.",
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: "The expected destination was not observed.",
+          },
+          blocks: [
+            {
+              workflowRunBlockId: "wrb-open-site",
+              label: "open_site",
+              blockType: "navigation",
+              state: "failed",
+              lastSeenIteration: 0,
+              activity: [],
+              startedAt: null,
+              endedAt: null,
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.queryByText("Outcome not confirmed")).toBeNull();
+    expect(
+      screen.getByText(/The expected destination was not observed/),
+    ).toBeTruthy();
+  });
+
+  it("keeps a run-level unconfirmed outcome when completed blocks have no verdict", () => {
     render(
       <NarrativeView
         turn={terminalTurn({
@@ -255,6 +290,39 @@ describe("NarrativeView terminal prose", () => {
               label: "open_site",
               blockType: "navigation",
               state: "completed",
+              lastSeenIteration: 0,
+              activity: [],
+              startedAt: null,
+              endedAt: null,
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
+    expect(
+      screen.getByText(/The expected destination was not observed/),
+    ).toBeTruthy();
+  });
+
+  it("keeps a run-level unconfirmed outcome while a terminal block is still evaluating", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "build",
+          terminalMessage: "I built and tested the navigation block.",
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: "The expected destination was not observed.",
+          },
+          blocks: [
+            {
+              workflowRunBlockId: "wrb-open-site",
+              label: "open_site",
+              blockType: "navigation",
+              state: "completed",
+              outcome: "evaluating",
               lastSeenIteration: 0,
               activity: [],
               startedAt: null,
