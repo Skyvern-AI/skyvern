@@ -2874,7 +2874,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         unvalidated=False,
         output_policy_diagnostics={
             "final_output_policy_allowed": False,
-            "hard_block_reason_codes": ["internal_tool_instruction_leak"],
+            "hard_block_reason_codes": ["raw_secret_leak"],
         },
         turn_outcome=None,
     )
