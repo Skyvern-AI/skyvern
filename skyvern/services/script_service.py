@@ -2056,6 +2056,75 @@ async def _generate_block_code_from_task(
         return ""
 
 
+def _render_block_otp_value(raw_value: str | None, label: str | None) -> str | None:
+    """Rendered OTP identifier/URL for a script block, or None when it cannot be resolved.
+    An unrendered template must never reach the totp_codes lookup — it would match
+    nothing for the entire poll and the run would fail as "no code found"."""
+    if not raw_value:
+        return None
+    rendered = raw_value
+    if "{{" in raw_value:
+        try:
+            rendered = _render_template_with_label(raw_value, label)
+        except Exception:
+            LOG.warning("Failed to render block OTP template", label=label, exc_info=True)
+            return None
+    rendered = rendered.strip()
+    if not rendered or "{{" in rendered:
+        return None
+    return rendered
+
+
+def _find_block_definition(blocks: list[Any], label: str) -> Any | None:
+    stack = list(blocks)
+    while stack:
+        block = stack.pop()
+        if getattr(block, "label", None) == label:
+            return block
+        stack.extend(getattr(block, "loop_blocks", None) or [])
+    return None
+
+
+async def _resolve_block_otp_config(
+    label: str | None,
+    totp_identifier: str | None,
+    totp_url: str | None,
+) -> tuple[str | None, str | None]:
+    """OTP config for a script block, inherited from the workflow definition when the
+    call site carries none. A synthesized run_signature (static-script pinning) omits
+    the block's totp fields, which silently strips 2FA polling from the whole block —
+    the workflow definition still knows them, so resolve from there by label."""
+    if totp_identifier or totp_url:
+        return _render_block_otp_value(totp_identifier, label), _render_block_otp_value(totp_url, label)
+    if not label:
+        return None, None
+    context = skyvern_context.current()
+    if not context or not context.workflow_id or not context.organization_id:
+        return None, None
+    try:
+        workflow = await app.DATABASE.workflows.get_workflow(
+            workflow_id=context.workflow_id, organization_id=context.organization_id
+        )
+    except Exception:
+        LOG.warning("Failed to load workflow for block OTP inheritance", label=label, exc_info=True)
+        return None, None
+    if not workflow:
+        return None, None
+    block = _find_block_definition(workflow.workflow_definition.blocks, label)
+    if block is None:
+        return None, None
+    inherited_identifier = _render_block_otp_value(getattr(block, "totp_identifier", None), label)
+    inherited_url = _render_block_otp_value(getattr(block, "totp_verification_url", None), label)
+    if inherited_identifier or inherited_url:
+        LOG.info(
+            "Inherited OTP config from workflow block definition",
+            label=label,
+            has_totp_identifier=bool(inherited_identifier),
+            has_totp_verification_url=bool(inherited_url),
+        )
+    return inherited_identifier, inherited_url
+
+
 async def run_task(
     prompt: str,
     url: str | None = None,
@@ -2078,6 +2147,7 @@ async def run_task(
         # Use `label` (the workflow block label) for the block run so the
         # framework can match it, and `cache_key` to look up the cached function.
         block_label = label or cache_key
+        totp_identifier, totp_url = await _resolve_block_otp_config(block_label, totp_identifier, totp_url)
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.NAVIGATION,
             prompt=prompt,
