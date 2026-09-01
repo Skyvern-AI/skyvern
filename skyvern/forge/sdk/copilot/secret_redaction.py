@@ -81,6 +81,18 @@ def contains_email_password_pair(text: str) -> bool:
     return bool(_email_password_pair_segments(text))
 
 
+def raw_secret_spans_for_prompt(text: str) -> tuple[tuple[int, int], ...]:
+    """Return deterministic secret spans in the original prompt text."""
+    raw = text or ""
+    spans = {(match.start(), match.end()) for pattern in RAW_SECRET_PATTERNS for match in pattern.finditer(raw)}
+    for segment in _email_password_pair_segments(raw):
+        start = 0
+        while (index := raw.find(segment, start)) >= 0:
+            spans.add((index, index + len(segment)))
+            start = index + 1
+    return tuple(sorted(spans))
+
+
 def redact_raw_secrets_for_prompt(text: str) -> str:
     redacted = text or ""
     for pattern in RAW_SECRET_PATTERNS:

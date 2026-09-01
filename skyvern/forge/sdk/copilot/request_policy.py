@@ -47,6 +47,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     contains_email_password_pair,
+    raw_secret_spans_for_prompt,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -239,12 +240,96 @@ async def _exonerate_saved_credential_citations(citations: list[str], organizati
 
 
 _MIN_RAW_SECRET_EVIDENCE_CHARS = 4
+_RAW_SECRET_EVIDENCE_BEFORE_URI_VALUE_BOUNDARIES = "=?&#"
+_RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES = "&#"
+_RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION = ".,;:!?"
+_RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES = ")]\"}'"
+
+
+def _redact_raw_secrets_outside_url_candidates(message: str) -> str:
+    """Keep independently occurring URL tokens intact for the model-backed disclosure decision."""
+    deterministic_secret_spans = raw_secret_spans_for_prompt(message)
+    pieces: list[str] = []
+    cursor = 0
+    for candidate in URL_CANDIDATE_RE.finditer(message):
+        if any(
+            start < candidate.end()
+            and candidate.start() < end
+            and not (candidate.start() <= start and end <= candidate.end())
+            for start, end in deterministic_secret_spans
+        ):
+            continue
+        pieces.append(redact_raw_secrets_for_prompt(message[cursor : candidate.start()]))
+        pieces.append(candidate.group(0))
+        cursor = candidate.end()
+    pieces.append(redact_raw_secrets_for_prompt(message[cursor:]))
+    return "".join(pieces)
+
+
+def _raw_secret_evidence_uri_candidate_end(
+    message: str,
+    index: int,
+    end: int,
+    url_candidate_spans: tuple[tuple[int, int], ...],
+) -> int | None:
+    for candidate_start, candidate_end in url_candidate_spans:
+        if candidate_start >= index or end > candidate_end:
+            continue
+        before = message[index - 1]
+        if before in _RAW_SECRET_EVIDENCE_BEFORE_URI_VALUE_BOUNDARIES:
+            return candidate_end
+    return None
+
+
+def _raw_secret_evidence_is_url_userinfo_password(
+    message: str,
+    index: int,
+    end: int,
+    url_candidate_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    for candidate_start, candidate_end in url_candidate_spans:
+        if index < candidate_start or end > candidate_end:
+            continue
+        candidate = message[candidate_start:candidate_end]
+        scheme_end = candidate.find("://")
+        if scheme_end < 0:
+            continue
+        authority_start = scheme_end + 3
+        authority_end = min(
+            (position for delimiter in "/?#" if (position := candidate.find(delimiter, authority_start)) >= 0),
+            default=len(candidate),
+        )
+        userinfo_end = candidate.rfind("@", authority_start, authority_end)
+        if userinfo_end < 0:
+            continue
+        password_start = candidate.find(":", authority_start, userinfo_end)
+        if password_start < 0:
+            continue
+        if index == candidate_start + password_start + 1 and end == candidate_start + userinfo_end:
+            return True
+    return False
+
+
+def _raw_secret_evidence_after_is_boundary(evidence: str, message: str, end: int) -> bool:
+    if end >= len(message):
+        return True
+    after = message[end]
+    if after.isspace() or after in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+        return True
+    if after in _RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION:
+        following = message[end + 1] if end + 1 < len(message) else ""
+        if not following or following.isspace() or following in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+            return True
+    return not evidence[-1].isalnum() and after in ".,;:?"
 
 
 def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[tuple[int, int]]:
     if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
         return []
     message = user_message or ""
+    url_candidate_spans = tuple(
+        (candidate.start(), candidate.end()) for candidate in URL_CANDIDATE_RE.finditer(message)
+    )
     spans: list[tuple[int, int]] = []
     start = 0
     while True:
@@ -253,11 +338,25 @@ def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[
             return spans
         end = index + len(evidence)
         before = message[index - 1] if index else ""
-        after = message[end] if end < len(message) else ""
-        before_is_boundary = not before or before.isspace() or before in "([{\"'"
-        after_is_boundary = (
-            not after or after.isspace() or after in ")]\"}'" or (not evidence[-1].isalnum() and after in ".,;:?")
+        uri_candidate_end = _raw_secret_evidence_uri_candidate_end(message, index, end, url_candidate_spans)
+        is_userinfo_password = _raw_secret_evidence_is_url_userinfo_password(
+            message,
+            index,
+            end,
+            url_candidate_spans,
         )
+        before_is_boundary = (
+            not before
+            or before.isspace()
+            or before in "([{\"'"
+            or uri_candidate_end is not None
+            or is_userinfo_password
+        )
+        after_is_uri_boundary = is_userinfo_password or (
+            uri_candidate_end is not None
+            and (end == uri_candidate_end or message[end] in _RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES)
+        )
+        after_is_boundary = after_is_uri_boundary or _raw_secret_evidence_after_is_boundary(evidence, message, end)
         if before_is_boundary and after_is_boundary:
             spans.append((index, end))
         start = index + 1
@@ -290,7 +389,7 @@ async def _screen_raw_secret_safety(
     *,
     organization_id: str,
 ) -> _RawSecretSafetyScreen:
-    deterministic_safe_message = redact_raw_secrets_for_prompt(user_message)
+    deterministic_safe_message = _redact_raw_secrets_outside_url_candidates(user_message)
     if handler is None:
         return _screen_unavailable("missing_handler")
     try:
