@@ -64,11 +64,20 @@ from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 class _ScriptedCaller:
     """Emits one queued turn per ``call``. Each turn is a list of (tool_name, args)."""
 
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], texts: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        script: list[list[tuple[str, dict[str, Any]]]],
+        texts: list[str] | None = None,
+        reasoning_contents: list[str | None] | None = None,
+    ) -> None:
         self._script = script
         # Per-turn assistant text, indexed like `script`; falls back to a fixed placeholder so
         # existing callers that don't care about the text still get a non-empty one.
         self._texts = texts
+        # Per-turn message.reasoning_content, indexed like `script`. Mirrors the litellm
+        # responses-bridge field a real gpt-5.6 call can return; unset by default so existing
+        # callers see no reasoning_content key at all, matching a non-bridge response shape.
+        self._reasoning_contents = reasoning_contents
         self.calls = 0
         self.message_history: list[dict[str, Any]] = []
         self.sent_tools: list[dict[str, Any]] | None = None
@@ -109,8 +118,13 @@ class _ScriptedCaller:
         idx = self.calls
         turn = self._script[idx] if idx < len(self._script) else []
         text = self._texts[idx] if self._texts and idx < len(self._texts) else "reasoning..."
+        reasoning_content = (
+            self._reasoning_contents[idx] if self._reasoning_contents and idx < len(self._reasoning_contents) else None
+        )
         self.calls += 1
         message: dict[str, Any] = {"content": text}
+        if reasoning_content is not None:
+            message["reasoning_content"] = reasoning_content
         if turn:
             message["tool_calls"] = [
                 {"id": f"call_{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
@@ -164,9 +178,10 @@ async def _run(
     tools: list[ToolSpec],
     *,
     texts: list[str] | None = None,
+    reasoning_contents: list[str | None] | None = None,
     **kwargs: Any,
 ):
-    caller = _ScriptedCaller(script, texts=texts)
+    caller = _ScriptedCaller(script, texts=texts, reasoning_contents=reasoning_contents)
     defaults = {"max_turns": 20, "max_tool_calls": 100}
     defaults.update(kwargs)
     outcome = await run_agent_tool_loop(
@@ -2344,6 +2359,80 @@ async def test_on_action_round_fires_once_per_action_round() -> None:
     # The action round's text is the SECOND turn's ("clicking the field..."), not the first
     # (perception-only) or third (finish) turn's text.
     assert round_texts == [texts[1]]
+
+
+@pytest.mark.asyncio
+async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty() -> None:
+    # Production gpt-5.6 tool calls arrive with empty message.content; the responses-bridge
+    # reasoning summary (message.reasoning_content) is the only readable turn text available.
+    round_texts: list[str | None] = []
+
+    async def _on_round(_actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None) -> None:
+        round_texts.append(turn_text)
+
+    clk = []
+    click = _recording_tool("click", clk)
+    click.billable = True
+    script = [
+        [("click", {"selector": "#a"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        on_action_round=_on_round,
+        texts=[""],
+        reasoning_contents=["clicked the primary submit button"],
+    )
+    assert outcome.status == "completed"
+    assert round_texts == ["clicked the primary submit button"]
+
+
+@pytest.mark.asyncio
+async def test_on_action_round_prefers_content_over_reasoning_summary() -> None:
+    round_texts: list[str | None] = []
+
+    async def _on_round(_actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None) -> None:
+        round_texts.append(turn_text)
+
+    clk = []
+    click = _recording_tool("click", clk)
+    click.billable = True
+    script = [
+        [("click", {"selector": "#a"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        on_action_round=_on_round,
+        texts=["typed the field"],
+        reasoning_contents=["a reasoning summary that should be ignored"],
+    )
+    assert outcome.status == "completed"
+    assert round_texts == ["typed the field"]
+
+
+@pytest.mark.asyncio
+async def test_transcript_content_stays_none_when_text_empty_despite_reasoning_summary() -> None:
+    # PERSISTENCE-ONLY contract: the reasoning summary reaches on_action_round (asserted above)
+    # but must never enter the transcript the model re-reads next turn -- only actual message
+    # content does.
+    clk = []
+    click = _recording_tool("click", clk)
+    click.billable = True
+    script = [
+        [("click", {"selector": "#a"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        texts=["", "done"],
+        reasoning_contents=["a readable summary that must stay out of the transcript"],
+    )
+    assistant_messages = [m for m in outcome.messages if m.get("role") == "assistant"]
+    assert assistant_messages[0]["content"] is None
 
 
 @pytest.mark.asyncio
@@ -8555,3 +8644,76 @@ async def test_auto_observe_consumes_a_refresh_signal_the_observe_handler_raises
     fires = [e for e in logs if e.get("event") == "taskv3 auto observe"]
     refresh_fires = [f for f in fires if f.get("fired") is False and f.get("reason") == "refresh"]
     assert len(refresh_fires) == 1
+
+
+class _ReasoningDictSensitiveCaller(_ScriptedCaller):
+    """Rejects any call carrying a dict reasoning_effort, as a provider without the responses
+    bridge would."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.reasoning_per_call: list[Any] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:
+        self.reasoning_per_call.append(kwargs.get("reasoning_effort"))
+        if isinstance(kwargs.get("reasoning_effort"), dict):
+            raise LLMProviderErrorRetryableTask("TEST_KEY")
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_loop_drops_reasoning_dict_and_retries_the_turn_after_a_call_failure() -> None:
+    # A bridge-gate false positive must degrade to the config's own reasoning_effort, not end the
+    # run on turn 1.
+    caller = _ReasoningDictSensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=[make_finish_tool()],
+        max_turns=5,
+        max_tool_calls=10,
+        call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        max_call_retries=2,
+        call_retry_base_delay=0.0,
+    )
+
+    assert outcome.status == "completed"
+    dict_calls = [r for r in caller.reasoning_per_call if isinstance(r, dict)]
+    assert dict_calls and caller.reasoning_per_call[-1] is None
+
+
+class _ReasoningDictOnlySensitiveCaller(_ScriptedCaller):
+    """Rejects only the dict reasoning_effort; tool_choice is independently supported."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.kwargs_per_call: list[tuple[Any, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:
+        self.kwargs_per_call.append((kwargs.get("reasoning_effort"), kwargs.get("tool_choice")))
+        if isinstance(kwargs.get("reasoning_effort"), dict):
+            raise LLMProviderErrorRetryableTask("TEST_KEY")
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_degrading_the_summary_dict_keeps_tool_choice() -> None:
+    caller = _ReasoningDictOnlySensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=[make_finish_tool()],
+        max_turns=5,
+        max_tool_calls=10,
+        call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}, "tool_choice": "required"},
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        max_call_retries=2,
+        call_retry_base_delay=0.0,
+    )
+    assert outcome.status == "completed"
+    final_reasoning, final_tool_choice = caller.kwargs_per_call[-1]
+    assert final_reasoning is None
+    assert final_tool_choice == "required"

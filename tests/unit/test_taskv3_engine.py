@@ -15,6 +15,7 @@ import aiohttp
 import pytest
 import yarl
 
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import engine as engine_mod
@@ -439,6 +440,109 @@ async def test_engine_requests_tool_choice_when_enabled(monkeypatch: pytest.Monk
     )
 
     assert captured["call_kwargs"] == {"step": step}
+
+
+@pytest.mark.asyncio
+async def test_engine_requests_reasoning_summary_for_bridge_routed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only gpt-5.6 models are routed through litellm's chat->responses bridge, which is the only
+    # path that accepts the dict form of reasoning_effort -- so only those calls should carry it.
+    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.schemas.llm import LLMConfig
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: LLMAPIHandlerFactory.uses_openai_responses_bridge(caller.llm_config)
+    caller.llm_config = LLMConfig(
+        model_name="gpt-5.6-luna",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+
+    # The configured effort is preserved verbatim, never hardcoded.
+    assert captured["call_kwargs"] == {"reasoning_effort": {"effort": "high", "summary": "auto"}}
+
+
+@pytest.mark.asyncio
+async def test_engine_requests_reasoning_summary_for_gpt56_dispatched_router_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # litellm bridges from the DISPATCHED model string, so a router deployment qualifies only when
+    # its litellm model is gpt-5.6-named; an opaque alias must not (litellm would not bridge it).
+    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: LLMAPIHandlerFactory.uses_openai_responses_bridge(caller.llm_config)
+    caller.llm_config = LLMRouterConfig(
+        model_name="azure-gpt-5-6-sol-flex-fallback-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="azure-gpt-5-6-sol-flex",
+                litellm_params={"model": "azure/gpt-5.6-sol-deployment"},
+                model_info={"model_name": "azure/gpt-5.6-sol"},
+            ),
+        ],
+        main_model_group="azure-gpt-5-6-sol-flex",
+        reasoning_effort="medium",
+    )
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+
+    assert captured["call_kwargs"] == {"reasoning_effort": {"effort": "medium", "summary": "auto"}}
+
+    captured.clear()
+    caller.llm_config.model_list[0].litellm_params["model"] = "azure/some-opaque-deployment-name"
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+    assert "reasoning_effort" not in (captured.get("call_kwargs") or {})
+
+
+@pytest.mark.asyncio
+async def test_engine_omits_reasoning_summary_for_non_bridge_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.schemas.llm import LLMConfig
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: LLMAPIHandlerFactory.uses_openai_responses_bridge(caller.llm_config)
+    caller.llm_config = LLMConfig(
+        model_name="claude-fable-5",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+
+    # A plain dict reasoning_effort on a non-bridge model 400s ("Unknown parameter: 'reasoning'"),
+    # so this model must never get it -- and no other call kwarg applies here either.
+    assert captured["call_kwargs"] is None
 
 
 @pytest.mark.asyncio
@@ -1066,3 +1170,163 @@ async def test_page_free_run_never_gets_auto_observe_guidance_even_with_the_flag
     await run_task_v3_agent_loop(page_provider=no_page, llm_caller=_ScriptedCaller([]), goal="decide", page_free=True)
     assert loop_kwargs["auto_observe"] is False
     assert "act from that snapshot instead of calling observe again" not in loop_kwargs["system_prompt"]
+
+
+def test_caller_level_bridge_check_denies_raw_client_dispatch() -> None:
+    # A custom/BYO model can be NAMED gpt-5.6-* yet dispatch through the raw OpenAI client branch,
+    # which never bridges — the dict form there is a schema violation on every call. The caller-level
+    # check must deny on dispatch path, whatever the name says.
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LLMConfig
+
+    config = LLMConfig(
+        model_name="openrouter/gpt-5.6-custom",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    raw_client_self = SimpleNamespace(
+        openai_client=object(), _custom_openrouter=False, llm_config=config, original_llm_key="X"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(raw_client_self) is False
+    openrouter_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=True, llm_config=config, original_llm_key="X"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(openrouter_self) is False
+    litellm_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=False, llm_config=config, original_llm_key="X"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(litellm_self) is True
+
+
+def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
+    from skyvern.schemas.llm import LLMConfig
+
+    caller = _ScriptedCaller([])
+    caller.uses_openai_responses_bridge = lambda: False
+    caller.llm_config = LLMConfig(
+        model_name="gpt-5.6-luna",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    assert engine_mod._reasoning_effort_with_summary(caller) is None
+
+
+def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:
+    # litellm decides the bridge from the DISPATCHED model string alone. A model_info label saying
+    # gpt-5.6 must NOT flip the gate for an opaque deployment alias: litellm would not bridge that
+    # call, and the dict form would reach a chat-completions endpoint.
+    from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+    aliased = LLMConfig(
+        model_name="azure/opaque-deployment-alias",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+        litellm_params=LiteLLMParams(model_info={"model_name": "azure/gpt-5.6-sol"}),
+    )
+    assert LLMAPIHandlerFactory.uses_openai_responses_bridge(aliased) is False
+    dispatched_named = LLMConfig(
+        model_name="azure/gpt-5.6-sol-deployment",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    assert LLMAPIHandlerFactory.uses_openai_responses_bridge(dispatched_named) is True
+
+
+def test_bridge_check_denies_router_with_non_bridge_fallback_group() -> None:
+    # A mixed router could hand the dict reasoning_effort to a non-bridge fallback deployment,
+    # which rejects it — every serving deployment must qualify.
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    config = LLMRouterConfig(
+        model_name="mixed-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="primary-group",
+                litellm_params={"model": "gpt-5.6-luna"},
+                model_info={"model_name": "gpt-5.6-luna"},
+            ),
+            LLMRouterModelConfig(
+                model_name="fallback-group",
+                litellm_params={"model": "gpt-4.1"},
+                model_info={"model_name": "gpt-4.1"},
+            ),
+        ],
+        main_model_group="primary-group",
+        fallback_model_group="fallback-group",
+        reasoning_effort="high",
+    )
+    assert LLMAPIHandlerFactory.uses_openai_responses_bridge(config) is False
+
+
+def test_caller_level_bridge_check_denies_custom_llm_keys() -> None:
+    # A custom/BYO key routes litellm at an arbitrary api_base that need not implement
+    # /v1/responses, whatever the user named the model — default-deny.
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.forge.sdk.api.llm.custom_llm_registry import CUSTOM_LLM_KEY_PREFIX
+    from skyvern.schemas.llm import LLMConfig
+
+    config = LLMConfig(
+        model_name="openai/gpt-5.6-byo",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    custom_self = SimpleNamespace(
+        openai_client=None,
+        _custom_openrouter=False,
+        llm_config=config,
+        original_llm_key=f"{CUSTOM_LLM_KEY_PREFIX}abc123",
+    )
+    assert LLMCaller.uses_openai_responses_bridge(custom_self) is False
+
+
+def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base() -> None:
+    # The built-in OPENAI_COMPATIBLE registration (configurable key name) dispatches openai/<model>
+    # at an arbitrary api_base that need not implement /v1/responses — deny. Azure legitimately
+    # carries an api_base and does bridge.
+    from types import SimpleNamespace
+
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LiteLLMParams, LLMConfig
+
+    compat = LLMConfig(
+        model_name="openai/gpt-5.6-selfhosted",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+        litellm_params=LiteLLMParams(api_base="https://byo.example.internal/v1"),
+    )
+    compat_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=False, llm_config=compat, original_llm_key="OPENAI_COMPATIBLE"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(compat_self) is False
+
+    azure = LLMConfig(
+        model_name="azure/gpt-5.6-sol-deployment",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+        litellm_params=LiteLLMParams(api_base="https://example.openai.azure.com"),
+    )
+    azure_self = SimpleNamespace(
+        openai_client=None, _custom_openrouter=False, llm_config=azure, original_llm_key="AZURE_OPENAI_GPT5_6_SOL"
+    )
+    assert LLMCaller.uses_openai_responses_bridge(azure_self) is True
