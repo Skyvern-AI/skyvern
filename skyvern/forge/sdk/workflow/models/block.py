@@ -15387,6 +15387,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 # Late import: google_sheets_blocks imports Block from this module, so top-level import would cycle.
+from skyvern.forge.sdk.workflow.models.data_export_block import DataExportBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E402
     GoogleSheetsReadBlock,
@@ -15426,6 +15427,7 @@ BlockSubclasses = Union[
     GoogleSheetsWriteBlock,
     PdfFillBlock,
     SplitPdfBlock,
+    DataExportBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

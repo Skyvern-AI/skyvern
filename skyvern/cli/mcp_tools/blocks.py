@@ -22,6 +22,7 @@ from skyvern.schemas.workflows import (
     BlockYAML,
     CodeBlockYAML,
     ConditionalBlockYAML,
+    DataExportBlockYAML,
     DownloadToS3BlockYAML,
     EmailInboxBlockYAML,
     ExtractionBlockYAML,
@@ -79,6 +80,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.FILE_UPLOAD.value: FileUploadBlockYAML,
     BlockType.GOTO_URL.value: UrlBlockYAML,
     BlockType.DOWNLOAD_TO_S3.value: DownloadToS3BlockYAML,
+    BlockType.DATA_EXPORT.value: DataExportBlockYAML,
     BlockType.UPLOAD_TO_S3.value: UploadToS3BlockYAML,
     BlockType.FILE_URL_PARSER.value: FileParserBlockYAML,
     BlockType.PDF_PARSER.value: PDFParserBlockYAML,
@@ -114,6 +116,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "file_upload": "Upload a file from S3/Azure to a page element",
     "goto_url": "Navigate directly to a URL without additional instructions",
     "download_to_s3": "Download a URL directly to S3 storage",
+    "data_export": "Write schema-defined workflow records to a Parquet file",
     "upload_to_s3": "Upload local content to S3",
     "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
     "pdf_parser": "Extract structured data from a PDF document",
@@ -156,6 +159,22 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
                 },
             },
         },
+    },
+    "data_export": {
+        "block_type": "data_export",
+        "label": "export_records",
+        "data": "{{ extract_records_output.extracted_information }}",
+        "data_schema": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "price": {"type": "number"},
+                },
+            },
+        },
+        "file_name": "records",
     },
     "for_loop": {
         "block_type": "for_loop",

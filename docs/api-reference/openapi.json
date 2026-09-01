@@ -9770,7 +9770,8 @@
           "google_sheets_write",
           "pdf_fill",
           "split_pdf",
-          "email_inbox"
+          "email_inbox",
+          "data_export"
         ],
         "title": "BlockType"
       },
@@ -12507,6 +12508,249 @@
           "config"
         ],
         "title": "CustomLLMUpdateRequest"
+      },
+      "DataExportBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "data_export",
+            "title": "Block Type",
+            "default": "data_export"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "data": {
+            "type": "string",
+            "title": "Data"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "data",
+          "data_schema"
+        ],
+        "title": "DataExportBlock"
+      },
+      "DataExportBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "data_export",
+            "title": "Block Type",
+            "default": "data_export"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "data": {
+            "type": "string",
+            "title": "Data"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "data",
+          "data_schema"
+        ],
+        "title": "DataExportBlockYAML"
       },
       "DeleteScheduleResponse": {
         "properties": {
@@ -15964,6 +16208,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -15972,6 +16219,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -16214,6 +16462,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -27061,6 +27312,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -27069,6 +27323,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -27239,6 +27494,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -28099,6 +28357,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -28107,6 +28368,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -28321,6 +28583,9 @@
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -28363,6 +28628,7 @@
                   "action": "#/components/schemas/ActionBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
                   "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
                   "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",

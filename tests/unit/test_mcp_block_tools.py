@@ -222,3 +222,26 @@ def test_block_schema_docstring_routes_full_definitions_to_block_validate() -> N
 def test_block_validate_docstring_cross_refs_block_schema() -> None:
     doc = skyvern_block_validate.__doc__ or ""
     assert "skyvern_block_schema" in doc
+
+
+@pytest.mark.asyncio
+async def test_block_validate_data_export() -> None:
+    result = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "data_export",
+                "label": "export_records",
+                "data": "{{ extract_output.extracted_information }}",
+                "data_schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}},
+                    },
+                },
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["block_type"] == "data_export"

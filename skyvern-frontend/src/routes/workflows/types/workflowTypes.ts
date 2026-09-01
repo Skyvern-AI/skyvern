@@ -211,6 +211,7 @@ export type WorkflowBlock =
   | FileURLParserBlock
   | ValidationBlock
   | HumanInteractionBlock
+  | DataExportBlock
   | ActionBlock
   | NavigationBlock
   | ExtractionBlock
@@ -243,6 +244,7 @@ export const WorkflowBlockTypes = {
   FileURLParser: "file_url_parser",
   Validation: "validation",
   HumanInteraction: "human_interaction",
+  DataExport: "data_export",
   Action: "action",
   Navigation: "navigation",
   Extraction: "extraction",
@@ -496,6 +498,14 @@ export type HumanInteractionBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+};
+
+export type DataExportBlock = WorkflowBlockBase & {
+  block_type: "data_export";
+  data: string;
+  data_schema: Record<string, unknown>;
+  file_name: string | null;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type ActionBlock = WorkflowBlockBase & {

@@ -83,6 +83,17 @@ const nodeLibraryItems: Array<{
     title: "Human Interaction Block",
     description: "Pause agent for human review and approval",
   },
+  {
+    nodeType: "dataExport",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.DataExport}
+        className="size-6"
+      />
+    ),
+    title: "Data Export Block",
+    description: "Write schema-defined records to a Parquet file",
+  },
   // {
   //   nodeType: "task",
   //   icon: (
