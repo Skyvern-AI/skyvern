@@ -322,6 +322,27 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(timestamp.className).not.toContain("absolute");
   });
 
+  it("wraps long unbroken text inside the user-message bubble", async () => {
+    const content = `https://example.test/logs?query=${"encoded-query-segment".repeat(20)}`;
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content,
+          created_at: "2026-05-25T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    const message = screen.getByText(content);
+    expect(message.className).toContain("[overflow-wrap:anywhere]");
+  });
+
   it("leaves the input enabled while a turn is in flight", async () => {
     await renderChat();
     await submit("build me a workflow");

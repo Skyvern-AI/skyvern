@@ -6,18 +6,21 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type {
-  ButtonHTMLAttributes,
-  InputHTMLAttributes,
-  ReactNode,
-  SVGProps,
-  TextareaHTMLAttributes,
+import {
+  act,
+  createRef,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type Ref,
+  type ReactNode,
+  type SVGProps,
+  type TextareaHTMLAttributes,
 } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { toast } from "@/components/ui/use-toast";
 
-import { PromptBox } from "./PromptBox";
+import { PromptBox, type PromptBoxHandle } from "./PromptBox";
 
 const { mockNavigate, mockPost, mockSetAutoplay } = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
@@ -60,11 +63,15 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-vi.mock("@/components/AutoResizingTextarea/AutoResizingTextarea", () => ({
-  AutoResizingTextarea: (
-    props: TextareaHTMLAttributes<HTMLTextAreaElement>,
-  ) => <textarea {...props} />,
-}));
+vi.mock("@/components/AutoResizingTextarea/AutoResizingTextarea", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    AutoResizingTextarea: React.forwardRef<
+      HTMLTextAreaElement,
+      TextareaHTMLAttributes<HTMLTextAreaElement>
+    >((props, ref) => <textarea ref={ref} {...props} />),
+  };
+});
 
 vi.mock("@/components/ui/button", () => ({
   Button: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
@@ -132,14 +139,17 @@ vi.mock("@/components/icons/InboxIcon", () => ({ InboxIcon: () => null }));
 vi.mock("@/components/icons/MessageIcon", () => ({ MessageIcon: () => null }));
 vi.mock("@/components/icons/TrophyIcon", () => ({ TrophyIcon: () => null }));
 
-function renderPromptBox(enableCopilotHandoff = false) {
+function renderPromptBox(
+  enableCopilotHandoff = false,
+  ref?: Ref<PromptBoxHandle>,
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
 
   return render(
     <QueryClientProvider client={queryClient}>
-      <PromptBox enableCopilotHandoff={enableCopilotHandoff} />
+      <PromptBox ref={ref} enableCopilotHandoff={enableCopilotHandoff} />
     </QueryClientProvider>,
   );
 }
@@ -164,6 +174,51 @@ async function submitPrompt(text: string) {
 }
 
 describe("PromptBox", () => {
+  test("focuses and prefills an empty prompt without submitting or overwriting typed text", () => {
+    const ref = createRef<PromptBoxHandle>();
+    renderPromptBox(false, ref);
+    const textarea = screen.getByPlaceholderText("Enter your prompt...");
+    textarea.scrollIntoView = vi.fn();
+
+    act(() => ref.current?.focusAndPrefillExample("hackernews"));
+    expect((textarea as HTMLTextAreaElement).value).toBe(
+      "Navigate to the Hacker News homepage and get the top 3 posts.",
+    );
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    expect(textarea.getAttribute("id")).toBe("discover-prompt-input");
+    expect(mockPost).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea, { target: { value: "Keep my agent prompt" } });
+    act(() => ref.current?.focusAndPrefillExample("contact_us_forms"));
+    expect((textarea as HTMLTextAreaElement).value).toBe(
+      "Keep my agent prompt",
+    );
+    expect(document.activeElement).toBe(textarea);
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
+  test("reuses the shipped sample prompts for onboarding intent keys", () => {
+    const ref = createRef<PromptBoxHandle>();
+    renderPromptBox(false, ref);
+    const textarea = screen.getByPlaceholderText(
+      "Enter your prompt...",
+    ) as HTMLTextAreaElement;
+    const cases = [
+      ["finditparts", "finditparts.com"],
+      ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
+      ["hackernews", "Hacker News homepage"],
+      ["AAPLStockPrice", "google finance"],
+    ] as const;
+
+    for (const [key, expected] of cases) {
+      fireEvent.change(textarea, { target: { value: "" } });
+      act(() => ref.current?.focusAndPrefillExample(key));
+      expect(textarea.value).toContain(expected);
+    }
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
   test("creates prompt-generated workflows as V1 agent runs", async () => {
     mockPost.mockResolvedValue({
       data: {
