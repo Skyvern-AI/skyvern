@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
 )
+from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _BLOCK_CREATED_AT = datetime(2026, 6, 14, 11, 0, tzinfo=UTC)
 
@@ -144,6 +146,7 @@ def _wire_secure_runner(
     output: dict,
     on_execute: Callable[[], None] | None = None,
     downgrade: bool = False,
+    download_operation_invoked: bool = False,
 ) -> None:
     """Route execute() down the secure sidecar arm, whose returned payload is what the host binds.
 
@@ -162,7 +165,11 @@ def _wire_secure_runner(
             on_execute()
         if downgrade:
             return None
-        return SimpleNamespace(block_result=block_result, failure=None)
+        return SimpleNamespace(
+            block_result=block_result,
+            failure=None,
+            download_operation_receipt=object() if download_operation_invoked else None,
+        )
 
     fake_app = block_module.app
     fake_app.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=True)
@@ -2298,6 +2305,146 @@ async def test_secure_runner_session_download_reaches_registration(
     claim.assert_awaited()
     assert result.success is True
     assert result.output_parameter_value["downloaded_file_urls"] == [_SESSION_FILE.url]
+
+
+@pytest.mark.asyncio
+async def test_secure_runner_typed_download_waits_for_delayed_final_session_row(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A completed typed download is sufficient reason to settle a delayed final watcher row even
+    after its partial marker has disappeared. The first empty read must not end the custody handoff."""
+    skyvern_context.set(_session_context())
+
+    # Baseline read, host pre-registration read, and first registration read are empty. The
+    # watcher row becomes visible only to the receipt-gated settle attempt.
+    reads = [[], [], [], [_SESSION_FILE]]
+
+    async def _get(**_kwargs: object) -> list[FileInfo]:
+        return reads.pop(0) if len(reads) > 1 else list(reads[0])
+
+    claim = AsyncMock(return_value=1)
+    in_flight = AsyncMock(return_value=[])
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(side_effect=_get),
+        claim=claim,
+        in_flight=in_flight,
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(
+        monkeypatch,
+        output={"status": "ok"},
+        download_operation_invoked=True,
+    )
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    in_flight.assert_awaited_once()
+    assert claim.await_count == 2
+    assert result.success is True
+    assert result.output_parameter_value["downloaded_file_urls"] == [_SESSION_FILE.url]
+    assert result.output_parameter_value["downloaded_file_artifact_ids"] == [_SESSION_FILE.artifact_id]
+    persisted = _persisted_output()
+    assert isinstance(persisted, dict)
+    assert persisted["downloaded_file_artifact_ids"] == [_SESSION_FILE.artifact_id]
+
+    packet = build_test_evidence_packet(
+        make_copilot_ctx(),
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "completed",
+                "requested_block_labels": ["download_statement"],
+                "executed_block_labels": ["download_statement"],
+                "blocks": [
+                    {
+                        "label": "download_statement",
+                        "status": "completed",
+                        "extracted_data": persisted,
+                    }
+                ],
+            },
+        },
+    )
+    assert [download.artifact_id for download in packet.downloads] == [_SESSION_FILE.artifact_id]
+
+
+@pytest.mark.asyncio
+async def test_secure_runner_without_typed_download_does_not_settle_an_empty_session_row(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(_session_context())
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(block_module.asyncio, "sleep", sleep)
+    claim = AsyncMock(return_value=0)
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(return_value=[]),
+        claim=claim,
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(monkeypatch, output={"status": "ok"})
+
+    block = CodeBlock(
+        label="read_page",
+        code="return {'status': 'ok'}",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    sleep.assert_not_awaited()
+    assert claim.await_count == 1
+    assert result.success is True
+    assert "downloaded_file_artifact_ids" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_secure_runner_typed_download_with_no_final_row_is_bounded_and_invents_nothing(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(_session_context())
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(block_module.asyncio, "sleep", sleep)
+    claim = AsyncMock(return_value=0)
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(return_value=[]),
+        claim=claim,
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(
+        monkeypatch,
+        output={"status": "ok"},
+        download_operation_invoked=True,
+    )
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert claim.await_count == 1 + block_module._CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS
+    assert sleep.await_count == block_module._CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS
+    assert result.success is True
+    assert "downloaded_file_artifact_ids" not in result.output_parameter_value
 
 
 @pytest.mark.asyncio
