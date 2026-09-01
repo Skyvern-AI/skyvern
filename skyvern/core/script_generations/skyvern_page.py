@@ -121,7 +121,7 @@ class SkyvernPage(Page):
         """Return the current locator scope: the working iframe if set, otherwise the page.
 
         Use for element interaction (locator, click, fill). Keep self.page for
-        page-level operations (goto, keyboard, url, title, evaluate, reload, content).
+        page-level operations (goto, keyboard, url, title, reload, content).
         """
         frame = object.__getattribute__(self, "_working_frame")
         if frame is not None:

@@ -466,6 +466,7 @@ async def test_evaluate_and_screenshot_caps_an_oversize_evaluation(monkeypatch: 
         url="https://example.test",
         evaluate=AsyncMock(return_value="y" * (MCP_MAX_RESPONSE_CHARS + 1_000)),
     )
+    page.locator_scope = page
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
 
     tool = await mcp.get_tool("skyvern_evaluate_and_screenshot")

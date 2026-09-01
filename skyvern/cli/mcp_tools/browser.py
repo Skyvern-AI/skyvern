@@ -2533,7 +2533,7 @@ async def skyvern_evaluate(
 
     with Timer() as timer:
         try:
-            result = await page.evaluate(js)
+            result = await page.locator_scope.evaluate(js)
             timer.mark("sdk")
         except Exception as e:
             return action_result(
@@ -2547,7 +2547,7 @@ async def skyvern_evaluate(
     return action_result(
         "skyvern_evaluate",
         browser_context=ctx,
-        data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
+        data={"result": result, "sdk_equivalent": f"await page.locator_scope.evaluate({expression[:80]!r})"},
         timing_ms=timer.timing_ms,
     )
 
