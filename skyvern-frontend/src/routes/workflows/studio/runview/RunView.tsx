@@ -55,7 +55,11 @@ import {
   runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
-import { searchWithRunReference, toReadableSearch } from "../panes";
+import {
+  searchWithRunReference,
+  SYSTEM_RUN_FOCUS_PARAM,
+  toReadableSearch,
+} from "../panes";
 import { useStudioPanes } from "../useStudioPanes";
 import { collectBlockPrompts } from "./blockPrompts";
 import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
@@ -380,6 +384,9 @@ export function RunView({
     const params = new URLSearchParams(
       window.location.search || searchParamsRef.current.toString(),
     );
+    if (params.has(SYSTEM_RUN_FOCUS_PARAM)) {
+      return;
+    }
     // The short /runs/{wr} URL names the run in the path rather than ?wr=, so a
     // matching path id is the focused deep link too (parity with ?wr= cold open).
     const isFocusedDeepLink =
