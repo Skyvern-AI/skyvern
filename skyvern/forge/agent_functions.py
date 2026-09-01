@@ -897,6 +897,11 @@ class AgentFunction:
     ) -> AutoObserveDecision:
         return auto_observe_from_setting()
 
+    # OSS has no ATS-scoped guidance; cloud overrides to supply pre-authorized eligibility defaults
+    # behind a flag when the task targets a gated application-tracking-system host.
+    async def resolve_task_v3_extra_guidance(self, *, task: Task, organization: Organization) -> str | None:
+        return None
+
     async def record_run_duration(
         self,
         run_type: str,
