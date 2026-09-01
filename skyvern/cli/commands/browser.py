@@ -336,12 +336,15 @@ def _launch_extension_pairing(port: int) -> None:
     console.print("Approve the pairing in your browser.")
 
 
-async def _broker_client(port: int, *, auto_spawn: bool = True, operator: bool = False) -> BrokerClient:
+async def _broker_client(
+    port: int, *, auto_spawn: bool = True, operator: bool = False, connect: bool = True
+) -> BrokerClient:
     async def _ignore_event(_event: str, _params: dict) -> None:
         return None
 
     client = BrokerClient(port, _ignore_event, auto_spawn=auto_spawn, operator=operator)
-    await client.start()
+    if connect:
+        await client.start()
     return client
 
 
@@ -362,6 +365,15 @@ def _broker_status_output(port: int) -> None:
     console.print(f"broker ready on {port}")
     console.print(f"extension connected: {'yes' if status.get('extensionConnected') else 'no'}")
     console.print(f"authenticated clients: {status.get('clientCount', 0)}")
+    extension_build = status.get("extensionBuild", "unknown")
+    local_hash = status.get("extensionBuildHash")
+    remote_hash = BrowserExtensionRuntime.describe_reported_build_hash(status)
+    if extension_build == "stale":
+        console.print(f"extension_build: stale ({remote_hash} vs {local_hash})")
+    elif extension_build == "current":
+        console.print(f"extension_build: current ({local_hash})")
+    else:
+        console.print("extension_build: unknown (extension has not reported a build hash)")
 
 
 def _begin_broker_pairing(port: int, *, cancel_pending: bool) -> None:
@@ -530,7 +542,7 @@ def extension_broker_stop() -> None:
     port = BrowserExtensionRuntime.configured_port()
 
     async def _run() -> None:
-        client = await _broker_client(port, auto_spawn=False, operator=True)
+        client = await _broker_client(port, auto_spawn=False, operator=True, connect=False)
         try:
             await client.stop_broker()
         finally:

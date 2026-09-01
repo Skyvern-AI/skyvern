@@ -587,6 +587,7 @@ class ExtensionRelayServer:
         self.bound_port = port
         self.scoped_tabs: list[dict] = []
         self.extension_protocol_version: int | None = None
+        self.extension_build_hash: str | None = None
         self.extension_connection_generation = 0
         self._pending_reset_identity: tuple[str, int] | None = None
 
@@ -1006,6 +1007,7 @@ class ExtensionRelayServer:
             LOG.info("browser_extension_websocket_replaced")
             self._fail_pending_requests()
             self.scoped_tabs = []
+            self.extension_build_hash = None
             await self._call_on_disconnect()
             if not previous.closed:
                 await previous.close(code=_REPLACED_CLOSE_CODE, message=b"replaced")
@@ -1079,6 +1081,9 @@ class ExtensionRelayServer:
         if message.event is None or message.params is None:
             return
         self._update_scoped_tabs(message.event, message.params)
+        if message.event == "extension.hello":
+            build_hash = message.params.get("buildHash")
+            self.extension_build_hash = build_hash if isinstance(build_hash, str) and build_hash else None
         try:
             await self._on_event(message.event, message.params)
         except Exception:
@@ -1135,6 +1140,7 @@ class ExtensionRelayServer:
                 return
             self._websocket = None
             self.extension_protocol_version = None
+            self.extension_build_hash = None
             self._pending_reset_identity = None
             self._connected_event.clear()
 

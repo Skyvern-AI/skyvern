@@ -177,6 +177,16 @@ class BrowserExtensionRuntime:
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
 
+    async def broker_build_status(self) -> dict[str, Any] | None:
+        """Broker-reported extension_build status, or None outside broker mode."""
+        if not isinstance(self._relay, BrokerClient):
+            return None
+        return await self._relay.broker_status()
+
+    @staticmethod
+    def describe_reported_build_hash(status: dict[str, Any]) -> str:
+        return status.get("extensionReportedBuildHash") or "no hash reported (pre-dates this check)"
+
     async def evaluate(self, expression: str) -> Any:
         await self._relay.ensure_root_lease()
         tabs = await self._relay.list_scoped_tabs()

@@ -16,7 +16,10 @@ from skyvern.browser_extension.errors import BrowserExtensionBrokerError, Extens
 _HEADER = struct.Struct("!I")
 
 BROKER_PROTOCOL_VERSION = 1
-BROKER_GENERATION = 1
+# Bump whenever an upgraded client depends on a broker.status field a still-running,
+# pre-upgrade daemon won't populate, so the client rejects the stale daemon as
+# INCOMPATIBLE_BROKER instead of silently reading an incomplete status from it.
+BROKER_GENERATION = 2
 PREAUTH_FRAME_LIMIT = 8 * 1024
 CONTROL_FRAME_LIMIT = 64 * 1024
 # MAX_CLIENT_OUTPUT_BYTES is derived from this payload limit so a valid encoded operation frame always fits.
