@@ -1958,6 +1958,19 @@ class ForgeAgent:
                 captcha_tools, captcha_guidance = build_captcha_tools(
                     task, _page_provider, organization_id=organization.organization_id
                 )
+            # Withheld in page-free mode: form-filling defaults must not bias a data-only judgment.
+            ats_guidance = None
+            if not page_free_validation:
+                try:
+                    ats_guidance = await app.AGENT_FUNCTION.resolve_task_v3_extra_guidance(
+                        task=task, organization=organization
+                    )
+                except Exception:
+                    LOG.warning(
+                        "resolve_task_v3_extra_guidance failed; continuing without it",
+                        task_id=task.task_id,
+                        exc_info=True,
+                    )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -1994,8 +2007,14 @@ class ForgeAgent:
                 on_action_round=_on_action_round,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 extra_tools=auth_tools + captcha_tools,
+                # ats_guidance before workflow_system_prompt keeps the customer's own text later in
+                # the message; position in one system message is a weak signal, not precedence — the
+                # real contract is the guidance's own scoping prose (its NEVER list and the explicit
+                # link to the base stop-don't-guess rule).
                 extra_system_guidance="\n\n".join(
-                    part for part in (auth_guidance, captcha_guidance, task.workflow_system_prompt) if part
+                    part
+                    for part in (auth_guidance, captcha_guidance, ats_guidance, task.workflow_system_prompt)
+                    if part
                 ),
                 completion_probe=completion_probe,
                 completion_blocker=completion_blocker,
