@@ -2,7 +2,7 @@ import { RunEngine } from "@/api/types";
 import type { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 
 export const onboardingExamplePresentation = {
-  title: "See how a workflow run is organized",
+  title: "See how an agent run is organized",
   provenance: "Example data, not your run",
   structure: [
     {
@@ -19,12 +19,12 @@ export const onboardingExamplePresentation = {
     },
   ],
   playback: [
-    "Opened https://www.skyvern.com/ in this static example.",
-    "Read the public headline and product description.",
-    "Prepared the bounded example result shown below.",
+    "Opened https://www.skyvern.com/ in this static agent example.",
+    "The agent read the public headline and product description.",
+    "Prepared the bounded agent result shown below.",
   ],
   result: {
-    title: "Synthetic example result",
+    title: "Synthetic agent result",
     fields: [
       {
         label: "Headline",
@@ -33,16 +33,16 @@ export const onboardingExamplePresentation = {
       {
         label: "Product summary",
         value:
-          "Skyvern runs browser workflows that interact with websites and extract structured data.",
+          "Skyvern runs browser agents that interact with websites and extract structured data.",
       },
     ],
   },
 } as const;
 
 export const onboardingExampleRequest = {
-  title: "Copyable example: Skyvern homepage summary",
+  title: "Copyable agent example: Skyvern homepage summary",
   description:
-    "Create a draft that reads public content from Skyvern's homepage.",
+    "Create an agent draft that reads public content from Skyvern's homepage.",
   workflow_definition: {
     parameters: [],
     blocks: [

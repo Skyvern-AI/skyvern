@@ -509,7 +509,7 @@ const MessageItem = memo(
         <div className="flex justify-end">
           <div className="max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
             <div className="flex items-end gap-2">
-              <p className="min-w-0 flex-1 whitespace-pre-wrap">
+              <p className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">
                 {message.content}
               </p>
               {!queuedStatus && message.timestamp ? (

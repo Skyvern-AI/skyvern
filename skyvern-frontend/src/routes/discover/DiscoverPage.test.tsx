@@ -96,9 +96,35 @@ vi.mock("@/routes/workflows/hooks/useCreateWorkflowMutation", () => ({
     isPending: mocks.createPending,
   }),
 }));
-vi.mock("@/routes/tasks/create/PromptBox", () => ({
-  PromptBox: () => <div data-testid="discover-prompt">prompt</div>,
-}));
+vi.mock("@/routes/tasks/create/PromptBox", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    PromptBox: React.forwardRef<
+      { focusAndPrefillExample: (key: string) => void },
+      Record<string, never>
+    >(function PromptBoxMock(_, ref) {
+      const [value, setValue] = React.useState("");
+      const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+      React.useImperativeHandle(ref, () => ({
+        focusAndPrefillExample: (key) => {
+          setValue((current) => (current.trim() ? current : key));
+          textareaRef.current?.focus({ preventScroll: true });
+        },
+      }));
+      return (
+        <div data-testid="discover-prompt">
+          prompt
+          <textarea
+            ref={textareaRef}
+            aria-label="Discover prompt"
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+          />
+        </div>
+      );
+    }),
+  };
+});
 vi.mock("./WorkflowTemplates", () => ({
   WorkflowTemplates: () => (
     <div data-testid="discover-templates">templates</div>
@@ -402,15 +428,26 @@ describe("DiscoverPage progress surfaces", () => {
     mocks.progressState = "active";
     const { container, rerender } = render(<DiscoverPage />);
     expect(container.innerHTML).toMatch(
-      /<h1[^>]*>Create an agent<\/h1>.*prompt.*See how a workflow run is organized.*Build your first agent.*templates/s,
+      /<h1[^>]*>Create an agent<\/h1>.*prompt.*Build your first agent.*See how an agent run is organized.*templates/s,
     );
+    expect(screen.getByText("1 of 3")).toBeTruthy();
+    expect(mocks.createWorkflow).not.toHaveBeenCalled();
+
+    const describeAgent = screen.getByRole("button", {
+      name: "Describe your first agent",
+    });
+    const prompt = screen.getByRole("textbox", { name: "Discover prompt" });
+    fireEvent.change(prompt, { target: { value: "Keep my typed prompt" } });
+    fireEvent.click(describeAgent);
+    expect((prompt as HTMLTextAreaElement).value).toBe("Keep my typed prompt");
+    expect(document.activeElement).toBe(prompt);
     expect(mocks.createWorkflow).not.toHaveBeenCalled();
 
     const workingExampleLink = screen.getByRole("link", {
-      name: "Use the working example",
+      name: "or copy a working example",
     });
     const workingExampleHeading = screen.getByRole("heading", {
-      name: "See how a workflow run is organized",
+      name: "See how an agent run is organized",
     });
     expect(workingExampleLink.getAttribute("href")).toBe(
       "#working-example-heading",
@@ -461,11 +498,62 @@ describe("DiscoverPage progress surfaces", () => {
     const resume = screen.getByRole("button", { name: "Resume setup" });
     expect(resume).toBe(hide);
     expect(document.activeElement).toBe(resume);
-    expect(
-      screen.queryByText("See how a workflow run is organized"),
-    ).toBeNull();
+    expect(screen.queryByText("See how an agent run is organized")).toBeNull();
     fireEvent.click(resume);
     expect(mocks.restore).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["fill_forms", "contact_us_forms"],
+    ["extract_data", "hackernews"],
+    ["monitor_website", "AAPLStockPrice"],
+    ["something_else", "finditparts"],
+    [null, "finditparts"],
+  ] as const)(
+    "prefills the %s intent example without creating",
+    (intent, key) => {
+      mocks.progressState = "active";
+      renderDiscover({
+        ...baseState,
+        user_intent: intent,
+        questionnaire_prompted_at: "2026-08-27T00:00:00Z",
+        questionnaire: questionnaire(true),
+      });
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Describe your first agent" }),
+      );
+      const prompt = screen.getByRole("textbox", { name: "Discover prompt" });
+      expect((prompt as HTMLTextAreaElement).value).toBe(key);
+      expect(document.activeElement).toBe(prompt);
+      expect(mocks.createWorkflow).not.toHaveBeenCalled();
+    },
+  );
+
+  it("briefly celebrates an active to completed transition", () => {
+    vi.useFakeTimers();
+    mocks.progressState = "active";
+    mocks.completedCount = 1;
+    mocks.firstMilestoneComplete = true;
+    mocks.nextActionKey = "first_successful_run";
+    const { rerender } = render(
+      <MemoryRouter>
+        <DiscoverPage />
+      </MemoryRouter>,
+    );
+
+    mocks.progressState = "completed";
+    rerender(
+      <MemoryRouter>
+        <DiscoverPage />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("status").textContent).toContain("3 of 3 complete");
+    expect(screen.queryByText("See how an agent run is organized")).toBeNull();
+
+    act(() => vi.advanceTimersByTime(1800));
+    expect(screen.queryByText("First agent ready")).toBeNull();
+    vi.useRealTimers();
   });
 
   it.each(["completed", "ineligible", null] as const)(
@@ -474,7 +562,7 @@ describe("DiscoverPage progress surfaces", () => {
       mocks.progressState = state;
       render(<DiscoverPage />);
       expect(document.body.textContent).not.toMatch(
-        /Build your first agent|See how a workflow run is organized|Hide setup|Resume setup/,
+        /Build your first agent|See how an agent run is organized|Hide setup|Resume setup/,
       );
     },
   );
