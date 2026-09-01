@@ -937,7 +937,7 @@ class S3Storage(BaseStorage):
             listed=listed,
         )
         dump_download_visibility_inputs("empty_read", {"run_id": run_id, **decision})
-        LOG.info(
+        LOG.debug(
             "downloads.empty_read",
             organization_id=organization_id,
             run_id=run_id,
