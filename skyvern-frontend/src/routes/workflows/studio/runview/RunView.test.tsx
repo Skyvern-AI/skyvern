@@ -328,6 +328,22 @@ function SelectBlockOnCanvas({ label }: { label: string }) {
   );
 }
 
+function ReleaseCopilotRunFocus() {
+  const [params, setParams] = useSearchParams();
+  return (
+    <button
+      onClick={() => {
+        const next = new URLSearchParams(params);
+        next.delete("wr");
+        next.delete("wrs");
+        setParams(next, { replace: true });
+      }}
+    >
+      release copilot focus
+    </button>
+  );
+}
+
 function renderRunView(
   props: Partial<Parameters<typeof RunView>[0]> = {},
   initialEntry = "/",
@@ -773,6 +789,30 @@ describe("RunView cold-open selection", () => {
     expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
   });
 
+  test("a terminal Copilot-focused run stays unselected through release", () => {
+    seedTerminalRunWithActions();
+    const view = renderRunView(
+      {},
+      "/?wr=wr_1&wrs=copilot",
+      false,
+      <ReleaseCopilotRunFocus />,
+    );
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(view.getByTestId("location-search").textContent).not.toContain(
+      "active=",
+    );
+
+    fireEvent.click(
+      view.getByRole("button", { name: "release copilot focus" }),
+    );
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(view.getByTestId("location-search").textContent).not.toContain(
+      "active=",
+    );
+  });
+
   test("a still-running run keeps following the live edge", () => {
     seedRunningRun();
     renderRunView({}, "/?wr=wr_1");
@@ -931,6 +971,35 @@ describe("RunView live-watch terminal transition", () => {
       "active=act_2",
     );
     expect(useStudioBrowserStore.getState().view).toBe("auto");
+  });
+
+  test("a Copilot-focused watched run stays unselected when it finishes", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(view.getByTestId("location-search").textContent).not.toContain(
+      "active=",
+    );
+  });
+
+  test("an explicit timeline pin still wins during Copilot focus", () => {
+    seedWatchedRun(Status.Running);
+    const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+
+    act(() => useRunViewStore.getState().pinFrame("act_1"));
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
+    expect(view.getByTestId("location-search").textContent).toContain(
+      "active=act_1",
+    );
+
+    seedWatchedRun(Status.Completed);
+    view.rerenderRunView();
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
   });
 
   test("a view pill pinned mid-watch is never overridden at run end", () => {
@@ -1151,6 +1220,22 @@ describe("RunView failure presentation", () => {
     seedFailedCodeRun();
     renderRunView({}, "/?wr=wr_1");
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
+  });
+
+  test("a failed Copilot-focused run does not auto-pin its failing block", () => {
+    seedFailedCodeRun();
+    const { getByTestId } = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(getByTestId("location-search").textContent).not.toContain("active=");
+  });
+
+  test("a Copilot-focused latest failed run does not auto-pin its failing block", () => {
+    seedFailedCodeRun();
+    const { getByTestId } = renderRunView({}, "/?wrs=copilot");
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
+    expect(getByTestId("location-search").textContent).not.toContain("active=");
   });
 
   test("a failed latest-run Studio open lands on the failing block", () => {

@@ -15,6 +15,7 @@ import {
   resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
+import { SYSTEM_RUN_FOCUS_PARAM } from "./panes";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 
@@ -87,6 +88,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     scrubbing: visuals.scrubbing,
     inspectingRun: explicit,
     blockRunInDebugSession,
+    systemFocused: searchParams.has(SYSTEM_RUN_FOCUS_PARAM),
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
     failed: visuals.failed,
