@@ -1935,6 +1935,148 @@ def test_composition_gate_rejects_hollow_interaction_observation_without_schema(
     assert composition_page_evidence_error(ctx, workflow_yaml) is not None
 
 
+def test_composition_gate_credits_current_page_read_after_schema_less_scout_interaction() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"open_results": 1, "read_results": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_finding_reuses_reached_page_evidence_independent_of_block_order() -> None:
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"read_results": 2},
+    )
+    auto_credited = {
+        "block_type": "action",
+        "label": "inspect_result",
+        "navigation_goal": "Inspect the result opened during scouting.",
+    }
+    explicitly_credited = {
+        "block_type": "action",
+        "label": "read_results",
+        "navigation_goal": "Read the first result.",
+    }
+
+    for page_blocks in ([auto_credited, explicitly_credited], [explicitly_credited, auto_credited]):
+        workflow_yaml = _yaml(
+            {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+            {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+            *page_blocks,
+        )
+
+        assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_rejects_current_page_read_credited_by_a_later_interaction() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=1),
+            _flow_entry("https://example.com/results", reached_via="interaction", step=2),
+        ],
+        block_observation_refs={"open_results": 2, "read_results": 1},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_finding_reuses_one_interaction_observation_for_multiple_blocks() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+        {"block_type": "action", "label": "read_more", "navigation_goal": "Read the second result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"read_results": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_rejects_current_page_read_after_the_reached_page_was_left_and_reopened() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/cart", reached_via="navigate", step=2),
+            _flow_entry("https://example.com/results", reached_via="navigate", step=3),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=4),
+        ],
+        block_observation_refs={"open_results": 1, "read_results": 4},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_gate_rejects_current_page_read_after_same_url_navigation_reopened_page() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_results", "navigation_goal": "Read the first result."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/results", reached_via="navigate", step=2),
+            _flow_entry("https://example.com/results", reached_via="current_page", step=3),
+        ],
+        block_observation_refs={"open_results": 1, "read_results": 3},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_gate_rejects_current_page_read_without_a_same_location_interaction() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "open_results", "navigation_goal": "Open the results page."},
+        {"block_type": "action", "label": "read_cart", "navigation_goal": "Read the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _flow_entry("https://example.com/cart", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={"open_results": 1, "read_cart": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
 def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -> None:
     # SKY-10712 option 1: a click-reached action block with NO block_observation_refs entry is
     # auto-credited from the most-recent interaction-reached observation; the agent need not thread it.
@@ -1971,9 +2113,9 @@ def test_composition_gate_rejects_click_reached_block_with_no_interaction_observ
     assert "add_to_cart (action)" in error
 
 
-def test_composition_gate_auto_credit_consumes_each_interaction_once() -> None:
-    # Two click-reached blocks need two distinct interaction observations (consume-once); the
-    # SPA URL is identical across both, so binding is by trajectory order, never by url.
+def test_composition_finding_auto_credit_does_not_consume_interaction_observations() -> None:
+    # Page evidence is a reusable observation. It must not become an order-sensitive authority
+    # token merely because multiple authored blocks depend on the same observed page.
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
         {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
@@ -1985,7 +2127,7 @@ def test_composition_gate_auto_credit_consumes_each_interaction_once() -> None:
     one = _Ctx(
         flow_evidence=base + [_scout_interaction_entry("https://example.com/", step=1)], block_observation_refs={}
     )
-    assert composition_page_evidence_error(one, workflow_yaml) is not None
+    assert composition_page_evidence_error(one, workflow_yaml) is None
 
     two = _Ctx(
         flow_evidence=base
@@ -7090,3 +7232,16 @@ def test_a_structured_packet_claiming_an_observed_option_on_a_non_select_is_not_
     assert all("observed_selected" not in option for option in fields["liar"]["options"])
     assert fields["depart"]["options"][0]["observed_selected"] is True
     assert fields["liar"]["option_count"] == 1
+
+
+def test_composition_gate_falls_back_to_observed_page_for_a_stale_ref_on_an_unrequired_block() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={"search_product": 99},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None

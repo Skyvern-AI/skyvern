@@ -39,7 +39,9 @@ def run_upload_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _fake_page(raw: MagicMock | None = None) -> SimpleNamespace:
     if raw is None:
         raw = MagicMock()
-    return SimpleNamespace(page=raw, click=AsyncMock(), evaluate=AsyncMock())
+    page = SimpleNamespace(page=raw, click=AsyncMock(), evaluate=AsyncMock())
+    page.locator_scope = page
+    return page
 
 
 def _patch_get_page(monkeypatch: pytest.MonkeyPatch, page=None, ctx=None):

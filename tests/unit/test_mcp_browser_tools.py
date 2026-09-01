@@ -1033,7 +1033,11 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
         press=AsyncMock(),
         scroll_into_view_if_needed=AsyncMock(),
     )
-    raw_page = SimpleNamespace(locator=MagicMock(return_value=locator), url="https://example.test")
+    raw_page = SimpleNamespace(
+        locator=MagicMock(return_value=locator),
+        url="https://example.test",
+        evaluate=AsyncMock(return_value=False),
+    )
     run_task_result = SimpleNamespace(
         run_id="wr_test",
         status="completed",
@@ -1045,6 +1049,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     page = SimpleNamespace(
         page=raw_page,
         _working_frame=SimpleNamespace(url="https://example.test/frame"),
+        locator_scope=raw_page,
         url="https://example.test",
         agent=SimpleNamespace(run_task=AsyncMock(return_value=run_task_result)),
         click=AsyncMock(side_effect=lambda **kwargs: kwargs.get("selector")),

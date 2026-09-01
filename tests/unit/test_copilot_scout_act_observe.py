@@ -1763,11 +1763,11 @@ class TestActObserveNoRace:
         )
 
         by_step = _flow_by_step(ctx)
-        consumed: set[int] = set()
-        assert _auto_credit_interaction_observation(by_step, consumed) is True
-        credited_evidence, _ = by_step[next(iter(consumed))]
+        interaction_steps = [step for step, (_, reached_via) in by_step.items() if reached_via == "interaction"]
+        assert len(interaction_steps) == 1
+        credited_evidence, _ = by_step[interaction_steps[0]]
         assert has_bounded_page_schema(credited_evidence)
-        assert _auto_credit_interaction_observation(by_step, consumed) is False
+        assert _auto_credit_interaction_observation(by_step) is True
 
     @pytest.mark.asyncio
     async def test_degraded_path_preserves_pending_upgrade(self) -> None:
