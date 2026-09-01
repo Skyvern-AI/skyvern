@@ -9,6 +9,7 @@ auto-stamp.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +18,7 @@ from playwright.async_api import BrowserContext, Locator, Page
 
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.webeye import browser_factory as factory_module
+from skyvern.webeye import display_recorder as recorder_module
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
@@ -128,6 +130,164 @@ def _factory_harness(monkeypatch: pytest.MonkeyPatch) -> None:
         AGENT_FUNCTION = _FakeAgentFunction()
 
     monkeypatch.setattr(factory_module, "app", _FakeApp())
+
+
+def _register_eligible_local_creator(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    async def _eligible_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        artifacts = BrowserArtifacts()
+        # Mirrors what the real local-launch creators do after configure_local_display_recording().
+        artifacts.local_display_recording_eligible = True
+        return object(), artifacts, None
+
+    BrowserContextFactory.register_type(name, _eligible_creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", name)
+
+
+@pytest.mark.asyncio
+async def test_eligible_local_launch_seeds_single_artifact_and_skips_playwright_listener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    from skyvern.webeye.browser_artifacts import VideoArtifact
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+    from skyvern.webeye.display_recorder import DisplayRecorderAcquisition
+
+    _factory_harness(monkeypatch)
+    popup = MagicMock()
+    monkeypatch.setattr(factory_module, "set_popup_video_listener", popup)
+    seeded = VideoArtifact(video_path=str(tmp_path / "wr_seed.webm"))
+    recorder = MagicMock()
+    acquire = AsyncMock(return_value=DisplayRecorderAcquisition(recorder, seeded, True))
+    monkeypatch.setattr(factory_module, "acquire_display_recorder", acquire)
+    monkeypatch.setenv("DISPLAY", ":99")
+    monkeypatch.setattr(factory_module.settings, "VIDEO_PATH", str(tmp_path))
+    _register_eligible_local_creator(monkeypatch, "test-eligible-seed")
+
+    _, artifacts, _ = await BrowserContextFactory.create_browser_context(playwright=object(), workflow_run_id="wr_seed")
+
+    assert acquire.await_count == 1
+    # Exactly one run-scoped VideoArtifact, seeded synchronously in the creator tail.
+    assert artifacts.video_artifacts == [seeded]
+    assert artifacts._display_recorder is recorder
+    # The Playwright per-page listener must NOT run on the eligible whole-display path.
+    popup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_remote_cdp_path_never_spawns_recorder_and_keeps_playwright_listener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    _factory_harness(monkeypatch)
+    popup = MagicMock()
+    monkeypatch.setattr(factory_module, "set_popup_video_listener", popup)
+    acquire = AsyncMock()
+    monkeypatch.setattr(factory_module, "acquire_display_recorder", acquire)
+    monkeypatch.setenv("DISPLAY", ":99")
+    monkeypatch.setattr(factory_module.settings, "VIDEO_PATH", str(tmp_path))
+
+    async def _remote_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        # Remote/CDP/vendor creators never set the eligibility marker.
+        return object(), BrowserArtifacts(), None
+
+    BrowserContextFactory.register_type("test-remote", _remote_creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-remote")
+
+    _, artifacts, _ = await BrowserContextFactory.create_browser_context(playwright=object(), workflow_run_id="wr_x")
+
+    assert acquire.await_count == 0
+    assert artifacts.video_artifacts == []
+    assert artifacts._display_recorder is None
+    popup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_same_owner_recreation_reuses_exact_video_artifact_object(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Recreation (check_and_fix_state re-enters the factory) must reuse the exact VideoArtifact object so
+    its video_artifact_id survives, which is what keeps agent.initialize_execution_state at one RECORDING row."""
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    _factory_harness(monkeypatch)
+    recorder_module._REGISTRY.clear()
+    process = MagicMock(returncode=None)
+    process.wait = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    monkeypatch.setenv("DISPLAY", ":99")
+    monkeypatch.setattr(factory_module.settings, "VIDEO_PATH", str(tmp_path))
+    _register_eligible_local_creator(monkeypatch, "test-eligible-reuse")
+
+    try:
+        _, first, _ = await BrowserContextFactory.create_browser_context(
+            playwright=object(), workflow_run_id="wr_reuse"
+        )
+        _, second, _ = await BrowserContextFactory.create_browser_context(
+            playwright=object(), workflow_run_id="wr_reuse"
+        )
+
+        assert first.video_artifacts[0] is second.video_artifacts[0]
+        # Step-1 stamps the id on the shared object; recreation therefore never yields a second row.
+        first.video_artifacts[0].video_artifact_id = "va_1"
+        assert second.video_artifacts[0].video_artifact_id == "va_1"
+    finally:
+        process.returncode = 0
+        await recorder_module.release_display_recorder(first._display_recorder)
+        recorder_module._REGISTRY.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("producer_kwargs", "reconnect_kwargs"),
+    [
+        pytest.param({"task_id": "tsk_solo"}, {}, id="standalone"),
+        pytest.param({"workflow_run_id": "wr_parent"}, {"workflow_run_id": "wr_child"}, id="aliased-child"),
+    ],
+)
+async def test_reconnect_end_to_end_preserves_exact_display_recorder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, producer_kwargs: dict[str, str], reconnect_kwargs: dict[str, str]
+) -> None:
+    """End-to-end (real factory + reconnect()): the rebuild must re-acquire the EXACT same recorder + index-0
+    VideoArtifact, popup suppressed. Covers standalone reconnect AND the use_parent_browser_session aliased
+    child (parent-owned recorder, child reconnect id) — RED without the acquire-level override reuse."""
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+    from skyvern.webeye.real_browser_state import RealBrowserState
+
+    _factory_harness(monkeypatch)
+    recorder_module._REGISTRY.clear()
+    popup = MagicMock()
+    monkeypatch.setattr(factory_module, "set_popup_video_listener", popup)
+    process = MagicMock(returncode=None, wait=AsyncMock())
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    monkeypatch.setenv("DISPLAY", ":99")
+    monkeypatch.setattr(factory_module.settings, "VIDEO_PATH", str(tmp_path))
+    _register_eligible_local_creator(monkeypatch, "test-eligible-e2e")
+
+    _, first, _ = await BrowserContextFactory.create_browser_context(playwright=object(), **producer_kwargs)
+    recorder0, artifact0 = first._display_recorder, first.video_artifacts[0]
+    assert recorder0 is not None
+
+    state = RealBrowserState.__new__(RealBrowserState)
+    state.pw = AsyncMock()
+    state.browser_context = MagicMock()
+    state.engine_selection = MagicMock(start_driver=AsyncMock(return_value=AsyncMock()))
+    state.set_working_page = AsyncMock()
+    state.get_working_page = AsyncMock(return_value=MagicMock())
+    state.browser_artifacts = first
+
+    try:
+        await state.reconnect(**reconnect_kwargs)
+        assert state.browser_artifacts._display_recorder is recorder0, "exact same recorder survives reconnect"
+        assert state.browser_artifacts.video_artifacts == [artifact0], "one index-0 VideoArtifact object survives"
+        popup.assert_not_called()
+    finally:
+        process.returncode = 0
+        await recorder_module.release_display_recorder(recorder0)
+        recorder_module._REGISTRY.clear()
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ from skyvern.webeye.browser_engine import (
     BrowserEngineSelection,
 )
 from skyvern.webeye.browser_factory import set_popup_video_listener
+from skyvern.webeye.display_recorder import DisplayRecorder
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -826,6 +827,161 @@ async def test_get_video_artifacts_empty_finalize_path_warns() -> None:
 
     assert artifacts == []
     mock_log.warning.assert_called_once()
+
+
+def _make_browser_state_with_display_recorder(video_path: str) -> tuple[MagicMock, VideoArtifact]:
+    artifact = VideoArtifact(video_path=video_path)
+    recorder = DisplayRecorder(
+        display=":99",
+        owner_id="owner",
+        process=MagicMock(),
+        lock_fd=-1,
+        video_artifact=artifact,
+    )
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = [artifact]
+    browser_state.browser_artifacts._display_recorder = recorder
+    return browser_state, artifact
+
+
+@pytest.mark.asyncio
+async def test_display_recording_index0_real_seams_first_step_two_updates_terminal_same_id(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V2 parity through the real consumer wiring: the whole-display recording is the single index-0
+    ArtifactType.RECORDING, created ONCE on the first step, then two real per-step syncs and the terminal
+    update that SAME id (never a duplicate/last-step row). Only the DB/storage artifact boundary is faked."""
+    from skyvern.forge import app as forge_app
+    from skyvern.forge.agent import ForgeAgent
+    from skyvern.forge.sdk.artifact.models import ArtifactType
+
+    src = tmp_path / "whole-display.webm"
+    src.write_bytes(b"step1")
+    browser_state, display_artifact = _make_browser_state_with_display_recorder(str(src))
+    manager = RealBrowserManager()
+    manager.pages["tsk_int"] = browser_state
+    task = MagicMock(task_id="tsk_int", organization_id="org", workflow_run_id=None)
+
+    creates: list[dict] = []
+    updates: list[dict] = []
+
+    async def _create(*, step, artifact_type, data=None, path=None, file_extension=None):
+        creates.append({"step": step, "type": artifact_type})
+        return "rec_0"
+
+    async def _update(*, artifact_id, organization_id, data, file_extension=None):
+        updates.append({"id": artifact_id, "data": data, "ext": file_extension})
+        return "upload_key"
+
+    artifact_mgr = MagicMock(
+        create_artifact=AsyncMock(side_effect=_create), update_artifact_data=AsyncMock(side_effect=_update)
+    )
+    monkeypatch.setattr(forge_app, "ARTIFACT_MANAGER", artifact_mgr)
+    monkeypatch.setattr(forge_app, "BROWSER_MANAGER", manager)
+    (tmp_path / "f.mp4").write_bytes(b"final-mp4")
+    monkeypatch.setattr(
+        real_browser_manager,
+        "prepare_recording_for_upload",
+        lambda p: fake_prepared_recording(p, str(tmp_path / "f.mp4")),
+    )
+    first_step, last_step = MagicMock(step_id="s0"), MagicMock(step_id="s9")
+
+    # First-step init seam: real get_video_artifacts -> create the RECORDING row on the FIRST step.
+    for a in await manager.get_video_artifacts(task_id="tsk_int", browser_state=browser_state, finalize=False):
+        if a.video_artifact_id is None:
+            a.video_artifact_id = await artifact_mgr.create_artifact(
+                step=first_step, artifact_type=ArtifactType.RECORDING, data=a.video_data
+            )
+    manager.set_video_artifact_for_task(task, browser_state.browser_artifacts.video_artifacts)
+
+    agent = ForgeAgent()
+    src.write_bytes(b"step1-step2")
+    await agent._sync_video_artifact_after_step(task, browser_state)  # real per-step update #1
+    src.write_bytes(b"step1-step2-step3")
+    await agent._sync_video_artifact_after_step(task, browser_state)  # real per-step update #2
+
+    # Terminal seam (mirrors cleanup_browser_and_create_artifacts' inline video loop; the full method also does
+    # HAR/logs/webhooks, out of scope): real finalize read updates the SAME id, never creates a last-step row.
+    for a in await manager.get_video_artifacts(task_id="tsk_int", browser_state=browser_state, finalize=True):
+        if a.video_artifact_id:
+            await artifact_mgr.update_artifact_data(
+                artifact_id=a.video_artifact_id,
+                organization_id=task.organization_id,
+                data=a.video_data,
+                file_extension=a.video_file_extension,
+            )
+        else:
+            a.video_artifact_id = await artifact_mgr.create_artifact(
+                step=last_step, artifact_type=ArtifactType.RECORDING, data=a.video_data
+            )
+
+    recording_creates = [c for c in creates if c["type"] == ArtifactType.RECORDING]
+    assert len(recording_creates) == 1, "exactly one index-0 RECORDING row, created once"
+    assert recording_creates[0]["step"] is first_step, "the recording is attached to the FIRST step, never last_step"
+    assert display_artifact.video_artifact_id == "rec_0"
+    assert len(updates) == 3, "two real per-step syncs + the terminal, all real update_artifact_data calls"
+    assert all(u["id"] == "rec_0" for u in updates), "every update targets the same first-step artifact id"
+    assert [updates[0]["data"], updates[1]["data"]] == [b"step1-step2", b"step1-step2-step3"], "growing per-step bytes"
+    assert updates[2]["data"] == b"final-mp4" and updates[2]["ext"] == "mp4", "terminal finalized bytes/extension"
+    assert browser_state.browser_artifacts.video_artifacts == [display_artifact], "cardinality one; no duplicate row"
+
+
+async def _stopped_display_recorder(owner_id: str, video_path: str) -> tuple[DisplayRecorder, VideoArtifact]:
+    """A run-owned recorder wrapping a fake ffmpeg that a graceful stop() reaps to returncode 0."""
+    artifact = VideoArtifact(video_path=video_path)
+    process = MagicMock(returncode=None)
+
+    async def _wait() -> int:
+        process.returncode = 0
+        return 0
+
+    process.wait = AsyncMock(side_effect=_wait)
+    recorder = DisplayRecorder(display=":99", owner_id=owner_id, process=process, lock_fd=-1, video_artifact=artifact)
+    return recorder, artifact
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "recorder_owner, task_ids, expect_stopped",
+    [("wfr_stream", [], True), ("tsk_child", ["tsk_child"], True), ("wfr_parent", [], False)],
+)
+async def test_deferred_stream_close_finalizes_display_recording_before_persist(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, recorder_owner: str, task_ids: list[str], expect_stopped: bool
+) -> None:
+    """Deferred close finalizes a workflow- or task-owned recorder, never a foreign parent."""
+    src = tmp_path / "whole-display.webm"
+    src.write_bytes(b"raw-webm")
+    recorder, artifact = await _stopped_display_recorder(recorder_owner, str(src))
+
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.browser_artifacts.video_artifacts = [artifact]
+    browser_state.browser_artifacts._display_recorder = recorder
+    browser_state.close = AsyncMock()
+    manager.pages["wfr_stream"] = browser_state
+
+    monkeypatch.setattr(real_browser_manager, "persist_session_cookies", AsyncMock())
+    monkeypatch.setattr(real_browser_manager, "stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr(real_browser_manager, "set_deferred_close_params", lambda *a, **k: True)
+    prepared = tmp_path / "whole-display.mp4"
+    prepared.write_bytes(b"final-mp4")
+    monkeypatch.setattr(
+        real_browser_manager, "prepare_recording_for_upload", lambda path: fake_prepared_recording(path, str(prepared))
+    )
+
+    result = await manager.cleanup_for_workflow_run("wfr_stream", task_ids=task_ids, close_browser_on_completion=True)
+
+    # Defer semantics preserved (browser NOT closed, recording_finalized False). Only a run-owned recorder
+    # is stopped, so its WebM is remuxed+uploaded; a foreign owner is left running and uploads its raw prefix.
+    browser_state.close.assert_not_awaited()
+    assert result.recording_finalized is False
+    assert recorder.is_stopped is expect_stopped
+    artifacts = await manager.get_video_artifacts(browser_state=browser_state, finalize=result.recording_finalized)
+    assert artifact in artifacts
+    assert artifact.video_data == (b"final-mp4" if expect_stopped else b"raw-webm")
+    assert artifact.video_file_extension == ("mp4" if expect_stopped else "webm")
 
 
 def _make_page_mock(video_path: str | None) -> MagicMock:
