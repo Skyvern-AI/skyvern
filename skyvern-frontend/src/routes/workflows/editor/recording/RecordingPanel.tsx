@@ -1,12 +1,10 @@
 import {
   CheckIcon,
   CursorArrowIcon,
-  EnterFullScreenIcon,
   PauseIcon,
   Pencil1Icon,
   PlayIcon,
   TrashIcon,
-  ZoomInIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
@@ -31,11 +29,9 @@ import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   applyDraftStepOverlays,
-  findScreenshotForStep,
   useRecordingStore,
   type RecordingActionKind,
   type RecordingDraftStep,
-  type RecordingScreenshot,
 } from "@/store/useRecordingStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import { formatRecordingClock } from "@/util/recordingClock";
@@ -86,55 +82,6 @@ function formatDraftStepDisplayTitle(step: RecordingDraftStep): string {
   }
 
   return step.label;
-}
-
-function StepScreenshot({ screenshot }: { screenshot: RecordingScreenshot }) {
-  const [showFullPage, setShowFullPage] = useState(false);
-  const xp = screenshot.xp ?? 0.5;
-  const yp = screenshot.yp ?? 0.5;
-
-  return (
-    <div className="group/shot relative h-36 overflow-hidden rounded-md border bg-black">
-      <div
-        className="absolute inset-0"
-        style={
-          showFullPage
-            ? {
-                backgroundImage: `url(${screenshot.dataUrl})`,
-                backgroundSize: "contain",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: "center",
-              }
-            : {
-                // background-position p% pins image point p% to container
-                // point p%, keeping the zoomed crop in-bounds with the click
-                // point at the same relative spot as the ring below.
-                backgroundImage: `url(${screenshot.dataUrl})`,
-                backgroundSize: "250% auto",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: `${xp * 100}% ${yp * 100}%`,
-              }
-        }
-      />
-      <button
-        type="button"
-        className="absolute bottom-2 right-2 inline-flex items-center gap-1 rounded bg-black/70 px-2 py-1 text-[10.5px] text-slate-200 opacity-0 transition-opacity group-hover/shot:opacity-100"
-        onClick={() => setShowFullPage(!showFullPage)}
-      >
-        {showFullPage ? (
-          <>
-            <ZoomInIcon className="h-3 w-3" />
-            Zoom to action
-          </>
-        ) : (
-          <>
-            <EnterFullScreenIcon className="h-3 w-3" />
-            Full page
-          </>
-        )}
-      </button>
-    </div>
-  );
 }
 
 function credentialPromptForKind(
@@ -188,7 +135,6 @@ function DraftStepCard({
   step,
   index,
   baselineMs,
-  screenshot,
   onDelete,
   onRename,
   showCredentialPrompt,
@@ -199,7 +145,6 @@ function DraftStepCard({
   step: RecordingDraftStep;
   index: number;
   baselineMs: number | null;
-  screenshot: RecordingScreenshot | null;
   onDelete: () => void;
   onRename: (value: string) => void;
   showCredentialPrompt: boolean;
@@ -322,11 +267,6 @@ function DraftStepCard({
           </button>
         </div>
       </div>
-      {screenshot && (
-        <div className="pl-8">
-          <StepScreenshot screenshot={screenshot} />
-        </div>
-      )}
       {showCredentialPrompt && (
         <div className="flex flex-wrap items-center gap-2 pl-8">
           <Button
@@ -435,7 +375,6 @@ function RecordingPanel({ browserSessionId }: Props) {
     deletedStepIds,
     stepPatches,
     dismissedCredentialStepIds,
-    screenshots,
     sessionRevision,
     optimisticSteps: rawOptimisticSteps,
     workflowPermanentId,
@@ -451,7 +390,6 @@ function RecordingPanel({ browserSessionId }: Props) {
       deletedStepIds: state.deletedStepIds,
       stepPatches: state.stepPatches,
       dismissedCredentialStepIds: state.dismissedCredentialStepIds,
-      screenshots: state.screenshots,
       sessionRevision: state.sessionRevision,
       optimisticSteps: state.optimisticSteps,
       workflowPermanentId: state.workflowPermanentId,
@@ -643,7 +581,6 @@ function RecordingPanel({ browserSessionId }: Props) {
               step={step}
               index={index}
               baselineMs={baselineMs}
-              screenshot={findScreenshotForStep(step, screenshots)}
               showCredentialPrompt={
                 Boolean(step.credential_kind) &&
                 !dismissedCredentialStepIds.includes(step.step_id)

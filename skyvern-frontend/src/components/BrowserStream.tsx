@@ -221,10 +221,6 @@ function BrowserStream({
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
     entity !== "browserSession" || isBrowserSessionStarted;
-  const getFrameDataUrl = useCallback(() => {
-    const canvas = canvasContainer?.querySelector("canvas");
-    return canvas?.toDataURL("image/jpeg", 0.5) ?? null;
-  }, [canvasContainer]);
   const handleMessageConnectionChange = useCallback(
     (connected: boolean, event?: CloseEvent) => {
       if (connected) {
@@ -268,7 +264,6 @@ function BrowserStream({
       isBrowserSessionBackendReady,
     exfiltrate,
     workflowPermanentId,
-    getFrameDataUrl,
     clipboard: "vnc",
     socketUrl: legacyMessageSocketUrl,
     reconnectTrigger: messagesDisconnectedTrigger,

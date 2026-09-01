@@ -19750,6 +19750,46 @@ async def test_select_combobox_prefix_completion_commit_is_accepted() -> None:
         )
 
 
+# SKY-15364: a committed pill whose label is the requested value plus a parenthesized decoration
+# ("United Kingdom (+44)") must satisfy the covered-field already-holds read — and nothing looser.
+def _decorated_pill_covered_html(pill_label: str) -> str:
+    return f"""
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="wrapd" style="position:absolute;top:0;left:0;width:340px">
+  <label for="cityd">Phone code</label>
+  <input id="cityd" type="text" autocomplete="off" style="width:300px;height:26px">
+  <span class="pill">{pill_label}</span>
+</div>
+<div id="overlayd" style="position:absolute;top:0;left:0;width:340px;height:60px;background:#fffc;z-index:50">{pill_label}</div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pill", "value", "expect_ok"),
+    [
+        ("United Kingdom (+44), press delete to clear value.", "United Kingdom", True),
+        ("United Kingdom (+44)", "United Kingdom", True),
+        # Precision: a shorter request must not match a longer decorated label...
+        ("United Kingdom (+44), press delete to clear value.", "United", False),
+        # ...and a non-parenthetical suffix is not a decoration.
+        ("United Kingdom +44, press delete to clear value.", "United Kingdom", False),
+    ],
+    ids=["decorated-with-instruction", "decorated-bare", "shorter-request-refused", "non-parenthetical-refused"],
+)
+async def test_covered_field_decorated_pill_already_holds(pill: str, value: str, expect_ok: bool) -> None:
+    async with _content_page(_decorated_pill_covered_html(pill)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        picked = await _tool(tools, "select_combobox").handler({"selector": "#cityd", "value": value})
+        if expect_ok:
+            assert picked.status == "ok", picked.content
+            assert "already" in picked.content, picked.content
+        else:
+            assert picked.status == "error", picked.content
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_errored_pre_click_snapshot_fails_closed() -> None:

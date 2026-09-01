@@ -1813,13 +1813,22 @@ _COMMIT_SURFACE_JS = (
   // Actual instruction SYNTAX, not a keyword alone ("Austin, Clear Lake" is a place, not an
   // instruction) — mirror of the Python _INSTRUCTION_CLAUSE_RE.
   const INSTRUCTION_RE = /\b(?:press|tap|click|hit)\s+(?:delete|backspace|enter|escape)\b|\bto\s+(?:delete|remove|clear|dismiss|deselect)\b|\b(?:delete|remove|clear|dismiss|deselect|backspace)\s+(?:the\s+)?(?:value|values|selection|selections|item|items|option|options|entry|entries|choice|choices|tag|tags|this|it|all)\b/i;
+  // Exact, or the value plus ONE parenthesized decoration ("United Kingdom (+44)") — the canonical-
+  // label idiom that otherwise loops a covered field forever. Nothing looser: a prefix without its
+  // own " (" boundary and a non-parenthetical suffix both stay refusals.
+  const satisfied = (text) => {
+    if (text === want) return true;
+    if (!(text.length > want.length + 3 && text.startsWith(want + ' (') && text.endsWith(')'))) return false;
+    const inner = text.slice(want.length + 2, -1);
+    return inner.length > 0 && !inner.includes('(') && !inner.includes(')');
+  };
   const clauseHolds = (raw) => {
     const own = nrm(raw).split('|')[0].trim();
     if (!own) return false;
-    if (own === want) return true;
+    if (satisfied(own)) return true;
     const cut = own.lastIndexOf(',');
     if (cut <= 0 || !INSTRUCTION_RE.test(own.slice(cut + 1))) return false;
-    return own.slice(0, cut).trim() === want;
+    return satisfied(own.slice(0, cut).trim());
   };
   // The stamped [data-tv3-sugglist] container is the LIVE option list of the pick in flight: its
   // rows are offers, never commits, and a re-render that strips row tags keeps the container stamp.
@@ -1871,7 +1880,7 @@ _COMMIT_SURFACE_JS = (
     // committed label beside a field whose own value is an opaque id). Exact match only.
     for (const cand of scope.querySelectorAll('*')) {
       if (cand.children.length > 0 || excluded(cand) || !visible(cand)) continue;
-      if (nrm(cand.textContent) === want || nrm(cand.getAttribute('aria-label')) === want) return true;
+      if (satisfied(nrm(cand.textContent)) || satisfied(nrm(cand.getAttribute('aria-label')))) return true;
     }
   }
   return false;
@@ -7426,6 +7435,15 @@ def build_browser_tools(
         if not want:
             return False
 
+        def satisfied(text: str) -> bool:
+            # Exact, or the value plus ONE parenthesized decoration ("United Kingdom (+44)") — the
+            # canonical-label idiom that otherwise loops a covered field forever. Nothing looser:
+            # a prefix without its own " (" boundary ("United" vs "United Kingdom (+44)") and a
+            # non-parenthetical suffix both stay refusals.
+            if text == want:
+                return True
+            return bool(re.fullmatch(re.escape(want) + r" \([^()]+\)", text))
+
         def holds(raw: object) -> bool:
             # The committed label may itself contain commas ("Korea, Republic of"); the widget's
             # instruction ("press delete to clear value.") is ONE trailing comma-clause. Strip it
@@ -7434,12 +7452,12 @@ def build_browser_tools(
             own = norm(str(raw or "")).split("|")[0].strip()
             if not own:
                 return False
-            if own == want:
+            if satisfied(own):
                 return True
             head, _, tail = own.rpartition(",")
             if not head or not _INSTRUCTION_CLAUSE_RE.search(tail):
                 return False
-            return head.strip() == want
+            return satisfied(head.strip())
 
         if holds((occluder or {}).get("name")):
             return True

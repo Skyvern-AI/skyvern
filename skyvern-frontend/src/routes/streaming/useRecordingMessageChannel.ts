@@ -4,7 +4,6 @@ import { toast } from "@/components/ui/use-toast";
 import { buildOptimisticStep } from "@/routes/workflows/editor/recording/optimisticSteps";
 import {
   useRecordingStore,
-  type ExfiltratedEventConsoleParams,
   type MessageInExfiltratedEvent,
   type RecordingInterpretationUpdate,
 } from "@/store/useRecordingStore";
@@ -22,8 +21,6 @@ export interface UseRecordingMessageChannelOptions {
   /** recording active: drives begin/end-exfiltration on edges */
   exfiltrate: boolean;
   workflowPermanentId: string | null;
-  /** returns a data URL of the current frame for click screenshots, or null */
-  getFrameDataUrl?: () => string | null;
   clipboard: RecordingClipboardMode;
   socketUrl?: string;
   reconnectTrigger?: number;
@@ -247,38 +244,10 @@ function getMessage(data: unknown): MessageIn | undefined {
   }
 }
 
-function captureRecordingScreenshot(
-  params: ExfiltratedEventConsoleParams,
-  getFrameDataUrl: (() => string | null) | undefined,
-) {
-  const schedule =
-    typeof requestIdleCallback === "function"
-      ? (fn: () => void) => requestIdleCallback(fn, { timeout: 750 })
-      : (fn: () => void) => window.setTimeout(fn, 0);
-
-  schedule(() => {
-    try {
-      const dataUrl = getFrameDataUrl?.();
-      if (!dataUrl) {
-        return;
-      }
-      useRecordingStore.getState().addScreenshot({
-        timestampMs: params.timestamp,
-        dataUrl,
-        xp: params.mousePosition.xp,
-        yp: params.mousePosition.yp,
-      });
-    } catch {
-      // toDataURL can throw on a tainted/headless canvas; shots are optional
-    }
-  });
-}
-
 function handleMessage(
   data: unknown,
   ws: WebSocket | null,
   clipboard: RecordingClipboardMode,
-  getFrameDataUrl: (() => string | null) | undefined,
   onBeginExfiltrationError: () => void,
 ) {
   const message = getMessage(data);
@@ -380,13 +349,6 @@ function handleMessage(
       }
       if (store.isCapturePaused()) {
         break;
-      }
-      if (
-        store.isRecording &&
-        message.source === "console" &&
-        message.params.type === "click"
-      ) {
-        captureRecordingScreenshot(message.params, getFrameDataUrl);
       }
       if (
         store.isRecording &&
@@ -555,7 +517,6 @@ export function useRecordingMessageChannel(
             message,
             ws,
             currentOptions.clipboard,
-            currentOptions.getFrameDataUrl,
             scheduleBeginRetry,
           );
         } catch (e) {

@@ -88,7 +88,6 @@ const mocks = vi.hoisted(() => {
 
   const recordingStore = {
     add: vi.fn(),
-    addScreenshot: vi.fn(),
     applyInterpretationUpdate: vi.fn(),
     compressedChunks: [],
     draftEditDepth: 0,
@@ -203,7 +202,6 @@ vi.mock("@/store/useRecordingStore", () => {
   const useRecordingStore = (
     selector?: (state: typeof mocks.recordingStore) => unknown,
   ) => (selector ? selector(mocks.recordingStore) : mocks.recordingStore);
-  // Also read imperatively (reset/addScreenshot/etc.) via getState().
   useRecordingStore.getState = () => mocks.recordingStore;
   return {
     useRecordingStore,
