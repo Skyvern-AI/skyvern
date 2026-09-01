@@ -192,6 +192,92 @@ def test_resolver_finds_loop_nested_block_engine() -> None:
     assert script_service._resolve_original_block_engine("missing", workflow) is None
 
 
+def _make_run_context(values: dict[str, object]) -> MagicMock:
+    workflow_run_context = MagicMock()
+    workflow_run_context.values = dict(values)
+    workflow_run_context.get_block_metadata.return_value = {}
+    workflow_run_context.workflow_title = "test workflow"
+    workflow_run_context.workflow_id = "w_test"
+    workflow_run_context.workflow_permanent_id = "wpid_test"
+    workflow_run_context.workflow_run_id = "wr_test"
+    workflow_run_context.browser_session_id = None
+    return workflow_run_context
+
+
+async def _resolve_otp(
+    workflow: Workflow,
+    values: dict[str, object],
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+) -> tuple[tuple[str | None, str | None], MagicMock]:
+    app = _make_app(workflow)
+    app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = _make_run_context(values)
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+    ):
+        resolved = await script_service._resolve_block_otp_config("my_block", totp_identifier, totp_url)
+    return resolved, app
+
+
+@pytest.mark.asyncio
+async def test_otp_config_inherited_from_block_definition_when_call_site_omits_it() -> None:
+    # Static-script run signatures omit the block's totp fields (SKY-15221); the task the
+    # script path creates must still poll the identifier the workflow block configured.
+    block = _make_task_block("my_block")
+    block.totp_identifier = "{{ email }}"
+    workflow = _make_workflow([block])
+
+    (identifier, url), _ = await _resolve_otp(workflow, {"email": "candidate+x@gmail.com"})
+
+    assert identifier == "candidate+x@gmail.com"
+    assert url is None
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_otp_template_yields_none_not_the_literal() -> None:
+    # A literal "{{ email }}" as identifier would match nothing for the whole poll —
+    # worse than no identifier, because the failure reads as "code never arrived".
+    block = _make_task_block("my_block")
+    block.totp_identifier = "{{ email }}"
+    workflow = _make_workflow([block])
+
+    (identifier, _), _ = await _resolve_otp(workflow, {})
+
+    assert identifier is None
+
+
+@pytest.mark.asyncio
+async def test_call_site_otp_values_pass_through_without_workflow_lookup() -> None:
+    workflow = _make_workflow([_make_task_block("my_block")])
+
+    (identifier, url), app = await _resolve_otp(workflow, {}, totp_identifier="direct@example.com")
+
+    assert identifier == "direct@example.com"
+    assert url is None
+    app.DATABASE.workflows.get_workflow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_otp_inheritance_finds_loop_nested_block() -> None:
+    from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
+
+    nested = _make_task_block("my_block")
+    nested.totp_identifier = "{{ email }}"
+    loop = ForLoopBlock(
+        label="outer_loop",
+        loop_blocks=[nested],
+        loop_over=None,
+        loop_variable_reference="items",
+        output_parameter=nested.output_parameter,
+    )
+    workflow = _make_workflow([loop])
+
+    (identifier, _), _ = await _resolve_otp(workflow, {"email": "candidate+x@gmail.com"})
+
+    assert identifier == "candidate+x@gmail.com"
+
+
 @pytest.mark.asyncio
 async def test_block_screenshot_without_browser_state_is_not_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     # A block that runs before a browser exists, or never needs one, has no screenshot to take;
