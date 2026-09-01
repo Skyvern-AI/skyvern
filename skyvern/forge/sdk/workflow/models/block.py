@@ -5105,6 +5105,7 @@ async def wrapper({default_args}):
         session_bound: bool = False,
         download_run_id: str | None = None,
         download_binding_kind: str | None = None,
+        download_operation_invoked: bool = False,
     ) -> tuple[list[FileInfo] | None, set[str]]:
         """Register downloads, recording what the registered directory held on either side.
 
@@ -5123,6 +5124,7 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 session_bound=session_bound,
                 download_run_id=download_run_id,
+                download_operation_invoked=download_operation_invoked,
             )
         finally:
             with contained_effect(
@@ -5158,6 +5160,7 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         session_bound: bool = False,
         download_run_id: str | None = None,
+        download_operation_invoked: bool = False,
     ) -> tuple[list[FileInfo] | None, set[str]]:
         """Registered downloads, plus the names of files whose save storage skipped.
 
@@ -5224,6 +5227,7 @@ async def wrapper({default_args}):
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     run_id=storage_run_id,
+                    download_operation_invoked=download_operation_invoked,
                 )
                 or registered_files
             )
@@ -5236,12 +5240,14 @@ async def wrapper({default_args}):
         workflow_run_id: str,
         workflow_run_block_id: str,
         run_id: str,
+        download_operation_invoked: bool = False,
     ) -> list[FileInfo] | None:
-        """Registered downloads once an in-flight one lands, or ``None`` when none was in flight.
+        """Return a session download once its final watcher row becomes visible.
 
         The watcher drops the partial's artifact row on Chrome's rename and writes the final row from
-        the same event batch, in either order, so a vanished partial does not prove the final row is
-        committed yet — hence the settle poll rather than a single re-read."""
+        the same event batch, in either order. A visible partial or a typed broker receipt therefore
+        authorizes the same bounded settle poll; neither a vanished partial nor completed browser
+        bytes alone prove that the final artifact row is committed."""
         context = skyvern_context.current()
         browser_session_id = context.browser_session_id if context else None
         if not browser_session_id:
@@ -5251,18 +5257,19 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
             )
-            if not in_flight:
+            if not in_flight and not download_operation_invoked:
                 return None
-            LOG.info(
-                "Code block finished with a session download still in flight; waiting for it",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                browser_session_id=browser_session_id,
-                in_flight_count=len(in_flight),
-            )
-            await wait_for_download_finished(
-                downloading_files=in_flight, timeout=_CODE_BLOCK_SESSION_DOWNLOAD_WAIT_SECONDS
-            )
+            if in_flight:
+                LOG.info(
+                    "Code block finished with a session download still in flight; waiting for it",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    browser_session_id=browser_session_id,
+                    in_flight_count=len(in_flight),
+                )
+                await wait_for_download_finished(
+                    downloading_files=in_flight, timeout=_CODE_BLOCK_SESSION_DOWNLOAD_WAIT_SECONDS
+                )
             for _ in range(_CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS):
                 await self._claim_session_download_artifacts(
                     organization_id=organization_id,
@@ -7226,6 +7233,9 @@ async def wrapper({default_args}):
                                 workflow_run_block_id=workflow_run_block_id,
                                 session_bound=session_download_lane_active(browser_state),
                                 download_run_id=resolved_download_id,
+                                download_operation_invoked=(
+                                    secure_code_block_result.download_operation_receipt is not None
+                                ),
                             )
                         secure_output, binding_failure_reason = await self._bind_and_grade_downloads(
                             engine="secure_runner",
