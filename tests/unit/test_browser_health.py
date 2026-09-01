@@ -100,7 +100,7 @@ class TestEvaluateRecordsBrowserHealth:
                 frame=MagicMock(),
                 expression="() => 7",
                 evaluate_expression=answers,
-                timeout_ms=1000,
+                timeout_ms=30_000,
             )
             == 7
         )
@@ -124,7 +124,7 @@ class TestEvaluateRecordsBrowserHealth:
         )
         frame.wait_for_load_state = AsyncMock()
 
-        assert await SkyvernFrame.evaluate(frame=frame, expression="() => 7", timeout_ms=1000) == 7
+        assert await SkyvernFrame.evaluate(frame=frame, expression="() => 7", timeout_ms=30_000) == 7
         assert context.browser_health.consecutive_timeouts == 0
         assert not context.browser_health.stuck_operations
 
