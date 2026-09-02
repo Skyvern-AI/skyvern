@@ -28,6 +28,11 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locat
 from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailure,
+    BuildTestConnectFailureState,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     INFRASTRUCTURE_RUNNER_ERROR_CODES,
     BuildTestEvidencePacket,
@@ -46,6 +51,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
+    bind_post_run_page_evidence,
     connect_failure_from_run_blocks_result,
     failed_operation_from_run_blocks_result,
     post_run_page_capture_from_result,
@@ -96,7 +102,9 @@ from skyvern.forge.sdk.copilot.narration import handler_available as narration_h
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import (
+    _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     BUILD_TEST_PACKET_KEY,
     build_run_blocks_response,
     iter_failure_reasons,
@@ -2424,6 +2432,141 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
     )
 
 
+async def _attach_post_run_browser_enrichment(
+    ctx: CopilotContext,
+    result_data: dict[str, Any],
+    *,
+    workflow: Workflow | None,
+    workflow_run_id: str,
+    run_block_rows: list[WorkflowRunBlock],
+    results: list[dict[str, Any]],
+    block_outputs_by_label: Mapping[str, Any],
+    failed_block_code: str | None,
+    run_session_id: str | None,
+    dispatch_to_worker: bool,
+    sensitive_origin_run: bool,
+    run_ok: bool,
+    used_fresh_run_session: bool,
+    run_detached_from_chat: bool,
+) -> tuple[str, dict[str, Any] | None]:
+    """Probe the browser for post-run facts and stamp them onto an already-recorded run result.
+    The outcome is what is protected, not these awaits: it is committed before this runs, so a probe
+    the deadline cancels costs enrichment and never the record. Only the screenshot capture is
+    guarded here; every other await propagates and fails the tool call."""
+    # Dispatched runs: the worker owns the run session; do not touch it over CDP from the API.
+    # The frontier's anchors and the page the run ended on both come from the rows the worker
+    # persisted instead. A dispatched run has no page title to report.
+    current_url, page_title, dispatched_end_url = await _resolve_post_run_page_info(
+        ctx,
+        run_block_rows=run_block_rows,
+        dispatch_to_worker=dispatch_to_worker,
+        sensitive_origin_run=sensitive_origin_run,
+        run_session_id=run_session_id,
+    )
+
+    screenshot_b64: str | None = None
+    # Dispatched runs: the worker owns the persistent browser session, so the API side must not
+    # grab the live page over CDP. Their at-failure frames come from worker-persisted artifacts.
+    if not dispatch_to_worker and not run_ok and run_session_id and not sensitive_origin_run:
+        try:
+            browser_state = await resolve_persistent_browser_state(
+                session_id=run_session_id,
+                organization_id=ctx.organization_id,
+            )
+            if browser_state:
+                page = await browser_state.get_or_create_page()
+                if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                    try:
+                        await SkyvernFrame.hide_cursor_overlay(page)
+                    except Exception:
+                        pass
+                try:
+                    screenshot_bytes = await page.screenshot(type="png")
+                finally:
+                    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+                        try:
+                            await SkyvernFrame.show_cursor_overlay(page)
+                        except Exception:
+                            pass
+                screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception:
+            LOG.debug("Failed to capture post-run screenshot", exc_info=True)
+
+    locator_observations: list[AuthoredLocatorObservationRow] | None = None
+    post_run_page_capture: BuildTestPacketPageCapture | None = None
+    if (
+        not dispatch_to_worker
+        and run_session_id
+        and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and not ctx.copilot_total_timeout_exceeded
+    ):
+        # Structured evidence is admitted through the origin registry scrubber. Pixel capture
+        # and locator probes remain withheld for sensitive runs because they have no equivalent
+        # exact-value disclosure boundary.
+        _pin_pre_run_page_reference(ctx, workflow_run_id)
+        post_run_page_capture = await _capture_and_store_post_run_page(
+            ctx,
+            run_session_id=run_session_id,
+            run_id=workflow_run_id,
+            current_url=current_url,
+        )
+
+    if not sensitive_origin_run:
+        locator_observations = await _observe_authored_locators(
+            ctx,
+            run_session_id=run_session_id,
+            failed_block_code=failed_block_code,
+            worker_owned=dispatch_to_worker,
+            observation_deadline_exceeded=ctx.copilot_total_timeout_exceeded,
+        )
+
+    if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
+        await _capture_registered_artifact_evidence(
+            ctx,
+            run_id=workflow_run_id,
+            organization_id=ctx.organization_id,
+            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label),
+        )
+
+    # Dispatched runs are worker-owned, so the API cannot CDP-capture the terminal page; read the
+    # worker-persisted terminal HTML artifact instead and route it through the same post-run sink.
+    if dispatch_to_worker and run_session_id and not ctx.copilot_total_timeout_exceeded:
+        await _capture_dispatched_terminal_page_evidence(
+            ctx,
+            workflow=workflow,
+            run_id=workflow_run_id,
+            run_session_id=run_session_id,
+            organization_id=ctx.organization_id,
+            current_url=current_url,
+            origin_redaction_registry=ctx.origin_run_redaction_registry,
+        )
+
+    result_data["current_url"] = current_url
+    result_data["page_title"] = page_title
+    if locator_observations is not None:
+        result_data["authored_locator_observations"] = locator_observations
+    if not dispatch_to_worker and current_url:
+        result_data["current_url_live_observed"] = True
+    if dispatch_to_worker and dispatched_end_url is None:
+        result_data["current_url_evidence"] = NO_PERSISTED_END_URL
+    post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run_id)
+    if post_run_page_evidence is not None:
+        result_data["post_run_page_evidence"] = model_visible_composition_evidence(post_run_page_evidence)
+    if post_run_page_capture is not None:
+        result_data["post_run_page_capture"] = post_run_page_capture.model_dump(mode="json")
+    _attach_run_session_facts(
+        result_data,
+        used_fresh_run_session=used_fresh_run_session,
+        run_detached_from_chat=run_detached_from_chat,
+        run_ok=run_ok,
+        page_evidence=post_run_page_evidence,
+    )
+    resolved_screenshot_b64 = _resolve_run_screenshot_b64(live_capture=screenshot_b64, results=results, run_ok=run_ok)
+    if resolved_screenshot_b64 is not None:
+        result_data["screenshot_base64"] = resolved_screenshot_b64
+    return current_url, post_run_page_evidence
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -3272,94 +3415,7 @@ async def _run_blocks_and_collect_debug(
         for entry in results:
             entry.pop("action_trace", None)
 
-        # Dispatched runs: the worker owns the run session; do not touch it over CDP from the API.
-        # The frontier's anchors and the page the run ended on both come from the rows the worker
-        # persisted instead. A dispatched run has no page title to report.
         block_end_urls = {} if sensitive_origin_run else _block_end_urls_by_label(run_block_rows)
-        current_url, page_title, dispatched_end_url = await _resolve_post_run_page_info(
-            ctx,
-            run_block_rows=run_block_rows,
-            dispatch_to_worker=dispatch_to_worker,
-            sensitive_origin_run=sensitive_origin_run,
-            run_session_id=run_session_id,
-        )
-
-        screenshot_b64: str | None = None
-        # Dispatched runs: the worker owns the persistent browser session, so the API side must not
-        # grab the live page over CDP. Their at-failure frames come from worker-persisted artifacts.
-        if not dispatch_to_worker and not run_ok and run_session_id and not sensitive_origin_run:
-            try:
-                browser_state = await resolve_persistent_browser_state(
-                    session_id=run_session_id,
-                    organization_id=ctx.organization_id,
-                )
-                if browser_state:
-                    page = await browser_state.get_or_create_page()
-                    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
-                        try:
-                            await SkyvernFrame.hide_cursor_overlay(page)
-                        except Exception:
-                            pass
-                    try:
-                        screenshot_bytes = await page.screenshot(type="png")
-                    finally:
-                        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
-                            try:
-                                await SkyvernFrame.show_cursor_overlay(page)
-                            except Exception:
-                                pass
-                    screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-            except Exception:
-                LOG.debug("Failed to capture post-run screenshot", exc_info=True)
-
-        locator_observations: list[AuthoredLocatorObservationRow] | None = None
-        post_run_page_capture: BuildTestPacketPageCapture | None = None
-        if (
-            not dispatch_to_worker
-            and run_session_id
-            and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-            and not ctx.copilot_total_timeout_exceeded
-        ):
-            # Structured evidence is admitted through the origin registry scrubber. Pixel capture
-            # and locator probes remain withheld for sensitive runs because they have no equivalent
-            # exact-value disclosure boundary.
-            _pin_pre_run_page_reference(ctx, workflow_run.workflow_run_id)
-            post_run_page_capture = await _capture_and_store_post_run_page(
-                ctx,
-                run_session_id=run_session_id,
-                run_id=workflow_run.workflow_run_id,
-                current_url=current_url,
-            )
-
-        if not sensitive_origin_run:
-            locator_observations = await _observe_authored_locators(
-                ctx,
-                run_session_id=run_session_id,
-                failed_block_code=failed_block_code,
-                worker_owned=dispatch_to_worker,
-                observation_deadline_exceeded=ctx.copilot_total_timeout_exceeded,
-            )
-
-        if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
-            await _capture_registered_artifact_evidence(
-                ctx,
-                run_id=workflow_run.workflow_run_id,
-                organization_id=ctx.organization_id,
-                downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label),
-            )
-
-        # Dispatched runs are worker-owned, so the API cannot CDP-capture the terminal page; read the
-        # worker-persisted terminal HTML artifact instead and route it through the same post-run sink.
-        if dispatch_to_worker and run_session_id and not ctx.copilot_total_timeout_exceeded:
-            await _capture_dispatched_terminal_page_evidence(
-                ctx,
-                workflow=workflow,
-                run_id=workflow_run.workflow_run_id,
-                run_session_id=run_session_id,
-                organization_id=ctx.organization_id,
-                current_url=current_url,
-                origin_redaction_registry=ctx.origin_run_redaction_registry,
-            )
 
         result_data: dict[str, Any] = {
             "workflow_run_id": workflow_run.workflow_run_id,
@@ -3369,39 +3425,18 @@ async def _run_blocks_and_collect_debug(
             "executed_block_labels": list(labels_to_execute),
             "frontier_start_label": frontier_start_label,
             "blocks": results,
-            "current_url": current_url,
-            "page_title": page_title,
             "action_trace_summary": action_trace_summary,
             "failing_code_line": failing_code_line,
             "action_observations": action_observations,
         }
-        if locator_observations is not None:
-            result_data["authored_locator_observations"] = locator_observations
-        if not dispatch_to_worker and current_url:
-            result_data["current_url_live_observed"] = True
-        if dispatch_to_worker and dispatched_end_url is None:
-            result_data["current_url_evidence"] = NO_PERSISTED_END_URL
-        post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id)
-        if post_run_page_evidence is not None:
-            result_data["post_run_page_evidence"] = model_visible_composition_evidence(post_run_page_evidence)
-        if post_run_page_capture is not None:
-            result_data["post_run_page_capture"] = post_run_page_capture.model_dump(mode="json")
-        _attach_run_session_facts(
-            result_data,
-            used_fresh_run_session=used_fresh_run_session,
-            run_detached_from_chat=run_detached_from_chat,
-            run_ok=run_ok,
-            page_evidence=post_run_page_evidence,
-        )
         if runtime_frontier_anchor_url is not None:
             result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
         if runtime_frontier_starter_url_seeded:
             result_data["runtime_frontier_starter_url_seeded"] = True
-        screenshot_b64 = _resolve_run_screenshot_b64(live_capture=screenshot_b64, results=results, run_ok=run_ok)
-        if screenshot_b64 is not None:
-            result_data["screenshot_base64"] = screenshot_b64
         if not run_ok and run and getattr(run, "failure_reason", None):
             result_data["failure_reason"] = run.failure_reason
+        if not run_ok and run and getattr(run, "failure_category", None):
+            result_data["failure_category"] = run.failure_category
 
         output_identity_workflow = _registered_output_identity_workflow(
             dispatch_to_worker=dispatch_to_worker,
@@ -3423,18 +3458,23 @@ async def _run_blocks_and_collect_debug(
             data=result_data,
             persisted_output_parameters=all_output_params,
         )
+        # The run's terminal facts are known here, so the outcome is committed before any
+        # browser-dependent probe: a probe the turn deadline cancels must not erase what the run did.
+        # The post-run capture that drops another run's page now happens after the record, and the
+        # anti-bot read has no run-id check of its own, so stale evidence would grade this run.
+        if not post_run_inspection_cleanly_matches(ctx.composition_page_evidence, workflow_run.workflow_run_id):
+            ctx.composition_page_evidence = None
+
         for label, output in registered_outputs_by_label.items():
             if isinstance(output, dict) and output:
                 block_outputs_by_label[label] = output
 
-        # Update verified prefix state ONLY on a fully-successful run. A failed
-        # suffix run leaves the browser in post-failure state, so we must not
-        # trust blocks that individually succeeded inside it.
-        if run_ok and all(r.get("status") == "completed" for r in results):
-            for label, output in block_outputs_by_label.items():
-                ctx.verified_block_outputs[label] = output
+        # The record below derives "fully tested" from these credits and prefers its own
+        # extracted_data for terminal replies, so both have to land before it, not after.
+        run_fully_completed = run_ok and all(r.get("status") == "completed" for r in results)
+        if run_fully_completed:
             ctx.verified_terminal_block_outputs = dict(block_outputs_by_label)
-            existing_prefix = list(getattr(ctx, "verified_prefix_labels", []) or [])
+            existing_prefix = list(ctx.verified_prefix_labels or [])
             existing_set = set(existing_prefix)
             for label in labels_to_execute:
                 if label not in existing_set:
@@ -3442,6 +3482,48 @@ async def _run_blocks_and_collect_debug(
                     existing_set.add(label)
             ctx.verified_prefix_labels = existing_prefix
             _credit_composition_verified_labels(ctx, labels_to_execute, start_provenance)
+
+        response = build_run_blocks_response(run_ok, result_data)
+        committed_run_outcome = _commit_run_blocks_record(ctx, response)
+
+        current_url, post_run_page_evidence = await _attach_post_run_browser_enrichment(
+            ctx,
+            result_data,
+            workflow=workflow,
+            workflow_run_id=workflow_run.workflow_run_id,
+            run_block_rows=run_block_rows,
+            results=results,
+            block_outputs_by_label=block_outputs_by_label,
+            failed_block_code=failed_block_code,
+            run_session_id=run_session_id,
+            dispatch_to_worker=dispatch_to_worker,
+            sensitive_origin_run=sensitive_origin_run,
+            run_ok=run_ok,
+            used_fresh_run_session=used_fresh_run_session,
+            run_detached_from_chat=run_detached_from_chat,
+        )
+        settle_terminal_challenge_after_enrichment(ctx, response)
+        settled_page_evidence = post_run_page_evidence or ctx.composition_page_evidence
+        bind_post_run_page_evidence(
+            ctx,
+            result_data,
+            # Singular selectors are stripped at this boundary; page_evidence_refs reaches a prompt.
+            model_visible_composition_evidence(settled_page_evidence) if settled_page_evidence else None,
+            regraded=_build_recorded_build_test_outcome(
+                ctx,
+                response,
+                ctx.last_run_outcome or committed_run_outcome,
+                response.get(_INTERNAL_GOAL_PATH_OMISSIONS_KEY),
+            ),
+        )
+        _update_verification_evidence_from_run_result(ctx, response)
+
+        # Update verified prefix state ONLY on a fully-successful run. A failed
+        # suffix run leaves the browser in post-failure state, so we must not
+        # trust blocks that individually succeeded inside it.
+        if run_fully_completed:
+            for label, output in block_outputs_by_label.items():
+                ctx.verified_block_outputs[label] = output
             if sensitive_origin_run:
                 # Preserve verified labels and outputs, but never carry browser-position URLs from
                 # a credential-bearing run into a later frontier or model-visible result.
@@ -3457,7 +3539,7 @@ async def _run_blocks_and_collect_debug(
                 if verified_current_url is not None:
                     ctx.verified_prefix_current_url = verified_current_url
 
-        return build_run_blocks_response(run_ok, result_data)
+        return response
     finally:
         # A paused run keeps its association so the pane still follows the run the person was
         # asked to act on; the next run's generation replaces it.
@@ -3809,6 +3891,82 @@ def _block_labels_from_result_data(data: Mapping[str, object]) -> tuple[str, ...
     return tuple(dict.fromkeys(labels))
 
 
+def _apply_terminal_challenge_latches(
+    copilot_ctx: CopilotContext, result: dict[str, Any], terminal_challenge: TerminalChallengeEvidence
+) -> None:
+    result["ok"] = False
+    result.setdefault("error", terminal_challenge.reason)
+    data = result.get("data")
+    if isinstance(data, dict):
+        data.setdefault("failure_reason", terminal_challenge.reason)
+        _ensure_terminal_challenge_category(
+            data, challenge_evidence_source=terminal_challenge.challenge_evidence_source
+        )
+        copilot_ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
+    LOG.info(
+        "copilot anti-bot evidence stamp",
+        anti_bot_evidence_source=terminal_challenge.challenge_evidence_source,
+        stamp_seam="terminal_challenge",
+    )
+    copilot_ctx.last_test_ok = False
+    copilot_ctx.last_test_suspicious_success = False
+    copilot_ctx.last_test_failure_reason = terminal_challenge.reason
+    copilot_ctx.last_test_anti_bot = terminal_challenge.reason
+    copilot_ctx.last_full_workflow_test_ok = False
+    copilot_ctx.last_failed_workflow_yaml = copilot_ctx.workflow_yaml
+    # A challenge used to fire before the success branch could run, so these were unreachable for a
+    # challenged run; the grade now precedes the settle and can set them.
+    copilot_ctx.verified_terminal_proposal_ready = False
+
+
+def settle_terminal_challenge_after_enrichment(copilot_ctx: CopilotContext, result: dict[str, Any]) -> bool:
+    """Re-decide the terminal challenge once post-run page evidence exists, since the grade committed
+    at handback could not see it. It may only turn a reported pass into a failure, never the reverse."""
+    if result.get("ok") is not True:
+        return False
+    structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
+    anti_bot_match, _, failure_categories, _ = _analyze_run_blocks(result, copilot_ctx)
+    anti_bot_source = first_carrier_backed_anti_bot_source(failure_categories) if anti_bot_match else None
+    anti_bot_evidence_source = anti_bot_source.value if anti_bot_source else None
+    if not anti_bot_match:
+        anti_bot_match = _composition_anti_bot_reason(copilot_ctx)
+        if anti_bot_match:
+            composition_source = composition_challenge_carrier(copilot_ctx.composition_page_evidence)
+            anti_bot_evidence_source = composition_source.value if composition_source else None
+    if anti_bot_match and not anti_bot_evidence_source:
+        # Keyword-only, same as the pre-enrichment path: drop the match but keep going, because a
+        # structured blocker plus a challenge artifact still decides this without it.
+        LOG.info("copilot anti-bot latch keyword-only-suppressed")
+        anti_bot_match = None
+    terminal_challenge = _terminal_challenge_evidence(
+        result,
+        failure_categories=failure_categories,
+        structured_blocker=structured_blocker,
+        anti_bot_match=anti_bot_match,
+        anti_bot_evidence_source=anti_bot_evidence_source,
+        artifact_flag_key=_artifact_challenge_flag_from_result(result, copilot_ctx),
+        challenge_kind=_terminal_challenge_kind(copilot_ctx, result),
+    )
+    if terminal_challenge is None:
+        return False
+    _apply_terminal_challenge_latches(copilot_ctx, result, terminal_challenge)
+    # The committed outcome still reads as the pass this run looked like; the emitted envelope would
+    # otherwise contradict the failure the caller now returns.
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    _stash_recorded_run_outcome(
+        copilot_ctx,
+        RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason=run_outcome_display_reason(terminal_challenge.reason),
+            workflow_run_id=run_id if isinstance(run_id, str) else None,
+            run_completed=False,
+        ),
+    )
+    return True
+
+
 def _terminal_challenge_evidence(
     result: dict[str, Any],
     *,
@@ -4007,7 +4165,10 @@ def _retained_terminal_output_has_value(value: Any) -> bool:
 
 
 def _record_run_blocks_result(
-    copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
+    copilot_ctx: Any,
+    result: dict[str, Any],
+    completion_verification: CompletionVerificationResult | None = None,
+    connect_failure_reason: str | None = None,
 ) -> RecordedRunOutcome | None:
     """Record the run result on ctx without letting a second judge rewrite it."""
     _record_executed_block_labels(copilot_ctx, result)
@@ -4154,27 +4315,8 @@ def _record_run_blocks_result(
             }
 
     if terminal_challenge is not None:
-        result["ok"] = False
+        _apply_terminal_challenge_latches(copilot_ctx, result, terminal_challenge)
         run_ok = False
-        result.setdefault("error", terminal_challenge.reason)
-        data = result.get("data")
-        if isinstance(data, dict):
-            data.setdefault("failure_reason", terminal_challenge.reason)
-            _ensure_terminal_challenge_category(
-                data, challenge_evidence_source=terminal_challenge.challenge_evidence_source
-            )
-            copilot_ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
-        LOG.info(
-            "copilot anti-bot evidence stamp",
-            anti_bot_evidence_source=terminal_challenge.challenge_evidence_source,
-            stamp_seam="terminal_challenge",
-        )
-        copilot_ctx.last_test_ok = False
-        copilot_ctx.last_test_suspicious_success = False
-        copilot_ctx.last_test_failure_reason = terminal_challenge.reason
-        copilot_ctx.last_test_anti_bot = terminal_challenge.reason
-        copilot_ctx.last_full_workflow_test_ok = False
-        copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
 
     if run_ok:
         registered_output_identity_mismatch = bool(
@@ -4255,12 +4397,18 @@ def _record_run_blocks_result(
         copilot_ctx.last_test_failure_reason = next(iter_failure_reasons(result), None)
     if result.get("error") and copilot_ctx.last_test_failure_reason is None:
         copilot_ctx.last_test_failure_reason = str(result["error"])
+    if connect_failure_reason:
+        # User-facing surfaces read this; the result dict keeps the run's own reason for the
+        # repair signature, the failure summary and loop detection.
+        copilot_ctx.last_test_failure_reason = connect_failure_reason
     _update_verification_evidence_from_run_result(copilot_ctx, result)
     recorded_outcome = RecordedRunOutcome(
         verdict="not_demonstrated",
         reason_code="blocker_reported",
         display_reason=run_outcome_display_reason(
-            copilot_ctx.last_test_failure_reason or str(result.get("error") or "The run failed.")
+            connect_failure_reason
+            or copilot_ctx.last_test_failure_reason
+            or str(result.get("error") or "The run failed.")
         ),
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         run_completed=False,
@@ -4270,6 +4418,19 @@ def _record_run_blocks_result(
 
 
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
+
+
+def _commit_run_blocks_record(copilot_ctx: CopilotContext, result: dict[str, Any]) -> RecordedRunOutcome | None:
+    """Commit the run's structured outcome once, marking the result so the shared seam does not redo it.
+
+    The browser-loss stamp runs here rather than at the shared seam: the commit happens upstream of
+    that seam, so a stamp applied there would never reach the committed record."""
+    connect_failure_reason = _stamp_run_side_connect_failure(copilot_ctx, result)
+    recorded = _record_run_blocks_result(
+        copilot_ctx, result, completion_verification=None, connect_failure_reason=connect_failure_reason
+    )
+    result[_INTERNAL_RUN_OUTCOME_RECORDED_KEY] = True
+    return recorded
 
 
 def _record_executed_block_labels(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
@@ -4358,6 +4519,8 @@ def _record_build_test_outcome(
     recorded_run_outcome: RecordedRunOutcome | None,
     declared_goal_path_omissions: Sequence[Mapping[str, str]] | None = None,
 ) -> None:
+    # Kept on the result so a post-enrichment regrade reads the same omission facts this grade did.
+    result[_INTERNAL_GOAL_PATH_OMISSIONS_KEY] = list(declared_goal_path_omissions or [])
     record_build_test_outcome(
         copilot_ctx,
         _build_recorded_build_test_outcome(
@@ -4546,24 +4709,75 @@ def _safe_reason_code(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+_RUN_SIDE_CONNECT_STATES: dict[str, BuildTestConnectFailureState] = {
+    "browser_session_closed": "already_closed",
+    "browser_session_startup_timeout": "provisioning_unavailable",
+}
+
+
+def _run_side_connect_state(failure_category: object) -> BuildTestConnectFailureState | None:
+    if not isinstance(failure_category, list):
+        return None
+    for entry in failure_category:
+        if isinstance(entry, dict) and entry.get("category") == "BROWSER_ERROR":
+            state = _RUN_SIDE_CONNECT_STATES.get(str(entry.get("reason_code") or ""))
+            if state is not None:
+                return state
+    return None
+
+
+def _stamp_run_side_connect_failure(copilot_ctx: CopilotContext, result: dict[str, Any]) -> str | None:
+    """Attach the typed browser-loss fact the run itself persisted at its lease seam, beside the
+    run's own failure text, and return the sentence the user should see. Nothing here is inferred:
+    a run that failed for any other reason carries no BROWSER_ERROR reason code and stays untyped,
+    however its session row happens to look afterwards."""
+    if result.get("ok"):
+        return None
+    data = result.get("data")
+    if not isinstance(data, dict) or data.get("build_test_connect_failure") is not None:
+        return None
+    if data.get("blocks") or data.get("control_signal") is not None:
+        return None
+    workflow_run_id = data.get("workflow_run_id")
+    if not isinstance(workflow_run_id, str) or not workflow_run_id:
+        return None
+    state = _run_side_connect_state(data.get("failure_category"))
+    if state is None:
+        return None
+    session_id = data.get("browser_session_id")
+    failure = BuildTestConnectFailure(
+        state=state,
+        browser_session_id=session_id if isinstance(session_id, str) and session_id else None,
+        workflow_run_id=workflow_run_id,
+    )
+    data["build_test_connect_failure"] = failure.model_dump(mode="json", exclude_none=True)
+    return build_test_connect_failure_sentence(failure)
+
+
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], _handler_start: float
 ) -> RecordedBuildTestOutcome | None:
     """Record and emit the run fact once; no authoring judge may rewrite it."""
-    await _resolve_captcha_solver_availability(copilot_ctx)
-    recorded = _record_run_blocks_result(copilot_ctx, result, completion_verification=None)
+    if result.get(_INTERNAL_RUN_OUTCOME_RECORDED_KEY) is True:
+        recorded = copilot_ctx.last_run_outcome
+    else:
+        recorded = _commit_run_blocks_record(copilot_ctx, result)
     if not result.get("ok"):
         _mark_stored_post_run_failure_page(copilot_ctx)
+    if recorded is not None:
+        await _send_run_outcome_update(
+            copilot_ctx,
+            result,
+            verdict=recorded.verdict,
+            role=recorded.role,
+            reason_code=recorded.reason_code,
+            display_reason=recorded.display_reason,
+        )
+    # The solver probe reaches the browser and can be cancelled by the turn deadline, so it runs
+    # only after the outcome is committed and emitted, and still before the caller builds repair context.
+    await _resolve_captcha_solver_availability(copilot_ctx)
     if recorded is None:
         return None
-    await _send_run_outcome_update(
-        copilot_ctx,
-        result,
-        verdict=recorded.verdict,
-        role=recorded.role,
-        reason_code=recorded.reason_code,
-        display_reason=recorded.display_reason,
-    )
     build_test_outcome = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
     result_data = result.get("data")
     result_run_id = result_data.get("workflow_run_id") if isinstance(result_data, dict) else None

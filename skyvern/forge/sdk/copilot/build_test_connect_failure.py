@@ -18,3 +18,11 @@ class BuildTestConnectFailure(BaseModel):
     task_id: str | None = None
     browser_session_id: str | None = None
     retry_action: Literal["test_end_to_end"] = "test_end_to_end"
+
+
+def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str:
+    """A run id means the session was lost after the run started, so the operator must not be
+    pointed at provisioning."""
+    if failure.workflow_run_id:
+        return f"Build-test browser session was unavailable before any block ran: {failure.state}."
+    return f"Build-test browser acquisition stopped: {failure.state}."

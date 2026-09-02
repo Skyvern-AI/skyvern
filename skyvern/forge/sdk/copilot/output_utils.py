@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY = "_copilot_internal_run_cancelled_by_watchdog"
+_INTERNAL_RUN_OUTCOME_RECORDED_KEY = "_copilot_internal_run_outcome_recorded"
+_INTERNAL_GOAL_PATH_OMISSIONS_KEY = "_copilot_internal_goal_path_omissions"
 _BASE64_IMAGE_OMITTED_MESSAGE = "[base64 image omitted — screenshot was taken successfully]"
 BUILD_TEST_PACKET_KEY = "build_test_packet"
 
@@ -1216,6 +1218,8 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             "timing_ms",
             "_workflow",
             _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+            _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
+            _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
         ),
         drop_data_keys=("sdk_equivalent", "authored_locator_observations"),
         replacement_fields={"screenshot_base64": _BASE64_IMAGE_OMITTED_MESSAGE},

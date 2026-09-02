@@ -13,7 +13,10 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
-from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailure,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     carrier_backed_anti_bot_categories,
     interactive_challenge_controls,
@@ -456,6 +459,30 @@ class _RecordedBuildTestOutcomeContext(Protocol):
     recorded_persisted_block_run_workflow_run_id: str | None
 
 
+def _history_entry(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome) -> dict[str, object]:
+    return {
+        "phase": outcome.phase,
+        "reason_code": outcome.reason_code,
+        "verdict": outcome.verdict,
+        "structural_key": outcome.structural_key,
+        "is_authoritative": outcome.is_authoritative,
+        "workflow_run_id": outcome.workflow_run_id,
+        "authored_structure_signature": outcome.authored_structure_signature,
+        "block_labels": list(outcome.block_labels),
+        "attempted_block_label": outcome.attempted_block_label,
+        "attempted_block_signature": _attempted_block_signature(ctx, outcome),
+        "attempted_call_ref": outcome.attempted_call_ref,
+        "code_safety_rejection_facts": [fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts],
+        "failed_operation": (
+            outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
+        ),
+        "connect_failure": (
+            outcome.connect_failure.model_dump(mode="json") if outcome.connect_failure is not None else None
+        ),
+        "failed_operation_call_signature": outcome.failed_operation_call_signature,
+    }
+
+
 def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome | None) -> None:
     if outcome is None:
         latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
@@ -504,31 +531,7 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     ctx.latest_recorded_build_test_outcome = outcome
     raw_history = getattr(ctx, "recorded_build_test_outcome_history", None)
     history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
-    history.append(
-        {
-            "phase": outcome.phase,
-            "reason_code": outcome.reason_code,
-            "verdict": outcome.verdict,
-            "structural_key": outcome.structural_key,
-            "is_authoritative": outcome.is_authoritative,
-            "workflow_run_id": outcome.workflow_run_id,
-            "authored_structure_signature": outcome.authored_structure_signature,
-            "block_labels": list(outcome.block_labels),
-            "attempted_block_label": outcome.attempted_block_label,
-            "attempted_block_signature": _attempted_block_signature(ctx, outcome),
-            "attempted_call_ref": outcome.attempted_call_ref,
-            "code_safety_rejection_facts": [
-                fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts
-            ],
-            "failed_operation": (
-                outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
-            ),
-            "connect_failure": (
-                outcome.connect_failure.model_dump(mode="json") if outcome.connect_failure is not None else None
-            ),
-            "failed_operation_call_signature": outcome.failed_operation_call_signature,
-        }
-    )
+    history.append(_history_entry(ctx, outcome))
     del history[:-_HISTORY_LIMIT]
     ctx.recorded_build_test_outcome_history = history
     if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
@@ -797,6 +800,58 @@ def bind_post_run_page_path_failure(
     if condition is None:
         return False
     ctx.latest_recorded_build_test_outcome = latest.model_copy(update={"page_path_failure": condition})
+    return True
+
+
+def bind_post_run_page_evidence(
+    ctx: _RecordedBuildTestOutcomeContext,
+    data: Mapping[str, object],
+    page_evidence: Mapping[str, object] | None,
+    *,
+    regraded: RecordedBuildTestOutcome | None = None,
+) -> bool:
+    """Settle the outcome for this run now that post-run page evidence exists, replacing the
+    entry recorded before it rather than appending a second one. Page evidence is a grading
+    input rather than a decoration, so ``regraded`` supersedes a verdict reached without it."""
+    run_id = _safe_str(data.get("workflow_run_id"))
+    if not run_id:
+        return False
+    if regraded is not None and (regraded.phase != "persisted_block_run" or regraded.workflow_run_id != run_id):
+        regraded = None
+    latest = ctx.latest_recorded_build_test_outcome
+    if latest is None or latest.phase != "persisted_block_run" or latest.workflow_run_id != run_id:
+        # Grading before enrichment had no page to key on, so this run may have recorded nothing at all.
+        if regraded is None:
+            return False
+        record_build_test_outcome(ctx, regraded)
+        return True
+    graded = page_evidence if _post_run_page_evidence_matches_result(data, page_evidence) else None
+    page_fields: dict[str, object] = {
+        "page_evidence_refs": _page_evidence_refs(graded),
+        "page_capture": post_run_page_capture_from_result(data, graded),
+        "page_path_failure": _post_run_page_path_failure(graded, run_id),
+        "observed_page_value_excerpt": _observed_page_value_excerpt(graded),
+    }
+    if regraded is not None:
+        # record_build_test_outcome resolved these against the executed code; the regrade cannot see it.
+        carried = (
+            {
+                "failed_operation": latest.failed_operation,
+                "failed_operation_call_signature": latest.failed_operation_call_signature,
+                "failed_operation_code_signature": latest.failed_operation_code_signature,
+            }
+            if latest.failed_operation is not None
+            else {}
+        )
+        updated = regraded.model_copy(update={**page_fields, **carried})
+    else:
+        updated = latest.model_copy(update=page_fields)
+    ctx.latest_recorded_build_test_outcome = updated
+    history = ctx.recorded_build_test_outcome_history
+    if history and history[-1].get("workflow_run_id") == run_id:
+        history[-1] = _history_entry(ctx, updated)
+    if updated.is_authoritative:
+        ctx.recorded_persisted_block_run_workflow_run_id = run_id
     return True
 
 
@@ -1091,7 +1146,7 @@ def recorded_outcome_from_run_blocks_result(
             requested_block_labels=requested_block_labels,
             structural_failure_identity=f"build_test_connect:{connect_failure.state}",
             connect_failure=connect_failure,
-            observed_evidence_summary=f"Build-test browser acquisition stopped: {connect_failure.state}.",
+            observed_evidence_summary=build_test_connect_failure_sentence(connect_failure),
             key_provenance={"structural_failure_identity": "typed build-test browser acquisition fact"},
         )
     executed_block_labels = _clean_list(

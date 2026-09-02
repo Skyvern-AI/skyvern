@@ -54,6 +54,7 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
     InProcessScriptExecutionDenied,
@@ -1385,6 +1386,28 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     suffix = f" (auto-saved: {key})"
     title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
     return f"{title}{suffix}"
+
+
+def _browser_lease_failure_category(exc: Exception) -> list[dict] | None:
+    """The lease seam still holds the typed exception; persist its identity so a reader does not
+    have to rediscover it from prose or from the session row, which closes the same way after
+    every run."""
+    if isinstance(exc, BrowserSessionClosed):
+        reason_code = "browser_session_closed"
+        reasoning = "The browser session had already closed before the run could lease it"
+    elif isinstance(exc, BrowserSessionStartupTimeout):
+        reason_code = "browser_session_startup_timeout"
+        reasoning = "The browser session did not start within its startup timeout"
+    else:
+        return None
+    return [
+        {
+            "category": "BROWSER_ERROR",
+            "confidence_float": 1.0,
+            "reason_code": reason_code,
+            "reasoning": reasoning,
+        }
+    ]
 
 
 class WorkflowService:
@@ -4999,6 +5022,7 @@ class WorkflowService:
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id,
                     failure_reason=failure_reason,
+                    failure_category=_browser_lease_failure_category(e),
                 )
                 await self.clean_up_workflow(
                     workflow=workflow,
