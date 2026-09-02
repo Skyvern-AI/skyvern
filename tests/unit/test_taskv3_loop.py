@@ -8720,7 +8720,7 @@ async def test_degrading_the_summary_dict_keeps_tool_choice() -> None:
 
 
 def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
-    from skyvern.forge.taskv3.loop import _CanonicalProgressTracker
+    from skyvern.forge.taskv3.loop import _CanonicalProgressTracker, _ProgressEvidence
 
     t = _CanonicalProgressTracker()
     assert t.record_touch("#code", True) == (1, 1)
@@ -8730,9 +8730,33 @@ def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> N
     assert t.looping_targets() == 0  # below the 4-touch rung
     assert t.record_touch("#code", False) == (4, 3)
     assert t.looping_targets() == 1
-    t.progress()
+    t.progress(_ProgressEvidence.FRESH_DOWNLOAD_OR_NAVIGATION)
     assert t.record_touch("#code", True) == (1, 1)  # streak reset by progress
     assert t.looping_targets() == 0
+
+
+def test_canonical_ring_state_is_touched_only_through_the_tracker() -> None:
+    # The choke-point contract: a clear that bypasses progress() (poking the ring's fields
+    # directly) is behavior-identical and invisible to every other test in this file, so the
+    # invariant is pinned at the source level — the ring's state must have no references
+    # outside _CanonicalProgressTracker's own body.
+    import ast
+    import inspect
+
+    import skyvern.forge.taskv3.loop as loop_module
+
+    source = inspect.getsource(loop_module)
+    tree = ast.parse(source)
+    tracker = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "_CanonicalProgressTracker"
+    )
+    lines = source.splitlines()
+    outside = [
+        (idx + 1, line)
+        for idx, line in enumerate(lines)
+        if ("_touches" in line or "_fired" in line) and not (tracker.lineno <= idx + 1 <= tracker.end_lineno)
+    ]
+    assert outside == []
 
 
 def _error_billable_tool(name: str, sink: list[tuple[str, dict[str, Any]]]) -> ToolSpec:
@@ -8809,7 +8833,9 @@ async def test_canonical_loop_clears_on_invalid_fields_new_low_not_on_stall_verd
 
     async def observe_handler(args: dict[str, Any]) -> ToolResult:
         inv = next(seq)
-        return ToolResult.ok(f"url=x inv={inv}", data={"summary": {"invalid_fields": inv}})
+        # Constant observed text: the varying count must reach the ledger only via data, or the
+        # perception-digest clear wipes the ring on its own and masks the clear under test.
+        return ToolResult.ok("url=x form", data={"summary": {"invalid_fields": inv}})
 
     observe_tool = ToolSpec(
         name="observe",
