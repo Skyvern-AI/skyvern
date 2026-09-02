@@ -6,11 +6,18 @@ generation-0 GC defers, so plain refcount drop leaves ~100 MB/event resident unt
 collection runs (which can exhaust worker memory). These tests pin the fix: explicit close of the decoded
 images, the stitched image, and the PNG buffer, followed by a full ``gc.collect()`` scoped
 to the multi-viewport stitch — without changing the returned bytes or scroll restoration.
+
+The ``test_cdp_rescue_*`` cases cover the same handler's other branch: the raw-CDP rescue that runs
+when the capture primitive itself failed, and the conditions under which it must stay out of the way.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 from io import BytesIO
+from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,6 +25,14 @@ from PIL import Image
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import skyvern.webeye.utils.page as page_module
+from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.webeye.browser_engine import (
+    SKYCDP_ENGINE_NAME,
+    BrowserDriverStarter,
+    BrowserEngineMetadata,
+    BrowserEngineSelection,
+)
+from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.utils.page import ScreenshotMode
 
 
@@ -92,15 +107,21 @@ async def _invoke_take_scrolling_screenshot(
     bytesio_instances: list[BytesIO],
     fake_frame: _FakeSkyvernFrame,
     fallback_bytes: bytes = b"FALLBACK",
+    page: MagicMock | None = None,
+    engine_selection: BrowserEngineSelection | None = None,
+    scroll_helper_exc: Exception | None = None,
+    record_recovery: MagicMock | None = None,
+    file_path: str | None = None,
 ) -> bytes:
     tracking_bytesio = _tracking_bytesio_factory(bytesio_instances)
+    scroll_helper = (
+        AsyncMock(side_effect=scroll_helper_exc)
+        if scroll_helper_exc is not None
+        else AsyncMock(return_value=(list(screenshots), list(positions)))
+    )
     with (
         patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame)),
-        patch.object(
-            page_module,
-            "_scrolling_screenshots_helper",
-            AsyncMock(return_value=(list(screenshots), list(positions))),
-        ),
+        patch.object(page_module, "_scrolling_screenshots_helper", scroll_helper),
         patch.object(page_module, "_merge_images_by_position", MagicMock(side_effect=merge_impl)),
         patch.object(
             page_module,
@@ -109,11 +130,18 @@ async def _invoke_take_scrolling_screenshot(
         ),
         patch.object(page_module, "BytesIO", tracking_bytesio),
         patch.object(page_module, "gc", fake_gc, create=True),
+        patch.object(page_module.skyvern_context, "record_browser_success", MagicMock()),
+        patch.object(page_module.skyvern_context, "record_browser_recovery", record_recovery or MagicMock()),
+        patch.object(page_module, "CDP_RESCUE_SESSION_TIMEOUT_SECONDS", 0.05),
+        patch.object(page_module, "CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS", 0.05),
+        patch.object(page_module, "CDP_RESCUE_DETACH_TIMEOUT_SECONDS", 0.05),
     ):
         return await page_module.SkyvernFrame.take_scrolling_screenshot(
-            page=MagicMock(name="page"),
+            page=page if page is not None else MagicMock(name="page"),
+            file_path=file_path,
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
+            engine_selection=engine_selection,
         )
 
 
@@ -411,6 +439,202 @@ def test_merge_images_closes_canvas_and_crop_when_paste_fails_after_allocation()
 
     for img in images:
         img.close()
+
+
+async def _hang(*args: object, **kwargs: object) -> None:
+    await asyncio.sleep(30)
+
+
+def _skycdp_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name=SKYCDP_ENGINE_NAME,
+        start_driver=cast("BrowserDriverStarter", lambda: None),
+        error_type=Exception,
+        timeout_error_type=TimeoutError,
+        metadata=BrowserEngineMetadata(name=SKYCDP_ENGINE_NAME),
+        selection_reason="test-skycdp",
+    )
+
+
+def _cdp_page(
+    *,
+    send_result: dict[str, str] | None = None,
+    send_exc: Exception | None = None,
+    send_hang: bool = False,
+    detach_exc: Exception | None = None,
+    detach_hang: bool = False,
+    open_hang: bool = False,
+) -> tuple[MagicMock, AsyncMock]:
+    session = AsyncMock(name="cdp_session")
+    if send_hang:
+        session.send = AsyncMock(side_effect=_hang)
+    else:
+        session.send = AsyncMock(side_effect=send_exc) if send_exc else AsyncMock(return_value=send_result or {})
+    if detach_hang:
+        session.detach = AsyncMock(side_effect=_hang)
+    else:
+        session.detach = AsyncMock(side_effect=detach_exc) if detach_exc else AsyncMock(return_value=None)
+    page = MagicMock(name="page")
+    page.context.new_cdp_session = AsyncMock(side_effect=_hang) if open_hang else AsyncMock(return_value=session)
+    return page, session
+
+
+async def _invoke_rescue_case(
+    *,
+    page: MagicMock,
+    fake_frame: _FakeSkyvernFrame,
+    scroll_helper_exc: Exception,
+    engine_selection: BrowserEngineSelection | None = None,
+    record_recovery: MagicMock | None = None,
+    file_path: str | None = None,
+) -> bytes:
+    return await _invoke_take_scrolling_screenshot(
+        screenshots=[],
+        positions=[],
+        scrolling_number=2,
+        merge_impl=MagicMock(),
+        fake_gc=MagicMock(),
+        bytesio_instances=[],
+        fake_frame=fake_frame,
+        page=page,
+        engine_selection=engine_selection,
+        scroll_helper_exc=scroll_helper_exc,
+        record_recovery=record_recovery,
+        file_path=file_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cdp_rescue_returns_png_writes_file_and_records_success(tmp_path: Path) -> None:
+    expected_png = _png_bytes(800, 600, (43, 108, 176))
+    page, session = _cdp_page(send_result={"data": base64.b64encode(expected_png).decode()})
+    fake_frame = _FakeSkyvernFrame()
+    record_recovery = MagicMock()
+    out_path = tmp_path / "not" / "yet" / "created" / "rescued.png"
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=fake_frame,
+        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
+        record_recovery=record_recovery,
+        file_path=str(out_path),
+    )
+
+    assert result == expected_png
+    assert out_path.read_bytes() == expected_png, (
+        "the rescue must create missing parent directories like page.screenshot"
+    )
+    record_recovery.assert_called_once_with(BrowserOperation.SCREENSHOT)
+    session.send.assert_awaited_once_with("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
+    session.detach.assert_awaited_once()
+    assert fake_frame.scroll_restore_calls == [], "rescue must not scroll the page that just failed to capture"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detach_exc,detach_hang", [(RuntimeError("detach boom"), False), (None, True)])
+async def test_cdp_rescue_keeps_bytes_when_detach_fails_or_hangs(
+    detach_exc: Exception | None, detach_hang: bool
+) -> None:
+    expected_png = _png_bytes(120, 100, (10, 20, 30))
+    page, session = _cdp_page(
+        send_result={"data": base64.b64encode(expected_png).decode()},
+        detach_exc=detach_exc,
+        detach_hang=detach_hang,
+    )
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=_FakeSkyvernFrame(),
+        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
+    )
+
+    assert result == expected_png
+    session.detach.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_exc,send_hang", [(RuntimeError("cdp send boom"), False), (None, True)])
+async def test_cdp_rescue_send_failure_or_hang_falls_back_and_detaches(
+    send_exc: Exception | None, send_hang: bool, tmp_path: Path
+) -> None:
+    page, session = _cdp_page(send_exc=send_exc, send_hang=send_hang)
+    record_recovery = MagicMock()
+    out_path = tmp_path / "rescued.png"
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=_FakeSkyvernFrame(),
+        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
+        record_recovery=record_recovery,
+        file_path=str(out_path),
+    )
+
+    assert result == b"FALLBACK"
+    assert not out_path.exists()
+    record_recovery.assert_not_called()
+    session.detach.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_result", [{}, {"data": ""}, {"data": "abcde"}, {"data": "!!!!YQ=="}])
+async def test_cdp_rescue_rejects_non_png_payloads(send_result: dict[str, str], tmp_path: Path) -> None:
+    page, _ = _cdp_page(send_result=send_result)
+    record_recovery = MagicMock()
+    out_path = tmp_path / "rescued.png"
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=_FakeSkyvernFrame(),
+        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
+        record_recovery=record_recovery,
+        file_path=str(out_path),
+    )
+
+    assert result == b"FALLBACK"
+    assert not out_path.exists(), "a non-PNG payload must never be written to the artifact path"
+    record_recovery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cdp_rescue_session_open_timeout_falls_back() -> None:
+    page, _ = _cdp_page(open_hang=True)
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=_FakeSkyvernFrame(),
+        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
+    )
+
+    assert result == b"FALLBACK"
+
+
+@pytest.mark.asyncio
+async def test_cdp_rescue_skipped_on_skycdp_engine() -> None:
+    page, _ = _cdp_page(send_result={"data": base64.b64encode(_png_bytes(120, 100, (1, 2, 3))).decode()})
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=_FakeSkyvernFrame(),
+        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
+        engine_selection=_skycdp_selection(),
+    )
+
+    assert result == b"FALLBACK"
+    page.context.new_cdp_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cdp_rescue_skipped_for_non_screenshot_exception() -> None:
+    page, _ = _cdp_page(send_result={"data": base64.b64encode(_png_bytes(120, 100, (1, 2, 3))).decode()})
+
+    result = await _invoke_rescue_case(
+        page=page,
+        fake_frame=_FakeSkyvernFrame(),
+        scroll_helper_exc=RuntimeError("stitch boom"),
+    )
+
+    assert result == b"FALLBACK"
+    page.context.new_cdp_session.assert_not_called()
 
 
 def _fake_timeout_page(message: str) -> MagicMock:
