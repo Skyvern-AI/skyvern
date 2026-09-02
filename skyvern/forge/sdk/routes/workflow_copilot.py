@@ -2268,6 +2268,7 @@ async def _new_copilot_chat_post(
                     ),
                     eval_mode=eval_mode,
                     eval_entrypoint_url=eval_entrypoint_url,
+                    auto_accept=chat.auto_accept,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(

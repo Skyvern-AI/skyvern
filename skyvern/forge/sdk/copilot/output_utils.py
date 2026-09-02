@@ -1549,6 +1549,12 @@ def _describe_value_shape(value: Any) -> str:
     return "value"
 
 
+def _workflow_write_phrase(data: dict[str, Any]) -> str:
+    """A write stages a proposal — only the end of the turn can persist it — so the summary frame
+    must not say the workflow was updated when the tool result it summarizes says ``staged``."""
+    return "Staged a workflow draft" if data.get("persistence") else "Workflow updated"
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
     the activity feed; the default leaves them verbatim because this string is parsed
@@ -1564,17 +1570,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     data = raw_data if isinstance(raw_data, dict) else {}
 
     if tool_name == "update_workflow":
-        return f"Workflow updated ({data.get('block_count', '?')} blocks)"
+        return f"{_workflow_write_phrase(data)} ({data.get('block_count', '?')} blocks)"
     if tool_name == "update_and_run_blocks" or (tool_name == "edit_block_and_run" and data.get("skipped_run")):
         if not isinstance(raw_data, dict):
             return "OK"
         if data.get("skipped_run"):
-            return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
+            return f"{_workflow_write_phrase(data)} ({data.get('block_count', '?')} blocks); browser run skipped"
         # Non-skip result is run-blocks-shaped (overall_status, no block_count).
+        ran = "Staged a workflow draft and ran it" if data.get("persistence") else "Updated the workflow and ran it"
         status = data.get("overall_status") or data.get("status")
         if status:
-            return f"Updated the workflow and ran it: {status}"
-        return "Updated the workflow and ran it"
+            return f"{ran}: {status}"
+        return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
             credential = data.get("credential")
