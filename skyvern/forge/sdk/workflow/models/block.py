@@ -226,6 +226,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -15575,7 +15576,13 @@ class WorkflowTriggerBlock(Block):
                     if created_fresh_session and resolved_browser_session_id:
                         try:
                             await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                                organization_id, resolved_browser_session_id
+                                organization_id,
+                                resolved_browser_session_id,
+                                reason=(
+                                    BrowserSessionCloseReason.user_requested
+                                    if success
+                                    else BrowserSessionCloseReason.aborted
+                                ),
                             )
                         except Exception:
                             LOG.warning(

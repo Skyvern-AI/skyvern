@@ -203,6 +203,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
     TASK_STATUS_MAP,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.proxy_pinning import (
     derive_proxy_session_id,
     redact_proxy_session_id,
@@ -3865,7 +3866,9 @@ class WorkflowService:
     @staticmethod
     async def _close_reused_session_best_effort(*, organization_id: str, session_id: str) -> None:
         try:
-            await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id)
+            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                organization_id, session_id, reason=BrowserSessionCloseReason.aborted
+            )
         except Exception:
             LOG.warning(
                 "Failed to close unusable reused browser session",
