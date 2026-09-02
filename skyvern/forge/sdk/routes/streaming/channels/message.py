@@ -739,7 +739,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.warning(
+                    LOG.info(
                         f"{class_name} no vnc channel client found for message channel.",
                         message=message,
                         **message_channel.identity,
