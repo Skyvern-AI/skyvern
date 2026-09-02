@@ -22,6 +22,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Awaitable, Callable, Literal, TypeVar
 
 import structlog
@@ -932,6 +933,22 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
 )
 
 
+class _ProgressEvidence(str, Enum):
+    """Why the canonical ring was cleared. Every clear names the positive evidence class that
+    justified it — an "assume changed" fallback (a missing sample read charitably) may never clear."""
+
+    REFRESH_RELOAD = "refresh_reload"
+    FRESH_DOWNLOAD_OR_NAVIGATION = "fresh_download_or_navigation"
+    PAGE_TRANSITIONED = "page_transitioned"
+    INVALID_FIELDS_BASELINE_MOVE = "invalid_fields_baseline_move"
+    PERCEPTION_DIGEST = "perception_digest"
+    CROSS_BATCH_MOVEMENT = "cross_batch_movement"
+    PROBE_MISMATCH = "probe_mismatch"
+    AUTO_OBSERVE_VERDICT = "auto_observe_verdict"
+    PAGE_STATE_VERDICT = "page_state_verdict"
+    TERMINAL_BATCH_FINGERPRINT = "terminal_batch_fingerprint"
+
+
 @dataclass
 class _CanonicalProgressTracker:
     """Touches on canonicalized targets since the last compound-progress event (SKY-15379, Phase A).
@@ -944,42 +961,53 @@ class _CanonicalProgressTracker:
     """
 
     window: int = CANONICAL_LOOP_WINDOW
-    touches: list[tuple[str, bool]] = field(default_factory=list)
+    _touches: list[tuple[str, bool]] = field(default_factory=list)
     # Bumped on every clear: a pending loop event minted under an older generation was completed
     # by (or followed by) absorbed progress and must not be emitted.
     gen: int = 0
     # Rungs already fired this generation. Once the window saturates, same-target counts can PARK
     # on a fire rung while churn evicts other keys — a rung is one threshold crossing, not one
     # event per touch spent at it.
-    fired: set[tuple[str, int]] = field(default_factory=set)
+    _fired: set[tuple[str, int]] = field(default_factory=set)
 
     def record_touch(self, target_key: str, is_error: bool) -> tuple[int, int]:
         """Record one billable touch; returns (same-target touches, same-target errors) in-window."""
-        self.touches.append((target_key, is_error))
-        if len(self.touches) > self.window:
-            self.touches.pop(0)
-        same = [err for key, err in self.touches if key == target_key]
+        self._touches.append((target_key, is_error))
+        if len(self._touches) > self.window:
+            self._touches.pop(0)
+        same = [err for key, err in self._touches if key == target_key]
         # A rung re-arms once the in-window count dips below it: a fresh streak after full eviction
         # is a genuine re-crossing, distinct from a saturated window PARKED on a fire count.
-        self.fired = {entry for entry in self.fired if entry[0] != target_key or entry[1] <= len(same)}
+        self._fired = {entry for entry in self._fired if entry[0] != target_key or entry[1] <= len(same)}
         return len(same), sum(1 for err in same if err)
 
-    def progress(self) -> None:
-        self.touches.clear()
-        self.fired.clear()
+    def progress(self, evidence: _ProgressEvidence) -> None:
+        """The one clear choke point: a caller must name its evidence class, so no site can wipe
+        the ring on a local, untyped notion of progress."""
+        self._touches.clear()
+        self._fired.clear()
         self.gen += 1
+        LOG.debug("taskv3 canonical progress clear", evidence=evidence.value)
+
+    def claim_rung(self, target_key: str, count: int) -> bool:
+        """A rung is one threshold crossing per generation: the first claim wins, and a repeat
+        claim while a saturated window PARKS on a fire count is refused."""
+        if (target_key, count) in self._fired:
+            return False
+        self._fired.add((target_key, count))
+        return True
 
     def invalidate_marks(self) -> None:
         """A look renumbered the manifest, so every mark=N key now names an arbitrary element: drop
         them rather than let four different controls alias into one false streak. A surviving mark
         streak is therefore always within a single manifest generation. Selector keys stay — their
         identity outlives the renumbering."""
-        self.touches = [touch for touch in self.touches if not touch[0].startswith("mark=")]
-        self.fired = {entry for entry in self.fired if not entry[0].startswith("mark=")}
+        self._touches = [touch for touch in self._touches if not touch[0].startswith("mark=")]
+        self._fired = {entry for entry in self._fired if not entry[0].startswith("mark=")}
 
     def looping_targets(self) -> int:
         counts: dict[str, list[bool]] = {}
-        for key, err in self.touches:
+        for key, err in self._touches:
             counts.setdefault(key, []).append(err)
         return sum(
             1
@@ -1506,7 +1534,7 @@ async def run_agent_tool_loop(
         stall_nudges_due = []
         if progress is not None:
             progress.hard_progress()
-        canonical.progress()
+        canonical.progress(_ProgressEvidence.REFRESH_RELOAD)
         if submit_watch is not None:
             submit_watch.clear()
         _append_skipped_tool_results(messages, remaining, "the page was refreshed")
@@ -1529,7 +1557,7 @@ async def run_agent_tool_loop(
         # reading the post-absorb value would leave this clear dead for the rest of the page.
         stalled = invalid_fields is not None and progress.observe(invalid_fields)
         if baseline_before is not None and progress.invalid_baseline != baseline_before:
-            canonical.progress()
+            canonical.progress(_ProgressEvidence.INVALID_FIELDS_BASELINE_MOVE)
         if stalled:
             LOG.info(
                 PROGRESS_LEDGER_SHADOW_EVENT,
@@ -1587,7 +1615,7 @@ async def run_agent_tool_loop(
                 # A REPLAYED notice (download_notice without download_new) re-clears the retry
                 # ledger but is not fresh progress: it must not keep wiping the canonical ring, or
                 # a post-download loop could never accumulate enough touches to emit telemetry.
-                canonical.progress()
+                canonical.progress(_ProgressEvidence.FRESH_DOWNLOAD_OR_NAVIGATION)
         # A click that moved the URL is a real page transition (H1 hard progress) for the shadow
         # ledger, but URL equality does NOT prove same-page (a URL-stable SPA form advance) — so only
         # the positive direction is acted on, and kept OUT of the branch above so it never clears the
@@ -1597,7 +1625,7 @@ async def run_agent_tool_loop(
         if result_data.get("page_transitioned") is True:
             if progress is not None:
                 progress.hard_progress()
-            canonical.progress()
+            canonical.progress(_ProgressEvidence.PAGE_TRANSITIONED)
         return tool_name == "look" and bool(result_data.get("marks_renumbered"))
 
     async def _completion_probe_outcome(
@@ -1658,7 +1686,7 @@ async def run_agent_tool_loop(
             _clear_action_state()
             # Two landed digests that differ are positive evidence, exactly like a fingerprint
             # mismatch — and the only movement evidence there is when page_fingerprint is absent.
-            canonical.progress()
+            canonical.progress(_ProgressEvidence.PERCEPTION_DIGEST)
             # Evidence requires NEW content: a URL-only flip (history.pushState) still clears the
             # repeat guards above but earns no budget, and neither does a return to a content state
             # in the probe's recent ring (a panel toggling open and shut).
@@ -1948,7 +1976,7 @@ async def run_agent_tool_loop(
                 # after-sample): the touches the old samples described are stale, and this batch's
                 # dispatch and extension decisions must not read them. Canonical-only — the
                 # incumbent stall counters keep their end-of-batch turn_did_action gate.
-                canonical.progress()
+                canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
         # The auto-observe path's FINAL page-changed verdict (resample included) when it ran; the
         # stall detector prefers this over re-comparing raw samples so the two can never disagree.
@@ -2202,9 +2230,8 @@ async def run_agent_tool_loop(
                 if (
                     same_count in CANONICAL_LOOP_FIRE_COUNTS
                     and same_errors >= same_count - 1
-                    and (target_key, same_count) not in canonical.fired
+                    and canonical.claim_rung(target_key, same_count)
                 ):
-                    canonical.fired.add((target_key, same_count))
                     pending_canonical_fires.append(
                         {
                             "gen": canonical.gen,
@@ -2420,7 +2447,7 @@ async def run_agent_tool_loop(
                         # Two landed identity samples that differ: the failed call still moved the
                         # document, and the fingerprint may render identically on the new one (a
                         # same-template step) — absorb it here or the rung survives that blindness.
-                        canonical.progress()
+                        canonical.progress(_ProgressEvidence.PROBE_MISMATCH)
                 if poisoned:
                     _append_skipped_tool_results(
                         messages,
@@ -2546,7 +2573,7 @@ async def run_agent_tool_loop(
                 batch_auto_page_changed = page_changed
                 batch_auto_page_change_evidence = page_change_evidence
                 if page_changed and page_change_evidence:
-                    canonical.progress()
+                    canonical.progress(_ProgressEvidence.AUTO_OBSERVE_VERDICT)
                 if not page_changed:
                     messages[batch_carrier_idx]["content"] = (
                         str(messages[batch_carrier_idx]["content"]) + "\n\n[no markup change detected after this batch]"
@@ -2757,7 +2784,7 @@ async def run_agent_tool_loop(
                     and batch_auto_page_changed is True
                     and not batch_auto_page_change_evidence
                 ):
-                    canonical.progress()
+                    canonical.progress(_ProgressEvidence.PAGE_STATE_VERDICT)
             elif page_state_changed is False:
                 page_state_stall_rounds += 1
                 if page_state_stall_rounds == PAGE_STATE_STALL_TERMINATE_AFTER and page_state_nudge_delivered:
@@ -2786,7 +2813,7 @@ async def run_agent_tool_loop(
             if batch_fp_after is None:
                 batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
             if batch_fp_after is not None and batch_fp_after != batch_fp_before:
-                canonical.progress()
+                canonical.progress(_ProgressEvidence.TERMINAL_BATCH_FINGERPRINT)
         # A rung completed by — or followed in this batch by — absorbed progress describes a
         # progressing run, not a loop: only events whose generation survived every clear above
         # (same-call result data, invalid-fields baseline, batch fingerprint verdict) are emitted.
