@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -133,15 +133,85 @@ describe("ExtractionBlockForm (SKY-9371)", () => {
 
     const root = screen.getByTestId("extraction-block-form");
     expect(root.getAttribute("data-block-id")).toBe(blockId);
-    // Pin the two accordion section headers carried over from the inline
+    // Pin the three accordion section headers carried over from the inline
     // ExtractionNode form so a future visual refactor that drops one is
     // caught.
     expect(screen.getByText("Extraction")).toBeDefined();
+    expect(screen.getByText("Export")).toBeDefined();
     expect(screen.getByText("Advanced Settings")).toBeDefined();
     // The default-open Extraction section must surface the goal label so
     // a user opening the sidebar sees the extraction goal field
     // immediately, matching inline-tile parity.
     expect(screen.getByText("Data Extraction Goal")).toBeDefined();
+  });
+
+  test("export configuration stays hidden until export is enabled (SKY-15396)", () => {
+    mockNodeFixtures.set(blockId, fixtureNode());
+    renderWithProviders(<ExtractionBlockForm blockId={blockId} />);
+    fireEvent.click(screen.getByText("Export"));
+
+    expect(screen.queryByText("Filename (optional)")).toBeNull();
+    expect(screen.queryByText("Records (optional)")).toBeNull();
+  });
+
+  test("enabling export seeds its schema from the extraction schema, as a one-time convenience (SKY-15396)", () => {
+    mockNodeFixtures.set(
+      blockId,
+      fixtureNode({
+        dataSchema: JSON.stringify({
+          type: "object",
+          properties: { name: { type: "string" } },
+        }),
+      }),
+    );
+    renderWithProviders(<ExtractionBlockForm blockId={blockId} />);
+    fireEvent.click(screen.getByText("Export"));
+
+    fireEvent.click(screen.getByTestId("extraction-export-enabled-switch"));
+
+    expect(updateNodeDataMock).toHaveBeenCalledWith(blockId, {
+      exportEnabled: true,
+      exportDataSchema: JSON.stringify(
+        {
+          type: "array",
+          items: { type: "object", properties: { name: { type: "string" } } },
+        },
+        null,
+        2,
+      ),
+    });
+  });
+
+  test("enabling export passes an already array-typed extraction schema through as-is (SKY-15396)", () => {
+    // Extracting a list of rows is the main export case, and its schema is
+    // already {type: array, items: {...}} -- wrapping it again would nest it
+    // one level too deep and the export would keep the unrelated placeholder.
+    const arraySchema = {
+      type: "array",
+      items: { type: "object", properties: { name: { type: "string" } } },
+    };
+    mockNodeFixtures.set(
+      blockId,
+      fixtureNode({ dataSchema: JSON.stringify(arraySchema) }),
+    );
+    renderWithProviders(<ExtractionBlockForm blockId={blockId} />);
+    fireEvent.click(screen.getByText("Export"));
+
+    fireEvent.click(screen.getByTestId("extraction-export-enabled-switch"));
+
+    expect(updateNodeDataMock).toHaveBeenCalledWith(blockId, {
+      exportEnabled: true,
+      exportDataSchema: JSON.stringify(arraySchema, null, 2),
+    });
+  });
+
+  test("enabling export reveals the export schema, filename, and records fields (SKY-15396)", () => {
+    mockNodeFixtures.set(blockId, fixtureNode({ exportEnabled: true }));
+    renderWithProviders(<ExtractionBlockForm blockId={blockId} />);
+    fireEvent.click(screen.getByText("Export"));
+
+    expect(screen.getByText("Filename (optional)")).toBeDefined();
+    expect(screen.getByText("Records (optional)")).toBeDefined();
   });
 
   test("registers a no-op commit on mount and unregisters on unmount", () => {

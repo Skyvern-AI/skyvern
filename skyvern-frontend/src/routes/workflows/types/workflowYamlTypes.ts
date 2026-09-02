@@ -293,6 +293,10 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  export_enabled?: boolean;
+  export_data_schema?: Record<string, unknown> | null;
+  export_file_name?: string | null;
+  export_records?: string | null;
 };
 
 export type LoginBlockYAML = BlockYAMLBase & {

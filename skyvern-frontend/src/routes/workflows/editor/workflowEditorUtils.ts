@@ -123,6 +123,7 @@ import {
   MAX_STEPS_DEFAULT,
 } from "./nodes/NavigationNode/types";
 import {
+  extractionExportDataSchemaDefault,
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
@@ -867,6 +868,13 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
+          exportEnabled: block.export_enabled ?? false,
+          exportDataSchema:
+            block.export_data_schema == null
+              ? extractionExportDataSchemaDefault
+              : JSON.stringify(block.export_data_schema, null, 2),
+          exportFileName: block.export_file_name ?? "",
+          exportRecords: block.export_records ?? "",
         },
       };
     }
@@ -3164,6 +3172,14 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
+        // export_data_schema (like export_file_name/export_records below) is
+        // saved regardless of export_enabled -- the backend already no-ops on
+        // all three while export is off, and gating persistence here would
+        // silently drop an authored schema the next time the toggle flips.
+        export_enabled: node.data.exportEnabled ?? false,
+        export_data_schema: JSONParseSafe(node.data.exportDataSchema),
+        export_file_name: node.data.exportFileName || null,
+        export_records: node.data.exportRecords || null,
       };
     }
     case "login": {
@@ -4607,6 +4623,10 @@ function convertBlocksToBlockYAML(
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
+          export_enabled: block.export_enabled ?? false,
+          export_data_schema: block.export_data_schema ?? null,
+          export_file_name: block.export_file_name ?? null,
+          export_records: block.export_records ?? null,
         };
         return blockYaml;
       }
