@@ -34,7 +34,7 @@ function WorkingExampleInspector({
       </header>
       <div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-3">
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold">Agent structure</h3>
+          <h3 className="text-sm font-semibold">How the agent is built</h3>
           <ol className="mt-3 list-decimal space-y-3 pl-4 marker:text-muted-foreground">
             {structure.map((step) => (
               <li key={step.title} className="break-words pl-1">
@@ -47,7 +47,7 @@ function WorkingExampleInspector({
           </ol>
         </div>
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold">Agent playback</h3>
+          <h3 className="text-sm font-semibold">What the agent did</h3>
           <ol className="mt-3 list-decimal space-y-2 pl-4 marker:text-muted-foreground">
             {playback.map((detail) => (
               <li

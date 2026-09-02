@@ -201,7 +201,7 @@ it("offers the working example as a quiet focus handoff from step 2", () => {
       onDescribeAgent={vi.fn()}
     >
       <h2 id="working-example-heading" tabIndex={-1}>
-        See how an agent run is organized
+        What a finished run looks like
       </h2>
     </OnboardingProgressBand>,
     { wrapper: MemoryRouter },
@@ -213,6 +213,6 @@ it("offers the working example as a quiet focus handoff from step 2", () => {
   expect(affordance.getAttribute("href")).toBe("#working-example-heading");
   fireEvent.click(affordance);
   expect(document.activeElement).toBe(
-    screen.getByRole("heading", { name: "See how an agent run is organized" }),
+    screen.getByRole("heading", { name: "What a finished run looks like" }),
   );
 });

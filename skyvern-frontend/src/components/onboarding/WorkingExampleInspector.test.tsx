@@ -6,17 +6,19 @@ it("shows provenance, structure, playback, and result before one safe copy", () 
   const onMakeCopy = vi.fn();
   render(<WorkingExampleInspector isPending={false} onMakeCopy={onMakeCopy} />);
   expect(screen.getByText("Example data, not your run")).toBeTruthy();
-  expect(screen.getByRole("heading", { name: "Agent structure" })).toBeTruthy();
+  expect(
+    screen.getByRole("heading", { name: "How the agent is built" }),
+  ).toBeTruthy();
   expect(screen.getByText("Visit a public page")).toBeTruthy();
-  expect(screen.getByRole("heading", { name: "Agent playback" })).toBeTruthy();
+  expect(
+    screen.getByRole("heading", { name: "What the agent did" }),
+  ).toBeTruthy();
   expect(
     screen.getByText(
       "Opened https://www.skyvern.com/ in this static agent example.",
     ),
   ).toBeTruthy();
-  expect(
-    screen.getByRole("heading", { name: "Synthetic agent result" }),
-  ).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Example result" })).toBeTruthy();
   expect(screen.getByText("Product summary")).toBeTruthy();
   expect(screen.getByRole("region").textContent).not.toMatch(/workflow/i);
   expect(onMakeCopy).not.toHaveBeenCalled();

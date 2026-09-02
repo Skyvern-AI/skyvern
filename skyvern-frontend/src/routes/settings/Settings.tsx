@@ -1,6 +1,4 @@
-import { useEffect } from "react";
-import { useLocation } from "react-router-dom";
-
+import { useScrollToHash } from "@/hooks/useScrollToHash";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -48,22 +46,11 @@ function describeRuntimeCredential(credential: RuntimeCredential): string {
 }
 
 function Settings() {
-  const { hash } = useLocation();
+  useScrollToHash();
   const { environment, organization, setEnvironment, setOrganization } =
     useSettingsStore();
   const credential = useRuntimeCredential();
   const { data: versionData } = useVersionQuery();
-
-  useEffect(() => {
-    if (!hash) {
-      return;
-    }
-
-    document.getElementById(hash.slice(1))?.scrollIntoView({
-      behavior: "smooth",
-      block: "start",
-    });
-  }, [hash]);
 
   return (
     <div className="flex flex-col gap-8">

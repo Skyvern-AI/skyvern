@@ -26,11 +26,11 @@ it("keeps the copy payload to one passive public task", () => {
 it("labels playback and result data as synthetic examples", () => {
   const { title, provenance, playback, result } =
     example.onboardingExamplePresentation;
-  expect(title).toBe("See how an agent run is organized");
+  expect(title).toBe("What a finished run looks like");
   expect(provenance).toBe("Example data, not your run");
   expect(playback[0]).toMatch(/static agent example/);
   expect(playback[2]).toMatch(/agent result/);
-  expect(result.title).toMatch(/synthetic.*agent/i);
+  expect(result.title).toBe("Example result");
   expect(result.fields.map(({ label }) => label)).toEqual([
     "Headline",
     "Product summary",

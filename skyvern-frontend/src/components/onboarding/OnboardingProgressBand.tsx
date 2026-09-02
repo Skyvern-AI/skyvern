@@ -26,6 +26,11 @@ type OnboardingProgressBandProps = {
   onDismiss: () => void;
   onRestore: () => void;
   onDescribeAgent: () => void;
+  trackRemaining?: number;
+  onDismissHandoff?: () => void;
+  trackDismissed?: boolean;
+  trackPending?: boolean;
+  onRestoreTrack?: () => void;
   children?: ReactNode;
 };
 type StepState = "complete" | "active" | "pending" | "upcoming";
@@ -81,19 +86,28 @@ function StepDot({ state, index }: { state: StepState; index: number }) {
   );
 }
 
-function ProgressSegments({ completedSteps }: { completedSteps: number }) {
+function ProgressSegments({
+  completedSteps,
+  totalSteps = milestoneLabels.length,
+  label = "Setup progress",
+}: {
+  completedSteps: number;
+  totalSteps?: number;
+  label?: string;
+}) {
   return (
     <div
-      className="grid grid-cols-3 gap-1"
+      className="grid gap-1"
+      style={{ gridTemplateColumns: `repeat(${totalSteps}, minmax(0, 1fr))` }}
       role="progressbar"
-      aria-label="Setup progress"
+      aria-label={label}
       aria-valuemin={0}
-      aria-valuemax={3}
+      aria-valuemax={totalSteps}
       aria-valuenow={completedSteps}
     >
-      {milestoneLabels.map((label, index) => (
+      {Array.from({ length: totalSteps }, (_, index) => (
         <span
-          key={label}
+          key={index}
           aria-hidden="true"
           className={`h-1.5 rounded-full ${
             index < completedSteps ? "bg-primary" : "bg-muted"
@@ -242,6 +256,75 @@ function WorkingExampleAffordance() {
   );
 }
 
+function HandoffRow({
+  remaining,
+  onDismiss,
+}: {
+  remaining: number;
+  onDismiss?: () => void;
+}) {
+  return (
+    <section
+      aria-labelledby="onboarding-handoff-heading"
+      aria-live="polite"
+      role="status"
+      className="flex min-h-11 flex-wrap items-center gap-3 rounded-lg border border-border bg-background px-5 py-3 shadow-sm motion-safe:animate-in motion-safe:fade-in motion-reduce:animate-none sm:px-6"
+    >
+      <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-badge-success text-foreground">
+        <CheckIcon aria-hidden="true" className="size-3.5" />
+      </span>
+      <p
+        id="onboarding-handoff-heading"
+        className="text-sm font-semibold tracking-tight"
+      >
+        First agent ready.
+      </p>
+      <Link
+        to="/getting-started"
+        onClick={onDismiss}
+        className="inline-flex min-h-11 touch-manipulation items-center text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        Keep going: {remaining} more {remaining === 1 ? "step" : "steps"} →
+      </Link>
+      <Button
+        type="button"
+        variant="ghost"
+        className="ml-auto h-11 touch-manipulation text-muted-foreground hover:text-foreground"
+        onClick={onDismiss}
+      >
+        Hide
+      </Button>
+    </section>
+  );
+}
+
+// A hidden track has no sidebar row and no handoff, so Home keeps one quiet
+// way back to it.
+function ResumeTrackRow({
+  isPending,
+  onRestore,
+}: {
+  isPending: boolean;
+  onRestore?: () => void;
+}) {
+  return (
+    <div className="flex justify-end">
+      <Button
+        type="button"
+        variant={isPending ? "disabled" : "ghost"}
+        className="h-11 touch-manipulation text-muted-foreground hover:text-foreground"
+        aria-disabled={isPending}
+        aria-busy={isPending}
+        onClick={() => {
+          if (!isPending) onRestore?.();
+        }}
+      >
+        Resume getting started
+      </Button>
+    </div>
+  );
+}
+
 function CompletionBand() {
   return (
     <section
@@ -291,16 +374,24 @@ function OnboardingProgressBand({
   onDismiss,
   onRestore,
   onDescribeAgent,
+  trackRemaining = 0,
+  onDismissHandoff,
+  trackDismissed = false,
+  trackPending = false,
+  onRestoreTrack,
   children,
 }: OnboardingProgressBandProps) {
   const previousState = useRef(progress?.state);
   const [isCelebrating, setIsCelebrating] = useState(false);
+  // Completed progress with an active track keeps a compact handoff in place
+  // of the retired band; the timed celebration only remains for a null track.
+  const showHandoff = progress?.state === "completed" && trackRemaining > 0;
 
   useEffect(() => {
     const completedFromActive =
       previousState.current === "active" && progress?.state === "completed";
     previousState.current = progress?.state;
-    if (!completedFromActive) {
+    if (!completedFromActive || showHandoff) {
       setIsCelebrating(false);
       return;
     }
@@ -308,13 +399,21 @@ function OnboardingProgressBand({
     setIsCelebrating(true);
     const timeout = window.setTimeout(() => setIsCelebrating(false), 1800);
     return () => window.clearTimeout(timeout);
-  }, [progress?.state]);
+  }, [progress?.state, showHandoff]);
 
+  const resumeTrack = trackDismissed ? (
+    <ResumeTrackRow isPending={trackPending} onRestore={onRestoreTrack} />
+  ) : null;
+  if (showHandoff) {
+    return (
+      <HandoffRow remaining={trackRemaining} onDismiss={onDismissHandoff} />
+    );
+  }
   if (isCelebrating) return <CompletionBand />;
 
   const activeProgress = isActiveProgress(progress) ? progress : null;
   const isDismissed = progress?.state === "dismissed";
-  if (!activeProgress && !isDismissed) return null;
+  if (!activeProgress && !isDismissed) return resumeTrack;
 
   const completedSteps = activeProgress
     ? activeProgress.completed_count + 1
@@ -329,114 +428,118 @@ function OnboardingProgressBand({
     : 1;
 
   return (
-    <div className={activeProgress ? "relative" : "flex justify-end"}>
-      <Button
-        type="button"
-        variant={isPending ? "disabled" : "ghost"}
-        className={`z-10 h-11 touch-manipulation text-muted-foreground hover:text-foreground ${
-          activeProgress ? "absolute right-5 top-4" : ""
-        }`}
-        aria-disabled={isPending}
-        aria-busy={isPending}
-        onClick={() => {
-          if (isPending) return;
-          if (activeProgress) onDismiss();
-          else onRestore();
-        }}
-      >
-        {isPending && <PendingIcon />}
-        {activeProgress ? "Hide setup" : "Resume setup"}
-      </Button>
-
-      {activeProgress && action ? (
-        <section
-          aria-labelledby="onboarding-progress-heading"
+    <>
+      <div className={activeProgress ? "relative" : "flex justify-end"}>
+        <Button
+          type="button"
+          variant={isPending ? "disabled" : "ghost"}
+          className={`z-10 h-11 touch-manipulation text-muted-foreground hover:text-foreground ${
+            activeProgress ? "absolute right-5 top-4" : ""
+          }`}
+          aria-disabled={isPending}
           aria-busy={isPending}
-          className="overflow-hidden rounded-lg border border-border bg-background shadow-sm"
+          onClick={() => {
+            if (isPending) return;
+            if (activeProgress) onDismiss();
+            else onRestore();
+          }}
         >
-          {isPending ? (
-            <span className="sr-only" aria-live="polite">
-              Saving setup progress…
-            </span>
-          ) : null}
-          <div className="border-b border-border bg-card px-5 py-4 sm:px-6">
-            <div className="pr-28">
-              <h2
-                id="onboarding-progress-heading"
-                className="text-base font-semibold tracking-tight"
-              >
-                Build your first agent
-              </h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                An agent is a browser automation you describe in plain words.
-              </p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                <span className="font-semibold tabular-nums text-foreground">
-                  {completedSteps} of 3
-                </span>{" "}
-                complete
-              </p>
+          {isPending && <PendingIcon />}
+          {activeProgress ? "Hide setup" : "Resume setup"}
+        </Button>
+
+        {activeProgress && action ? (
+          <section
+            aria-labelledby="onboarding-progress-heading"
+            aria-busy={isPending}
+            className="overflow-hidden rounded-lg border border-border bg-background shadow-sm"
+          >
+            {isPending ? (
+              <span className="sr-only" aria-live="polite">
+                Saving setup progress…
+              </span>
+            ) : null}
+            <div className="border-b border-border bg-card px-5 py-4 sm:px-6">
+              <div className="pr-28">
+                <h2
+                  id="onboarding-progress-heading"
+                  className="text-base font-semibold tracking-tight"
+                >
+                  Build your first agent
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  An agent is a browser automation you describe in plain words.
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  <span className="font-semibold tabular-nums text-foreground">
+                    {completedSteps} of 3
+                  </span>{" "}
+                  complete
+                </p>
+              </div>
+
+              <div className="mt-4">
+                <ProgressSegments completedSteps={completedSteps} />
+              </div>
+
+              <ol aria-label="Setup milestones" className="mt-4 grid gap-2">
+                {milestoneLabels.map((label, index) => {
+                  const state: StepState =
+                    index < completedSteps
+                      ? "complete"
+                      : isPending && index === activeIndex
+                        ? "pending"
+                        : index === activeIndex
+                          ? "active"
+                          : "upcoming";
+                  return (
+                    <SetupRow
+                      key={label}
+                      label={label}
+                      index={index}
+                      state={state}
+                      secondaryAffordance={
+                        index === 1 &&
+                        activeProgress.next_action_key ===
+                          "first_agent_created" ? (
+                          <WorkingExampleAffordance />
+                        ) : undefined
+                      }
+                      affordance={
+                        index === activeIndex ? (
+                          <QuietResourceLink
+                            href={action.resourceHref}
+                            label={action.resourceLabel}
+                            isPending={isPending}
+                          />
+                        ) : undefined
+                      }
+                    />
+                  );
+                })}
+              </ol>
+
+              <div className="mt-4 flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+                <ProgressPrimaryAction
+                  nextActionKey={activeProgress.next_action_key}
+                  isPending={isPending}
+                  onDescribeAgent={onDescribeAgent}
+                />
+              </div>
             </div>
 
-            <div className="mt-4">
-              <ProgressSegments completedSteps={completedSteps} />
-            </div>
-
-            <ol aria-label="Setup milestones" className="mt-4 grid gap-2">
-              {milestoneLabels.map((label, index) => {
-                const state: StepState =
-                  index < completedSteps
-                    ? "complete"
-                    : isPending && index === activeIndex
-                      ? "pending"
-                      : index === activeIndex
-                        ? "active"
-                        : "upcoming";
-                return (
-                  <SetupRow
-                    key={label}
-                    label={label}
-                    index={index}
-                    state={state}
-                    secondaryAffordance={
-                      index === 1 &&
-                      activeProgress.next_action_key ===
-                        "first_agent_created" ? (
-                        <WorkingExampleAffordance />
-                      ) : undefined
-                    }
-                    affordance={
-                      index === activeIndex ? (
-                        <QuietResourceLink
-                          href={action.resourceHref}
-                          label={action.resourceLabel}
-                          isPending={isPending}
-                        />
-                      ) : undefined
-                    }
-                  />
-                );
-              })}
-            </ol>
-
-            <div className="mt-4 flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
-              <ProgressPrimaryAction
-                nextActionKey={activeProgress.next_action_key}
-                isPending={isPending}
-                onDescribeAgent={onDescribeAgent}
-              />
-            </div>
-          </div>
-
-          {children && (
-            <div className="[&>section]:rounded-none [&>section]:border-0">
-              {children}
-            </div>
-          )}
-        </section>
-      ) : null}
-    </div>
+            {children && (
+              <div className="[&>section]:rounded-none [&>section]:border-0">
+                {children}
+              </div>
+            )}
+          </section>
+        ) : null}
+      </div>
+      {resumeTrack}
+    </>
   );
 }
 
-export { OnboardingProgressBand };
+export { OnboardingProgressBand, PendingIcon, ProgressSegments, StepDot };
+export type { StepState };

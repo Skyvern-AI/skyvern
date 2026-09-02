@@ -2,7 +2,7 @@ import { RunEngine } from "@/api/types";
 import type { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 
 export const onboardingExamplePresentation = {
-  title: "See how an agent run is organized",
+  title: "What a finished run looks like",
   provenance: "Example data, not your run",
   structure: [
     {
@@ -24,7 +24,7 @@ export const onboardingExamplePresentation = {
     "Prepared the bounded agent result shown below.",
   ],
   result: {
-    title: "Synthetic agent result",
+    title: "Example result",
     fields: [
       {
         label: "Headline",
