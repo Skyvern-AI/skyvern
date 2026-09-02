@@ -27,6 +27,30 @@ it("accepts a well-formed track", () => {
   expect(parseOnboardingTrack(validTrack())?.completed_count).toBe(1);
 });
 
+it("accepts only the server-verified second-agent ninth row", () => {
+  const track = validTrack();
+  const ninth = {
+    ...track,
+    total_count: 9,
+    items: [
+      ...track.items,
+      {
+        key: "second_agent_run",
+        completed_at: null,
+        verification: "server",
+      },
+    ],
+  };
+  expect(parseOnboardingTrack(ninth)?.total_count).toBe(9);
+  expect(
+    parseOnboardingTrack({
+      ...ninth,
+      items: [...track.items, { ...ninth.items[8], key: "wrong" }],
+    }),
+  ).toBeNull();
+  expect(parseOnboardingTrack({ ...ninth, total_count: 8 })).toBeNull();
+});
+
 it("rejects the retired six-key shape", () => {
   const track = validTrack();
   expect(

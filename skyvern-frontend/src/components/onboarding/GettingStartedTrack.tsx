@@ -10,6 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   countedTrackItems,
+  SECOND_AGENT_KEY,
   SELF_ATTESTED_KEYS,
   type OnboardingTrackItemV1,
   type OnboardingTrackV1,
@@ -42,9 +43,15 @@ type GettingStartedTrackProps = {
   onDismiss: () => void;
   onRestore: () => void;
   isPending: boolean;
+  rowDetails?: Partial<Record<TrackKey, React.ReactNode>>;
 };
 
 const rowDefinitions: Record<TrackKey, RowDefinition> = {
+  second_agent_run: {
+    title: "Run a second agent",
+    why: "You finished your first workflow.",
+    links: [{ label: "Run another workflow…", to: "/agents" }],
+  },
   first_scheduled_run: {
     title: "Run your agent automatically",
     why: "Set a schedule so it runs without you",
@@ -184,12 +191,14 @@ function TrackRow({
   state,
   onAttest,
   isPending,
+  detail,
 }: {
   item: OnboardingTrackItemV1;
   index: number | null;
   state: RowState;
   onAttest: (key: TrackKey) => void;
   isPending: boolean;
+  detail?: React.ReactNode;
 }) {
   const definition = rowDefinitions[item.key];
   const isDone = state === "complete";
@@ -233,6 +242,7 @@ function TrackRow({
             definition.why
           )}
         </p>
+        {isLocked ? null : detail}
       </div>
       {isDone ? null : isLocked ? (
         <div className="flex items-center sm:justify-end">
@@ -306,6 +316,7 @@ function GettingStartedTrack({
   onDismiss,
   onRestore,
   isPending,
+  rowDetails,
 }: GettingStartedTrackProps) {
   const heading = (
     <h1
@@ -345,7 +356,7 @@ function GettingStartedTrack({
   const byKey = new Map(track.items.map((item) => [item.key, item]));
   const rowsFor = (keys: readonly TrackKey[]) =>
     keys.flatMap((key) => byKey.get(key) ?? []);
-  const keepGoing = rowsFor(keepGoingOrder(intent));
+  const keepGoing = rowsFor([SECOND_AGENT_KEY, ...keepGoingOrder(intent)]);
   const community = rowsFor(communityOrder);
   const isLocked = (item: OnboardingTrackItemV1) =>
     item.key === "credential_saved" && !credentialUnlocked;
@@ -412,6 +423,7 @@ function GettingStartedTrack({
             state={stateOf(row)}
             onAttest={onAttest}
             isPending={isPending}
+            detail={rowDetails?.[row.key]}
           />
         ))}
       </TrackGroup>
@@ -424,6 +436,7 @@ function GettingStartedTrack({
             state={row.completed_at !== null ? "complete" : "upcoming"}
             onAttest={onAttest}
             isPending={isPending}
+            detail={rowDetails?.[row.key]}
           />
         ))}
       </TrackGroup>

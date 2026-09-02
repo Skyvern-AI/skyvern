@@ -8,6 +8,7 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import {
+  SECOND_AGENT_KEY,
   SELF_ATTESTED_KEYS,
   TRACK_KEYS,
   type OnboardingTrackV1,
@@ -85,6 +86,38 @@ it("orders Keep going by intent and gives the first incomplete row the only prim
     "https://www.skyvern.com/docs/developers/getting-started/quickstart",
     "https://www.skyvern.com/docs/developers/features/authentication-and-2fa",
   ]);
+});
+
+it("leads a nine-row track with the second-agent detail and omits it from eight-row tracks", () => {
+  const base = track([]);
+  renderTrack(
+    {
+      ...base,
+      total_count: 9,
+      items: [
+        ...base.items,
+        {
+          key: SECOND_AGENT_KEY,
+          completed_at: null,
+          verification: "server",
+        },
+      ],
+    },
+    { rowDetails: { second_agent_run: <span>detail</span> } },
+  );
+  expect(titlesIn("Keep going")[0]).toBe("Current step: Run a second agent");
+  expect(screen.getByText("detail")).toBeTruthy();
+  expect(screen.getByText("0 of 5 complete")).toBeTruthy();
+  expect(primaryLinks()).toEqual(["Run another workflow…"]);
+  expect(
+    screen
+      .getByRole("link", { name: "Run another workflow…" })
+      .getAttribute("href"),
+  ).toBe("/agents");
+
+  cleanup();
+  renderTrack(base);
+  expect(screen.queryByText("Run a second agent")).toBeNull();
 });
 
 it("locks the credential row on Free, keeps it first for fill_forms, and leaves it uncounted", () => {

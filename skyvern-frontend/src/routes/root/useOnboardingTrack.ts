@@ -22,8 +22,8 @@ const TRACK_KEYS = [
   "discord_joined",
   "social_followed",
 ] as const;
-type TrackKey = (typeof TRACK_KEYS)[number];
-const TRACK_SIZE = TRACK_KEYS.length;
+const SECOND_AGENT_KEY = "second_agent_run" as const;
+type TrackKey = (typeof TRACK_KEYS)[number] | typeof SECOND_AGENT_KEY;
 const SELF_ATTESTED_KEYS: ReadonlySet<TrackKey> = new Set([
   "github_starred",
   "discord_joined",
@@ -32,6 +32,7 @@ const SELF_ATTESTED_KEYS: ReadonlySet<TrackKey> = new Set([
 // Rows that count toward N/M. The teammate row stays out until its
 // destination exists; community rows are never counted.
 const COUNTED_KEYS: readonly TrackKey[] = [
+  SECOND_AGENT_KEY,
   "first_scheduled_run",
   "first_api_run",
   "mcp_installed",
@@ -51,7 +52,7 @@ type OnboardingTrackV1 = {
   state: TrackState;
   arm: "control" | "treatment";
   completed_count: number;
-  total_count: typeof TRACK_SIZE;
+  total_count: 8 | 9;
   items: OnboardingTrackItemV1[];
 };
 
@@ -70,14 +71,19 @@ function parseOnboardingTrack(value: unknown): OnboardingTrackV1 | null {
   if (!isTrackState(state)) return null;
   if (arm !== "control" && arm !== "treatment") return null;
   if (
-    total_count !== TRACK_SIZE ||
     !Array.isArray(items) ||
-    items.length !== TRACK_SIZE
+    (items.length !== 8 && items.length !== 9) ||
+    total_count !== items.length
   )
     return null;
   const parsed: OnboardingTrackItemV1[] = [];
   for (const [index, item] of items.entries()) {
-    const key = TRACK_KEYS[index];
+    const key =
+      index < TRACK_KEYS.length
+        ? TRACK_KEYS[index]
+        : index === TRACK_KEYS.length
+          ? SECOND_AGENT_KEY
+          : undefined;
     if (key === undefined || !isRecord(item) || item.key !== key) return null;
     const completedAt = item.completed_at;
     if (!isTimestampOrNull(completedAt)) return null;
@@ -87,13 +93,13 @@ function parseOnboardingTrack(value: unknown): OnboardingTrackV1 | null {
   }
   const derivedCount = parsed.filter((row) => row.completed_at !== null).length;
   if (completed_count !== derivedCount) return null;
-  if ((state === "completed") !== (derivedCount === TRACK_SIZE)) return null;
+  if ((state === "completed") !== (derivedCount === items.length)) return null;
   return {
     version: "onboarding_track_v1",
     state,
     arm,
     completed_count: derivedCount,
-    total_count: TRACK_SIZE,
+    total_count: items.length,
     items: parsed,
   };
 }
@@ -177,6 +183,7 @@ function countedTrackItems(
 export {
   countedTrackItems,
   parseOnboardingTrack,
+  SECOND_AGENT_KEY,
   SELF_ATTESTED_KEYS,
   TRACK_KEYS,
   useOnboardingTrack,
