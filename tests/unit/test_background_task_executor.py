@@ -11,6 +11,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 
 
 @pytest.mark.asyncio
@@ -254,7 +255,7 @@ async def test_execute_workflow_closes_forced_session_before_credential_fence(
             block_outputs=None,
         )
 
-    close_session.assert_awaited_once_with("org_test", "pbs_forced")
+    close_session.assert_awaited_once_with("org_test", "pbs_forced", reason=BrowserSessionCloseReason.aborted)
     executor._schedule.assert_not_called()
 
 

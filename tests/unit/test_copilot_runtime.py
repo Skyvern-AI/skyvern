@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.test_copilot_secret_scrub import _make_server
@@ -280,7 +281,40 @@ async def test_ensure_browser_session_times_out_and_cleans_up(monkeypatch: pytes
     result = await ensure_browser_session(ctx)
     assert result == {"ok": False, "error": "Failed to create browser session"}
     assert ctx.browser_session_id is None
-    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_2")
+    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_2", reason=BrowserSessionCloseReason.aborted)
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_session_from_a_creation_race_closes_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-15022: the loser of a create race closes a healthy browser it never used; that is not an abort.
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    ctx = _make_ctx()
+    loser = MagicMock()
+    loser.persistent_browser_session_id = "bs_loser"
+
+    async def _create(**_kwargs: object) -> MagicMock:
+        ctx.browser_session_id = "bs_winner"
+        return loser
+
+    ready_state = MagicMock()
+    ready_state.browser_context = _FakeBrowserContext()
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(side_effect=_create)
+    mock_manager.get_browser_state = AsyncMock(return_value=ready_state)
+    mock_manager.close_session = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    result = await ensure_browser_session(ctx)
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_winner"
+    mock_manager.close_session.assert_awaited_once_with(
+        "org_1", "bs_loser", reason=BrowserSessionCloseReason.user_requested
+    )
 
 
 @pytest.mark.asyncio
@@ -309,7 +343,9 @@ async def test_cancelled_browser_boot_closes_the_partially_created_session(monke
     with pytest.raises(asyncio.CancelledError):
         await task
     assert ctx.browser_session_id is None
-    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_cancelled_boot")
+    mock_manager.close_session.assert_awaited_once_with(
+        "org_1", "bs_cancelled_boot", reason=BrowserSessionCloseReason.aborted
+    )
 
 
 @pytest.mark.asyncio
@@ -591,7 +627,7 @@ def _install_dispatch_stack(
     monkeypatch.setattr(runtime, "register_copilot_session", MagicMock())
     monkeypatch.setattr(runtime, "unregister_copilot_session", MagicMock())
 
-    async def _close(_organization_id: str, _session_id: str) -> None:
+    async def _close(_organization_id: str, _session_id: str, **_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(runtime, "close_browser_session_quietly", _close)
