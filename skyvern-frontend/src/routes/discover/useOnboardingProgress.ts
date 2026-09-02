@@ -153,4 +153,4 @@ function useOnboardingProgress() {
     restore: () => mutate("restore"),
   };
 }
-export { useOnboardingProgress };
+export { isTimestampOrNull, useOnboardingProgress };

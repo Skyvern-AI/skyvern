@@ -42,3 +42,5 @@ export const CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY";
 export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";
 
 export const ONBOARDING_PROGRESS_FLAG = "onboarding_progress_v1";
+
+export const ONBOARDING_TRACK_FLAG = "onboarding_track_v1";

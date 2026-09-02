@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import {
   QueryClient,
   QueryClientProvider,
@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-query";
 import {
   act,
+  fireEvent,
   render,
   renderHook,
   screen,
@@ -19,11 +20,19 @@ const mocks = vi.hoisted<{
   flag: boolean | undefined;
   org: string | undefined;
   user: string | undefined;
+  trackRemaining: number;
+  dismissHandoff: ReturnType<typeof vi.fn<() => void>>;
+  trackDismissed: boolean;
+  restoreTrack: ReturnType<typeof vi.fn<() => void>>;
 }>(() => ({
   get: vi.fn(),
   flag: true,
   org: "org-test",
   user: "user-test",
+  trackRemaining: 0,
+  dismissHandoff: vi.fn<() => void>(),
+  trackDismissed: false,
+  restoreTrack: vi.fn<() => void>(),
 }));
 vi.mock("@/api/AxiosClient", () => ({
   getClient: () => Promise.resolve({ get: mocks.get }),
@@ -81,6 +90,7 @@ function renderProgress(client = new QueryClient()) {
 }
 function ProgressBand() {
   const { progress, isPending, dismiss, restore } = useOnboardingProgress();
+  const [trackRemaining, setTrackRemaining] = useState(mocks.trackRemaining);
   return (
     <OnboardingProgressBand
       progress={progress}
@@ -88,6 +98,13 @@ function ProgressBand() {
       onDismiss={dismiss}
       onRestore={restore}
       onDescribeAgent={vi.fn()}
+      trackRemaining={trackRemaining}
+      onDismissHandoff={() => {
+        mocks.dismissHandoff();
+        setTrackRemaining(0);
+      }}
+      trackDismissed={mocks.trackDismissed}
+      onRestoreTrack={mocks.restoreTrack}
     />
   );
 }
@@ -105,6 +122,8 @@ beforeEach(() => {
   mocks.flag = true;
   mocks.org = "org-test";
   mocks.user = "user-test";
+  mocks.trackRemaining = 0;
+  mocks.trackDismissed = false;
 });
 afterEach(() => vi.useRealTimers());
 it.each([
@@ -171,6 +190,60 @@ it("refetches fresh cached progress when Discover remounts", async () => {
   );
   expect(secondMount.result.current.progress).toEqual(refreshedPayload);
 });
+it("keeps one way back to a hidden track on Home", async () => {
+  mocks.trackDismissed = true;
+  mocks.get.mockResolvedValueOnce({ data: completedPayload() });
+  renderProgressBand(new QueryClient());
+  const resume = await screen.findByRole("button", {
+    name: "Resume getting started",
+  });
+  expect(screen.queryByText(/First agent ready/)).toBeNull();
+  fireEvent.click(resume);
+  expect(mocks.restoreTrack).toHaveBeenCalledOnce();
+});
+
+it("keeps a persistent handoff instead of the timed celebration when the track is active", async () => {
+  const client = new QueryClient();
+  mocks.get.mockResolvedValueOnce({ data: validPayload() });
+  const activeMount = renderProgressBand(client);
+  expect(await screen.findByText("Build your first agent")).toBeTruthy();
+  activeMount.unmount();
+
+  const completedRequest = deferred<{ data: unknown }>();
+  mocks.get.mockReturnValueOnce(completedRequest.promise);
+  mocks.trackRemaining = 4;
+  vi.useFakeTimers();
+  const completionMount = renderProgressBand(client);
+  completedRequest.resolve({ data: completedPayload() });
+  await completedRequest.promise;
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  const handoff = screen.getByRole("link", {
+    name: "Keep going: 4 more steps →",
+  });
+  expect(handoff.getAttribute("href")).toBe("/getting-started");
+  expect(screen.getByRole("status").textContent).toContain(
+    "First agent ready.",
+  );
+  expect(screen.queryByText("3 of 3 complete")).toBeNull();
+  act(() => vi.advanceTimersByTime(5000));
+  expect(
+    screen.getByRole("link", { name: "Keep going: 4 more steps →" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Hide" }));
+  expect(mocks.dismissHandoff).toHaveBeenCalledOnce();
+  expect(screen.queryByText(/First agent ready/)).toBeNull();
+  act(() => vi.advanceTimersByTime(1800));
+  expect(screen.queryByText(/First agent ready/)).toBeNull();
+  completionMount.unmount();
+  vi.useRealTimers();
+
+  mocks.get.mockResolvedValueOnce({ data: completedPayload() });
+  renderProgressBand(new QueryClient());
+  expect(
+    await screen.findByRole("link", { name: "Keep going: 4 more steps →" }),
+  ).toBeTruthy();
+  expect(screen.queryByText("3 of 3 complete")).toBeNull();
+});
 it("celebrates only cached active progress completing on remount", async () => {
   const freshClient = new QueryClient();
   mocks.get.mockResolvedValueOnce({ data: completedPayload() });
@@ -207,6 +280,7 @@ it("celebrates only cached active progress completing on remount", async () => {
   await act(() => vi.advanceTimersByTimeAsync(0));
   expect(screen.getAllByText("First agent ready")).toHaveLength(1);
   expect(screen.getByRole("status").textContent).toContain("3 of 3 complete");
+  expect(screen.queryByRole("link", { name: /Keep going/ })).toBeNull();
 
   act(() => vi.advanceTimersByTime(1799));
   expect(screen.getByText("First agent ready")).toBeTruthy();

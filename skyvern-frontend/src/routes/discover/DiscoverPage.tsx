@@ -34,7 +34,19 @@ function getIntentExampleKey(
   }
 }
 
-function DiscoverPage() {
+function DiscoverPage({
+  trackRemaining = 0,
+  onDismissHandoff,
+  trackDismissed = false,
+  trackPending = false,
+  onRestoreTrack,
+}: {
+  trackRemaining?: number;
+  onDismissHandoff?: () => void;
+  trackDismissed?: boolean;
+  trackPending?: boolean;
+  onRestoreTrack?: () => void;
+} = {}) {
   const enableCopilotHandoff =
     useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
   const createWorkflowMutation = useCreateWorkflowMutation();
@@ -110,6 +122,11 @@ function DiscoverPage() {
         onDismiss={dismiss}
         onRestore={restore}
         onDescribeAgent={handleDescribeAgent}
+        trackRemaining={trackRemaining}
+        onDismissHandoff={onDismissHandoff}
+        trackDismissed={trackDismissed}
+        trackPending={trackPending}
+        onRestoreTrack={onRestoreTrack}
       >
         {progress?.state === "active" ? (
           <WorkingExampleInspector

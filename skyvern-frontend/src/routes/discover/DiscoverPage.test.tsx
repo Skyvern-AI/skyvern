@@ -428,7 +428,7 @@ describe("DiscoverPage progress surfaces", () => {
     mocks.progressState = "active";
     const { container, rerender } = render(<DiscoverPage />);
     expect(container.innerHTML).toMatch(
-      /<h1[^>]*>Create an agent<\/h1>.*prompt.*Build your first agent.*See how an agent run is organized.*templates/s,
+      /<h1[^>]*>Create an agent<\/h1>.*prompt.*Build your first agent.*What a finished run looks like.*templates/s,
     );
     expect(screen.getByText("1 of 3")).toBeTruthy();
     expect(mocks.createWorkflow).not.toHaveBeenCalled();
@@ -447,7 +447,7 @@ describe("DiscoverPage progress surfaces", () => {
       name: "or copy a working example",
     });
     const workingExampleHeading = screen.getByRole("heading", {
-      name: "See how an agent run is organized",
+      name: "What a finished run looks like",
     });
     expect(workingExampleLink.getAttribute("href")).toBe(
       "#working-example-heading",
@@ -498,7 +498,7 @@ describe("DiscoverPage progress surfaces", () => {
     const resume = screen.getByRole("button", { name: "Resume setup" });
     expect(resume).toBe(hide);
     expect(document.activeElement).toBe(resume);
-    expect(screen.queryByText("See how an agent run is organized")).toBeNull();
+    expect(screen.queryByText("What a finished run looks like")).toBeNull();
     fireEvent.click(resume);
     expect(mocks.restore).toHaveBeenCalledTimes(1);
   });
@@ -549,7 +549,7 @@ describe("DiscoverPage progress surfaces", () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole("status").textContent).toContain("3 of 3 complete");
-    expect(screen.queryByText("See how an agent run is organized")).toBeNull();
+    expect(screen.queryByText("What a finished run looks like")).toBeNull();
 
     act(() => vi.advanceTimersByTime(1800));
     expect(screen.queryByText("First agent ready")).toBeNull();
@@ -562,7 +562,7 @@ describe("DiscoverPage progress surfaces", () => {
       mocks.progressState = state;
       render(<DiscoverPage />);
       expect(document.body.textContent).not.toMatch(
-        /Build your first agent|See how an agent run is organized|Hide setup|Resume setup/,
+        /Build your first agent|What a finished run looks like|Hide setup|Resume setup/,
       );
     },
   );
