@@ -6,9 +6,16 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { cn } from "@/util/utils";
 
-// A long input list would grow the start node without bound, and the canvas
-// card is a summary, not the editor — the panel lists them all.
-const MAX_VISIBLE_KEYS = 8;
+// The node is a summary; the panel lists every input. Six names fill about
+// two lines of the 30rem card. Keys have no length limit, so each is cut to
+// what the panel's 12rem name column shows; the full sentence stays in the
+// accessible name and the tooltip.
+const MAX_VISIBLE_KEYS = 6;
+const MAX_KEY_CHARS = 24;
+
+// The editor's hand-rolled controls all carry this ring.
+const FOCUS_RING =
+  "rounded-md focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
 
 /**
  * Count chip for the editor headers' Inputs control. `Badge` is px-2.5 py-1,
@@ -38,54 +45,93 @@ function InputsCountBadge({
   );
 }
 
+function summarize(keys: string[], maxKeyChars = Infinity): string {
+  const hidden = keys.length - MAX_VISIBLE_KEYS;
+  const shown = keys
+    .slice(0, MAX_VISIBLE_KEYS)
+    .map((key) =>
+      key.length > maxKeyChars ? `${key.slice(0, maxKeyChars - 1)}\u2026` : key,
+    )
+    .join(", ");
+  return hidden > 0 ? `${shown}, and ${hidden} more` : shown;
+}
+
 /**
  * Inputs, stated where the flow starts, because a header toggle was the only
- * door and nobody found it (SKY-14866). Its own card rather than a row in the
- * start node's settings accordion, which already carries thirteen configs.
+ * door and nobody found it (SKY-14866). A section of the Start card under its
+ * heading, beside Workflow Settings rather than inside it: that accordion
+ * already carries thirteen configs and would hide Inputs again.
  *
- * A summary, not an editor: the keys are text, and every action routes to the
- * existing Inputs panel.
- *
- * `editable` is the start node's own flag (false for global workflows and
- * deleted snapshots, matching what the editor headers hide). The summary still
- * renders when it is false — reading a view-only agent's inputs is fine — but
- * Add is gone, because WorkflowParametersPanel can mutate and would dirty a
- * workflow that cannot be saved.
+ * A summary in plain language, not an editor: the names read as a sentence in
+ * the body font, and the heading, the sentence and Add all open the existing
+ * Inputs panel. The heading row copies the sibling accordion trigger's grammar
+ * (h3 wrapping a button, label underlines on hover) so the two rows behave
+ * alike. `editable` is the start node's own flag (false for global workflows
+ * and deleted snapshots, matching what the editor headers hide). The summary
+ * still renders when it is false, but nothing is clickable, because
+ * WorkflowParametersPanel can mutate and would dirty a workflow that cannot be
+ * saved.
  */
-function WorkflowInputsCard({ editable }: { editable: boolean }) {
+function WorkflowInputsSection({ editable }: { editable: boolean }) {
   const parameters = useWorkflowParametersStore((s) => s.parameters);
   const isRecording = useRecordingStore((s) => s.isRecording);
   const setWorkflowPanelState = useWorkflowPanelStore(
     (s) => s.setWorkflowPanelState,
   );
-  const hidden = parameters.length - MAX_VISIBLE_KEYS;
+  const openPanel = () =>
+    setWorkflowPanelState({ active: true, content: "parameters" });
 
   // Nothing to summarise and nothing to offer.
   if (!editable && parameters.length === 0) {
     return null;
   }
 
+  const heading = (
+    <>
+      <InputIcon className="size-4 text-muted-foreground" aria-hidden />
+      <span className={cn({ "group-hover:underline": editable })}>Inputs</span>
+      <InputsCountBadge count={parameters.length} />
+    </>
+  );
+  const keys = parameters.map((parameter) => parameter.key);
+  const summary = summarize(keys, MAX_KEY_CHARS);
+  const fullSummary = summarize(keys);
+
   return (
-    // The card sits inside the start node, whose canvas click selects it and
-    // expands Workflow Settings (FlowRenderer's onNodeClick). This summary is
-    // its own surface, so no click in it reaches that.
+    // Clicks stop here: a canvas click on the start node expands Workflow
+    // Settings (FlowRenderer's onNodeClick), and reading a name must not. pl-6
+    // aligns with the settings trigger's label, which sits after its chevron.
     <div
-      className="nodrag nopan w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4"
+      className="nodrag nopan mt-3 pl-6 text-left"
       onClick={(event) => event.stopPropagation()}
     >
       <div className="flex items-center justify-between gap-3">
-        <span className="flex items-center gap-2 text-sm">
-          <InputIcon className="size-4 text-muted-foreground" aria-hidden />
-          Inputs
-        </span>
+        <h3 className="flex min-w-0">
+          {editable ? (
+            <button
+              type="button"
+              disabled={isRecording}
+              onClick={openPanel}
+              className={cn(
+                "group flex items-center gap-2 py-1 text-sm font-medium",
+                FOCUS_RING,
+              )}
+            >
+              {heading}
+            </button>
+          ) : (
+            <span className="flex items-center gap-2 py-1 text-sm font-medium">
+              {heading}
+            </span>
+          )}
+        </h3>
         {editable ? (
           <Button
-            variant="tertiary"
+            variant="ghost"
             size="sm"
+            className="-mr-3 shrink-0 text-muted-foreground hover:text-foreground"
             disabled={isRecording}
-            onClick={() =>
-              setWorkflowPanelState({ active: true, content: "parameters" })
-            }
+            onClick={openPanel}
           >
             <PlusIcon className="mr-1 size-3.5" aria-hidden />
             Add
@@ -93,30 +139,33 @@ function WorkflowInputsCard({ editable }: { editable: boolean }) {
         ) : null}
       </div>
       {parameters.length === 0 ? (
-        <p className="mt-2 text-left text-xs text-muted-foreground">
-          None yet. Inputs are placeholder values you can link in any block, and
-          fill in before each run.
+        <p className="pl-6 text-sm text-muted-foreground">
+          None yet. Add placeholders to fill in before each run.
         </p>
+      ) : editable ? (
+        <button
+          type="button"
+          disabled={isRecording}
+          onClick={openPanel}
+          title={fullSummary}
+          aria-label={fullSummary}
+          className={cn(
+            "ml-6 block break-words text-left text-sm hover:underline",
+            FOCUS_RING,
+          )}
+        >
+          {summary}
+        </button>
       ) : (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {parameters.slice(0, MAX_VISIBLE_KEYS).map((parameter) => (
-            <span
-              key={parameter.key}
-              title={parameter.key}
-              className="max-w-[10rem] truncate rounded-md bg-slate-elevation1 px-2 py-1 font-mono text-xs"
-            >
-              {parameter.key}
-            </span>
-          ))}
-          {hidden > 0 ? (
-            <span className="px-1 py-1 text-xs text-muted-foreground">
-              +{hidden} more
-            </span>
-          ) : null}
-        </div>
+        // aria-label is not allowed on a paragraph, so the full text rides
+        // along visually hidden instead.
+        <p className="break-words pl-6 text-sm" title={fullSummary}>
+          <span aria-hidden>{summary}</span>
+          <span className="sr-only">{fullSummary}</span>
+        </p>
       )}
     </div>
   );
 }
 
-export { InputsCountBadge, WorkflowInputsCard };
+export { InputsCountBadge, WorkflowInputsSection };
