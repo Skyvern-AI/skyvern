@@ -13884,6 +13884,45 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": false
+          },
+          "export_enabled": {
+            "type": "boolean",
+            "title": "Export Enabled",
+            "default": false
+          },
+          "export_data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Data Schema"
+          },
+          "export_file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export File Name"
+          },
+          "export_records": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Records"
           }
         },
         "type": "object",
@@ -14023,6 +14062,45 @@
             "type": "boolean",
             "title": "Disable Cache",
             "default": false
+          },
+          "export_enabled": {
+            "type": "boolean",
+            "title": "Export Enabled",
+            "default": false
+          },
+          "export_data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Data Schema"
+          },
+          "export_file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export File Name"
+          },
+          "export_records": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Records"
           }
         },
         "type": "object",
