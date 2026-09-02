@@ -3478,6 +3478,7 @@ async def _translate_to_agent_result(
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=inline_diagnostics,
                     require_full_workflow_test=chat_request.product_action == "test_end_to_end",
+                    evaluated_reason_codes=list(inline_raw_verdict.reason_codes),
                 )
             # REPLACE_WORKFLOW bypasses the update_workflow tool guardrail, so
             # policy and post-emission rejects run here before YAML processing.
@@ -3745,6 +3746,7 @@ async def _translate_to_agent_result(
             prior_workflow_yaml=chat_request.workflow_yaml,
             output_policy_diagnostics=output_policy_diagnostics,
             require_full_workflow_test=direct_test_handoff,
+            evaluated_reason_codes=list(raw_output_policy_verdict.reason_codes),
         )
 
     final_user_response = str(user_response)
@@ -4248,6 +4250,19 @@ def _output_policy_diagnostics_from_guardrail_exception(exc: BaseException) -> d
     return {key: data[key] for key in keys if key in data}
 
 
+def _output_policy_reason_codes_from_guardrail_exception(exc: BaseException) -> list[OutputPolicyReason]:
+    diagnostics = _output_policy_diagnostics_from_guardrail_exception(exc)
+    if diagnostics is None:
+        return list(_output_policy_verdict_from_guardrail_exception(exc).reason_codes)
+    reason_codes: list[OutputPolicyReason] = []
+    for raw_reason in diagnostics.get("raw_reason_codes") or []:
+        try:
+            reason_codes.append(OutputPolicyReason(str(raw_reason)))
+        except ValueError:
+            continue
+    return reason_codes or list(_output_policy_verdict_from_guardrail_exception(exc).reason_codes)
+
+
 def _unapproved_credential_reference_reply() -> str:
     # "Credentials UI" is a credential_prompt_reason() text marker the FE credential card keys off, so
     # this reply must keep it verbatim. One sentence, no candidate enumeration: the card renders the
@@ -4272,6 +4287,7 @@ def _build_output_policy_blocked_result(
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
     require_full_workflow_test: bool = False,
+    evaluated_reason_codes: list[OutputPolicyReason] | None = None,
 ) -> AgentResult:
     # A blocker turn whose signal owns final rendering never ships a proposal;
     # steering-only blockers should still flow through normal output-policy
@@ -4282,9 +4298,15 @@ def _build_output_policy_blocked_result(
         ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
     )
     preserved_workflow_yaml = ctx.last_workflow_yaml if preserved_workflow is not None else None
+    output_policy_reasons = list(verdict.reason_codes if evaluated_reason_codes is None else evaluated_reason_codes)
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
-        "output-policy blocked final output: " + ", ".join(reason.value for reason in verdict.reason_codes)
+        "output-policy blocked final output: " + ", ".join(reason.value for reason in output_policy_reasons)
+    )
+    LOG.warning(
+        "copilot output policy blocked final output",
+        log_code="copilot_output_policy_block",
+        **{"copilot.output_policy_reasons": [reason.value for reason in output_policy_reasons]},
     )
     add_saved_draft_copy = False
     fallback_user_response: str | None = None
@@ -4390,6 +4412,7 @@ def _build_output_policy_blocked_result(
                 reason_code="output_policy_block",
                 terminal_reason="output_policy_block",
             )
+    output_policy_outcome = output_policy_outcome.model_copy(update={"output_policy_reasons": output_policy_reasons})
     proposal_tested = ctx.last_full_workflow_test_ok if require_full_workflow_test else ctx.last_test_ok
     return _make_agent_result(
         ctx,
@@ -5081,6 +5104,7 @@ async def _run_copilot_turn_impl(
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=_output_policy_diagnostics_from_guardrail_exception(exc),
                     require_full_workflow_test=chat_request.product_action == "test_end_to_end",
+                    evaluated_reason_codes=_output_policy_reason_codes_from_guardrail_exception(exc),
                 )
             except CopilotTurnHalt as exc:
                 LOG.info(

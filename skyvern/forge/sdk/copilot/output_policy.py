@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids_from_parsed,
     workflow_credential_origins_from_parsed,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason
 
 WORKFLOW_PRESENT_SENTINEL = object()
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
@@ -172,20 +173,6 @@ class CopilotOutputKind(StrEnum):
     WORKFLOW_DRAFT_PROPOSAL = "workflow_draft_proposal"
     WORKFLOW_UPDATE_PROPOSAL = "workflow_update_proposal"
     WORKFLOW_RUN_RESULT = "workflow_run_result"
-
-
-class OutputPolicyReason(StrEnum):
-    RAW_SECRET_LEAK = "raw_secret_leak"
-    UNAPPROVED_CREDENTIAL_REFERENCE = "unapproved_credential_reference"
-    CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
-    UNBACKED_WORKFLOW_DELIVERY_CLAIM = "unbacked_workflow_delivery_claim"
-    MISSING_PROPOSAL_STATE = "missing_proposal_state"
-    PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
-    OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
-    INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
-    INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
-    SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
-    WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
 
 
 @dataclass
