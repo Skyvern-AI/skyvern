@@ -25,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.workflows import BlockType
 
 
@@ -644,7 +645,9 @@ async def test_sync_trigger_closes_fresh_session_when_fence_fires() -> None:
     mock_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
     mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
     assert captured["success"] is False
-    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_parent", "pbs_fresh")
+    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with(
+        "org_parent", "pbs_fresh", reason=BrowserSessionCloseReason.aborted
+    )
 
 
 @pytest.mark.asyncio
@@ -667,7 +670,9 @@ async def test_sync_trigger_closes_fresh_session_when_setup_raises() -> None:
     mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh", setup_raises=True)
 
     assert captured["success"] is False
-    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_parent", "pbs_fresh")
+    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with(
+        "org_parent", "pbs_fresh", reason=BrowserSessionCloseReason.aborted
+    )
 
 
 class TestBlockMetadata:

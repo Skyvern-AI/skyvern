@@ -108,6 +108,7 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
@@ -2434,7 +2435,11 @@ async def _new_copilot_chat_post(
                 metadata = agent_result.browser_ablation_metadata
                 browser_session_id = metadata.get("browser_session_id") if isinstance(metadata, dict) else None
                 if isinstance(browser_session_id, str) and browser_session_id:
-                    await close_browser_session_quietly(organization.organization_id, browser_session_id)
+                    await close_browser_session_quietly(
+                        organization.organization_id,
+                        browser_session_id,
+                        reason=BrowserSessionCloseReason.user_requested,
+                    )
 
     return FastAPIEventSourceStream.create(request, stream_handler)
 

@@ -13,6 +13,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_retirement import (
     BrowserOperationRejected,
@@ -271,8 +272,14 @@ class PersistentSessionsManager(Protocol):
         """
         ...
 
-    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
-        """Close a specific browser session."""
+    async def close_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
+    ) -> None:
+        """Close a specific browser session; ``reason`` is recorded on its row, and an abort lands it on failed."""
         ...
 
     async def close_all_sessions(self, organization_id: str) -> None:

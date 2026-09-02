@@ -4,6 +4,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
@@ -69,6 +70,7 @@ def manager() -> DefaultPersistentSessionsManager:
     db.browser_sessions.get_persistent_browser_session = AsyncMock()
     db.browser_sessions.close_persistent_browser_session = AsyncMock()
     db.browser_sessions.archive_browser_session_address = AsyncMock()
+    db.browser_sessions.record_persistent_browser_session_close_reason = AsyncMock()
     return DefaultPersistentSessionsManager(database=db)
 
 
@@ -155,6 +157,28 @@ async def test_close_session_exports_and_closes_for_matching_org(
         "pbs_owned",
         "org_owner",
     )
+
+
+@pytest.mark.asyncio
+async def test_close_session_records_the_reason_before_closing_the_row(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    """SKY-15022: the row close resolves its terminal status from the recorded reason."""
+    events: list[str] = []
+    manager.database.browser_sessions.record_persistent_browser_session_close_reason = AsyncMock(
+        side_effect=lambda *_: events.append("reason")
+    )
+    manager.database.browser_sessions.close_persistent_browser_session = AsyncMock(
+        side_effect=lambda *_: events.append("close")
+    )
+
+    with patch.object(manager_mod.settings, "BROWSER_STREAMING_MODE", "vnc"):
+        await manager.close_session("org_owner", "pbs_aborted", reason=BrowserSessionCloseReason.aborted)
+
+    manager.database.browser_sessions.record_persistent_browser_session_close_reason.assert_awaited_once_with(
+        "pbs_aborted", "org_owner", "aborted"
+    )
+    assert events == ["reason", "close"]
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_final_status,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
@@ -741,7 +742,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                     raise
             # Session doesn't exist, has started, is completed, or is stuck — close it
             if session is None or session.completed_at is None:
-                await self.close_session(organization_id, session_id)
+                await self.close_session(organization_id, session_id, reason=BrowserSessionCloseReason.expired)
             raise
 
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
@@ -975,7 +976,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             _release_cdp_port(browser_session.cdp_port)
         return True
 
-    async def _close_session(self, organization_id: str, browser_session_id: str) -> None:
+    async def _close_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
+    ) -> None:
         released = await self._release_local_browser_session(organization_id, browser_session_id)
         if not released:
             LOG.info(
@@ -984,16 +991,33 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 session_id=browser_session_id,
             )
 
+        try:
+            await self.database.browser_sessions.record_persistent_browser_session_close_reason(
+                browser_session_id, organization_id, reason.value
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record the close reason; the row will close on its terminal default",
+                organization_id=organization_id,
+                session_id=browser_session_id,
+                exc_info=True,
+            )
         await self.database.browser_sessions.close_persistent_browser_session(browser_session_id, organization_id)
         if settings.BROWSER_STREAMING_MODE == "cdp":
             await self.database.browser_sessions.archive_browser_session_address(browser_session_id, organization_id)
 
-    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
+    async def close_session(
+        self,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
+    ) -> None:
         """Close a session while retaining cleanup ownership if its caller is cancelled."""
         cleanup_key = (organization_id, browser_session_id)
         cleanup_task = self._close_cleanup_tasks.get(cleanup_key)
         if cleanup_task is None:
-            cleanup_task = asyncio.create_task(self._close_session(organization_id, browser_session_id))
+            cleanup_task = asyncio.create_task(self._close_session(organization_id, browser_session_id, reason=reason))
             self._close_cleanup_tasks[cleanup_key] = cleanup_task
             self._retain_background_task(cleanup_task)
 
@@ -1008,7 +1032,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """Close all browser sessions for an organization."""
         browser_sessions = await self.database.browser_sessions.get_active_persistent_browser_sessions(organization_id)
         for browser_session in browser_sessions:
-            await self.close_session(organization_id, browser_session.persistent_browser_session_id)
+            await self.close_session(
+                organization_id,
+                browser_session.persistent_browser_session_id,
+                reason=BrowserSessionCloseReason.shutdown,
+            )
 
     async def cleanup_stale_sessions(self) -> None:
         """Close sessions left active by a previous process."""
@@ -1137,7 +1165,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=db_session.organization_id,
             )
             try:
-                await self.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
+                await self.close_session(
+                    db_session.organization_id,
+                    db_session.persistent_browser_session_id,
+                    reason=BrowserSessionCloseReason.expired,
+                )
             except Exception:
                 LOG.exception(
                     "Failed to reap expired persistent browser session",
@@ -1228,5 +1260,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         if cls.instance:
             active_sessions = await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
             for db_session in active_sessions:
-                await cls.instance.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
+                await cls.instance.close_session(
+                    db_session.organization_id,
+                    db_session.persistent_browser_session_id,
+                    reason=BrowserSessionCloseReason.shutdown,
+                )
         LOG.info("PersistentSessionsManager is closed")

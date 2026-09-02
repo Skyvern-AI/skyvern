@@ -5,6 +5,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocationInput
 
@@ -27,6 +28,13 @@ FINAL_STATUSES = (
 
 def is_final_status(status: str | None) -> bool:
     return status in FINAL_STATUSES
+
+
+def resolve_terminal_status(status: str, close_reason: str | None) -> str:
+    """A close requested as an abort lands on failed; every other terminal write keeps what it asked for."""
+    if status == PersistentBrowserSessionStatus.completed and close_reason == BrowserSessionCloseReason.aborted:
+        return PersistentBrowserSessionStatus.failed.value
+    return status
 
 
 def export_profile_storage_id(
@@ -98,6 +106,7 @@ class PersistentBrowserSession(BaseModel):
     last_activity_at: datetime | None = None
     close_requested_at: datetime | None = None
     cdp_unreachable_at: datetime | None = None
+    close_reason: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

@@ -47,6 +47,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
@@ -929,12 +930,17 @@ async def resolve_persistent_browser_state(
     return await asyncio.shield(_abandonable_browser_state_resolve(session_id, organization_id))
 
 
-async def close_browser_session_quietly(organization_id: str, session_id: str) -> None:
+async def close_browser_session_quietly(
+    organization_id: str,
+    session_id: str,
+    *,
+    reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
+) -> None:
     """Bounded: the session-manager backend is often the reason we are closing at all, so an
     unbounded close could hang the request."""
     try:
         await asyncio.wait_for(
-            app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id),
+            app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason),
             timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
         )
     except Exception:
@@ -1291,7 +1297,11 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
                 installed_session_id=ctx.browser_session_id,
                 organization_id=ctx.organization_id,
             )
-            await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+            await close_browser_session_quietly(
+                ctx.organization_id,
+                session.persistent_browser_session_id,
+                reason=BrowserSessionCloseReason.user_requested,
+            )
             session = None
         else:
             ctx.browser_session_id = session.persistent_browser_session_id
