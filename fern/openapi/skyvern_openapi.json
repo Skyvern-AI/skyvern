@@ -28,10 +28,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-user-agent",
@@ -286,6 +284,7 @@
                     "mapping": {
                       "task_v1": "#/components/schemas/TaskRunResponse",
                       "task_v2": "#/components/schemas/TaskRunResponse",
+                      "task_v3": "#/components/schemas/TaskRunResponse",
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
@@ -526,6 +525,24 @@
               "title": "X-Api-Key"
             },
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes."
           }
         ],
         "requestBody": {
@@ -548,6 +565,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "A create with this idempotency key is still in progress"
           },
           "422": {
             "description": "Invalid agent definition"
@@ -1440,6 +1460,7 @@
             "description": "Invalid tag key or value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "apply_run_tags"
       },
       "get": {
@@ -1508,6 +1529,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tags"
       }
     },
@@ -1592,6 +1614,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_run_tag"
       }
     },
@@ -1713,6 +1736,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tag_history"
       }
     },
@@ -1770,6 +1794,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_tag_keys"
       }
     },
@@ -1840,6 +1865,7 @@
             "description": "Description too long"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_tag_key"
       },
       "delete": {
@@ -1908,6 +1934,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
@@ -1983,7 +2010,66 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_tag_values"
+      },
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Create tag value",
+        "description": "Register a grouped tag (key, value) with a palette color before any workflow uses it. The label shows a zero workflow count until applied to a workflow.",
+        "operationId": "create_tag_value_v1_tag_values_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully registered tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValue"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Tag value already exists"
+          },
+          "422": {
+            "description": "Invalid key, value, or color"
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "create_tag_value"
       }
     },
     "/v1/tag-values/{key}": {
@@ -2056,6 +2142,7 @@
             "description": "Invalid palette color"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_tag_value"
       },
       "delete": {
@@ -2134,6 +2221,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_tag_value"
       }
     },
@@ -2210,6 +2298,7 @@
             "description": "Invalid value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "rename_tag_value"
       }
     },
@@ -2497,6 +2586,60 @@
         },
         "x-hidden": true,
         "x-fern-sdk-method-name": "batch_get_run_tags_post"
+      }
+    },
+    "/v1/run-tag-suggestions": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List run tag suggestions",
+        "description": "List distinct (key, value) pairs ever set on a run for the organization, sourced from the run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys (which are never registered) so pickers can offer them alongside user-defined tags.",
+        "operationId": "get_run_tag_suggestions_v1_run_tag_suggestions_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run tag suggestions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagSuggestionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "get_run_tag_suggestions"
       }
     },
     "/v1/artifacts/{artifact_id}/content": {
@@ -2862,7 +3005,8 @@
         "tags": [
           "agent"
         ],
-        "summary": "Get Runs V2",
+        "summary": "List runs",
+        "description": "List the organization's task and agent runs, newest first, filterable by status, run type, agent, a free-text search term, and failure category. Returns a paginated array of run summaries.",
         "operationId": "get_runs_v2_v1_runs_get",
         "parameters": [
           {
@@ -2951,6 +3095,79 @@
             }
           },
           {
+            "name": "workflow_permanent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 50
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to runs of these workflows (agents). Repeat the param to include multiple.",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Filter to runs of these workflows (agents). Repeat the param to include multiple."
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
+            "name": "failure_category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 100
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact-match filter on a workflow run's top classifier failure category (`failure_category[0].category`). Only failed, terminated, and timed_out runs are eligible; canceled runs are never returned by this filter. Applies to `run_type=workflow_run` only — combined with a task run_type it matches nothing.",
+              "examples": [
+                "ANTI_BOT_DETECTION",
+                "AUTH_FAILURE"
+              ],
+              "title": "Failure Category"
+            },
+            "description": "Exact-match filter on a workflow run's top classifier failure category (`failure_category[0].category`). Only failed, terminated, and timed_out runs are eligible; canceled runs are never returned by this filter. Applies to `run_type=workflow_run` only — combined with a task run_type it matches nothing."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -3004,7 +3221,8 @@
         "tags": [
           "Files"
         ],
-        "summary": "Upload File",
+        "summary": "Upload a file",
+        "description": "Upload a file to Skyvern storage so runs can reference it as an input. Returns the file id, its storage URI, a presigned download URL, and the expiry implied by the requested retention period.",
         "operationId": "upload_file_v1_upload_file_post",
         "parameters": [
           {
@@ -3059,6 +3277,61 @@
           }
         },
         "x-fern-sdk-method-name": "upload_file"
+      }
+    },
+    "/v1/files/{file_id}": {
+      "delete": {
+        "tags": [
+          "Files"
+        ],
+        "summary": "Delete File",
+        "description": "Delete a previously uploaded file.\n\nA file that does not exist, was already deleted, or belongs to another organization all\nanswer 404 alike — the endpoint must not tell a caller whether someone else's file id\nexists.",
+        "operationId": "delete_file_v1_files__file_id__delete",
+        "parameters": [
+          {
+            "name": "file_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "File Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_file"
       }
     },
     "/v1/browser_profiles": {
@@ -3133,11 +3406,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a blank browser profile for future runs\nblank_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"Fresh Profile\",\n)\nprint(blank_profile)\n\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a blank browser profile for future runs\nblank_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"Fresh Profile\",\n)\nprint(blank_profile)\n\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from any workflow run that saved a browser (has a persisted archive)\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from any workflow run that saved a browser (has a persisted archive)\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
               }
             ]
           }
@@ -3541,6 +3814,76 @@
         ]
       }
     },
+    "/v1/browser_profiles/{profile_id}/usage": {
+      "get": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Get browser profile usage",
+        "description": "List the workflows, credentials, and recent runs that depend on a browser profile.",
+        "operationId": "get_browser_profile_usage_v1_browser_profiles__profile_id__usage_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved browser profile usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfileUsage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile_usage"
+      }
+    },
     "/v1/browser_sessions": {
       "post": {
         "tags": [
@@ -3576,7 +3919,8 @@
                 "$ref": "#/components/schemas/CreateBrowserSessionRequest",
                 "default": {
                   "timeout": 60,
-                  "generate_browser_profile": false
+                  "generate_browser_profile": false,
+                  "needs_live_view": false
                 }
               }
             }
@@ -3592,6 +3936,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request"
           },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
@@ -3936,6 +4283,39 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Downloaded files could not be returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "downloaded_files_unavailable"
+                          ]
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "x-fern-sdk-method-name": "get_browser_session",
@@ -4003,6 +4383,9 @@
                 }
               }
             }
+          },
+          "402": {
+            "description": "Insufficient credits to parse OTP content"
           },
           "422": {
             "description": "Validation Error",
@@ -4613,6 +4996,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_custom_llms"
       },
       "post": {
@@ -4674,6 +5058,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_custom_llm"
       }
     },
@@ -4748,6 +5133,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_custom_llm"
       },
       "delete": {
@@ -4810,6 +5196,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_custom_llm"
       }
     },
@@ -4835,10 +5222,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-user-agent",
@@ -4946,10 +5331,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-user-agent",
@@ -5079,6 +5462,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_script"
       },
       "get": {
@@ -5166,6 +5550,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_scripts"
       }
     },
@@ -5233,6 +5618,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_script"
       }
     },
@@ -5310,6 +5696,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "deploy_script"
       }
     },
@@ -5374,7 +5761,8 @@
               }
             }
           }
-        }
+        },
+        "x-hidden": true
       }
     },
     "/v1/sdk/run_action": {
@@ -5447,6 +5835,7 @@
           "Schedules"
         ],
         "summary": "List all schedules for the organization",
+        "description": "List every schedule in the organization, across all agents, filterable by active/paused status and a search term matched against agent title or schedule name. Returns a paginated list plus the total count.",
         "operationId": "schedules_list_all",
         "parameters": [
           {
@@ -5708,6 +6097,7 @@
             "description": "Invalid tag key or value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "apply_workflow_tags"
       },
       "get": {
@@ -5776,6 +6166,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_workflow_tags"
       }
     },
@@ -5860,6 +6251,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_workflow_tag"
       }
     },
@@ -5981,6 +6373,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_workflow_tag_history"
       }
     },
@@ -6245,7 +6638,7 @@
           "Runs"
         ],
         "summary": "Get all runs by agent",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
         "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -6391,6 +6784,46 @@
             "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
+            "name": "include_child_runs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs.",
+              "default": false,
+              "title": "Include Child Runs"
+            },
+            "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -6444,6 +6877,7 @@
           "Agents"
         ],
         "summary": "Get an agent by id",
+        "description": "Fetch a single agent definition by its permanent id, optionally pinned to a specific version. Returns the agent's blocks, parameters, and metadata.",
         "operationId": "get_workflow_v1_workflows__workflow_permanent_id__get",
         "parameters": [
           {
@@ -6673,6 +7107,7 @@
           "Schedules"
         ],
         "summary": "Create a schedule for an agent",
+        "description": "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. Returns the stored schedule and its next upcoming run times.",
         "operationId": "schedules_create",
         "parameters": [
           {
@@ -6741,6 +7176,7 @@
           "Schedules"
         ],
         "summary": "List schedules for an agent",
+        "description": "List all schedules attached to a single agent. Returns the schedules in creation order.",
         "operationId": "schedules_list",
         "parameters": [
           {
@@ -6801,6 +7237,7 @@
           "Schedules"
         ],
         "summary": "Get an agent schedule by id",
+        "description": "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, parameters, enabled state, and next upcoming run times.",
         "operationId": "schedules_get",
         "parameters": [
           {
@@ -6868,6 +7305,7 @@
           "Schedules"
         ],
         "summary": "Update an agent schedule",
+        "description": "Replace a schedule's cron expression, timezone, run parameters, and enabled state. Returns the updated schedule and its next upcoming run times.",
         "operationId": "schedules_update",
         "parameters": [
           {
@@ -6945,6 +7383,7 @@
           "Schedules"
         ],
         "summary": "Delete an agent schedule",
+        "description": "Permanently delete a schedule so it never triggers again. Returns an acknowledgement flag.",
         "operationId": "schedules_delete",
         "parameters": [
           {
@@ -7014,6 +7453,7 @@
           "Schedules"
         ],
         "summary": "Enable an agent schedule",
+        "description": "Resume a paused schedule so it starts triggering runs again. Returns the updated schedule.",
         "operationId": "schedules_enable",
         "parameters": [
           {
@@ -7083,6 +7523,7 @@
           "Schedules"
         ],
         "summary": "Disable an agent schedule",
+        "description": "Pause a schedule so it stops triggering runs, without deleting it. Returns the updated schedule.",
         "operationId": "schedules_disable",
         "parameters": [
           {
@@ -7719,6 +8160,30 @@
             "title": "Skip Auto Complete Tab",
             "default": false
           },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
           "created_at": {
             "anyOf": [
               {
@@ -7856,6 +8321,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -8201,6 +8671,17 @@
             "title": "Max Retries",
             "default": 0
           },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -8280,6 +8761,7 @@
         "enum": [
           "click",
           "input_text",
+          "paste_text",
           "upload_file",
           "download_file",
           "select_option",
@@ -9288,12 +9770,25 @@
           "google_sheets_write",
           "pdf_fill",
           "split_pdf",
-          "email_inbox"
+          "email_inbox",
+          "data_export"
         ],
         "title": "BlockType"
       },
       "Body_upload_file_v1_upload_file_post": {
         "properties": {
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days",
+            "description": "Number of days to keep the file before it is deleted automatically. Omit to keep the file until the organization's data retention policy removes it."
+          },
           "file": {
             "type": "string",
             "contentMediaType": "application/octet-stream",
@@ -9558,6 +10053,29 @@
               }
             ],
             "title": "Deleted At"
+          },
+          "last_verified_login_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Verified Login At"
+          },
+          "linked_credential_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Name"
           }
         },
         "type": "object",
@@ -9569,6 +10087,87 @@
           "modified_at"
         ],
         "title": "BrowserProfile"
+      },
+      "BrowserProfileUsage": {
+        "properties": {
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageWorkflow"
+            },
+            "type": "array",
+            "title": "Workflows",
+            "default": []
+          },
+          "credentials": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageCredential"
+            },
+            "type": "array",
+            "title": "Credentials",
+            "default": []
+          },
+          "recent_seeded_run_count": {
+            "type": "integer",
+            "title": "Recent Seeded Run Count",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "BrowserProfileUsage"
+      },
+      "BrowserProfileUsageCredential": {
+        "properties": {
+          "credential_id": {
+            "type": "string",
+            "title": "Credential Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential_id",
+          "name"
+        ],
+        "title": "BrowserProfileUsageCredential"
+      },
+      "BrowserProfileUsageWorkflow": {
+        "properties": {
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "via": {
+            "type": "string",
+            "title": "Via"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_permanent_id",
+          "title",
+          "via"
+        ],
+        "title": "BrowserProfileUsageWorkflow"
+      },
+      "BrowserSeedSource": {
+        "type": "string",
+        "enum": [
+          "override",
+          "picked",
+          "own_memory",
+          "credential",
+          "fresh",
+          "degraded_fresh"
+        ],
+        "title": "BrowserSeedSource",
+        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -9733,6 +10332,22 @@
             "description": "Whether the browser session supports VNC streaming",
             "default": false
           },
+          "stream_transport": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Transport",
+            "description": "Live-view transport for this session: \"vnc\" or \"cdp\". Resolved on the single-session fetch only; null elsewhere.",
+            "examples": [
+              "vnc",
+              "cdp"
+            ]
+          },
           "download_path": {
             "anyOf": [
               {
@@ -9825,6 +10440,18 @@
             ],
             "title": "Deleted At",
             "description": "Timestamp when the session was deleted, if applicable"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning",
+            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped; null otherwise."
           }
         },
         "type": "object",
@@ -9973,6 +10600,17 @@
               }
             ],
             "title": "Single Option Click"
+          },
+          "desired_state": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired State"
           }
         },
         "type": "object",
@@ -10099,6 +10737,20 @@
             "type": "array",
             "title": "Parameters",
             "default": []
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
@@ -10299,6 +10951,20 @@
             "type": "string",
             "title": "Code"
           },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -10322,7 +10988,8 @@
                 "type": "null"
               }
             ],
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "Plain-language goal of this code block, shown as the block's Goal in the editor"
           },
           "steps": {
             "anyOf": [
@@ -10336,7 +11003,8 @@
                 "type": "null"
               }
             ],
-            "title": "Steps"
+            "title": "Steps",
+            "description": "Plain-language step outline mapped to code line ranges; derived from the code when omitted"
           }
         },
         "type": "object",
@@ -10807,6 +11475,12 @@
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
             "default": false
+          },
+          "needs_live_view": {
+            "type": "boolean",
+            "title": "Needs Live View",
+            "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
+            "default": false
           }
         },
         "type": "object",
@@ -10900,6 +11574,42 @@
             "title": "Rotate Proxy Session Id",
             "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
             "default": false
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "Optional plain browser profile to link as this credential's saved profile. Must be an unmanaged profile in your organization that no other credential already owns."
+          },
+          "auto_profile_disabled": {
+            "type": "boolean",
+            "title": "Auto Profile Disabled",
+            "description": "Disable automatic saving and reuse of this credential's browser profile.",
+            "default": false
+          },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
+            "description": "Keep the same IP across sign-ins that reuse this credential's saved profile.",
+            "default": false
+          },
+          "tested_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tested Url",
+            "description": "Login page URL used during the credential test"
           }
         },
         "type": "object",
@@ -11090,6 +11800,31 @@
             ],
             "title": "Selection Strategy"
           },
+          "fallback_credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Credential Ids"
+          },
+          "fallback_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Trigger"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -11175,6 +11910,31 @@
               }
             ],
             "title": "Selection Strategy"
+          },
+          "fallback_credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Credential Ids"
+          },
+          "fallback_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Trigger"
           }
         },
         "type": "object",
@@ -11244,6 +12004,24 @@
             "title": "Browser Profile Id",
             "description": "Browser profile ID linked to this credential"
           },
+          "auto_profile_disabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Profile Disabled",
+            "description": "Whether automatic saving and reuse of this credential's browser profile is disabled."
+          },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
+            "description": "Whether sign-ins reusing this credential's saved profile keep the same IP",
+            "default": false
+          },
           "tested_url": {
             "anyOf": [
               {
@@ -11279,6 +12057,11 @@
             ],
             "title": "Save Browser Session Intent",
             "description": "Whether the user intends to save a browser session, regardless of test outcome"
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
           },
           "folder_id": {
             "anyOf": [
@@ -11649,6 +12432,11 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "extra_parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Extra Parameters"
           }
         },
         "type": "object",
@@ -11692,7 +12480,8 @@
         "enum": [
           "openai_compatible",
           "ollama",
-          "openrouter"
+          "openrouter",
+          "gemini"
         ],
         "title": "CustomLLMProvider"
       },
@@ -11719,6 +12508,249 @@
           "config"
         ],
         "title": "CustomLLMUpdateRequest"
+      },
+      "DataExportBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "data_export",
+            "title": "Block Type",
+            "default": "data_export"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "data": {
+            "type": "string",
+            "title": "Data"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "data",
+          "data_schema"
+        ],
+        "title": "DataExportBlock"
+      },
+      "DataExportBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "data_export",
+            "title": "Block Type",
+            "default": "data_export"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "data": {
+            "type": "string",
+            "title": "Data"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "data",
+          "data_schema"
+        ],
+        "title": "DataExportBlockYAML"
       },
       "DeleteScheduleResponse": {
         "properties": {
@@ -11846,6 +12878,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this run"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
           },
           "browser_address": {
             "anyOf": [
@@ -12645,6 +13683,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -13049,6 +14092,233 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
+          },
+          "azure_storage_account_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Name"
+          },
+          "azure_storage_account_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Key"
+          },
+          "azure_blob_container_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language control over which downloaded files are uploaded; empty means upload all."
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
+            "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -13084,6 +14354,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -13288,6 +14563,10 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "download_target": {
+            "$ref": "#/components/schemas/FileDownloadTarget",
+            "default": "website"
           }
         },
         "type": "object",
@@ -13347,6 +14626,235 @@
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
+            "default": false
+          },
+          "download_target": {
+            "$ref": "#/components/schemas/FileDownloadTarget",
+            "default": "website"
+          },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
+          },
+          "azure_storage_account_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Name"
+          },
+          "azure_storage_account_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Key"
+          },
+          "azure_blob_container_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
             "default": false
           },
           "navigation_goal": {
@@ -13473,6 +14981,17 @@
           "navigation_goal"
         ],
         "title": "FileDownloadBlockYAML"
+      },
+      "FileDownloadTarget": {
+        "type": "string",
+        "enum": [
+          "website",
+          "s3",
+          "azure",
+          "google_drive",
+          "sftp"
+        ],
+        "title": "FileDownloadTarget"
       },
       "FileEncoding": {
         "type": "string",
@@ -13884,10 +15403,6 @@
             "title": "Next Loop On Failure",
             "default": false
           },
-          "storage_type": {
-            "$ref": "#/components/schemas/FileStorageType",
-            "default": "s3"
-          },
           "s3_bucket": {
             "anyOf": [
               {
@@ -13931,6 +15446,17 @@
               }
             ],
             "title": "Region Name"
+          },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
           },
           "azure_storage_account_name": {
             "anyOf": [
@@ -14103,6 +15629,10 @@
             "title": "Continue On Empty",
             "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
             "default": false
+          },
+          "storage_type": {
+            "$ref": "#/components/schemas/FileStorageType",
+            "default": "s3"
           }
         },
         "type": "object",
@@ -14211,6 +15741,17 @@
               }
             ],
             "title": "Region Name"
+          },
+          "endpoint_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint Url"
           },
           "azure_storage_account_name": {
             "anyOf": [
@@ -14667,6 +16208,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -14675,6 +16219,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -14917,6 +16462,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -16190,6 +17738,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -16879,6 +18432,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -17277,6 +18835,11 @@
             "title": "Complete Verification",
             "default": true
           },
+          "include_action_history_in_verification": {
+            "type": "boolean",
+            "title": "Include Action History In Verification",
+            "default": false
+          },
           "skip_saved_profile": {
             "type": "boolean",
             "title": "Skip Saved Profile",
@@ -17376,6 +18939,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this run"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
           },
           "browser_address": {
             "anyOf": [
@@ -17513,6 +19082,18 @@
             ],
             "title": "Onepassword Item Id",
             "description": "1Password item ID"
+          },
+          "onepassword_totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Onepassword Totp Field Name",
+            "description": "1Password item field id or label to treat as the TOTP secret, overriding 1Password's own field-type detection"
           },
           "azure_vault_name": {
             "anyOf": [
@@ -17664,6 +19245,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -18045,6 +19631,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -18197,9 +19788,9 @@
         "properties": {
           "password": {
             "type": "string",
-            "minLength": 1,
             "title": "Password",
-            "description": "The password value (must not be empty)",
+            "description": "The password value; may be empty or omitted for logins that have no password",
+            "default": "",
             "examples": [
               "securepassword123"
             ]
@@ -18251,15 +19842,29 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Optional additional password credential metadata fields"
           }
         },
         "type": "object",
         "required": [
-          "password",
           "username"
         ],
         "title": "NonEmptyPasswordCredential",
-        "description": "Password credential model that requires non-empty values."
+        "description": "Password credential model for API writes: non-empty username, optionally empty password."
       },
       "OTPType": {
         "type": "string",
@@ -18307,6 +19912,17 @@
           "item_id": {
             "type": "string",
             "title": "Item Id"
+          },
+          "totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Field Name"
           },
           "created_at": {
             "type": "string",
@@ -18373,6 +19989,17 @@
           "item_id": {
             "type": "string",
             "title": "Item Id"
+          },
+          "totp_field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Field Name"
           }
         },
         "type": "object",
@@ -19675,6 +21302,40 @@
         ],
         "title": "RunTagHistoryResponse"
       },
+      "RunTagSuggestionsResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keys",
+            "description": "Distinct grouped tag keys seen on runs."
+          },
+          "values_by_key": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Values By Key",
+            "description": "Values seen for each grouped key."
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Labels",
+            "description": "Distinct standalone (keyless) labels seen on runs."
+          }
+        },
+        "type": "object",
+        "title": "RunTagSuggestionsResponse",
+        "description": "Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs\never set on a run for the org, sourced from the event log rather than the\ntag-key/tag-value registry so reserved ``skyvern.*`` system keys (never\nregistered) reach the pickers too."
+      },
       "RunTagsBatchRequest": {
         "properties": {
           "workflow_run_ids": {
@@ -19737,6 +21398,7 @@
         "enum": [
           "task_v1",
           "task_v2",
+          "task_v3",
           "workflow_run",
           "openai_cua",
           "anthropic_cua",
@@ -20251,6 +21913,52 @@
             "type": "array",
             "title": "File Attachments",
             "default": []
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535,
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           }
         },
         "type": "object",
@@ -20363,6 +22071,52 @@
               }
             ],
             "title": "Smtp Password Secret Parameter Key"
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535,
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           },
           "sender": {
             "type": "string",
@@ -21298,6 +23052,39 @@
         "title": "TagValue",
         "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
       },
+      "TagValueCreate": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key",
+            "description": "Tag key (group) for the new label."
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) to register under the key."
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color",
+            "description": "Palette color name for the label; a random palette color when omitted."
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "TagValueCreate",
+        "description": "Body for ``POST /v1/tag-values``: register a grouped label before any\nworkflow uses it. The label shows a zero workflow count until applied."
+      },
       "TagValueDelete": {
         "properties": {
           "value": {
@@ -21535,6 +23322,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -22276,6 +24068,24 @@
               "pbs_123"
             ]
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this task"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
+          },
           "model": {
             "anyOf": [
               {
@@ -22381,6 +24191,27 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
             ]
           }
         },
@@ -22578,6 +24409,24 @@
               "pbs_123"
             ]
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this task"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
+          },
           "model": {
             "anyOf": [
               {
@@ -22684,6 +24533,27 @@
               "agent",
               "code"
             ]
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -22711,6 +24581,7 @@
               "created",
               "queued",
               "running",
+              "paused",
               "timed_out",
               "failed",
               "terminated",
@@ -22957,6 +24828,7 @@
             "enum": [
               "task_v1",
               "task_v2",
+              "task_v3",
               "openai_cua",
               "anthropic_cua",
               "ui_tars",
@@ -23214,6 +25086,76 @@
           "prompt"
         ],
         "title": "TaskV2BlockYAML"
+      },
+      "TelInputOutcome": {
+        "properties": {
+          "flag_enabled": {
+            "type": "boolean",
+            "title": "Flag Enabled"
+          },
+          "final_element_id": {
+            "type": "string",
+            "title": "Final Element Id"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/TelInputStrategy"
+          },
+          "expected_digit_count": {
+            "type": "integer",
+            "title": "Expected Digit Count"
+          },
+          "actual_digit_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Digit Count"
+          },
+          "browser_valid": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Valid"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "title": "Attempt Count"
+          },
+          "retargeted": {
+            "type": "boolean",
+            "title": "Retargeted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "flag_enabled",
+          "final_element_id",
+          "strategy",
+          "expected_digit_count",
+          "attempt_count",
+          "retargeted"
+        ],
+        "title": "TelInputOutcome"
+      },
+      "TelInputStrategy": {
+        "type": "string",
+        "enum": [
+          "legacy_sequential",
+          "formatted_sequential",
+          "sequential_national",
+          "atomic_national",
+          "atomic_e164"
+        ],
+        "title": "TelInputStrategy"
       },
       "TextPromptBlock": {
         "properties": {
@@ -23912,6 +25854,31 @@
             "type": "string",
             "title": "Presigned Url",
             "description": "Presigned URL to access the uploaded file"
+          },
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Id",
+            "description": "Identifier for this upload. Pass it to DELETE /v1/files/{file_id} to delete the file."
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At",
+            "description": "When the file will be deleted, if a retention_days was supplied. Null means the file has no expiry of its own and follows the organization's data retention policy."
           }
         },
         "type": "object",
@@ -24158,6 +26125,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -24597,6 +26569,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -24866,6 +26843,10 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -24901,6 +26882,17 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
           },
           "parameter_keys": {
             "anyOf": [
@@ -25320,6 +27312,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -25328,6 +27323,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -25388,7 +27384,7 @@
           "condition"
         ],
         "title": "WhileLoopBlock",
-        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
+        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (1000). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
       },
       "WhileLoopBlockYAML": {
         "properties": {
@@ -25498,6 +27494,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -25651,6 +27650,16 @@
           "persist_browser_session": {
             "type": "boolean",
             "title": "Persist Browser Session",
+            "default": false
+          },
+          "reuse_browser_session": {
+            "type": "boolean",
+            "title": "Reuse Browser Session",
+            "default": false
+          },
+          "mask_secrets": {
+            "type": "boolean",
+            "title": "Mask Secrets",
             "default": false
           },
           "pin_saved_session_ip": {
@@ -25980,6 +27989,23 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "reuse_browser_session": {
+            "type": "boolean",
+            "title": "Reuse Browser Session",
+            "default": false
+          },
+          "mask_secrets": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mask Secrets",
+            "description": "Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
@@ -26331,6 +28357,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/SplitPdfBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/DataExportBlock"
                 }
               ],
               "discriminator": {
@@ -26339,6 +28368,7 @@
                   "action": "#/components/schemas/ActionBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
+                  "data_export": "#/components/schemas/DataExportBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
@@ -26407,6 +28437,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -26540,6 +28583,9 @@
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/DataExportBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -26582,6 +28628,7 @@
                   "action": "#/components/schemas/ActionBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
                   "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
                   "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",
@@ -26650,6 +28697,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -26899,6 +28959,49 @@
             ],
             "title": "Browser Profile Id"
           },
+          "browser_seed_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSeedSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "browser_sink_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Sink Profile Id"
+          },
+          "start_fresh_browser": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Fresh Browser"
+          },
+          "reuse_browser_session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reuse Browser Session"
+          },
           "debug_session_id": {
             "anyOf": [
               {
@@ -27029,6 +29132,28 @@
             ],
             "title": "Failure Category"
           },
+          "retried_from_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retried From Workflow Run Id"
+          },
+          "fallback_attempt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Attempt"
+          },
           "parent_workflow_run_id": {
             "anyOf": [
               {
@@ -27137,6 +29262,17 @@
               }
             ],
             "title": "Sequential Key"
+          },
+          "sequential_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Credential Id"
           },
           "ai_fallback": {
             "anyOf": [
@@ -27412,6 +29548,28 @@
               }
             ],
             "title": "Url"
+          },
+          "final_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Url"
+          },
+          "finish_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finish Reason"
           },
           "navigation_goal": {
             "anyOf": [
@@ -27857,6 +30015,18 @@
             "title": "Browser Session Id",
             "description": "ID of a Skyvern browser session to reuse, having it continue from the current screen state"
           },
+          "reuse_browser_session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reuse Browser Session",
+            "description": "Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account."
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -27868,6 +30038,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this workflow run"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
           },
           "max_screenshot_scrolls": {
             "anyOf": [
@@ -27983,6 +30159,27 @@
             ],
             "title": "Run Metadata",
             "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -28102,6 +30299,18 @@
             "title": "Browser Session Id",
             "description": "ID of a Skyvern browser session to reuse, having it continue from the current screen state"
           },
+          "reuse_browser_session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reuse Browser Session",
+            "description": "Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account."
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -28113,6 +30322,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this workflow run"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
           },
           "max_screenshot_scrolls": {
             "anyOf": [
@@ -28228,6 +30443,27 @@
             ],
             "title": "Run Metadata",
             "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -28255,6 +30491,7 @@
               "created",
               "queued",
               "running",
+              "paused",
               "timed_out",
               "failed",
               "terminated",
@@ -28535,6 +30772,22 @@
             ],
             "title": "Script Id",
             "description": "ID of the cached script used for this workflow run, if any."
+          },
+          "browser_seed_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSeedSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which layer of the seed-precedence chain seeded this run's browser (provenance).",
+            "examples": [
+              "credential",
+              "own_memory",
+              "fresh"
+            ]
           },
           "run_request": {
             "anyOf": [
