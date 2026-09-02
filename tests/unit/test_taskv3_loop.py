@@ -8717,3 +8717,606 @@ async def test_degrading_the_summary_dict_keeps_tool_choice() -> None:
     final_reasoning, final_tool_choice = caller.kwargs_per_call[-1]
     assert final_reasoning is None
     assert final_tool_choice == "required"
+
+
+def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
+    from skyvern.forge.taskv3.loop import _CanonicalProgressTracker
+
+    t = _CanonicalProgressTracker()
+    assert t.record_touch("#code", True) == (1, 1)
+    assert t.record_touch("#code", True) == (2, 2)
+    assert t.record_touch("#other", False) == (1, 0)
+    assert t.record_touch("#code", True) == (3, 3)
+    assert t.looping_targets() == 0  # below the 4-touch rung
+    assert t.record_touch("#code", False) == (4, 3)
+    assert t.looping_targets() == 1
+    t.progress()
+    assert t.record_touch("#code", True) == (1, 1)  # streak reset by progress
+    assert t.looping_targets() == 0
+
+
+def _error_billable_tool(name: str, sink: list[tuple[str, dict[str, Any]]]) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append((name, args))
+        return ToolResult.error(f"{name} refused")
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, billable=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_event_fires_on_varying_args_same_target() -> None:
+    # The class the incumbent action-loop key (tool+args) provably missed in prod: one selector
+    # touched repeatedly with DIFFERENT args/tools, every touch refused, page unchanged. The
+    # canonical tracker keys on the target and must emit its log-only event; the incumbent must NOT
+    # have terminated (its exact-args streak never forms), which is the superset demonstration.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("fill", {"selector": "#code", "value": "+44"})],
+        [("fill", {"selector": "#code", "value": "United Kingdom"})],
+        [("poke", {"selector": "#code"})],
+        [("fill", {"selector": "#code", "value": "44"})],
+        [("finish", {"status": "failed", "reason": "field kept refusing"})],
+    ]
+    tools = [_error_billable_tool("fill", touches), _error_billable_tool("poke", touches), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert outcome.reason == "field kept refusing"
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 4]
+    assert all(e["repeat_errors"] == e["repeat_count"] for e in fires)
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_event_silent_when_progress_intervenes() -> None:
+    # The structural safety: a confirmed progress signal (here a page transition) clears the ring,
+    # so the same four touches spread across real progress never read as a loop.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("fill", {"selector": "#code", "value": "+44"})],
+        [("fill", {"selector": "#code", "value": "United Kingdom"})],
+        [("advance", {"selector": "#next"})],
+        [("fill", {"selector": "#code", "value": "44"})],
+        [("fill", {"selector": "#code", "value": "uk"})],
+        [("finish", {"status": "completed"})],
+    ]
+    tools = [
+        _error_billable_tool("fill", touches),
+        _billable_tool("advance", clicks, data={"page_transitioned": True}),
+        make_finish_tool(),
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "completed"
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_clears_on_invalid_fields_new_low_not_on_stall_verdict() -> None:
+    # The ledger's True return is the shadow STALL verdict; the canonical clear must key on the
+    # ledger re-baselining (a new low) — real form progress between refused touches stays silent.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    seq = iter([5, 4, 3, 2, 1])
+
+    async def observe_handler(args: dict[str, Any]) -> ToolResult:
+        inv = next(seq)
+        return ToolResult.ok(f"url=x inv={inv}", data={"summary": {"invalid_fields": inv}})
+
+    observe_tool = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe_handler,
+        billable=False,
+        compactable=True,
+    )
+    script = [
+        [("observe", {})],
+        [("fill", {"selector": "#code", "value": "a"})],
+        [("observe", {})],
+        [("fill", {"selector": "#code", "value": "b"})],
+        [("observe", {})],
+        [("fill", {"selector": "#code", "value": "c"})],
+        [("observe", {})],
+        [("fill", {"selector": "#code", "value": "d"})],
+        [("finish", {"status": "completed"})],
+    ]
+    tools = [_error_billable_tool("fill", touches), observe_tool, make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "completed"
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_event_keys_marks_like_selectors() -> None:
+    # look-based actions carry mark=N, not selector — the same mark re-touched must accumulate as
+    # one target, not collapse into a per-tool bucket with every other mark.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("poke", {"mark": 7})],
+        [("poke", {"mark": 7, "value": "x"})],
+        [("poke", {"mark": 7, "value": "y"})],
+        [("poke", {"mark": 7, "value": "z"})],
+        [("finish", {"status": "failed", "reason": "mark kept refusing"})],
+    ]
+    tools = [_error_billable_tool("poke", touches), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_event_distinct_marks_are_distinct_targets() -> None:
+    # The discriminating twin: four DIFFERENT marks are four targets — a per-tool bucket would
+    # wrongly read them as one looping target.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("poke", {"mark": 1})],
+        [("poke", {"mark": 2})],
+        [("poke", {"mark": 3})],
+        [("poke", {"mark": 4})],
+        [("finish", {"status": "failed", "reason": "distinct controls refused"})],
+    ]
+    tools = [_error_billable_tool("poke", touches), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_mark_keys_die_with_the_manifest_selector_keys_survive() -> None:
+    # Each look renumbers marks from 1, so a mark=1 refused after every look is a DIFFERENT control
+    # each time — no streak may form across manifest generations. The same-batch selector streak is
+    # the discriminating pair: its identity outlives the renumbering and must still fire.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    looks: list[tuple[str, dict[str, Any]]] = []
+    turn = [("fill", {"selector": "#code", "value": "x"}), ("poke", {"mark": 1}), ("look", {})]
+    script = [list(turn) for _ in range(4)] + [[("finish", {"status": "failed", "reason": "kept refusing"})]]
+    tools = [
+        _error_billable_tool("fill", touches),
+        _error_billable_tool("poke", touches),
+        _look_tool(looks),
+        make_finish_tool(),
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [(e["tool"], e["repeat_count"]) for e in fires] == [("fill", 3), ("fill", 4)]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_event_suppressed_when_the_completing_touch_progresses() -> None:
+    # Two refusals then a third touch that lands AND changes the page: the rung-3 predicate is
+    # numerically satisfied at record time (2 errors >= 3-1), but the completing touch's own
+    # progress must be absorbed before the verdict — a progressing run emits nothing.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return ToolResult.error("fill refused")
+        return ToolResult.ok("fill landed", data={"page_state_changed": True})
+
+    fill = ToolSpec(
+        name="fill", description="fill", parameters={"type": "object", "properties": {}}, handler=handler, billable=True
+    )
+    script = [
+        [("fill", {"selector": "#code", "value": "a"})],
+        [("fill", {"selector": "#code", "value": "b"})],
+        [("fill", {"selector": "#code", "value": "ab"})],
+        [("finish", {"status": "completed", "reason": "landed"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [fill, make_finish_tool()], max_turns=50, max_tool_calls=100)
+    assert outcome.status == "completed"
+    assert calls["n"] == 3
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_cleared_by_movement_landing_between_batches() -> None:
+    # A delayed render lands after one batch's after-sample and before the next batch's
+    # before-sample: the cross-batch fingerprint move is confirmed progress and must clear the
+    # ring BEFORE the new batch's touches are read against the old ones.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    fp_calls = {"n": 0}
+
+    async def between_batch_fingerprint() -> str:
+        fp_calls["n"] += 1
+        return f"dom-{(fp_calls['n'] - 1) // 2}"
+
+    script = [[("fill", {"selector": "#code", "value": str(i)})] for i in range(4)]
+    script.append([("finish", {"status": "failed", "reason": "kept refusing"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_error_billable_tool("fill", touches), make_finish_tool()],
+            page_fingerprint=between_batch_fingerprint,
+            max_turns=50,
+            max_tool_calls=100,
+        )
+    assert outcome.status == "failed"
+    assert len(touches) == 4
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_not_masked_by_replayed_download_notice() -> None:
+    # A compactable tool replaying a retained download notice (download_notice without
+    # download_new) is not fresh progress: it must not keep wiping the ring, or a post-download
+    # loop could never accumulate enough touches to emit telemetry.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+
+    async def replay_observe(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("page\nDownloaded: report.pdf (1.0 MB)", data={"download_notice": True})
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=replay_observe,
+        billable=False,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(4):
+        script.append([("click", {"selector": "#dl", "note": str(i)})])
+        script.append([("observe", {})])
+    script.append([("finish", {"status": "failed", "reason": "kept refusing after the download"})])
+    tools = [_error_billable_tool("click", touches), observe, make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert len(touches) == 4
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_suppressed_when_completion_probe_fires_on_the_rung_touch() -> None:
+    # complete_on_download: the file can land while the probe waits, AFTER the tool result returned
+    # without download_new. The probe's outcome skips the end-of-batch detector, but the pending
+    # rung minted by that same touch must not be emitted — the run completed on real progress.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        return ToolResult.error("click refused") if calls["n"] < 3 else ToolResult.ok("clicked")
+
+    click = ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        billable=True,
+    )
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return "a file finished downloading" if calls["n"] >= 3 else None
+
+    script = [
+        [("click", {"selector": "#dl", "note": "a"})],
+        [("click", {"selector": "#dl", "note": "b"})],
+        [("click", {"selector": "#dl", "note": "c"})],
+        [("finish", {"status": "failed", "reason": "unreached"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, [click, make_finish_tool()], completion_probe=probe, max_turns=50, max_tool_calls=100
+        )
+    assert outcome.status == "completed"
+    assert outcome.reason == "a file finished downloading"
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_not_masked_by_missing_probe_samples() -> None:
+    # Auto-observe deliberately treats a missing probe sample as "assume changed" for the model's
+    # benefit, but that fallback is not evidence: intermittent probe timeouts must not keep
+    # clearing the ring and permanently mask a genuine loop.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+
+    async def dead_probe() -> str | None:
+        return None
+
+    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("url=x page digest (1 interactive elements)")
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe_handler,
+        compactable=True,
+    )
+    script = [[("click", {"selector": "#dl", "note": str(i)})] for i in range(4)]
+    script.append([("finish", {"status": "failed", "reason": "kept refusing"})])
+    tools = [_error_billable_tool("click", touches), observe, make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, tools, auto_observe=True, page_probe=dead_probe, max_turns=50, max_tool_calls=100
+        )
+    assert outcome.status == "failed"
+    assert len(touches) == 4
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_absorbs_movement_in_a_terminal_batch_before_emitting() -> None:
+    # Two refusals, then a batch whose successful third touch changes the DOM (fingerprint-only)
+    # and whose finish completes the run: the terminal outcome skips the detector, but the batch's
+    # own movement must still be absorbed before the pending rung is decided.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        return ToolResult.error("click refused") if calls["n"] < 3 else ToolResult.ok("clicked")
+
+    click = ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        billable=True,
+    )
+    fp_calls = {"n": 0}
+
+    async def fingerprint() -> str:
+        # Moves only at the terminal batch's after-sample (calls 1-5 are the three before-samples
+        # and the first two batches' after-samples).
+        fp_calls["n"] += 1
+        return "dom-0" if fp_calls["n"] <= 5 else "dom-1"
+
+    script = [
+        [("click", {"selector": "#dl", "note": "a"})],
+        [("click", {"selector": "#dl", "note": "b"})],
+        [("click", {"selector": "#dl", "note": "c"}), ("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, [click, make_finish_tool()], page_fingerprint=fingerprint, max_turns=50, max_tool_calls=100
+        )
+    assert outcome.status == "completed"
+    assert calls["n"] == 3
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canceled_run_emits_pending_fire_without_a_terminal_probe() -> None:
+    # An acknowledged cancellation must not wait on the terminal-batch reconciliation sample (a
+    # hung renderer can hold that probe for its full timeout); the pending rung is emitted as
+    # minted, since no progress evidence contradicts it.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    fp_calls = {"n": 0}
+
+    async def fingerprint() -> str:
+        fp_calls["n"] += 1
+        return "dom-0"
+
+    async def should_cancel() -> bool:
+        return len(touches) >= 3
+
+    script = [
+        [("click", {"selector": "#dl", "note": "a"})],
+        [("click", {"selector": "#dl", "note": "b"})],
+        [("click", {"selector": "#dl", "note": "c"}), ("click", {"selector": "#dl", "note": "d"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_error_billable_tool("click", touches), make_finish_tool()],
+            page_fingerprint=fingerprint,
+            should_cancel=should_cancel,
+            max_turns=50,
+            max_tool_calls=100,
+        )
+    assert outcome.status == "canceled"
+    assert len(touches) == 3  # the fourth call was refused by the cancellation check
+    # 2 samples per completed batch plus the final batch's before-sample; NO terminal probe.
+    assert fp_calls["n"] == 5
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_cleared_by_changed_perception_digest_without_fingerprint() -> None:
+    # With no page_fingerprint, a repeated observe whose digest changes is the only movement
+    # evidence there is; two landed digests that differ must clear the ring like a fingerprint
+    # mismatch would, so touches against superseded pages never alias into a rung.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    pages = {"n": 0}
+
+    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
+        pages["n"] += 1
+        return ToolResult.ok(f"url=x page {pages['n']} content (1 interactive elements)")
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe_handler,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    for i in range(4):
+        script.append([("click", {"selector": "#dl", "note": str(i)})])
+        script.append([("observe", {})])
+    script.append([("finish", {"status": "failed", "reason": "kept refusing"})])
+    tools = [_error_billable_tool("click", touches), observe, make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert len(touches) == 4
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_rung_fires_once_even_when_the_window_parks_on_it() -> None:
+    # Eight failed touches on A, two on B, then more on A: eviction keeps A's in-window count
+    # parked at 8, which must not re-emit rung 8 on every subsequent touch — a rung is one
+    # threshold crossing per generation.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    script = [[("click", {"selector": "#a", "note": str(i)})] for i in range(8)]
+    script += [[("click", {"selector": "#b", "note": str(i)})] for i in range(2)]
+    script += [[("click", {"selector": "#a", "note": f"again-{i}"})] for i in range(3)]
+    script.append([("finish", {"status": "failed", "reason": "kept refusing"})])
+    tools = [_error_billable_tool("click", touches), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=60, max_tool_calls=200)
+    assert outcome.status == "failed"
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 4, 6, 8]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_clears_on_new_low_even_under_a_replayed_notice() -> None:
+    # Blocker 1 (AronPerez round 6/10): a replayed download notice hard-progresses the shadow
+    # ledger, nulling invalid_baseline BEFORE the shadow read on the same result — which left the
+    # new-low clear dead for the rest of the page. Constant observe content keeps the perception
+    # digest from masking the probe. A form ratcheting to a new low on every look is progressing;
+    # the refusing selector must emit nothing.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    seq = iter([6, 5, 4, 3, 2])
+
+    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("url=x form", data={"download_notice": True, "summary": {"invalid_fields": next(seq)}})
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe_handler,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(4):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": "#stuck", "note": str(i)})])
+    script.append([("observe", {})])
+    script.append([("finish", {"status": "failed", "reason": "one field kept refusing"})])
+    tools = [_error_billable_tool("click", touches), observe, make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert len(touches) == 4
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_spares_a_sibling_targets_rung() -> None:
+    # Blocker 2 (AronPerez round 10): the probe firing is progress for the COMPLETING touch only.
+    # A five-error streak on one selector minted a genuine rung 6 the same batch a download on a
+    # DIFFERENT selector completed the run — that sibling rung is real data and must survive.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    fetched = {"done": False}
+
+    async def fetch_handler(_args: dict[str, Any]) -> ToolResult:
+        fetched["done"] = True
+        return ToolResult.ok("fetch dispatched")
+
+    fetch = ToolSpec(
+        name="fetch",
+        description="fetch",
+        parameters={"type": "object", "properties": {}},
+        handler=fetch_handler,
+        billable=True,
+    )
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return "a file finished downloading" if fetched["done"] else None
+
+    script = [[("click", {"selector": "#stuck", "note": str(i)})] for i in range(5)]
+    script.append([("click", {"selector": "#stuck", "note": "sixth"}), ("fetch", {"selector": "#other"})])
+    tools = [_error_billable_tool("click", touches), fetch, make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, completion_probe=probe, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "completed"
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 4, 6]
+
+
+@pytest.mark.asyncio
+async def test_canonical_rung_rearms_after_full_eviction() -> None:
+    # A rung re-arms once the target's in-window count dips below it: a fresh streak after full
+    # eviction is a genuine re-crossing, unlike the parked-window case the once-per-generation
+    # guard exists for.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    script = [[("click", {"selector": "#a", "note": str(i)})] for i in range(3)]
+    script += [[("click", {"selector": "#b", "note": str(i)})] for i in range(10)]
+    script += [[("click", {"selector": "#a", "note": f"again-{i}"})] for i in range(3)]
+    script.append([("finish", {"status": "failed", "reason": "kept refusing"})])
+    tools = [_error_billable_tool("click", touches), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=60, max_tool_calls=200)
+    assert outcome.status == "failed"
+    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
+    assert [e["repeat_count"] for e in fires] == [3, 3, 4, 6, 8, 3]
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_cleared_by_positive_probe_mismatch_on_a_failed_call() -> None:
+    # A failed call that moved the document (two landed identity samples that differ) is progress
+    # the fingerprint can miss entirely (a same-template step renders identically): the poisoned
+    # batch stop already knows the page moved, and the ring must learn it too.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    probe_calls = {"n": 0}
+
+    async def moving_probe() -> str:
+        probe_calls["n"] += 1
+        return f"doc-{probe_calls['n']}"
+
+    script = [[("click", {"selector": "#stuck", "note": str(i)})] for i in range(4)]
+    script.append([("finish", {"status": "failed", "reason": "kept refusing"})])
+    tools = [_error_billable_tool("click", touches), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, page_probe=moving_probe, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert len(touches) == 4
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
