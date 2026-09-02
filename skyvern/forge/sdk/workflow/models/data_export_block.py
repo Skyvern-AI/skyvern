@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import structlog
 
@@ -33,20 +33,21 @@ class DataExportBlock(Block):
     file_name: str | None = None
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"data", "file_name"})
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.data = self.format_block_parameter_template_from_workflow_run_context(
+        self.data = self.render_templatable_field(
+            "data",
             self.data,
             workflow_run_context,
             env=jinja_json_finalize_required_binding_env,
             skip_missing_variable_preflight=True,
         )
         if self.file_name:
-            self.file_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.file_name, workflow_run_context
-            )
+            self.file_name = self.render_templatable_field("file_name", self.file_name, workflow_run_context)
 
     def _resolve_file_name(self, workflow_run_context: WorkflowRunContext) -> str:
         stem = sanitize_filename(self.file_name or self.label)
@@ -134,6 +135,17 @@ class DataExportBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
             self.format_potential_template_parameters(workflow_run_context)
+        except Exception as exc:
+            return await self._template_format_failure_result(
+                exc,
+                str(exc),
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
+
+        try:
             records = self._parse_records(self.data)
             parquet_data = export_parquet_records(records, self.data_schema)
         except (FailedToFormatJinjaStyleParameter, ParquetExportError) as exc:

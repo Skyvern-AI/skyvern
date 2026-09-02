@@ -1565,7 +1565,9 @@ class WorkflowRunContext:
             raise ValueError(f"Unknown parameter type: {parameter.parameter_type}")
 
     async def register_output_parameter_value_post_execution(
-        self, parameter: OutputParameter, value: dict[str, Any] | list | str | None
+        self,
+        parameter: OutputParameter,
+        value: dict[str, Any] | list | str | None,
     ) -> None:
         if parameter.key in self.values:
             LOG.debug(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
@@ -1591,12 +1593,17 @@ class WorkflowRunContext:
 
         if block_label in self.values:
             current_value = self.values[block_label]
-            # only able to merge the value when the current value and the pending value are both dicts
-            if isinstance(current_value, dict) and isinstance(block_reference_value, dict):
-                # Merge old into new so that new values (e.g. from the latest loop
-                # iteration) take precedence over stale ones.
-                merged = {**current_value, **block_reference_value}
-                block_reference_value = merged
+            # Merge old into new so the latest loop iteration's keys win. A failure payload describes
+            # one attempt only, so it is never merged in either direction: merging it into a later
+            # success would carry `failure_reason` forward, and merging an earlier success into it
+            # would let a prior iteration's keys leak into the failed one.
+            if (
+                isinstance(current_value, dict)
+                and isinstance(block_reference_value, dict)
+                and not current_value.get("failure_reason")
+                and not block_reference_value.get("failure_reason")
+            ):
+                block_reference_value = {**current_value, **block_reference_value}
             else:
                 LOG.debug(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
