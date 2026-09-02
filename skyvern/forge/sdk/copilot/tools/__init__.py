@@ -276,6 +276,10 @@ async def update_workflow_tool(
     Provide the complete workflow YAML as a string.
     Returns the validated workflow or validation errors.
 
+    A successful write is staged as a proposal, which the returned `persistence` and
+    `persistence_message` report. The user accepts a staged proposal to save it, or
+    discards it to keep the current version.
+
     Top-level workflow parameter keys appear in the run-input UI. When you
     add runtime inputs in `workflow_definition.parameters`, name keys for the
     reusable domain value the user supplies, not the page widget or action used
@@ -1104,7 +1108,7 @@ def _credential_deferred_combined_tool_result(
     arguments: dict[str, Any],
     update_result: dict[str, Any],
 ) -> str:
-    """Record a persisted draft when a combined edit/update cannot safely run yet."""
+    """Record the staged draft when a combined edit/update cannot safely run yet."""
     copilot_ctx.last_run_skipped_unbound_credentials = True
     skip_result = {
         "ok": True,
@@ -1116,7 +1120,7 @@ def _credential_deferred_combined_tool_result(
             "skip_reason": "workflow_credential_inputs_unbound",
         },
     }
-    carry_author_time_findings(update_result, skip_result)
+    skip_result = carry_author_time_findings(update_result, skip_result)
     record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
     finalize_build_test_result(
         copilot_ctx,
@@ -1175,7 +1179,7 @@ async def _run_updated_workflow_blocks(
                 frontier_start_label=frontier_start_label,
             )
         recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
-        carry_author_time_findings(update_result, run_result)
+        run_result = carry_author_time_findings(update_result, run_result)
         _carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
         finalize_build_test_result(

@@ -4456,6 +4456,7 @@ async def run_copilot_agent(
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
+    auto_accept: bool | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4501,6 +4502,7 @@ async def run_copilot_agent(
                     eval_capture_case_id=eval_capture_case_id,
                     eval_mode=eval_mode,
                     eval_entrypoint_url=eval_entrypoint_url,
+                    auto_accept=auto_accept,
                 )
                 return result
             except Exception as exc:
@@ -4601,6 +4603,7 @@ async def _run_copilot_turn_impl(
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
+    auto_accept: bool | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     copilot_config = config_for_eval_mode(copilot_config, eval_mode)
@@ -4665,6 +4668,7 @@ async def _run_copilot_turn_impl(
         api_key=api_key,
         user_message=chat_request.message,
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+        auto_accept=auto_accept,
         eval_capture_case_id=eval_capture_case_id,
         eval_mode=eval_mode,
         turn_id=turn_id,

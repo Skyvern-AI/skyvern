@@ -974,6 +974,9 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
+    # staged draft at turn end. None on entrypoints that load no chat row.
+    auto_accept: bool | None = None
     # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
     prior_copilot_workflow_yaml: str | None = None
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
