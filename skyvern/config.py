@@ -92,8 +92,6 @@ class Settings(BaseSettings):
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
-    # Whole-display recording is opt-in and intended for packaged Linux workers only.
-    EXCLUSIVE_DISPLAY_RECORDING: bool = False
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
