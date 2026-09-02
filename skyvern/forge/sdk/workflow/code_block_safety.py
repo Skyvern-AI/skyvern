@@ -551,7 +551,20 @@ def is_safe_code(
     *,
     error_factory: Callable[[str], Exception] = InsecureCodeDetected,
 ) -> None:
-    """Reject imports, private members, and known escape hatches."""
+    """Reject imports, private members, and known escape hatches.
+
+    Leaves bare builtin names like `globals`/`locals` unblocked here; whether that's
+    reachable is runner-dependent, not a blanket invariant. The legacy in-process exec path
+    (CodeBlock.build_safe_vars) and the sidecar's non-sandboxed runner never bind
+    globals/locals into `__builtins__`, so a bare call raises NameError. Only the
+    OS-sandboxed subprocess child binds them, and there `globals()` returns the full live
+    exec-globals dict -- private injected helpers and unreferenced parameters included, not
+    just the code's own free variables -- so that runner's actual boundary is the OS sandbox
+    plus stdout/stderr redaction (see tests/cloud/test_codeblock_parameter_redaction_core.py),
+    not this checker. is_safe_script_code blocks the bare names because it validates a real
+    importlib-loaded module with the genuine `__builtins__` attached and no sandbox
+    underneath.
+    """
     tree = ast.parse(textwrap.dedent(code))
     _validate_tree(
         tree,
