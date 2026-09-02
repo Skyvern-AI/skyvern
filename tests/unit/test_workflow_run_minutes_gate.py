@@ -338,3 +338,103 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
     assert sum(call.kwargs["duration_seconds"] for call in record_run_duration.await_args_list) == pytest.approx(
         wall_clock_seconds
     )
+
+
+@pytest.mark.asyncio
+async def test_duration_metrics_log_carries_task_run_type_for_a_bare_task(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # The v1-vs-v3 wall-time dashboard needs an engine discriminator on "Task duration metrics";
+    # a bare task resolves it from its own task_runs row (SKY-15499).
+    from structlog.testing import capture_logs
+
+    from skyvern.schemas.run_enums import RunType
+
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
+    claimed_task = _make_task(status=TaskStatus.completed, started_at=now - timedelta(minutes=5), finished_at=now)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
+    )
+    monkeypatch.setattr(app.DATABASE.tasks, "get_run", AsyncMock(return_value=MagicMock(task_run_type=RunType.task_v3)))
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    with capture_logs() as logs:
+        await ForgeAgent().update_task(entry_task, status=TaskStatus.completed)
+
+    duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_run_type"] == "task_v3"
+
+
+@pytest.mark.asyncio
+async def test_duration_metrics_log_resolves_engine_from_the_block_for_a_workflow_task(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # Workflow-block tasks have no task_runs row; the block row's RESOLVED engine is the
+    # discriminator (task_runs cover bare tasks only).
+    from structlog.testing import capture_logs
+
+    from skyvern.schemas.run_enums import RunEngine
+
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
+    entry_task.workflow_run_id = "wr_gate"
+    claimed_task = _make_task(status=TaskStatus.terminated, started_at=now - timedelta(minutes=5), finished_at=now)
+    claimed_task.workflow_run_id = "wr_gate"
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
+    )
+    monkeypatch.setattr(
+        app.DATABASE.observer,
+        "get_workflow_run_block_engine_by_task_id",
+        AsyncMock(return_value=RunEngine.skyvern_v1),
+    )
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    with capture_logs() as logs:
+        await ForgeAgent().update_task(entry_task, status=TaskStatus.terminated, failure_reason="blocked")
+
+    duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_run_type"] == "task_v1"
+
+
+@pytest.mark.asyncio
+async def test_duration_metrics_log_survives_a_failed_run_type_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    # The discriminator is best-effort telemetry: a DB error must neither drop the log nor fail the
+    # terminal update.
+    from structlog.testing import capture_logs
+
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5))
+    claimed_task = _make_task(status=TaskStatus.completed, started_at=now - timedelta(minutes=5), finished_at=now)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "update_task_and_claim_finish", AsyncMock(return_value=(claimed_task, True))
+    )
+    monkeypatch.setattr(app.DATABASE.tasks, "get_run", AsyncMock(side_effect=RuntimeError("db down")))
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    with capture_logs() as logs:
+        await ForgeAgent().update_task(entry_task, status=TaskStatus.completed)
+
+    duration_logs = [e for e in logs if e.get("event") == "Task duration metrics"]
+    assert len(duration_logs) == 1
+    assert duration_logs[0]["task_run_type"] is None
+
+
+def test_run_type_by_engine_mapping_is_exhaustive() -> None:
+    # A new RunEngine member silently maps to None otherwise -- pin the dict to the enum.
+    from skyvern.forge.agent import _RUN_TYPE_BY_ENGINE
+    from skyvern.schemas.run_enums import RunEngine, RunType
+
+    assert set(_RUN_TYPE_BY_ENGINE) == set(RunEngine)
+    assert set(_RUN_TYPE_BY_ENGINE.values()) <= {t.value for t in RunType}

@@ -380,6 +380,18 @@ def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
 # display; a runaway multi-paragraph turn must not become a per-row payload.
 _TASKV3_REASONING_MAX_CHARS = 1000
 
+# Block-engine to run-type labels for the "Task duration metrics" discriminator (SKY-15499):
+# workflow-block tasks have no task_runs row, so the block's resolved engine stands in.
+_RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
+    RunEngine.skyvern_v1: "task_v1",
+    RunEngine.skyvern_v2: "task_v2",
+    RunEngine.skyvern_v3: "task_v3",
+    RunEngine.openai_cua: "openai_cua",
+    RunEngine.anthropic_cua: "anthropic_cua",
+    RunEngine.ui_tars: "ui_tars",
+    RunEngine.yutori_navigator: "yutori_navigator",
+}
+
 
 def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields: Any) -> Action:
     """Build the Action a v3 tool call persists as, carrying the fields its typed subclass requires so
@@ -1983,6 +1995,7 @@ class ForgeAgent:
                 page_fingerprint=_page_fingerprint,
                 page_probe=_page_probe,
                 reload_page=_reload_page,
+                block_type=str(task_block.block_type) if task_block is not None else None,
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
@@ -7160,6 +7173,21 @@ class ForgeAgent:
             start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
             duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            # Best-effort engine discriminator (SKY-15499): a bare task's own task_runs row is exact;
+            # a workflow-block task has no task_runs row, so its block row's RESOLVED engine is the
+            # source. Telemetry only — a failed lookup must not touch the terminal update.
+            task_run_type: str | None = None
+            try:
+                if task.workflow_run_id is None:
+                    run = await app.DATABASE.tasks.get_run(task.task_id, organization_id=task.organization_id)
+                    task_run_type = str(run.task_run_type) if run else None
+                else:
+                    block_engine = await app.DATABASE.observer.get_workflow_run_block_engine_by_task_id(
+                        task.task_id, organization_id=task.organization_id
+                    )
+                    task_run_type = _RUN_TYPE_BY_ENGINE.get(block_engine) if block_engine else None
+            except Exception:
+                LOG.warning("task_run_type resolution for duration metrics failed", task_id=task.task_id, exc_info=True)
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -7169,6 +7197,7 @@ class ForgeAgent:
                 task_status=status,
                 organization_id=task.organization_id,
                 failure_reason=failure_reason,
+                task_run_type=task_run_type,
             )
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)

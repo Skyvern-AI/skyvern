@@ -688,6 +688,23 @@ class ObserverRepository(BaseRepository):
                 return convert_to_workflow_run_block(workflow_run_block, task=task)
             raise NotFoundError(f"WorkflowRunBlock not found by {task_id}")
 
+    @db_operation("get_workflow_run_block_engine_by_task_id")
+    async def get_workflow_run_block_engine_by_task_id(
+        self,
+        task_id: str,
+        organization_id: str | None = None,
+    ) -> RunEngine | None:
+        """The block row's resolved engine only — no task hydration, one indexed point read."""
+        async with self.Session() as session:
+            engine = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel.engine)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return RunEngine(engine) if engine else None
+
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(
         self,

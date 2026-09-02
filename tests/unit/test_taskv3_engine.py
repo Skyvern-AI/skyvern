@@ -1330,3 +1330,33 @@ def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base()
         openai_client=None, _custom_openrouter=False, llm_config=azure, original_llm_key="AZURE_OPENAI_GPT5_6_SOL"
     )
     assert LLMCaller.uses_openai_responses_bridge(azure_self) is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_carries_duration_and_block_type() -> None:
+    # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
+    # the block context to slice workflow-block runs (SKY-15499).
+    from structlog.testing import capture_logs
+
+    script = [[("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type="navigation",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1
+    assert terminal[0]["block_type"] == "navigation"
+    assert isinstance(terminal[0]["duration_seconds"], float)
+    assert terminal[0]["duration_seconds"] >= 0.0
+
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert terminal[0]["block_type"] is None  # bare task: no block context
