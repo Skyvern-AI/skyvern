@@ -556,6 +556,10 @@ export type ExtractionBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  export_enabled?: boolean;
+  export_data_schema?: Record<string, unknown> | null;
+  export_file_name?: string | null;
+  export_records?: string | null;
 };
 
 export type LoginBlock = WorkflowBlockBase & {

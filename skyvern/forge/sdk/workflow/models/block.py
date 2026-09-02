@@ -24,7 +24,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -191,6 +191,7 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
 from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
+    jinja_json_finalize_required_binding_env,
     jinja_json_finalize_strict_env,
     mask_jinja_in_python_comments,
     render_templates_in_json_value,
@@ -249,6 +250,7 @@ from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_available_keys, get_missing_variables
@@ -508,6 +510,138 @@ def extract_file_url_from_block_output(value: Any) -> str | None:
 def sanitize_filename(filename: str, default: str = "document") -> str:
     sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
     return sanitized[:200] if sanitized else default
+
+
+class ParquetExportMixin:
+    """Shared Parquet-export execution: schema-directed serialization, filename
+    resolution (with loop-iteration suffixing), atomic file write, and download
+    registration. Used by DataExportBlock and by ExtractionBlock's export option."""
+
+    @staticmethod
+    def parse_export_records(data: str) -> list[Any]:
+        try:
+            records = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ParquetExportError("data must resolve to a JSON array") from exc
+        if not isinstance(records, list):
+            raise ParquetExportError("data must resolve to a JSON array of object records")
+        return records
+
+    def _resolve_export_file_name(
+        self, file_name: str | None, label: str, workflow_run_context: WorkflowRunContext
+    ) -> str:
+        stem = sanitize_filename(file_name or label)
+        if stem.lower().endswith(".parquet"):
+            stem = stem[: -len(".parquet")]
+        current_index = workflow_run_context.get_block_metadata(label).get("current_index")
+        if isinstance(current_index, int) and not isinstance(current_index, bool):
+            stem = f"{stem}-{current_index + 1:04d}"
+        return f"{stem}.parquet"
+
+    async def _register_export_download(
+        self,
+        *,
+        organization_id: str | None,
+        run_download_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+    ) -> list[FileInfo]:
+        if not organization_id:
+            return []
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout saving Parquet export; workflow finalization will retry",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except DownloadSaveIncompleteError:
+            pass
+        except Exception:
+            LOG.warning(
+                "Failed to register Parquet export; workflow finalization will retry",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+        except Exception:
+            LOG.warning(
+                "Failed to read registered Parquet exports",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+
+    async def write_parquet_export(
+        self,
+        *,
+        records: Any,
+        data_schema: dict[str, Any],
+        file_name: str | None,
+        label: str,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> dict[str, Any]:
+        """Writes records to Parquet and registers the download. Raises ParquetExportError
+        on a bad schema/records or a file-write failure."""
+        parquet_data = export_parquet_records(records, data_schema)
+
+        filename = self._resolve_export_file_name(file_name, label, workflow_run_context)
+        run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
+        path = get_path_for_workflow_download_directory(run_download_id) / filename
+        file_created = False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stem = path.stem
+            suffix = 2
+            while True:
+                try:
+                    with path.open("xb") as parquet_file:
+                        file_created = True
+                        parquet_file.write(parquet_data)
+                    break
+                except FileExistsError:
+                    path = path.with_name(f"{stem}-{suffix:04d}{path.suffix}")
+                    suffix += 1
+        except OSError as exc:
+            if file_created:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    LOG.warning("Failed to remove incomplete Parquet export", exc_info=True)
+            raise ParquetExportError(f"failed to write {filename}: {exc}") from exc
+
+        filename = path.name
+        downloaded_files = await self._register_export_download(
+            organization_id=organization_id,
+            run_download_id=run_download_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        downloaded_files = [file for file in downloaded_files if file.filename == filename]
+        return {
+            "file_name": filename,
+            "file_path": str(path),
+            "file_size": path.stat().st_size,
+            "format": "parquet",
+            "compression": "snappy",
+            "row_count": len(records),
+            "columns": list(data_schema.get("items", {}).get("properties", {})),
+            "downloaded_files": [file.model_dump() for file in downloaded_files],
+            "downloaded_file_urls": [file.url for file in downloaded_files],
+        }
 
 
 def _format_payload_path_segment(key: str) -> str:
@@ -11872,13 +12006,122 @@ class NavigationBlock(BaseTaskBlock):
     navigation_goal: str
 
 
-class ExtractionBlock(BaseTaskBlock):
+class ExtractionBlock(ParquetExportMixin, BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
     data_extraction_goal: str
     include_extracted_text: bool = False
+
+    # Export the extracted data as a Parquet file -- an output option of this block
+    # rather than a separate Data Export block. See ParquetExportMixin and
+    # skyvern.forge.sdk.workflow.models.data_export_block.DataExportBlock.
+    export_enabled: bool = False
+    export_data_schema: dict[str, Any] | None = None
+    export_file_name: str | None = None
+    export_records: str | None = None
+
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"export_file_name", "export_records"})
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        super().format_potential_template_parameters(workflow_run_context)
+        # Export fields are only meaningful when export is on; rendering them
+        # unconditionally would fail an otherwise-fine run over a stale
+        # export_records left over from before export was disabled (or a
+        # deleted-block reference), since the strict Jinja env raises on an
+        # undefined binding regardless of the missing-variable preflight.
+        if not self.export_enabled:
+            return
+        if self.export_file_name:
+            self.export_file_name = self.render_templatable_field(
+                "export_file_name", self.export_file_name, workflow_run_context
+            )
+        if self.export_records:
+            self.export_records = self.render_templatable_field(
+                "export_records",
+                self.export_records,
+                workflow_run_context,
+                env=jinja_json_finalize_required_binding_env,
+                skip_missing_variable_preflight=True,
+            )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: Any,
+    ) -> BlockResult:
+        result = await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+        if not self.export_enabled or not result.success or not isinstance(result.output_parameter_value, dict):
+            return result
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            if not self.export_data_schema:
+                raise ParquetExportError("export_data_schema is required when export is enabled")
+            if self.export_records:
+                records = self.parse_export_records(self.export_records)
+            else:
+                extracted = result.output_parameter_value.get("extracted_information")
+                if isinstance(extracted, list):
+                    records = extracted
+                elif isinstance(extracted, Mapping):
+                    records = [extracted]
+                elif extracted is None:
+                    # Nothing to export is a legitimate outcome (e.g. an optional
+                    # extraction that found nothing) -- an honest empty file, not
+                    # a fabricated all-null row.
+                    records = []
+                else:
+                    raise ParquetExportError(
+                        "extracted_information must be an object or a list of objects to export, got "
+                        f"{type(extracted).__name__}"
+                    )
+            export_output = await self.write_parquet_export(
+                records=records,
+                data_schema=self.export_data_schema,
+                file_name=self.export_file_name,
+                label=self.label,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id or workflow_run_context.organization_id,
+            )
+        except ParquetExportError as exc:
+            # Reuse the standard failure path (records output + error_codes +
+            # secret redaction) rather than a bare failed result: the base
+            # execute() already recorded the successful extraction's output,
+            # so without this a downstream block under continue_on_failure
+            # would read stale, pre-export-failure output as if nothing had
+            # gone wrong.
+            return await self._template_format_failure_result(
+                exc,
+                str(exc),
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
+
+        merged_output = {**result.output_parameter_value, "export": export_output}
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, merged_output)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=merged_output,
+            status=result.status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
 
 class LoginBlock(BaseTaskBlock):

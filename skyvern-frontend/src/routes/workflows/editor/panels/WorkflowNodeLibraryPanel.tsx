@@ -83,17 +83,20 @@ const nodeLibraryItems: Array<{
     title: "Human Interaction Block",
     description: "Pause agent for human review and approval",
   },
-  {
-    nodeType: "dataExport",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.DataExport}
-        className="size-6"
-      />
-    ),
-    title: "Data Export Block",
-    description: "Write schema-defined records to a Parquet file",
-  },
+  // Data export now lives inside the Extraction block's "Export" section
+  // (SKY-15396). Existing workflows that already have a Data Export node keep
+  // working -- this only hides it from new-block authoring.
+  // {
+  //   nodeType: "dataExport",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.DataExport}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Data Export Block",
+  //   description: "Write schema-defined records to a Parquet file",
+  // },
   // {
   //   nodeType: "task",
   //   icon: (

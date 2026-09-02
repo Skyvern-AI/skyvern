@@ -4,6 +4,7 @@ import { ProxyLocation, RunEngine } from "@/api/types";
 
 import type {
   DataExportBlock,
+  ExtractionBlock,
   WorkflowBlock,
   WorkflowSettings,
 } from "../types/workflowTypes";
@@ -116,5 +117,42 @@ describe("data export blocks", () => {
         file_name: "records",
       }),
     ]);
+  });
+});
+
+describe("extraction block export fields (SKY-15396)", () => {
+  test("export_data_schema survives a load/save round trip while export is disabled", () => {
+    // The schema must persist even with export_enabled: false, or toggling
+    // export off then back on silently loses whatever the user authored.
+    const exportDataSchema = {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { name: { type: "string" } },
+      },
+    };
+    const block = {
+      label: "extract",
+      block_type: "extraction",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      parameters: [],
+      data_extraction_goal: "extract names",
+      data_schema: null,
+      export_enabled: false,
+      export_data_schema: exportDataSchema,
+      export_file_name: "names",
+      export_records: null,
+    } as unknown as ExtractionBlock;
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const [savedBlock] = getWorkflowBlocks(nodes, edges);
+
+    expect(savedBlock).toMatchObject({
+      export_enabled: false,
+      export_data_schema: exportDataSchema,
+      export_file_name: "names",
+    });
   });
 });

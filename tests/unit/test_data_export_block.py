@@ -84,7 +84,7 @@ async def test_export_block_writes_and_registers_one_parquet_file_per_loop_itera
     monkeypatch.setattr(DataExportBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context))
     monkeypatch.setattr(app.DATABASE.workflow_runs, "create_or_update_workflow_run_output_parameter", AsyncMock())
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.data_export_block.get_path_for_workflow_download_directory",
+        "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
         lambda _run_id: download_directory,
     )
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
@@ -136,7 +136,7 @@ async def test_export_block_preserves_parquet_files_with_repeated_loop_indexes(
     monkeypatch.setattr(DataExportBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context))
     monkeypatch.setattr(app.DATABASE.workflow_runs, "create_or_update_workflow_run_output_parameter", AsyncMock())
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.data_export_block.get_path_for_workflow_download_directory",
+        "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
         lambda _run_id: download_directory,
     )
 
@@ -166,7 +166,7 @@ async def test_export_block_returns_clean_failure_when_writing_parquet_fails(
     download_directory = tmp_path / "workflow-downloads"
     monkeypatch.setattr(DataExportBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context))
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.data_export_block.get_path_for_workflow_download_directory",
+        "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
         lambda _run_id: download_directory,
     )
 
@@ -197,7 +197,7 @@ async def test_export_block_removes_partial_parquet_file_after_write_failure(
     download_directory = tmp_path / "workflow-downloads"
     monkeypatch.setattr(DataExportBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context))
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.data_export_block.get_path_for_workflow_download_directory",
+        "skyvern.forge.sdk.workflow.models.block.get_path_for_workflow_download_directory",
         lambda _run_id: download_directory,
     )
 
