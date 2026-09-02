@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog.testing
 
+from skyvern.exceptions import get_user_facing_exception_message
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestConnectFailure, BuildTestFailedOperation
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -23,9 +27,129 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     reason_in_reply_shadow,
     render_terminal_message,
 )
-from skyvern.forge.sdk.copilot.tools.run_execution import _stash_recorded_run_outcome
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _record_run_blocks_result,
+    _stamp_run_side_connect_failure,
+    _stash_recorded_run_outcome,
+)
 from skyvern.forge.sdk.copilot.tools.workflow_update import _record_workflow_update_result
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+
+RUN_SIDE_SHARED_REASON = get_user_facing_exception_message(
+    Exception("connect_over_cdp failed: WebSocket error: connection closed")
+)
+RUN_SIDE_TYPED_REASON = build_test_connect_failure_sentence(
+    BuildTestConnectFailure(state="already_closed", workflow_run_id="wr_run_side")
+)
+
+
+def _run_side_failed_result(
+    *, failure_reason: str = RUN_SIDE_SHARED_REASON, reason_code: str | None = None
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "workflow_run_id": "wr_run_side",
+        "browser_session_id": "pbs_run_side",
+        "overall_status": "failed",
+        "blocks": [],
+        "failure_reason": failure_reason,
+    }
+    if reason_code is not None:
+        data["failure_category"] = [{"category": "BROWSER_ERROR", "confidence_float": 1.0, "reason_code": reason_code}]
+    return {"ok": False, "error": failure_reason, "data": data}
+
+
+def _install_session_record(monkeypatch: pytest.MonkeyPatch, session: PersistentBrowserSession | None) -> None:
+    mock_app = MagicMock()
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=session)
+    monkeypatch.setattr(run_execution_module, "app", mock_app)
+
+
+def _session_record(*, closed: bool) -> PersistentBrowserSession:
+    now = datetime.now(UTC)
+    return PersistentBrowserSession(
+        persistent_browser_session_id="pbs_run_side",
+        organization_id="org-1",
+        status="completed" if closed else "running",
+        completed_at=now if closed else None,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def test_a_persisted_session_closed_reason_types_the_stop_without_touching_the_runs_own_text() -> None:
+    result = _run_side_failed_result(reason_code="browser_session_closed")
+
+    sentence = _stamp_run_side_connect_failure(make_copilot_ctx(), result)
+
+    assert sentence == RUN_SIDE_TYPED_REASON
+    assert result["data"]["build_test_connect_failure"]["state"] == "already_closed"
+    assert result["error"] == RUN_SIDE_SHARED_REASON
+    assert result["data"]["failure_reason"] == RUN_SIDE_SHARED_REASON
+
+
+def test_a_persisted_startup_timeout_types_provisioning_unavailable() -> None:
+    result = _run_side_failed_result(reason_code="browser_session_startup_timeout")
+
+    sentence = _stamp_run_side_connect_failure(make_copilot_ctx(), result)
+
+    assert sentence is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "provisioning_unavailable"
+
+
+def test_a_run_that_failed_for_its_own_reason_stays_untyped_however_its_session_row_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mistyped block label fails before any block runs and its session row closes normally
+    afterwards; the run persisted no browser reason code, so the author must see the typo, not
+    a browser-loss retry."""
+    _install_session_record(monkeypatch, _session_record(closed=True))
+    typo = "Unable to find block with label extract_invoice_total"
+    result = _run_side_failed_result(failure_reason=typo)
+
+    sentence = _stamp_run_side_connect_failure(make_copilot_ctx(), result)
+
+    assert sentence is None
+    assert result["data"].get("build_test_connect_failure") is None
+    assert result["error"] == typo
+    assert result["data"]["failure_reason"] == typo
+
+
+@pytest.mark.asyncio
+async def test_a_typed_run_side_stop_keeps_the_shared_prose_out_of_the_chat_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_session_record(monkeypatch, _session_record(closed=True))
+    ctx = make_copilot_ctx()
+    ctx.last_update_block_count = 2
+    result = _run_side_failed_result(reason_code="browser_session_closed")
+
+    sentence = _stamp_run_side_connect_failure(ctx, result)
+    recorded = _record_run_blocks_result(ctx, result, connect_failure_reason=sentence)
+    reply = agent_module._rewrite_failed_test_response("The test failed.", ctx)
+
+    assert recorded is not None and recorded.display_reason == RUN_SIDE_TYPED_REASON
+    assert RUN_SIDE_TYPED_REASON in reply
+    assert RUN_SIDE_SHARED_REASON not in reply
+    assert "high demand" not in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_typed_run_side_stop_keeps_the_shared_prose_out_of_the_recorded_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_session_record(monkeypatch, _session_record(closed=True))
+    ctx = make_copilot_ctx()
+    result = _run_side_failed_result(reason_code="browser_session_closed")
+
+    sentence = _stamp_run_side_connect_failure(ctx, result)
+    _record_run_blocks_result(ctx, result, connect_failure_reason=sentence)
+    reason, _ = agent_module._recorded_failure_summary(ctx)
+
+    assert reason and reason in RUN_SIDE_TYPED_REASON
+    assert RUN_SIDE_SHARED_REASON not in reason
+    assert "high demand" not in reason.lower()
 
 
 def _run_outcome(verdict: str, display_reason: str | None = None) -> RecordedRunOutcome:

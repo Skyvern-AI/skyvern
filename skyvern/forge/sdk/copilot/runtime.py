@@ -30,7 +30,10 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailure,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -1225,12 +1228,13 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
 
 
 def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
+    sentence = build_test_connect_failure_sentence(failure)
     return {
         "ok": False,
-        "error": f"Build-test browser acquisition stopped: {failure.state}.",
+        "error": sentence,
         "data": {
             "overall_status": "setup_failed",
-            "failure_reason": f"Build-test browser acquisition stopped: {failure.state}.",
+            "failure_reason": sentence,
             "browser_session_id": failure.browser_session_id,
             "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=True),
             "blocks": [],

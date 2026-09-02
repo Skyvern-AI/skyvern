@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot.build_test_outcome import record_build_test_outcome
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
     CopilotTotalTimeoutError,
@@ -21,6 +25,13 @@ from skyvern.forge.sdk.copilot.pending_operation import (
     _turn_operations,
     pending_operation,
     pending_operation_fields,
+)
+from skyvern.forge.sdk.copilot.tools import run_execution
+from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
+from tests.unit.copilot_test_helpers import (
+    count_record_and_send,
+    failed_second_factor_run,
+    handback_ctx,
 )
 
 
@@ -470,3 +481,179 @@ async def test_the_deadline_path_is_unchanged_when_the_fingerprint_contributes_n
     with capture_logs() as already_marked:
         _mark_copilot_total_timeout(ctx, elapsed_seconds=99.0, iteration=1)
     assert _deadline_events(already_marked) == []
+
+
+async def _run_with_failing_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+    enrichment: Callable[..., Awaitable[tuple[str, dict[str, object] | None]]],
+) -> tuple[CopilotContext, dict[str, int]]:
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_prior_failure"))
+    counts = count_record_and_send(monkeypatch)
+    monkeypatch.setattr(run_execution, "_attach_post_run_browser_enrichment", enrichment)
+    return ctx, counts
+
+
+def _assert_later_run_survived(ctx: CopilotContext, counts: dict[str, int]) -> None:
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.workflow_run_id == "wr_paused"
+    assert outcome.verdict != "repairable_failure"
+    assert counts["record"] == 1
+    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == [
+        "wr_prior_failure",
+        "wr_paused",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_run_survives_an_enrichment_probe_that_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _raising(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
+        raise RuntimeError("post-run browser probe failed")
+
+    ctx, counts = await _run_with_failing_enrichment(monkeypatch, _raising)
+
+    with pytest.raises(RuntimeError, match="post-run browser probe failed"):
+        await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    _assert_later_run_survived(ctx, counts)
+
+
+@pytest.mark.asyncio
+async def test_completed_run_survives_an_enrichment_probe_cancelled_by_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled: list[str] = []
+
+    async def _hanging(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append("cancelled")
+            raise
+        return "", None
+
+    ctx, counts = await _run_with_failing_enrichment(monkeypatch, _hanging)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx),
+            timeout=0.05,
+        )
+
+    assert cancelled == ["cancelled"]
+    _assert_later_run_survived(ctx, counts)
+
+
+@pytest.mark.asyncio
+async def test_bot_wall_seen_only_by_the_post_run_page_still_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every block reports completed and the run output alone looks clean; the challenge is visible
+    only in the page evidence that arrives after the outcome is committed."""
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    challenge_evidence = {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_paused",
+        "source_browser_session_id": "pbs_run",
+        "current_url": "https://example.com/verify",
+        "inspected_url": "https://example.com/verify",
+        "anti_bot_indicators": ["captcha"],
+        "challenge_state": {
+            "detected": True,
+            "kind": "captcha",
+            "requires_human_verification": True,
+        },
+        "message": "Please complete the CAPTCHA to continue",
+    }
+
+    async def _enrichment(
+        enrich_ctx: CopilotContext, result_data: dict[str, object], **_kwargs: object
+    ) -> tuple[str, dict[str, object]]:
+        enrich_ctx.composition_page_evidence = challenge_evidence
+        result_data["post_run_page_evidence"] = challenge_evidence
+        return "https://example.com/verify", challenge_evidence
+
+    monkeypatch.setattr(run_execution, "_attach_post_run_browser_enrichment", _enrichment)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["ok"] is False, "a run that ended on a bot wall was reported as passing"
+    assert ctx.last_test_anti_bot, ctx.last_test_anti_bot
+    assert ctx.last_full_workflow_test_ok is False
+    # The emitted envelope must agree with the failure the caller returns.
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.verdict == "not_demonstrated", ctx.last_run_outcome
+    assert ctx.last_run_outcome.run_completed is False
+    # The success-branch latches must not survive a run the settle turned into a failure.
+    assert ctx.verified_terminal_proposal_ready is False
+
+
+@pytest.mark.asyncio
+async def test_prior_run_page_evidence_does_not_fail_this_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A challenge page left on ctx by an earlier run must not grade this one: the capture that drops
+    another run's page runs after the record, and the anti-bot read has no run-id check."""
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_some_older_run",
+        "source_browser_session_id": "pbs_run",
+        "current_url": "https://example.com/verify",
+        "anti_bot_indicators": ["captcha"],
+        "challenge_state": {"detected": True, "kind": "captcha", "requires_human_verification": True},
+        "message": "Please complete the CAPTCHA to continue",
+    }
+
+    async def _enrichment(
+        _enrich_ctx: CopilotContext, _result_data: dict[str, object], **_kwargs: object
+    ) -> tuple[str, dict[str, object] | None]:
+        return "https://example.com/done", None
+
+    monkeypatch.setattr(run_execution, "_attach_post_run_browser_enrichment", _enrichment)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["ok"] is True, "another run's page evidence failed this run"
+    assert ctx.last_test_anti_bot is None, ctx.last_test_anti_bot
+
+
+@pytest.mark.asyncio
+async def test_enrichment_supplied_page_reaches_the_grade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drives the real _attach_post_run_browser_enrichment. Every other test stubs the helper and
+    plants the page on ctx first, which cannot tell a page enrichment supplied from one already
+    there -- the distinction this ordering is entirely about."""
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    assert ctx.composition_page_evidence is None, "the page must arrive from enrichment, not the fixture"
+
+    challenge_page = {
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_paused",
+        "current_url": "https://example.com/verify",
+        "inspected_url": "https://example.com/verify",
+        "anti_bot_indicators": ["captcha"],
+        "challenge_state": {"detected": True, "kind": "captcha", "requires_human_verification": True},
+        "message": "Please complete the CAPTCHA to continue",
+    }
+
+    async def _page_info(*_args: object, **_kwargs: object) -> tuple[str, str | None, str | None]:
+        return "https://example.com/verify", "Verify you are human", None
+
+    async def _read_evidence(*_args: object, **_kwargs: object) -> tuple[dict[str, object], str, None, None]:
+        return challenge_page, "pbs_run", None, None
+
+    monkeypatch.setattr(run_execution, "_resolve_post_run_page_info", _page_info)
+    monkeypatch.setattr(run_execution, "_read_run_session_page_evidence", _read_evidence)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert ctx.composition_page_evidence is not None, "the real enrichment never stored the page"
+    assert result["ok"] is False, "a page supplied by enrichment did not reach the grade"
+    assert ctx.last_test_anti_bot, ctx.last_test_anti_bot
