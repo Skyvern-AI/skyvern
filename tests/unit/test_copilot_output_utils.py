@@ -1836,3 +1836,44 @@ class TestMcpResultProvenance:
 
         assert marked[MCP_RESULT_PROVENANCE_KEY] == MCP_RESULT_PROVENANCE_VALUE
         assert marked["data"] == "STORMBREAKER"
+
+
+class TestStagedWriteSummaryFrame:
+    """The summary line rides alongside the tool result in the SSE frame and in agent state, so a
+    staged write must not be framed there as a completed save."""
+
+    STAGED = {
+        "persistence": "staged",
+        "persistence_message": "Staged as a proposal for review.",
+        "block_count": 5,
+    }
+
+    def test_no_frame_claims_an_update_while_the_result_says_staged(self) -> None:
+        update = {"ok": True, "data": dict(self.STAGED)}
+        skipped = {"ok": True, "data": {**self.STAGED, "skipped_run": True}}
+        ran = {
+            "ok": True,
+            "data": {k: v for k, v in self.STAGED.items() if k != "block_count"} | {"overall_status": "completed"},
+        }
+
+        frames = [
+            format_tool_result_for_user("update_workflow", update),
+            summarize_tool_result("update_workflow", update),
+            summarize_tool_result("update_and_run_blocks", skipped),
+            summarize_tool_result("update_and_run_blocks", ran),
+        ]
+
+        for frame in frames:
+            assert "workflow updated" not in frame.casefold()
+            assert "updated the workflow" not in frame.casefold()
+            assert "staged" in frame.casefold()
+
+    def test_auto_apply_is_framed_as_staged_because_nothing_is_written_at_tool_time(self) -> None:
+        result = {"ok": True, "data": {**self.STAGED, "persistence": "staged_auto_apply"}}
+
+        assert "workflow updated" not in summarize_tool_result("update_workflow", result).casefold()
+
+    def test_a_result_without_the_disposition_keeps_the_prior_wording(self) -> None:
+        assert summarize_tool_result("update_workflow", {"ok": True, "data": {"block_count": 5}}) == (
+            "Workflow updated (5 blocks)"
+        )
