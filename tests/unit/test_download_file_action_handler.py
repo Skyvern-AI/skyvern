@@ -155,6 +155,8 @@ async def _run_false_click_observation(
     needs_cdp_frame_publisher: bool = False,
     rig: tuple | None = None,
     action_outcome: list[ActionSuccess | ActionFailure] | BaseException | None = None,
+    grace: float = 0.05,
+    get_download_dir_mock: MagicMock | None = None,
 ) -> tuple:
     task, step, context, page, scraped_page, action = rig or _make_false_click_observation_context()
     scraped_page._browser_state.release_driver_on_close = remote
@@ -175,11 +177,12 @@ async def _run_false_click_observation(
             return action_outcome
         return [ActionSuccess()]
 
+    gdd_mock = get_download_dir_mock if get_download_dir_mock is not None else MagicMock(return_value=str(tmp_path))
     with (
         patch.object(ActionHandler, "_handle_action", side_effect=inner),
         patch("skyvern.webeye.actions.handler.app", app_mock),
-        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
-        patch("skyvern.webeye.actions.handler.settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS", 0.05),
+        patch("skyvern.webeye.actions.handler.get_download_dir", gdd_mock),
+        patch("skyvern.webeye.actions.handler.settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS", grace),
     ):
         results = await ActionHandler.handle_action(
             scraped_page,
@@ -422,6 +425,130 @@ async def test_false_click_finalizes_artifacts_and_closes_only_emitting_popup(tm
     unrelated.close.assert_not_awaited()
     scraped_page._browser_state.navigate_to_url.assert_awaited_once_with(page=page, url="https://example.test/files")
     assert results[-1].downloaded_files == action.downloaded_files == ["captured_1.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_false_click_grace_zero_closes_download_popup_without_persisting(tmp_path: Path) -> None:
+    # At grace=0 a FileDownloadBlock click that mints a download on a popup must still have that popup
+    # closed and the original page restored before handle_action returns; persistence stays gated on
+    # grace>0, so the download is not credited here.
+    downloaded_path = tmp_path / "captured_grace0.pdf"
+    downloaded_path.write_bytes(b"content")
+    rig = _make_false_click_observation_context()
+    _, _, context, page, scraped_page, action = rig
+    popup = _EventEmitter(context, ":")
+    popup.close = AsyncMock()  # type: ignore[attr-defined]
+    scraped_page._browser_state.navigate_to_url = AsyncMock()
+
+    def click(_context: _EventEmitter, clicked_page: _EventEmitter) -> None:
+        clicked_page.emit("popup", popup)
+        popup.emit("download", _download(path=downloaded_path))
+        clicked_page.url = "about:blank"
+
+    results, action, _, _, _ = await _run_false_click_observation(tmp_path, click_effect=click, rig=rig, grace=0)
+
+    popup.close.assert_awaited_once()
+    scraped_page._browser_state.navigate_to_url.assert_awaited_once_with(page=page, url="https://example.test/files")
+    assert not action.download_triggered and not action.downloaded_files
+    assert not results[-1].download_triggered
+
+
+@pytest.mark.asyncio
+async def test_false_click_grace_zero_leaves_non_download_popup_open(tmp_path: Path) -> None:
+    # A popup event without a confirmed same-action download must never be closed as a download popup.
+    rig = _make_false_click_observation_context()
+    _, _, context, page, scraped_page, action = rig
+    popup = _EventEmitter(context, ":")
+    popup.close = AsyncMock()  # type: ignore[attr-defined]
+    scraped_page._browser_state.navigate_to_url = AsyncMock()
+
+    def click(_context: _EventEmitter, clicked_page: _EventEmitter) -> None:
+        clicked_page.emit("popup", popup)  # popup opens, but no download is confirmed
+
+    results, action, _, _, _ = await _run_false_click_observation(tmp_path, click_effect=click, rig=rig, grace=0)
+
+    popup.close.assert_not_awaited()
+    scraped_page._browser_state.navigate_to_url.assert_not_awaited()
+    assert not action.download_triggered and not action.downloaded_files
+
+
+@pytest.mark.asyncio
+async def test_false_click_grace_zero_adds_no_capture_dwell(tmp_path: Path) -> None:
+    # At grace=0 the capture path adds no new timed wait -- it acts only on an already-resolved
+    # download event. The admission wait_for lives in _handle_action (patched out here), so a zero
+    # count here is scoped to the outer capture, not a global wait_for ban.
+    rig = _make_false_click_observation_context()
+    _, _, context, page, scraped_page, _ = rig
+    popup = _EventEmitter(context, ":")
+    popup.close = AsyncMock()  # type: ignore[attr-defined]
+    scraped_page._browser_state.navigate_to_url = AsyncMock()
+
+    def click(_context: _EventEmitter, clicked_page: _EventEmitter) -> None:
+        clicked_page.emit("popup", popup)  # popup, no download -> event never resolves
+
+    wait_for_spy = AsyncMock(wraps=asyncio.wait_for)
+    with patch("skyvern.webeye.actions.handler.asyncio.wait_for", wait_for_spy):
+        await _run_false_click_observation(tmp_path, click_effect=click, rig=rig, grace=0)
+
+    wait_for_spy.assert_not_awaited()
+    popup.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_false_click_grace_zero_closes_only_download_popup(tmp_path: Path) -> None:
+    # Only the popup that minted the download is closed; a pre-existing tab and the original action
+    # page are never closed.
+    downloaded_path = tmp_path / "captured_iso.pdf"
+    downloaded_path.write_bytes(b"content")
+    rig = _make_false_click_observation_context()
+    _, _, context, page, scraped_page, _ = rig
+    unrelated = _EventEmitter(context, "https://example.test/unrelated")
+    popup = _EventEmitter(context, ":")
+    unrelated.close = AsyncMock()  # type: ignore[attr-defined]
+    popup.close = AsyncMock()  # type: ignore[attr-defined]
+    page.close = AsyncMock()  # type: ignore[attr-defined]
+    scraped_page._browser_state.navigate_to_url = AsyncMock()
+
+    def click(_context: _EventEmitter, clicked_page: _EventEmitter) -> None:
+        clicked_page.emit("popup", popup)
+        popup.emit("download", _download(path=downloaded_path))
+        clicked_page.url = "about:blank"
+
+    await _run_false_click_observation(tmp_path, click_effect=click, rig=rig, grace=0)
+
+    popup.close.assert_awaited_once()
+    unrelated.close.assert_not_awaited()
+    page.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_false_click_grace_zero_runs_no_persistence_setup(tmp_path: Path) -> None:
+    # At grace=0 no persistence-only setup may run -- get_download_dir must not be called and no
+    # storage listing happens -- while the captured popup is still closed and the original page
+    # restored.
+    downloaded_path = tmp_path / "captured_no_setup.pdf"
+    downloaded_path.write_bytes(b"content")
+    rig = _make_false_click_observation_context()
+    _, _, context, page, scraped_page, _ = rig
+    popup = _EventEmitter(context, ":")
+    popup.close = AsyncMock()  # type: ignore[attr-defined]
+    scraped_page._browser_state.navigate_to_url = AsyncMock()
+    get_download_dir_mock = MagicMock(return_value=str(tmp_path))
+
+    def click(_context: _EventEmitter, clicked_page: _EventEmitter) -> None:
+        clicked_page.emit("popup", popup)
+        popup.emit("download", _download(path=downloaded_path))
+        clicked_page.url = "about:blank"
+
+    _, action, _, _, storage = await _run_false_click_observation(
+        tmp_path, click_effect=click, rig=rig, grace=0, get_download_dir_mock=get_download_dir_mock
+    )
+
+    get_download_dir_mock.assert_not_called()
+    storage.list_downloaded_files_in_browser_session.assert_not_called()
+    popup.close.assert_awaited_once()
+    scraped_page._browser_state.navigate_to_url.assert_awaited_once_with(page=page, url="https://example.test/files")
+    assert not action.download_triggered and not action.downloaded_files
 
 
 @pytest.mark.asyncio
