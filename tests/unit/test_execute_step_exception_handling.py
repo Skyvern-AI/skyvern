@@ -35,6 +35,9 @@ import pytest
 
 from skyvern.config import settings as agent_settings
 from skyvern.exceptions import (
+    BrowserSessionAlreadyOccupiedError,
+    BrowserSessionClosed,
+    BrowserSessionOwnershipConflict,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
     FailedToSendWebhook,
@@ -45,6 +48,7 @@ from skyvern.exceptions import (
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
     TaskAlreadyTimeout,
+    UnknownErrorWhileCreatingBrowserContext,
     UnsupportedActionType,
     UnsupportedTaskType,
 )
@@ -52,6 +56,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from tests.unit.helpers import make_organization, make_step, make_task
 
 # ``clean_up_task``'s real signature defaults; handlers that omit these kwargs get them.
@@ -248,6 +253,53 @@ CLEANUP_CASES: list[CleanupHandlerCase] = [
         effective_final_screenshot=True,
         cleanup_gated_on_fail_task=True,
     ),
+    # SKY-15xxx: these four are Skyvern's own named browser/session exceptions (already
+    # anticipated, unlike a true "unexpected" error) that used to fall through to the
+    # generic_exception handler above and page P1 on every occurrence. They now share a
+    # dedicated LOG.warning handler with the same fail_task/clean_up_task shape as
+    # generic_exception, just without the error-level page. fail_task/clean_up_task shape
+    # is identical here regardless of whether the wrapped cause is recognized (see the
+    # dedicated log-level tests below for that split).
+    CleanupHandlerCase(
+        id="unknown_error_creating_browser_context",
+        exc_factory=lambda: UnknownErrorWhileCreatingBrowserContext("chromium", RuntimeError("boom")),
+        fail_task_called=True,
+        effective_webhook=True,
+        effective_final_screenshot=True,
+        cleanup_gated_on_fail_task=True,
+    ),
+    CleanupHandlerCase(
+        id="browser_session_already_occupied",
+        exc_factory=lambda: BrowserSessionAlreadyOccupiedError("pbs-1", "tsk-2"),
+        fail_task_called=True,
+        effective_webhook=True,
+        effective_final_screenshot=True,
+        cleanup_gated_on_fail_task=True,
+    ),
+    CleanupHandlerCase(
+        id="browser_session_closed",
+        exc_factory=lambda: BrowserSessionClosed("pbs-1"),
+        fail_task_called=True,
+        effective_webhook=True,
+        effective_final_screenshot=True,
+        cleanup_gated_on_fail_task=True,
+    ),
+    CleanupHandlerCase(
+        id="browser_session_ownership_conflict",
+        exc_factory=lambda: BrowserSessionOwnershipConflict("pbs-1"),
+        fail_task_called=True,
+        effective_webhook=True,
+        effective_final_screenshot=True,
+        cleanup_gated_on_fail_task=True,
+    ),
+    CleanupHandlerCase(
+        id="browser_target_closed",
+        exc_factory=lambda: BrowserTargetClosedError("session closed underneath the run"),
+        fail_task_called=True,
+        effective_webhook=True,
+        effective_final_screenshot=True,
+        cleanup_gated_on_fail_task=True,
+    ),
 ]
 
 
@@ -287,6 +339,89 @@ async def test_cleanup_gating_when_fail_task_reports_not_failed(
 
     assert outcome.raised is None
     assert outcome.cleanup_called is not case.cleanup_gated_on_fail_task
+
+
+@pytest.mark.asyncio
+async def test_unknown_browser_context_error_pages_p1_for_unrecognized_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BrowserFactory.create_browser_context wraps *any* exception, so a cause that isn't
+    one of Skyvern's own named exceptions (e.g. a real bug's AttributeError) is not an
+    anticipated browser/session failure -- it must keep the error-level page, not go quiet.
+    """
+    log_mock = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.LOG", log_mock)
+
+    cause = AttributeError("'NoneType' object has no attribute 'frame'")
+    exc = UnknownErrorWhileCreatingBrowserContext("chromium", cause)
+    exc.__cause__ = cause  # mirrors `raise ... from e` at the real call site
+
+    outcome = await _drive_execute_step(monkeypatch, exc, fail_task_result=True)
+
+    assert outcome.raised is None
+    assert outcome.fail_task_called is True
+    assert outcome.cleanup_called is True
+    log_mock.exception.assert_called_once_with("Got an unexpected exception in step, marking task as failed")
+    log_mock.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unknown_browser_context_error_stays_quiet_for_recognized_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cause that IS one of Skyvern's own named exceptions (e.g. a proxy-capacity error
+    surfacing as MissingBrowserStatePage) is the anticipated case this handler exists for --
+    it must stay on the quiet, non-paging path.
+    """
+    log_mock = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.LOG", log_mock)
+
+    cause = MissingBrowserStatePage(task_id="task-123")
+    exc = UnknownErrorWhileCreatingBrowserContext("chromium", cause)
+    exc.__cause__ = cause
+
+    outcome = await _drive_execute_step(monkeypatch, exc, fail_task_result=True)
+
+    assert outcome.raised is None
+    assert outcome.fail_task_called is True
+    assert outcome.cleanup_called is True
+    log_mock.warning.assert_called_once()
+    log_mock.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: BrowserSessionAlreadyOccupiedError("pbs-1", "tsk-2"),
+        lambda: BrowserSessionClosed("pbs-1"),
+        lambda: BrowserSessionOwnershipConflict("pbs-1"),
+        lambda: BrowserTargetClosedError("session closed underneath the run"),
+    ],
+    ids=[
+        "browser_session_already_occupied",
+        "browser_session_closed",
+        "browser_session_ownership_conflict",
+        "browser_target_closed",
+    ],
+)
+async def test_direct_session_exceptions_stay_on_the_quiet_path(
+    monkeypatch: pytest.MonkeyPatch, exc_factory: Callable[[], BaseException]
+) -> None:
+    """These four are Skyvern's own named browser/session exceptions -- unlike
+    UnknownErrorWhileCreatingBrowserContext's conditional handling, they're unconditionally
+    quiet. CLEANUP_CASES pins fail_task/clean_up_task/webhook/screenshot, which stay
+    identical to generic_exception's -- only the log level tells these apart, so pin that
+    directly: dropping any one of the four from the tuple must fail this test.
+    """
+    log_mock = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.LOG", log_mock)
+
+    outcome = await _drive_execute_step(monkeypatch, exc_factory(), fail_task_result=True)
+
+    assert outcome.raised is None
+    log_mock.warning.assert_called_once()
+    log_mock.exception.assert_not_called()
 
 
 @pytest.mark.asyncio

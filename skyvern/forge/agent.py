@@ -44,8 +44,11 @@ from skyvern.errors.errors import (
     filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
+    BrowserSessionAlreadyOccupiedError,
+    BrowserSessionClosed,
     BrowserSessionDegraded,
     BrowserSessionNotFound,
+    BrowserSessionOwnershipConflict,
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
     EmptyScrapePage,
@@ -69,6 +72,7 @@ from skyvern.exceptions import (
     TaskAlreadyCanceled,
     TaskAlreadyTimeout,
     TaskNotFound,
+    UnknownErrorWhileCreatingBrowserContext,
     UnsupportedActionType,
     UnsupportedTaskType,
     get_user_facing_exception_message,
@@ -227,6 +231,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
     consume_unsolicited_download_error_for_context,
@@ -2902,6 +2907,40 @@ class ForgeAgent:
                 download_suffix=task_block.download_suffix if task_block else None,
                 list_files_before=list_files_before,
             )
+            return step, detailed_output, None
+        except (
+            UnknownErrorWhileCreatingBrowserContext,
+            BrowserSessionAlreadyOccupiedError,
+            BrowserSessionClosed,
+            BrowserSessionOwnershipConflict,
+            BrowserTargetClosedError,
+        ) as e:
+            # UnknownErrorWhileCreatingBrowserContext wraps *any* exception raised during
+            # browser-context creation (BrowserFactory.create_browser_context's `except
+            # BaseException`), so unlike its three siblings above it isn't inherently a known
+            # condition. Only mute it when the wrapped cause is itself one of Skyvern's own
+            # named exceptions (e.g. a proxy-capacity error) -- an unrecognized cause (a raw
+            # AttributeError/TypeError from a real bug) stays on the paging path.
+            if isinstance(e, UnknownErrorWhileCreatingBrowserContext) and not isinstance(e.__cause__, SkyvernException):
+                LOG.exception("Got an unexpected exception in step, marking task as failed")
+            else:
+                LOG.warning("Recognized browser/session failure, marking the task as failed", exc_info=True)
+
+            failure_reason = get_user_facing_exception_message(e)
+
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
+            if is_task_marked_as_failed:
+                await self.clean_up_task(
+                    task=task,
+                    last_step=step,
+                    api_key=api_key,
+                    close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
+                )
+            else:
+                LOG.warning("Task isn't marked as failed, after browser/session failure. NOT clean up the task")
             return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
@@ -6395,9 +6434,11 @@ class ForgeAgent:
             )
         return None
 
-    async def get_failure_reason_for_task(self, task: Task) -> str | None:
+    async def get_failure_reason_for_task(self, task: Task) -> str:
         """
         Find the TerminateAction for the task and return the reasoning.
+        TaskStatus.terminated requires a failure_reason (see validate_update), so this always
+        returns a non-empty string even when no reasoning can be recovered.
         # TODO (kerem): Also return meaningful exceptions when we add them [WYV-311]
         """
         steps = await app.DATABASE.tasks.get_task_steps(
@@ -6413,13 +6454,13 @@ class ForgeAgent:
             if step.output.actions_and_results:
                 for action, action_results in step.output.actions_and_results:
                     if action.action_type == ActionType.TERMINATE:
-                        return action.reasoning
+                        return action.reasoning or "Task was terminated without a stated reason."
 
         LOG.error(
             "Failed to find failure reasoning for task",
             task_id=task.task_id,
         )
-        return None
+        return "Task was terminated, but Skyvern could not determine why."
 
     @traced(name="skyvern.agent.cleanup")
     async def clean_up_task(

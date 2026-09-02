@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from skyvern.exceptions import NoTOTPVerificationCodeFound
+from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -25,6 +27,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     ExtractAction,
+    TerminateAction,
     WaitAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -447,3 +450,39 @@ async def test_parallel_verification_marks_speculative_original_status(monkeypat
 
     assert step.status == StepStatus.completed
     assert step.speculative_original_status == StepStatus.completed
+
+
+# SKY-15xxx: TaskStatus.terminated requires a non-empty failure_reason (Task.validate_update).
+# get_failure_reason_for_task is the only source of that reason for a terminated task; either
+# empty path below used to return None, which handle_completed_step then handed straight to
+# update_task, tripping the invariant and crashing the step as an "unexpected exception".
+@pytest.mark.asyncio
+async def test_get_failure_reason_for_task_falls_back_when_terminate_reasoning_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    terminate = TerminateAction(reasoning=None, organization_id=organization.organization_id, task_id=task.task_id)
+    output = AgentStepOutput(actions_and_results=[(terminate, [])])
+    step = make_step(now, task, step_id="step-0", status=StepStatus.completed, order=0, output=output)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", AsyncMock(return_value=[step]))
+
+    reason = await ForgeAgent().get_failure_reason_for_task(task)
+
+    assert reason
+
+
+@pytest.mark.asyncio
+async def test_get_failure_reason_for_task_falls_back_when_no_terminate_action_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-0", status=StepStatus.completed, order=0, output=None)
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task_steps", AsyncMock(return_value=[step]))
+
+    reason = await ForgeAgent().get_failure_reason_for_task(task)
+
+    assert reason

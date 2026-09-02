@@ -161,6 +161,39 @@ async def test_input_clear_classifies_incompatible_element(monkeypatch: pytest.M
         await element.input_clear()
 
 
+def _make_non_stale_locator() -> MagicMock:
+    locator = MagicMock()
+    locator.count = AsyncMock(return_value=1)  # refresh_locator_if_stale sees a unique match
+    return locator
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_classifies_incompatible_element(monkeypatch: pytest.MonkeyPatch) -> None:
+    # input_sequentially's underlying strategy_aware_input can call locator.fill() directly (the
+    # long-text "fast prefix" path); until this fix that raw Playwright error skipped the same
+    # classification input_fill/input_clear already apply and escaped unclassified (SKY-15219).
+    element = _make_element("huk-input-field", _make_non_stale_locator())
+
+    async def _raise(*args: object, **kwargs: object) -> None:
+        raise PlaywrightError(_NOT_INPUT_ERROR)
+
+    monkeypatch.setattr("skyvern.webeye.utils.dom.handler_utils.input_sequentially", _raise)
+    with pytest.raises(InvalidElementForTextInput):
+        await element.input_sequentially("hello")
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_reraises_unrelated_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    element = _make_element("input", _make_non_stale_locator())
+
+    async def _raise(*args: object, **kwargs: object) -> None:
+        raise PlaywrightError(_TIMEOUT_ERROR)
+
+    monkeypatch.setattr("skyvern.webeye.utils.dom.handler_utils.input_sequentially", _raise)
+    with pytest.raises(PlaywrightError):
+        await element.input_sequentially("hello")
+
+
 # --------------------------------------------------------------------------- #
 # _strict_date_mask_order / _canonical_iso_date — deterministic date canonicalization.
 # A live <input type=date> takes only YYYY-MM-DD; a locale value is canonicalized only when the
