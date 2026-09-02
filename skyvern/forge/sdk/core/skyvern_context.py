@@ -677,6 +677,12 @@ def record_browser_success() -> None:
         context.browser_health.record_success()
 
 
+def record_browser_recovery(operation: BrowserOperation) -> None:
+    context = current()
+    if context is not None:
+        context.browser_health.record_recovery(operation)
+
+
 def set(context: SkyvernContext) -> None:
     """
     Set the current context
