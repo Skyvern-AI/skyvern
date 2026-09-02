@@ -202,7 +202,9 @@ class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
 
 
 class FailedToFormatJinjaStyleParameter(SkyvernException):
-    def __init__(self, template: str, msg: str) -> None:
+    def __init__(self, template: str, msg: str, *, available_keys: list[str] | None = None) -> None:
+        self.template = template
+        self.available_keys = available_keys or []
         super().__init__(
             f"Failed to format Jinja style parameter '{template}'. "
             f"Reason: {msg}. "

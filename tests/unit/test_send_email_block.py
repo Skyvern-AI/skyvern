@@ -308,7 +308,7 @@ def test_format_templates_renders_full_reference_password() -> None:
     with patch.object(
         SendEmailBlock,
         "format_block_parameter_template_from_workflow_run_context",
-        side_effect=lambda value, _context: f"formatted:{value}",
+        side_effect=lambda value, _context, **_kwargs: f"formatted:{value}",
     ):
         block.format_potential_template_parameters(MagicMock())
     assert block.custom_smtp_password == "formatted:{{ smtp_password_param }}"

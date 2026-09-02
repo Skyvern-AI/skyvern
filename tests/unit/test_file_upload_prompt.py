@@ -64,7 +64,7 @@ def test_file_upload_block_applies_workflow_system_prompt() -> None:
     with patch.object(
         FileUploadBlock,
         "format_block_parameter_template_from_workflow_run_context",
-        side_effect=lambda value, _: value,
+        side_effect=lambda value, _, **_kwargs: value,
     ):
         block.format_potential_template_parameters(workflow_run_context)
 
@@ -246,7 +246,8 @@ async def test_prompt_render_failure_fails_without_uploading(tmp_path: Path) -> 
     assert "Failed to format jinja template" in execution.result.failure_reason
     execution.handler_factory.assert_not_called()
     execution.upload.assert_not_awaited()
-    execution.record_output.assert_not_awaited()
+    execution.record_output.assert_awaited_once()
+    assert "Failed to format jinja template" in execution.record_output.await_args.args[2]["failure_reason"]
 
 
 @pytest.mark.asyncio

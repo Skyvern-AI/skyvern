@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from skyvern.forge import app
 from skyvern.forge.sdk.services import google_oauth_service
@@ -24,30 +24,24 @@ class EmailInboxBlock(Block):
     include_body: bool = True
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"credential_id", "folder", "prompt", "sender", "subject"})
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
     def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.credential_id:
-            self.credential_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.credential_id, workflow_run_context
+            self.credential_id = self.render_templatable_field(
+                "credential_id", self.credential_id, workflow_run_context
             )
         if self.folder:
-            self.folder = self.format_block_parameter_template_from_workflow_run_context(
-                self.folder, workflow_run_context
-            )
+            self.folder = self.render_templatable_field("folder", self.folder, workflow_run_context)
         if self.prompt:
-            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
-                self.prompt, workflow_run_context
-            )
+            self.prompt = self.render_templatable_field("prompt", self.prompt, workflow_run_context)
         if self.sender:
-            self.sender = self.format_block_parameter_template_from_workflow_run_context(
-                self.sender, workflow_run_context
-            )
+            self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
         if self.subject:
-            self.subject = self.format_block_parameter_template_from_workflow_run_context(
-                self.subject, workflow_run_context
-            )
+            self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
 
     async def _failure(
         self,
@@ -99,10 +93,13 @@ class EmailInboxBlock(Block):
         try:
             self._render_templates(workflow_run_context)
         except Exception as e:
-            return await self._failure(
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if self.email_client not in {"gmail", "outlook"}:
