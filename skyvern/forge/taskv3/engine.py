@@ -248,6 +248,7 @@ async def run_task_v3_agent_loop(
     initial_navigation_status: int | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    block_type: str | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -260,6 +261,7 @@ async def run_task_v3_agent_loop(
     failure-evidence gate, which shares the sampler, intact. `page_probe` is a separate sampler (URL
     plus fingerprint) the loop uses to detect whether a failed batched call moved the page; a
     page-free run has no page to probe."""
+    loop_started_at = time.monotonic()
     # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
@@ -417,5 +419,7 @@ async def run_task_v3_agent_loop(
         auto_observe_arm=auto_observe_decision.arm,
         tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,
         tool_choice_in_effect=outcome.tool_choice_in_effect,
+        duration_seconds=time.monotonic() - loop_started_at,
+        block_type=block_type,
     )
     return outcome
