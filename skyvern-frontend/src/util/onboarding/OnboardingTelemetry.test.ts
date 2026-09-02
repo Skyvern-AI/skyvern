@@ -71,6 +71,7 @@ describe("OnboardingTelemetry", () => {
     const input = {
       primaryIntent: "fill_forms",
       promptReason: "initial",
+      organizationId: null,
     } as const;
     expect(OnboardingTelemetry.questionnaireShown(input)).toBe(true);
 
@@ -83,6 +84,19 @@ describe("OnboardingTelemetry", () => {
     expect(OnboardingTelemetry.questionnaireShown(input)).toBe(false);
   });
 
+  it("prefers the server-provided organization over the group lookup", () => {
+    OnboardingTelemetry.questionnaireShown({
+      primaryIntent: null,
+      promptReason: "initial",
+      organizationId: "org_from_server",
+    });
+    expect(posthog.getGroups).not.toHaveBeenCalled();
+    expect(posthog.capture).toHaveBeenLastCalledWith(
+      "onboarding_questionnaire_shown",
+      expect.objectContaining({ organization_id: "org_from_server" }),
+    );
+  });
+
   it("captures the exact bounded questionnaire dictionaries", () => {
     const answers = {
       role: "developer",
@@ -93,6 +107,7 @@ describe("OnboardingTelemetry", () => {
     OnboardingTelemetry.questionnaireShown({
       primaryIntent: null,
       promptReason: "initial",
+      organizationId: null,
     });
     OnboardingTelemetry.questionnaireCompleted({
       responseId: "response",
