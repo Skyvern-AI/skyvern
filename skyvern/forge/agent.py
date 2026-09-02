@@ -2750,10 +2750,13 @@ class ForgeAgent:
             )
             return step, detailed_output, next_step
         except FailedToNavigateToUrl as e:
-            # Fail the task if we can't navigate to the URL and send the response
-            LOG.exception(
+            # Fail the task if we can't navigate to the URL and send the response.
+            # Navigation failures are target-site/customer-caused and are surfaced on the run
+            # via failure_reason below, so this is expected-and-handled, not an error.
+            LOG.warning(
                 "Failed to navigate to URL, marking task as failed, and sending webhook response",
                 url=e.url,
+                exc_info=True,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
             is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
