@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from PIL import Image
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import skyvern.webeye.utils.page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
@@ -410,3 +411,60 @@ def test_merge_images_closes_canvas_and_crop_when_paste_fails_after_allocation()
 
     for img in images:
         img.close()
+
+
+def _fake_timeout_page(message: str) -> MagicMock:
+    page = MagicMock(name="page")
+    page.is_closed.return_value = False
+    page.url = "https://example.test"
+    page.viewport_size = {"width": 800, "height": 600}
+    page.screenshot = AsyncMock(side_effect=PlaywrightTimeoutError(message))
+    return page
+
+
+async def _screenshot_timeout_warning_kwargs(message: str) -> dict[str, object]:
+    page = _fake_timeout_page(message)
+    captured: list[dict[str, object]] = []
+
+    def _capture(event: str, **kwargs: object) -> None:
+        if event == "Screenshot timeout":
+            captured.append(kwargs)
+
+    with (
+        patch.object(page_module.LOG, "warning", side_effect=_capture),
+        pytest.raises(page_module.FailedToTakeScreenshot),
+    ):
+        await page_module.SkyvernFrame.take_scrolling_screenshot(
+            page=page,
+            scrolling_number=0,
+            mode=ScreenshotMode.LITE,
+            engine_selection=None,
+        )
+
+    assert len(captured) == 1, "exactly one Screenshot timeout warning expected"
+    return captured[0]
+
+
+@pytest.mark.asyncio
+async def test_screenshot_timeout_warning_names_the_last_call_log_stage() -> None:
+    kwargs = await _screenshot_timeout_warning_kwargs(
+        "Page.screenshot: Timeout 20000ms exceeded.\n"
+        "Call log:\n"
+        "  - taking page screenshot\n"
+        "  - waiting for fonts to load...\n"
+    )
+    assert kwargs["screenshot_stage"] == "waiting for fonts to load..."
+
+
+@pytest.mark.asyncio
+async def test_screenshot_timeout_warning_reads_an_undashed_single_entry_call_log() -> None:
+    kwargs = await _screenshot_timeout_warning_kwargs(
+        "Page.screenshot: Timeout 20000ms exceeded.\nCall log:\ntaking page screenshot\n"
+    )
+    assert kwargs["screenshot_stage"] == "taking page screenshot"
+
+
+@pytest.mark.asyncio
+async def test_screenshot_timeout_warning_stage_is_unknown_without_a_call_log() -> None:
+    kwargs = await _screenshot_timeout_warning_kwargs("Page.screenshot: Timeout 20000ms exceeded.")
+    assert kwargs["screenshot_stage"] == "unknown"
