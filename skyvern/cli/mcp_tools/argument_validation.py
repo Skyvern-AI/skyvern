@@ -14,10 +14,17 @@ This middleware checks arguments against the tool's published input schema
 short-circuits with a structured error when argument keys don't match. Because
 invalid keys never reach dispatch, no raw validation error is logged, and the
 model receives a clear message naming the unsupported and expected arguments
-(the same ``make_result``/``make_error`` envelope every tool uses). Other
-type-level mismatches still fall through to pydantic. A call with no
-``arguments`` at all also falls through: pydantic handles it, rejecting only
-when the tool has required parameters.
+(the same ``make_result``/``make_error`` envelope every tool uses). A call
+with no ``arguments`` at all also falls through: pydantic handles it,
+rejecting only when the tool has required parameters.
+
+Type-level mismatches the repair step doesn't cover (an out-of-range int, a
+still-malformed list) still reach FastMCP's own pydantic validation inside
+``call_next``. Those are deliberately not silently coerced — an ambiguous
+shape should fail rather than be guessed at — but the resulting
+``fastmcp.exceptions.ValidationError`` is caught here too and wrapped in the
+same structured envelope, so the model always gets an actionable message
+instead of the raw pydantic text.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import json
 from typing import Any
 
 import structlog
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
@@ -124,7 +132,15 @@ class MCPArgumentValidationMiddleware(Middleware):
         rejection = await self._reject_bad_arguments(context)
         if rejection is not None:
             return rejection
-        return await call_next(context)
+        try:
+            return await call_next(context)
+        except FastMCPValidationError as exc:
+            # Argument shapes/ranges that _reject_bad_arguments and _repair_argument_types don't
+            # cover (e.g. an out-of-range int, a still-malformed list) reach here from FastMCP's
+            # own pydantic validation inside tool dispatch. Without this, the caller gets the raw
+            # exception text instead of the same structured envelope every other tool error uses.
+            tool_name = getattr(context.message, "name", None)
+            return _validation_error_result(tool_name, exc)
 
     async def _reject_bad_arguments(self, context: MiddlewareContext[Any]) -> ToolResult | None:
         tool_name = getattr(context.message, "name", None)
@@ -192,6 +208,21 @@ def _rejection_result(
                 "missing_required_arguments": missing,
                 "expected_arguments": expected,
             },
+        ),
+    )
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    return ToolResult(content=[TextContent(type="text", text=text)], structured_content=payload)
+
+
+def _validation_error_result(tool_name: str | None, exc: FastMCPValidationError) -> ToolResult:
+    name = tool_name or "unknown_tool"
+    payload = make_result(
+        name,
+        ok=False,
+        error=make_error(
+            ErrorCode.INVALID_INPUT,
+            str(exc),
+            f"Check the argument types and values against {name}'s documented parameters.",
         ),
     )
     text = json.dumps(payload, ensure_ascii=False, default=str)

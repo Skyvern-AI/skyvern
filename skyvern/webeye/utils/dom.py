@@ -1171,6 +1171,8 @@ class SkyvernElement:
         try:
             await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
         except Exception as exc:
+            if is_engine_error(exc, self._engine_selection) and is_incompatible_text_input_error(exc):
+                raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
             if not is_engine_timeout_error(exc, self._engine_selection):
                 raise
             await self._classify_typing_timeout(exc)
