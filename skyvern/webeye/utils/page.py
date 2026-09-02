@@ -290,6 +290,15 @@ def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSel
     )
 
 
+def _extract_playwright_screenshot_stage(exc: BaseException) -> str:
+    """Playwright 1.46 joins call-log entries with ``-``, leaving the first one undashed; 1.58 dashes every entry."""
+    _, separator, tail = str(exc).rpartition("Call log:")
+    if not separator:
+        return "unknown"
+    stages = [line.strip().removeprefix("- ").strip() for line in tail.splitlines() if line.strip()]
+    return stages[-1] if stages else "unknown"
+
+
 def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Execution context was destroyed" in error_msg:
         return True
@@ -798,6 +807,7 @@ async def _current_viewpoint_screenshot_helper(
                 viewport=viewport_info,
                 full_page=full_page,
                 mode=mode.value if hasattr(mode, "value") else str(mode),
+                screenshot_stage=_extract_playwright_screenshot_stage(e),
                 error=str(e),
             )
             raise FailedToTakeScreenshot(error_message=str(e)) from e
