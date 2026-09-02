@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _prior_run_debug_text,
     _recorded_build_test_outcome_prompt,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestConnectFailure,
     BuildTestEvidencePacket,
@@ -42,7 +44,10 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
-from skyvern.forge.sdk.copilot.output_utils import project_build_test_packet_for_llm
+from skyvern.forge.sdk.copilot.output_utils import (
+    _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
+    project_build_test_packet_for_llm,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
@@ -55,6 +60,8 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _first_failed_result,
     _record_run_blocks_result,
     _recorded_run_block_result,
+    _run_blocks_and_collect_debug,
+    _verify_and_record_run_blocks_result,
     build_test_evidence_packet,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
@@ -63,10 +70,14 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
+    count_record_and_send,
     failed_second_factor_run,
+    handback_ctx,
     make_copilot_ctx,
     make_stub_html_artifact,
+    page_only_failed_block,
     passing_run,
+    same_run_page_evidence,
     straight_line_login_yaml,
     two_page_login_yaml,
 )
@@ -173,6 +184,7 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     outcome = recorded_outcome_from_run_blocks_result(result)
     assert outcome is not None
     assert outcome.connect_failure == failure
+    assert outcome.observed_evidence_summary == build_test_connect_failure_sentence(failure)
     packet = build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
     assert packet.failure is not None
     assert packet.failure.connect_failure == failure
@@ -4629,3 +4641,191 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
         if output["output_parameter_key"] == "collect_payment_options_output"
     ]
     assert run_owned == [after_output], "the corrected run does not hand back the output its code produced"
+
+
+@pytest.mark.asyncio
+async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    order: list[str] = []
+    real_record = run_execution_module.record_build_test_outcome
+
+    def _record(record_ctx: object, outcome: object) -> None:
+        order.append("record")
+        real_record(record_ctx, outcome)
+
+    async def _enrichment(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
+        order.append("enrichment")
+        return "", None
+
+    monkeypatch.setattr(run_execution_module, "record_build_test_outcome", _record)
+    monkeypatch.setattr(run_execution_module, "_attach_post_run_browser_enrichment", _enrichment)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["ok"] is True, result
+    assert order == ["record", "enrichment"]
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.workflow_run_id == "wr_paused"
+
+
+@pytest.mark.asyncio
+async def test_failed_run_still_records_the_failure_and_marks_the_post_run_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await handback_ctx(monkeypatch, polled_status="failed", block_status="failed")
+    marks: list[str] = []
+
+    async def _enrichment(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
+        return "", None
+
+    monkeypatch.setattr(run_execution_module, "_attach_post_run_browser_enrichment", _enrichment)
+    monkeypatch.setattr(
+        run_execution_module,
+        "_mark_stored_post_run_failure_page",
+        lambda _ctx: marks.append("marked"),
+    )
+    counts = count_record_and_send(monkeypatch)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    await _verify_and_record_run_blocks_result(ctx, result, 0.0)
+
+    assert result["ok"] is False, result
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.workflow_run_id == "wr_paused"
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code != ""
+    assert marks == ["marked"]
+    assert counts == {"record": 1, "send": 1}
+    assert len(ctx.recorded_build_test_outcome_history) == 1
+
+
+@pytest.mark.asyncio
+async def test_enrichment_facts_still_land_on_the_recorded_outcome_and_agree_with_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    evidence = same_run_page_evidence()
+
+    async def _enrichment(
+        enrich_ctx: CopilotContext, result_data: dict[str, object], **_kwargs: object
+    ) -> tuple[str, dict[str, object]]:
+        enrich_ctx.composition_page_evidence = evidence
+        result_data["current_url"] = "https://example.com/done"
+        result_data["post_run_page_evidence"] = evidence
+        result_data["post_run_page_capture"] = {"status": "captured"}
+        return "https://example.com/done", evidence
+
+    monkeypatch.setattr(run_execution_module, "_attach_post_run_browser_enrichment", _enrichment)
+    monkeypatch.setattr(
+        run_execution_module.app.AGENT_FUNCTION,
+        "captcha_solving_available",
+        AsyncMock(return_value=True),
+    )
+    counts = count_record_and_send(monkeypatch)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    await _verify_and_record_run_blocks_result(ctx, result, 0.0)
+
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert ctx.captcha_solver_available is True
+    assert ctx.captcha_solver_available_for_url == "https://example.com/done"
+    assert outcome.page_evidence_refs, outcome
+    assert outcome.page_capture is not None and outcome.page_capture.status == "captured"
+    assert counts == {"record": 1, "send": 1}
+    assert len(ctx.recorded_build_test_outcome_history) == 1
+    entry = ctx.recorded_build_test_outcome_history[-1]
+    assert entry["workflow_run_id"] == outcome.workflow_run_id
+    assert entry["verdict"] == outcome.verdict
+    assert entry["reason_code"] == outcome.reason_code
+    assert entry["structural_key"] == outcome.structural_key
+    assert outcome.is_authoritative is True
+    assert entry["is_authoritative"] is True
+    assert ctx.recorded_persisted_block_run_workflow_run_id == outcome.workflow_run_id
+
+
+@pytest.mark.asyncio
+async def test_failed_run_known_only_by_its_page_is_graded_after_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed block carrying no failure_reason has no structural identity until the post-run page
+    arrives, so grading it before enrichment records nothing at all."""
+    ctx = await handback_ctx(
+        monkeypatch,
+        polled_status="failed",
+        block_status="failed",
+        terminal_blocks=[page_only_failed_block()],
+    )
+    evidence = same_run_page_evidence()
+
+    async def _enrichment(
+        enrich_ctx: CopilotContext, result_data: dict[str, object], **_kwargs: object
+    ) -> tuple[str, dict[str, object]]:
+        enrich_ctx.composition_page_evidence = evidence
+        result_data["post_run_page_evidence"] = evidence
+        return "https://example.com/done", evidence
+
+    monkeypatch.setattr(run_execution_module, "_attach_post_run_browser_enrichment", _enrichment)
+    counts = count_record_and_send(monkeypatch)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    await _verify_and_record_run_blocks_result(ctx, result, 0.0)
+
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None, "the run's failure was lost because the page was unknown at record time"
+    assert outcome.verdict == "repairable_failure", outcome
+    assert outcome.page_evidence_refs, outcome
+    assert outcome.key_provenance.get("structural_failure_identity") != (
+        "no typed verification/page/output identity available"
+    )
+    assert counts["record"] == 1
+    assert len(ctx.recorded_build_test_outcome_history) == 1
+    entry = ctx.recorded_build_test_outcome_history[-1]
+    assert entry["verdict"] == outcome.verdict
+    assert entry["reason_code"] == outcome.reason_code
+    assert entry["structural_key"] == outcome.structural_key
+    assert entry["is_authoritative"] == outcome.is_authoritative
+
+
+@pytest.mark.asyncio
+async def test_watchdog_paused_result_is_recorded_before_the_captcha_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await handback_ctx(monkeypatch, polled_status="paused", block_status="completed")
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_prior_failure"))
+    counts = count_record_and_send(monkeypatch)
+    observed_at_probe: list[RecordedBuildTestOutcome | None] = []
+
+    async def _cancelled_probe(*_args: object, **_kwargs: object) -> bool:
+        observed_at_probe.append(ctx.latest_recorded_build_test_outcome)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        run_execution_module.app.AGENT_FUNCTION,
+        "captcha_solving_available",
+        _cancelled_probe,
+    )
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["ok"] is False, result
+    assert result["data"]["control_signal"]["kind"] == "watchdog_paused"
+    assert _INTERNAL_RUN_OUTCOME_RECORDED_KEY not in result
+
+    with pytest.raises(asyncio.CancelledError):
+        await _verify_and_record_run_blocks_result(ctx, result, 0.0)
+
+    assert len(observed_at_probe) == 1
+    at_probe = observed_at_probe[0]
+    assert at_probe is not None and at_probe.workflow_run_id == "wr_paused"
+    assert at_probe.verdict == "not_authoritative"
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None and outcome.workflow_run_id == "wr_paused"
+    assert counts == {"record": 1, "send": 1}
+    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == [
+        "wr_prior_failure",
+        "wr_paused",
+    ]

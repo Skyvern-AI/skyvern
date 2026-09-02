@@ -36,7 +36,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app as forge_app
-from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
     contains_internal_machinery_leak,
@@ -58,12 +57,9 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _watchdog_user_facing_summary,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
-from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
 from skyvern.schemas.workflows import BlockType
-from skyvern.services import workflow_service as workflow_service_module
+from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -589,112 +585,6 @@ workflow_definition:
       code: |
         await page.locator("#submit").click()
 """
-
-
-async def _install_run_harness(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    workflow_yaml: str,
-    polled_status: str,
-    dispatch_to_worker: bool = False,
-    terminal_blocks: list[WorkflowRunBlock] | None = None,
-) -> dict[str, Any]:
-    """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
-    polled run parked on ``polled_status`` so the watchdog decides the exit."""
-    workflow = await _process_workflow_yaml(
-        settings_fallback_yaml="enable_self_healing: false",
-        workflow_id="w_source",
-        workflow_permanent_id="wfp-1",
-        organization_id="org-1",
-        workflow_yaml=workflow_yaml,
-    )
-    now = datetime.now(timezone.utc)
-    organization = Organization(
-        organization_id="org-1",
-        organization_name="Test Org",
-        created_at=now,
-        modified_at=now,
-    )
-    captured: dict[str, Any] = {"workflow": workflow, "executor_cancelled": False}
-
-    database = MagicMock()
-    database.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
-    database.organizations.get_organization = AsyncMock(return_value=organization)
-    persisted_output_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, OutputParameter)]
-    persisted_workflow_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, WorkflowParameter)]
-    database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
-    database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
-    database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_run(status=polled_status))
-    monkeypatch.setattr(forge_app, "DATABASE", database)
-
-    async def _execute_workflow(**_kwargs: Any) -> None:
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            captured["executor_cancelled"] = True
-            raise
-
-    workflow_service = MagicMock()
-    workflow_service.get_workflow_parameters = AsyncMock(return_value=persisted_workflow_params)
-    workflow_service.execute_workflow = AsyncMock(side_effect=_execute_workflow)
-    workflow_service.create_copilot_dispatch_draft_version = AsyncMock(return_value=workflow)
-    monkeypatch.setattr(forge_app, "WORKFLOW_SERVICE", workflow_service)
-    monkeypatch.setattr(
-        forge_app.AGENT_FUNCTION,
-        "should_dispatch_copilot_block_run_to_worker",
-        AsyncMock(return_value=dispatch_to_worker),
-    )
-    monkeypatch.setattr(
-        forge_app.AGENT_FUNCTION,
-        "allow_copilot_inline_code_execution",
-        MagicMock(return_value=False),
-    )
-
-    workflow_run = SimpleNamespace(
-        workflow_run_id="wr_paused",
-        workflow_id="w_source",
-        sequential_credential_id=None,
-    )
-    monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=workflow_run))
-
-    polled_run = _fake_run(status=polled_status)
-
-    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any, Any]:
-        return polled_run, now, now
-
-    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
-    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(run_execution, "_fallback_page_info", AsyncMock(return_value=("", "")))
-
-    association = ActiveRunSessionAssociation(
-        organization_id="org-1",
-        workflow_permanent_id="wfp-1",
-        debug_browser_session_id="pbs_chat",
-        run_browser_session_id="pbs_run",
-        workflow_run_id="wr_paused",
-        turn_id="turn-1",
-        generation="gen-1",
-        expires_at=now + timedelta(minutes=5),
-    )
-    captured["publish"] = AsyncMock(return_value=association)
-    captured["clear"] = AsyncMock(return_value=True)
-    captured["cancel_run_task"] = AsyncMock(return_value=None)
-    captured["cooperative_cancel"] = AsyncMock(return_value=None)
-    monkeypatch.setattr(run_execution, "publish_active_run_session", captured["publish"])
-    monkeypatch.setattr(run_execution, "clear_active_run_session", captured["clear"])
-    monkeypatch.setattr(run_execution, "_cancel_run_task_if_not_final", captured["cancel_run_task"])
-    monkeypatch.setattr(run_execution, "_cooperative_cancel_dispatched_run", captured["cooperative_cancel"])
-    if dispatch_to_worker:
-        captured["worker_execute"] = AsyncMock(return_value=None)
-        monkeypatch.setattr(
-            run_execution.AsyncExecutorFactory,
-            "get_executor",
-            MagicMock(return_value=SimpleNamespace(execute_workflow=captured["worker_execute"])),
-        )
-        monkeypatch.setattr(run_execution, "_delete_dispatch_draft_if_run_final", AsyncMock(return_value=None))
-        monkeypatch.setattr(run_execution, "_capture_dispatched_terminal_page_evidence", AsyncMock(return_value=None))
-        monkeypatch.setattr(run_execution, "_attach_registered_output_parameter_values", AsyncMock(return_value={}))
-    return captured
 
 
 def _adopted_detached_tasks(before: set[Any]) -> list[Any]:

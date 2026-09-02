@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -23,6 +26,12 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml as process_workflow_yaml
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
+from skyvern.schemas.workflows import BlockType
+from skyvern.services import workflow_service as workflow_service_module
 
 DISPATCHED_LOGIN_GATE_HTML = (
     "<html><head><title>Sign in</title></head><body><main>"
@@ -109,6 +118,215 @@ def stub_artifact_app(
     )
     monkeypatch.setattr(run_execution_module, "app", fake_app)
     return retrieved_ids
+
+
+def _fake_workflow_run(status: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        status=status,
+        modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
+        browser_session_id=None,
+    )
+
+
+async def install_run_blocks_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workflow_yaml: str,
+    polled_status: str,
+    dispatch_to_worker: bool = False,
+    terminal_blocks: list[WorkflowRunBlock] | None = None,
+) -> dict[str, Any]:
+    """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
+    polled run parked on ``polled_status`` so the watchdog decides the exit."""
+    workflow = await process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=workflow_yaml,
+    )
+    now = datetime.now(timezone.utc)
+    organization = Organization(
+        organization_id="org-1",
+        organization_name="Test Org",
+        created_at=now,
+        modified_at=now,
+    )
+    captured: dict[str, Any] = {"workflow": workflow, "executor_cancelled": False}
+
+    database = MagicMock()
+    database.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
+    database.organizations.get_organization = AsyncMock(return_value=organization)
+    persisted_output_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, OutputParameter)]
+    persisted_workflow_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, WorkflowParameter)]
+    database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
+    database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
+    database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
+    monkeypatch.setattr(forge_app, "DATABASE", database)
+
+    async def _execute_workflow(**_kwargs: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            captured["executor_cancelled"] = True
+            raise
+
+    workflow_service = MagicMock()
+    workflow_service.get_workflow_parameters = AsyncMock(return_value=persisted_workflow_params)
+    workflow_service.execute_workflow = AsyncMock(side_effect=_execute_workflow)
+    workflow_service.create_copilot_dispatch_draft_version = AsyncMock(return_value=workflow)
+    monkeypatch.setattr(forge_app, "WORKFLOW_SERVICE", workflow_service)
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION,
+        "should_dispatch_copilot_block_run_to_worker",
+        AsyncMock(return_value=dispatch_to_worker),
+    )
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION,
+        "allow_copilot_inline_code_execution",
+        MagicMock(return_value=False),
+    )
+
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_paused",
+        workflow_id="w_source",
+        sequential_credential_id=None,
+    )
+    monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=workflow_run))
+
+    polled_run = _fake_workflow_run(status=polled_status)
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, Any, Any]:
+        return polled_run, now, now
+
+    monkeypatch.setattr(run_execution_module, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution_module, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(run_execution_module, "_fallback_page_info", AsyncMock(return_value=("", "")))
+
+    association = ActiveRunSessionAssociation(
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        debug_browser_session_id="pbs_chat",
+        run_browser_session_id="pbs_run",
+        workflow_run_id="wr_paused",
+        turn_id="turn-1",
+        generation="gen-1",
+        expires_at=now + timedelta(minutes=5),
+    )
+    captured["publish"] = AsyncMock(return_value=association)
+    captured["clear"] = AsyncMock(return_value=True)
+    captured["cancel_run_task"] = AsyncMock(return_value=None)
+    captured["cooperative_cancel"] = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "publish_active_run_session", captured["publish"])
+    monkeypatch.setattr(run_execution_module, "clear_active_run_session", captured["clear"])
+    monkeypatch.setattr(run_execution_module, "_cancel_run_task_if_not_final", captured["cancel_run_task"])
+    monkeypatch.setattr(run_execution_module, "_cooperative_cancel_dispatched_run", captured["cooperative_cancel"])
+    if dispatch_to_worker:
+        captured["worker_execute"] = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            run_execution_module.AsyncExecutorFactory,
+            "get_executor",
+            MagicMock(return_value=SimpleNamespace(execute_workflow=captured["worker_execute"])),
+        )
+        monkeypatch.setattr(run_execution_module, "_delete_dispatch_draft_if_run_final", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            run_execution_module, "_capture_dispatched_terminal_page_evidence", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            run_execution_module, "_attach_registered_output_parameter_values", AsyncMock(return_value={})
+        )
+    return captured
+
+
+HANDBACK_WORKFLOW_YAML = """
+title: extraction example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+"""
+
+
+def terminal_extraction_block(status: str) -> WorkflowRunBlock:
+    return WorkflowRunBlock(
+        label="extract_heading",
+        block_type=BlockType.EXTRACTION,
+        status=status,
+        failure_reason=(
+            'Timeout exceeded: waiting for locator("#heading") to be visible' if status == "failed" else None
+        ),
+        workflow_run_block_id="wrb_extract_heading",
+        workflow_run_id="wr_paused",
+        organization_id="org-1",
+        created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+        modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+    )
+
+
+def page_only_failed_block() -> WorkflowRunBlock:
+    """A failed block with no failure_reason, so the post-run page is its only structural signal."""
+    return WorkflowRunBlock(
+        label="extract_heading",
+        block_type=BlockType.EXTRACTION,
+        status="failed",
+        failure_reason=None,
+        workflow_run_block_id="wrb_extract_heading",
+        workflow_run_id="wr_paused",
+        organization_id="org-1",
+        created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+        modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
+    )
+
+
+def same_run_page_evidence() -> dict[str, object]:
+    return {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_paused",
+        "source_browser_session_id": "pbs_run",
+        "current_url": "https://example.com/done",
+        "page_title": "Done",
+        "inspected_url": "https://example.com/done",
+    }
+
+
+def count_record_and_send(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    counts = {"record": 0, "send": 0}
+    real_record = run_execution_module.record_build_test_outcome
+    real_send = run_execution_module._send_run_outcome_update
+
+    def _record(ctx: object, outcome: object) -> None:
+        counts["record"] += 1
+        real_record(ctx, outcome)
+
+    async def _send(*args: object, **kwargs: object) -> None:
+        counts["send"] += 1
+        await real_send(*args, **kwargs)
+
+    monkeypatch.setattr(run_execution_module, "record_build_test_outcome", _record)
+    monkeypatch.setattr(run_execution_module, "_send_run_outcome_update", _send)
+    return counts
+
+
+async def handback_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    polled_status: str,
+    block_status: str,
+    terminal_blocks: list[WorkflowRunBlock] | None = None,
+) -> CopilotContext:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status=polled_status,
+        terminal_blocks=terminal_blocks or [terminal_extraction_block(block_status)],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    return ctx
 
 
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
