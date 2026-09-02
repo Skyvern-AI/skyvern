@@ -246,7 +246,10 @@ from skyvern.services.webhook_delivery import (
     deliver_webhook_with_retries,
     describe_delivery_error,
 )
-from skyvern.services.workflow_script_service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-exported; several tests import it from this module
+    BLOCK_TYPES_THAT_SHOULD_BE_CACHED,
+    is_block_type_cacheable,
+)
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
@@ -1059,11 +1062,7 @@ def _collect_uncached_loop_children(
     a double-nested for-loop).
     """
     for child in block.loop_blocks:
-        if (
-            child.label
-            and child.label not in script_blocks_by_label
-            and child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-        ):
+        if child.label and child.label not in script_blocks_by_label and is_block_type_cacheable(child):
             blocks_to_update.add(child.label)
         # Recurse into nested loop blocks regardless of whether the loop
         # itself is cached — its children may not be.
@@ -6114,9 +6113,7 @@ class WorkflowService:
         # Per-block mints exist to cache block functions incrementally. A workflow
         # with no cacheable block types has nothing block-level to cache — its
         # script is fully derivable at end of run, so mint once there (SKY-13659).
-        if not any(
-            block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED for block in workflow.workflow_definition.blocks
-        ):
+        if not any(is_block_type_cacheable(block) for block in workflow.workflow_definition.blocks):
             return
 
         asyncio.create_task(
@@ -6589,7 +6586,7 @@ class WorkflowService:
             and block.label
             and block.label not in script_blocks_by_label
             and workflow_run_block_result.status in cacheable_statuses
-            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            and is_block_type_cacheable(block)
             # For traditional caching (code_version < 2), only track blocks
             # for regeneration when actually running with code. Agent-mode runs
             # should not trigger regeneration — doing so creates an infinite loop
@@ -6648,6 +6645,13 @@ class WorkflowService:
             and block.label
             and block.label in script_blocks_by_label
             and not block.disable_cache
+            # A stale script_blocks_by_label entry can predate export being turned
+            # on for this block (or predate this guard existing at all); the
+            # generated code path only knows prompt/schema/url/model, so it would
+            # silently skip the Parquet export. Force such blocks through the
+            # agent path, which is where is_block_type_cacheable already keeps
+            # them from being (re-)minted in the first place.
+            and is_block_type_cacheable(block)
         )
         # requires_agent blocks must execute via agent, not code — skip code path
         block_requires_agent = False
@@ -6868,9 +6872,9 @@ class WorkflowService:
             is_script_run
             and block.label
             and block.label not in script_blocks_by_label
-            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            and is_block_type_cacheable(block)
         )
-        block_is_non_cacheable = bool(is_script_run and block.block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED)
+        block_is_non_cacheable = bool(is_script_run and not is_block_type_cacheable(block))
         # If ai_fallback is explicitly disabled, skip the agent fallback entirely —
         # UNLESS this block requires_agent, has never been cached, or is a
         # non-cacheable block type that must always run via agent.
@@ -12374,7 +12378,7 @@ class WorkflowService:
                 task_block_labels = {
                     block.label
                     for block in workflow.workflow_definition.blocks
-                    if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                    if block.label and is_block_type_cacheable(block)
                 }
                 blocks_to_update.update(task_block_labels)
                 blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
@@ -12434,7 +12438,7 @@ class WorkflowService:
             should_cache_block_labels = {
                 block.label
                 for block in workflow.workflow_definition.blocks
-                if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                if block.label and is_block_type_cacheable(block)
             }
             should_cache_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
             cached_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)

@@ -1233,6 +1233,13 @@ class ExtractionBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
 
+    # Export as a Parquet file, as an output option of this block rather than a
+    # separate Data Export block. See skyvern.forge.sdk.workflow.models.data_export_block.
+    export_enabled: bool = False
+    export_data_schema: dict[str, Any] | None = None
+    export_file_name: str | None = None
+    export_records: str | None = None
+
 
 class LoginBlockYAML(BlockYAML):
     block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore

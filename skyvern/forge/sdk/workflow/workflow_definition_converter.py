@@ -838,6 +838,11 @@ def block_yaml_to_block(
         )
 
     elif block_yaml.block_type == BlockType.EXTRACTION:
+        if block_yaml.export_enabled and not block_yaml.export_data_schema:
+            raise InvalidWorkflowDefinition(
+                f"Extraction block '{block_yaml.label}' has export enabled but no export_data_schema. "
+                "A Parquet export needs a schema for the exported records."
+            )
         extraction_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return ExtractionBlock(
             **base_kwargs,
@@ -851,6 +856,10 @@ def block_yaml_to_block(
             max_retries=block_yaml.max_retries,
             disable_cache=block_yaml.disable_cache,
             complete_verification=False,
+            export_enabled=block_yaml.export_enabled,
+            export_data_schema=block_yaml.export_data_schema,
+            export_file_name=block_yaml.export_file_name,
+            export_records=block_yaml.export_records,
         )
 
     elif block_yaml.block_type == BlockType.LOGIN:
