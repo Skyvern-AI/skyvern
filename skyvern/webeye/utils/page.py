@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import gc
 import json
@@ -11,6 +12,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import structlog
@@ -32,7 +34,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
-from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_object_predicates import is_page_like
@@ -829,6 +831,42 @@ async def _current_viewpoint_screenshot_helper(
             exc_info=True,
         )
         raise FailedToTakeScreenshot(error_message=str(e)) from e
+
+
+CDP_RESCUE_SESSION_TIMEOUT_SECONDS = 5
+CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS = 5
+CDP_RESCUE_DETACH_TIMEOUT_SECONDS = 2
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+async def _cdp_rescue_screenshot(page: Page, file_path: str | None) -> bytes | None:
+    """Capture over raw CDP after the page-level screenshot primitive failed; the page just proved it
+    will not answer a capture, so session open, send and detach each carry their own budget and the
+    detach bound stays lexically outside the capture one."""
+    session = None
+    try:
+        session = await asyncio.wait_for(page.context.new_cdp_session(page), timeout=CDP_RESCUE_SESSION_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(
+            session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False}),
+            timeout=CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS,
+        )
+        data = base64.b64decode(result.get("data", ""), validate=False)
+        if data[: len(_PNG_SIGNATURE)] != _PNG_SIGNATURE:
+            LOG.warning("Raw CDP rescue screenshot returned a non-PNG payload", payload_bytes=len(data))
+            return None
+        if file_path is not None:
+            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(file_path).write_bytes(data)
+        LOG.info("Recovered the screenshot over raw CDP after the page screenshot failed", file_path=file_path)
+        skyvern_context.record_browser_recovery(BrowserOperation.SCREENSHOT)
+        return data
+    except Exception:
+        LOG.warning("Raw CDP rescue screenshot failed", exc_info=True)
+        return None
+    finally:
+        if session is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(session.detach(), timeout=CDP_RESCUE_DETACH_TIMEOUT_SECONDS)
 
 
 async def take_element_screenshot(
@@ -1906,7 +1944,7 @@ class SkyvernFrame:
             x = None
             y = None
             raise
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "Failed to take full page screenshot, fallback to use playwright full page screenshot",
                 exc_info=True,
@@ -1914,6 +1952,12 @@ class SkyvernFrame:
             # reset x and y to None to avoid the scroll_to_x_y call in finally block
             x = None
             y = None
+            if isinstance(exc, FailedToTakeScreenshot) and not (
+                engine_selection is not None and engine_selection.name == SKYCDP_ENGINE_NAME
+            ):
+                rescued = await _cdp_rescue_screenshot(page=page, file_path=file_path)
+                if rescued is not None:
+                    return rescued
             return await _current_viewpoint_screenshot_helper(
                 page=page,
                 file_path=file_path,
