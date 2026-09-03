@@ -658,6 +658,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   edit_block: "Editing block",
   add_block: "Adding block",
   delete_block: "Deleting block",
+  request_credential: "Requesting a credential",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 
