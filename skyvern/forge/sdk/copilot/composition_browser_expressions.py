@@ -1345,6 +1345,64 @@ for (const target of REQUESTED_TARGETS) {
     break;
   }
 }
+// A value the same call's screenshot pass read addresses a tile its label cannot: the label repeats
+// across hidden siblings, while exactly one visible leaf carries that magnitude.
+const witnessedLabelNear = (valueLeaf) => {
+  const wanted = new Set(REQUESTED_TARGETS.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean));
+  if (!wanted.size) return { text: '', owner: null };
+  let branch = valueLeaf;
+  let ancestor = valueLeaf.parentElement;
+  while (ancestor && ancestor.tagName !== 'BODY' && ancestor.tagName !== 'HTML') {
+    for (const leaf of Array.from(ancestor.querySelectorAll('*'))) {
+      if (!isLeafEl(leaf) || withinEl(leaf, branch) || !elementVisible(leaf) || insidePageChrome(leaf)) continue;
+      const text = nodeText(leaf);
+      if (wanted.has(text.trim().toLowerCase())) return { text: text, owner: ancestor };
+    }
+    branch = ancestor;
+    ancestor = ancestor.parentElement;
+  }
+  return { text: '', owner: null };
+};
+const witnessedValueRelation = (valueLeaf) => {
+  const carrier = valueLeaf.parentElement;
+  if (!carrier) return null;
+  const kids = Array.from(carrier.children || []);
+  const childIndex = kids.indexOf(valueLeaf);
+  if (childIndex < 0) return null;
+  const sel = selectorFor(carrier);
+  if (!sel || sel.length > MAX_SELECTOR_CHARS) return null;
+  const matches = selectorMatchCount(sel);
+  if (!matches) return null;
+  let pos = -1;
+  try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
+  if (pos < 0) return null;
+  const near = witnessedLabelNear(valueLeaf);
+  return { owner: carrier, relation: { key_text: near.text, selector_candidates: relationCandidatesFor(carrier, near.text), identity: identityFor(carrier), label_selector: '', label_child_index: -1, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+};
+const witnessedWanted = new Set(WITNESSED_VALUES);
+if (witnessedWanted.size) {
+  const witnessedLeaves = new Map();
+  for (const node of all) {
+    if (!isLeafEl(node)) continue;
+    const text = nodeText(node);
+    if (!witnessedWanted.has(text)) continue;
+    if (!elementVisible(node) || insidePageChrome(node) || insideMetricCard(node)) continue;
+    const seen = witnessedLeaves.get(text);
+    if (seen) seen.push(node);
+    else witnessedLeaves.set(text, [node]);
+  }
+  for (const value of WITNESSED_VALUES) {
+    if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; break; }
+    const leaves = witnessedLeaves.get(value);
+    if (!leaves || leaves.length !== 1) continue;
+    const found = witnessedValueRelation(leaves[0]);
+    if (!found) continue;
+    countFoldedKey(found.relation.key_text);
+    countWalkedValue(found.relation.value_text);
+    keyValueRelations.push(found.relation);
+    metricCardNodes.add(found.owner);
+  }
+}
 for (const node of all) {
   const tag = (node.tagName || '').toLowerCase();
   if (keyValueSkipTags.has(tag) || !elementVisible(node) || insidePageChrome(node) || insideMetricCard(node)) continue;
@@ -1676,15 +1734,42 @@ return boundedStructuredEvidence(structuredEvidence);
 """
 
 
-def composition_structured_evidence_expression(requested_targets: tuple[str, ...] = ()) -> str:
-    """The capture expression, told which labels the turn asked for.
+def composition_structured_evidence_expression(
+    requested_targets: tuple[str, ...] = (),
+    witnessed_values: tuple[str, ...] = (),
+) -> str:
+    """The capture expression, told which labels the turn asked for and which values were just seen.
 
-    Capture that does not know the request can only guess which of a page's relations matters, and a
-    tile whose shape it fails to recognise is replaced by whatever generic pair sits nearby.
+    Capture that does not know the request can only guess which relations matter, and a witnessed
+    value addresses a tile by the magnitude a screenshot read off it rather than by its shape.
     """
     targets = [target.strip() for target in requested_targets if isinstance(target, str) and target.strip()]
-    header = f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
+    values = [value.strip() for value in witnessed_values if isinstance(value, str) and value.strip()]
+    header = (
+        f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
+        f"const WITNESSED_VALUES={json.dumps(values[:_MAX_KEY_VALUE_RELATIONS])};"
+    )
     return "(() => {" + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
 
 
 COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION = composition_structured_evidence_expression()
+
+
+def value_witness_read_expression(container_selector: str, match_count: int, position: int, child_index: int) -> str:
+    """The page read that returns a witnessed relation's value, folding whitespace the way nodeText does.
+
+    A positional index only names the observed element while the selector still matches the same
+    number of nodes, so a page that grew or shed one reads nothing rather than the wrong element.
+    """
+    return (
+        "(() => { const nodes = document.querySelectorAll("
+        + json.dumps(container_selector)
+        + "); if (nodes.length !== "
+        + str(int(match_count))
+        + ") return null; const carrier = nodes["
+        + str(int(position))
+        + "]; if (!carrier) return null; const leaf = carrier.children["
+        + str(int(child_index))
+        + "]; if (!leaf) return null; "
+        + "return String(leaf.textContent || '').replace(/\\s+/g, ' ').trim(); })()"
+    )

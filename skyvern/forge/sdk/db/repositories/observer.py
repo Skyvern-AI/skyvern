@@ -417,6 +417,7 @@ class ObserverRepository(BaseRepository):
         engine: RunEngine | None = None,
         current_value: str | None = None,
         current_index: int | None = None,
+        ai_fallback_triggered: bool | None = None,
     ) -> WorkflowRunBlock:
         if output is not None:
             output = truncate_oversized_jsonb_value(
@@ -437,6 +438,9 @@ class ObserverRepository(BaseRepository):
                 engine=engine,
                 current_value=current_value,
                 current_index=current_index,
+                script_run=ScriptRunResponse(ai_fallback_triggered=ai_fallback_triggered).model_dump(mode="json")
+                if ai_fallback_triggered is not None
+                else None,
             )
             session.add(new_workflow_run_block)
             await session.commit()

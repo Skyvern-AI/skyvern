@@ -1235,11 +1235,14 @@ class WorkflowRunBlockModel(Base):
     # Accumulates LLM cost for block-scoped calls (no step/thought attribution).
     llm_cost = Column(Numeric, default=0, nullable=False)
 
-    # Per-block cached-script execution state. Written (via the writer bridge
-    # in `services/script_service.py::_update_workflow_block`) when a script
-    # block falls back to AI mid-execution. Always null for blocks that ran
-    # cleanly from cache or were always-agent. Mirrors the `script_run`
-    # column on `WorkflowRunModel` but at block granularity.
+    # Per-block cached-script execution state, and the execution-mode marker:
+    # non-null iff the block was created by the cached-script path. Stamped with
+    # the initial `ai_fallback_triggered=false` state at block creation in
+    # `services/script_service.py`, then overwritten with `true` by the writer
+    # bridge (`_update_workflow_block`) if the block falls back to AI
+    # mid-execution. Null for always-agent blocks, whose execution mode is
+    # instead carried by `engine`. Mirrors the `script_run` column on
+    # `WorkflowRunModel` but at block granularity.
     script_run = Column(JSON, nullable=True)
 
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is

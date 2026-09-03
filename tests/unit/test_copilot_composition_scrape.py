@@ -6,6 +6,7 @@ served in a real scout because the agent acts between inspects.)
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from types import SimpleNamespace
@@ -21,9 +22,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     parse_composition_structured,
 )
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
 from skyvern.forge.sdk.copilot.tools import _shared as shared_module
-from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
+from skyvern.forge.sdk.copilot.tools._shared import (
+    _composition_get_structured_evidence_result,
+    admitted_requested_output_reads,
+)
 from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
@@ -752,3 +758,578 @@ def test_inspection_regression_guard_uses_current_location_after_leave_and_retur
     assert refusal is not None
     assert refusal["data"]["current_url"] == reached_url
     assert refusal["data"]["observation_step"] == 0
+
+
+def _tile_packet(*, with_relation: bool, match_count: int = 1, position: int = 0) -> dict:
+    relations = (
+        [
+            {
+                "key_text": "Sessions Started",
+                "value_text": "72.51k",
+                "container_selector": "div.query-value__container",
+                "container_match_count": match_count,
+                "container_position": position,
+                "value_child_index": 0,
+                "direct_child_count": 1,
+                "visible": True,
+                "value_visible": True,
+                "selector_candidates": [],
+                "identity": {},
+            }
+        ]
+        if with_relation
+        else []
+    )
+    packet = parse_composition_structured(
+        {
+            "page_title": "Fleet Metrics",
+            "forms": [],
+            "navigation_targets": [{"text": "Overview", "href": "https://example.com/overview", "selector": "a"}],
+            "key_value_relations": relations,
+        },
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+    assert packet is not None
+    return packet
+
+
+def _requested_tile_ctx() -> CopilotContext:
+    ctx = make_copilot_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="return the sessions started figure",
+                output_path="output.sessions_started",
+                requested_output_label="Sessions Started",
+            )
+        ]
+    )
+    return ctx
+
+
+def _install_tile_vision(
+    monkeypatch: pytest.MonkeyPatch, calls: dict[str, int], label: str = "Sessions Started"
+) -> None:
+    async def screenshot(ctx: object, *, dispatch_session_id: object) -> dict:
+        calls["screenshot"] += 1
+        return {"ok": True, "data": {"screenshot_base64": base64.b64encode(b"frame").decode()}}
+
+    async def handler(**_kwargs: object) -> dict:
+        calls["vision"] += 1
+        return {
+            "summary": "One metric panel over a dashboard grid.",
+            "requested_values": [{"label": label, "value": "72.51k"}],
+        }
+
+    async def visual_handler(ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_screenshot", screenshot)
+    monkeypatch.setattr(tools.composition_capture, "_composition_visual_handler", visual_handler)
+
+
+def _install_witness_read(ctx: CopilotContext, returns: str | None = "72.51k") -> list[str]:
+    expressions: list[str] = []
+
+    async def call_internal_tool(_tool_name: str, arguments: dict) -> dict:
+        expressions.append(arguments["expression"])
+        return {"ok": True, "data": {"result": returns}}
+
+    ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=call_internal_tool)
+    return expressions
+
+
+@pytest.mark.asyncio
+async def test_screenshot_read_value_addresses_the_tile_the_label_alone_could_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"screenshot": 0, "vision": 0}
+    witnessed_per_call: list[tuple[str, ...]] = []
+
+    async def structured(ctx: object, **kwargs: object) -> tuple[dict, None]:
+        witnessed = tuple(kwargs.get("witnessed_values") or ())
+        witnessed_per_call.append(witnessed)
+        return _tile_packet(with_relation=bool(witnessed)), None
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    _install_tile_vision(monkeypatch, calls)
+    ctx = _requested_tile_ctx()
+    reads = _install_witness_read(ctx)
+
+    evidence, error = await tools._capture_composition_evidence(
+        ctx,
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert (calls["screenshot"], calls["vision"]) == (1, 1)
+    assert witnessed_per_call == [(), ("72.51k",)]
+    assert evidence["requested_values"] == [{"label": "Sessions Started", "value": "72.51k"}]
+    assert [
+        (witness["label"], witness["value"], witness["output_path"]) for witness in evidence["value_witnesses"]
+    ] == [("Sessions Started", "72.51k", "output.sessions_started")]
+    assert len(reads) == 1
+    assert "div.query-value__container" in reads[0]
+    projected = tools.composition_capture.model_visible_composition_evidence(evidence)
+    assert "expression" not in projected["value_witnesses"][0]
+
+
+@pytest.mark.asyncio
+async def test_witness_read_that_does_not_return_the_witnessed_value_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"screenshot": 0, "vision": 0}
+
+    async def structured(ctx: object, **kwargs: object) -> tuple[dict, None]:
+        return _tile_packet(with_relation=bool(kwargs.get("witnessed_values"))), None
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    _install_tile_vision(monkeypatch, calls)
+    ctx = _requested_tile_ctx()
+    reads = _install_witness_read(ctx, returns="72.7k")
+
+    evidence, error = await tools._capture_composition_evidence(
+        ctx,
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert len(reads) == 1
+    assert "value_witnesses" not in evidence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    [
+        {"value_truncated": True},
+        {"container_match_count": 1, "container_position": 3},
+        {"direct_child_count": 1, "value_child_index": 4},
+    ],
+)
+async def test_a_relation_whose_channel_or_coordinates_are_broken_witnesses_nothing(damage: dict) -> None:
+    relation = {
+        "key_text": "Sessions Started",
+        "value_text": "72.51k",
+        "container_selector": "div.query-value__container",
+        "container_match_count": 2,
+        "container_position": 1,
+        "value_child_index": 0,
+        "direct_child_count": 1,
+        "visible": True,
+        "value_visible": True,
+        **damage,
+    }
+    ctx = _requested_tile_ctx()
+    reads = _install_witness_read(ctx)
+
+    records = await tools.composition_capture._value_witness_records(
+        ctx,
+        {"key_value_relations": [relation]},
+        [tools.composition_capture.ValueWitness("Sessions Started", "72.51k", "output.sessions_started")],
+    )
+
+    assert records == []
+    assert reads == []
+
+
+@pytest.mark.asyncio
+async def test_witness_read_pins_the_selector_cardinality_it_was_observed_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"screenshot": 0, "vision": 0}
+
+    async def structured(ctx: object, **kwargs: object) -> tuple[dict, None]:
+        return _tile_packet(with_relation=bool(kwargs.get("witnessed_values")), match_count=4, position=2), None
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    _install_tile_vision(monkeypatch, calls)
+    ctx = _requested_tile_ctx()
+    reads = _install_witness_read(ctx)
+
+    evidence, error = await tools._capture_composition_evidence(
+        ctx,
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert len(reads) == 1
+    expression = reads[0]
+    assert "nodes.length !== 4" in expression
+    assert "nodes[2]" in expression
+    projected = tools.composition_capture.model_visible_composition_evidence(evidence)
+    assert "expression" not in projected["value_witnesses"][0]
+
+
+@pytest.mark.asyncio
+async def test_failed_second_look_keeps_the_evidence_the_first_one_captured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"screenshot": 0, "vision": 0}
+
+    async def structured(ctx: object, **kwargs: object) -> tuple[dict | None, str | None]:
+        if kwargs.get("witnessed_values"):
+            return None, "skyvern_evaluate timed out"
+        return _tile_packet(with_relation=False), None
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    _install_tile_vision(monkeypatch, calls)
+
+    evidence, error = await tools._capture_composition_evidence(
+        _requested_tile_ctx(),
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert evidence["page_title"] == "Fleet Metrics"
+    assert "value_witnesses" not in evidence
+    assert "value_witness_extract_failed" not in (evidence.get("inspection_warnings") or [])
+
+
+@pytest.mark.asyncio
+async def test_label_the_page_already_answers_takes_no_screenshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"screenshot": 0, "vision": 0}
+
+    async def structured(ctx: object, **_kwargs: object) -> tuple[dict, None]:
+        return _tile_packet(with_relation=True), None
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    _install_tile_vision(monkeypatch, calls)
+
+    evidence, error = await tools._capture_composition_evidence(
+        _requested_tile_ctx(),
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert (calls["screenshot"], calls["vision"]) == (0, 0)
+    assert "value_witnesses" not in evidence
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_read_carries_the_witnessed_values_into_the_page_expression() -> None:
+    expressions: list[str] = []
+
+    async def call_internal_tool(_tool_name: str, arguments: dict) -> dict:
+        expressions.append(arguments["expression"])
+        return {"ok": True, "data": {"result": json.dumps(_bounded_example_page_payload())}}
+
+    await _composition_get_structured_evidence_result(
+        SimpleNamespace(discovery_mcp_server=SimpleNamespace(call_internal_tool=call_internal_tool)),
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+        witnessed_values=("72.51k",),
+    )
+
+    assert 'const WITNESSED_VALUES=["72.51k"];' in expressions[0]
+
+
+def _witness_packet(**extra: object) -> dict:
+    packet: dict = {
+        "value_witnesses": [
+            {
+                "label": "Sessions Started",
+                "value": "72.51k",
+                "output_path": "output.sessions_started",
+                "expression": "x",
+            }
+        ],
+        "requested_values": [{"label": "Sessions Started", "value": "72.51k"}],
+    }
+    packet.update(extra)
+    return packet
+
+
+@pytest.mark.parametrize(
+    ("packet", "capture_session_id"),
+    [
+        (_witness_packet(browser_session_provenance={"mixed": True}), None),
+        (_witness_packet(), "a-different-session"),
+    ],
+)
+def test_witness_the_capture_cannot_record_leaves_no_witness_in_the_packet(
+    monkeypatch: pytest.MonkeyPatch, packet: dict, capture_session_id: str | None
+) -> None:
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        tools.composition_capture,
+        "_record_scouted_read",
+        lambda ctx, *, expression, data, url, declared_output_path=None: recorded.append(expression),
+    )
+    ctx = _requested_tile_ctx()
+
+    tools.composition_capture._record_value_witnesses(
+        ctx,
+        packet,
+        url="https://example.com/metrics",
+        capture_session_id=capture_session_id,
+        run_page_source_session_id=None,
+    )
+
+    assert recorded == []
+    assert "value_witnesses" not in packet
+    assert "requested_values" not in packet
+    assert tools._witnessed_output_paths(packet) == frozenset()
+
+
+def test_a_read_bound_to_another_path_leaves_its_path_to_the_designation_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tools.composition_capture,
+        "_record_scouted_read",
+        lambda ctx, *, expression, data, url, declared_output_path=None: {
+            "tool_name": "read_value",
+            "read_expression": expression,
+            "read_output_path": "output.a_different_field",
+        },
+    )
+    ctx = _requested_tile_ctx()
+    packet = _witness_packet()
+
+    tools.composition_capture._record_value_witnesses(
+        ctx,
+        packet,
+        url="https://example.com/metrics",
+        capture_session_id=ctx.browser_session_id,
+        run_page_source_session_id=None,
+    )
+
+    assert "value_witnesses" not in packet
+    assert "requested_values" not in packet
+    assert tools._witnessed_output_paths(packet) == frozenset()
+
+
+def test_a_declined_recording_leaves_its_path_to_the_designation_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        tools.composition_capture,
+        "_record_scouted_read",
+        lambda ctx, *, expression, data, url, declared_output_path=None: None,
+    )
+    ctx = _requested_tile_ctx()
+    packet = _witness_packet()
+
+    tools.composition_capture._record_value_witnesses(
+        ctx,
+        packet,
+        url="https://example.com/metrics",
+        capture_session_id=ctx.browser_session_id,
+        run_page_source_session_id=None,
+    )
+
+    assert "value_witnesses" not in packet
+    assert "requested_values" not in packet
+    assert tools._witnessed_output_paths(packet) == frozenset()
+
+
+def test_two_labels_reading_one_value_witness_nothing() -> None:
+    summary = {
+        "requested_values": [
+            {"label": "Sessions Started", "value": "72.51k"},
+            {"label": "Retries Queued", "value": "72.51k"},
+        ]
+    }
+    owned = {"Sessions Started": "output.a", "Retries Queued": "output.b"}
+
+    witnesses, dropped = tools.composition_capture._witnesses_from_visual_summary(
+        summary, owned, ("Sessions Started", "Retries Queued")
+    )
+
+    assert witnesses == []
+    assert dropped == 2
+
+
+def test_two_names_for_one_output_reading_one_value_witness_it_once() -> None:
+    summary = {
+        "requested_values": [
+            {"label": "Sessions Started", "value": "72.51k"},
+            {"label": "panel metric", "value": "72.51k"},
+        ]
+    }
+    owned = {"Sessions Started": "output.sessions_started", "panel metric": "output.sessions_started"}
+
+    witnesses, dropped = tools.composition_capture._witnesses_from_visual_summary(
+        summary, owned, ("Sessions Started", "panel metric")
+    )
+
+    assert [(witness.value, witness.output_path) for witness in witnesses] == [("72.51k", "output.sessions_started")]
+    assert dropped == 1
+
+
+def test_a_designated_label_seeds_a_capture_target_and_never_a_witness_value() -> None:
+    reads = [
+        {"output_path": f"output.metric_{index}", "value_text": f"value {index}", "label": f"label {index}"}
+        for index in range(9)
+    ]
+    admitted, rejected = admitted_requested_output_reads(reads)
+
+    targets = tools.composition_capture._seeded_capture_targets(make_copilot_ctx(), admitted)
+
+    assert len(admitted) == 8
+    assert rejected[0]["reason"] == "only-first-8-reads-verified"
+    assert targets == tuple(f"label {index}" for index in range(8))
+    assert not hasattr(tools.composition_capture, "_designated_values")
+
+
+@pytest.mark.asyncio
+async def test_designated_read_seeds_the_screenshot_pass_when_the_turn_declared_no_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"screenshot": 0, "vision": 0}
+    seeded_targets: list[tuple[str, ...]] = []
+    seeded_values: list[tuple[str, ...]] = []
+
+    async def structured(ctx: object, **kwargs: object) -> tuple[dict, None]:
+        seeded_targets.append(tuple(kwargs.get("requested_targets") or ()))
+        seeded_values.append(tuple(kwargs.get("witnessed_values") or ()))
+        return _tile_packet(with_relation=bool(kwargs.get("witnessed_values"))), None
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    _install_tile_vision(monkeypatch, calls, label="panel metric")
+    admitted, _ = admitted_requested_output_reads(
+        [{"output_path": "output.sessions_started", "value_text": "Sessions Started", "label": "panel metric"}]
+    )
+    ctx = make_copilot_ctx()
+    _install_witness_read(ctx)
+
+    evidence, error = await tools._capture_composition_evidence(
+        ctx,
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+        requested_reads=admitted,
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert seeded_targets[0] == ("panel metric",)
+    assert seeded_values[0] == ()
+    assert (calls["screenshot"], calls["vision"]) == (1, 1)
+    assert [(witness["value"], witness["output_path"]) for witness in evidence["value_witnesses"]] == [
+        ("72.51k", "output.sessions_started")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inspect_tool_forwards_the_designated_read_into_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    forwarded: list[tuple[str, ...]] = []
+    ctx = make_copilot_ctx()
+
+    async def capture(_ctx: object, **kwargs: object) -> tuple[dict, None]:
+        reads = kwargs.get("requested_reads") or ()
+        forwarded.append(tuple(read.output_path for read in reads))
+        return _tile_packet(with_relation=True), None
+
+    async def page_info(_ctx: object, _session_id: str | None = None) -> tuple[str, str]:
+        return "https://example.com/metrics", "Fleet Metrics"
+
+    async def navigate(_ctx: object, url: str, **_kwargs: object) -> dict[str, object]:
+        return {"ok": True, "data": {"url": url}}
+
+    monkeypatch.setattr(tools, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools.composition_capture, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools.composition_capture, "_fallback_page_info", page_info)
+    monkeypatch.setattr(tools.composition_capture, "_discovery_navigate", navigate)
+    monkeypatch.setattr(tools.composition_capture, "_capture_composition_evidence", capture)
+
+    for target_url in ("current_page", "https://example.com/other"):
+        raw = await tools.inspect_page_for_composition_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="inspect_page_for_composition"),
+            json.dumps(
+                {
+                    "target_url": target_url,
+                    "requested_output_reads": [
+                        {"output_path": "sessions_started", "value_text": "Sessions Started", "label": "panel metric"}
+                    ],
+                }
+            ),
+        )
+        assert json.loads(raw)["ok"] is True
+
+    assert forwarded == [("output.sessions_started",), ("output.sessions_started",)]
+
+
+@pytest.mark.asyncio
+async def test_witnessed_output_path_is_not_probed_again_by_the_designation_verifier() -> None:
+    probes: list[str] = []
+
+    async def call_internal_tool(_tool_name: str, arguments: dict) -> dict:
+        probes.append(arguments["expression"])
+        return {"ok": True, "data": {"result": json.dumps({"text": "72.51k", "selector_candidates": ["#v"]})}}
+
+    ctx = make_copilot_ctx()
+    ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=call_internal_tool)
+    reads = [
+        {"output_path": "output.sessions_started", "value_text": "72.51k", "label": "Sessions Started"},
+        {"output_path": "output.failures", "value_text": "3", "label": "Failures"},
+    ]
+
+    verified, unverified = await tools._verify_requested_output_reads(
+        ctx, reads, frozenset({"output.sessions_started"})
+    )
+
+    assert [fact["output_path"] for fact in verified] == ["output.failures"]
+    assert unverified == [{"output_path": "output.sessions_started", "reason": "superseded-by-value-witness"}]
+    assert len(probes) == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_after_a_failed_navigation_still_asks_for_the_designated_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded_targets: list[tuple[str, ...]] = []
+    seeded_values: list[tuple[str, ...]] = []
+
+    async def structured(ctx: object, **kwargs: object) -> tuple[dict, None]:
+        seeded_targets.append(tuple(kwargs.get("requested_targets") or ()))
+        seeded_values.append(tuple(kwargs.get("witnessed_values") or ()))
+        return _tile_packet(with_relation=True), None
+
+    async def page_info(_ctx: object, _session_id: str | None = None) -> tuple[str, str]:
+        return "https://example.com/metrics", "Fleet Metrics"
+
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", structured)
+    monkeypatch.setattr(tools.composition_capture, "_fallback_page_info", page_info)
+    admitted, _ = admitted_requested_output_reads(
+        [{"output_path": "output.sessions_started", "value_text": "Sessions Started", "label": "panel metric"}]
+    )
+
+    captured = await tools.composition_capture._composition_evidence_after_navigation_failure(
+        make_copilot_ctx(),
+        inspected_url="https://example.com/metrics",
+        navigation_error="timeout",
+        requested_reads=admitted,
+    )
+
+    assert captured is not None
+    assert seeded_targets == [("panel metric",)]
+    # A designated value is the model's own claim, so it never keys the page's value-first pass.
+    assert seeded_values == [()]
+
+
+def test_one_output_whose_names_read_different_values_witnesses_nothing() -> None:
+    summary = {
+        "requested_values": [
+            {"label": "Sessions Started", "value": "72.51k"},
+            {"label": "panel metric", "value": "0.4%"},
+        ]
+    }
+    owned = {"Sessions Started": "output.sessions_started", "panel metric": "output.sessions_started"}
+
+    witnesses, dropped = tools.composition_capture._witnesses_from_visual_summary(
+        summary, owned, ("Sessions Started", "panel metric")
+    )
+
+    assert witnesses == []
+    assert dropped == 2

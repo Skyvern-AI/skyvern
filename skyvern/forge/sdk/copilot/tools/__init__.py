@@ -11,7 +11,6 @@ import structlog
 from agents import FunctionTool, function_tool
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
-from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
@@ -76,6 +75,8 @@ from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEILING_SECONDS
+from ._shared import AdmittedOutputRead as AdmittedOutputRead
+from ._shared import RequestedOutputRead as RequestedOutputRead
 from ._shared import _composition_get_html as _composition_get_html
 from ._shared import _current_workflow_has_evidence_block as _current_workflow_has_evidence_block
 from ._shared import _fallback_page_info as _fallback_page_info
@@ -84,6 +85,7 @@ from ._shared import _proxy_location_trace_value as _proxy_location_trace_value
 from ._shared import _raw_yaml_proxy_location as _raw_yaml_proxy_location
 from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragment
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
+from ._shared import admitted_requested_output_reads
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
@@ -666,39 +668,38 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     )
 
 
-class RequestedOutputRead(TypedDict):
-    """A requested output and the exact label/value the model sees on the current page."""
-
-    output_path: str
-    value_text: str
-    label: str
+SUPERSEDED_BY_VALUE_WITNESS = "superseded-by-value-witness"
 
 
-_MAX_REQUESTED_OUTPUT_READS = 8
+def _witnessed_output_paths(data: object) -> frozenset[str]:
+    """Output paths this call's capture already addressed by the value its screenshot read."""
+    if not isinstance(data, dict):
+        return frozenset()
+    witnesses = data.get("value_witnesses")
+    if not isinstance(witnesses, list):
+        return frozenset()
+    return frozenset(
+        str(witness["output_path"])
+        for witness in witnesses
+        if isinstance(witness, dict) and str(witness.get("output_path") or "")
+    )
 
 
 async def _verify_requested_output_reads(
     copilot_ctx: CopilotContext,
     reads: list[RequestedOutputRead],
+    witnessed_paths: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Verify model-designated rendered values and return page facts without retaining a plan."""
     verified: list[dict[str, Any]] = []
-    unverified: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
-    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
-        unverified.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
-    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
-        raw_path = str(read.get("output_path") or "").strip()
-        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
-        value_text = str(read.get("value_text") or "").strip()
-        label = str(read.get("label") or "").strip()
-        if not raw_path or not value_text:
-            unverified.append({"output_path": raw_path, "reason": "malformed"})
+    admitted, unverified = admitted_requested_output_reads(reads)
+    for read in admitted:
+        output_path = read.output_path
+        value_text = read.value_text
+        label = read.label
+        if output_path in witnessed_paths:
+            unverified.append({"output_path": output_path, "reason": SUPERSEDED_BY_VALUE_WITNESS})
             continue
-        if output_path in seen_paths:
-            unverified.append({"output_path": output_path, "reason": "duplicate-output-path"})
-            continue
-        seen_paths.add(output_path)
         server = copilot_ctx.discovery_mcp_server
         if server is None:
             unverified.append({"output_path": output_path, "reason": "no-browser"})
@@ -1350,15 +1351,23 @@ async def inspect_page_for_composition_tool(
     authority_error = _authority_tool_error(ctx.context, "inspect_page_for_composition")
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, "inspect_page_for_composition", authority_error)
-    result = await _inspect_page_for_composition_impl(ctx.context, target_url)
+    admitted, _ = admitted_requested_output_reads(requested_output_reads or [])
+    result = await _inspect_page_for_composition_impl(ctx.context, target_url, admitted)
     if requested_output_reads and result.get("ok"):
-        verified, unverified = await _verify_requested_output_reads(ctx.context, requested_output_reads)
         data = result.get("data")
+        witnessed_paths = _witnessed_output_paths(data)
+        verified, unverified = await _verify_requested_output_reads(
+            ctx.context, requested_output_reads, witnessed_paths
+        )
         if isinstance(data, dict):
             data["requested_output_designations"] = verified
             if unverified:
                 data["unverified_output_designations"] = unverified
-                retry_paths = [item["output_path"] for item in unverified if item.get("output_path")]
+                retry_paths = [
+                    item["output_path"]
+                    for item in unverified
+                    if item.get("output_path") and item.get("reason") != SUPERSEDED_BY_VALUE_WITNESS
+                ]
                 if retry_paths:
                     data["requested_output_designation_capability"] = requested_output_designation_capability(
                         retry_paths

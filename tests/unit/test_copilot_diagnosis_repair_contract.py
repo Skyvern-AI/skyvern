@@ -2884,7 +2884,7 @@ async def _drive_inspect_page(
     capture_raises: bool = False,
 ) -> dict[str, object]:
     async def fake_capture(
-        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str
+        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str, **_kwargs: object
     ) -> tuple[dict[str, object] | None, None]:
         if capture_clears_session:
             inner_ctx.browser_session_id = None

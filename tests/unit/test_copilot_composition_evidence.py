@@ -63,6 +63,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     page_evidence_needs_visual_fallback,
     parse_composition_html,
     parse_composition_structured,
+    unresolved_requested_targets,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
@@ -7245,3 +7246,37 @@ def test_composition_gate_falls_back_to_observed_page_for_a_stale_ref_on_an_unre
     )
 
     assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_merge_visual_composition_evidence_keeps_only_typed_requested_value_pairs() -> None:
+    parsed = parse_composition_html(
+        "<html><body><div>Sessions Started</div></body></html>",
+        inspected_url="https://example.com/metrics",
+        current_url="https://example.com/metrics",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "One metric panel.",
+            "requested_values": [
+                {"label": "Sessions Started", "value": "72.51k"},
+                {"label": "Failure rate", "value": ""},
+                {"label": 7, "value": "3"},
+                "Sessions Started=72.51k",
+            ],
+        },
+    )
+
+    assert merged["requested_values"] == [{"label": "Sessions Started", "value": "72.51k"}]
+
+
+def test_unresolved_requested_targets_ignores_case_and_invisible_relations() -> None:
+    evidence = {
+        "key_value_relations": [
+            {"key_text": "sessions started", "value_text": "72.51k", "visible": True, "value_visible": True},
+            {"key_text": "Failure rate", "value_text": "0.4%", "visible": True, "value_visible": False},
+        ]
+    }
+
+    assert unresolved_requested_targets(evidence, ("Sessions Started", "Failure rate", "  ")) == ("Failure rate",)
