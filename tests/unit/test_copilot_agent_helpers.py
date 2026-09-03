@@ -110,6 +110,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -4229,6 +4230,114 @@ workflow_definition:
 
         assert result["ok"] is True, result
         get_credentials_by_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_canonicalizes_a_cited_google_connection_name(self, monkeypatch) -> None:
+        connection = GoogleOAuthCredentialBase(
+            id="goac_cited_persist",
+            organization_id="org-1",
+            credential_name="Blog Metrics Connection",
+            state="active",
+            scopes_requested=[],
+            scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+            created_at=datetime(2026, 9, 1),
+            modified_at=datetime(2026, 9, 1),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_visible_credentials_for_org",
+            AsyncMock(return_value=[connection]),
+        )
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                canonical_user_message='append the titles with the "Blog Metrics Connection" account'
+            )
+        )
+
+        workflow = MagicMock()
+        workflow.workflow_definition.blocks = []
+        process_workflow_yaml = AsyncMock(return_value=workflow)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            process_workflow_yaml,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=AsyncMock()),
+        )
+
+        result = await tools_module._update_workflow(
+            {
+                "workflow_yaml": (
+                    "workflow_definition:\n"
+                    "  blocks:\n"
+                    "    - label: append_titles\n"
+                    "      block_type: google_sheets_write\n"
+                    '      credential_id: "Blog Metrics Connection"\n'
+                )
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True, result
+        assert result["data"]["google_connection_resolution"][0]["status"] == "resolved"
+        assert "goac_cited_persist" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
+        assert "goac_cited_persist" in ctx.staged_workflow_yaml
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_reports_an_unmatched_cited_google_connection_name(self, monkeypatch) -> None:
+        connection = GoogleOAuthCredentialBase(
+            id="goac_eligible_row",
+            organization_id="org-1",
+            credential_name="Blog Metrics Connection",
+            state="active",
+            scopes_requested=[],
+            scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+            created_at=datetime(2026, 9, 1),
+            modified_at=datetime(2026, 9, 1),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_visible_credentials_for_org",
+            AsyncMock(return_value=[connection]),
+        )
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                canonical_user_message='append the titles with the "Quarterly Revenue Connection" account'
+            )
+        )
+
+        workflow = MagicMock()
+        workflow.workflow_definition.blocks = []
+        process_workflow_yaml = AsyncMock(return_value=workflow)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            process_workflow_yaml,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=AsyncMock()),
+        )
+
+        result = await tools_module._update_workflow(
+            {
+                "workflow_yaml": (
+                    "workflow_definition:\n"
+                    "  blocks:\n"
+                    "    - label: append_titles\n"
+                    "      block_type: google_sheets_write\n"
+                    '      credential_id: "Quarterly Revenue Connection"\n'
+                )
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True, result
+        assert "block_id" not in result
+        fact = result["data"]["google_connection_resolution"][0]
+        assert fact["status"] == "not_found"
+        assert fact["canonicalized"] is False
+        assert [row["connection_id"] for row in fact["eligible_connections"]] == ["goac_eligible_row"]
+        assert "Quarterly Revenue Connection" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
+        assert "Quarterly Revenue Connection" in ctx.staged_workflow_yaml
 
 
 class TestRunBlocksCredentialApproval:
