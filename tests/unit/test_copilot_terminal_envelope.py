@@ -15,12 +15,18 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
-from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestConnectFailure, BuildTestFailedOperation
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestConnectFailure,
+    BuildTestFailedOperation,
+    RecordedBuildTestOutcome,
+)
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    INTERRUPTED_TERMINAL_HEADLINE,
     MINIMAL_HONEST_STOP,
+    InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
     finalize_applied_state,
@@ -249,6 +255,79 @@ def test_connect_failure_owns_terminal_over_earlier_failed_operation() -> None:
     assert replaced is True
     assert "cdp_connect_failed" in message
     assert "fresh browser session" in message
+
+
+def test_crash_exit_renders_interrupted_not_the_failed_operation_sentence() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+        proposal_present=True,
+        interruption=InterruptedTurnFacts(workflow_permanent_id="wpid_1", workflow_version=4),
+    )
+    message, replaced = render_terminal_message(envelope, "The code run failed.", cancelled=False)
+
+    assert replaced is True
+    assert message.startswith(INTERRUPTED_TERMINAL_HEADLINE)
+    assert "browser operation failed" not in message.lower()
+    assert "wpid_1" in message
+    # The Accept/Discard card is still on screen, so the copy must not read as if it were gone.
+    assert "The untested draft is available for review." in message
+    # The latch is not dropped: it still drives the unverified/unapplied terminal state.
+    assert envelope.failed_operation is not None
+    assert envelope.verified is False
+    assert envelope.workflow_applied is False
+
+
+def test_failed_operation_without_a_crash_keeps_its_own_sentence() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+        proposal_present=True,
+    )
+    message, replaced = render_terminal_message(envelope, "The code run failed.", cancelled=False)
+
+    assert replaced is True
+    assert "browser operation failed" in message.lower()
+    assert INTERRUPTED_TERMINAL_HEADLINE not in message
+
+
+def test_unexpected_error_exit_renders_interrupted_and_keeps_its_terminal_reason() -> None:
+    ctx = make_copilot_ctx(
+        latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+        ),
+        # The YAML parse stamps this constant whatever the workflow's real version is, so reading
+        # it here would report version 1 on every crash.
+        last_workflow=SimpleNamespace(version=1),
+    )
+
+    result = agent_module._build_unexpected_error_exit_result(ctx, None, error=RuntimeError("boom"))
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "unexpected_error"
+    assert result.user_response.startswith(INTERRUPTED_TERMINAL_HEADLINE)
+    assert "browser operation failed" not in result.user_response.lower()
+    # Neither fact is observable at a crash site, so the copy must not state either one.
+    assert "version 1" not in result.user_response
+    assert "were not saved" not in result.user_response
+
+
+def test_connect_failure_still_outranks_a_crash_exit() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        connect_failure=BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id="pbs_1"),
+        proposal_present=True,
+        interruption=InterruptedTurnFacts(workflow_permanent_id="wpid_1"),
+    )
+    message, replaced = render_terminal_message(envelope, "The code run failed.", cancelled=False)
+
+    assert replaced is True
+    assert "cdp_connect_failed" in message
+    assert INTERRUPTED_TERMINAL_HEADLINE not in message
 
 
 @pytest.mark.parametrize("capacity_cause", ["deadline_expired", "max_turns_exceeded"])
