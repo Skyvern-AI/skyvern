@@ -2,11 +2,11 @@ import { useReactFlow } from "@xyflow/react";
 import { useEffect, useMemo } from "react";
 
 import {
-  GOOGLE_SHEETS_REQUIRED_SCOPES,
   getDefaultGoogleOAuthCredentialId,
   hasGoogleOAuthCredentialScopes,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
+import { GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES } from "@/util/googleScopes";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
 import type { AppNode } from "../nodes";
@@ -52,7 +52,7 @@ export function useResolveDefaultGoogleSheetsCredential(
       credentials.filter((credential) =>
         hasGoogleOAuthCredentialScopes(
           credential,
-          GOOGLE_SHEETS_REQUIRED_SCOPES,
+          GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
         ),
       ),
     [credentials],
