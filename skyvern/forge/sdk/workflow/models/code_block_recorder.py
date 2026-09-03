@@ -683,8 +683,6 @@ class RecordingPage:
 
     def _set_brokered_default_timeout(self, scope: Literal["page", "context"], timeout: float) -> None:
         """Apply a synchronous Playwright setter received over the secure-runner transport."""
-        if not self.__recorder.strategy_aware_typing:
-            raise RuntimeError("brokered default timeout is unavailable")
         if scope == "page":
             self.__page.set_default_timeout(timeout)
             self.__recorder.playwright_input_defaults.set_page_timeout(timeout)
@@ -696,7 +694,9 @@ class RecordingPage:
         raise ValueError(f"unsupported default-timeout scope: {scope}")
 
     def _supports_brokered_default_timeout(self) -> bool:
-        return self.__recorder.strategy_aware_typing
+        # Snapshot/restore rides on playwright_input_defaults, which every recorder always has;
+        # it is independent of the typing strategy, so the setter must not be gated on it.
+        return True
 
     def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
         return RecordingLocator(self.__page.locator(selector, **kwargs), self.__recorder, selector)
