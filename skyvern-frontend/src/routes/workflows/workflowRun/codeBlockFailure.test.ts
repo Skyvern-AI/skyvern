@@ -388,3 +388,71 @@ describe("failureSupportsScreenshot", () => {
     });
   }
 });
+
+describe("guard denials under unsupported_page_operation", () => {
+  // All four guards report the same error code, so the code alone cannot pick the remedy.
+  // The regression these guard against: telling someone who exhausted the per-run operation
+  // budget, or who navigated somewhere refused, to "use a supported page method" instead.
+  const denial = (exceptionClass: string | null): FailedBlock =>
+    block({
+      error_codes: ["unsupported_page_operation"],
+      failure_reason:
+        "Browser operation failed while running CodeBlock: denied at line 4",
+      output:
+        exceptionClass === null
+          ? { status: "failed" }
+          : { status: "failed", runner_exception_class: exceptionClass },
+    });
+
+  test("a quota breach and an egress block get different remedies", () => {
+    const quota = describeCodeBlockFailure(
+      denial("codeblock.page_operation_broker.PageOperationLimitExceeded"),
+    );
+    const egress = describeCodeBlockFailure(
+      denial("codeblock.page_operation_broker.BlockedEgressError"),
+    );
+
+    expect(quota?.title).not.toBe(egress?.title);
+    expect(quota?.guidance).not.toBe(egress?.guidance);
+    // Neither may keep telling the user the method was the problem.
+    expect(quota?.guidance).not.toMatch(/supported page method/i);
+    expect(egress?.guidance).not.toMatch(/supported page method/i);
+    expect(quota?.guidance).toMatch(/split the work|narrow/i);
+    expect(egress?.guidance).toMatch(/url|destination/i);
+  });
+
+  test("an unrecognised or absent class still falls back to the generic denial", () => {
+    for (const value of [
+      null,
+      "codeblock.page_operation_broker.SomethingNew",
+    ]) {
+      const failure = describeCodeBlockFailure(denial(value));
+      expect(failure?.code).toBe("unsupported_page_operation");
+      expect(failure?.title).toBe(
+        "The code called an unsupported browser operation",
+      );
+    }
+  });
+
+  test("a declared workflow error still outranks the guard class", () => {
+    const failure = describeCodeBlockFailure(
+      block({
+        error_codes: ["unsupported_page_operation", "no_tables_available"],
+        failure_reason: "denied",
+        output: {
+          status: "failed",
+          runner_exception_class:
+            "codeblock.page_operation_broker.BlockedEgressError",
+          errors: [
+            {
+              error_type: "USER_DEFINED_ERROR",
+              error_code: "no_tables_available",
+              reasoning: "denied",
+            },
+          ],
+        },
+      }),
+    );
+    expect(failure?.code).toBe("no_tables_available");
+  });
+});

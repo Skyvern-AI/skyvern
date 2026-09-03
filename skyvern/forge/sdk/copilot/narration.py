@@ -119,6 +119,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "edit_block": "Editing block",
     "add_block": "Adding block",
     "delete_block": "Deleting block",
+    "request_credential": "Requesting a credential",
 }
 
 # Tools whose label names the block they operate on, read from the tool's own

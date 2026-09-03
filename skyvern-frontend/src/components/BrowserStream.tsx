@@ -9,6 +9,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
+import { isForbiddenError } from "@/api/forbidden";
 import {
   Status,
   type TaskApiResponse,
@@ -169,11 +170,22 @@ function BrowserStream({
       } catch (error) {
         setHasBrowserSession(false);
         setIsBrowserSessionStarted(false);
+        // A forbidden session (expired, or owned by another org) never becomes
+        // allowed, so surface it as an error and stop the poll instead of
+        // swallowing it into the 1/s "not started yet" branch below.
+        if (isForbiddenError(error)) {
+          throw error;
+        }
         return false;
       }
     },
     enabled: entity === "browserSession" && !!browserSessionId,
-    refetchInterval: (query) => (query.state.data ? 5000 : 1000),
+    refetchInterval: (query) =>
+      query.state.status === "error" && isForbiddenError(query.state.error)
+        ? false
+        : query.state.data
+          ? 5000
+          : 1000,
   });
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic

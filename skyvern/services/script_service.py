@@ -651,6 +651,12 @@ async def _create_workflow_block_run_and_task(
         label=label,
         current_value=current_value_str,
         current_index=current_index_val,
+        # Blocks created here always execute from a cached script and never resolve an engine,
+        # so `engine IS NULL` alone cannot distinguish them from an agent block whose engine was
+        # never written. Stamping the initial (no-fallback-yet) state at creation makes
+        # `script_run` the execution-mode marker; the fallback paths overwrite it with True.
+        # Mirrors the run-level `ai_fallback_triggered=False` initialization in `execute_script`.
+        ai_fallback_triggered=False,
     )
 
     workflow_run_block_id = workflow_run_block.workflow_run_block_id
@@ -1700,7 +1706,12 @@ async def _fallback_to_ai_run(
                         organization_id=organization_id,
                     )
                     ai_actions = [a for a in all_actions if a.step_id != script_step_id]
-                    agent_action_count = len(ai_actions)
+                    # Decision rows are verdicts, not agent interactions -- exclude them so a
+                    # click-free run still reads as zero agent actions here.
+                    countable_actions = [
+                        a for a in ai_actions if a.action_type not in (ActionType.COMPLETE, ActionType.TERMINATE)
+                    ]
+                    agent_action_count = len(countable_actions)
                     action_summaries = build_action_summaries_with_timing(ai_actions)
                 except Exception:
                     LOG.debug("Could not fetch actions for fallback episode", exc_info=True)

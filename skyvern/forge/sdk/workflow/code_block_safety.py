@@ -551,7 +551,16 @@ def is_safe_code(
     *,
     error_factory: Callable[[str], Exception] = InsecureCodeDetected,
 ) -> None:
-    """Reject imports, private members, and known escape hatches."""
+    """Reject imports, private members, and known escape hatches.
+
+    Leaves bare builtin names like `globals`/`locals` unblocked here; the caller decides
+    whether and how those (and any other) builtins are bound in the dict it execs the
+    validated code against, and owns making sure nothing reachable through that dict is an
+    escape. The legacy in-process path (CodeBlock.build_safe_vars) never binds them, so a bare
+    call there raises NameError. is_safe_script_code instead blocks the bare names outright,
+    because it validates a real importlib-loaded module with the genuine `__builtins__`
+    attached and no sandbox underneath.
+    """
     tree = ast.parse(textwrap.dedent(code))
     _validate_tree(
         tree,

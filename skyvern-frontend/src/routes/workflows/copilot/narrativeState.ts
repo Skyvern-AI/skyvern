@@ -168,6 +168,8 @@ function isBuildTestConnectFailureState(
 export interface TerminalEnvelopeFacts {
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
+  // Absent on envelopes persisted before the role was carried.
+  runOutcomeRole?: RunOutcomeRole | null;
   connectFailure?: {
     state: BuildTestConnectFailureState;
     retryAction: "test_end_to_end";
@@ -257,6 +259,7 @@ export function parseTerminalEnvelope(
       browserSessionId: text("browser_session_id"),
     };
   })();
+  const role = obj.run_outcome_role;
   return {
     runVerdict:
       v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
@@ -265,6 +268,12 @@ export function parseTerminalEnvelope(
     runDisplayReason:
       typeof obj.run_display_reason === "string"
         ? obj.run_display_reason
+        : null,
+    runOutcomeRole:
+      role === "recorded" ||
+      role === "adjudicated" ||
+      role === "interim_build_test"
+        ? role
         : null,
     connectFailure,
   };
@@ -658,6 +667,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   edit_block: "Editing block",
   add_block: "Adding block",
   delete_block: "Deleting block",
+  request_credential: "Requesting a credential",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 
@@ -1888,7 +1898,11 @@ export function notConfirmedOutcome(
   // verdict; the pointer/block inference below only covers rows persisted
   // before the envelope existed (or envelopes from run-less turns).
   const envelope = turn.terminalEnvelope;
-  if (envelope !== null && envelope.runVerdict !== null) {
+  if (
+    envelope !== null &&
+    envelope.runVerdict !== null &&
+    !isInterimOutcome(envelope.runOutcomeRole ?? undefined)
+  ) {
     return envelope.runVerdict === "not_demonstrated"
       ? {
           verdict: "not_demonstrated",

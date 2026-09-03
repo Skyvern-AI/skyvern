@@ -3999,14 +3999,14 @@ class ActionHandler:
             false_click_bypass_eligible = (
                 file_download_false_click_eligible and isinstance(action, ClickAction) and action.download is False
             )
-            # The popup-grace persistence wrapper stays separately gated: it captures/persists a
-            # download the click mints on a popup, which is only worth its cost when grace > 0.
-            observe_false_click = (
-                false_click_bypass_eligible
-                and browser_state is not None
-                and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0
+            # Popup cleanup runs whenever an eligible click could mint a download on a popup, so the
+            # marker popup never lingers as the working page. Only persistence -- and its grace wait --
+            # stays gated on grace > 0, since capturing/persisting the download is what carries the cost.
+            capture_false_click_popup = false_click_bypass_eligible and browser_state is not None
+            persist_false_click_download = (
+                capture_false_click_popup and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0
             )
-            if not observe_false_click:
+            if not capture_false_click_popup:
                 false_click_eligible_token = (
                     _false_click_download_eligible.set(True) if false_click_bypass_eligible else None
                 )
@@ -4048,7 +4048,9 @@ class ActionHandler:
                         captured: tuple[Download, Page] | None = None
                         if false_click_download_event.done():
                             captured = false_click_download_event.result()
-                        elif download_callbacks:
+                        elif download_callbacks and settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS > 0:
+                            # grace>0 only: wait briefly for a late download event. At grace=0 we never
+                            # introduce a new wait -- cleanup acts only on an already-resolved capture.
                             try:
                                 captured = await asyncio.wait_for(
                                     asyncio.shield(false_click_download_event),
@@ -4060,32 +4062,37 @@ class ActionHandler:
                             return
 
                         false_click_download, download_popup = captured
-                        context = skyvern_context.current()
-                        run_id = resolve_run_download_id(context, task.workflow_run_id or task.task_id)
-                        download_dir = Path(get_download_dir(run_id=run_id))
-
-                        async def list_false_click_files(extra: Path | None = None) -> list[str]:
-                            files = list_files_in_directory(download_dir)
-                            if task.browser_session_id:
-                                files += await app.STORAGE.list_downloaded_files_in_browser_session(
-                                    organization_id=task.organization_id,
-                                    browser_session_id=task.browser_session_id,
-                                )
-                            if extra and extra.is_file():
-                                files.append(str(extra))
-                            return files
-
-                        browser_artifacts = getattr(browser_state, "browser_artifacts", None)
-                        remote_session_id = getattr(browser_artifacts, "remote_browser_session_id", None)
-                        remote_session = isinstance(remote_session_id, str) and bool(remote_session_id)
-                        eager_save = (
-                            getattr(browser_state, "release_driver_on_close", False) is True
-                            or remote_session
-                            or getattr(browser_artifacts, "needs_cdp_frame_publisher", False) is True
-                        )
-                        if eager_save:
-                            download_dir.mkdir(parents=True, exist_ok=True)
                         try:
+                            # Persistence and every side effect it needs -- run id, download dir, storage
+                            # listing, directory creation, persist, finalize -- stay grace-gated. At
+                            # grace=0 we skip all of it and only the popup cleanup/restore below runs.
+                            if not persist_false_click_download:
+                                return
+                            context = skyvern_context.current()
+                            run_id = resolve_run_download_id(context, task.workflow_run_id or task.task_id)
+                            download_dir = Path(get_download_dir(run_id=run_id))
+
+                            async def list_false_click_files(extra: Path | None = None) -> list[str]:
+                                files = list_files_in_directory(download_dir)
+                                if task.browser_session_id:
+                                    files += await app.STORAGE.list_downloaded_files_in_browser_session(
+                                        organization_id=task.organization_id,
+                                        browser_session_id=task.browser_session_id,
+                                    )
+                                if extra and extra.is_file():
+                                    files.append(str(extra))
+                                return files
+
+                            browser_artifacts = getattr(browser_state, "browser_artifacts", None)
+                            remote_session_id = getattr(browser_artifacts, "remote_browser_session_id", None)
+                            remote_session = isinstance(remote_session_id, str) and bool(remote_session_id)
+                            eager_save = (
+                                getattr(browser_state, "release_driver_on_close", False) is True
+                                or remote_session
+                                or getattr(browser_artifacts, "needs_cdp_frame_publisher", False) is True
+                            )
+                            if eager_save:
+                                download_dir.mkdir(parents=True, exist_ok=True)
                             persisted = await _persist_captured_download(
                                 false_click_download,
                                 target=_download_target_path(download_dir, false_click_download.suggested_filename)
@@ -5031,7 +5038,10 @@ class ActionHandler:
             LOG.exception("LLM error in action handler", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
         except ImaginarySecretValue as e:
-            LOG.exception("Imaginary secret value", action=action, exc_info=True)
+            # The model referenced a secret placeholder that is not in the run's secrets. Handled:
+            # it becomes an ActionFailure below and reaches the run that way. Warning rather than
+            # info because it is secret-adjacent.
+            LOG.warning("Imaginary secret value", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
         except CaptchaSolveError as e:
             LOG.warning(
@@ -6813,6 +6823,61 @@ def _attr_indicates_aria_invalid(raw: object) -> bool:
     return str(raw).strip().casefold() not in ("", "false")
 
 
+def _has_exact_class_token(class_attr: str | None, token: str) -> bool:
+    return class_attr is not None and token in str(class_attr).split()
+
+
+# Owner-scoped ui-select state read before and after Enter (`owned` reachable for a ui-select nested in another's
+# dropdown). Disabled = stock 0.19.8 forms only: `disabled` attr/class, `select2-disabled`, non-"false" `aria-disabled`.
+_UI_SELECT_STATE_JS = """
+(el) => {
+  const container = el.closest('.ui-select-container');
+  if (container === null) { return null; }
+  const owned = (n) => n.closest('.ui-select-container') === container;
+  const rows = [...container.querySelectorAll('.ui-select-choices-row')].filter((r) => owned(r) && r.getClientRects().length > 0);
+  const isDisabled = (r) => r.hasAttribute('disabled') || r.classList.contains('disabled') || r.classList.contains('select2-disabled') || (r.hasAttribute('aria-disabled') && (r.getAttribute('aria-disabled') || '').trim().toLowerCase() !== 'false');
+  const matches = [...container.querySelectorAll('.ui-select-match-text, .select2-chosen, .ui-select-match-item, .ui-select-match')].filter((m) => owned(m) && m.getClientRects().length > 0).slice(0, 20).map((m) => (m.textContent || '').trim());
+  return { enabledRowCount: rows.filter((r) => !isDisabled(r)).length, firstVisibleEnabled: rows.length > 0 && !isDisabled(rows[0]), firstVisibleLabel: rows.length > 0 ? (rows[0].textContent || '').trim() : '', choicesOpen: rows.length > 0 || [...container.querySelectorAll('.ui-select-choices')].some((c) => owned(c) && c.getClientRects().length > 0), matchTexts: matches, searchValue: typeof el.value === 'string' ? el.value : '' };
+}
+"""
+
+
+def _ui_select_commit_result(
+    action: InputTextAction,
+    pre: dict,
+    post: Any,
+    candidate: str,
+    text: str,
+) -> ActionResult | None:
+    """Adjudicate a ui-select Enter from the same-owner post-settle state: ``ActionSuccess`` (with evidence) only
+    on a proven commit (choices closed + search emptied + a match display for the candidate); ``None`` on a proven
+    clean no-op (byte-identical to pre-Enter) → fall through; else ``NoAvailableOptionFoundForCustomSelection``."""
+    if isinstance(post, dict) and not post.get("choicesOpen") and post.get("searchValue") == "":
+        normalized_candidate = _normalize_select_shadow_text(candidate)
+        for observed in post.get("matchTexts") or []:
+            if normalized_candidate and _normalize_select_shadow_text(observed) == normalized_candidate:
+                result = ActionSuccess(
+                    committed_option=_truncate_select_shadow_field(candidate),
+                    committed_value=_truncate_select_shadow_field(str(observed)),
+                )
+                action.set_has_mini_agent()
+                if action.stop_batch_after_dropdown_select:
+                    result.skip_remaining_actions = True
+                return result
+    if (
+        isinstance(post, dict)
+        and post.get("choicesOpen")
+        and post.get("searchValue") == text
+        and post.get("matchTexts") == pre.get("matchTexts")
+    ):
+        return None
+    return ActionFailure(
+        NoAvailableOptionFoundForCustomSelection(
+            reason="ui-select Enter commit could not be verified", target_value=candidate
+        )
+    )
+
+
 async def _is_combobox_or_typeahead(skyvern_element: SkyvernElement) -> bool:
     # role=combobox or aria-autocomplete list/both/inline marks a control whose options surface only as characters
     # are entered. This structural identity -- not the post-input aria-invalid state -- decides whether the
@@ -7152,6 +7217,61 @@ async def _handle_input_text_action(
                 )
             )
         ]
+
+    # ui-select (AngularJS) resets activeIndex to the first visible row per keystroke, so Enter commits rows[0].
+    # Press it only when that first visible row is the unique enabled one, then prove the commit landed before
+    # recording it (see _ui_select_commit_result). Run before the generic probe.
+    if (
+        text
+        and tag_name == InteractiveElement.INPUT
+        and not is_secret_value
+        and not is_totp_value
+        and (input_or_select_context is None or input_or_select_context.is_date_related is not True)
+        and _has_exact_class_token(await skyvern_element.get_attr("class"), "ui-select-search")
+    ):
+        await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+        try:
+            try:
+                await skyvern_element.input_clear()
+            except Exception:
+                LOG.info(
+                    "Failed to clear ui-select search before filtering; failing closed",
+                    element_id=skyvern_element.get_id(),
+                )
+                return [ActionFailure(FailedToClearInputField(element_id=action.element_id, tag_name=tag_name))]
+            pre: Any = None
+            try:
+                await skyvern_element.input_sequentially(text=text)
+                await skyvern_frame.safe_wait_for_animation_end(caller="input_text.ui_select")
+                if await get_input_value(tag_name, skyvern_element.get_locator()) == text:
+                    pre = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
+            except Exception:
+                LOG.info("Failed to filter/probe ui-select rows, falling back", element_id=skyvern_element.get_id())
+            if (
+                isinstance(pre, dict)
+                and pre.get("enabledRowCount") == 1
+                and pre.get("firstVisibleEnabled")
+                and pre.get("firstVisibleLabel")
+            ):
+                candidate = str(pre["firstVisibleLabel"])
+                await skyvern_element.press_key("Enter")
+                post: Any = None
+                try:
+                    await _wait_custom_select_render_settle(skyvern_element)
+                    post = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
+                except Exception:
+                    LOG.info("Failed to read ui-select state after Enter", element_id=skyvern_element.get_id())
+                commit_result = _ui_select_commit_result(action, pre, post, candidate, text)
+                if commit_result is not None:
+                    return [commit_result]  # None → proven clean no-op: fall through to the generic path
+        finally:
+            await incremental_scraped.stop_listen_dom_increment()
+        # Not commit-ready or a proven no-op: clear the probe so the ordinary path does not double the typed value.
+        try:
+            await skyvern_element.input_clear()
+        except Exception:
+            LOG.warning("Failed to clear ui-select probe before fallthrough", element_id=skyvern_element.get_id())
+            return [ActionFailure(FailedToClearInputField(element_id=action.element_id, tag_name=tag_name))]
 
     # check if it's selectable
     if (

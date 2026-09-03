@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
 import yaml
+from typing_extensions import TypedDict
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -750,6 +752,53 @@ async def _composition_get_html(
     return "", str(error) if error else None, False, True
 
 
+class RequestedOutputRead(TypedDict):
+    """A requested output and the exact label/value the model sees on the current page."""
+
+    output_path: str
+    value_text: str
+    label: str
+
+
+_MAX_REQUESTED_OUTPUT_READS = 8
+
+
+@dataclass(frozen=True)
+class AdmittedOutputRead:
+    output_path: str
+    value_text: str
+    label: str
+
+
+def admitted_requested_output_reads(
+    reads: Sequence[RequestedOutputRead],
+) -> tuple[tuple[AdmittedOutputRead, ...], list[dict[str, str]]]:
+    """Admit the designations this turn may act on, and say why the rest were refused.
+
+    Capture and the designation verifier read the same admission, so a turn cannot seed a target the
+    verifier would have rejected or probe one capture already addressed.
+    """
+    admitted: list[AdmittedOutputRead] = []
+    rejected: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
+        rejected.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
+    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
+        raw_path = str(read.get("output_path") or "").strip()
+        value_text = str(read.get("value_text") or "").strip()
+        label = str(read.get("label") or "").strip()
+        if not raw_path or not value_text:
+            rejected.append({"output_path": raw_path, "reason": "malformed"})
+            continue
+        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
+        if output_path in seen_paths:
+            rejected.append({"output_path": output_path, "reason": "duplicate-output-path"})
+            continue
+        seen_paths.add(output_path)
+        admitted.append(AdmittedOutputRead(output_path=output_path, value_text=value_text, label=label))
+    return tuple(admitted), rejected
+
+
 def _requested_capture_targets(copilot_ctx: object) -> tuple[str, ...]:
     """The labels this turn asked for, so capture resolves them rather than guessing which relations matter."""
     if not isinstance(copilot_ctx, AgentContext):
@@ -779,6 +828,8 @@ async def _composition_get_structured_evidence_result(
     inspected_url: str,
     current_url: str,
     timeout_seconds: float | None = None,
+    requested_targets: tuple[str, ...] | None = None,
+    witnessed_values: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Capture composition evidence and preserve why the observation failed.
 
@@ -794,7 +845,12 @@ async def _composition_get_structured_evidence_result(
             evaluate = _call_internal_browser_tool(
                 server,
                 "skyvern_evaluate",
-                {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
+                {
+                    "expression": composition_structured_evidence_expression(
+                        _requested_capture_targets(copilot_ctx) if requested_targets is None else requested_targets,
+                        witnessed_values,
+                    )
+                },
             )
             if timeout_seconds is None:
                 result, outcome = await evaluate

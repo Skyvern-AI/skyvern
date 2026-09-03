@@ -454,8 +454,9 @@ async def _screen_raw_secret_safety(
 
 
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
-# Only deterministic post-resolution code may mint these; a classifier emission would
-# skip the concrete-target and credential-reachability checks the reason stands for.
+# The server owns these in model-authored JSON. safety_screen_unavailable is minted
+# deterministically; login_credentials_unresolved names a pause frame, and a model-emitted one
+# would still stamp a credential CTA on the terminal reply.
 _DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
     {"login_credentials_unresolved", "safety_screen_unavailable"}
 )
@@ -481,11 +482,6 @@ _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "missing_conditional_condition",
     "missing_target_context",
 }
-# A failed credential lookup under explicit login intent is the same condition
-# login_credentials_unresolved names, so it may be upgraded; other planes may not.
-_LOGIN_CREDENTIAL_OVERRIDABLE_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"none", "credential_name_unresolved"}
-)
 _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
     "ambiguous_loop_edit",
     "invalid_conditional_container",
@@ -510,22 +506,7 @@ SAFETY_SCREEN_UNAVAILABLE_QUESTION = (
     "I couldn't finish safety screening on that message, so I never read it. "
     "That's a problem on my side, not something wrong with what you sent — please send it again."
 )
-_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
-_SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
-_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX = (
-    "This request needs to sign in, and no saved credential for it is available yet. "
-    "Please connect one, or reply with its exact saved credential name or a credential ID beginning with cred_."
-)
-_LOGIN_CREDENTIAL_QUESTION = f"{_LOGIN_CREDENTIAL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
-_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
-    "Which website or login page should I use to look up the stored credential?"
-)
-_STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
-_AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION = (
-    "I found multiple saved credentials, and none of them is bound to that login page. Which one should I use?"
-)
-_SIGNIN_EMAIL_QUESTION = "Which email address should I sign in with?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
@@ -932,11 +913,9 @@ class RequestPolicy:
     raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
     clarification_reason: ClarificationReason = "none"
-    # `clarification_reason` cannot say this on its own: credential_name_unresolved is also raised
-    # by raw-secret, invention and invalid-id asks the credential card cannot answer.
-    credential_ask_card_answerable: bool = False
-    # The server-held login page URLs this ask was formed against; the only origin source the
-    # connected resume may bind from.
+    # The login page URLs a tool ask was formed against. A model-supplied URL reaches this list only
+    # after it matched a site in ``user_provided_site_urls``; the connected resume falls back to the
+    # classifier-authored ``login_page_urls`` when it is empty, which carries no such grounding.
     credential_ask_login_page_urls: list[str] = field(default_factory=list)
     # Credentials this turn resolved from an explicit user reference — an exact saved name or a
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
@@ -948,7 +927,6 @@ class RequestPolicy:
     user_provided_site_urls: list[str] = field(default_factory=list)
     # Which user message (1-based) each of those URLs came from, so a release records its provenance.
     user_site_url_sources: dict[str, int] = field(default_factory=dict)
-    credential_ask_candidate_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.

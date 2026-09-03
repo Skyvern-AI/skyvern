@@ -184,6 +184,42 @@ describe("RunStopButton concurrency with a live block run", () => {
     expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
   });
 
+  test("a run payload retained after the focus clears does not hold Stop open", () => {
+    workflowRunQueryMock.mockReturnValue({
+      data: {
+        workflow_run_id: "wr_1",
+        status: Status.Running,
+        task_v2: null,
+        workflow: { deleted_at: null },
+      },
+      isError: false,
+      isPlaceholderData: true,
+    });
+
+    renderAt("/workflows/wpid_1/studio");
+    expect(screen.queryByRole("button", { name: /Stop/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
+  });
+
+  // An org switch re-keys the query, so the retained payload can carry the
+  // focused run's own id while describing the org that was just left.
+  test("a placeholder payload does not hold Stop open even when its id matches", () => {
+    workflowRunQueryMock.mockReturnValue({
+      data: {
+        workflow_run_id: "wr_1",
+        status: Status.Running,
+        task_v2: null,
+        workflow: { deleted_at: null },
+      },
+      isError: false,
+      isPlaceholderData: true,
+    });
+
+    renderAt("/workflows/wpid_1/studio?wr=wr_1");
+    expect(screen.queryByRole("button", { name: /Stop/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
+  });
+
   test("a finalized workflow run reruns with the legacy navigation state", () => {
     mockRun(Status.Completed);
     renderAt("/workflows/wpid_1/studio?wr=wr_1");

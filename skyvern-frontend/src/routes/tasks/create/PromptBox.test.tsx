@@ -9,6 +9,7 @@ import {
 import {
   act,
   createRef,
+  isValidElement,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type Ref,
@@ -18,7 +19,9 @@ import {
 } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
+import { Link } from "react-router-dom";
 
 import { PromptBox, type PromptBoxHandle } from "./PromptBox";
 
@@ -367,4 +370,71 @@ describe("PromptBox", () => {
       sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_studio"),
     ).toBe("Build this in studio");
   });
+
+  // SKY-15589: the axios message ("Request failed with status code 402") hid
+  // the server's billing guidance behind a generic toast.
+  test.each([
+    { handoff: false, status: 402 },
+    { handoff: true, status: 402 },
+    { handoff: false, status: 422 },
+    { handoff: true, status: 422 },
+  ])(
+    "surfaces the server detail on a $status (handoff=$handoff)",
+    async ({ handoff, status }) => {
+      const detail =
+        status === 402
+          ? "Credits exhausted. Upgrade your plan in Billing."
+          : "Prompt must be at least 10 characters.";
+      mockPost.mockRejectedValue({
+        isAxiosError: true,
+        message: `Request failed with status code ${status}`,
+        response: { status, data: { detail } },
+      });
+
+      renderPromptBox(handoff);
+      fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+        target: { value: "Visit the docs" },
+      });
+      fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+      await waitFor(() =>
+        expect(vi.mocked(toast)).toHaveBeenCalledWith(
+          expect.objectContaining({
+            variant: "destructive",
+            description: detail,
+          }),
+        ),
+      );
+      const args = vi.mocked(toast).mock.calls[0]![0];
+      if (status === 402) {
+        expect(args.title).toBe("Not enough credits");
+        const action = args.action;
+        if (
+          !isValidElement<{
+            altText: string;
+            asChild?: boolean;
+            children: unknown;
+          }>(action)
+        ) {
+          throw new Error("402 toast has no action element");
+        }
+        expect(action.type).toBe(ToastAction);
+        expect(action.props.altText).toBe("Go to Billing");
+        expect(action.props.asChild).toBe(true);
+        const link = action.props.children;
+        if (!isValidElement<{ to: string; children: unknown }>(link)) {
+          throw new Error("402 toast action has no link child");
+        }
+        expect(link.type).toBe(Link);
+        expect(link.props.to).toBe("/billing");
+        expect(link.props.children).toBe("Go to Billing");
+      } else {
+        expect(args.title).toBe(
+          handoff ? "Error creating agent" : "Error creating agent from prompt",
+        );
+        expect(args.action).toBeUndefined();
+      }
+      expect(mockNavigate).not.toHaveBeenCalled();
+    },
+  );
 });

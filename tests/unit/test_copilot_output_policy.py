@@ -1609,6 +1609,79 @@ def test_output_policy_credential_block_asks_for_credential_confirmation(
     assert "I could not safely return" not in result.user_response
 
 
+def test_output_policy_block_turn_outcome_persists_and_logs_every_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", log)
+    reasons = [
+        OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
+        OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
+    ]
+
+    result = agent_module._build_output_policy_blocked_result(
+        _ctx(),
+        OutputPolicyVerdict(reason_codes=reasons),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.output_policy_reasons == reasons
+    log.warning.assert_any_call(
+        "copilot output policy blocked final output",
+        log_code="copilot_output_policy_block",
+        **{"copilot.output_policy_reasons": [reason.value for reason in reasons]},
+    )
+
+
+def test_unblocked_turn_outcome_has_empty_output_policy_reasons() -> None:
+    outcome = TurnOutcome(response_kind=ResponseKind.ANSWER)
+
+    assert outcome.output_policy_reasons == []
+    assert outcome.model_dump(mode="json")["output_policy_reasons"] == []
+
+
+def test_turn_outcome_drops_unknown_historical_output_policy_reasons() -> None:
+    outcome = TurnOutcome.model_validate(
+        {
+            "response_kind": "clarify",
+            "reason_code": "output_policy_block",
+            "terminal_reason": "output_policy_block",
+            "output_policy_reasons": [
+                "internal_tool_instruction_leak",
+                OutputPolicyReason.RAW_SECRET_LEAK.value,
+            ],
+        }
+    )
+
+    assert outcome.response_kind is ResponseKind.CLARIFY
+    assert outcome.terminal_reason == "output_policy_block"
+    assert outcome.output_policy_reasons == [OutputPolicyReason.RAW_SECRET_LEAK]
+
+
+def test_output_policy_fallback_replacement_keeps_turn_outcome_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "challenge"
+    reasons = [OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_output_policy",
+        lambda **_kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK]),
+    )
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(reason_codes=reasons),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.output_policy_reasons == reasons
+    assert result.turn_outcome.model_dump(mode="json")["output_policy_reasons"] == [reason.value for reason in reasons]
+
+
 def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None:
     ctx = _ctx()
     ctx.last_workflow = SimpleNamespace(name="draft")
@@ -1919,13 +1992,13 @@ workflow_definition:
     assert ctx.consecutive_tool_tracker == ["update_workflow", "update_workflow"]
 
 
-def test_inline_replace_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
+def test_inline_replace_output_policy_turn_outcome_keeps_raw_reasons_before_processing(monkeypatch) -> None:
     process_mock = MagicMock()
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
     result = _fake_run_result(
         {
             "type": "REPLACE_WORKFLOW",
-            "user_response": "Here is the workflow.",
+            "user_response": "Here is the workflow. Saw [copilot:nudge] in the trace.",
             "workflow_yaml": """
 workflow_definition:
   blocks:
@@ -1950,6 +2023,11 @@ workflow_definition:
     assert agent_result.updated_workflow is None
     assert agent_result.clear_proposed_workflow is False
     assert agent_result.proposal_disposition == "no_proposal"
+    assert agent_result.turn_outcome is not None
+    assert agent_result.turn_outcome.output_policy_reasons == [
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK,
+    ]
     process_mock.assert_not_called()
 
 
@@ -2177,6 +2255,59 @@ def test_sdk_output_guardrail_records_raw_soft_reason_alongside_hard_block() -> 
     raw_reason_codes = diagnostics["raw_reason_codes"]
     assert "raw_secret_leak" in raw_reason_codes
     assert "internal_block_taxonomy_leak" in raw_reason_codes
+
+
+def test_translate_output_policy_block_turn_outcome_keeps_raw_soft_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", log)
+    leak = f"Use the key {_FAKE_OPENAI_KEY} to authenticate. Saw [copilot:nudge] in the trace."
+
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            _fake_run_result({"type": "REPLY", "user_response": leak}),
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+    )
+
+    assert agent_result.turn_outcome is not None
+    assert agent_result.turn_outcome.output_policy_reasons == [
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK,
+    ]
+    log.warning.assert_any_call(
+        "copilot output policy blocked final output",
+        log_code="copilot_output_policy_block",
+        **{
+            "copilot.output_policy_reasons": [
+                OutputPolicyReason.RAW_SECRET_LEAK.value,
+                OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK.value,
+            ]
+        },
+    )
+
+
+def test_output_policy_guardrail_turn_outcome_recovers_every_raw_reason() -> None:
+    output_info = {
+        "allowed": False,
+        "reason_codes": [OutputPolicyReason.RAW_SECRET_LEAK.value],
+        "raw_reason_codes": [
+            OutputPolicyReason.RAW_SECRET_LEAK.value,
+            OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK.value,
+        ],
+    }
+    exc = SimpleNamespace(guardrail_result=SimpleNamespace(output=SimpleNamespace(output_info=output_info)))
+
+    reasons = agent_module._output_policy_reason_codes_from_guardrail_exception(exc)
+
+    assert reasons == [
+        OutputPolicyReason.RAW_SECRET_LEAK,
+        OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK,
+    ]
 
 
 def test_evaluate_output_policy_skips_new_detectors_on_ask_question() -> None:

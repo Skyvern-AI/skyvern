@@ -88,6 +88,22 @@ def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
     assert blocks[0]["status"] == "completed"
 
 
+def test_sanitize_get_run_results_bounds_recorded_block_output_without_packet() -> None:
+    recorded_output = {"service_name": "a" * 2200}
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_123",
+            "blocks": [{"label": "collect_service", "output": recorded_output}],
+        },
+    }
+
+    sanitized = sanitize_tool_result_for_llm("get_run_results", result)
+
+    assert sanitized["data"]["blocks"][0]["output"].endswith("\n... [truncated]")
+    assert result["data"]["blocks"][0]["output"] is recorded_output
+
+
 def test_sanitize_does_not_mutate_original_blocks() -> None:
     original_screenshot = "iVBORw0KGgo" + "B" * 500
     result = {
@@ -169,7 +185,7 @@ def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_proven
         },
         "action_observations": ["observed " + "x" * 500 for _ in range(8)],
         "registered_outputs": [
-            {"output_parameter_key": f"output_{index}", "value": "v" * 1_300} for index in range(13)
+            {"label": f"output_{index}", "status": "completed", "output": "v" * 1_300} for index in range(13)
         ],
         "downloads": [{"artifact_id": f"artifact_{index}"} for index in range(13)],
         "screenshot": {"present": True, "provenance": "data.screenshot_base64"},
@@ -210,10 +226,9 @@ def test_provider_bound_build_test_packet_omits_raw_registered_output_copies(pro
         "run": {"workflow_run_id": "wr_secret", "status": "completed"},
         "registered_outputs": [
             {
-                "workflow_run_id": "wr_secret",
-                "output_parameter_key": "result",
-                "block_label": "read_result",
-                "value": "[REDACTED_SECRET]",
+                "label": "read_result",
+                "status": "completed",
+                "output": "[REDACTED_SECRET]",
             }
         ],
         "screenshot": {"present": False},
@@ -243,6 +258,7 @@ def test_provider_bound_build_test_packet_omits_raw_registered_output_copies(pro
                 {
                     "label": "read_result",
                     "status": "completed",
+                    "output": secret,
                     "extracted_data": {"result": secret, "ordinary_fact": "safe"},
                 }
             ],
@@ -259,8 +275,8 @@ def test_provider_bound_build_test_packet_omits_raw_registered_output_copies(pro
     assert secret not in serialized
     assert "registered_output_parameter_values" not in provider_payload["data"]
     assert "workflow_run_output_parameters" not in provider_payload["data"]
-    assert provider_payload["data"]["blocks"][0]["extracted_data"] == "Extracted object with keys: ordinary_fact"
-    assert provider_payload["data"]["build_test_packet"]["registered_outputs"][0]["value"] == "[REDACTED_SECRET]"
+    assert provider_payload["data"]["blocks"][0] == {"label": "read_result", "status": "completed"}
+    assert provider_payload["data"]["build_test_packet"]["registered_outputs"][0]["output"] == "[REDACTED_SECRET]"
 
 
 @pytest.mark.parametrize("provider_surface", ["native", "mcp"])
@@ -280,10 +296,9 @@ def test_provider_bound_build_test_result_omits_raw_action_trace_copies(
                 "action_observations": ["clicked submit"],
                 "registered_outputs": [
                     {
-                        "workflow_run_id": "wr_action_trace",
-                        "output_parameter_key": "result",
-                        "block_label": "submit",
-                        "value": "[REDACTED_SECRET]",
+                        "label": "submit",
+                        "status": "completed",
+                        "output": "[REDACTED_SECRET]",
                     }
                 ],
                 "screenshot": {"present": False},
@@ -317,7 +332,7 @@ def test_provider_bound_build_test_result_omits_raw_action_trace_copies(
     assert provider_payload["data"]["blocks"] == [{"label": "submit", "status": "completed"}]
     if packet_valid:
         assert provider_payload["data"]["build_test_packet"]["action_observations"] == ["clicked submit"]
-        assert provider_payload["data"]["build_test_packet"]["registered_outputs"][0]["value"] == "[REDACTED_SECRET]"
+        assert provider_payload["data"]["build_test_packet"]["registered_outputs"][0]["output"] == "[REDACTED_SECRET]"
     else:
         assert "build_test_packet" not in provider_payload["data"]
         assert provider_payload["data"]["build_test_packet_omitted"] == "The internal packet failed typed validation."
@@ -364,12 +379,9 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
         "action_observations": [long_summary for _ in range(8)],
         "registered_outputs": [
             {
-                "workflow_run_id": long_identifier,
-                "output_parameter_id": long_identifier,
-                "output_parameter_key": long_identifier,
-                "block_label": long_identifier,
-                "block_type": long_identifier,
-                "value": "v" * 1_300,
+                "label": long_identifier,
+                "status": long_identifier,
+                "output": "v" * 1_300,
             }
             for _ in range(13)
         ],
@@ -1836,3 +1848,44 @@ class TestMcpResultProvenance:
 
         assert marked[MCP_RESULT_PROVENANCE_KEY] == MCP_RESULT_PROVENANCE_VALUE
         assert marked["data"] == "STORMBREAKER"
+
+
+class TestStagedWriteSummaryFrame:
+    """The summary line rides alongside the tool result in the SSE frame and in agent state, so a
+    staged write must not be framed there as a completed save."""
+
+    STAGED = {
+        "persistence": "staged",
+        "persistence_message": "Staged as a proposal for review.",
+        "block_count": 5,
+    }
+
+    def test_no_frame_claims_an_update_while_the_result_says_staged(self) -> None:
+        update = {"ok": True, "data": dict(self.STAGED)}
+        skipped = {"ok": True, "data": {**self.STAGED, "skipped_run": True}}
+        ran = {
+            "ok": True,
+            "data": {k: v for k, v in self.STAGED.items() if k != "block_count"} | {"overall_status": "completed"},
+        }
+
+        frames = [
+            format_tool_result_for_user("update_workflow", update),
+            summarize_tool_result("update_workflow", update),
+            summarize_tool_result("update_and_run_blocks", skipped),
+            summarize_tool_result("update_and_run_blocks", ran),
+        ]
+
+        for frame in frames:
+            assert "workflow updated" not in frame.casefold()
+            assert "updated the workflow" not in frame.casefold()
+            assert "staged" in frame.casefold()
+
+    def test_auto_apply_is_framed_as_staged_because_nothing_is_written_at_tool_time(self) -> None:
+        result = {"ok": True, "data": {**self.STAGED, "persistence": "staged_auto_apply"}}
+
+        assert "workflow updated" not in summarize_tool_result("update_workflow", result).casefold()
+
+    def test_a_result_without_the_disposition_keeps_the_prior_wording(self) -> None:
+        assert summarize_tool_result("update_workflow", {"ok": True, "data": {"block_count": 5}}) == (
+            "Workflow updated (5 blocks)"
+        )

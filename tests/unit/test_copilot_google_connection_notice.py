@@ -124,6 +124,12 @@ def test_nested_and_duplicate_bindings_are_flattened_and_deduplicated() -> None:
     assert google_sheet_connection_ids(_workflow(loop)) == ("goac_nested",)
 
 
+def test_unresolved_connection_name_left_in_the_slot_is_not_a_connection_binding() -> None:
+    workflow = _workflow(_write("named", "Shared Sheets Account"), _write("bound", "goac_active"))
+
+    assert google_sheet_connection_bindings(workflow) == (("bound", "goac_active"),)
+
+
 def test_new_block_using_a_preexisting_connection_is_still_a_new_binding() -> None:
     notices = collect_google_connection_notices(
         turn_start_bindings=(("existing", "goac_error"),),

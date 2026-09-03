@@ -212,3 +212,34 @@ async def test_type_repair_preserves_structured_missing_key_rejection() -> None:
     assert error["code"] == "INVALID_INPUT"
     assert error["details"]["unsupported_arguments"] == []
     assert error["details"]["missing_required_arguments"] == ["workflow_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_field"),
+    [
+        # SKY-15319: page below the tool's documented 1-based minimum.
+        ({"workflow_id": "wpid_test", "page": 0}, "page"),
+        # SKY-14997: a single status value sent as a bare string instead of a list. Not
+        # comma-separated, so the narrow CSV repair correctly leaves it for validation.
+        ({"workflow_id": "wpid_test", "status": "completed"}, "status"),
+    ],
+)
+async def test_out_of_schema_value_gets_structured_error_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict,
+    expected_field: str,
+) -> None:
+    list_runs = AsyncMock(return_value=[])
+    monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
+
+    # Regression proof: before the fix, FastMCP's own pydantic validation raised
+    # fastmcp.exceptions.ValidationError out of call_next, uncaught by this middleware.
+    payload = await _call("skyvern_workflow_run_list", arguments)
+
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert error["code"] == "INVALID_INPUT"
+    assert expected_field in error["message"]
+    assert "skyvern_workflow_run_list" in error["hint"]
+    list_runs.assert_not_awaited()

@@ -16,7 +16,11 @@ from skyvern.forge.sdk.copilot.challenge_evidence import ChallengeKind, challeng
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    value_witness_read_expression,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    _MAX_KEY_VALUE_RELATIONS,
     CONSENT_OBSTRUCTION_KIND,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
@@ -27,11 +31,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     page_records_share_location,
     parse_composition_html,
     stamp_page_evidence_provenance,
+    unresolved_requested_targets,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _requested_output_labels_by_path
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.output_extraction_plan import _exact_path, _value_witness_bindings
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
@@ -63,6 +69,7 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from ._shared import (
     _CURRENT_PAGE_INSPECTION_TARGETS,
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    AdmittedOutputRead,
     _append_flow_evidence,
     _call_internal_browser_tool,
     _composition_evidence_page_url,
@@ -77,7 +84,7 @@ from ._shared import (
 from .blockers import _allows_post_run_current_page_inspection_budget_bypass
 from .discovery import _resolve_discovery_entry_url
 from .guardrails import _authority_tool_error
-from .mcp_hooks import _bind_login_credential_for_observed_url
+from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_read
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
@@ -177,7 +184,7 @@ def _composition_extract_screenshot_b64(result: dict[str, Any]) -> str:
     return ""
 
 
-def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
+def _composition_visual_prompt(evidence: dict[str, Any], requested_targets: tuple[str, ...] = ()) -> str:
     # The DOM challenge_state / anti-bot token hits are deliberately NOT fed in:
     # the vision pass classifies obstruction-vs-challenge from the screenshot
     # alone instead of confirming the detector's anchor.
@@ -189,13 +196,23 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "page_obstruction_count": len(evidence.get("page_obstructions") or []),
         "visual_obstruction_candidate_count": len(evidence.get("visual_obstruction_candidates") or []),
         "schema_empty_page": evidence.get("schema_empty_page") is True,
+        "requested_labels": list(requested_targets),
     }
+    requested_values_key = "requested_values, " if requested_targets else ""
+    requested_values_rule = (
+        "requested_values is a list of {label, value} objects, at most one per entry in the DOM "
+        "context's requested_labels, carrying that label's value exactly as rendered on screen; omit "
+        "a label whose value is not legibly visible. "
+        if requested_targets
+        else ""
+    )
     return (
         "Summarize this screenshot for Workflow Copilot build-time page evidence. "
-        "Return JSON only with keys: summary, challenge_detected, challenge_kind, "
+        f"Return JSON only with keys: summary, {requested_values_key}challenge_detected, challenge_kind, "
         "challenge_location, submit_blocked, blocked_submit_controls, empty_page_visible, "
         "loading_state_visible, page_obstruction_detected, obstruction_kind, "
         "obstruction_location, underlying_page_blocked, visible_dismiss_controls, omissions. "
+        f"{requested_values_rule}"
         "In summary, include the visible page state that would help verify an end-state outcome, "
         "such as cart items, "
         "record rows, visible identifiers, quantities, statuses, prices, confirmations, search results, "
@@ -234,6 +251,21 @@ async def _composition_visual_handler(ctx: CopilotContext) -> Any | None:
     )
 
 
+def _normalize_requested_values(value: Any) -> list[dict[str, str]]:
+    """Keep only label/value string pairs, in the order the vision pass returned them."""
+    if not isinstance(value, list):
+        return []
+    pairs = [(item.get("label"), item.get("value")) for item in value if isinstance(item, dict)]
+    kept: list[dict[str, str]] = []
+    for label, observed in pairs:
+        if not isinstance(label, str) or not isinstance(observed, str) or not label.strip() or not observed.strip():
+            continue
+        kept.append({"label": label.strip()[:240], "value": observed.strip()[:240]})
+        if len(kept) >= _MAX_KEY_VALUE_RELATIONS:
+            break
+    return kept
+
+
 def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -253,6 +285,7 @@ def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
     omissions = value.get("omissions")
     return {
         "summary": summary if isinstance(summary, str) else "",
+        "requested_values": _normalize_requested_values(value.get("requested_values")),
         "challenge_detected": challenge_detected if isinstance(challenge_detected, bool) else None,
         "challenge_kind": challenge_kind if isinstance(challenge_kind, str) else "",
         "challenge_location": challenge_location if isinstance(challenge_location, str) else "",
@@ -278,6 +311,7 @@ async def _composition_summarize_screenshot(
     *,
     evidence: dict[str, Any],
     screenshot_b64: str,
+    requested_targets: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
     handler = await _composition_visual_handler(ctx)
     if handler is None:
@@ -289,7 +323,7 @@ async def _composition_summarize_screenshot(
     try:
         response = await asyncio.wait_for(
             handler(
-                prompt=_composition_visual_prompt(evidence),
+                prompt=_composition_visual_prompt(evidence, requested_targets),
                 prompt_name=_COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME,
                 screenshots=[screenshot_bytes],
                 organization_id=getattr(ctx, "organization_id", None),
@@ -308,22 +342,26 @@ async def _composition_summarize_screenshot(
     return normalized, None
 
 
-async def _augment_composition_evidence_with_visual_fallback(
+@dataclass(frozen=True)
+class VisualSummaryCapture:
+    summary: dict[str, Any] | None = None
+    error: str | None = None
+    frame: CapturedFrame | None = None
+    screenshot_failure: str | None = None
+
+
+async def _composition_capture_visual_summary(
     ctx: CopilotContext,
     evidence: dict[str, Any],
-) -> tuple[dict[str, Any], CapturedFrame | None]:
+    requested_targets: tuple[str, ...] = (),
+) -> VisualSummaryCapture:
     capture_started_at = time.monotonic()
     capture_url = evidence.get("current_url") or evidence.get("inspected_url")
     capture_session_id = getattr(ctx, "browser_session_id", None)
     screenshot_result = await _composition_get_screenshot(ctx, dispatch_session_id=capture_session_id)
     if not screenshot_result.get("ok"):
-        return (
-            _composition_add_visual_capture_omission(
-                evidence,
-                "screenshot_capture_failed",
-                f"screenshot_capture_failed: {screenshot_result.get('error', 'unknown')}",
-            ),
-            None,
+        return VisualSummaryCapture(
+            screenshot_failure=f"screenshot_capture_failed: {screenshot_result.get('error', 'unknown')}"
         )
     screenshot_b64 = _composition_extract_screenshot_b64(screenshot_result)
     producer_url, producer_session_id, session_binding = screenshot_result_facts(
@@ -349,9 +387,28 @@ async def _augment_composition_evidence_with_visual_fallback(
         ctx,
         evidence=evidence,
         screenshot_b64=screenshot_b64,
+        requested_targets=requested_targets,
     )
-    merged = merge_visual_composition_evidence(evidence, visual_summary=visual_summary, visual_error=visual_error)
-    return merged, captured_frame
+    return VisualSummaryCapture(summary=visual_summary, error=visual_error, frame=captured_frame)
+
+
+def _merge_visual_summary_capture(
+    evidence: dict[str, Any],
+    captured: VisualSummaryCapture,
+) -> dict[str, Any]:
+    if captured.screenshot_failure is not None:
+        return _composition_add_visual_capture_omission(
+            evidence, "screenshot_capture_failed", captured.screenshot_failure
+        )
+    return merge_visual_composition_evidence(evidence, visual_summary=captured.summary, visual_error=captured.error)
+
+
+async def _augment_composition_evidence_with_visual_fallback(
+    ctx: CopilotContext,
+    evidence: dict[str, Any],
+) -> tuple[dict[str, Any], CapturedFrame | None]:
+    captured = await _composition_capture_visual_summary(ctx, evidence)
+    return _merge_visual_summary_capture(evidence, captured), captured.frame
 
 
 def _composition_add_evidence_omission(evidence: dict[str, Any], message: str) -> dict[str, Any]:
@@ -393,11 +450,16 @@ async def _composition_evidence_after_navigation_failure(
     *,
     inspected_url: str,
     navigation_error: str,
+    requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> tuple[dict[str, Any], CapturedFrame | None] | None:
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
+    requested_targets = _seeded_capture_targets(ctx, requested_reads)
     structured, structured_error = await _composition_get_structured_evidence_result(
-        ctx, inspected_url=inspected_url, current_url=current_url
+        ctx,
+        inspected_url=inspected_url,
+        current_url=current_url,
+        requested_targets=requested_targets,
     )
     if structured is not None and has_bounded_page_schema(structured):
         evidence = _composition_add_inspection_warning(
@@ -431,7 +493,7 @@ async def _composition_evidence_after_navigation_failure(
             html,
             inspected_url=inspected_url,
             current_url=current_url,
-            requested_targets=_requested_capture_targets(ctx),
+            requested_targets=requested_targets,
         )
         evidence = _composition_add_inspection_warning(
             evidence,
@@ -615,6 +677,200 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
     return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
+@dataclass(frozen=True)
+class ValueWitness:
+    label: str
+    value: str
+    output_path: str
+
+
+def _seeded_capture_targets(copilot_ctx: object, requested_reads: tuple[AdmittedOutputRead, ...]) -> tuple[str, ...]:
+    """The labels this turn asked capture to resolve, from declared criteria and this call's designations.
+
+    Only a label can resolve: a target is answered by a relation whose key_text equals it, and no pass
+    mints a relation keyed by a bare magnitude.
+    """
+    targets = list(_requested_capture_targets(copilot_ctx))
+    for read in requested_reads:
+        if read.label and read.label not in targets:
+            targets.append(read.label)
+    return tuple(targets)
+
+
+def _seeded_label_owners(copilot_ctx: object, requested_reads: tuple[AdmittedOutputRead, ...]) -> dict[str, str]:
+    """Each requested label exactly one output path claims, keyed to that path."""
+    paths_by_label: dict[str, set[str]] = {}
+    for read in requested_reads:
+        if read.label:
+            paths_by_label.setdefault(read.label, set()).add(read.output_path)
+    owned = {label: next(iter(paths)) for label, paths in paths_by_label.items() if len(paths) == 1}
+    owned.update(_singly_owned_requested_labels(copilot_ctx))
+    return owned
+
+
+def _singly_owned_requested_labels(copilot_ctx: object) -> dict[str, str]:
+    """Requested labels exactly one output path owns, keyed to that path."""
+    if not isinstance(copilot_ctx, AgentContext):
+        return {}
+    labels_by_path = _requested_output_labels_by_path(copilot_ctx)
+    owned: dict[str, str] = {}
+    for labels in labels_by_path.values():
+        for label in labels:
+            path = _exact_path(label, labels_by_path)
+            if path is not None and label.strip():
+                owned[label.strip()] = path
+    return owned
+
+
+def _witnesses_from_visual_summary(
+    visual_summary: dict[str, Any],
+    owned_labels: dict[str, str],
+    unresolved: tuple[str, ...],
+) -> tuple[list[ValueWitness], int]:
+    """Pair each unresolved label with the value the screenshot read for it, keeping only the unambiguous.
+
+    Aliases of one output reading one value address the same tile once, while a value two outputs
+    claim, or an output whose aliases read different values, names no single element.
+    """
+    # The pass echoes the label as the tile renders it, while the request mints it case-folded.
+    wanted = {target.strip().casefold() for target in unresolved}
+    owners_by_folded_label = {label.strip().casefold(): path for label, path in owned_labels.items()}
+    seen: set[tuple[str, str]] = set()
+    by_value: dict[str, list[ValueWitness]] = {}
+    dropped = 0
+    for pair in visual_summary.get("requested_values") or []:
+        label = str(pair.get("label") or "").strip()
+        value = str(pair.get("value") or "").strip()
+        if not label or not value:
+            continue
+        folded_label = label.casefold()
+        if folded_label not in wanted or folded_label not in owners_by_folded_label:
+            dropped += 1
+            continue
+        if (folded_label, value) in seen:
+            continue
+        seen.add((folded_label, value))
+        by_value.setdefault(value, []).append(ValueWitness(label, value, owners_by_folded_label[folded_label]))
+    witnesses: list[ValueWitness] = []
+    for owners in by_value.values():
+        if len({owner.output_path for owner in owners}) == 1:
+            witnesses.append(owners[0])
+            dropped += len(owners) - 1
+        else:
+            dropped += len(owners)
+    values_by_path: dict[str, set[str]] = {}
+    for witness in witnesses:
+        values_by_path.setdefault(witness.output_path, set()).add(witness.value)
+    kept = [witness for witness in witnesses if len(values_by_path[witness.output_path]) == 1]
+    return kept, dropped + len(witnesses) - len(kept)
+
+
+async def _evaluate_witness_read(copilot_ctx: object, expression: str) -> str | None:
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_evaluate", {"expression": expression}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    return value if isinstance(value, str) else None
+
+
+async def _value_witness_records(
+    copilot_ctx: object,
+    evidence: dict[str, Any],
+    witnesses: list[ValueWitness],
+) -> list[dict[str, str]]:
+    """The page read that returns each witnessed value, kept only when running it returns that value.
+
+    The recorded expression is emitted verbatim into generated workflow code, so an unexecuted read
+    is a claim about the page rather than an observation of it.
+    """
+    labels_by_path = {witness.output_path: witness.label for witness in witnesses}
+    values_by_path = {witness.output_path: witness.value for witness in witnesses}
+    bindings = _value_witness_bindings(
+        evidence,
+        values_by_path,
+        channel_intact=evidence.get("key_value_relations_truncated") is not True,
+    )
+    records: list[dict[str, str]] = []
+    for binding in bindings:
+        expression = value_witness_read_expression(
+            binding.selector,
+            binding.selector_count,
+            binding.selector_index,
+            binding.child_index,
+        )
+        value = values_by_path[binding.output_path]
+        if await _evaluate_witness_read(copilot_ctx, expression) != value:
+            continue
+        records.append(
+            {
+                "label": labels_by_path[binding.output_path],
+                "value": value,
+                "output_path": binding.output_path,
+                "expression": expression,
+            }
+        )
+    return records
+
+
+async def _witness_unresolved_requested_targets(
+    copilot_ctx: object,
+    evidence: dict[str, Any],
+    *,
+    captured: VisualSummaryCapture,
+    unresolved: tuple[str, ...],
+    owned_labels: dict[str, str],
+    requested_targets: tuple[str, ...],
+    inspected_url: str,
+    current_url: str,
+) -> dict[str, Any]:
+    """Re-read the page for the values this call's screenshot just read off the unresolved tiles.
+
+    The model cannot run this itself, because a live figure ticks between calls and only the capture
+    that took the frame can key a DOM pass on what the frame showed.
+    """
+    summary = captured.summary or {}
+    witnesses, dropped = _witnesses_from_visual_summary(summary, owned_labels, unresolved)
+    LOG.info(
+        "copilot_composition_requested_values_seen",
+        unresolved_target_count=len(unresolved),
+        pair_count=len(summary.get("requested_values") or []),
+        witness_count=len(witnesses),
+        dropped_count=dropped,
+    )
+    if not witnesses:
+        return evidence
+    witnessed_evidence, witness_error = await _composition_get_structured_evidence_result(
+        copilot_ctx,
+        inspected_url=inspected_url,
+        current_url=current_url,
+        requested_targets=requested_targets,
+        witnessed_values=tuple(witness.value for witness in witnesses),
+    )
+    if witnessed_evidence is None:
+        LOG.info("copilot_composition_value_witness_extract_failed", error_present=bool(witness_error))
+        return evidence
+    merged = _merge_visual_summary_capture(witnessed_evidence, captured)
+    records = await _value_witness_records(copilot_ctx, merged, witnesses)
+    if not records:
+        LOG.info("copilot_composition_value_witness_records_dropped", witness_count=len(witnesses))
+        return evidence
+    # The replacement has to clear the same gate the retry loop cleared for the packet it displaces.
+    if not _composition_capture_settled(merged):
+        LOG.info("copilot_composition_value_witness_replacement_unsettled", witness_count=len(witnesses))
+        return evidence
+    merged["value_witnesses"] = records
+    return merged
+
+
 def _composition_capture_settled(evidence: dict[str, Any]) -> bool:
     return (
         has_bounded_page_schema(evidence) or has_satisfiable_collapsed_disclosure_path(evidence)
@@ -626,19 +882,25 @@ async def _capture_composition_evidence(
     *,
     inspected_url: str,
     current_url: str,
+    requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> CompositionEvidenceCapture:
     """Capture page evidence, using HTML only to enrich a valid but unsettled structured packet."""
     capture_session_id = copilot_ctx.browser_session_id if isinstance(copilot_ctx, AgentContext) else None
     capture_session_generation = (
         copilot_ctx.browser_session_continuity_generation if isinstance(copilot_ctx, AgentContext) else None
     )
+    requested_targets = _seeded_capture_targets(copilot_ctx, requested_reads)
+    owned_labels = _seeded_label_owners(copilot_ctx, requested_reads)
     evidence: dict[str, Any] | None = None
     html_truncated = False
     used_structured = False
     skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
         structured, structured_error = await _composition_get_structured_evidence_result(
-            copilot_ctx, inspected_url=inspected_url, current_url=current_url
+            copilot_ctx,
+            inspected_url=inspected_url,
+            current_url=current_url,
+            requested_targets=requested_targets,
         )
         if structured_error is not None:
             if evidence is not None:
@@ -675,7 +937,7 @@ async def _capture_composition_evidence(
             html,
             inspected_url=inspected_url,
             current_url=current_url,
-            requested_targets=_requested_capture_targets(copilot_ctx),
+            requested_targets=requested_targets,
         )
         used_structured = False
         if _composition_capture_settled(evidence):
@@ -688,11 +950,28 @@ async def _capture_composition_evidence(
     if evidence is not None and not used_structured:
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     frame: CapturedFrame | None = None
+    unresolved = unresolved_requested_targets(evidence, requested_targets) if evidence is not None else ()
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
+        or (used_structured and unresolved)
     ):
-        evidence, frame = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+        captured = await _composition_capture_visual_summary(copilot_ctx, evidence, unresolved)
+        merged = _merge_visual_summary_capture(evidence, captured)
+        frame = captured.frame
+        if used_structured and unresolved and captured.summary is not None:
+            evidence = await _witness_unresolved_requested_targets(
+                copilot_ctx,
+                merged,
+                captured=captured,
+                unresolved=unresolved,
+                owned_labels=owned_labels,
+                requested_targets=requested_targets,
+                inspected_url=inspected_url,
+                current_url=current_url,
+            )
+        else:
+            evidence = merged
     if (
         isinstance(copilot_ctx, AgentContext)
         and evidence is not None
@@ -843,18 +1122,84 @@ def _same_inspect_target(live_url: str | None, target_url: str | None) -> bool:
 async def _inspect_page_for_composition_impl(
     copilot_ctx: Any,
     target_url: str,
+    requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> dict[str, Any]:
     # Named navigation is the only route that may release sensitive-page custody. Keep navigation,
     # release, capture, and evidence admission atomic with sensitive-run registration so this call
     # cannot clear a newer run's taint after its navigation returns.
     async with browser_page_custody_lock(copilot_ctx):
         async with browser_evidence_commit_lock(copilot_ctx):
-            return await _inspect_page_for_composition_under_custody(copilot_ctx, target_url)
+            return await _inspect_page_for_composition_under_custody(copilot_ctx, target_url, requested_reads)
+
+
+def _record_value_witnesses(
+    copilot_ctx: object,
+    evidence: dict[str, Any],
+    *,
+    url: str,
+    capture_session_id: str | None,
+    run_page_source_session_id: str | None,
+) -> None:
+    """Keep the witnessed pairs this capture could record as scouted reads, and drop the rest.
+
+    A witness left in the packet cancels the designation probe for its path, so a pair read through
+    the run's browser, or one whose session moved mid-capture, must not survive here.
+    """
+    records = evidence.get("value_witnesses")
+    if not isinstance(records, list) or not records:
+        _drop_uncorroborated_screenshot_values(evidence)
+        return
+    provenance = evidence.get("browser_session_provenance")
+    kept: list[dict[str, Any]] = []
+    same_session = (
+        isinstance(copilot_ctx, AgentContext)
+        and run_page_source_session_id is None
+        and copilot_ctx.browser_session_id == capture_session_id
+        and not (isinstance(provenance, dict) and provenance.get("mixed") is True)
+    )
+    if same_session and isinstance(copilot_ctx, AgentContext):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            output_path = str(record.get("output_path") or "")
+            recorded = _record_scouted_read(
+                copilot_ctx,
+                expression=str(record.get("expression") or ""),
+                data={"result": record.get("value")},
+                url=url,
+                declared_output_path=output_path or None,
+            )
+            # `_record_scouted_read` may bind the fact elsewhere; a witness only cancels the
+            # designation probe for the path the read actually answered.
+            bound_output_path = str(recorded.get("read_output_path") or "") if recorded is not None else ""
+            LOG.info(
+                "copilot_composition_value_witness_recorded",
+                recorded=recorded is not None,
+                declared_output_path_present=bool(output_path),
+                bound_to_declared_path=bool(output_path) and bound_output_path == output_path,
+            )
+            if recorded is not None and output_path and bound_output_path == output_path:
+                kept.append({key: value for key, value in record.items() if key != "expression"})
+    if kept:
+        evidence["value_witnesses"] = kept
+    else:
+        _drop_uncorroborated_screenshot_values(evidence)
+
+
+def _drop_uncorroborated_screenshot_values(evidence: dict[str, Any]) -> None:
+    """Take the screenshot's label/value pairs back out once no witness survived the page lookup.
+
+    The pairs are what the frame appeared to say. Leaving them in the packet offers the model a
+    magnitude nothing on the page corroborated, which it can copy into a step instead of reading.
+    """
+    evidence.pop("value_witnesses", None)
+    evidence.pop("requested_values", None)
 
 
 async def _inspect_page_for_composition_under_custody(
     copilot_ctx: Any,
     target_url: str,
+    requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> dict[str, Any]:
     """Inspect a known target page and store form/search evidence on ctx.
 
@@ -953,7 +1298,10 @@ async def _inspect_page_for_composition_under_custody(
                 )
             else:
                 capture = await _capture_composition_evidence(
-                    copilot_ctx, inspected_url=entry_url, current_url=current_url
+                    copilot_ctx,
+                    inspected_url=entry_url,
+                    current_url=current_url,
+                    requested_reads=requested_reads,
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
         else:
@@ -979,6 +1327,7 @@ async def _inspect_page_for_composition_under_custody(
                     copilot_ctx,
                     inspected_url=entry_url,
                     navigation_error=nav_error,
+                    requested_reads=requested_reads,
                 )
                 if failure_capture is None:
                     result = {
@@ -994,7 +1343,10 @@ async def _inspect_page_for_composition_under_custody(
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
                 clear_sensitive_origin_page_taint(copilot_ctx)
                 capture = await _capture_composition_evidence(
-                    copilot_ctx, inspected_url=entry_url, current_url=current_url
+                    copilot_ctx,
+                    inspected_url=entry_url,
+                    current_url=current_url,
+                    requested_reads=requested_reads,
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
 
@@ -1094,6 +1446,13 @@ async def _inspect_page_for_composition_under_custody(
     observation_step = _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)
     if observation_step is None:
         LOG.warning("copilot_flow_evidence_append_failed_no_trajectory")
+    _record_value_witnesses(
+        copilot_ctx,
+        evidence,
+        url=str(evidence.get("current_url") or current_url or ""),
+        capture_session_id=capture_session_id,
+        run_page_source_session_id=run_page_source_session_id,
+    )
     # Surface the reached page at the top level so the model registers that the
     # inspection already navigated there and does not re-issue navigate_browser.
     current_url = evidence.get("current_url") or evidence.get("inspected_url") or ""

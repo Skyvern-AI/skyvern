@@ -283,6 +283,7 @@ function GetStartedModalForUser() {
           OnboardingTelemetry.questionnaireShown({
             primaryIntent: null,
             promptReason: "initial",
+            organizationId: response.organization_id ?? null,
           });
           setOwner({ kind: "questionnaire", step: "intent" });
         } else if (

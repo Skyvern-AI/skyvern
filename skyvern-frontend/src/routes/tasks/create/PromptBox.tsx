@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
@@ -14,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { Switch } from "@/components/ui/switch";
+import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
@@ -34,7 +36,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   generatePhoneNumber,
   generateUniqueEmail,
@@ -48,6 +50,7 @@ import { useAutoplayStore } from "@/store/useAutoplayStore";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { ImprovePrompt } from "@/components/ImprovePrompt";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
@@ -181,6 +184,23 @@ function describeResponseEnvelope(response: AxiosResponse<unknown>): string {
   return `status=${response.status} content_type=${contentType} body_length=${bodyLength} parsed_as_json=${parsedAsJson}`;
 }
 
+function showCreateErrorToast(title: string, error: unknown) {
+  if (isPaymentRequiredError(error)) {
+    toast({
+      variant: "destructive",
+      title: "Not enough credits",
+      description: getErrorDetail(error),
+      action: (
+        <ToastAction altText="Go to Billing" asChild>
+          <Link to="/billing">Go to Billing</Link>
+        </ToastAction>
+      ),
+    });
+    return;
+  }
+  toast({ variant: "destructive", title, description: getErrorDetail(error) });
+}
+
 function PromptBoxImpl(
   { enableCopilotHandoff = false }: PromptBoxProps,
   ref: ForwardedRef<PromptBoxHandle>,
@@ -308,11 +328,7 @@ function PromptBoxImpl(
       );
     },
     onError: (error: Error) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating agent from prompt",
-        description: error.message,
-      });
+      showCreateErrorToast("Error creating agent from prompt", error);
     },
     onSettled: () => {
       submitInFlightRef.current = false;
@@ -364,11 +380,7 @@ function PromptBoxImpl(
       );
     },
     onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating agent",
-        description: error.message,
-      });
+      showCreateErrorToast("Error creating agent", error);
     },
     onSettled: () => {
       submitInFlightRef.current = false;

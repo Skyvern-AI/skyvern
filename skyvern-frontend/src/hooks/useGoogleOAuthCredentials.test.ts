@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GoogleOAuthCredential } from "@/api/types";
 import {
+  attemptedGoogleOAuthIntegrationScopes,
   getGoogleOAuthCredentialScopesGranted,
   getGoogleOAuthCredentialScopesRequested,
-  matchesGoogleOAuthIntegrationScopes,
+  hasGoogleOAuthCredentialScopes,
   normalizeGoogleOAuthScopes,
   safePostCredentialsInvalidate,
 } from "./useGoogleOAuthCredentials";
@@ -57,31 +58,61 @@ describe("Google OAuth credential scope helpers", () => {
     ).toEqual(["requested:a", "requested:b"]);
   });
 
-  it("matches integrations by requested scopes before cumulative granted scopes", () => {
+  it("attributes an attempt by requested scopes before cumulative granted scopes", () => {
     const credential = {
       ...baseCredential,
       scopes_requested: ["gmail"],
       scopes_granted: ["gmail", "sheets"],
     };
 
-    expect(matchesGoogleOAuthIntegrationScopes(credential, ["gmail"])).toBe(
+    expect(attemptedGoogleOAuthIntegrationScopes(credential, ["gmail"])).toBe(
       true,
     );
-    expect(matchesGoogleOAuthIntegrationScopes(credential, ["sheets"])).toBe(
+    expect(attemptedGoogleOAuthIntegrationScopes(credential, ["sheets"])).toBe(
       false,
     );
   });
 
-  it("falls back to granted scopes when requested scopes are absent", () => {
+  it("falls back to capability scopes when requested scopes are absent", () => {
+    const noHistory = { ...baseCredential, scopes_granted: ["sheets"] };
+
+    expect(attemptedGoogleOAuthIntegrationScopes(noHistory, ["sheets"])).toBe(
+      true,
+    );
     expect(
-      matchesGoogleOAuthIntegrationScopes(
-        {
-          ...baseCredential,
-          scopes_granted: ["sheets"],
-        },
+      attemptedGoogleOAuthIntegrationScopes(
+        noHistory,
+        ["sheets", "drive.metadata"],
         ["sheets"],
       ),
     ).toBe(true);
+    expect(
+      attemptedGoogleOAuthIntegrationScopes(noHistory, [
+        "sheets",
+        "drive.metadata",
+      ]),
+    ).toBe(false);
+  });
+
+  it("separates a partial grant's attempt from its capability", () => {
+    const partiallyGranted = {
+      ...baseCredential,
+      scopes_requested: ["sheets", "drive.metadata"],
+      scopes_granted: ["drive.metadata"],
+    };
+
+    expect(
+      attemptedGoogleOAuthIntegrationScopes(partiallyGranted, [
+        "sheets",
+        "drive.metadata",
+      ]),
+    ).toBe(true);
+    expect(
+      hasGoogleOAuthCredentialScopes(partiallyGranted, [
+        "sheets",
+        "drive.metadata",
+      ]),
+    ).toBe(false);
   });
 });
 

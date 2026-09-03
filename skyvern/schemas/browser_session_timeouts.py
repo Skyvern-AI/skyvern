@@ -10,6 +10,8 @@ from __future__ import annotations
 MIN_TIMEOUT = 5
 MAX_TIMEOUT = 60 * 4  # 4 hours
 MAX_LIFETIME_SECONDS = MAX_TIMEOUT * 60
+# A found reusable session with less lifetime left than this is retired and replaced rather than handed to a run.
+REUSE_MIN_REMAINING_LIFETIME_SECONDS = 30 * 60
 DEFAULT_TIMEOUT = 60
 
 MAX_TIMEOUT_EXCEEDED_MESSAGE = (

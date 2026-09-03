@@ -43,6 +43,20 @@ PROXY_SENSITIVE_NAV_ERRORS = (
 # The outer context-recreation retry in get_or_create_page may still attempt
 # recovery for proxy-sensitive errors by picking a different proxy node.
 SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
+# The subset of PROXY_SENSITIVE_NAV_ERRORS that attributes a navigation failure to our own
+# egress rather than to the site. PROXY_SENSITIVE_NAV_ERRORS is deliberately wider because it
+# answers a different question -- whether retrying on a different proxy node is worth it -- and
+# it includes cert failures a plain expired certificate on the target site also produces.
+# ERR_CERT_AUTHORITY_INVALID is the one cert code that means an untrusted issuer, i.e. something
+# terminating TLS in front of us.
+EGRESS_ATTRIBUTABLE_NAV_ERRORS = (
+    "net::ERR_TUNNEL_CONNECTION_FAILED",
+    "net::ERR_SOCKS_CONNECTION_FAILED",
+    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NAME_RESOLUTION_FAILED",
+    "net::ERR_CERT_AUTHORITY_INVALID",
+)
 
 AUTO_COMPLETION_POTENTIAL_VALUES_COUNT = 3
 DROPDOWN_MENU_MAX_DISTANCE = 100

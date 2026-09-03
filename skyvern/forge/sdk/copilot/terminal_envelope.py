@@ -8,8 +8,10 @@ from pydantic import BaseModel, model_validator
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.context import ProposalDisposition
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeRole
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import CopilotCancelSource
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
@@ -26,6 +28,16 @@ _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
 
 MINIMAL_HONEST_STOP = "I stopped without confirming the goal was met."
+MINIMAL_CANCEL_STOP = "Stopped."
+_INTERIM_RUN_OUTCOME_ROLE: RunOutcomeRole = "interim_build_test"
+TESTED_DRAFT_PRESERVED = "The tested draft from this turn was preserved for review."
+UNTESTED_DRAFT_PRESERVED = "The untested draft from this turn was preserved for review."
+_NO_DRAFT_PRESERVED = "No workflow draft from this turn was preserved."
+_CANCEL_DRAFT_DISPOSITIONS = (TESTED_DRAFT_PRESERVED, UNTESTED_DRAFT_PRESERVED, _NO_DRAFT_PRESERVED)
+# Only a Stop click is unambiguously the user asking. An Escape may be ambient, so it
+# keeps the plain opening rather than claiming an intent the request cannot establish.
+CANCEL_STOP_AT_USER_REQUEST = "Stopped at your request."
+_CANONICAL_ROLLED_BACK = "The saved workflow was rolled back to its state before this turn."
 
 INTERRUPTED_TERMINAL_REASON = "interrupted"
 INTERRUPTED_TERMINAL_HEADLINE = "This turn was interrupted before it could finish."
@@ -56,6 +68,9 @@ class TerminalOutcomeEnvelope(BaseModel):
     run_id: str | None = None
     run_completed: bool | None = None
     blocks_run_this_turn: int | None = None
+    # ``interim_build_test`` marks a run start with no result behind it, which no
+    # surface may read as a resolved outcome.
+    run_outcome_role: RunOutcomeRole | None = None
     run_display_reason: str | None = None
     run_output_report: str | None = None
     blocker_reason: str | None = None
@@ -67,7 +82,12 @@ class TerminalOutcomeEnvelope(BaseModel):
     failed_operation: BuildTestFailedOperation | None = None
     connect_failure: BuildTestConnectFailure | None = None
     proposal_present: bool = False
+    proposal_disposition: ProposalDisposition | None = None
+    canonical_rolled_back: bool = False
     interruption: InterruptedTurnFacts | None = None
+    # None when the client named no gesture, so the report stays silent rather
+    # than naming one the request never carried.
+    cancel_source: CopilotCancelSource | None = None
     rendered_from_envelope: bool = False
     envelope_version: int = 1
 
@@ -84,7 +104,7 @@ def assemble_terminal_envelope(
     response_type: str,
     verified: bool,
     workflow_applied: bool,
-    proposal_disposition: str | None,
+    proposal_disposition: ProposalDisposition | None,
     run_outcomes: Sequence[RecordedRunOutcome],
     blocker_reason: str | None,
     halt_kind: str | None,
@@ -96,8 +116,11 @@ def assemble_terminal_envelope(
     failed_operation: BuildTestFailedOperation | None = None,
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
+    interruption: InterruptedTurnFacts | None = None,
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = select_run_outcome_anchor(run_outcomes)
+    run_outcome_role = run_outcome.role if run_outcome is not None else None
+    run_resolved = run_outcome is not None and not is_interim_run_outcome(run_outcome)
     run_verdict = run_outcome.verdict if run_outcome is not None else None
     run_id = _clean_text(run_outcome.workflow_run_id) if run_outcome is not None else None
     # Lifecycle and identity come from the same archived outcome, which a workflow edit
@@ -120,7 +143,7 @@ def assemble_terminal_envelope(
         next_state=next_state,
         workflow_mutated=workflow_mutated,
         workflow_attempted=workflow_attempted,
-        explicit_stop=bool(run_outcome or blocker_reason or halt_kind or terminal_cause),
+        explicit_stop=bool(run_resolved or blocker_reason or halt_kind or terminal_cause),
     )
     if failed_operation is not None:
         if not user_action_required:
@@ -144,6 +167,7 @@ def assemble_terminal_envelope(
         run_id=run_id,
         run_completed=run_completed,
         blocks_run_this_turn=blocks_run_this_turn,
+        run_outcome_role=run_outcome_role,
         run_display_reason=run_display_reason,
         run_output_report=run_output_report,
         blocker_reason=_clean_text(blocker_reason),
@@ -155,6 +179,8 @@ def assemble_terminal_envelope(
         failed_operation=failed_operation,
         connect_failure=connect_failure,
         proposal_present=proposal_present,
+        proposal_disposition=proposal_disposition,
+        interruption=interruption,
     )
 
 
@@ -208,7 +234,7 @@ def interrupted_terminal_envelope(facts: InterruptedTurnFacts | None = None) -> 
     )
 
 
-def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str:
+def render_interrupted_message(facts: InterruptedTurnFacts | None = None, *, proposal_present: bool = False) -> str:
     """User-facing copy for an interrupted turn: what is known, and never why it stopped."""
     message = INTERRUPTED_TERMINAL_HEADLINE
     if facts is not None:
@@ -228,6 +254,10 @@ def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str
             message = _append_sentence(
                 message, f"Last recorded build-test phase: {facts.last_recorded_build_test_phase}."
             )
+    if proposal_present:
+        # The Accept/Discard card stays on screen for an untested draft, so a message that did not
+        # mention it would contradict what the user is looking at.
+        message = _append_sentence(message, "The untested draft is available for review.")
     return _append_sentence(message, INTERRUPTED_TERMINAL_RETRY)
 
 
@@ -258,8 +288,18 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
                 return agent_message, False
             message = _append_sentence(message, f"{pending_question_intro}: {agent_message}")
         return message, True
+    # A crash and a failed test are different endings, and the latch a crash inherits from an
+    # earlier build test in the same turn would otherwise render both with the same sentence.
+    # A connect failure still outranks this: it names identities the operator needs.
+    if envelope.interruption is not None and not cancelled:
+        return render_interrupted_message(envelope.interruption, proposal_present=envelope.proposal_present), True
     if envelope.failed_operation is not None and not cancelled:
-        message = "I stopped after a browser operation failed while testing the workflow."
+        block_label = envelope.failed_operation.block_label
+        message = (
+            f"I stopped after a browser operation failed in `{block_label}` while testing the workflow."
+            if block_label
+            else "I stopped after a browser operation failed while testing the workflow."
+        )
         if envelope.proposal_present:
             message = _append_sentence(
                 message,
@@ -297,12 +337,32 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
             return _append_sentence(message, output_report), True
         return message, True
 
+    # A stop reports what the turn recorded regardless of derived state: a cancel that
+    # preserved a draft derives ``proposal_pending`` and never reaches the branch below.
+    if cancelled:
+        # This branch renders twice on a stop that also carries a failed operation or a
+        # connect failure, so every clause is appended only when it is not already there.
+        message = agent_message.strip() or MINIMAL_CANCEL_STOP
+        # Replace only the opening sentence, so a stop that also preserved a draft keeps
+        # the rest of its seed reply instead of losing the upgrade to a longer prefix.
+        if envelope.cancel_source == "stop_button" and message.startswith(MINIMAL_CANCEL_STOP):
+            message = CANCEL_STOP_AT_USER_REQUEST + message[len(MINIMAL_CANCEL_STOP) :]
+        for sentence in _recorded_run_facts(envelope):
+            if not _text_contains(message, sentence):
+                message = _append_sentence(message, sentence)
+        if not any(_text_contains(message, sentence) for sentence in _CANCEL_DRAFT_DISPOSITIONS):
+            message = _append_sentence(message, _cancel_draft_disposition(envelope))
+        if envelope.canonical_rolled_back and not _text_contains(message, _CANONICAL_ROLLED_BACK):
+            message = _append_sentence(message, _CANONICAL_ROLLED_BACK)
+        if envelope.run_display_reason and not _text_contains(message, envelope.run_display_reason):
+            message = _append_labeled_sentence(message, label="Reason", text=envelope.run_display_reason)
+        if output_report and not _text_contains(message, output_report):
+            message = _append_sentence(message, output_report)
+        return message, message != agent_message
+
     # A plain reply with no concrete workflow/run/blocker evidence is an answer
     # even though next_state remains "stopped"; only stopped-kind turns carry the
     # recorded facts.
-    if cancelled:
-        return agent_message, False
-
     if envelope.next_state != "stopped" or envelope.response_kind != "stopped":
         if output_report and not _text_contains(agent_message, output_report):
             return _append_sentence(agent_message, output_report), True
@@ -335,6 +395,8 @@ def _recorded_run_facts(envelope: TerminalOutcomeEnvelope) -> list[str]:
     ran = envelope.blocks_run_this_turn
     if ran is not None:
         facts.append(f"{ran} block{'' if ran == 1 else 's'} ran this turn.")
+    elif envelope.run_id is not None:
+        facts.append("A run was started, and how many of its blocks ran was not confirmed.")
     # The completion clause rides on the recorded lifecycle fact, never on the
     # verdict: an unevaluated outcome says nothing about whether the run finished.
     lifecycle = "The recorded run completed, and its" if envelope.run_completed else "The recorded run's"
@@ -345,17 +407,52 @@ def _recorded_run_facts(envelope: TerminalOutcomeEnvelope) -> list[str]:
     return facts
 
 
+def _cancel_draft_disposition(envelope: TerminalOutcomeEnvelope) -> str:
+    """Reads the disposition the seed reply was chosen from, so the two cannot disagree."""
+    if not envelope.proposal_present:
+        return _NO_DRAFT_PRESERVED
+    if envelope.proposal_disposition == "review_tested":
+        return TESTED_DRAFT_PRESERVED
+    return UNTESTED_DRAFT_PRESERVED
+
+
+def is_interim_run_outcome(outcome: RecordedRunOutcome | None) -> bool:
+    """A run start with no result behind it, which no surface may read as a resolved outcome."""
+    return outcome is not None and outcome.role == _INTERIM_RUN_OUTCOME_ROLE
+
+
+def interim_run_start_outcome(workflow_run_id: str) -> RecordedRunOutcome:
+    """The run-start record a mid-run stop reads: a run exists, its lifecycle and blocks are unresolved."""
+    return RecordedRunOutcome(
+        verdict="not_evaluated",
+        workflow_run_id=workflow_run_id,
+        run_completed=None,
+        role=_INTERIM_RUN_OUTCOME_ROLE,
+    )
+
+
 def select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> RecordedRunOutcome | None:
-    final_outcomes = [outcome for outcome in run_outcomes if outcome.verdict in _FINAL_RUN_VERDICTS]
+    # The terminal describes the last run the turn touched, and a result supersedes that run's
+    # own start whatever its verdict — including the ``demonstrated`` one no anchor reports.
+    resolved_run_ids = {
+        outcome.workflow_run_id
+        for outcome in run_outcomes
+        if outcome.workflow_run_id is not None and not is_interim_run_outcome(outcome)
+    }
+    live_outcomes = [
+        outcome
+        for outcome in run_outcomes
+        if not (is_interim_run_outcome(outcome) and outcome.workflow_run_id in resolved_run_ids)
+    ]
+    final_outcomes = [outcome for outcome in live_outcomes if outcome.verdict in _FINAL_RUN_VERDICTS]
     if not final_outcomes:
         return None
-    # The terminal reports the run record in order. An interim event is not a terminal
-    # run when a recorded run exists; otherwise the latest interim event is the only
-    # run fact available.
-    recorded = [outcome for outcome in final_outcomes if outcome.role != "interim_build_test"]
-    if recorded:
-        return recorded[-1]
     return final_outcomes[-1]
+
+
+def run_start_unresolved(run_outcomes: Sequence[RecordedRunOutcome]) -> bool:
+    """True when the outcome the terminal anchors on is a run start with no result behind it."""
+    return is_interim_run_outcome(select_run_outcome_anchor(run_outcomes))
 
 
 def _derive_next_state(
@@ -363,7 +460,7 @@ def _derive_next_state(
     user_action_required: bool,
     verified: bool,
     workflow_applied: bool,
-    proposal_disposition: str | None,
+    proposal_disposition: ProposalDisposition | None,
 ) -> TerminalNextState:
     if user_action_required:
         return "awaiting_user_input"
@@ -411,10 +508,8 @@ def reason_in_reply_shadow(run_display_reason: str | None, final_message: str) -
     return bool(normalized_reason and normalized_reply and normalized_reason in normalized_reply)
 
 
-def _proposal_requires_review(proposal_disposition: str | None) -> bool:
-    if not isinstance(proposal_disposition, str):
-        return False
-    return proposal_disposition.strip().lower() in _REVIEW_PROPOSAL_DISPOSITIONS
+def _proposal_requires_review(proposal_disposition: ProposalDisposition | None) -> bool:
+    return proposal_disposition in _REVIEW_PROPOSAL_DISPOSITIONS
 
 
 def _clean_text(value: str | None) -> str | None:

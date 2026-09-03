@@ -622,9 +622,9 @@ async def test_engine_forwards_the_page_probe_and_withholds_it_from_page_free_ru
 async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_free_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The innerHTML fingerprint sampler also drives the loop's auto-observe change decision (not just
-    # make_finish_tool's settle gate) -- drop it anywhere on the way to run_agent_tool_loop and
-    # auto-observe silently falls back to the document-identity probe for every in-page mutation.
+    # The innerHTML fingerprint sampler also drives the loop's page-state stall detector (not just
+    # make_finish_tool's settle gate) -- drop it anywhere on the way to run_agent_tool_loop and the
+    # detector silently loses its rendered-content signal.
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
@@ -1107,71 +1107,6 @@ async def test_engine_drops_a_leftover_refresh_signal_when_the_loop_is_cancelled
     assert ctx.refresh_working_page is False
 
 
-@pytest.mark.asyncio
-async def test_system_prompt_carries_auto_observe_guidance_only_when_the_flag_is_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # SYSTEM_PROMPT itself must stay byte-identical to the flag-off prompt: the two auto-observe
-    # sentences belong in an addendum appended at the call site, never baked into the base constant,
-    # or TASK_V3_AUTO_OBSERVE=off would no longer be a no-op against the base engine.
-    from skyvern.config import settings
-    from skyvern.forge.taskv3.engine import SYSTEM_PROMPT
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    loop_kwargs: dict[str, Any] = {}
-
-    async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-
-    when_auto_observe_present = "act from that snapshot instead of calling observe again"
-    when_batching_present = "put it in the same turn"
-
-    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", False)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="fill the form"
-    )
-    system_prompt = loop_kwargs["system_prompt"]
-    assert system_prompt.startswith(SYSTEM_PROMPT)
-    assert when_auto_observe_present not in system_prompt
-    assert when_batching_present not in system_prompt
-
-    loop_kwargs.clear()
-    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", True)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="fill the form"
-    )
-    system_prompt = loop_kwargs["system_prompt"]
-    assert when_auto_observe_present in system_prompt
-    assert when_batching_present in system_prompt
-
-
-@pytest.mark.asyncio
-async def test_page_free_run_never_gets_auto_observe_guidance_even_with_the_flag_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from skyvern.config import settings
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    loop_kwargs: dict[str, Any] = {}
-
-    async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-    monkeypatch.setattr(settings, "TASK_V3_AUTO_OBSERVE", True)
-
-    async def no_page() -> Any:
-        raise AssertionError("page provider must never be consulted in page-free mode")
-
-    await run_task_v3_agent_loop(page_provider=no_page, llm_caller=_ScriptedCaller([]), goal="decide", page_free=True)
-    assert loop_kwargs["auto_observe"] is False
-    assert "act from that snapshot instead of calling observe again" not in loop_kwargs["system_prompt"]
-
-
 def test_caller_level_bridge_check_denies_raw_client_dispatch() -> None:
     # A custom/BYO model can be NAMED gpt-5.6-* yet dispatch through the raw OpenAI client branch,
     # which never bridges — the dict form there is a schema violation on every call. The caller-level
@@ -1330,3 +1265,33 @@ def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base()
         openai_client=None, _custom_openrouter=False, llm_config=azure, original_llm_key="AZURE_OPENAI_GPT5_6_SOL"
     )
     assert LLMCaller.uses_openai_responses_bridge(azure_self) is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_carries_duration_and_block_type() -> None:
+    # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
+    # the block context to slice workflow-block runs (SKY-15499).
+    from structlog.testing import capture_logs
+
+    script = [[("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type="navigation",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1
+    assert terminal[0]["block_type"] == "navigation"
+    assert isinstance(terminal[0]["duration_seconds"], float)
+    assert terminal[0]["duration_seconds"] >= 0.0
+
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert terminal[0]["block_type"] is None  # bare task: no block context

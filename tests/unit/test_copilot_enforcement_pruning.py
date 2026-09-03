@@ -388,6 +388,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_good_workflow_yaml=None,
         non_retriable_nav_error_last_emitted_signature=None,
         workflow_yaml=None,
+        staged_workflow_yaml=None,
         executed_block_labels=set(),
         executed_block_fingerprints={},
         last_workflow=None,

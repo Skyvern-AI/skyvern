@@ -11,6 +11,7 @@ every block instead of once.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +20,8 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.scripts import ScriptStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -91,6 +94,42 @@ class TestCacheableMissingLabels:
     def test_empty_when_cacheable_blocks_already_cached(self) -> None:
         blocks = [{"label": "fill_form", "block_type": BlockType.TASK}]
         assert workflow_script_service.cacheable_missing_labels(blocks, cached_labels={"fill_form"}) == set()
+
+    def test_excludes_extraction_blocks_with_export_enabled(self) -> None:
+        # SKY-15396: the generated script's cached replay only carries
+        # prompt/schema/url/model, so caching an export-enabled extraction
+        # block would silently skip the Parquet export on every later run.
+        blocks = [
+            {"label": "plain_extract", "block_type": BlockType.EXTRACTION, "export_enabled": False},
+            {"label": "export_extract", "block_type": BlockType.EXTRACTION, "export_enabled": True},
+        ]
+        missing = workflow_script_service.cacheable_missing_labels(blocks, cached_labels=set())
+        assert missing == {"plain_extract"}
+
+    def test_extraction_without_export_enabled_key_is_still_cacheable(self) -> None:
+        # Block dicts predating this field (or non-extraction types) have no
+        # export_enabled key at all -- must default to cacheable, not excluded.
+        blocks = [{"label": "plain_extract", "block_type": BlockType.EXTRACTION}]
+        assert workflow_script_service.cacheable_missing_labels(blocks, cached_labels=set()) == {"plain_extract"}
+
+
+class TestIsBlockTypeCacheable:
+    def test_accepts_a_real_block_model_instance_not_just_dicts(self) -> None:
+        # service.py's mint/regen/run-dispatch call sites all hold typed Block
+        # instances (workflow.workflow_definition.blocks), not dicts.
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            output_parameter_id="op_1", key="out", workflow_id="w_1", created_at=now, modified_at=now
+        )
+        plain = ExtractionBlock(label="plain", output_parameter=output_parameter, data_extraction_goal="g")
+        exporting = ExtractionBlock(
+            label="exporting", output_parameter=output_parameter, data_extraction_goal="g", export_enabled=True
+        )
+        non_cacheable = SimpleNamespace(block_type=BlockType.WAIT)
+
+        assert workflow_script_service.is_block_type_cacheable(plain) is True
+        assert workflow_script_service.is_block_type_cacheable(exporting) is False
+        assert workflow_script_service.is_block_type_cacheable(non_cacheable) is False
 
 
 class TestPendingMintSkipsNonCacheableWorkflows:

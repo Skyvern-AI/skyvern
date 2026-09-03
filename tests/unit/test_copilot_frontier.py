@@ -2982,6 +2982,7 @@ workflow_definition:
                 {
                     "label": "inspect_result",
                     "status": "completed",
+                    "output": "prefix customer-secret suffix",
                     "action_trace": [{"action": "click", "status": "completed", "element": "sensitive-target"}],
                 }
             ],
@@ -3023,7 +3024,7 @@ workflow_definition:
     assert packet["attempted_block_labels"] == ["inspect_result"]
     assert packet["executed_block_labels"] == ["inspect_result"]
     assert packet["action_observations"] == ["click completed"]
-    assert packet["registered_outputs"][0]["value"] == "prefix [REDACTED_SECRET] suffix"
+    assert packet["registered_outputs"][0]["output"] == "prefix [REDACTED_SECRET] suffix"
     assert any("registered_outputs redacted" in notice for notice in packet["omission_notices"])
     assert MCP_RESULT_PROVENANCE_KEY not in output
     assert set(output) == {"ok", "data"}
@@ -3082,6 +3083,42 @@ async def test_test_end_to_end_provider_input_excludes_target_controlled_action_
     packet = json.loads(provider_input)["data"]["build_test_packet"]
     assert packet["action_observations"] == ["click completed"]
     assert hostile not in provider_input
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_handoff_keeps_prior_attempt_change_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This handoff rebuilds its data from a whitelist, so a fact the run attached is dropped unless
+    it is named here — and this is the surface where a repeat failing attempt reaches the model."""
+    change_identity = {
+        "prior_workflow_run_id": "wr_first_attempt",
+        "block_label": "price_the_trip",
+        "changed": False,
+        "basis": "code_hash",
+    }
+    monkeypatch.setattr(
+        agent_module,
+        "run_workflow_end_to_end",
+        AsyncMock(
+            return_value={
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_second_attempt",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["price_the_trip"],
+                    "executed_block_labels": ["price_the_trip"],
+                    "prior_attempt_change_identity": change_identity,
+                },
+            }
+        ),
+    )
+    ctx = _make_ctx(workflow_permanent_id="wpid_repeat_failing_attempt")
+
+    handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
+
+    provider_input = json.loads(handoff[1]["output"])
+    assert provider_input["data"]["prior_attempt_change_identity"] == change_identity
 
 
 @pytest.mark.asyncio
@@ -3366,8 +3403,8 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
             assert packet["attempted_block_labels"] == ["inspect_result"]
             assert packet["executed_block_labels"] == executed_labels
             assert packet["action_observations"] == ["click completed code_line=7"]
-            assert packet["registered_outputs"][0]["output_parameter_key"] == "recorded_result"
-            assert packet["registered_outputs"][0]["value"] == "recorded value"
+            assert packet["registered_outputs"][0]["label"] == "inspect_result"
+            assert packet["registered_outputs"][0]["output"] == "recorded value"
             page_state = packet["failure"]["page_state"]
             assert page_state["current_origin"] == "https://example.test/"
             assert "current_url" not in page_state
@@ -3497,6 +3534,7 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
                 {
                     "label": "inspect_result",
                     "status": "failed",
+                    "output": "recorded value",
                     "failure_reason": f"{hostile_instruction}: {secret_marker}",
                     "error_codes": [hostile_instruction, secret_marker],
                     "action_trace": [

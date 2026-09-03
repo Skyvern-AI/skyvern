@@ -221,6 +221,7 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
+  engine: RunEngine | null;
 };
 
 export type HumanInteractionBlockYAML = BlockYAMLBase & {
@@ -293,6 +294,10 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  export_enabled?: boolean;
+  export_data_schema?: Record<string, unknown> | null;
+  export_file_name?: string | null;
+  export_records?: string | null;
 };
 
 export type LoginBlockYAML = BlockYAMLBase & {

@@ -2884,7 +2884,7 @@ async def _drive_inspect_page(
     capture_raises: bool = False,
 ) -> dict[str, object]:
     async def fake_capture(
-        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str
+        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str, **_kwargs: object
     ) -> tuple[dict[str, object] | None, None]:
         if capture_clears_session:
             inner_ctx.browser_session_id = None
@@ -3030,7 +3030,7 @@ async def test_post_run_inspect_does_not_close_the_session_it_landed_on(
     closed: list[str] = []
 
     class _Sessions:
-        async def close_session(self, *, organization_id: str, browser_session_id: str) -> None:
+        async def close_session(self, *, organization_id: str, browser_session_id: str, **_: object) -> None:
             closed.append(browser_session_id)
 
     monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", _Sessions(), raising=False)

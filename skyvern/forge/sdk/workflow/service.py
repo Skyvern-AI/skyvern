@@ -54,6 +54,7 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
     InProcessScriptExecutionDenied,
@@ -89,7 +90,10 @@ from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workf
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
-from skyvern.forge.sdk.experimentation.workflow_block_engine import resolve_workflow_block_engine_arm
+from skyvern.forge.sdk.experimentation.workflow_block_engine import (
+    resolve_workflow_block_engine_arm,
+    resolved_workflow_block_engine_arm_label,
+)
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
@@ -202,6 +206,8 @@ from skyvern.forge.sdk.workflow.status_mapping import (
     TASK_STATUS_MAP,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_timeouts import REUSE_MIN_REMAINING_LIFETIME_SECONDS
 from skyvern.schemas.proxy_pinning import (
     derive_proxy_session_id,
     redact_proxy_session_id,
@@ -245,7 +251,10 @@ from skyvern.services.webhook_delivery import (
     deliver_webhook_with_retries,
     describe_delivery_error,
 )
-from skyvern.services.workflow_script_service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-exported; several tests import it from this module
+    BLOCK_TYPES_THAT_SHOULD_BE_CACHED,
+    is_block_type_cacheable,
+)
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
@@ -950,6 +959,24 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
+def _task_v3_ab_arm_for_duration_log(workflow_run_id: str) -> str | None:
+    """Failure-safe wrapper around ``resolved_workflow_block_engine_arm_label`` (which owns the
+    three-way contract): telemetry only, so a lookup failure must never break run finalization —
+    it logs a warning and returns "unknown" (attribution lost) rather than propagating.
+    """
+    try:
+        return resolved_workflow_block_engine_arm_label(workflow_run_id)
+    except Exception:
+        LOG.warning(
+            "task_v3_ab_arm resolution for duration metrics failed",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        # A failed read is attribution-loss, not "never entered the A/B" — same bucket as the
+        # out-of-band finalizers.
+        return "unknown"
+
+
 def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> float:
     effective_minutes = get_effective_workflow_run_max_elapsed_time_minutes(workflow_run.max_elapsed_time_minutes)
     started_at = _as_utc(workflow_run.started_at or workflow_run.created_at)
@@ -1058,11 +1085,7 @@ def _collect_uncached_loop_children(
     a double-nested for-loop).
     """
     for child in block.loop_blocks:
-        if (
-            child.label
-            and child.label not in script_blocks_by_label
-            and child.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-        ):
+        if child.label and child.label not in script_blocks_by_label and is_block_type_cacheable(child):
             blocks_to_update.add(child.label)
         # Recurse into nested loop blocks regardless of whether the loop
         # itself is cached — its children may not be.
@@ -1198,6 +1221,13 @@ class ReusedSessionOwnerProof:
             and self.router_activity_is_stale
             and self.observed_last_activity_at is not None
         )
+
+
+class ReusedSessionBelowLifetimeFloor(Exception):
+    def __init__(self, *, browser_session: PersistentBrowserSession, shortfall: dict[str, object]) -> None:
+        super().__init__(browser_session.persistent_browser_session_id)
+        self.browser_session = browser_session
+        self.shortfall = shortfall
 
 
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
@@ -1385,6 +1415,28 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     suffix = f" (auto-saved: {key})"
     title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
     return f"{title}{suffix}"
+
+
+def _browser_lease_failure_category(exc: Exception) -> list[dict] | None:
+    """The lease seam still holds the typed exception; persist its identity so a reader does not
+    have to rediscover it from prose or from the session row, which closes the same way after
+    every run."""
+    if isinstance(exc, BrowserSessionClosed):
+        reason_code = "browser_session_closed"
+        reasoning = "The browser session had already closed before the run could lease it"
+    elif isinstance(exc, BrowserSessionStartupTimeout):
+        reason_code = "browser_session_startup_timeout"
+        reasoning = "The browser session did not start within its startup timeout"
+    else:
+        return None
+    return [
+        {
+            "category": "BROWSER_ERROR",
+            "confidence_float": 1.0,
+            "reason_code": reason_code,
+            "reasoning": reasoning,
+        }
+    ]
 
 
 class WorkflowService:
@@ -2738,7 +2790,7 @@ class WorkflowService:
                 if unknown_parameter_keys:
                     # Keys only, never values: an unknown key is the whole diagnosis and a value may
                     # be a credential id or customer data.
-                    LOG.warning(
+                    LOG.info(
                         "Workflow run request sent parameter keys the workflow does not declare",
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_permanent_id=workflow.workflow_permanent_id,
@@ -3841,9 +3893,14 @@ class WorkflowService:
         return bool(profile and profile.is_managed)
 
     @staticmethod
-    async def _close_reused_session_best_effort(*, organization_id: str, session_id: str) -> None:
+    async def _close_reused_session_best_effort(
+        *,
+        organization_id: str,
+        session_id: str,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
+    ) -> None:
         try:
-            await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id)
+            await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason)
         except Exception:
             LOG.warning(
                 "Failed to close unusable reused browser session",
@@ -4035,6 +4092,77 @@ class WorkflowService:
         current_context.browser_session_runnable_generation_id = lease_generation_id
         return session_id
 
+    async def _reused_session_lifetime_shortfall(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        browser_session: PersistentBrowserSession,
+    ) -> dict[str, object] | None:
+        try:
+            remaining_lifetime_seconds = await app.PERSISTENT_SESSIONS_MANAGER.remaining_lifetime_seconds(
+                browser_session.persistent_browser_session_id,
+                organization_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Could not evaluate reusable browser session remaining lifetime; leaving reuse enabled",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                exc_info=True,
+            )
+            return None
+        if remaining_lifetime_seconds is None or remaining_lifetime_seconds >= REUSE_MIN_REMAINING_LIFETIME_SECONDS:
+            return None
+        return {
+            "organization_id": organization_id,
+            "workflow_run_id": workflow_run_id,
+            "workflow_permanent_id": workflow_permanent_id,
+            "bound_key": browser_session.bound_key,
+            "browser_session_id": browser_session.persistent_browser_session_id,
+            "retirement_reason": "below_lifetime_floor",
+            "remaining_lifetime_seconds": remaining_lifetime_seconds,
+            "min_remaining_lifetime_seconds": REUSE_MIN_REMAINING_LIFETIME_SECONDS,
+        }
+
+    async def _reused_session_renewal_failure(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        browser_session: PersistentBrowserSession,
+    ) -> dict[str, object] | None:
+        try:
+            await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
+                browser_session.persistent_browser_session_id,
+                organization_id,
+                workflow_run_id=workflow_run_id,
+            )
+        except BrowserSessionNotRenewable as error:
+            return {
+                "organization_id": organization_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_permanent_id": workflow_permanent_id,
+                "bound_key": browser_session.bound_key,
+                "browser_session_id": browser_session.persistent_browser_session_id,
+                "retirement_reason": "not_renewable",
+                "not_renewable_reason": str(error),
+            }
+        except Exception:
+            LOG.warning(
+                "Could not renew reusable browser session budget; leaving reuse enabled",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                exc_info=True,
+            )
+        return None
+
     async def _adopt_reused_session(
         self,
         *,
@@ -4043,6 +4171,7 @@ class WorkflowService:
         expected_workflow_permanent_id: str,
         expected_bound_key: str | None,
         browser_session: PersistentBrowserSession,
+        lifetime_floor_session_id: str | None = None,
     ) -> str | None:
         session_id = browser_session.persistent_browser_session_id
         workflow_identity_matches = browser_session.bound_workflow_permanent_id == expected_workflow_permanent_id or (
@@ -4069,7 +4198,7 @@ class WorkflowService:
             if latest is None or is_final_status(latest.status):
                 return None
             raise BrowserSessionAlreadyOccupiedError(session_id, latest.runnable_id or "unknown")
-
+        stale_owner_released = False
         stale_owner_id = browser_session.runnable_id
         if stale_owner_id and stale_owner_id != workflow_run_id:
             owner_proof = await self._read_reused_session_owner_proof(
@@ -4110,6 +4239,34 @@ class WorkflowService:
                 stale_runnable_id=stale_owner_id,
                 browser_session_id=session_id,
             )
+            # A trusted stale-owner release clears runnable_id in the stored row; mirror that state for retirement.
+            stale_owner_released = True
+
+        if lifetime_floor_session_id == session_id and (browser_session.runnable_id is None or stale_owner_released):
+            retirement = await self._reused_session_lifetime_shortfall(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=expected_workflow_permanent_id,
+                browser_session=browser_session,
+            )
+            # A session's budget starts at started_at, so an unstarted session has nothing to renew.
+            # The OSS manager rejects renewal before that point.
+            if retirement is None and browser_session.started_at is not None:
+                retirement = await self._reused_session_renewal_failure(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=expected_workflow_permanent_id,
+                    browser_session=browser_session,
+                )
+            if retirement is not None:
+                raise ReusedSessionBelowLifetimeFloor(
+                    browser_session=(
+                        browser_session.model_copy(update={"runnable_id": None})
+                        if stale_owner_released
+                        else browser_session
+                    ),
+                    shortfall=retirement,
+                )
 
         try:
             return await self._claim_reused_session(
@@ -4139,6 +4296,7 @@ class WorkflowService:
         workflow_permanent_id: str,
         bound_key: str | None,
         browser_session: PersistentBrowserSession,
+        lifetime_floor_session_id: str | None = None,
     ) -> tuple[str | None, PersistentBrowserSession]:
         candidate = browser_session
         for attempt in range(2):
@@ -4150,6 +4308,7 @@ class WorkflowService:
                         expected_workflow_permanent_id=workflow_permanent_id,
                         expected_bound_key=bound_key,
                         browser_session=candidate,
+                        lifetime_floor_session_id=lifetime_floor_session_id,
                     ),
                     candidate,
                 )
@@ -4180,6 +4339,8 @@ class WorkflowService:
         workflow_permanent_id: str,
         bound_key: str | None,
         browser_session: PersistentBrowserSession,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
+        lifetime_floor_session_id: str | None = None,
     ) -> str | None:
         session_id = browser_session.persistent_browser_session_id
         observed_workflow_permanent_id = browser_session.bound_workflow_permanent_id
@@ -4187,6 +4348,7 @@ class WorkflowService:
             await self._close_reused_session_best_effort(
                 organization_id=organization_id,
                 session_id=session_id,
+                reason=reason,
             )
             return None
         occupied_owner_id = browser_session.runnable_id
@@ -4210,13 +4372,21 @@ class WorkflowService:
             )
             if latest is None:
                 return None
-            adopted_session_id, latest = await self._adopt_reused_session_with_occupancy_retry(
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                bound_key=bound_key,
-                browser_session=latest,
-            )
+            try:
+                adopted_session_id, latest = await self._adopt_reused_session_with_occupancy_retry(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                    browser_session=latest,
+                    lifetime_floor_session_id=lifetime_floor_session_id,
+                )
+                latest_reason = (
+                    reason if latest.persistent_browser_session_id == session_id else BrowserSessionCloseReason.aborted
+                )
+            except ReusedSessionBelowLifetimeFloor as below_floor:
+                adopted_session_id, latest = None, below_floor.browser_session
+                latest_reason = BrowserSessionCloseReason.expired
             if adopted_session_id is not None:
                 return adopted_session_id
             latest_workflow_permanent_id = latest.bound_workflow_permanent_id
@@ -4240,6 +4410,7 @@ class WorkflowService:
                 await self._close_reused_session_best_effort(
                     organization_id=organization_id,
                     session_id=latest.persistent_browser_session_id,
+                    reason=latest_reason,
                 )
             return None
         if occupied_owner_id is not None:
@@ -4254,6 +4425,7 @@ class WorkflowService:
         await self._close_reused_session_best_effort(
             organization_id=organization_id,
             session_id=session_id,
+            reason=reason,
         )
         return None
 
@@ -4302,13 +4474,21 @@ class WorkflowService:
             bound_key=bound_key,
         )
         if browser_session is not None:
-            adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                bound_key=bound_key,
-                browser_session=browser_session,
-            )
+            lifetime_floor_session_id = browser_session.persistent_browser_session_id
+            close_reason = BrowserSessionCloseReason.aborted
+            try:
+                adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                    browser_session=browser_session,
+                    lifetime_floor_session_id=lifetime_floor_session_id,
+                )
+            except ReusedSessionBelowLifetimeFloor as below_floor:
+                LOG.info("Retiring reusable browser session before claim", **below_floor.shortfall)
+                adopted_session_id, browser_session = None, below_floor.browser_session
+                close_reason = BrowserSessionCloseReason.expired
             if adopted_session_id is not None:
                 return adopted_session_id
             LOG.info(
@@ -4326,6 +4506,8 @@ class WorkflowService:
                 workflow_permanent_id=workflow_permanent_id,
                 bound_key=bound_key,
                 browser_session=browser_session,
+                reason=close_reason,
+                lifetime_floor_session_id=lifetime_floor_session_id,
             )
             if adopted_after_unbind_race is not None:
                 return adopted_after_unbind_race
@@ -4999,6 +5181,7 @@ class WorkflowService:
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id,
                     failure_reason=failure_reason,
+                    failure_category=_browser_lease_failure_category(e),
                 )
                 await self.clean_up_workflow(
                     workflow=workflow,
@@ -6090,9 +6273,7 @@ class WorkflowService:
         # Per-block mints exist to cache block functions incrementally. A workflow
         # with no cacheable block types has nothing block-level to cache — its
         # script is fully derivable at end of run, so mint once there (SKY-13659).
-        if not any(
-            block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED for block in workflow.workflow_definition.blocks
-        ):
+        if not any(is_block_type_cacheable(block) for block in workflow.workflow_definition.blocks):
             return
 
         asyncio.create_task(
@@ -6565,7 +6746,7 @@ class WorkflowService:
             and block.label
             and block.label not in script_blocks_by_label
             and workflow_run_block_result.status in cacheable_statuses
-            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            and is_block_type_cacheable(block)
             # For traditional caching (code_version < 2), only track blocks
             # for regeneration when actually running with code. Agent-mode runs
             # should not trigger regeneration — doing so creates an infinite loop
@@ -6624,6 +6805,13 @@ class WorkflowService:
             and block.label
             and block.label in script_blocks_by_label
             and not block.disable_cache
+            # A stale script_blocks_by_label entry can predate export being turned
+            # on for this block (or predate this guard existing at all); the
+            # generated code path only knows prompt/schema/url/model, so it would
+            # silently skip the Parquet export. Force such blocks through the
+            # agent path, which is where is_block_type_cacheable already keeps
+            # them from being (re-)minted in the first place.
+            and is_block_type_cacheable(block)
         )
         # requires_agent blocks must execute via agent, not code — skip code path
         block_requires_agent = False
@@ -6844,9 +7032,9 @@ class WorkflowService:
             is_script_run
             and block.label
             and block.label not in script_blocks_by_label
-            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            and is_block_type_cacheable(block)
         )
-        block_is_non_cacheable = bool(is_script_run and block.block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED)
+        block_is_non_cacheable = bool(is_script_run and not is_block_type_cacheable(block))
         # If ai_fallback is explicitly disabled, skip the agent fallback entirely —
         # UNLESS this block requires_agent, has never been cached, or is a
         # non-cacheable block type that must always run via agent.
@@ -6936,7 +7124,11 @@ class WorkflowService:
                             task_id=wrb.task_id,
                             organization_id=organization_id,
                         )
-                        agent_action_count = len(actions)
+                        # Decision rows are verdicts, not agent interactions.
+                        countable_actions = [
+                            a for a in actions if a.action_type not in (ActionType.COMPLETE, ActionType.TERMINATE)
+                        ]
+                        agent_action_count = len(countable_actions)
                         action_summaries = build_action_summaries_with_timing(actions)
                 except Exception:
                     LOG.debug(
@@ -9428,6 +9620,7 @@ class WorkflowService:
                 ai_fallback=workflow_run.ai_fallback,
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
+                task_v3_ab_arm=_task_v3_ab_arm_for_duration_log(workflow_run_id),
             )
             # Run minutes measure compute. A run finalized without ever reaching
             # `running` held no pod, and the created_at fallback above would bill its
@@ -9939,6 +10132,7 @@ class WorkflowService:
             ai_fallback=updated.ai_fallback,
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
+            task_v3_ab_arm=_task_v3_ab_arm_for_duration_log(workflow_run_id),
         )
         # Same compute gate as ``_after_workflow_run_status_write``: cancelling a run
         # that never started bills queue age, not compute, so it records as a tagged
@@ -12350,7 +12544,7 @@ class WorkflowService:
                 task_block_labels = {
                     block.label
                     for block in workflow.workflow_definition.blocks
-                    if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                    if block.label and is_block_type_cacheable(block)
                 }
                 blocks_to_update.update(task_block_labels)
                 blocks_to_update.add(settings.WORKFLOW_START_BLOCK_LABEL)
@@ -12410,7 +12604,7 @@ class WorkflowService:
             should_cache_block_labels = {
                 block.label
                 for block in workflow.workflow_definition.blocks
-                if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+                if block.label and is_block_type_cacheable(block)
             }
             should_cache_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
             cached_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)

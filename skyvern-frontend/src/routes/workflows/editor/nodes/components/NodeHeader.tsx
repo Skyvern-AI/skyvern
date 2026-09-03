@@ -282,13 +282,22 @@ function NodeHeader({
   const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
-  const { data: workflowRun, isError: statusUnavailable } = useWorkflowRunQuery(
-    {
-      workflowRunId: activeWorkflowRunId,
-    },
-  );
+  const {
+    data: workflowRun,
+    isError: statusUnavailable,
+    isPlaceholderData,
+  } = useWorkflowRunQuery({
+    workflowRunId: activeWorkflowRunId,
+  });
+  // keepPreviousData serves the last run's payload after the target run changes
+  // or clears, and clearing it also disables the query — so a retained
+  // "running" payload would otherwise keep every block's play control inert.
+  const runStateIsLive =
+    !statusUnavailable &&
+    !isPlaceholderData &&
+    workflowRun?.workflow_run_id === activeWorkflowRunId;
   const workflowRunIsRunningOrQueued =
-    !statusUnavailable && workflowRun && statusIsRunningOrQueued(workflowRun);
+    runStateIsLive && workflowRun && statusIsRunningOrQueued(workflowRun);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -851,7 +860,7 @@ function NodeHeader({
   };
 
   const isRunning =
-    !statusUnavailable &&
+    runStateIsLive &&
     (workflowRun ? statusIsRunningOrQueued(workflowRun) : false);
   const createdAt = toDate(workflowRun?.created_at ?? "", null);
   const finishedAt = toDate(workflowRun?.finished_at ?? "", null);

@@ -44,8 +44,11 @@ from skyvern.errors.errors import (
     filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
+    BrowserSessionAlreadyOccupiedError,
+    BrowserSessionClosed,
     BrowserSessionDegraded,
     BrowserSessionNotFound,
+    BrowserSessionOwnershipConflict,
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
     EmptyScrapePage,
@@ -64,11 +67,13 @@ from skyvern.exceptions import (
     ScrapingFailed,
     ScreenshotTargetClosed,
     SkyvernException,
+    SkyvernPageAnalysisTimeout,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
     TaskAlreadyTimeout,
     TaskNotFound,
+    UnknownErrorWhileCreatingBrowserContext,
     UnsupportedActionType,
     UnsupportedTaskType,
     get_user_facing_exception_message,
@@ -227,6 +232,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
     consume_unsolicited_download_error_for_context,
@@ -375,6 +381,18 @@ def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
 # display; a runaway multi-paragraph turn must not become a per-row payload.
 _TASKV3_REASONING_MAX_CHARS = 1000
 
+# Block-engine to run-type labels for the "Task duration metrics" discriminator (SKY-15499):
+# workflow-block tasks have no task_runs row, so the block's resolved engine stands in.
+_RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
+    RunEngine.skyvern_v1: "task_v1",
+    RunEngine.skyvern_v2: "task_v2",
+    RunEngine.skyvern_v3: "task_v3",
+    RunEngine.openai_cua: "openai_cua",
+    RunEngine.anthropic_cua: "anthropic_cua",
+    RunEngine.ui_tars: "ui_tars",
+    RunEngine.yutori_navigator: "yutori_navigator",
+}
+
 
 def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields: Any) -> Action:
     """Build the Action a v3 tool call persists as, carrying the fields its typed subclass requires so
@@ -403,6 +421,14 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
         turn_reasoning = fields.pop("reasoning", None)
         reload_reason = str(args.get("reason") or "") or (turn_reasoning or "")
         return ReloadPageAction(reasoning=reload_reason, **fields)
+    if tool_name == "finish":
+        # The finish verdict is v1's complete/terminate decision: its own stated reason outranks the
+        # turn prose (same pop pattern as reload_page).
+        turn_reasoning = fields.pop("reasoning", None)
+        finish_reason = str(args.get("reason") or "") or (turn_reasoning or "")
+        if str(args.get("status") or "") == "completed":
+            return CompleteAction(reasoning=finish_reason, **fields)
+        return TerminateAction(reasoning=finish_reason, **fields)
     return Action(action_type=_TASKV3_TOOL_ACTION_TYPES.get(tool_name, ActionType.CLICK), **fields)
 
 
@@ -1379,7 +1405,6 @@ class ForgeAgent:
         close_browser_on_completion: bool,
         browser_session_id: str | None,
         task_block: BaseTaskBlock | None = None,
-        workflow_permanent_id: str | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -1978,6 +2003,7 @@ class ForgeAgent:
                 page_fingerprint=_page_fingerprint,
                 page_probe=_page_probe,
                 reload_page=_reload_page,
+                block_type=str(task_block.block_type) if task_block is not None else None,
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
@@ -1993,10 +2019,6 @@ class ForgeAgent:
                 starting_url=task.url,
                 downloads_dir=get_download_dir(download_id),
                 organization_id=organization.organization_id,
-                task_id=task.task_id,
-                # Task.workflow_permanent_id is never populated on the execution path (get_task
-                # builds Task without it); the caller sources it from the WorkflowRun row.
-                workflow_permanent_id=workflow_permanent_id,
                 max_action_steps=step_cap,
                 max_action_steps_ceiling=workflow_step_ceiling,
                 max_turns=max_turns,
@@ -2082,6 +2104,67 @@ class ForgeAgent:
         )
         if missing_extraction:
             task_status = TaskStatus.failed
+        # Persist the terminal decision as the run's last action row — v1's step engine always writes
+        # its complete/terminate decision, and this row is the only step detail a click-free
+        # validation/extraction block has to show. Written HERE, after the verdict is
+        # final: a completion the gate or the extraction check rejects records as the FAILED attempt
+        # it was, and a finish the loop rejected mid-run never persists at all. A verdict-less death
+        # (budget_exhausted/loop_error) records as a FAILED terminate carrying the outcome reason —
+        # those are the runs users most need step details for. Cancellation persists nothing.
+        if outcome.status in ("completed", "terminated", "failed", "budget_exhausted", "loop_error"):
+            with contained_effect("task_v3 terminal decision persist", task_id=task.task_id):
+                decision_reason = outcome.reason or ""
+                decision_action_status = ActionStatus.completed
+                if outcome.status in ("budget_exhausted", "loop_error"):
+                    decision_action_status = ActionStatus.failed
+                elif outcome.status == "completed" and (completion_vetoed or missing_extraction):
+                    decision_action_status = ActionStatus.failed
+                    rejection = (
+                        "the completion gate rejected the verdict"
+                        if completion_vetoed
+                        else "completed with no extracted output for a data-extraction goal"
+                    )
+                    decision_reason = f"{decision_reason} — {rejection}" if decision_reason else rejection
+                decision_secrets = (
+                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+                )
+                if decision_secrets:
+                    decision_reason = redact_secrets_from_text(decision_reason, decision_secrets)
+                decision_reason = decision_reason[:_TASKV3_REASONING_MAX_CHARS]
+                decision_screenshot_id: str | None = None
+                if not page_free_validation:
+                    try:
+                        # Bounded like the neighboring persists: the verdict-less death paths reach
+                        # this on exactly the runs whose page is most likely stuck.
+                        async with asyncio.timeout(30):
+                            decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+                            decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
+                                step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
+                            )
+                    except Exception:
+                        LOG.warning(
+                            "task_v3 failed to capture decision screenshot", task_id=task.task_id, exc_info=True
+                        )
+                decision_action = _taskv3_action_for_tool_call(
+                    "finish",
+                    {"status": outcome.status, "reason": decision_reason},
+                    status=decision_action_status,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    # The decision rides on the LAST consumed billable index (or the single Step's own
+                    # order 0): a fresh index would read as a new distinct (task, step_order) pair to
+                    # the workflow-run step budget, the way v1's complete shares its final step.
+                    step_order=max(v3_round_index - 1, 0),
+                    action_order=len(v3_persisted_actions),
+                    description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}finish {outcome.status}",
+                    screenshot_artifact_id=decision_screenshot_id,
+                )
+                v3_persisted_actions.append(decision_action)
+                await app.DATABASE.workflow_params.create_action(action=decision_action)
         completed = task_status == TaskStatus.completed
         if task_status == TaskStatus.canceled:
             step_status = StepStatus.canceled
@@ -2095,7 +2178,15 @@ class ForgeAgent:
         # step even when the task fails. Canceled runs stay unbilled, matching the step engine.
         if step_status == StepStatus.failed and outcome.billable_actions:
             step_status = StepStatus.completed
-        extracted_information = outcome.extracted_output if completed else None
+        # A cap-tripped run that still produced extracted_output (a granted final turn that finished,
+        # or a partial the model had staged before the honest budget_exhausted exit) carries it even
+        # when the terminal status isn't `completed` -- AC-2 is that the cap doesn't discard work the
+        # model already had in hand.
+        extracted_information = (
+            outcome.extracted_output
+            if (completed or (outcome.cap_trip is not None and outcome.extracted_output is not None))
+            else None
+        )
         if completed and task.extracted_information_schema is not None and extracted_information is not None:
             # Repair the model's output against the schema (fill missing required fields, drop
             # hallucinated array items), matching the step engine — but only when the output's shape
@@ -2158,10 +2249,39 @@ class ForgeAgent:
             failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
         else:
             failure_reason = outcome.reason or outcome.status
-        if task_status == TaskStatus.failed:
+        if outcome.cap_trip is not None:
+            # The typed fact a budget cap tripped this run, independent of whether the model went on
+            # to finish on the granted final turn (a completed/failed/terminated verdict) or the loop
+            # gave up honestly without one (budget_exhausted).
+            LOG.info(
+                "task_v3 budget cap tripped",
+                task_id=task.task_id,
+                cap_trip=outcome.cap_trip,
+                final_turn_finished=outcome.status != "budget_exhausted",
+            )
+        # failure_category must agree with failure_reason: a vetoed or extraction-less completion,
+        # a loop_error, and any finish verdict the model delivered on the granted turn all failed
+        # for THEIR reason, not the budget's. BUDGET_EXHAUSTED is reserved for the exits where the
+        # cap genuinely is the cause: the loop gave up without a verdict, or the granted-turn
+        # verdict's reason classifies to nothing (usually the model narrating the truncation).
+        cap_is_the_cause = (
+            outcome.cap_trip is not None
+            and not completion_vetoed
+            and not missing_extraction
+            and outcome.status != "loop_error"
+        )
+        if task_status == TaskStatus.failed and outcome.status == "budget_exhausted" and cap_is_the_cause:
+            failure_category = [
+                {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
+            ]
+        elif task_status == TaskStatus.failed:
             # Same code-level failure classification fail_task records, so v3 failures carry a
             # failure_category like step-engine failures.
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
+            if failure_category is None and cap_is_the_cause:
+                failure_category = [
+                    {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
+                ]
         if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
             # Same user-defined error detection the step engine runs on failure, so workflows that
             # consume configured error codes keep that contract on v3.
@@ -2477,7 +2597,6 @@ class ForgeAgent:
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                         task_block=task_block,
-                        workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
@@ -2750,10 +2869,13 @@ class ForgeAgent:
             )
             return step, detailed_output, next_step
         except FailedToNavigateToUrl as e:
-            # Fail the task if we can't navigate to the URL and send the response
-            LOG.exception(
+            # Fail the task if we can't navigate to the URL and send the response.
+            # Navigation failures are target-site/customer-caused and are surfaced on the run
+            # via failure_reason below, so this is expected-and-handled, not an error.
+            LOG.warning(
                 "Failed to navigate to URL, marking task as failed, and sending webhook response",
                 url=e.url,
+                exc_info=True,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
             is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
@@ -2899,6 +3021,40 @@ class ForgeAgent:
                 download_suffix=task_block.download_suffix if task_block else None,
                 list_files_before=list_files_before,
             )
+            return step, detailed_output, None
+        except (
+            UnknownErrorWhileCreatingBrowserContext,
+            BrowserSessionAlreadyOccupiedError,
+            BrowserSessionClosed,
+            BrowserSessionOwnershipConflict,
+            BrowserTargetClosedError,
+        ) as e:
+            # UnknownErrorWhileCreatingBrowserContext wraps *any* exception raised during
+            # browser-context creation (BrowserFactory.create_browser_context's `except
+            # BaseException`), so unlike its three siblings above it isn't inherently a known
+            # condition. Only mute it when the wrapped cause is itself one of Skyvern's own
+            # named exceptions (e.g. a proxy-capacity error) -- an unrecognized cause (a raw
+            # AttributeError/TypeError from a real bug) stays on the paging path.
+            if isinstance(e, UnknownErrorWhileCreatingBrowserContext) and not isinstance(e.__cause__, SkyvernException):
+                LOG.exception("Got an unexpected exception in step, marking task as failed")
+            else:
+                LOG.warning("Recognized browser/session failure, marking the task as failed", exc_info=True)
+
+            failure_reason = get_user_facing_exception_message(e)
+
+            is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
+            if is_task_marked_as_failed:
+                await self.clean_up_task(
+                    task=task,
+                    last_step=step,
+                    api_key=api_key,
+                    close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
+                )
+            else:
+                LOG.warning("Task isn't marked as failed, after browser/session failure. NOT clean up the task")
             return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
@@ -5055,6 +5211,8 @@ class ForgeAgent:
             # dead target, so returning here avoids trading this for an ERROR from get_content().
             LOG.info("Skipping post-action artifacts because the browser target closed")
             return
+        except SkyvernPageAnalysisTimeout:
+            LOG.warning("Timed out taking the post-action screenshot, skipping it")
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -5088,6 +5246,8 @@ class ForgeAgent:
                             step=step,
                         )
                     )
+        except SkyvernPageAnalysisTimeout:
+            LOG.warning("Timed out reading the post-action html, skipping it")
         except Exception:
             LOG.exception("Failed to record html after action")
 
@@ -6392,9 +6552,11 @@ class ForgeAgent:
             )
         return None
 
-    async def get_failure_reason_for_task(self, task: Task) -> str | None:
+    async def get_failure_reason_for_task(self, task: Task) -> str:
         """
         Find the TerminateAction for the task and return the reasoning.
+        TaskStatus.terminated requires a failure_reason (see validate_update), so this always
+        returns a non-empty string even when no reasoning can be recovered.
         # TODO (kerem): Also return meaningful exceptions when we add them [WYV-311]
         """
         steps = await app.DATABASE.tasks.get_task_steps(
@@ -6410,13 +6572,13 @@ class ForgeAgent:
             if step.output.actions_and_results:
                 for action, action_results in step.output.actions_and_results:
                     if action.action_type == ActionType.TERMINATE:
-                        return action.reasoning
+                        return action.reasoning or "Task was terminated without a stated reason."
 
         LOG.error(
             "Failed to find failure reasoning for task",
             task_id=task.task_id,
         )
-        return None
+        return "Task was terminated, but Skyvern could not determine why."
 
     @traced(name="skyvern.agent.cleanup")
     async def clean_up_task(
@@ -7116,6 +7278,21 @@ class ForgeAgent:
             start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
             duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            # Best-effort engine discriminator (SKY-15499): a bare task's own task_runs row is exact;
+            # a workflow-block task has no task_runs row, so its block row's RESOLVED engine is the
+            # source. Telemetry only — a failed lookup must not touch the terminal update.
+            task_run_type: str | None = None
+            try:
+                if task.workflow_run_id is None:
+                    run = await app.DATABASE.tasks.get_run(task.task_id, organization_id=task.organization_id)
+                    task_run_type = str(run.task_run_type) if run else None
+                else:
+                    block_engine = await app.DATABASE.observer.get_workflow_run_block_engine_by_task_id(
+                        task.task_id, organization_id=task.organization_id
+                    )
+                    task_run_type = _RUN_TYPE_BY_ENGINE.get(block_engine) if block_engine else None
+            except Exception:
+                LOG.warning("task_run_type resolution for duration metrics failed", task_id=task.task_id, exc_info=True)
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -7125,6 +7302,7 @@ class ForgeAgent:
                 task_status=status,
                 organization_id=task.organization_id,
                 failure_reason=failure_reason,
+                task_run_type=task_run_type,
             )
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)

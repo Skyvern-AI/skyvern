@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
@@ -1115,3 +1116,90 @@ def test_custom_ollama_chat_models_skip_max_token_parameters() -> None:
     assert "max_completion_tokens" not in params
     assert "max_tokens" not in params
     assert params["temperature"] == 0.1
+
+
+_LEAK_CANARY = "custom-llm-leak-canary"
+_INVALID_CONFIG_JSON = '{"provider": "gemini", "api_key": "' + _LEAK_CANARY + '"}'
+_ALLOWED_WARNING_KEYS = {"event", "log_level", "custom_llm_id", "organization_id", "error_type"}
+
+
+def _invalid_custom_llm_token(token_id: str, organization_id: str) -> OrganizationAuthToken:
+    now = datetime.now(timezone.utc)
+    return OrganizationAuthToken(
+        id=token_id,
+        organization_id=organization_id,
+        token_type=OrganizationAuthTokenType.custom_llm,
+        token=_INVALID_CONFIG_JSON,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _skipping_warnings(logs: list[dict]) -> list[dict]:
+    return [entry for entry in logs if entry.get("event") == "Skipping invalid custom LLM config"]
+
+
+def _assert_no_payload_leak(logs: list[dict]) -> None:
+    assert _LEAK_CANARY not in repr(logs)
+    for entry in _skipping_warnings(logs):
+        assert set(entry) <= _ALLOWED_WARNING_KEYS
+        for forbidden in ("token", "api_key", "api_base", "config", "exception", "exc_info", "traceback"):
+            assert forbidden not in entry
+
+
+@pytest.mark.asyncio
+async def test_load_all_orgs_warns_with_organization_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(custom_llm_registry, "_custom_llm_configs", {})
+    organizations = FakeOrganizationsRepository()
+    organizations.tokens.append(_invalid_custom_llm_token("oat_batch_invalid", "o_batch"))
+    database = SimpleNamespace(organizations=organizations)
+
+    with structlog.testing.capture_logs() as logs:
+        await custom_llm_registry.load_custom_llm_configs_from_database(database)
+
+    warnings = _skipping_warnings(logs)
+    assert len(warnings) == 1
+    assert warnings[0]["organization_id"] == "o_batch"
+    assert warnings[0]["custom_llm_id"] == "oat_batch_invalid"
+    assert warnings[0]["error_type"] == "ValidationError"
+    _assert_no_payload_leak(logs)
+
+
+@pytest.mark.asyncio
+async def test_load_org_configs_warns_with_organization_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(custom_llm_registry, "_custom_llm_configs", {})
+    organizations = FakeOrganizationsRepository()
+    organizations.tokens.append(_invalid_custom_llm_token("oat_org_invalid", "o_single"))
+    database = SimpleNamespace(organizations=organizations)
+
+    with structlog.testing.capture_logs() as logs:
+        await custom_llm_registry.load_custom_llm_configs_for_organization(database, "o_single")
+
+    warnings = _skipping_warnings(logs)
+    assert len(warnings) == 1
+    assert warnings[0]["organization_id"] == "o_single"
+    assert warnings[0]["custom_llm_id"] == "oat_org_invalid"
+    assert warnings[0]["error_type"] == "ValidationError"
+    _assert_no_payload_leak(logs)
+
+
+@pytest.mark.asyncio
+async def test_ensure_registered_warns_with_organization_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(custom_llm_registry, "_custom_llm_configs", {})
+    organizations = FakeOrganizationsRepository()
+    organizations.tokens.append(_invalid_custom_llm_token("oat_ensure_invalid", "o_ensure"))
+    database = SimpleNamespace(organizations=organizations)
+
+    with structlog.testing.capture_logs() as logs:
+        registered = await custom_llm_registry.ensure_custom_llm_registered_for_org(
+            "oat_ensure_invalid", "o_ensure", database
+        )
+
+    assert registered is False
+    warnings = _skipping_warnings(logs)
+    assert len(warnings) == 1
+    assert warnings[0]["organization_id"] == "o_ensure"
+    assert warnings[0]["custom_llm_id"] == "oat_ensure_invalid"
+    assert warnings[0]["error_type"] == "ValidationError"
+    _assert_no_payload_leak(logs)

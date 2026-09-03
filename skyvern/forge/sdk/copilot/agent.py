@@ -100,7 +100,6 @@ from skyvern.forge.sdk.copilot.context import (
     record_approved_credentials_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
-from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     _elapsed_run_seconds,
@@ -182,11 +181,17 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    MINIMAL_CANCEL_STOP,
+    TESTED_DRAFT_PRESERVED,
+    UNTESTED_DRAFT_PRESERVED,
+    InterruptedTurnFacts,
     TerminalCause,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
+    is_interim_run_outcome,
     reason_in_reply_shadow,
     render_terminal_message,
+    run_start_unresolved,
     select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
@@ -210,6 +215,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CANCEL_TERMINAL_REASON,
+    UNEXPECTED_ERROR_TERMINAL_REASON,
     apply_repeated_reply_guard,
     connected_account_choice_context,
     selected_connected_account_id,
@@ -1479,6 +1485,13 @@ def _terminal_envelope_run_outcomes(ctx: CopilotContext) -> list[RecordedRunOutc
     return [recorded] if isinstance(recorded, RecordedRunOutcome) else []
 
 
+def _blocks_run_this_turn(ctx: CopilotContext) -> int | None:
+    """None while a started run has no recorded result: an unresolved run's block count is unknown, not zero."""
+    if run_start_unresolved(_terminal_envelope_run_outcomes(ctx)):
+        return None
+    return len(ctx.executed_block_labels)
+
+
 def _terminal_halt_fields(ctx: CopilotContext) -> tuple[str | None, str | None]:
     halt = getattr(ctx, "turn_halt", None)
     if not isinstance(halt, TurnHalt):
@@ -1525,13 +1538,15 @@ def _draft_ran_on_current_source(
     facts: NarrativeTurnFacts, unresolved_failure: UnresolvedRuntimeFailure | None
 ) -> bool:
     """A tested draft claims full current-source coverage and a lifecycle that contradicts nothing:
-    a halted turn, an unfinished or unconfirmed run, or an open block failure each disqualify it.
-    ``runCompleted`` is None when no run is anchored to this turn, leaving the source-bound receipts
-    as the only claim."""
+    a halted turn, an unfinished, unresolved or unconfirmed run, or an open block failure each
+    disqualify it. ``runCompleted`` is None both when no run is anchored to this turn and when a
+    started run never resolved, so only the former leaves the source-bound receipts as the claim."""
     authored = facts.get("authoredBlockCount")
     if not facts["factsAvailable"] or not authored or facts.get("matchingSourceBlockCount") != authored:
         return False
     if facts["terminalCause"] is not None or unresolved_failure is not None:
+        return False
+    if facts["runId"] is not None and facts["runCompleted"] is None:
         return False
     return facts["runCompleted"] is not False and facts["evaluationState"] != "not_demonstrated"
 
@@ -1572,9 +1587,12 @@ def _turn_fact_bundle(
     unresolved_failure: UnresolvedRuntimeFailure | None = None,
 ) -> NarrativeTurnFacts:
     run_id = run_outcome.workflow_run_id if run_outcome is not None else None
+    # A run start with no result behind it names a run without adjudicating one, so the
+    # evaluation slot stays empty while the lifecycle keeps the outcome's own unfinished state.
+    resolved_outcome = None if is_interim_run_outcome(run_outcome) else run_outcome
     facts: NarrativeTurnFacts = {
         "factsAvailable": review is not None,
-        "evaluationState": run_outcome.verdict if run_outcome is not None else None,
+        "evaluationState": resolved_outcome.verdict if resolved_outcome is not None else None,
         "runId": (run_id.strip() or None) if isinstance(run_id, str) else None,
         "runCompleted": run_outcome.run_completed if run_outcome is not None else None,
         "terminalCause": terminal_cause,
@@ -1599,7 +1617,7 @@ def _turn_facts_for_context(
         review,
         select_run_outcome_anchor(_terminal_envelope_run_outcomes(ctx)),
         _terminal_cause_for_context(ctx),
-        len(ctx.executed_block_labels),
+        _blocks_run_this_turn(ctx),
         # The proposal these facts describe, not the turn-start persisted workflow. The terminal
         # seam asks whether the workflow the user can run today still carries the failure and is
         # right to read persistence; this pill claims the draft ran clean, so a failure the draft
@@ -1622,12 +1640,35 @@ def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | 
     return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
 
 
+def _crash_exit_interruption(
+    ctx: CopilotContext,
+    turn_outcome: TurnOutcome | None,
+    failed_operation: BuildTestFailedOperation | None,
+) -> InterruptedTurnFacts | None:
+    """A turn that died in the error handler stopped; it never reported a test result.
+
+    Scoped to a crash that inherited a `failed_operation` from an earlier build test in the same
+    turn, because that latch is the only thing that would otherwise author the reply. A crash with
+    no latch already renders the recoverable-failure text, which names an error reference this
+    would drop. The latch itself is kept: it still drives the unverified/unapplied terminal state.
+    """
+    if failed_operation is None:
+        return None
+    if turn_outcome is None or turn_outcome.terminal_reason != UNEXPECTED_ERROR_TERMINAL_REASON:
+        return None
+    # Only the identity is known here. ``workflow_persisted`` is always False under staging, which
+    # is the population this path serves, and ``last_workflow`` is stamped version=1 by the YAML
+    # parse rather than carrying the workflow's real version, so both would state something about
+    # the turn that this site cannot observe.
+    return InterruptedTurnFacts(workflow_permanent_id=ctx.workflow_permanent_id)
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
     verified: bool,
     workflow_applied: bool,
-    proposal_disposition: str | None,
+    proposal_disposition: ProposalDisposition | None,
     run_outcomes: Sequence[RecordedRunOutcome],
     blocker_reason: str | None,
     halt_kind: str | None,
@@ -1640,6 +1681,7 @@ def _assemble_terminal_envelope_safe(
     failed_operation: BuildTestFailedOperation | None = None,
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
+    interruption: InterruptedTurnFacts | None = None,
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1658,6 +1700,7 @@ def _assemble_terminal_envelope_safe(
             failed_operation=failed_operation,
             connect_failure=connect_failure,
             proposal_present=proposal_present,
+            interruption=interruption,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1751,7 +1794,9 @@ def _make_agent_result(
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
     raw_disposition = kwargs.get("proposal_disposition")
-    proposal_disposition: str | None = raw_disposition if isinstance(raw_disposition, str) else None
+    proposal_disposition: ProposalDisposition | None = (
+        raw_disposition if raw_disposition in get_args(ProposalDisposition) else None
+    )
     if turn_facts is not None and proposal_disposition == "review_tested" and not turn_facts["ranCleanOnCurrentSource"]:
         proposal_disposition = "review_untested"
         kwargs["proposal_disposition"] = proposal_disposition
@@ -1824,16 +1869,17 @@ def _make_agent_result(
     unresolved_failure = None
     detector_disposition = "not_evaluated"
     if ctx is not None and note_eligible:
-        # Only the workflow the user can actually run clears a failure. A staged proposal may be
-        # shown, tested, or auto-applied later, but this terminal is assembled before the route
-        # commits it, so at claim time it is not yet what anyone would run. `workflow_was_persisted`
-        # records a mid-turn canonical write that can still be rolled back, so it proves nothing here.
+        # Only the workflow the user can actually run clears a failure, and while one is saved a
+        # staged proposal is not it: this terminal is assembled before the route commits the proposal,
+        # and `workflow_was_persisted` records a mid-turn write that can still be rolled back. With
+        # nothing saved there is no such workflow, so a run's own receipts stand in -- hence the
+        # persisted flag below, which says that is what an absent report means here.
         # Deliberately a different question from the tested pill above, which judges the proposal:
         # both can hold at once, and a turn that repairs a block it authored this turn will say the
         # draft tested clean while its saved workflow still carries the failure.
         reported_workflow_yaml = ctx.persisted_workflow_yaml
         unresolved_failure, detector_disposition = unresolved_runtime_block_failure_with_disposition(
-            ctx, reported_workflow_yaml=reported_workflow_yaml
+            ctx, reported_workflow_yaml=reported_workflow_yaml, reported_workflow_is_persisted=True
         )
     if ctx is not None and history_has_runtime_block_failure(ctx):
         # A turn that sets a runtime failure aside otherwise leaves no record of having done so, which
@@ -1874,7 +1920,7 @@ def _make_agent_result(
             response_type=response_type_value,
             verified=bool(outcome_fully_verified(ctx)),
             workflow_applied=False,
-            proposal_disposition=proposal_disposition if isinstance(proposal_disposition, str) else None,
+            proposal_disposition=proposal_disposition,
             run_outcomes=_terminal_envelope_run_outcomes(ctx),
             blocker_reason=blocker_reason,
             halt_kind=halt_kind,
@@ -1883,13 +1929,16 @@ def _make_agent_result(
             workflow_attempted=ctx.has_genuine_workflow_attempt(),
             final_message=str(kwargs.get("user_response") or ""),
             terminal_cause=terminal_cause,
-            blocks_run_this_turn=len(ctx.executed_block_labels),
+            blocks_run_this_turn=_blocks_run_this_turn(ctx),
             failed_operation=failed_operation,
             connect_failure=connect_failure,
             proposal_present=result_carries_workflow,
+            interruption=_crash_exit_interruption(ctx, turn_outcome, failed_operation),
         )
     if terminal_envelope is not None and (
-        terminal_envelope.get("failed_operation") is not None or terminal_envelope.get("connect_failure") is not None
+        terminal_envelope.get("failed_operation") is not None
+        or terminal_envelope.get("connect_failure") is not None
+        or terminal_envelope.get("interruption") is not None
     ):
         envelope = TerminalOutcomeEnvelope.model_validate(terminal_envelope)
         terminal_message, replaced = render_terminal_message(
@@ -2210,6 +2259,9 @@ async def _run_end_to_end_test_turn(
                 handoff_data["overall_status"] = run["status"]
     elif isinstance(sanitized_data, dict) and isinstance(sanitized_data.get("build_test_packet_omitted"), str):
         handoff_data["build_test_packet_omitted"] = sanitized_data["build_test_packet_omitted"]
+    change_identity = sanitized_data.get("prior_attempt_change_identity") if isinstance(sanitized_data, dict) else None
+    if isinstance(change_identity, dict) and change_identity:
+        handoff_data["prior_attempt_change_identity"] = change_identity
     control_signal = sanitized_data.get("control_signal") if isinstance(sanitized_data, dict) else None
     control_kind = control_signal.get("kind") if isinstance(control_signal, dict) else None
     watchdog_control_kinds = {
@@ -2435,12 +2487,10 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
-_CANCEL_REPLY_DEFAULT = "Cancelled by user."
-_CANCEL_REPLY_UNVALIDATED = (
-    "Cancelled. I have a draft workflow you can keep — accept it to save "
-    "(note: it hasn't been verified end-to-end), or discard."
-)
-_CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
+_CANCEL_REPLY_DEFAULT = MINIMAL_CANCEL_STOP
+_CANCEL_REPLY_ACCEPT_OR_DISCARD = "Accept it to save, or discard."
+_CANCEL_REPLY_UNVALIDATED = f"{MINIMAL_CANCEL_STOP} {UNTESTED_DRAFT_PRESERVED} {_CANCEL_REPLY_ACCEPT_OR_DISCARD}"
+_CANCEL_REPLY_TESTED = f"{MINIMAL_CANCEL_STOP} {TESTED_DRAFT_PRESERVED} {_CANCEL_REPLY_ACCEPT_OR_DISCARD}"
 _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
     "I wasn't able to produce a workflow proposal in this turn, and I couldn't identify which details were missing "
     "from this turn. Please retry with the target site, page, or workflow requirement."
@@ -3212,7 +3262,7 @@ def _build_unexpected_error_exit_result(
         default_reply=default_reply,
         unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
         tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
-        terminal_reason="unexpected_error",
+        terminal_reason=UNEXPECTED_ERROR_TERMINAL_REASON,
     )
     LOG.warning(
         "Copilot unexpected error translated to recoverable reply",
@@ -3478,6 +3528,7 @@ async def _translate_to_agent_result(
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=inline_diagnostics,
                     require_full_workflow_test=chat_request.product_action == "test_end_to_end",
+                    evaluated_reason_codes=list(inline_raw_verdict.reason_codes),
                 )
             # REPLACE_WORKFLOW bypasses the update_workflow tool guardrail, so
             # policy and post-emission rejects run here before YAML processing.
@@ -3745,6 +3796,7 @@ async def _translate_to_agent_result(
             prior_workflow_yaml=chat_request.workflow_yaml,
             output_policy_diagnostics=output_policy_diagnostics,
             require_full_workflow_test=direct_test_handoff,
+            evaluated_reason_codes=list(raw_output_policy_verdict.reason_codes),
         )
 
     final_user_response = str(user_response)
@@ -4248,6 +4300,19 @@ def _output_policy_diagnostics_from_guardrail_exception(exc: BaseException) -> d
     return {key: data[key] for key in keys if key in data}
 
 
+def _output_policy_reason_codes_from_guardrail_exception(exc: BaseException) -> list[OutputPolicyReason]:
+    diagnostics = _output_policy_diagnostics_from_guardrail_exception(exc)
+    if diagnostics is None:
+        return list(_output_policy_verdict_from_guardrail_exception(exc).reason_codes)
+    reason_codes: list[OutputPolicyReason] = []
+    for raw_reason in diagnostics.get("raw_reason_codes") or []:
+        try:
+            reason_codes.append(OutputPolicyReason(str(raw_reason)))
+        except ValueError:
+            continue
+    return reason_codes or list(_output_policy_verdict_from_guardrail_exception(exc).reason_codes)
+
+
 def _unapproved_credential_reference_reply() -> str:
     # "Credentials UI" is a credential_prompt_reason() text marker the FE credential card keys off, so
     # this reply must keep it verbatim. One sentence, no candidate enumeration: the card renders the
@@ -4272,6 +4337,7 @@ def _build_output_policy_blocked_result(
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
     require_full_workflow_test: bool = False,
+    evaluated_reason_codes: list[OutputPolicyReason] | None = None,
 ) -> AgentResult:
     # A blocker turn whose signal owns final rendering never ships a proposal;
     # steering-only blockers should still flow through normal output-policy
@@ -4282,9 +4348,15 @@ def _build_output_policy_blocked_result(
         ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
     )
     preserved_workflow_yaml = ctx.last_workflow_yaml if preserved_workflow is not None else None
+    output_policy_reasons = list(verdict.reason_codes if evaluated_reason_codes is None else evaluated_reason_codes)
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
-        "output-policy blocked final output: " + ", ".join(reason.value for reason in verdict.reason_codes)
+        "output-policy blocked final output: " + ", ".join(reason.value for reason in output_policy_reasons)
+    )
+    LOG.warning(
+        "copilot output policy blocked final output",
+        log_code="copilot_output_policy_block",
+        **{"copilot.output_policy_reasons": [reason.value for reason in output_policy_reasons]},
     )
     add_saved_draft_copy = False
     fallback_user_response: str | None = None
@@ -4390,6 +4462,7 @@ def _build_output_policy_blocked_result(
                 reason_code="output_policy_block",
                 terminal_reason="output_policy_block",
             )
+    output_policy_outcome = output_policy_outcome.model_copy(update={"output_policy_reasons": output_policy_reasons})
     proposal_tested = ctx.last_full_workflow_test_ok if require_full_workflow_test else ctx.last_test_ok
     return _make_agent_result(
         ctx,
@@ -4456,6 +4529,7 @@ async def run_copilot_agent(
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
+    auto_accept: bool | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4501,6 +4575,7 @@ async def run_copilot_agent(
                     eval_capture_case_id=eval_capture_case_id,
                     eval_mode=eval_mode,
                     eval_entrypoint_url=eval_entrypoint_url,
+                    auto_accept=auto_accept,
                 )
                 return result
             except Exception as exc:
@@ -4601,6 +4676,7 @@ async def _run_copilot_turn_impl(
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
+    auto_accept: bool | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     copilot_config = config_for_eval_mode(copilot_config, eval_mode)
@@ -4665,6 +4741,7 @@ async def _run_copilot_turn_impl(
         api_key=api_key,
         user_message=chat_request.message,
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+        auto_accept=auto_accept,
         eval_capture_case_id=eval_capture_case_id,
         eval_mode=eval_mode,
         turn_id=turn_id,
@@ -4781,16 +4858,12 @@ async def _run_copilot_turn_impl(
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
-        preflight_resolution = None
-        if credential_pause_reason(ctx) is not None:
-            preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
-        if preflight_resolution is None:
-            return _build_request_policy_clarification_result(
-                request_policy,
-                prior_global_llm_context=global_llm_context,
-                prior_workflow_yaml=chat_request.workflow_yaml,
-                ctx=ctx,
-            )
+        return _build_request_policy_clarification_result(
+            request_policy,
+            prior_global_llm_context=global_llm_context,
+            prior_workflow_yaml=chat_request.workflow_yaml,
+            ctx=ctx,
+        )
     if request_policy is None:
         raise CopilotRequestPolicyMissingError()
 
@@ -5077,6 +5150,7 @@ async def _run_copilot_turn_impl(
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=_output_policy_diagnostics_from_guardrail_exception(exc),
                     require_full_workflow_test=chat_request.product_action == "test_end_to_end",
+                    evaluated_reason_codes=_output_policy_reason_codes_from_guardrail_exception(exc),
                 )
             except CopilotTurnHalt as exc:
                 LOG.info(

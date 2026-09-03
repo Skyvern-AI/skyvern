@@ -227,15 +227,14 @@ describe("useResolveDefaultGoogleSheetsCredential (SKY-11219)", () => {
     });
   });
 
-  test("ignores partial Sheets grants that are missing Drive scopes", () => {
+  test("fills a grant that carries only the Sheets data scope, as the copilot reads it", () => {
     mockCredentials = [
       credential("cred_spreadsheets_only", "active", [GOOGLE_SHEETS_SCOPE]),
-      credential("cred_sheets"),
     ];
     render(<Harness nodes={[writeNode("g1", "")]} />);
 
     expect(updateNodeData).toHaveBeenCalledWith("g1", {
-      credentialId: "cred_sheets",
+      credentialId: "cred_spreadsheets_only",
     });
   });
 

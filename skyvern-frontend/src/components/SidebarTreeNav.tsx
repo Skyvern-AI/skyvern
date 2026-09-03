@@ -476,6 +476,11 @@ function SidebarTreeNav({ items, collapsed: collapsedOverride }: Props) {
                 {!collapsed && (
                   <span className="min-w-0 flex-1 truncate">{item.label}</span>
                 )}
+                {!collapsed && item.badge ? (
+                  <span className="rounded bg-neutral-200 px-1.5 py-0.5 text-[9px] font-medium uppercase leading-none text-neutral-500 dark:bg-white/[0.06] dark:text-neutral-400">
+                    {item.badge}
+                  </span>
+                ) : null}
               </SidebarNavLink>
             )}
 

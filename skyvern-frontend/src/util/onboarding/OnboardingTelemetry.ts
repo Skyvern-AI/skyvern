@@ -18,6 +18,7 @@ type TourLayer = 1 | 2;
 type QuestionnaireShownInput = {
   primaryIntent: QuestionnaireUserIntentV1 | null;
   promptReason: "initial";
+  organizationId: string | null;
 };
 
 type QuestionnaireResponseInput = {
@@ -41,15 +42,20 @@ type QuestionnaireUpdatedInput = QuestionnaireAnswerInput & {
 
 const ONBOARDING_STEP_VERSION = "v1";
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+// The org group registers after GET /organizations/ resolves and can lose the race
+// against a fresh signup's first onboarding event, so a caller-provided org wins.
 function capture(event: string, properties: Properties): boolean {
-  let organizationId: string | undefined;
-  try {
-    const groupId = posthog.getGroups().organization;
-    if (typeof groupId === "string" && groupId.length > 0) {
-      organizationId = groupId;
+  let organizationId = nonEmptyString(properties.organization_id);
+  if (organizationId === undefined) {
+    try {
+      organizationId = nonEmptyString(posthog.getGroups().organization);
+    } catch {
+      organizationId = undefined;
     }
-  } catch {
-    organizationId = undefined;
   }
 
   try {
@@ -178,6 +184,7 @@ function questionnaireShown(input: QuestionnaireShownInput): boolean {
     surface: "get_started_modal",
     primary_intent: input.primaryIntent,
     prompt_reason: input.promptReason,
+    ...(input.organizationId ? { organization_id: input.organizationId } : {}),
   });
 }
 

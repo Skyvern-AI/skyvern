@@ -545,3 +545,16 @@ async def test_shielded_finalize_skipped_when_pre_finally_status_unset() -> None
         await task
 
     assert not finalize_called, "finalize must not run when pre_finally_status is unset"
+
+
+def test_lease_failure_category_persists_only_typed_browser_loss() -> None:
+    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionStartupTimeout
+    from skyvern.forge.sdk.workflow.service import _browser_lease_failure_category
+
+    closed = _browser_lease_failure_category(BrowserSessionClosed("pbs_x"))
+    timeout = _browser_lease_failure_category(BrowserSessionStartupTimeout("pbs_x"))
+
+    assert closed is not None and closed[0]["category"] == "BROWSER_ERROR"
+    assert closed[0]["reason_code"] == "browser_session_closed"
+    assert timeout is not None and timeout[0]["reason_code"] == "browser_session_startup_timeout"
+    assert _browser_lease_failure_category(RuntimeError("a required workflow parameter was not provided")) is None

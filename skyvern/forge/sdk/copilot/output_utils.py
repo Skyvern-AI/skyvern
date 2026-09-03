@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY = "_copilot_internal_run_cancelled_by_watchdog"
+_INTERNAL_RUN_OUTCOME_RECORDED_KEY = "_copilot_internal_run_outcome_recorded"
+_INTERNAL_GOAL_PATH_OMISSIONS_KEY = "_copilot_internal_goal_path_omissions"
 _BASE64_IMAGE_OMITTED_MESSAGE = "[base64 image omitted — screenshot was taken successfully]"
 BUILD_TEST_PACKET_KEY = "build_test_packet"
 
@@ -658,11 +660,11 @@ def _compact_packet_for_aggregate_limit(
     )
     outputs: list[BuildTestPacketRegisteredOutput] = []
     for output in packet.registered_outputs[:6]:
-        rendered = json.dumps(output.value, ensure_ascii=False, separators=(",", ":"))
+        rendered = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
         outputs.append(
             output.model_copy(
                 update={
-                    "value": rendered[:197] + "..." if len(rendered) > 200 else output.value,
+                    "output": rendered[:197] + "..." if len(rendered) > 200 else output.output,
                     "value_complete": output.value_complete and len(rendered) <= 200,
                 }
             )
@@ -820,51 +822,32 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
 
     registered_outputs: list[BuildTestPacketRegisteredOutput] = []
     for output in packet.registered_outputs[:_BUILD_TEST_OUTPUT_MAX_ITEMS]:
-        rendered_value = json.dumps(output.value, ensure_ascii=False, separators=(",", ":"))
-        value = output.value
+        rendered_output = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
+        block_output = output.output
         value_complete = output.value_complete
-        if len(rendered_value) > _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS:
-            value = rendered_value[: _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS - 3] + "..."
+        if len(rendered_output) > _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS:
+            block_output = rendered_output[: _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS - 3] + "..."
             value_complete = False
             _append_omission(
                 notices,
-                "registered output "
-                f"{output.output_parameter_key or output.output_parameter_id or '(unnamed)'} shortened.",
+                f"registered output {output.label or '(unlabeled)'} shortened.",
             )
         registered_outputs.append(
             output.model_copy(
                 update={
-                    "workflow_run_id": _bounded_packet_string(
-                        output.workflow_run_id,
-                        field_name="registered_outputs[].workflow_run_id",
+                    "label": _bounded_packet_string(
+                        output.label,
+                        field_name="registered_outputs[].label",
                         max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                         notices=notices,
                     ),
-                    "output_parameter_id": _bounded_packet_string(
-                        output.output_parameter_id,
-                        field_name="registered_outputs[].output_parameter_id",
+                    "status": _bounded_packet_string(
+                        output.status,
+                        field_name="registered_outputs[].status",
                         max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                         notices=notices,
                     ),
-                    "output_parameter_key": _bounded_packet_string(
-                        output.output_parameter_key,
-                        field_name="registered_outputs[].output_parameter_key",
-                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
-                        notices=notices,
-                    ),
-                    "block_label": _bounded_packet_string(
-                        output.block_label,
-                        field_name="registered_outputs[].block_label",
-                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
-                        notices=notices,
-                    ),
-                    "block_type": _bounded_packet_string(
-                        output.block_type,
-                        field_name="registered_outputs[].block_type",
-                        max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
-                        notices=notices,
-                    ),
-                    "value": value,
+                    "output": block_output,
                     "value_complete": value_complete,
                 }
             )
@@ -1097,9 +1080,11 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
     if not packet.action_observations:
         notices.append("action_observations empty: no same-run typed action observation was recorded.")
     if not packet.registered_outputs:
-        notices.append("registered_outputs empty: no output parameter value was recorded.")
+        notices.append(
+            "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
+        )
     redacted_output_count = sum(
-        REDACTED_SECRET_PLACEHOLDER in json.dumps(output.value, ensure_ascii=False)
+        REDACTED_SECRET_PLACEHOLDER in json.dumps(output.output, ensure_ascii=False)
         for output in packet.registered_outputs
     )
     if redacted_output_count:
@@ -1180,7 +1165,7 @@ def _remove_registered_output_copies(data: dict[str, Any]) -> dict[str, Any]:
                 registered_output_locations.add((block_label, output_key))
 
     blocks = data.get("blocks")
-    if not isinstance(blocks, list) or not registered_output_locations:
+    if not isinstance(blocks, list):
         return data
     sanitized_blocks: list[Any] = []
     for raw_block in blocks:
@@ -1188,9 +1173,13 @@ def _remove_registered_output_copies(data: dict[str, Any]) -> dict[str, Any]:
             sanitized_blocks.append(raw_block)
             continue
         block = dict(raw_block)
+        recorded_output_present = "output" in block
+        block.pop("output", None)
         block_label = block.get("label")
         extracted_data = block.get("extracted_data")
-        if isinstance(block_label, str) and isinstance(extracted_data, dict):
+        if recorded_output_present:
+            block.pop("extracted_data", None)
+        elif isinstance(block_label, str) and isinstance(extracted_data, dict):
             registered_keys = {
                 output_key
                 for registered_label, output_key in registered_output_locations
@@ -1216,6 +1205,8 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             "timing_ms",
             "_workflow",
             _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+            _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
+            _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
         ),
         drop_data_keys=("sdk_equivalent", "authored_locator_observations"),
         replacement_fields={"screenshot_base64": _BASE64_IMAGE_OMITTED_MESSAGE},
@@ -1270,6 +1261,15 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                         **({"screenshot_b64": _BASE64_IMAGE_OMITTED_MESSAGE} if "screenshot_b64" in block else {}),
                     }
                     if isinstance(block, dict)
+                    else block
+                    for block in blocks
+                ]
+        if tool_name == "get_run_results" and not had_build_test_packet:
+            blocks = data.get("blocks")
+            if isinstance(blocks, list):
+                data["blocks"] = [
+                    {**block, "output": truncate_output(block["output"])}
+                    if isinstance(block, dict) and "output" in block
                     else block
                     for block in blocks
                 ]
@@ -1545,6 +1545,12 @@ def _describe_value_shape(value: Any) -> str:
     return "value"
 
 
+def _workflow_write_phrase(data: dict[str, Any]) -> str:
+    """A write stages a proposal — only the end of the turn can persist it — so the summary frame
+    must not say the workflow was updated when the tool result it summarizes says ``staged``."""
+    return "Staged a workflow draft" if data.get("persistence") else "Workflow updated"
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
     the activity feed; the default leaves them verbatim because this string is parsed
@@ -1560,17 +1566,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     data = raw_data if isinstance(raw_data, dict) else {}
 
     if tool_name == "update_workflow":
-        return f"Workflow updated ({data.get('block_count', '?')} blocks)"
+        return f"{_workflow_write_phrase(data)} ({data.get('block_count', '?')} blocks)"
     if tool_name == "update_and_run_blocks" or (tool_name == "edit_block_and_run" and data.get("skipped_run")):
         if not isinstance(raw_data, dict):
             return "OK"
         if data.get("skipped_run"):
-            return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
+            return f"{_workflow_write_phrase(data)} ({data.get('block_count', '?')} blocks); browser run skipped"
         # Non-skip result is run-blocks-shaped (overall_status, no block_count).
+        ran = "Staged a workflow draft and ran it" if data.get("persistence") else "Updated the workflow and ran it"
         status = data.get("overall_status") or data.get("status")
         if status:
-            return f"Updated the workflow and ran it: {status}"
-        return "Updated the workflow and ran it"
+            return f"{ran}: {status}"
+        return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
             credential = data.get("credential")
@@ -1719,6 +1726,7 @@ _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
         "evaluate",
         "select_option",
         "list_credentials",
+        "request_credential",
         # The server-authored display label already names the operation and its
         # target block; a bare "OK" summary would render instead of it.
         "edit_block",

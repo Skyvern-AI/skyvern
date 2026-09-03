@@ -807,6 +807,7 @@ async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction
         *,
         evidence: dict[str, Any],
         screenshot_b64: str,
+        requested_targets: tuple[str, ...] = (),
     ) -> tuple[dict[str, Any], None]:
         assert screenshot_b64 == _VALID_PNG_B64
         assert evidence["visual_obstruction_candidates"][0]["coverage"] == "viewport"
@@ -878,6 +879,7 @@ async def test_post_run_visual_fallback_binds_the_observed_run_session(
         *,
         evidence: dict[str, Any],
         screenshot_b64: str,
+        requested_targets: tuple[str, ...] = (),
     ) -> tuple[dict[str, Any], None]:
         assert screenshot_b64 == _VALID_PNG_B64
         return {

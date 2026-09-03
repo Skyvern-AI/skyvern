@@ -32,7 +32,7 @@ import {
 import {
   GOOGLE_DRIVE_REQUIRED_SCOPES,
   GOOGLE_GMAIL_REQUIRED_SCOPES,
-  GOOGLE_SHEETS_REQUIRED_SCOPES,
+  GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
 } from "@/util/googleScopes";
 import {
   buildGoogleOAuthRedirectUri,
@@ -46,21 +46,21 @@ const integrations = [
     title: "Google Sheets",
     description: "Read, append, and update spreadsheet data from workflows.",
     scopeProfile: "google_sheets",
-    requiredScopes: GOOGLE_SHEETS_REQUIRED_SCOPES,
+    capabilityScopes: GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
   },
   {
     id: "gmail",
     title: "Gmail",
     description: "Read verification emails for OTP polling.",
     scopeProfile: "gmail",
-    requiredScopes: GOOGLE_GMAIL_REQUIRED_SCOPES,
+    capabilityScopes: GOOGLE_GMAIL_REQUIRED_SCOPES,
   },
   {
     id: "google_drive",
     title: "Google Drive",
     description: "Upload generated files to connected Drive accounts.",
     scopeProfile: "google_drive",
-    requiredScopes: GOOGLE_DRIVE_REQUIRED_SCOPES,
+    capabilityScopes: GOOGLE_DRIVE_REQUIRED_SCOPES,
   },
 ] as const;
 
@@ -128,7 +128,7 @@ function Integrations() {
           const matchingCredentials = credentials.filter((credential) =>
             hasGoogleOAuthCredentialScopes(
               credential,
-              Array.from(integration.requiredScopes),
+              Array.from(integration.capabilityScopes),
             ),
           );
           const activeCount = matchingCredentials.filter(

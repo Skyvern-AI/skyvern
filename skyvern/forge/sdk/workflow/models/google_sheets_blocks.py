@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import structlog
 from jinja2 import UndefinedError
@@ -156,25 +156,30 @@ class GoogleSheetsReadBlock(Block):
     has_header_row: bool = True
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "credential_id",
+            "range",
+            "sheet_name",
+            "spreadsheet_url",
+        }
+    )
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
     def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.spreadsheet_url:
-            self.spreadsheet_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.spreadsheet_url, workflow_run_context
+            self.spreadsheet_url = self.render_templatable_field(
+                "spreadsheet_url", self.spreadsheet_url, workflow_run_context
             )
         if self.sheet_name:
-            self.sheet_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.sheet_name, workflow_run_context
-            )
+            self.sheet_name = self.render_templatable_field("sheet_name", self.sheet_name, workflow_run_context)
         if self.range:
-            self.range = self.format_block_parameter_template_from_workflow_run_context(
-                self.range, workflow_run_context
-            )
+            self.range = self.render_templatable_field("range", self.range, workflow_run_context)
         if self.credential_id:
-            self.credential_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.credential_id, workflow_run_context
+            self.credential_id = self.render_templatable_field(
+                "credential_id", self.credential_id, workflow_run_context
             )
 
     async def execute(
@@ -190,13 +195,13 @@ class GoogleSheetsReadBlock(Block):
         try:
             self._render_templates(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if not self.credential_id:
@@ -544,25 +549,31 @@ class GoogleSheetsWriteBlock(Block):
     create_sheet_if_missing: bool = False
     parameters: list[PARAMETER_TYPE] = []
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "credential_id",
+            "range",
+            "sheet_name",
+            "spreadsheet_url",
+            "values",
+        }
+    )
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
     def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.spreadsheet_url:
-            self.spreadsheet_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.spreadsheet_url, workflow_run_context
+            self.spreadsheet_url = self.render_templatable_field(
+                "spreadsheet_url", self.spreadsheet_url, workflow_run_context
             )
         if self.sheet_name:
-            self.sheet_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.sheet_name, workflow_run_context
-            )
+            self.sheet_name = self.render_templatable_field("sheet_name", self.sheet_name, workflow_run_context)
         if self.range:
-            self.range = self.format_block_parameter_template_from_workflow_run_context(
-                self.range, workflow_run_context
-            )
+            self.range = self.render_templatable_field("range", self.range, workflow_run_context)
         if self.credential_id:
-            self.credential_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.credential_id, workflow_run_context
+            self.credential_id = self.render_templatable_field(
+                "credential_id", self.credential_id, workflow_run_context
             )
         if self.values:
             self.values = self._render_values_or_raise(workflow_run_context)
@@ -571,7 +582,8 @@ class GoogleSheetsWriteBlock(Block):
         """A reference no upstream block answered would otherwise render as "" and be appended as a
         blank cell the Sheets API reports as a successful write. `| default(...)` passes an empty."""
         try:
-            return self.format_block_parameter_template_from_workflow_run_context(
+            return self.render_templatable_field(
+                "values",
                 self.values,
                 workflow_run_context,
                 env=jinja_json_finalize_required_binding_env,
@@ -684,13 +696,13 @@ class GoogleSheetsWriteBlock(Block):
         try:
             self._render_templates(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if not self.credential_id:

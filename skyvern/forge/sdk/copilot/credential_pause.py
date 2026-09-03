@@ -1,8 +1,9 @@
 """Mid-loop pause for copilot BUILD turns blocked on a missing credential.
 
-Parks between ``Runner.run_streamed`` iterations at the enforcement finalize
-seam (see ``run_with_enforcement``) so the SSE connection stays open while
-the frontend surfaces a credential-connect card. Resume transport is a
+Parks either inside the ``request_credential`` tool call the model makes, or
+between ``Runner.run_streamed`` iterations at the enforcement finalize seam
+(see ``run_with_enforcement``) for the run-derived asks, so the SSE connection
+stays open while the frontend surfaces a credential-connect card. Resume transport is a
 per-turn Redis flag polled directly by the paused coroutine -- the inverse of
 the ``/workflow/copilot/cancel`` sidecar watcher, since here the paused loop
 itself is the poller rather than a task racing the handler.
@@ -23,6 +24,8 @@ import json
 import re
 import secrets
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -44,8 +47,6 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
-
-    from skyvern.forge.sdk.copilot.context import CopilotContext
 
     # Importing the routes package at module scope pulls in workflow_copilot.py ->
     # agent.py -> enforcement.py, which imports this module -> circular import.
@@ -244,14 +245,6 @@ def credential_pause_reason(ctx: Any) -> str | None:
         and policy.raw_secret_detected
         and policy.raw_secret_handling == "redacted_draft"
     )
-    if isinstance(policy, RequestPolicy) and (
-        policy.clarification_reason == "login_credentials_unresolved"
-        # Every ask the credential card can answer resumes through the same typed contract, so
-        # the reason literal no longer distinguishes them -- `card_answerable` does.
-        or (policy.requires_user_clarification and policy.credential_ask_card_answerable)
-    ):
-        return "login_credentials_unresolved"
-
     if getattr(ctx, "last_run_skipped_unbound_credentials", False) and not raw_secret_redacted_draft:
         # This is a concrete run result, not a policy or classifier verdict. Preserve it
         # even when legacy context labels the request as skip_test.
@@ -273,14 +266,10 @@ def credential_pause_reason(ctx: Any) -> str | None:
     return None
 
 
-def credential_pause_would_fire(ctx: Any, copilot_config: CopilotConfig | None) -> bool:
-    """Synchronous subset of maybe_credential_pause's guards.
+def credential_pause_transport_ready(ctx: Any, copilot_config: CopilotConfig | None) -> bool:
+    """Whether a card can be shown at all this turn, independent of what is asking for one.
 
-    Called from both here and enforcement.py's enforcement_decision so the two
-    can't drift: enforcement pre-empts hygiene nudges based on this same
-    prediction, and a client/kill-switch/latch mismatch between the two would
-    either suppress nudges for a pause that will never fire, or let a nudge
-    race a pause that will. Excludes the async-only checks (stream disconnect).
+    Excludes the async-only checks (stream disconnect).
     """
     return (
         copilot_config is not None
@@ -290,17 +279,16 @@ def credential_pause_would_fire(ctx: Any, copilot_config: CopilotConfig | None) 
         # A same-process-only cache (LocalCache) can't coordinate the poller with a
         # /credential-response POST that may land on a different worker -- gate on a
         # cache that's explicitly known to be shared (Redis) rather than merely non-None.
-        and getattr(getattr(app, "CACHE", None), "is_shared", False)
-        and credential_pause_reason(ctx) is not None
+        and bool(getattr(getattr(app, "CACHE", None), "is_shared", False))
     )
 
 
-def _defang(text: str) -> str:
+def defang_card_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).replace('"', "").strip()[:200]
 
 
 def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credential) -> str | None:
-    """Stamp the server-held origin this ask was formed against, so a card-created credential with
+    """Stamp the origin this ask was formed against, so a card-created credential with
     no ``tested_url`` still has an intended origin at the fill seam. Written directly rather than
     through ``_record_live_page_admission``, which skips already-resolved ids and would stamp
     nothing here.
@@ -336,7 +324,6 @@ def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, crede
     admitted_url = _bind_connected_credential_origin(policy, credential)
     LOG.info(
         "copilot_credential_pause_connected",
-        card_answerable=policy.credential_ask_card_answerable,
         credential_id=credential.credential_id,
         bound_origin=loggable_origin(admitted_url) if admitted_url else None,
     )
@@ -366,7 +353,7 @@ def _assemble_resume_messages(ctx: Any, text: str) -> list[dict[str, Any]]:
 
 
 def _connected_resume_text(credential: Credential) -> str:
-    safe_name = _defang(credential.name)
+    safe_name = defang_card_text(credential.name)
     return (
         f"The user connected saved credential {safe_name} ({credential.credential_id}) via the credential card. "
         "Bind it as the credential parameter and continue the build; run the blocks that were skipped or failed "
@@ -428,27 +415,57 @@ async def _wait_for_credential_response(
     return None
 
 
+def _reschedule_stream_deadline(deadline: asyncio.Timeout, when: float | None) -> None:
+    try:
+        deadline.reschedule(when)
+    except RuntimeError:
+        # The owning ``asyncio.timeout`` block has already exited -- the turn was cancelled or torn
+        # down while the card was open -- so there is no deadline left to move.
+        LOG.info("copilot_credential_pause_deadline_reschedule_skipped")
+
+
+@contextmanager
+def _stream_deadline_suspended(ctx: Any) -> Iterator[None]:
+    """Hold off the turn's model-stream deadline while the user answers the card, then give it back
+    the time the answer took; the wait itself is bounded by the pause timeout."""
+    deadline = getattr(ctx, "model_stream_deadline", None)
+    when = deadline.when() if deadline is not None else None
+    if deadline is None or when is None:
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    _reschedule_stream_deadline(deadline, None)
+    try:
+        yield
+    finally:
+        _reschedule_stream_deadline(deadline, when + (loop.time() - start))
+
+
 async def _run_credential_pause(
     ctx: Any,
     message: str,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
+    *,
+    reason: str,
+    login_page_urls: list[str],
 ) -> CredentialPauseResolution | None:
     """Send the credential card and wait for the user's decision.
 
     Returns the resolution, or None to let the caller proceed without one
     (kill-switch off, client can't render the frame, already paused once this
-    turn, no cache configured or not shared across workers, client gone, no
-    typed signal fired, or the wait timed out).
+    turn, no cache configured or not shared across workers, client gone, or
+    the wait timed out).
     """
-    if not credential_pause_would_fire(ctx, copilot_config):
+    if not credential_pause_transport_ready(ctx, copilot_config):
         return None
     # Predicted true (the sync guard chain passed) but bailing below anyway --
     # latch it now so this iteration can't loop back into the same prediction,
     # and tag the outcome "declined" (distinct from "timeout") so the caller
     # knows no frame was ever sent and can fall back to a normal nudge instead
-    # of a premature finalize. credential_pause_would_fire's own docstring notes
-    # it excludes the async-only disconnect check, which is exactly the gap here.
+    # of a premature finalize. credential_pause_transport_ready's own docstring
+    # notes it excludes the async-only disconnect check, which is the gap here.
     ctx.credential_pause_used = True
     cache = getattr(app, "CACHE", None)
     if cache is None:
@@ -457,18 +474,10 @@ async def _run_credential_pause(
     if await stream.is_disconnected():
         ctx.credential_pause_outcome = "declined"
         return None
-    reason = credential_pause_reason(ctx)
-    if reason is None:
-        ctx.credential_pause_outcome = "declined"
-        return None
-
     policy = getattr(ctx, "request_policy", None)
-    login_page_urls = list(policy.login_page_urls) if isinstance(policy, RequestPolicy) else []
     # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
     # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
-    credential_refs: list[str] = []
-    if isinstance(policy, RequestPolicy):
-        credential_refs = list(policy.credential_ask_candidate_ids or policy.credential_refs)
+    credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 
@@ -538,7 +547,8 @@ async def _run_credential_pause(
 
     start = time.monotonic()
     try:
-        resolution = await _wait_for_credential_response(response_key, ctx, stream, timeout_seconds)
+        with _stream_deadline_suspended(ctx):
+            resolution = await _wait_for_credential_response(response_key, ctx, stream, timeout_seconds)
     except BaseException:
         # Covers CancelledError (a direct BaseException subclass, not Exception)
         # alongside any unexpected failure in the wait loop itself -- the frame's
@@ -575,28 +585,103 @@ async def _run_credential_pause(
     return resolution
 
 
+def arm_credential_pause_gate(ctx: Any) -> None:
+    """Close the gate as soon as a model response is known to contain a ``request_credential`` call.
+
+    Arming inside the tool coroutine would be too late: the SDK runs one response's tool calls as
+    concurrent tasks, so a run tool scheduled first would pass an unarmed gate.
+    """
+    settled = getattr(ctx, "credential_pause_settled", None)
+    if settled is None or settled.is_set():
+        ctx.credential_pause_settled = asyncio.Event()
+
+
+def release_credential_pause_gate(ctx: Any) -> None:
+    settled = getattr(ctx, "credential_pause_settled", None)
+    if settled is not None:
+        settled.set()
+
+
+async def request_credential_pause(
+    ctx: Any,
+    *,
+    login_page_url: str,
+    message: str,
+    stream: EventSourceStream,
+    copilot_config: CopilotConfig,
+) -> CredentialPauseResolution | None:
+    """Raise the card from the model's own ``request_credential`` call and wait, inline, for the
+    answer, so tool calls the model issued alongside it can await ``credential_pause_settled``."""
+    arm_credential_pause_gate(ctx)
+    ctx.credential_ask_in_flight = True
+    try:
+        resolution = await _run_credential_pause(
+            ctx,
+            message,
+            stream,
+            copilot_config,
+            reason="login_credentials_unresolved",
+            login_page_urls=[login_page_url],
+        )
+        ctx.credential_pause_reaskable_by_run = resolution is None or resolution.action != "connected"
+        return resolution
+    finally:
+        ctx.credential_ask_in_flight = False
+        release_credential_pause_gate(ctx)
+
+
+async def await_pending_credential_pause(ctx: Any) -> None:
+    """Wait out a ``request_credential`` ask that is still open, so a run tool the model called in
+    parallel with it cannot start a run before the user has answered. Draft edits are not gated:
+    they neither run nor sign in."""
+    settled = getattr(ctx, "credential_pause_settled", None)
+    if settled is None:
+        return
+    # A call the SDK rejects on its arguments arms the gate without ever reaching the handler that
+    # releases it, and the stream cannot exit to run the enforcement backstop while this wait is
+    # parked inside it. Bound the wait so that strands one tool call rather than the whole turn.
+    try:
+        await asyncio.wait_for(settled.wait(), settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 30)
+    except asyncio.TimeoutError:
+        LOG.warning("copilot_credential_gate_wait_timed_out")
+        settled.set()
+
+
 async def maybe_credential_pause(
     ctx: Any,
     result: RunResultStreaming,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
 ) -> list[dict[str, Any]] | None:
-    """Pause a finalizing turn that hit a typed mid-build credential ask.
+    """Pause a finalizing turn that hit a typed run-derived credential ask.
 
     Returns the resume messages to re-enter the loop with, or None to let the
     caller finalize normally.
     """
-    if not credential_pause_would_fire(ctx, copilot_config):
+    reason = credential_pause_reason(ctx)
+    if reason is None:
+        return None
+    # Exactly True, not merely truthy: ctx is Any here, and a partial stand-in returns a truthy
+    # object for any attribute, which would hand the budget back on every turn.
+    if getattr(ctx, "credential_pause_reaskable_by_run", False) is True:
+        # The spent card was a guess the user never answered; this ask has a run behind it. Hand the
+        # budget back once, so an unanswered guess cannot silently cost the turn its real card.
+        ctx.credential_pause_reaskable_by_run = False
+        ctx.credential_pause_used = False
+    if not credential_pause_transport_ready(ctx, copilot_config):
         return None
     # Local import: same module-load-cycle reason as _assemble_resume_messages.
     from skyvern.forge.sdk.copilot.enforcement import _parse_normalized_final_response
 
     parsed = _parse_normalized_final_response(result)
+    policy = getattr(ctx, "request_policy", None)
     resolution = await _run_credential_pause(
         ctx,
         str((parsed or {}).get("user_response") or ""),
         stream,
         copilot_config,
+        reason=reason,
+        login_page_urls=list(policy.login_page_urls) if isinstance(policy, RequestPolicy) else [],
     )
     if resolution is None:
         return None
@@ -606,31 +691,3 @@ async def maybe_credential_pause(
     if credential is None:
         return None
     return _assemble_resume_messages(ctx, _connected_resume_text(credential))
-
-
-async def preflight_credential_pause(
-    ctx: CopilotContext,
-    stream: EventSourceStream,
-    copilot_config: CopilotConfig,
-) -> CredentialPauseResolution | None:
-    """Ask for a credential before the agent loop starts, so no build precedes the ask.
-
-    Both decisions clear the clarification block the request policy raised, so the
-    caller falls through into a normal run instead of the terminal clarify; a
-    declined turn must not keep a reason that would re-surface the card CTA.
-    """
-    policy = ctx.request_policy
-    question = (policy.clarification_question or "") if policy is not None else ""
-    resolution = await _run_credential_pause(ctx, question, stream, copilot_config)
-    if resolution is None or policy is None:
-        return resolution
-    policy.user_response_policy = "proceed"
-    # Record the explicit product-owned resume. These are compatibility facts for
-    # the credential flow, not generic update/run permissions.
-    policy.allow_update_workflow = True
-    policy.allow_run_blocks = True
-    if resolution.action == "skip":
-        policy.allow_missing_credentials_in_draft = True
-        policy.requires_user_clarification = False
-        policy.clarification_reason = "none"
-    return resolution

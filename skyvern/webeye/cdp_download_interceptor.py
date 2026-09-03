@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Literal
 from urllib.parse import unquote, urlparse
 
+import aiohttp
 import structlog
 from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
@@ -46,6 +47,7 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
 )
+from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.sdk.api import files as file_api
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
@@ -1701,7 +1703,15 @@ class CDPDownloadInterceptor:
         except Exception as exc:
             # The download URL is credential-bearing and can reappear inside an exception message
             # (aiohttp embeds it), so the raise site stands in for the message and traceback.
-            LOG.error(
+            #
+            # This try also covers _validated_download_basename and _cookie_header_for_url, so a
+            # first-party defect lands here too. Only the transport failure set is site-caused and
+            # safe to lower; anything else keeps error, because nothing watches warn on this service
+            # and a defect downgraded here would be invisible. Unknown types stay at error by
+            # construction -- the test is a whitelist, so it fails toward visibility.
+            site_caused = isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError, DownloadFileMaxSizeExceeded))
+            emit = LOG.warning if site_caused else LOG.error
+            emit(
                 "Guarded direct download failed",
                 error_type=type(exc).__name__,
                 error_origin=redacted_exception_origin(exc),

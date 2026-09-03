@@ -29,11 +29,9 @@ from typing import Any, Awaitable, Callable
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.taskv3.auto_observe import AutoObserveDecision
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
@@ -113,10 +111,6 @@ This task completes automatically once a file download finishes -- trigger the d
 DOWNLOAD_REQUIRED_GUIDANCE = """
 
 This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
-
-AUTO_OBSERVE_GUIDANCE = """
-
-When an action result already ends with an auto-observe block, act from that snapshot instead of calling observe again. If an action changes only styling or focus (hover menus, toggles), the result may say no markup change was detected — observe if you expect something new to be visible. If the next action on the same page does not depend on seeing this one's result, put it in the same turn (the button that advances the form included); type a whole value or key sequence in one `type`/`press_key`, never one character per turn."""
 
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
@@ -221,8 +215,6 @@ async def run_task_v3_agent_loop(
     starting_url: str | None = None,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
-    task_id: str | None = None,
-    workflow_permanent_id: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_action_steps: int | None = None,
@@ -248,6 +240,7 @@ async def run_task_v3_agent_loop(
     initial_navigation_status: int | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    block_type: str | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -260,6 +253,7 @@ async def run_task_v3_agent_loop(
     failure-evidence gate, which shares the sampler, intact. `page_probe` is a separate sampler (URL
     plus fingerprint) the loop uses to detect whether a failed batched call moved the page; a
     page-free run has no page to probe."""
+    loop_started_at = time.monotonic()
     # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
@@ -334,24 +328,6 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
-    # Resolved through the AgentFunction seam so cloud can bucket the run into an A/B; a page-free
-    # run has no observe to append, so it is never resolved and never bands as an arm.
-    auto_observe_decision = (
-        AutoObserveDecision(enabled=False, arm="default")
-        if page_free
-        else await app.AGENT_FUNCTION.resolve_task_v3_auto_observe(
-            task_id=task_id, organization_id=organization_id, workflow_permanent_id=workflow_permanent_id
-        )
-    )
-    auto_observe = auto_observe_decision.enabled
-    if not page_free:
-        LOG.info(
-            "taskv3 auto-observe resolved",
-            task_id=task_id,
-            organization_id=organization_id,
-            auto_observe=auto_observe,
-            auto_observe_arm=auto_observe_decision.arm,
-        )
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
@@ -359,8 +335,6 @@ async def run_task_v3_agent_loop(
         extra_system_guidance = extra_system_guidance + DOWNLOAD_COMPLETION_GUIDANCE
     elif completion_blocker is not None and completion_probe is None:
         extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
-    if auto_observe:
-        extra_system_guidance = extra_system_guidance + AUTO_OBSERVE_GUIDANCE
     system_prompt = base_system_prompt + extra_system_guidance
     system_prompt += datetime.now(ctx.tz_info if ctx and ctx.tz_info else UTC).strftime(
         "\n\nToday's date is %Y-%m-%d (%A), %Z."
@@ -395,7 +369,7 @@ async def run_task_v3_agent_loop(
             page_probe=None if page_free else page_probe,
             page_fingerprint=None if page_free else page_fingerprint,
             reload_page=None if page_free else reload_page,
-            auto_observe=auto_observe,
+            final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -414,8 +388,9 @@ async def run_task_v3_agent_loop(
         tool_seconds=outcome.tool_seconds,
         action_steps=outcome.action_steps,
         no_tool_call_turns=outcome.no_tool_call_turns,
-        auto_observe_arm=auto_observe_decision.arm,
         tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,
         tool_choice_in_effect=outcome.tool_choice_in_effect,
+        duration_seconds=time.monotonic() - loop_started_at,
+        block_type=block_type,
     )
     return outcome

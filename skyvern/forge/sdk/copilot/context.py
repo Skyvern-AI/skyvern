@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -723,7 +724,7 @@ class AgentResult:
     resolved_model: str | None = None
     # Set when the agent absorbed an asyncio cancellation initiated by an
     # explicit user Stop. Lets the route route to a cancel-specific
-    # persistence path (rollback + ``Cancelled by user.`` chat row) without
+    # persistence path (rollback + stop-report chat row) without
     # losing ``workflow_was_persisted`` the way a re-raise would.
     cancelled: bool = False
     # Facts the route needs to persist an interruption record; the route sees the
@@ -827,9 +828,19 @@ class CopilotContext(AgentContext):
     last_run_skipped_unbound_credentials: bool = False
     client_supports_credential_pause: bool = False
     credential_pause_used: bool = False
+    # True only while a card is on screen. credential_pause_used stays true for the rest of the
+    # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
+    credential_ask_in_flight: bool = False
+    # A tool ask the user did not answer with a credential spends the one-card budget on a guess.
+    # A run that then hits a real login wall has evidence the guess did not, so it gets the budget
+    # back once.
+    credential_pause_reaskable_by_run: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
     credential_pause_connected_credential_id: str | None = None
+    # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
+    # model response wait for the user's answer instead of racing it.
+    credential_pause_settled: asyncio.Event | None = None
     # Preserve the immutable turn-open document because ``workflow_yaml`` is
     # reassigned after every accepted update in the same agent turn.
     google_connection_turn_start_workflow_yaml: str | None = field(init=False, default=None)
@@ -910,7 +921,6 @@ class CopilotContext(AgentContext):
     # state untouched, because the browser session is now in post-failure
     # state and the prefix labels can no longer be trusted as an anchor.
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
-    verified_terminal_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
     verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
@@ -974,6 +984,9 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
+    # staged draft at turn end. None on entrypoints that load no chat row.
+    auto_accept: bool | None = None
     # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
     prior_copilot_workflow_yaml: str | None = None
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level

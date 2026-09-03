@@ -56,6 +56,10 @@ export const helpTooltips = {
     ...baseHelpTooltipContent,
     dataExtractionGoal:
       "Tell Skyvern what data you would like to scrape. Use {{ parameter_name }} to specify inputs to use.",
+    exportEnabled:
+      "Also write the extracted data to a downloadable Parquet file. No separate Data Export block needed.",
+    exportRecords:
+      "Defaults to this block's own extracted data. Only set this if you want to export something else, using {{ parameter_name }} to reference it.",
   },
   action: {
     ...baseHelpTooltipContent,

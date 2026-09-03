@@ -6,6 +6,7 @@ import {
   fireEvent,
   render,
   screen,
+  within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -99,27 +100,32 @@ afterEach(() => {
 });
 
 describe("StartNode inputs summary", () => {
-  test("states the declared inputs, and Add opens the Inputs panel", () => {
+  test("states the declared inputs as a sentence, and Add opens the Inputs panel", () => {
+    // Seven names: six read out, the rest counted, in the body font.
+    const keys = [
+      "order_id",
+      "vendor_email",
+      "invoice_total",
+      "due_date",
+      "po_number",
+      "cost_center",
+      "currency",
+    ];
     useWorkflowParametersStore.setState({
-      parameters: [
-        {
-          key: "order_id",
-          parameterType: "workflow",
-          dataType: "string",
-          defaultValue: null,
-        },
-        {
-          key: "vendor_email",
-          parameterType: "workflow",
-          dataType: "string",
-          defaultValue: null,
-        },
-      ],
+      parameters: keys.map((key) => ({
+        key,
+        parameterType: "workflow",
+        dataType: "string",
+        defaultValue: null,
+      })),
     });
     renderStartNode();
 
-    expect(screen.getByText("order_id")).toBeDefined();
-    expect(screen.getByText("vendor_email")).toBeDefined();
+    expect(
+      screen.getByText(
+        "order_id, vendor_email, invoice_total, due_date, po_number, cost_center, and 1 more",
+      ),
+    ).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: /add/i }));
 
@@ -129,12 +135,109 @@ describe("StartNode inputs summary", () => {
     });
   });
 
+  test("the Inputs heading and the names each open the Inputs panel on their own", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "order_id",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+      ],
+    });
+    renderStartNode();
+
+    fireEvent.click(screen.getByRole("button", { name: "Inputs" }));
+    expect(useWorkflowPanelStore.getState().workflowPanelState.active).toBe(
+      true,
+    );
+
+    useWorkflowPanelStore.setState({
+      workflowPanelState: { active: false, content: "parameters" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "order_id" }));
+    expect(useWorkflowPanelStore.getState().workflowPanelState).toEqual({
+      active: true,
+      content: "parameters",
+    });
+  });
+
+  test("the flipped code view takes the Inputs controls out of reach", () => {
+    // Flippable only turns the front face away, so without inert a keyboard
+    // user could tab to the invisible Add and open the panel over the script.
+    // Exactly one face is inert either way, so the visible one never is.
+    const flipped = renderStartNode({ showCode: true });
+    expect(screen.getByText("Add").closest("[inert]")).not.toBeNull();
+    expect(flipped.container.querySelectorAll("[inert]")).toHaveLength(1);
+
+    cleanup();
+    const front = renderStartNode();
+    expect(screen.getByText("Add").closest("[inert]")).toBeNull();
+    expect(front.container.querySelectorAll("[inert]")).toHaveLength(1);
+  });
+
+  test("a long input name is cut in the sentence but kept for assistive tech", () => {
+    // Keys have no length limit; one long key must not grow the Start card.
+    const key = "shipping_address_line_two_for_the_billing_contact";
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key,
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+      ],
+    });
+    renderStartNode();
+
+    const sentence = screen.getByRole("button", { name: key });
+    expect(sentence.textContent).toBe("shipping_address_line_t\u2026");
+    expect(sentence.getAttribute("title")).toBe(key);
+
+    // View-only has no button to carry an aria-label, so the full key rides
+    // along visually hidden and the cut text is hidden from assistive tech.
+    cleanup();
+    renderStartNode({ editable: false });
+    const paragraph = screen.getByTitle(key);
+    expect(within(paragraph).getByText(key).className).toContain("sr-only");
+    expect(
+      within(paragraph)
+        .getByText("shipping_address_line_t\u2026")
+        .getAttribute("aria-hidden"),
+    ).toBe("true");
+  });
+
   test("an agent with no inputs says what inputs are, rather than nothing", () => {
     // The zero-input case is the one the header never distinguished, and the
     // reason nobody found the feature (SKY-14866).
     renderStartNode();
 
     expect(screen.getByText(/None yet/)).toBeDefined();
+  });
+
+  test("Inputs sit under the Start heading and above Workflow Settings", () => {
+    // Start is the first thing on the canvas; Inputs read as something Start
+    // declares, next to Workflow Settings (SKY-15467).
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "order_id",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: null,
+        },
+      ],
+    });
+    renderStartNode();
+
+    const precedes = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const start = screen.getByText("Start");
+    const inputs = screen.getByText("Inputs");
+    expect(precedes(start, inputs)).toBe(true);
+    expect(precedes(inputs, screen.getByText("Workflow Settings"))).toBe(true);
   });
 
   test("a view-only workflow can read its inputs but not add one", () => {
@@ -153,7 +256,9 @@ describe("StartNode inputs summary", () => {
     });
     renderStartNode({ editable: false });
 
-    expect(screen.getByText("order_id")).toBeDefined();
+    expect(screen.getByTitle("order_id").textContent).toContain("order_id");
+    expect(screen.queryByRole("button", { name: "Inputs" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "order_id" })).toBeNull();
     expect(screen.queryByRole("button", { name: /add/i })).toBeNull();
   });
 

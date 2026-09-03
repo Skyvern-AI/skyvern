@@ -136,7 +136,11 @@ from .banned_blocks import (
     _task_v3_pure_policy_violations,
     _task_v3_pure_reject_message,
 )
-from .credentials import _credential_id_misbinding_findings, _credential_reference_validation_error
+from .credentials import (
+    _credential_id_misbinding_findings,
+    _credential_reference_validation_error,
+    canonicalize_named_google_sheet_bindings,
+)
 from .frontier import (
     _get_prior_workflow,
     _invalidate_verified_state_on_edit,
@@ -3753,14 +3757,38 @@ def _missing_scouted_rung_violation_text(artifact: str) -> str:
     return "The persisted draft is missing scouted rung(s). " + artifact
 
 
+PersistenceDisposition = Literal["staged", "staged_auto_apply"]
+
+# Both values are staged: a write is never persisted at tool time, and the turn can still decline to
+# apply it. ``staged_auto_apply`` reports only that the chat opted into auto-apply; an unknown setting
+# is ``staged``.
+_PERSISTENCE_MESSAGES: dict[PersistenceDisposition, str] = {
+    "staged": (
+        "Staged as a proposal for review. Accepting it makes this version the saved workflow; "
+        "discarding it keeps the current one."
+    ),
+    "staged_auto_apply": (
+        "Staged as a proposal. This chat accepts proposals automatically, so this one becomes the saved "
+        "workflow at the end of the turn if the turn finishes cleanly and the change is fully verified. "
+        "Otherwise it stays staged for review."
+    ),
+}
+
+
+def persistence_disposition(ctx: AgentContext) -> PersistenceDisposition:
+    return "staged_auto_apply" if ctx.auto_accept is True else "staged"
+
+
 def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     """The combined update-and-run tool returns the run's result, not the update's, so what the
-    update said about the persisted draft reaches the model only if it is carried across."""
+    update said about the staged draft reaches the model only if it is carried across."""
     update_data = update_result.get("data")
     if not isinstance(update_data, dict):
         return result
     carried = {
-        key: update_data[key] for key in ("findings", "stored_code", "stored_code_withheld") if update_data.get(key)
+        key: update_data[key]
+        for key in ("findings", "stored_code", "stored_code_withheld", "persistence", "persistence_message")
+        if update_data.get(key)
     }
     if not carried:
         return result
@@ -4049,6 +4077,9 @@ async def _update_workflow(
         )
 
     try:
+        # Before redaction: a connection name equal to a registered scrub value would otherwise
+        # reach the resolver already replaced by the placeholder.
+        workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4234,8 +4265,12 @@ async def _update_workflow(
                 )
             except Exception as emit_err:
                 LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
+        disposition = persistence_disposition(ctx)
+        disposition_message = _PERSISTENCE_MESSAGES[disposition]
         data: dict[str, Any] = {
-            "message": "Workflow updated successfully.",
+            "persistence": disposition,
+            "persistence_message": disposition_message,
+            "message": disposition_message,
             "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
         }
         stored_code, stored_code_withheld = _accepted_code_delta(changed_code_blocks)
@@ -4269,6 +4304,8 @@ async def _update_workflow(
         )
         if findings:
             data["findings"] = findings
+        if google_connection_resolution:
+            data["google_connection_resolution"] = google_connection_resolution
         return {
             "ok": True,
             "data": data,

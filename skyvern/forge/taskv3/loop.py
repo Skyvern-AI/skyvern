@@ -22,6 +22,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Awaitable, Callable, Literal, TypeVar
 
 import structlog
@@ -95,6 +96,10 @@ class LoopOutcome:
     status: Literal["completed", "failed", "terminated", "budget_exhausted", "loop_error", "canceled"]
     reason: str
     extracted_output: Any = None
+    # The raw budget-cap string (e.g. "max_turns (40) reached") that granted this run its one final
+    # observed turn, carried on whatever outcome the final turn produces — a finish verdict or, if
+    # the model didn't finish, the honest budget_exhausted exit. None for a run that never tripped a cap.
+    cap_trip: str | None = None
     turns: int = 0
     tool_calls: int = 0
     action_steps: int = 0
@@ -215,6 +220,12 @@ ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
 
+# Single-shot final-turn grant (budget-exhaustion final turn): the first budget cap trip in a run
+# buys exactly one more unconstrained model turn instead of ending the run immediately, so a model
+# mid-extraction can still call finish with what it has. Facetable — change only with the dashboards
+# that read it.
+FINAL_TURN_GRANTED_EVENT = "taskv3 loop final turn granted"
+
 # Page-state stall policy (SKY-15265): rounds of billable batches that left the page fingerprint
 # byte-identical, with no page-change flag, mean the run is cycling on a frozen document in shapes
 # the per-tool guards cannot see (varied probes never streak; scroll/wait carry no digest at all).
@@ -249,17 +260,6 @@ NAV_DEAD_END_REASON_PREFIX = "navigation_dead_end:"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
 PAGE_REFRESH_EXHAUSTED_REASON_PREFIX = "page_refresh_exhausted:"
-
-# Delimiters around an auto-observe digest appended to a batch's tool message. Distinctive enough
-# that page content cannot plausibly collide with them; _compact_transcript keys off their presence
-# to treat the carrying message as an observe-class snapshot.
-AUTO_OBSERVE_BEGIN = "<<auto-observe>>"
-AUTO_OBSERVE_END = "<</auto-observe>>"
-
-# Settle-wait before the auto-observe DOM walk. Tests lower these via monkeypatch, mirroring
-# _PAGE_PROBE_TIMEOUT_SECONDS.
-AUTO_OBSERVE_SETTLE_INTERVAL_SECONDS = 0.7
-AUTO_OBSERVE_SETTLE_CAP_SECONDS = 2.0
 
 # Emitted, never acted on, when the oscillation rule WOULD have terminated. The step engine's
 # tripwires (skyvern/forge/sdk/fail_fast/shadow.py) earn the right to act by publishing this event
@@ -427,8 +427,31 @@ class _PerceptionLedger:
 PROGRESS_LEDGER_WINDOW = 8
 # Facetable event names; the offline precision/survival metrics key on these — change only with the
 # dashboards that read them.
+# Canonical progress signal, Phase A (SKY-15379): ONE target-churn + compound-progress tracker,
+# LOG-ONLY. The loop answers "is this run progressing?" five separate ways today; this tracker is
+# the candidate replacement signal, emitting the parity/precision data any consolidation needs
+# while changing no behavior. Its target key is the canonicalized SELECTOR, not tool+args — the
+# incumbent action-loop key provably missed prod repeat-loops whose args varied on a fixed target.
+CANONICAL_LOOP_EVENT = "taskv3 canonical progress loop detected"
+CANONICAL_EXTEND_DELTA_EVENT = "taskv3 canonical progress extension delta"
+# Log-only thresholds; the Phase-B intervention thresholds are tuned FROM this data, so the fire
+# points are logged at every rung of the distribution rather than one cliff.
+CANONICAL_LOOP_WINDOW = 10
+CANONICAL_LOOP_FIRE_COUNTS = (3, 4, 6, 8)
+# The rung that counts as "looping" for the extension-delta read — named so reordering the logging
+# rungs above can never silently move the threshold Phase B tunes against.
+CANONICAL_LOOP_TOUCHES = 4
+
 PROGRESS_LEDGER_SHADOW_EVENT = "taskv3 loop progress ledger would fail-fast"
 PROGRESS_LEDGER_FINAL_EVENT = "taskv3 loop progress ledger final"
+# The ledger's survival record is gated on ever_armed, so it describes ONLY runs that saw a
+# validation error. Search / filter / navigate / extract runs emitted nothing at all, which makes any
+# fire count taken off that population a floor and never a prevalence. This is the complement record,
+# keyed on the canonical tracker because its counters are the only progress signal defined without a
+# form. The two partition the population: exactly one is emitted per run, so their union is the
+# denominator. Additive — the ledger record's own population and fields are unchanged, so survival
+# data collected before this change stays comparable with data collected after it.
+CANONICAL_SURVIVAL_EVENT = "taskv3 canonical progress final"
 
 
 @dataclass
@@ -598,71 +621,6 @@ async def _sample_probe(probe: Callable[[], Awaitable[str | None]], deadline_at:
         return None
 
 
-async def _auto_observe_settle_wait(
-    page_probe: Callable[[], Awaitable[str | None]] | None,
-    should_cancel: Callable[[], Awaitable[bool]] | None,
-    deadline_at: float | None = None,
-    page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
-) -> float:
-    """Falls back to one flat sleep when neither sampler is available. Prefers `page_fingerprint`
-    (rendered-content quiescence) over `page_probe` (document identity) when both are supplied, since a
-    settle wait is asking "did the RENDER finish", not "is this still the same document" -- the same
-    preference the end-of-batch decision applies. Reads the AUTO_OBSERVE_SETTLE_* module globals (not
-    defaults) so tests can lower them via monkeypatch. The clock starts before the first probe sample,
-    so a slow probe counts against the cap; the wait is also capped at `deadline_at` (time.monotonic
-    clock, mirroring `_settled`), so probing cannot outlive the loop's own bounds. Returns the real
-    elapsed wall-clock time, including probe durations."""
-    started = time.monotonic()
-    sampler = page_fingerprint if page_fingerprint is not None else page_probe
-    if sampler is None:
-        wait = AUTO_OBSERVE_SETTLE_INTERVAL_SECONDS
-        if deadline_at is not None:
-            wait = min(wait, deadline_at - time.monotonic())
-        if wait > 0:
-            await asyncio.sleep(wait)
-        return time.monotonic() - started
-    prev = await _sample_probe(sampler, deadline_at=deadline_at)
-    while True:
-        elapsed = time.monotonic() - started
-        interval = min(AUTO_OBSERVE_SETTLE_INTERVAL_SECONDS, AUTO_OBSERVE_SETTLE_CAP_SECONDS - elapsed)
-        if deadline_at is not None:
-            interval = min(interval, deadline_at - time.monotonic())
-        if interval <= 0:
-            break
-        await asyncio.sleep(interval)
-        if should_cancel is not None and await should_cancel():
-            break
-        current = await _sample_probe(sampler, deadline_at=deadline_at)
-        if current is not None and current == prev:
-            break
-        prev = current
-    return time.monotonic() - started
-
-
-async def _resample_after_one_settle_interval(
-    sampler: Callable[[], Awaitable[str | None]],
-    before: str | None,
-    should_cancel: Callable[[], Awaitable[bool]] | None,
-    deadline_at: float | None,
-) -> tuple[bool, float]:
-    """An immediate post-batch sample that read as unchanged can just be too early for an async
-    render (a spinner resolving, a debounce firing) that hasn't touched the DOM yet. Wait one bounded
-    settle interval and take a single resample; ``changed`` is only ever a positive signal (a genuine
-    None either side proves nothing). Returns (changed, waited_seconds)."""
-    interval = AUTO_OBSERVE_SETTLE_INTERVAL_SECONDS
-    if deadline_at is not None:
-        interval = min(interval, deadline_at - time.monotonic())
-    started = time.monotonic()
-    if interval > 0 and not (should_cancel is not None and await should_cancel()):
-        await asyncio.sleep(interval)
-    waited = time.monotonic() - started
-    if should_cancel is not None and await should_cancel():
-        return False, waited
-    after = await _sample_probe(sampler, deadline_at=deadline_at)
-    changed = before is not None and after is not None and after != before
-    return changed, waited
-
-
 def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
     """A click, an Enter press, or a type that pressed Enter: the loop cannot tell a submit from any of them."""
     return tool_name == "click" or _is_enter_submit(tool_name, args)
@@ -698,6 +656,10 @@ class ActivityRecency:
     # run that reaches the edge and then stops reading that tool altogether leaves this true for the
     # rest of the run, disabling the deferral (same as the argument-blind counter it shipped with).
     perception_stall_imminent: bool = False
+    # True from the moment the loop's granted final turn starts running. A hold asks for a retry
+    # turn that no longer exists — honoring it would silently convert the model's verdict into
+    # budget_exhausted, the exact conversion the hold headroom gates exist to prevent.
+    final_turn_active: bool = False
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -724,6 +686,8 @@ def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | No
     reserves, for the same reason: a token exhaustion and a stall streak one short of its terminator
     each convert the deferral into a verdict the gate did not choose."""
     if activity is not None:
+        if activity.final_turn_active:
+            return False
         if activity.turns_remaining is not None and activity.turns_remaining < FAILURE_EVIDENCE_MIN_TURNS:
             return False
         if (
@@ -899,6 +863,40 @@ def _refresh_nudge_text() -> str:
     )
 
 
+def _budget_exhausted_observation(cap: str, recency: ActivityRecency | None) -> str:
+    """A typed, model-facing fact (not an instruction) that this is the run's last granted turn.
+    Deliberately silent on what to do next -- finishing with a partial result, retrying, or reporting
+    failure are all legitimate depending on what the model has."""
+    payload = {
+        "budget_exhausted": True,
+        "cap": cap,
+        "headroom": {
+            "tool_calls": recency.tool_calls_remaining if recency is not None else None,
+            "tokens": recency.tokens_remaining if recency is not None else None,
+        },
+    }
+    json_line = json.dumps(payload, separators=(",", ":"))
+    return f"{json_line}\nThe run's budget cap has tripped; this is the final turn before the run ends."
+
+
+def _budget_exhausted_reason(cap_trip: str) -> str:
+    """Human sentence for a no-finish budget exit. Never includes the raw cap literal (that lives
+    only in `cap_trip` and the logs) so a status/reason readout doesn't leak an internal counter."""
+    if "deadline" in cap_trip:
+        axis = "time"
+    elif "max_tokens" in cap_trip:
+        axis = "token"
+    elif "max_turns" in cap_trip:
+        axis = "turn"
+    elif "max_tool_calls" in cap_trip:
+        axis = "tool-call"
+    elif "maximum steps" in cap_trip:
+        axis = "step"
+    else:
+        axis = "run"
+    return f"The run reached its {axis} budget before the model finished; the recorded output may be partial."
+
+
 _TOOL_CALL_RECORD_FIELDS = frozenset(
     {
         "tool",
@@ -915,6 +913,105 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "probe_first_time",
     }
 )
+
+
+class _ProgressEvidence(str, Enum):
+    """Why the canonical ring was cleared. Every clear names the positive evidence class that
+    justified it — an "assume changed" fallback (a missing sample read charitably) may never clear."""
+
+    REFRESH_RELOAD = "refresh_reload"
+    FRESH_DOWNLOAD_OR_NAVIGATION = "fresh_download_or_navigation"
+    PAGE_TRANSITIONED = "page_transitioned"
+    INVALID_FIELDS_BASELINE_MOVE = "invalid_fields_baseline_move"
+    PERCEPTION_DIGEST = "perception_digest"
+    CROSS_BATCH_MOVEMENT = "cross_batch_movement"
+    PROBE_MISMATCH = "probe_mismatch"
+    PAGE_STATE_VERDICT = "page_state_verdict"
+    TERMINAL_BATCH_FINGERPRINT = "terminal_batch_fingerprint"
+
+
+@dataclass
+class _CanonicalProgressTracker:
+    """Touches on canonicalized targets since the last compound-progress event (SKY-15379, Phase A).
+
+    A touch is one billable tool dispatch, keyed by its selector (tool name when selector-less).
+    Progress — any of the ledger's hard-progress events, an invalid-fields new-low, or a confirmed
+    page change — clears the ring, so a repeat streak can only accumulate across a genuinely
+    unchanged situation; a progressing run is untrippable by construction. Log-only: the counts
+    feed telemetry, nothing reads them for control flow.
+    """
+
+    window: int = CANONICAL_LOOP_WINDOW
+    _touches: list[tuple[str, bool]] = field(default_factory=list)
+    # Bumped on every clear: a pending loop event minted under an older generation was completed
+    # by (or followed by) absorbed progress and must not be emitted.
+    gen: int = 0
+    # Rungs already fired this generation. Once the window saturates, same-target counts can PARK
+    # on a fire rung while churn evicts other keys — a rung is one threshold crossing, not one
+    # event per touch spent at it.
+    _fired: set[tuple[str, int]] = field(default_factory=set)
+    # Run-level high-water marks, deliberately NOT cleared by progress(): the survival record needs
+    # the worst churn the run ever reached, the same way the ledger keeps peak_actions_since_progress
+    # across its own clears. Clearing these with the ring would report the last streak, not the peak.
+    peak_same_touches: int = 0
+    peak_same_errors: int = 0
+
+    def record_touch(self, target_key: str, is_error: bool) -> tuple[int, int]:
+        """Record one billable touch; returns (same-target touches, same-target errors) in-window."""
+        self._touches.append((target_key, is_error))
+        if len(self._touches) > self.window:
+            self._touches.pop(0)
+        same = [err for key, err in self._touches if key == target_key]
+        # A rung re-arms once the in-window count dips below it: a fresh streak after full eviction
+        # is a genuine re-crossing, distinct from a saturated window PARKED on a fire count.
+        self._fired = {entry for entry in self._fired if entry[0] != target_key or entry[1] <= len(same)}
+        same_errors = sum(1 for err in same if err)
+        self.peak_same_touches = max(self.peak_same_touches, len(same))
+        self.peak_same_errors = max(self.peak_same_errors, same_errors)
+        return len(same), same_errors
+
+    def progress(self, evidence: _ProgressEvidence) -> None:
+        """The one clear choke point: a caller must name its evidence class, so no site can wipe
+        the ring on a local, untyped notion of progress."""
+        self._touches.clear()
+        self._fired.clear()
+        self.gen += 1
+        LOG.debug("taskv3 canonical progress clear", evidence=evidence.value)
+
+    def claim_rung(self, target_key: str, count: int) -> bool:
+        """A rung is one threshold crossing per generation: the first claim wins, and a repeat
+        claim while a saturated window PARKS on a fire count is refused."""
+        if (target_key, count) in self._fired:
+            return False
+        self._fired.add((target_key, count))
+        return True
+
+    def invalidate_marks(self) -> None:
+        """A look renumbered the manifest, so every mark=N key now names an arbitrary element: drop
+        them rather than let four different controls alias into one false streak. A surviving mark
+        streak is therefore always within a single manifest generation. Selector keys stay — their
+        identity outlives the renumbering."""
+        self._touches = [touch for touch in self._touches if not touch[0].startswith("mark=")]
+        self._fired = {entry for entry in self._fired if not entry[0].startswith("mark=")}
+
+    def survival_fields(self) -> dict[str, int]:
+        """The per-run survival numbers, read through the class for the same reason progress() is
+        the one write choke point: the ring's state has no references outside this body."""
+        return {
+            "peak_same_touches": self.peak_same_touches,
+            "peak_same_errors": self.peak_same_errors,
+            "looping_targets": self.looping_targets(),
+        }
+
+    def looping_targets(self) -> int:
+        counts: dict[str, list[bool]] = {}
+        for key, err in self._touches:
+            counts.setdefault(key, []).append(err)
+        return sum(
+            1
+            for errs in counts.values()
+            if len(errs) >= CANONICAL_LOOP_TOUCHES and sum(errs) >= CANONICAL_LOOP_TOUCHES - 1
+        )
 
 
 def _observe_summary_fields(result: ToolResult) -> dict[str, int]:
@@ -1095,7 +1192,14 @@ def make_finish_tool(
                 )
             if verification_message:
                 return ToolResult.error(verification_message)
-        if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
+        if (
+            status == "completed"
+            and page_fingerprint is not None
+            and deferrals < max_settle_deferrals
+            # On the granted final turn the re-verification turn a deferral asks for no longer
+            # exists: holding would convert the verdict into budget_exhausted instead.
+            and not (activity is not None and activity.final_turn_active)
+        ):
             try:
                 settled = await _settled()
             except Exception:
@@ -1115,6 +1219,8 @@ def make_finish_tool(
             and activity is not None
             and page_fingerprint is not None
             and failure_deferrals < max_failure_deferrals
+            # Same rule as the completed-side holds: no retry turn exists on the granted final turn.
+            and not activity.final_turn_active
             and activity.armed()
             # The corrected cycle needs budget for its worst case (wait + observe + re-finish);
             # without headroom on every budget axis a deferral would convert an honest failure
@@ -1188,32 +1294,10 @@ def make_finish_tool(
 
 _COMPACTED_PREFIX = "[superseded "
 
-_AUTO_OBSERVE_SPAN_RE = re.compile(
-    r"\n\n" + re.escape(AUTO_OBSERVE_BEGIN) + r".*?" + re.escape(AUTO_OBSERVE_END), re.DOTALL
-)
-
-
-def _neutralize_auto_observe_markers(digest: str) -> str:
-    """Break any BEGIN/END delimiter that appears verbatim in page-controlled digest text, so the
-    digest can never forge a fake span boundary once wrapped. A space after the leading `<` keeps the
-    text readable while making the substring no longer match the delimiter."""
-    return digest.replace(AUTO_OBSERVE_BEGIN, "< " + AUTO_OBSERVE_BEGIN[1:]).replace(
-        AUTO_OBSERVE_END, "< " + AUTO_OBSERVE_END[1:]
-    )
-
-
-def _elide_auto_observe_span(content: str) -> str:
-    """Only the marker span is elided; the tool's own text (e.g. a click's confirmation) survives,
-    since it was never a perception result."""
-    return _AUTO_OBSERVE_SPAN_RE.sub(
-        f"\n\n{_COMPACTED_PREFIX}auto-observe output elided to bound context]", content, count=1
-    )
-
 
 def _compact_transcript(
     messages: list[dict[str, Any]],
     snapshot_indices: set[int],
-    auto_carrier_indices: set[int] | None = None,
 ) -> None:
     """Bound the persistent conversation by eliding stale perception snapshots.
 
@@ -1230,48 +1314,25 @@ def _compact_transcript(
       `snapshot_indices`, so it can neither be elided nor shadow the real snapshot and leave the agent
       with no usable page view — regardless of content length (a verbose provider error included).
 
-    A message carrying an appended auto-observe block is grouped into the same "observe" supersession
-    class as a real `observe` result, whichever tool actually produced it. Only its marker span is
-    elided; the tool's own text is never touched. Membership in that class is decided by
-    `auto_carrier_indices` (the loop's own record of which index it appended a digest to), NEVER by
-    sniffing message content for `AUTO_OBSERVE_BEGIN` -- a page whose own text happens to contain that
-    literal string must not be able to forge its way into the carrier class, and content-sniffing would
-    also force neutralizing every ordinary tool result up front (breaking byte-identity for auto_observe
-    OFF runs) just to keep that forgery from mattering.
-
     Only a `tool` message's content is shrunk, never removed, so every tool_call keeps a matching result
     and the transcript stays valid. Eliding also drops the index, so re-running is a no-op and an elided
     placeholder can never re-anchor as the live snapshot."""
     if not snapshot_indices:
         return
-    if auto_carrier_indices is None:
-        auto_carrier_indices = set()
     last_assistant_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
             last_assistant_idx = i
             break
 
-    def _snapshot_class(i: int) -> str:
-        return "observe" if i in auto_carrier_indices else messages[i]["name"]
-
     seen: set[str] = set()
     for i in sorted(snapshot_indices, reverse=True):
-        cls = _snapshot_class(i)
+        cls = messages[i]["name"]
         if i > last_assistant_idx or cls not in seen:
             seen.add(cls)  # the still-unread latest round, or the newest snapshot of this class — keep
             continue
-        content = messages[i]["content"]
-        # The marker-span-only elision is for a non-compactable carrier (a click/type result an
-        # auto-observe digest rode along on): its own text must survive. Gated on the explicit index
-        # set, not on `messages[i]["name"]`, since a carrier is by construction never a compactable
-        # tool's own result (batch_carrier_idx skips compactable specs).
-        if i in auto_carrier_indices:
-            messages[i]["content"] = _elide_auto_observe_span(content)
-        else:
-            messages[i]["content"] = f"{_COMPACTED_PREFIX}{cls} output elided to bound context]"
+        messages[i]["content"] = f"{_COMPACTED_PREFIX}{cls} output elided to bound context]"
         snapshot_indices.discard(i)
-        auto_carrier_indices.discard(i)
 
 
 async def run_agent_tool_loop(
@@ -1310,7 +1371,10 @@ async def run_agent_tool_loop(
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
-    auto_observe: bool = False,
+    # One model call's worth of token headroom, reserved so the single-shot final turn (below) is
+    # actually fundable rather than being immediately re-tripped by the same max_tokens check it
+    # was granted under. 0 (the default) reproduces today's unreserved check.
+    final_turn_token_reserve: int = 0,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     outcome: LoopOutcome | None = None
@@ -1346,18 +1410,10 @@ async def run_agent_tool_loop(
     # Indices into `messages` of successful perception results, recorded as they are appended so
     # compaction can keep only the newest of each without inferring "real snapshot" from content size.
     snapshot_indices: set[int] = set()
-    # Indices carrying an appended auto-observe digest, recorded by the loop itself the moment it
-    # wraps one on -- _compact_transcript classifies a carrier off THIS set, never by sniffing message
-    # content for AUTO_OBSERVE_BEGIN, so a page whose own text happens to contain that literal string
-    # can never forge its way into the carrier class.
-    auto_carrier_indices: set[int] = set()
     perception = _PerceptionLedger()
-    # Auto-observe's own ledger: separate state so an auto snapshot's digest can never pad the
-    # model-issued no-arg observe's streak (both key on ("observe", "{}")) into the model's own
-    # can_terminate=True verdict.
-    auto_perception = _PerceptionLedger()
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress = _ProgressLedger(window=progress_window) if progress_window is not None else None
+    canonical = _CanonicalProgressTracker()
     # The action-loop counter: (repeat count, first turn of the streak) per billable action
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
@@ -1368,6 +1424,21 @@ async def run_agent_tool_loop(
     # page-change evidence, and whether the single extension has been spent.
     last_change_evidence_step: int | None = None
     budget_extension_granted = False
+    # Single-shot final-turn grant (budget-exhaustion final turn): mirrors budget_extension_granted's
+    # shape. The first budget-cap trip anywhere in the loop sets this and buys exactly one more
+    # unconstrained model turn; cap_trip_pending remembers which cap granted it, so a finish() outcome
+    # produced on that turn can carry the fact forward even though finish is a different code path.
+    # final_turn_started distinguishes "granted, turn not run yet" from "granted turn already ran": a
+    # mid-batch grant (max_tool_calls, the action-step gate) leaves the SAME counter tripped for the
+    # very next top-of-turn check, one code site removed from the grant with no turn boundary between
+    # them -- without this flag that check would end the run before the granted turn ever started.
+    final_turn_granted = False
+    final_turn_started = False
+    cap_trip_pending: str | None = None
+    # Extraction carried by a finish the granted turn staged but never got honored (skipped behind a
+    # failed or refused call, or refused by a fail-closed blocker). The verdict itself stays
+    # unhonored — its premise didn't hold — but the data rides the spent-grant exit.
+    final_turn_staged_output: Any = None
 
     def _clear_action_state() -> None:
         action_counts.clear()
@@ -1426,7 +1497,6 @@ async def run_agent_tool_loop(
         page_state_nudge_delivered = False
         page_state_prev_fp = None
         perception.reset()
-        auto_perception.reset()
         if activity is not None:
             activity.perception_stall_imminent = False
         pending_screenshots = []
@@ -1434,19 +1504,30 @@ async def run_agent_tool_loop(
         stall_nudges_due = []
         if progress is not None:
             progress.hard_progress()
+        canonical.progress(_ProgressEvidence.REFRESH_RELOAD)
         if submit_watch is not None:
             submit_watch.clear()
         _append_skipped_tool_results(messages, remaining, "the page was refreshed")
         refresh_nudge_due = True
         return True
 
-    def _progress_observe_shadow(observe_summary: dict[str, int], tool_name: str, attribution: dict[str, Any]) -> None:
-        """Shared by the model-dispatched and auto-observe paths so an auto-observe feeds the same
-        ledger a model-issued no-arg observe would."""
+    def _progress_observe_shadow(
+        observe_summary: dict[str, int], tool_name: str, attribution: dict[str, Any], baseline_before: int | None
+    ) -> None:
+        """Feeds a model-issued no-arg observe's invalid-fields count into the net-progress ledger."""
         if progress is None or not observe_summary:
             return
         invalid_fields = observe_summary.get("invalid_fields")
-        if invalid_fields is not None and progress.observe(invalid_fields):
+        # The ledger's True return is the SHADOW STALL verdict, not progress — the canonical clear
+        # keys on the ledger re-baselining (a new low, or a rise re-baseline: fresh context), which
+        # is visible as its baseline moving under an already-set baseline. The baseline is captured
+        # BEFORE _absorb_result_data runs: a replayed download notice hard-progresses the shadow
+        # ledger (nulling the baseline) on the same result whose summary carries the new low, and
+        # reading the post-absorb value would leave this clear dead for the rest of the page.
+        stalled = invalid_fields is not None and progress.observe(invalid_fields)
+        if baseline_before is not None and progress.invalid_baseline != baseline_before:
+            canonical.progress(_ProgressEvidence.INVALID_FIELDS_BASELINE_MOVE)
+        if stalled:
             LOG.info(
                 PROGRESS_LEDGER_SHADOW_EVENT,
                 actions=progress.actions_since_progress,
@@ -1458,9 +1539,8 @@ async def run_agent_tool_loop(
             )
 
     def _absorb_result_data(tool_name: str, spec: ToolSpec | None, result_data: dict[str, Any]) -> bool:
-        """Shared by the model-dispatched and auto-observe paths so a download/page-change signal
-        in a tool's result.data has the same effect (staged_downloads, action-state clear, progress
-        hard_progress) regardless of which path produced it. Returns whether marks were renumbered."""
+        """Absorbs a download/page-change signal in a tool's result.data (staged_downloads,
+        action-state clear, progress hard_progress). Returns whether marks were renumbered."""
         if staged_downloads is not None and result_data.get("staged_download"):
             staged_downloads.add(result_data["staged_download"])
         if spec is not None and (result_data.get("download_notice") or result_data.get("page_state_changed")):
@@ -1473,13 +1553,12 @@ async def run_agent_tool_loop(
             _clear_action_state()
             if result_data.get("same_url_reload") or result_data.get("nav_revisit"):
                 # A reload destroys the observed document and a revisit replaces it with a fresh
-                # instance of known territory: re-baseline the perception ledgers (as the refresh
+                # instance of known territory: re-baseline the perception ledger (as the refresh
                 # path does) so the first post-navigation look cannot diff against a pre-navigation
                 # digest and read as progress — and clear the evidence stamp in both cases, since
                 # navigation is non-billable and a surviving stamp would stay maximally recent
                 # through any amount of oscillation.
                 perception.reset()
-                auto_perception.reset()
                 nonlocal last_change_evidence_step
                 last_change_evidence_step = None
                 if activity is not None:
@@ -1494,6 +1573,16 @@ async def run_agent_tool_loop(
                     activity.perception_stall_imminent = False
             if progress is not None:
                 progress.hard_progress()
+            if (
+                result_data.get("download_new")
+                or result_data.get("page_state_changed")
+                or result_data.get("same_url_reload")
+                or result_data.get("nav_revisit")
+            ):
+                # A REPLAYED notice (download_notice without download_new) re-clears the retry
+                # ledger but is not fresh progress: it must not keep wiping the canonical ring, or
+                # a post-download loop could never accumulate enough touches to emit telemetry.
+                canonical.progress(_ProgressEvidence.FRESH_DOWNLOAD_OR_NAVIGATION)
         # A click that moved the URL is a real page transition (H1 hard progress) for the shadow
         # ledger, but URL equality does NOT prove same-page (a URL-stable SPA form advance) — so only
         # the positive direction is acted on, and kept OUT of the branch above so it never clears the
@@ -1503,13 +1592,13 @@ async def run_agent_tool_loop(
         if result_data.get("page_transitioned") is True:
             if progress is not None:
                 progress.hard_progress()
+            canonical.progress(_ProgressEvidence.PAGE_TRANSITIONED)
         return tool_name == "look" and bool(result_data.get("marks_renumbered"))
 
     async def _completion_probe_outcome(
         tool_name: str, spec: ToolSpec | None, result_data: dict[str, Any]
     ) -> LoopOutcome | None:
-        """Shared by the model-dispatched and auto-observe paths: a download an auto-observe reports
-        must reach completion exactly as it would if the model had called observe itself."""
+        """Consults the completion probe after a billable or download-signaling tool result."""
         if not (
             completion_probe is not None
             and spec is not None
@@ -1527,6 +1616,9 @@ async def run_agent_tool_loop(
         if not completion_reason:
             return None
         LOG.info("taskv3 loop completion probe fired", tool=tool_name, turn=turns)
+        # No tracker-wide clear here: the probe firing is download progress for the COMPLETING
+        # touch only, and its call site drops that one target's pending rungs — a whole-generation
+        # bump would erase a sibling target's true-positive rung along with it.
         return LoopOutcome("completed", completion_reason)
 
     def _perception_stall_check(
@@ -1538,26 +1630,22 @@ async def run_agent_tool_loop(
         *,
         content_only_digest: str | None = None,
         refresh_pending: bool = False,
-        can_terminate: bool = True,
     ) -> tuple[LoopOutcome | None, list[tuple[str, int]]]:
-        """Shared by the model-dispatched and auto-observe paths so both trip the same nudge/terminate
-        thresholds identically — each against its OWN ledger, so an auto snapshot can never pad the
-        model ledger's streak toward a can_terminate=True verdict."""
+        """Trips the nudge/terminate thresholds off ``ledger``'s own streak."""
         stall_nudges: list[tuple[str, int]] = []
         snap = ledger.record(action_key, content_digest)
         if snap.progressed:
             # This probe saw the page change since it last looked — fresh evidence of progress, so
             # repeat counts for actions taken against the old state are stale. A first-time probe has
             # no baseline and proves nothing, which is what keeps varied-selector probing from
-            # laundering repetition into progress. NOT gated on can_terminate: a multi-page wizard that
-            # clicks the same selector (e.g. "next") on every page relies on THIS clear to survive —
-            # page_transitioned alone deliberately does not clear the action-loop guard (see below), so
-            # only a progressed snapshot does, and progress is progress regardless of which ledger (the
-            # model's own observe, or auto-observe) happened to see it. What stays gated on
-            # can_terminate is below: auto-observe must never arm perception_stall_imminent or return a
-            # terminate verdict, since it fires far more often than the model calls observe on its own
-            # and would trip those far too eagerly for a path the model never asked to take.
+            # laundering repetition into progress. A multi-page wizard that clicks the same selector
+            # (e.g. "next") on every page relies on THIS clear to survive — page_transitioned alone
+            # deliberately does not clear the action-loop guard (see below), so only a progressed
+            # snapshot does.
             _clear_action_state()
+            # Two landed digests that differ are positive evidence, exactly like a fingerprint
+            # mismatch — and the only movement evidence there is when page_fingerprint is absent.
+            canonical.progress(_ProgressEvidence.PERCEPTION_DIGEST)
             # Evidence requires NEW content: a URL-only flip (history.pushState) still clears the
             # repeat guards above but earns no budget, and neither does a return to a content state
             # in the probe's recent ring (a panel toggling open and shut).
@@ -1569,45 +1657,28 @@ async def run_agent_tool_loop(
             if ring is None:
                 ring = ledger.content_only.setdefault(action_key, deque(maxlen=PERCEPTION_RING))
             ring.append(content_only_digest)
-        if can_terminate and activity is not None and stall_terminate_after is not None:
-            # Auto-observe (can_terminate=False) is a path the model never asked to take, so its
-            # snapshots must not arm this flag: it feeds the failure-evidence retry gate below, and a
-            # model-issued submit later in the SAME turn must not have its retry suppressed by a
-            # probe the model never saw.
+        if activity is not None and stall_terminate_after is not None:
             activity.perception_stall_imminent = ledger.next_snapshot_can_trip(stall_terminate_after)
         # A refresh about to be honored re-baselines this ledger anyway, so a stall verdict raised on
         # the stale page it is replacing would be wrong the instant the reload lands.
         if stall_terminate_after is not None and snap.live >= stall_terminate_after and not refresh_pending:
-            if not can_terminate:
-                # Auto-observe feeds the same ledger a model observe would (for progress detection and
-                # the shadow/suppressed reporting below), but it is a NEW path the model never asked
-                # to take — it must not be the thing that ends the run. Detection parity, not action
-                # parity: log what a model observe would have done here and continue.
-                LOG.info(
-                    "taskv3 auto observe stall would terminate",
-                    tool=tool_name,
-                    identical_count=snap.live,
-                    turn=turns,
-                    **attribution,
-                )
-            else:
-                LOG.info(
-                    "taskv3 loop perception stalled",
-                    tool=tool_name,
-                    identical_count=snap.live,
-                    turn=turns,
-                    **attribution,
-                )
-                return (
-                    LoopOutcome(
-                        "terminated",
-                        f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive identical snapshots from "
-                        f"one {tool_name} probe — the page stopped changing in response to actions, so the goal "
-                        "cannot progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
-                        "cross-origin frame)",
-                    ),
-                    stall_nudges,
-                )
+            LOG.info(
+                "taskv3 loop perception stalled",
+                tool=tool_name,
+                identical_count=snap.live,
+                turn=turns,
+                **attribution,
+            )
+            return (
+                LoopOutcome(
+                    "terminated",
+                    f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive identical snapshots from "
+                    f"one {tool_name} probe — the page stopped changing in response to actions, so the goal "
+                    "cannot progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
+                    "cross-origin frame)",
+                ),
+                stall_nudges,
+            )
         if (
             stall_terminate_after is not None
             and snap.tool_identical == stall_terminate_after
@@ -1698,18 +1769,51 @@ async def run_agent_tool_loop(
         if should_cancel is not None and await should_cancel():
             outcome = LoopOutcome("canceled", "run canceled")
             break
-        if deadline_seconds is not None and time.monotonic() - started_at > deadline_seconds:
-            outcome = LoopOutcome("budget_exhausted", f"deadline ({deadline_seconds:.0f}s) reached")
+        # The single-shot final-turn grant (see final_turn_granted above): the first budget trip
+        # here buys exactly one more turn instead of ending the run, so the checks below are elif'd
+        # (only the first tripped cap matters this iteration). A spent grant ends the run BEFORE any
+        # counter is consulted: the granted turn may have been granted at a gate no top-of-turn
+        # check re-reads (the action-step gate), so waiting for a counter to re-trip would let a
+        # finish-less granted turn keep looping on other budgets — and the cap that granted the
+        # turn, not whichever counter happens to re-trip first, is the honest fact to report.
+        # final_turn_started (set below, right before the turn actually runs) distinguishes a spent
+        # grant from a mid-batch grant whose turn has not run yet. Cancellation above is exempt: it
+        # is not a budget cap.
+        if final_turn_granted and final_turn_started:
+            outcome = LoopOutcome(
+                "budget_exhausted",
+                _budget_exhausted_reason(cap_trip_pending or "budget"),
+                cap_trip=cap_trip_pending,
+                extracted_output=final_turn_staged_output,
+            )
             break
-        if max_tokens is not None and total_tokens >= max_tokens:
-            outcome = LoopOutcome("budget_exhausted", f"max_tokens ({max_tokens}) reached")
-            break
-        if turns >= max_turns:
-            outcome = LoopOutcome("budget_exhausted", f"max_turns ({max_turns}) reached")
-            break
-        if total_tool_calls >= max_tool_calls:
-            outcome = LoopOutcome("budget_exhausted", f"max_tool_calls ({max_tool_calls}) reached")
-            break
+        # Once the grant fired no top-of-turn cap can trip again, so the checks only run pre-grant.
+        top_of_turn_trip: str | None = None
+        if not final_turn_granted:
+            if deadline_seconds is not None and time.monotonic() - started_at > deadline_seconds:
+                top_of_turn_trip = f"deadline ({deadline_seconds:.0f}s) reached"
+            elif max_tokens is not None and total_tokens >= max(0, max_tokens - final_turn_token_reserve):
+                top_of_turn_trip = f"max_tokens ({max_tokens}) reached"
+            elif turns >= max_turns:
+                top_of_turn_trip = f"max_turns ({max_turns}) reached"
+            elif total_tool_calls >= max_tool_calls:
+                top_of_turn_trip = f"max_tool_calls ({max_tool_calls}) reached"
+        if top_of_turn_trip is not None:
+            final_turn_granted = True
+            cap_trip_pending = top_of_turn_trip
+            LOG.info(
+                FINAL_TURN_GRANTED_EVENT,
+                cap=top_of_turn_trip,
+                turn=turns,
+                tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
+                tokens_remaining=None if activity is None else activity.tokens_remaining,
+            )
+            messages.append({"role": "user", "content": _budget_exhausted_observation(top_of_turn_trip, activity)})
+        if final_turn_granted:
+            final_turn_started = True
+            if activity is not None:
+                # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
+                activity.final_turn_active = True
         turns += 1
         if activity is not None:
             activity.turn = turns
@@ -1718,7 +1822,7 @@ async def run_agent_tool_loop(
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
-        _compact_transcript(messages, snapshot_indices, auto_carrier_indices)
+        _compact_transcript(messages, snapshot_indices)
         llm_caller.message_history = list(messages)
         # Consume any pending look image into THIS call only, then clear: the image rides one request
         # and is never appended to `messages`, so the turn after carries zero image blocks.
@@ -1814,47 +1918,54 @@ async def run_agent_tool_loop(
         failed_selectors: set[str] = set()
         batch_had_failure = False
         marks_stale = False
-        # Auto-observe signals, gathered across the whole batch so the end-of-batch check reads the
-        # batch's net effect rather than any one call's.
-        batch_observed_ok = False
+        # Loop events minted this batch, emitted only after every progress signal the batch can
+        # produce has been absorbed (see the end-of-batch emission below).
+        pending_canonical_fires: list[dict[str, Any]] = []
         batch_page_change_reason: str | None = None
-        batch_probe_before: str | None = None
         batch_fp_before: str | None = None
         # Sample only when the batch can actually land a billable action -- the end-of-batch check
         # below gates on turn_did_action, so a finish-only or perception-only batch has no use for
-        # these baselines and shouldn't pay their round-trip.
+        # this baseline and shouldn't pay its round-trip.
         batch_has_billable_call = any(
             tool_by_name.get(tool_name) is not None and tool_by_name[tool_name].billable
             for _, tool_name, _ in tool_calls
         )
-        # A cancellation that already landed makes this batch's baselines dead work: the per-call
-        # check below (before the first dispatch) ends the batch before anything they'd inform runs.
-        batch_will_sample_baseline = batch_has_billable_call and (
-            page_fingerprint is not None or (auto_observe and page_probe is not None)
-        )
+        # A cancellation that already landed makes this batch's baseline dead work: the per-call
+        # check below (before the first dispatch) ends the batch before anything it'd inform runs.
+        batch_will_sample_baseline = batch_has_billable_call and page_fingerprint is not None
         batch_cancelled = batch_will_sample_baseline and should_cancel is not None and await should_cancel()
-        if auto_observe and page_probe is not None and batch_has_billable_call and not batch_cancelled:
-            batch_probe_before = await _sample_probe(page_probe, deadline_at=deadline_at)
-        # Sampled on BOTH arms (not just auto-observe): the page-state stall detector reads the
-        # before/after fingerprint pair for every billable batch.
+        # The page-state stall detector (SKY-15265) reads the before/after fingerprint pair for
+        # every billable batch.
         if page_fingerprint is not None and batch_has_billable_call and not batch_cancelled:
             batch_fp_before = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
+            if page_state_prev_fp is not None and batch_fp_before is not None and batch_fp_before != page_state_prev_fp:
+                # The page moved BETWEEN batches (a delayed render landing after the prior
+                # after-sample): the touches the old samples described are stale, and this batch's
+                # dispatch and extension decisions must not read them. Canonical-only — the
+                # incumbent stall counters keep their end-of-batch turn_did_action gate.
+                canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
-        # The auto-observe path's FINAL page-changed verdict (resample included) when it ran; the
-        # stall detector prefers this over re-comparing raw samples so the two can never disagree.
-        batch_auto_page_changed: bool | None = None
-        # The batch's carrier for an auto-observe digest: the LAST tool message appended for an
-        # EXECUTED (dispatched) call whose spec is not compactable -- i.e. a real action result, never
-        # a skip stub and never a compactable perception dump that would otherwise elide the digest's
-        # own index away the next time it's superseded (see _compact_transcript).
-        batch_carrier_idx: int | None = None
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
             # this call nor the rest of the batch executes, so answer them as skipped.
-            if total_tool_calls >= max_tool_calls:
-                outcome = LoopOutcome("budget_exhausted", f"max_tool_calls ({max_tool_calls}) reached")
+            # Gated on `not final_turn_granted`: once the final turn is granted this same counter is
+            # already at (or past) the cap by construction, so re-enforcing it here would block the
+            # granted turn's very first call (including finish) before it ever ran. The top-of-turn
+            # check is what actually ends the run if this granted turn doesn't finish either.
+            if not final_turn_granted and total_tool_calls >= max_tool_calls:
+                mid_batch_trip = f"max_tool_calls ({max_tool_calls}) reached"
+                final_turn_granted = True
+                cap_trip_pending = mid_batch_trip
+                LOG.info(
+                    FINAL_TURN_GRANTED_EVENT,
+                    cap=mid_batch_trip,
+                    turn=turns,
+                    tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
+                    tokens_remaining=None if activity is None else activity.tokens_remaining,
+                )
                 _append_skipped_tool_results(messages, tool_calls[idx:], "tool-call budget reached")
+                messages.append({"role": "user", "content": _budget_exhausted_observation(mid_batch_trip, activity)})
                 break
             if should_cancel is not None and await should_cancel():
                 outcome = LoopOutcome("canceled", "run canceled")
@@ -1955,6 +2066,18 @@ async def run_agent_tool_loop(
                         extension,
                         seconds_per_step=(time.monotonic() - started_at) / max(action_steps, 1),
                     )
+                # This read cannot see unabsorbed in-batch movement: action_steps is frozen during
+                # a batch, so the cap check trips on the batch's FIRST billable call — before any
+                # page action dispatches — and between-batch movement was absorbed when
+                # batch_fp_before was sampled.
+                looping_now = canonical.looping_targets()
+                LOG.info(
+                    CANONICAL_EXTEND_DELTA_EVENT,
+                    current_decision=allowed,
+                    gate_reason=gate_reason,
+                    canonical_looping_targets=looping_now,
+                    would_block_extension=bool(allowed and looping_now),
+                )
                 if allowed:
                     original_cap = max_action_steps
                     budget_extension_granted = True
@@ -1976,8 +2099,45 @@ async def run_agent_tool_loop(
                         turn=turns,
                         tool=tool_name,
                     )
-                    outcome = LoopOutcome("budget_exhausted", f"Reached the maximum steps ({max_action_steps})")
+                    step_cap_trip = f"Reached the maximum steps ({max_action_steps})"
                     _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
+                    # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
+                    # away once the final turn is granted: a billable dispatch on the granted turn still
+                    # hits it, which is the honest exit the grant exists to produce.
+                    if final_turn_granted:
+                        # A finish staged later in this skipped batch: its VERDICT is not honored
+                        # (it presumed the refused action would run — accepting a completed there
+                        # could claim a success that never happened), but the extraction it was
+                        # already carrying is salvaged onto the honest exit.
+                        staged_finish_output = next(
+                            (
+                                t_args.get("extracted_output")
+                                for _t_id, t_name, t_args in tool_calls[idx:]
+                                if t_name == "finish" and isinstance(t_args, dict)
+                            ),
+                            None,
+                        )
+                        # The cap that granted the final turn is the honest fact to report — the
+                        # step gate merely happens to be where the spent grant gets caught.
+                        outcome = LoopOutcome(
+                            "budget_exhausted",
+                            _budget_exhausted_reason(cap_trip_pending or step_cap_trip),
+                            cap_trip=cap_trip_pending or step_cap_trip,
+                            extracted_output=staged_finish_output,
+                        )
+                    else:
+                        final_turn_granted = True
+                        cap_trip_pending = step_cap_trip
+                        LOG.info(
+                            FINAL_TURN_GRANTED_EVENT,
+                            cap=step_cap_trip,
+                            turn=turns,
+                            tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
+                            tokens_remaining=None if activity is None else activity.tokens_remaining,
+                        )
+                        messages.append(
+                            {"role": "user", "content": _budget_exhausted_observation(step_cap_trip, activity)}
+                        )
                     break
             # Submit-shaped actions (the failure-evidence predicate, minus captcha) are reported BEFORE
             # dispatch, since after it the page may be the confirmation page. A failure here never fails
@@ -2069,6 +2229,26 @@ async def run_agent_tool_loop(
                 **observe_summary,
                 **attribution,
             )
+            if spec is not None and spec.billable:
+                target_key = _call_selector(args) or f"tool:{tool_name}"
+                same_count, same_errors = canonical.record_touch(target_key, result.status == "error")
+                # Every rung of the distribution is logged (not one cliff): the Phase-B block
+                # threshold is tuned from this data.
+                if (
+                    same_count in CANONICAL_LOOP_FIRE_COUNTS
+                    and same_errors >= same_count - 1
+                    and canonical.claim_rung(target_key, same_count)
+                ):
+                    pending_canonical_fires.append(
+                        {
+                            "gen": canonical.gen,
+                            "target_key_hash": telemetry_hash(telemetry_salt, target_key),
+                            "tool": tool_name,
+                            "repeat_count": same_count,
+                            "repeat_errors": same_errors,
+                            "turn": turns,
+                        }
+                    )
 
             if spec is not None and spec.compactable and result.status == "ok":
                 snapshot_indices.add(len(messages))  # index this successful snapshot will occupy, pre-append
@@ -2082,8 +2262,6 @@ async def run_agent_tool_loop(
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
-            if spec is not None and not spec.compactable:
-                batch_carrier_idx = len(messages) - 1
             # A look's annotated screenshot is shown to the model on the next call only, never stored in
             # the transcript. Consumed and cleared at the top of the next turn. Only the LATEST snapshot
             # survives: a second look in the same turn supersedes the first (its marks replace the prior
@@ -2091,18 +2269,7 @@ async def run_agent_tool_loop(
             if result.screenshots:
                 pending_screenshots = list(result.screenshots)
             result_data = result.data or {}
-            if auto_observe:
-                # batch_observed_ok tracks FRESHNESS, not "did an observe happen this batch": any
-                # dispatched call that is not a perception snapshot (compactable) invalidates it,
-                # since that observe's snapshot now predates a page-changing call -- navigate/scroll/
-                # wait are non-billable but still change what a later observe would return.
-                if spec is not None and not spec.compactable:
-                    batch_observed_ok = False
-                if tool_name == "observe" and result.status == "ok":
-                    batch_observed_ok = True
-            # Accumulated on BOTH arms (hoisted out of the auto-observe gate for SKY-15265): the
-            # page-state stall detector re-baselines on these flags, and a hover or file-upload
-            # signal only the auto arm could see would false-kill the manual arm. Keeps the FIRST
+            # The page-state stall detector (SKY-15265) re-baselines on these flags. Keeps the FIRST
             # qualifying signal this batch -- the reason field is diagnostic (telemetry), not the
             # decision itself, so a later call's signal never overwrites it.
             if batch_page_change_reason is None or batch_page_change_reason == "page_transitioned":
@@ -2123,12 +2290,14 @@ async def run_agent_tool_loop(
                     batch_page_change_reason = "navigate"
                 elif batch_page_change_reason is None and result_data.get("page_transitioned") is True:
                     batch_page_change_reason = "page_transitioned"
+            shadow_baseline_before = progress.invalid_baseline if progress is not None else None
             if _absorb_result_data(tool_name, spec, result_data):
                 # Every mark=N still queued in this batch was chosen before this look renumbered the
                 # marks, so it now names an arbitrary element; a look refused before rebuilding its
                 # manifest leaves the old marks (and their failed keys) live.
                 marks_stale = True
-            _progress_observe_shadow(observe_summary, tool_name, attribution)
+                canonical.invalidate_marks()
+            _progress_observe_shadow(observe_summary, tool_name, attribution, shadow_baseline_before)
             if content_digest is not None:
                 stall_outcome, nudges_due = _perception_stall_check(
                     perception,
@@ -2222,6 +2391,13 @@ async def run_agent_tool_loop(
             completion_outcome = await _completion_probe_outcome(tool_name, spec, result_data)
             if completion_outcome is not None:
                 outcome = completion_outcome
+                if spec is not None and spec.billable:
+                    # The download landed while this call's probe waited, so this call's touch is
+                    # the progressing one: drop ITS pending rungs only, never a sibling target's.
+                    completing_hash = telemetry_hash(telemetry_salt, _call_selector(args) or f"tool:{tool_name}")
+                    pending_canonical_fires[:] = [
+                        fire for fire in pending_canonical_fires if fire["target_key_hash"] != completing_hash
+                    ]
                 _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "completion probe fired")
                 break
 
@@ -2241,6 +2417,9 @@ async def run_agent_tool_loop(
                     status=data.get("status", "completed"),
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
+                    # The model's own verdict wins whether or not it landed on the granted final turn;
+                    # cap_trip just records the fact that a cap forced this to be the last turn.
+                    cap_trip=cap_trip_pending if final_turn_granted else None,
                 )
                 break
 
@@ -2261,6 +2440,11 @@ async def run_agent_tool_loop(
                 if not poisoned and spec is not None and page_probe is not None:
                     probe_after = await _sample_probe(page_probe, deadline_at=deadline_at)
                     poisoned = probe_before is None or probe_after is None or probe_after != probe_before
+                    if probe_before is not None and probe_after is not None and probe_after != probe_before:
+                        # Two landed identity samples that differ: the failed call still moved the
+                        # document, and the fingerprint may render identically on the new one (a
+                        # same-template step) — absorb it here or the rung survives that blindness.
+                        canonical.progress(_ProgressEvidence.PROBE_MISMATCH)
                 if poisoned:
                     _append_skipped_tool_results(
                         messages,
@@ -2274,6 +2458,23 @@ async def run_agent_tool_loop(
                     if call_selector is not None:
                         failed_selectors.add(call_selector)
 
+        # Whatever skipped or refused a finish once a cap tripped — behind the very call that
+        # tripped it in the GRANTING batch, behind a failed call or fail-closed blocker on the
+        # granted turn, or under a guard that terminated the batch — the extraction it was already
+        # carrying is remembered; the post-loop stamp rides it out on whatever terminal the run
+        # ends with. Last write wins, so a granted-turn restatement supersedes the older capture.
+        if final_turn_granted:
+            staged = next(
+                (
+                    t_args.get("extracted_output")
+                    for _t_id, t_name, t_args in tool_calls
+                    if t_name == "finish" and isinstance(t_args, dict) and t_args.get("extracted_output") is not None
+                ),
+                None,
+            )
+            if staged is not None:
+                final_turn_staged_output = staged
+
         # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
         # failed/terminated choice to the model's finish tool (which does not converge on this class).
@@ -2285,270 +2486,10 @@ async def run_agent_tool_loop(
                 "the target no longer exists or has been removed, so the goal cannot be completed there",
             )
 
-        # Runs BEFORE the nudge message is assembled below (not after): auto-observe's own stall
-        # nudge must land in the SAME user message as a model-issued stall/action nudge, not a
-        # second consecutive one -- so this collects ao_nudges_result for the assembly below rather
-        # than appending its own message. Nav-dead-end still takes priority (checked above).
-        # Never touches action_steps/tool_calls accounting -- this is not a model-issued tool call.
-        ao_nudges_result: list[tuple[str, int]] = []
-        if outcome is None and auto_observe and turn_did_action and not batch_observed_ok and batch_carrier_idx is None:
-            # No executed non-compactable call landed a carrier this batch (every dispatched call was
-            # compactable, e.g. get_html/look, or every call was skipped) -- nowhere safe to attach a
-            # digest that would survive compaction.
-            LOG.info(
-                "taskv3 auto observe", turn=turns, fired=False, reason="no_carrier", digest_chars=0, wait_seconds=0.0
-            )
-        elif (
-            outcome is None
-            and auto_observe
-            and turn_did_action
-            and not batch_observed_ok
-            and batch_carrier_idx is not None
-        ):
-            wait_seconds = 0.0
-            # The deadline is honored at every step below, not just around sleeps: a probe or the
-            # observe handler itself can outlive the loop's deadline just as easily as a sleep can,
-            # so each sampler call is bounded to whatever's left of the deadline (via _sample_probe's
-            # deadline_at) and the path bails with reason="deadline" the instant nothing is left.
-            if deadline_at is not None and deadline_at - time.monotonic() <= 0:
-                LOG.info(
-                    "taskv3 auto observe",
-                    turn=turns,
-                    fired=False,
-                    reason="deadline",
-                    signal="none",
-                    digest_chars=0,
-                    wait_seconds=0.0,
-                )
-            else:
-                page_changed: bool
-                reason: str
-                signal: str
-                if batch_page_change_reason is not None:
-                    page_changed, reason, signal = True, batch_page_change_reason, "flag"
-                elif page_fingerprint is not None:
-                    # The fingerprint samples rendered content (innerHTML), so it catches an in-page
-                    # mutation (a dropdown, a validation error, a revealed section) the document-identity
-                    # probe below reads as "unchanged". Only trusted when BOTH samples landed -- a missing
-                    # before or after reading is not evidence either way, so it falls back to the probe.
-                    fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
-                    batch_fp_after = fp_after
-                    if batch_fp_before is not None and fp_after is not None:
-                        page_changed = fp_after != batch_fp_before
-                        reason = "fingerprint_mismatch" if page_changed else "unchanged"
-                        signal = "fingerprint"
-                    elif page_probe is not None:
-                        probe_after = await _sample_probe(page_probe, deadline_at=deadline_at)
-                        if batch_probe_before is None or probe_after is None or probe_after != batch_probe_before:
-                            page_changed, reason = True, "probe_mismatch"
-                        else:
-                            page_changed, reason = False, "unchanged"
-                        signal = "probe"
-                    else:
-                        page_changed, reason, signal = False, "unchanged", "none"
-                elif page_probe is not None:
-                    probe_after = await _sample_probe(page_probe, deadline_at=deadline_at)
-                    if batch_probe_before is None or probe_after is None or probe_after != batch_probe_before:
-                        page_changed, reason = True, "probe_mismatch"
-                    else:
-                        page_changed, reason = False, "unchanged"
-                    signal = "probe"
-                else:
-                    page_changed, reason, signal = False, "unchanged", "none"
-
-                if not page_changed and signal in ("fingerprint", "probe"):
-                    # The immediate comparison above can be too early for an async render; give it one
-                    # more settle interval and resample once before accepting "unchanged".
-                    resample_sampler = page_fingerprint if signal == "fingerprint" else page_probe
-                    resample_before = batch_fp_before if signal == "fingerprint" else batch_probe_before
-                    if resample_sampler is not None:
-                        resampled_changed, resample_wait = await _resample_after_one_settle_interval(
-                            resample_sampler, resample_before, should_cancel, deadline_at
-                        )
-                        wait_seconds += resample_wait
-                        if resampled_changed:
-                            page_changed = True
-                            reason = "fingerprint_mismatch" if signal == "fingerprint" else "probe_mismatch"
-
-                batch_auto_page_changed = page_changed
-                if not page_changed:
-                    messages[batch_carrier_idx]["content"] = (
-                        str(messages[batch_carrier_idx]["content"]) + "\n\n[no markup change detected after this batch]"
-                    )
-                    LOG.info(
-                        "taskv3 auto observe",
-                        turn=turns,
-                        fired=False,
-                        reason=reason,
-                        signal=signal,
-                        digest_chars=0,
-                        wait_seconds=wait_seconds,
-                    )
-                elif deadline_at is not None and deadline_at - time.monotonic() <= 0:
-                    LOG.info(
-                        "taskv3 auto observe",
-                        turn=turns,
-                        fired=False,
-                        reason="deadline",
-                        signal=signal,
-                        digest_chars=0,
-                        wait_seconds=wait_seconds,
-                    )
-                else:
-                    wait_seconds += await _auto_observe_settle_wait(
-                        page_probe, should_cancel, deadline_at, page_fingerprint=page_fingerprint
-                    )
-                    if should_cancel is not None and await should_cancel():
-                        # Re-checked after the settle wait: skip the observe dispatch and let the loop's
-                        # own top-of-turn cancellation check end the run as canceled.
-                        LOG.info(
-                            "taskv3 auto observe",
-                            turn=turns,
-                            fired=False,
-                            reason="canceled",
-                            signal=signal,
-                            digest_chars=0,
-                            wait_seconds=wait_seconds,
-                        )
-                    elif deadline_at is not None and deadline_at - time.monotonic() <= 0:
-                        LOG.info(
-                            "taskv3 auto observe",
-                            turn=turns,
-                            fired=False,
-                            reason="deadline",
-                            signal=signal,
-                            digest_chars=0,
-                            wait_seconds=wait_seconds,
-                        )
-                    else:
-                        observe_spec = tool_by_name.get("observe")
-                        ao_result: ToolResult | None = None
-                        if observe_spec is not None:
-                            observe_remaining = None if deadline_at is None else deadline_at - time.monotonic()
-                            observe_timeout = (
-                                _PAGE_PROBE_TIMEOUT_SECONDS
-                                if observe_remaining is None
-                                else min(_PAGE_PROBE_TIMEOUT_SECONDS, observe_remaining)
-                            )
-                            ao_started = time.monotonic()
-                            try:
-                                ao_result = await asyncio.wait_for(observe_spec.handler({}), timeout=observe_timeout)
-                            except Exception:
-                                LOG.debug("taskv3 auto observe handler raised", turn=turns, exc_info=True)
-                                ao_result = None
-                            finally:
-                                # Counted the same way the normal dispatch path counts tool_seconds
-                                # (below, at "tool_duration_seconds"): this IS a tool call, just one
-                                # the loop issued instead of the model.
-                                tool_seconds += time.monotonic() - ao_started
-                        # Mirrors the model-dispatched path's post-call check (skyvern_ctx.refresh_working_page,
-                        # further up): the injected observe can raise this flag exactly like any other
-                        # handler, whether or not it also raised an exception or returned content, so it is
-                        # consumed here before the digest below is trusted — a digest from a call that also
-                        # declared the page stale describes a page the next turn must not plan from.
-                        ao_ctx = skyvern_context.current()
-                        if ao_ctx is not None and ao_ctx.refresh_working_page:
-                            await _consume_refresh_signal(
-                                ao_ctx, "observe", [], round_actions, drop=reload_page is None
-                            )
-                            LOG.info(
-                                "taskv3 auto observe",
-                                turn=turns,
-                                fired=False,
-                                reason="refresh",
-                                signal=signal,
-                                digest_chars=0,
-                                wait_seconds=wait_seconds,
-                            )
-                        elif ao_result is not None and ao_result.status == "ok":
-                            # Absorbed the same way a model-dispatched observe's result.data would be,
-                            # so a download/page-change the injected observe reports (staged_downloads,
-                            # progress, and completion) lands identically whichever path produced it —
-                            # independent of whether the observe also produced a digest below.
-                            ao_result_data = ao_result.data or {}
-                            _absorb_result_data("observe", observe_spec, ao_result_data)
-                            completion_outcome = await _completion_probe_outcome(
-                                "observe", observe_spec, ao_result_data
-                            )
-                            if completion_outcome is not None:
-                                outcome = completion_outcome
-                            if ao_result.content:
-                                digest = ao_result.content
-                                ao_skyvern_ctx = skyvern_context.current()
-                                model_facing_digest = (
-                                    ao_skyvern_ctx.hide_from_model(digest) if ao_skyvern_ctx is not None else digest
-                                )
-                                model_facing_digest = _neutralize_auto_observe_markers(model_facing_digest)
-                                messages[batch_carrier_idx]["content"] = (
-                                    str(messages[batch_carrier_idx]["content"])
-                                    + "\n\n"
-                                    + AUTO_OBSERVE_BEGIN
-                                    + "[auto-observe after this batch — page changed]\n"
-                                    + model_facing_digest
-                                    + AUTO_OBSERVE_END
-                                )
-                                snapshot_indices.add(batch_carrier_idx)
-                                auto_carrier_indices.add(batch_carrier_idx)
-                                ao_action_key = ("observe", "{}")
-                                ao_digest = hashlib.sha256(
-                                    _canonical_perception_content(ao_result.content).encode()
-                                ).hexdigest()
-                                ao_attribution: dict[str, Any] = {
-                                    "action_key_hash": telemetry_hash(telemetry_salt, *ao_action_key),
-                                    "snapshot_digest": telemetry_hash(telemetry_salt, ao_digest),
-                                    "probe_first_time": auto_perception.first_time(ao_action_key),
-                                }
-                                _progress_observe_shadow(_observe_summary_fields(ao_result), "observe", ao_attribution)
-                                stall_outcome, ao_nudges_result = _perception_stall_check(
-                                    auto_perception,
-                                    ao_digest,
-                                    ao_action_key,
-                                    "observe",
-                                    ao_attribution,
-                                    content_only_digest=hashlib.sha256(
-                                        _content_only_perception(ao_result.content).encode()
-                                    ).hexdigest(),
-                                    can_terminate=False,
-                                )
-                                if stall_outcome is not None:
-                                    outcome = stall_outcome
-                                LOG.info(
-                                    "taskv3 auto observe",
-                                    turn=turns,
-                                    fired=True,
-                                    reason=reason,
-                                    signal=signal,
-                                    digest_chars=len(digest),
-                                    wait_seconds=wait_seconds,
-                                )
-                            else:
-                                LOG.debug("taskv3 auto observe produced no usable digest", turn=turns, reason=reason)
-                                LOG.info(
-                                    "taskv3 auto observe",
-                                    turn=turns,
-                                    fired=False,
-                                    reason="error",
-                                    signal=signal,
-                                    digest_chars=0,
-                                    wait_seconds=wait_seconds,
-                                )
-                        else:
-                            LOG.debug("taskv3 auto observe produced no usable digest", turn=turns, reason=reason)
-                            LOG.info(
-                                "taskv3 auto observe",
-                                turn=turns,
-                                fired=False,
-                                reason="error",
-                                signal=signal,
-                                digest_chars=0,
-                                wait_seconds=wait_seconds,
-                            )
-
         # Page-state stall detector (SKY-15265): tool-independent — any batch of billable work that
         # leaves the rendered document byte-identical ticks the counter, whatever tools produced it.
         # A missing sample is no evidence either way; any page-change flag or fingerprint movement
-        # re-baselines. When the auto-observe path already resolved the batch's verdict (resample
-        # included), that verdict is reused so the two can never disagree.
+        # re-baselines.
         if outcome is None and turn_did_action and page_fingerprint is not None and batch_fp_before is not None:
             if page_state_prev_fp is not None and batch_fp_before != page_state_prev_fp:
                 # The page moved BETWEEN batches (a delayed render landing after the prior
@@ -2558,10 +2499,6 @@ async def run_agent_tool_loop(
             page_state_changed: bool | None
             if batch_page_change_reason is not None and batch_page_change_reason != "page_transitioned":
                 page_state_changed = True
-            elif batch_auto_page_changed is not None and batch_page_change_reason is None:
-                # The auto verdict treats ANY flag as changed, so when the only signal is the
-                # URL-only page_transitioned hint, fall through to the raw fingerprint instead.
-                page_state_changed = batch_auto_page_changed
             else:
                 if batch_fp_after is None and not (deadline_at is not None and deadline_at - time.monotonic() <= 0):
                     batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
@@ -2570,6 +2507,7 @@ async def run_agent_tool_loop(
             if page_state_changed is True:
                 page_state_stall_rounds = 0
                 page_state_nudge_delivered = False
+                canonical.progress(_ProgressEvidence.PAGE_STATE_VERDICT)
             elif page_state_changed is False:
                 page_state_stall_rounds += 1
                 if page_state_stall_rounds == PAGE_STATE_STALL_TERMINATE_AFTER and page_state_nudge_delivered:
@@ -2582,10 +2520,34 @@ async def run_agent_tool_loop(
                 elif page_state_stall_rounds >= PAGE_STATE_STALL_NUDGE_AFTER and not page_state_nudge_delivered:
                     page_state_nudge_due = True
 
+        if (
+            outcome is not None
+            # An acknowledged cancellation must not wait on a possibly-hung renderer just to
+            # decide telemetry; and a batch whose pending fires are all generation-stale already
+            # has nothing left to absorb for.
+            and outcome.status != "canceled"
+            and page_fingerprint is not None
+            and batch_fp_before is not None
+            and any(fire["gen"] == canonical.gen for fire in pending_canonical_fires)
+        ):
+            # A terminal outcome mid-batch (a finish, a fired completion probe) skips the detector
+            # above, so the batch's own movement is unabsorbed here: take the after-sample now and
+            # clear on a positive mismatch only, before deciding the pending events below.
+            if batch_fp_after is None:
+                batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
+            if batch_fp_after is not None and batch_fp_after != batch_fp_before:
+                canonical.progress(_ProgressEvidence.TERMINAL_BATCH_FINGERPRINT)
+        # A rung completed by — or followed in this batch by — absorbed progress describes a
+        # progressing run, not a loop: only events whose generation survived every clear above
+        # (same-call result data, invalid-fields baseline, batch fingerprint verdict) are emitted.
+        for pending_fire in pending_canonical_fires:
+            if pending_fire.pop("gen") == canonical.gen:
+                LOG.info(CANONICAL_LOOP_EVENT, **pending_fire)
+        pending_canonical_fires.clear()
+
         # Warn only after the batch completes: a user message may not sit between an assistant
         # turn's tool results, and the model reads it with the snapshot that tripped it. Every note
-        # due this turn (including auto-observe's own stall nudge, folded in above) shares ONE user
-        # message so the transcript keeps alternating roles.
+        # due this turn shares ONE user message so the transcript keeps alternating roles.
         nudge_parts: list[str] = []
         if outcome is None and refresh_nudge_due:
             nudge_parts.append(_refresh_nudge_text())
@@ -2598,8 +2560,6 @@ async def run_agent_tool_loop(
             page_state_nudge_delivered = True
             LOG.info("taskv3 loop page state stall nudged", rounds=page_state_stall_rounds, turn=turns)
             nudge_parts.append(_page_state_nudge_text(page_state_stall_rounds))
-        if outcome is None and ao_nudges_result:
-            nudge_parts.append(_stall_nudge_text(ao_nudges_result, set(tool_by_name)))
         if outcome is None and action_nudges_due:
             # Deliver only warnings whose streak survived the batch AND spans turns: a later call in
             # the same batch (an observe showing the page changed, a download) may have cleared it,
@@ -2640,6 +2600,18 @@ async def run_agent_tool_loop(
     if outcome is None:
         outcome = LoopOutcome("loop_error", "loop exited without an outcome")
 
+    # Every model- or loop-produced terminal once the cap tripped — a finish verdict, a guard
+    # termination (even in the granting batch itself), a stall exit, the spent-grant exit —
+    # happened UNDER the cap: it carries the cap fact, and a missing extraction is filled from
+    # what a skipped finish had staged (the model's own earlier data), so no exit path can
+    # re-discard the partial output. A completed verdict that didn't restate its output would
+    # otherwise be demoted for missing extraction.
+    if final_turn_granted and outcome.status in ("completed", "failed", "terminated", "budget_exhausted", "loop_error"):
+        if outcome.cap_trip is None:
+            outcome.cap_trip = cap_trip_pending
+        if outcome.extracted_output is None:
+            outcome.extracted_output = final_turn_staged_output
+
     if progress is not None and progress.ever_armed:
         # Per-run survival record, emitted only for runs that ever saw a form (the population the
         # ledger applies to — this bounds the added log volume to formful runs, not every v3 run):
@@ -2654,6 +2626,20 @@ async def run_agent_tool_loop(
             actions_since_progress=progress.actions_since_progress,
             form_armed=progress.form_armed,
             would_fire=progress.shadow_reported,
+            outcome_status=outcome.status,
+            turns=turns,
+        )
+    else:
+        # The complement: a run that never armed a form. Same terminal join key and the same
+        # outcome/turns tagging as above, so the two read as one population split in two, not as two
+        # unrelated streams. `looping_targets` is the end-state count; the peaks are the run's worst.
+        # Deliberately NOT gated on `progress`: the canonical tracker is built and updated
+        # unconditionally, so this record does not need the ledger to exist. Gating it would drop
+        # BOTH records whenever progress_window is None and silently restore the very hole this
+        # record closes — the partition has to be total for the union to be a denominator.
+        LOG.info(
+            CANONICAL_SURVIVAL_EVENT,
+            **canonical.survival_fields(),
             outcome_status=outcome.status,
             turns=turns,
         )

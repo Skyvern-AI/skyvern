@@ -22,6 +22,7 @@ IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
 # and stamps RECOVER itself, so that value never reaches the labelers here. See
 # ROUTE_OWNED_TERMINAL_REASONS in dev_scripts/replay_turn_outcome_kind.py for the full split.
 CANCEL_TERMINAL_REASON = "cancel"
+UNEXPECTED_ERROR_TERMINAL_REASON = "unexpected_error"
 CopilotComposerMode = Literal["ask", "build", "code"]
 
 

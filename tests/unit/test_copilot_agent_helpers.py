@@ -85,6 +85,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.terminal_envelope import interim_run_start_outcome
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -110,6 +111,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -1982,6 +1984,7 @@ workflow_definition:
                     "block_type": "CODE",
                     "status": "failed",
                     "failure_reason": "The total was not available.",
+                    "output": {"total": None},
                     "extracted_data": {"downloaded_file_artifact_ids": ["artifact_1"]},
                 }
             ],
@@ -2182,7 +2185,12 @@ workflow_definition:
             model_data = json.loads(result)["data"]
             assert "page_obstructions" not in model_data["authoring_repair_context"]
             assert "page_obstruction_omission_notices" not in model_data["authoring_repair_context"]
-        assert packet["registered_outputs"][0]["output_parameter_key"] == "total"
+        assert packet["registered_outputs"][0] == {
+            "label": "read_total",
+            "status": "failed",
+            "output": {"total": None},
+            "value_complete": True,
+        }
         assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
         assert packet["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
         assert packet["unfinished_items"] == [{"kind": "unverified_block", "label": "read_total"}]
@@ -2256,7 +2264,6 @@ workflow_definition:
         assert packet["failure"]["page_state"]["current_url"] == "https://example.test/current"
         assert packet["failure"]["page_state"]["result_summaries"] == []
         assert packet["failure"]["page_state"]["obstructions"] == []
-        assert any("another or unknown run" in notice for notice in packet["omission_notices"])
 
     def test_packet_redacts_registered_output_values_matching_registered_secrets(self) -> None:
         ctx = _ctx(
@@ -2268,6 +2275,13 @@ workflow_definition:
             "data": {
                 "workflow_run_id": "wr_secret_output",
                 "overall_status": "completed",
+                "blocks": [
+                    {
+                        "label": "read_result",
+                        "status": "completed",
+                        "output": {"summary": "prefix customer-secret suffix"},
+                    }
+                ],
                 "registered_output_parameter_values": [
                     {
                         "workflow_run_id": "wr_secret_output",
@@ -2286,7 +2300,7 @@ workflow_definition:
         )
         packet = result["data"]["build_test_packet"]
 
-        assert packet["registered_outputs"][0]["value"] == {"summary": "prefix [REDACTED_SECRET] suffix"}
+        assert packet["registered_outputs"][0]["output"] == {"summary": "prefix [REDACTED_SECRET] suffix"}
         assert "customer-secret" not in json.dumps(packet)
         assert any(
             notice == "registered_outputs redacted 1 item(s) containing registered secret values."
@@ -4230,6 +4244,114 @@ workflow_definition:
         assert result["ok"] is True, result
         get_credentials_by_ids.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_update_workflow_canonicalizes_a_cited_google_connection_name(self, monkeypatch) -> None:
+        connection = GoogleOAuthCredentialBase(
+            id="goac_cited_persist",
+            organization_id="org-1",
+            credential_name="Blog Metrics Connection",
+            state="active",
+            scopes_requested=[],
+            scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+            created_at=datetime(2026, 9, 1),
+            modified_at=datetime(2026, 9, 1),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_visible_credentials_for_org",
+            AsyncMock(return_value=[connection]),
+        )
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                canonical_user_message='append the titles with the "Blog Metrics Connection" account'
+            )
+        )
+
+        workflow = MagicMock()
+        workflow.workflow_definition.blocks = []
+        process_workflow_yaml = AsyncMock(return_value=workflow)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            process_workflow_yaml,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=AsyncMock()),
+        )
+
+        result = await tools_module._update_workflow(
+            {
+                "workflow_yaml": (
+                    "workflow_definition:\n"
+                    "  blocks:\n"
+                    "    - label: append_titles\n"
+                    "      block_type: google_sheets_write\n"
+                    '      credential_id: "Blog Metrics Connection"\n'
+                )
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True, result
+        assert result["data"]["google_connection_resolution"][0]["status"] == "resolved"
+        assert "goac_cited_persist" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
+        assert "goac_cited_persist" in ctx.staged_workflow_yaml
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_reports_an_unmatched_cited_google_connection_name(self, monkeypatch) -> None:
+        connection = GoogleOAuthCredentialBase(
+            id="goac_eligible_row",
+            organization_id="org-1",
+            credential_name="Blog Metrics Connection",
+            state="active",
+            scopes_requested=[],
+            scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+            created_at=datetime(2026, 9, 1),
+            modified_at=datetime(2026, 9, 1),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.get_visible_credentials_for_org",
+            AsyncMock(return_value=[connection]),
+        )
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                canonical_user_message='append the titles with the "Quarterly Revenue Connection" account'
+            )
+        )
+
+        workflow = MagicMock()
+        workflow.workflow_definition.blocks = []
+        process_workflow_yaml = AsyncMock(return_value=workflow)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            process_workflow_yaml,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE",
+            SimpleNamespace(update_workflow_definition=AsyncMock()),
+        )
+
+        result = await tools_module._update_workflow(
+            {
+                "workflow_yaml": (
+                    "workflow_definition:\n"
+                    "  blocks:\n"
+                    "    - label: append_titles\n"
+                    "      block_type: google_sheets_write\n"
+                    '      credential_id: "Quarterly Revenue Connection"\n'
+                )
+            },
+            ctx,
+        )
+
+        assert result["ok"] is True, result
+        assert "block_id" not in result
+        fact = result["data"]["google_connection_resolution"][0]
+        assert fact["status"] == "not_found"
+        assert fact["canonicalized"] is False
+        assert [row["connection_id"] for row in fact["eligible_connections"]] == ["goac_eligible_row"]
+        assert "Quarterly Revenue Connection" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
+        assert "Quarterly Revenue Connection" in ctx.staged_workflow_yaml
+
 
 class TestRunBlocksCredentialApproval:
     @staticmethod
@@ -5094,6 +5216,13 @@ class TestCopilotConfig:
         )
 
         assert "CUSTOM SECURITY RULE" in prompt
+
+    def test_prompt_makes_untested_drafts_workflow_edits_not_reply_text(self) -> None:
+        prompt = agent_module._build_system_prompt(tool_usage_guide="", config=CopilotConfig())
+
+        assert "fenced code blocks for JSON, templates, or other structured examples" in prompt
+        assert "fenced code blocks for JSON, code," not in prompt
+        assert "it is still an edit to the workflow, not text in the reply, and you say it is untested" in prompt
 
     def test_retriable_llm_error_detects_openai_rate_limit(self) -> None:
         class FakeRateLimitError(Exception):
@@ -6404,6 +6533,24 @@ workflow_definition:
         assert rendered["facts"]["evaluationState"] == "not_demonstrated"
         assert rendered["disposition"] == "review_untested"
 
+    def test_an_unresolved_run_start_over_full_coverage_drops_the_tested_pill(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged)
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+        ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_unresolved"))
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["matchingSourceBlockCount"] == 2
+        assert rendered["facts"]["blocksRunThisTurn"] is None
+        assert rendered["facts"]["runCompleted"] is None
+        assert rendered["facts"]["evaluationState"] is None
+        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
+        assert rendered["disposition"] == "review_untested"
+
     def test_an_edited_block_is_no_longer_counted_against_its_stale_receipt(self) -> None:
         tested = self._two_block_yaml()
         staged = self._two_block_yaml("Read it twice")
@@ -6551,7 +6698,7 @@ workflow_definition:
             terminal_reason="max_turns",
         )
 
-        assert "tested draft" not in result.user_response
+        assert result.user_response != tested_reply
         assert result.user_response == unvalidated_reply
         assert result.proposal_disposition == "review_untested"
 

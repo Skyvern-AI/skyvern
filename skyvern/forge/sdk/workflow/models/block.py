@@ -24,7 +24,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -191,6 +191,7 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
 from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
+    jinja_json_finalize_required_binding_env,
     jinja_json_finalize_strict_env,
     mask_jinja_in_python_comments,
     render_templates_in_json_value,
@@ -225,6 +226,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -249,9 +251,10 @@ from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_missing_variables
+from skyvern.utils.templating import get_available_keys, get_missing_variables
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -265,7 +268,12 @@ from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
-from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
+from skyvern.webeye.navigation import (
+    default_navigation_settle,
+    is_egress_attributable_navigation_error,
+    navigate_with_retry,
+    redact_url_secrets,
+)
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
@@ -510,6 +518,138 @@ def sanitize_filename(filename: str, default: str = "document") -> str:
     return sanitized[:200] if sanitized else default
 
 
+class ParquetExportMixin:
+    """Shared Parquet-export execution: schema-directed serialization, filename
+    resolution (with loop-iteration suffixing), atomic file write, and download
+    registration. Used by DataExportBlock and by ExtractionBlock's export option."""
+
+    @staticmethod
+    def parse_export_records(data: str) -> list[Any]:
+        try:
+            records = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ParquetExportError("data must resolve to a JSON array") from exc
+        if not isinstance(records, list):
+            raise ParquetExportError("data must resolve to a JSON array of object records")
+        return records
+
+    def _resolve_export_file_name(
+        self, file_name: str | None, label: str, workflow_run_context: WorkflowRunContext
+    ) -> str:
+        stem = sanitize_filename(file_name or label)
+        if stem.lower().endswith(".parquet"):
+            stem = stem[: -len(".parquet")]
+        current_index = workflow_run_context.get_block_metadata(label).get("current_index")
+        if isinstance(current_index, int) and not isinstance(current_index, bool):
+            stem = f"{stem}-{current_index + 1:04d}"
+        return f"{stem}.parquet"
+
+    async def _register_export_download(
+        self,
+        *,
+        organization_id: str | None,
+        run_download_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+    ) -> list[FileInfo]:
+        if not organization_id:
+            return []
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout saving Parquet export; workflow finalization will retry",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except DownloadSaveIncompleteError:
+            pass
+        except Exception:
+            LOG.warning(
+                "Failed to register Parquet export; workflow finalization will retry",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+        except Exception:
+            LOG.warning(
+                "Failed to read registered Parquet exports",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+
+    async def write_parquet_export(
+        self,
+        *,
+        records: Any,
+        data_schema: dict[str, Any],
+        file_name: str | None,
+        label: str,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> dict[str, Any]:
+        """Writes records to Parquet and registers the download. Raises ParquetExportError
+        on a bad schema/records or a file-write failure."""
+        parquet_data = export_parquet_records(records, data_schema)
+
+        filename = self._resolve_export_file_name(file_name, label, workflow_run_context)
+        run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
+        path = get_path_for_workflow_download_directory(run_download_id) / filename
+        file_created = False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stem = path.stem
+            suffix = 2
+            while True:
+                try:
+                    with path.open("xb") as parquet_file:
+                        file_created = True
+                        parquet_file.write(parquet_data)
+                    break
+                except FileExistsError:
+                    path = path.with_name(f"{stem}-{suffix:04d}{path.suffix}")
+                    suffix += 1
+        except OSError as exc:
+            if file_created:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    LOG.warning("Failed to remove incomplete Parquet export", exc_info=True)
+            raise ParquetExportError(f"failed to write {filename}: {exc}") from exc
+
+        filename = path.name
+        downloaded_files = await self._register_export_download(
+            organization_id=organization_id,
+            run_download_id=run_download_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        downloaded_files = [file for file in downloaded_files if file.filename == filename]
+        return {
+            "file_name": filename,
+            "file_path": str(path),
+            "file_size": path.stat().st_size,
+            "format": "parquet",
+            "compression": "snappy",
+            "row_count": len(records),
+            "columns": list(data_schema.get("items", {}).get("properties", {})),
+            "downloaded_files": [file.model_dump() for file in downloaded_files],
+            "downloaded_file_urls": [file.url for file in downloaded_files],
+        }
+
+
 def _format_payload_path_segment(key: str) -> str:
     """Plain identifiers render as `.key`; anything else (dots, brackets, spaces,
     quotes) renders as a bracketed JSON-escaped string so paths stay unambiguous
@@ -637,6 +777,57 @@ class Block(BaseModel, abc.ABC):
     # value left by a prior for-loop iteration.
     _output_recorded_this_execution: bool = PrivateAttr(default=False)
 
+    # Fields this class renders as Jinja. Declared per class; the effective set is the
+    # union over the MRO, so a subclass never shadows what its base renders.
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset()
+
+    @classmethod
+    def templatable_fields(cls) -> frozenset[str]:
+        """Block fields rendered as Jinja. Branch-criteria expressions are templates by definition
+        and render through the raw formatter, so they are not declared here."""
+        declared: set[str] = set()
+        for klass in cls.__mro__:
+            declared.update(klass.__dict__.get("TEMPLATABLE_FIELDS", ()))
+        return frozenset(declared)
+
+    def render_templatable_field(
+        self,
+        field: str,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+        *,
+        force_include_secrets: bool = False,
+        env: SandboxedEnvironment | None = None,
+        skip_missing_variable_preflight: bool = False,
+    ) -> str:
+        if field not in type(self).model_fields:
+            raise ValueError(f"{type(self).__name__} has no field named {field!r}")
+        if field not in self.templatable_fields():
+            LOG.debug("Skipping Jinja render for a non-templatable field", block_label=self.label, field=field)
+            return value
+        LOG.debug("Rendering templatable field", block_label=self.label, field=field)
+        return self.format_block_parameter_template_from_workflow_run_context(
+            value,
+            workflow_run_context,
+            force_include_secrets=force_include_secrets,
+            env=env,
+            skip_missing_variable_preflight=skip_missing_variable_preflight,
+        )
+
+    @staticmethod
+    def _registered_secret_values(workflow_run_context: WorkflowRunContext) -> set[str]:
+        return {value for value in workflow_run_context.secrets.values() if isinstance(value, str) and value}
+
+    @classmethod
+    def _contains_registered_secret(cls, value: str, workflow_run_context: WorkflowRunContext) -> bool:
+        return any(secret in value for secret in cls._registered_secret_values(workflow_run_context))
+
+    @classmethod
+    def _redact_registered_secrets(cls, value: str, workflow_run_context: WorkflowRunContext) -> str:
+        for secret in sorted(cls._registered_secret_values(workflow_run_context), key=len, reverse=True):
+            value = value.replace(secret, "[redacted]")
+        return value
+
     def _own_llm_key(self) -> str | None:
         return None
 
@@ -682,6 +873,37 @@ class Block(BaseModel, abc.ABC):
             output_parameter_id=self.output_parameter.output_parameter_id,
             workflow_run_id=workflow_run_id,
             output_parameter_value_present=value is not None,
+        )
+
+    async def _template_format_failure_result(
+        self,
+        exc: Exception,
+        failure_reason: str,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str | None,
+        organization_id: str | None,
+    ) -> BlockResult:
+        failure_reason = self._redact_registered_secrets(failure_reason, workflow_run_context)
+        error_codes = self.get_failure_error_codes()
+        failure_output: dict[str, Any] = (
+            build_block_failure_output(failure_reason, error_codes)
+            if error_codes
+            else {"failure_reason": failure_reason}
+        )
+        if isinstance(exc, FailedToFormatJinjaStyleParameter) and exc.available_keys:
+            failure_output["available_keys"] = [
+                self._redact_registered_secrets(key, workflow_run_context) for key in exc.available_keys
+            ]
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
+        return await self.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            output_parameter_value=failure_output,
+            status=BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            error_codes=error_codes or None,
         )
 
     async def build_block_result(
@@ -979,7 +1201,11 @@ class Block(BaseModel, abc.ABC):
         except SkyvernException:
             raise
         except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
+            raise FailedToFormatJinjaStyleParameter(
+                potential_template,
+                str(exc),
+                available_keys=get_available_keys(potential_template, template_data),
+            ) from exc
 
     def _apply_workflow_system_prompt(
         self,
@@ -1331,13 +1557,30 @@ class BaseTaskBlock(Block):
     include_extracted_text: bool = True
     _data_extraction_goal_is_prerendered: bool = PrivateAttr(default=False)
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "complete_criterion",
+            "data_extraction_goal",
+            "data_schema",
+            "download_suffix",
+            "error_code_mapping",
+            "navigation_goal",
+            "terminate_criterion",
+            "title",
+            "totp_identifier",
+            "totp_verification_url",
+            "url",
+        }
+    )
+
     def mark_data_extraction_goal_prerendered(self) -> None:
         self._data_extraction_goal_is_prerendered = True
 
-    # Blocks built at runtime for internal machinery (loop-value and branch-condition extraction)
-    # are not part of the workflow definition, so the run-level engine A/B never saw them and must
-    # not reroute them. Private so an internal experiment toggle stays out of the published block
-    # schemas and out of stored workflow definitions.
+    # Blocks built at runtime for internal machinery the eligibility check never vetted (loop-value
+    # extraction) must not be rerouted by the run-level engine A/B. Branch-condition extraction is
+    # the deliberate exception: v3_ab_ineligibility_reason vets prompt-branch conditionals, so that
+    # synthetic block follows the run's arm. Private so an internal experiment toggle stays out of
+    # the published block schemas and out of stored workflow definitions.
     _exclude_from_engine_ab: bool = PrivateAttr(default=False)
 
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
@@ -1380,26 +1623,26 @@ class BaseTaskBlock(Block):
         return None
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.title = self.format_block_parameter_template_from_workflow_run_context(self.title, workflow_run_context)
+        self.title = self.render_templatable_field("title", self.title, workflow_run_context)
 
         if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = self.render_templatable_field("url", self.url, workflow_run_context)
             self.url = prepend_scheme_and_validate_url(self.url)
 
         if self.totp_identifier:
-            self.totp_identifier = self.format_block_parameter_template_from_workflow_run_context(
-                self.totp_identifier, workflow_run_context
+            self.totp_identifier = self.render_templatable_field(
+                "totp_identifier", self.totp_identifier, workflow_run_context
             )
 
         if self.totp_verification_url:
-            self.totp_verification_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.totp_verification_url, workflow_run_context
+            self.totp_verification_url = self.render_templatable_field(
+                "totp_verification_url", self.totp_verification_url, workflow_run_context
             )
             self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
         if self.download_suffix:
-            self.download_suffix = self.format_block_parameter_template_from_workflow_run_context(
-                self.download_suffix, workflow_run_context
+            self.download_suffix = self.render_templatable_field(
+                "download_suffix", self.download_suffix, workflow_run_context
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
@@ -1411,28 +1654,26 @@ class BaseTaskBlock(Block):
             )
 
         if self.navigation_goal:
-            self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
-                self.navigation_goal, workflow_run_context
+            self.navigation_goal = self.render_templatable_field(
+                "navigation_goal", self.navigation_goal, workflow_run_context
             )
 
         if self.data_extraction_goal and not self._data_extraction_goal_is_prerendered:
-            self.data_extraction_goal = self.format_block_parameter_template_from_workflow_run_context(
-                self.data_extraction_goal, workflow_run_context
+            self.data_extraction_goal = self.render_templatable_field(
+                "data_extraction_goal", self.data_extraction_goal, workflow_run_context
             )
 
         if isinstance(self.data_schema, str):
-            self.data_schema = self.format_block_parameter_template_from_workflow_run_context(
-                self.data_schema, workflow_run_context
-            )
+            self.data_schema = self.render_templatable_field("data_schema", self.data_schema, workflow_run_context)
 
         if self.complete_criterion:
-            self.complete_criterion = self.format_block_parameter_template_from_workflow_run_context(
-                self.complete_criterion, workflow_run_context
+            self.complete_criterion = self.render_templatable_field(
+                "complete_criterion", self.complete_criterion, workflow_run_context
             )
 
         if self.terminate_criterion:
-            self.terminate_criterion = self.format_block_parameter_template_from_workflow_run_context(
-                self.terminate_criterion, workflow_run_context
+            self.terminate_criterion = self.render_templatable_field(
+                "terminate_criterion", self.terminate_criterion, workflow_run_context
             )
 
         # Inherit workflow-level error_code_mapping; block-level entries override on key conflicts.
@@ -1445,10 +1686,8 @@ class BaseTaskBlock(Block):
             merged_mapping = dict(workflow_error_code_mapping or {})
             merged_mapping.update(self.error_code_mapping or {})
             self.error_code_mapping = {
-                self.format_block_parameter_template_from_workflow_run_context(error_code, workflow_run_context): (
-                    self.format_block_parameter_template_from_workflow_run_context(
-                        error_description, workflow_run_context
-                    )
+                self.render_templatable_field("error_code_mapping", error_code, workflow_run_context): (
+                    self.render_templatable_field("error_code_mapping", error_description, workflow_run_context)
                 )
                 for error_code, error_description in merged_mapping.items()
             }
@@ -1630,17 +1869,13 @@ class BaseTaskBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
         except Exception as e:
-            failure_reason = f"Failed to format jinja template: {str(e)}"
-            await self.record_output_parameter_value(
-                workflow_run_context, workflow_run_id, {"failure_reason": failure_reason}
-            )
-            return await self.build_block_result(
-                success=False,
-                failure_reason=failure_reason,
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         # SKY-8818: observability + wait_until override. Computed ONCE per block
@@ -1739,11 +1974,32 @@ class BaseTaskBlock(Block):
                                 )
 
                 except Exception as e:
-                    LOG.exception(
-                        "Failed to get browser state for first task",
-                        task_id=task.task_id,
-                        workflow_run_id=workflow_run_id,
-                    )
+                    if (
+                        isinstance(e, FailedToNavigateToUrl)
+                        and not isinstance(e, BlockedNavigationDestination)
+                        and not is_egress_attributable_navigation_error(e.error_message)
+                    ):
+                        # The target site did not load. Site-caused, and already surfaced on the run
+                        # through the failure_reason recorded below. Two classes stay at error
+                        # because they are ours rather than the site's: BlockedNavigationDestination
+                        # is the SSRF guard tripping, and EGRESS_ATTRIBUTABLE_NAV_ERRORS is our own
+                        # egress failing, which get_or_create_page may recover from on a different
+                        # proxy node. The block-execution handler above applies only the first of
+                        # those two carve-outs; see the PR discussion.
+                        LOG.warning(
+                            "Failed to get browser state for first task",
+                            task_id=task.task_id,
+                            workflow_run_id=workflow_run_id,
+                            url=e.url,
+                            exc_info=True,
+                        )
+                    else:
+                        LOG.exception(
+                            "Failed to get browser state for first task",
+                            task_id=task.task_id,
+                            workflow_run_id=workflow_run_id,
+                            url=getattr(e, "url", None),
+                        )
                     await self._handle_task_failure_with_error_detection(
                         task=task,
                         step=step,
@@ -2257,6 +2513,7 @@ class ForLoopBlock(Block):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
     execute_safe = _execute_parameter_observing_block_safe
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"data_schema", "loop_variable_reference"})
 
     loop_blocks: list[BlockTypeVar]
     loop_over: PARAMETER_TYPE | None = None
@@ -2431,8 +2688,8 @@ class ForLoopBlock(Block):
                 # Fall back to the original Jinja template approach
                 value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
                 try:
-                    value_json = self.format_block_parameter_template_from_workflow_run_context(
-                        value_template, workflow_run_context
+                    value_json = self.render_templatable_field(
+                        "loop_variable_reference", value_template, workflow_run_context
                     )
                 except Exception:
                     raise FailedToFormatJinjaStyleParameter("loop input", "Loop input could not be resolved.")
@@ -2503,8 +2760,8 @@ class ForLoopBlock(Block):
                 if self.loop_variable_reference is None:
                     return None
                 value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
-                value_json = self.format_block_parameter_template_from_workflow_run_context(
-                    value_template, workflow_run_context
+                value_json = self.render_templatable_field(
+                    "loop_variable_reference", value_template, workflow_run_context
                 )
                 parameter_value = json.loads(value_json)
                 if parameter_value is not None:
@@ -2524,8 +2781,8 @@ class ForLoopBlock(Block):
             for pattern in access_patterns:
                 try:
                     value_template = f"{{{{ {pattern.strip(' {}')} | tojson }}}}"
-                    value_json = self.format_block_parameter_template_from_workflow_run_context(
-                        value_template, workflow_run_context
+                    value_json = self.render_templatable_field(
+                        "loop_variable_reference", value_template, workflow_run_context
                     )
                     parameter_value = json.loads(value_json)
                     if parameter_value is not None:
@@ -2554,9 +2811,7 @@ class ForLoopBlock(Block):
                 # handles data_schema strings (see line 652-654)
                 schema_str = self.data_schema
                 if workflow_run_context is not None:
-                    schema_str = self.format_block_parameter_template_from_workflow_run_context(
-                        schema_str, workflow_run_context
-                    )
+                    schema_str = self.render_templatable_field("data_schema", schema_str, workflow_run_context)
                 try:
                     parsed = json.loads(schema_str)
                     if isinstance(parsed, dict):
@@ -4098,9 +4353,21 @@ def _code_block_safe_print(
     print(app.AGENT_FUNCTION.redact_codeblock_parameter_values(rendered.getvalue(), parameters), end="", flush=flush)
 
 
-def _redact_codeblock_failure_text(value: str | None, parameters: dict[str, Any]) -> str | None:
+def _redact_codeblock_failure_text(
+    value: str | None,
+    parameters: dict[str, Any],
+    fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON,
+) -> str | None:
     redacted = app.AGENT_FUNCTION.redact_codeblock_parameter_values(value, parameters)
-    return redacted if isinstance(redacted, str) else None
+    if not isinstance(redacted, str):
+        return None
+    # The scrubber fails closed by returning "" once a parameter budget is blown, which a run
+    # cannot afford for the one field that says why it stopped. codeblock/workflow.py's
+    # scrub_reason guards the runner-side pass the same way. Callers whose value is a code or a
+    # telemetry token rather than user-facing prose pass fallback="" to keep the empty result.
+    if isinstance(value, str) and value.strip() and not redacted.strip():
+        return fallback
+    return redacted
 
 
 def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
@@ -4645,22 +4912,10 @@ class CodeBlock(Block):
 
     execute_safe = _execute_parameter_observing_block_safe
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"code", "error_code_mapping", "prompt"})
+
     def _effective_error_code_mapping(self, workflow_run_context: WorkflowRunContext) -> dict[str, str]:
         return dict(self.error_code_mapping or {})
-
-    @staticmethod
-    def _registered_secret_values(workflow_run_context: WorkflowRunContext) -> set[str]:
-        return {value for value in workflow_run_context.secrets.values() if isinstance(value, str) and value}
-
-    @classmethod
-    def _contains_registered_secret(cls, value: str, workflow_run_context: WorkflowRunContext) -> bool:
-        return any(secret in value for secret in cls._registered_secret_values(workflow_run_context))
-
-    @classmethod
-    def _redact_registered_secrets(cls, value: str, workflow_run_context: WorkflowRunContext) -> str:
-        for secret in sorted(cls._registered_secret_values(workflow_run_context), key=len, reverse=True):
-            value = value.replace(secret, "[redacted]")
-        return value
 
     def _extract_declared_error(
         self, exception: Exception, workflow_run_context: WorkflowRunContext
@@ -4957,14 +5212,10 @@ async def wrapper({default_args}):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         masked_code, masked_comments = mask_jinja_in_python_comments(self.code)
-        rendered_code = self.format_block_parameter_template_from_workflow_run_context(
-            masked_code, workflow_run_context
-        )
+        rendered_code = self.render_templatable_field("code", masked_code, workflow_run_context)
         self.code = restore_jinja_masked_comments(rendered_code, masked_comments)
         if self.prompt:
-            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
-                self.prompt, workflow_run_context
-            )
+            self.prompt = self.render_templatable_field("prompt", self.prompt, workflow_run_context)
 
         # Match BaseTaskBlock: inherit first, let block entries override, then render both
         # keys and descriptions through the workflow context. Rendered entries are untrusted
@@ -4981,11 +5232,9 @@ async def wrapper({default_args}):
         rendered_mapping: dict[str, str] = {}
         rendered_mapping_utf8_bytes = 0
         for error_code, error_description in merged_mapping.items():
-            rendered_code = self.format_block_parameter_template_from_workflow_run_context(
-                error_code, workflow_run_context
-            )
-            rendered_description = self.format_block_parameter_template_from_workflow_run_context(
-                error_description, workflow_run_context
+            rendered_code = self.render_templatable_field("error_code_mapping", error_code, workflow_run_context)
+            rendered_description = self.render_templatable_field(
+                "error_code_mapping", error_description, workflow_run_context
             )
             rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
             if (
@@ -6357,8 +6606,8 @@ async def wrapper({default_args}):
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
 
-        def scrub_failure_value(value: str | None) -> str | None:
-            return _redact_codeblock_failure_text(value, resolved_redaction_parameters)
+        def scrub_failure_value(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
+            return _redact_codeblock_failure_text(value, resolved_redaction_parameters, fallback)
 
         # Capture before the healable branch: a non-healable failure is exactly the case the
         # repair loop has the least to go on.
@@ -6387,7 +6636,7 @@ async def wrapper({default_args}):
                 status="skipped",
                 skip_reason=HealSkipReason.user_defined_error,
                 parameter_binding_keys=self._heal_parameter_binding_keys(workflow_run_context),
-                exception_class=scrub_failure_value("Exception"),
+                exception_class=scrub_failure_value("Exception", fallback=""),
                 failing_line=failing_line,
                 matched_step_index=self._matched_step_index_for_failing_line(failing_line),
                 failure_message=None,
@@ -6508,7 +6757,7 @@ async def wrapper({default_args}):
         workflow_permanent_id = workflow_run_context.workflow_permanent_id
         workflow_id = workflow_run_context.workflow_id
         exception_for_heal = exception or RuntimeError("CodeBlock failed")
-        exception_class = scrub_failure_value("Exception")
+        exception_class = scrub_failure_value("Exception", fallback="")
         matched_step_index = self._matched_step_index_for_failing_line(failing_line)
         parameter_binding_keys = self._heal_parameter_binding_keys(workflow_run_context)
         live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
@@ -6778,7 +7027,7 @@ async def wrapper({default_args}):
                 exception_class=exception_class,
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
-                failure_message=scrub_failure_value("recovery_failed"),
+                failure_message=scrub_failure_value("recovery_failed", fallback=""),
                 wall_clock_ms=None,
                 action_count=None,
                 output_obligation=OutputObligation.none,
@@ -6901,14 +7150,14 @@ async def wrapper({default_args}):
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
-        except Exception:
-            return await self.build_block_result(
-                success=False,
-                failure_reason="Failed to format CodeBlock parameters.",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+        except Exception as e:
+            return await self._template_format_failure_result(
+                e,
+                "Failed to format CodeBlock parameters.",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         # get all parameters into a dictionary
@@ -6994,8 +7243,8 @@ async def wrapper({default_args}):
 
         serialized_parameter_values = app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
 
-        def scrub_failure_reason(value: str | None) -> str | None:
-            return _redact_codeblock_failure_text(value, serialized_parameter_values)
+        def scrub_failure_reason(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
+            return _redact_codeblock_failure_text(value, serialized_parameter_values, fallback)
 
         def scrub_failed_block_result(result: BlockResult) -> BlockResult:
             return _redact_codeblock_result(result, serialized_parameter_values)
@@ -7116,15 +7365,16 @@ async def wrapper({default_args}):
                                     engine_block_result.output_parameter_value,
                                 )
                                 return engine_block_result
-                            secure_failure_reason = (
-                                scrub_failure_reason(
-                                    secure_failure.failure_reason or "Code block failed in the secure runner"
-                                )
-                                or ""
-                            )
-                            secure_error_code = scrub_failure_reason(secure_failure.error_code)
+                            # The runner already scrubbed this text against the same serialized
+                            # parameters and guarded the fail-closed case, so re-scrubbing can only
+                            # no-op or empty it; fall back to what the runner reported.
+                            runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
+                            secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+                            secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
+                            if secure_failure.denied_exception_class is not None:
+                                failure_output["runner_exception_class"] = secure_failure.denied_exception_class
                             await self.record_output_parameter_value(
                                 workflow_run_context, workflow_run_id, failure_output
                             )
@@ -7806,6 +8056,8 @@ class TextPromptBlock(Block):
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     schema_validation_max_errors: ClassVar[int] = SCHEMA_VALIDATION_MAX_ERRORS
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"json_schema", "llm_key", "prompt"})
+
     def _own_llm_key(self) -> str | None:
         return self.llm_key
 
@@ -7818,7 +8070,7 @@ class TextPromptBlock(Block):
     def _render_schema_templates(self, obj: Any, workflow_run_context: WorkflowRunContext) -> Any:
         if isinstance(obj, str):
             try:
-                return self.format_block_parameter_template_from_workflow_run_context(obj, workflow_run_context)
+                return self.render_templatable_field("json_schema", obj, workflow_run_context)
             except Exception:
                 LOG.warning(
                     "Failed to render Jinja template in json_schema value, using original value",
@@ -7835,10 +8087,8 @@ class TextPromptBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.llm_key:
-            self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
-                self.llm_key, workflow_run_context
-            )
-        self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+            self.llm_key = self.render_templatable_field("llm_key", self.llm_key, workflow_run_context)
+        self.prompt = self.render_templatable_field("prompt", self.prompt, workflow_run_context)
         if self.json_schema:
             self.json_schema = self._render_schema_templates(self.json_schema, workflow_run_context)
 
@@ -8004,13 +8254,13 @@ class TextPromptBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
         for parameter in self.parameters:
             if not workflow_run_context.has_value(parameter.key):
@@ -8154,6 +8404,8 @@ class DownloadToS3Block(Block):
 
     url: str
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"url"})
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -8166,7 +8418,7 @@ class DownloadToS3Block(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+        self.url = self.render_templatable_field("url", self.url, workflow_run_context)
 
     async def _upload_file_to_s3(self, uri: str, file_path: str, cleanup_file: bool = True) -> None:
         try:
@@ -8205,13 +8457,13 @@ class DownloadToS3Block(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         try:
@@ -8252,6 +8504,8 @@ class UploadToS3Block(Block):
     # TODO (kerem): A directory upload is supported but we should also support a list of files
     path: str | None = None
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"path"})
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -8265,7 +8519,7 @@ class UploadToS3Block(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
-            self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+            self.path = self.render_templatable_field("path", self.path, workflow_run_context)
 
     @staticmethod
     def _get_s3_uri(workflow_run_id: str, path: str) -> str:
@@ -8309,13 +8563,13 @@ class UploadToS3Block(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if not self.path:
@@ -8425,6 +8679,29 @@ class FileDestinationBlock(Block):
 
     _normalize_endpoint_url = field_validator("endpoint_url")(_normalize_optional_endpoint_url)
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "azure_blob_container_name",
+            "azure_storage_account_key",
+            "azure_storage_account_name",
+            "endpoint_url",
+            "google_credential_id",
+            "google_drive_folder_id",
+            "path",
+            "prompt",
+            "s3_bucket",
+            "sftp_host",
+            "sftp_host_key",
+            "sftp_password",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_remote_path",
+            "sftp_username",
+        }
+    )
+
     def _get_destination_parameters(self, workflow_run_context: WorkflowRunContext) -> list[PARAMETER_TYPE]:
         parameters = []
 
@@ -8486,76 +8763,68 @@ class FileDestinationBlock(Block):
 
     def _format_destination_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
-            self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+            self.path = self.render_templatable_field("path", self.path, workflow_run_context)
 
         if self.prompt:
-            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
-                self.prompt, workflow_run_context
-            )
+            self.prompt = self.render_templatable_field("prompt", self.prompt, workflow_run_context)
 
         if self.s3_bucket:
-            self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
-                self.s3_bucket, workflow_run_context
-            )
+            self.s3_bucket = self.render_templatable_field("s3_bucket", self.s3_bucket, workflow_run_context)
         if self.aws_access_key_id:
-            self.aws_access_key_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.aws_access_key_id, workflow_run_context
+            self.aws_access_key_id = self.render_templatable_field(
+                "aws_access_key_id", self.aws_access_key_id, workflow_run_context
             )
         if self.aws_secret_access_key:
-            self.aws_secret_access_key = self.format_block_parameter_template_from_workflow_run_context(
-                self.aws_secret_access_key, workflow_run_context
+            self.aws_secret_access_key = self.render_templatable_field(
+                "aws_secret_access_key", self.aws_secret_access_key, workflow_run_context
             )
         if self.endpoint_url:
-            self.endpoint_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.endpoint_url, workflow_run_context
-            )
+            self.endpoint_url = self.render_templatable_field("endpoint_url", self.endpoint_url, workflow_run_context)
         if self.azure_storage_account_name:
-            self.azure_storage_account_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.azure_storage_account_name, workflow_run_context
+            self.azure_storage_account_name = self.render_templatable_field(
+                "azure_storage_account_name", self.azure_storage_account_name, workflow_run_context
             )
         if self.azure_storage_account_key:
-            self.azure_storage_account_key = self.format_block_parameter_template_from_workflow_run_context(
-                self.azure_storage_account_key, workflow_run_context
+            self.azure_storage_account_key = self.render_templatable_field(
+                "azure_storage_account_key", self.azure_storage_account_key, workflow_run_context
             )
         if self.azure_blob_container_name:
-            self.azure_blob_container_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.azure_blob_container_name, workflow_run_context
+            self.azure_blob_container_name = self.render_templatable_field(
+                "azure_blob_container_name", self.azure_blob_container_name, workflow_run_context
             )
         if self.google_credential_id:
-            self.google_credential_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.google_credential_id, workflow_run_context
+            self.google_credential_id = self.render_templatable_field(
+                "google_credential_id", self.google_credential_id, workflow_run_context
             )
         if self.google_drive_folder_id:
-            self.google_drive_folder_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.google_drive_folder_id, workflow_run_context
+            self.google_drive_folder_id = self.render_templatable_field(
+                "google_drive_folder_id", self.google_drive_folder_id, workflow_run_context
             )
         if self.sftp_host:
-            self.sftp_host = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_host, workflow_run_context
-            )
+            self.sftp_host = self.render_templatable_field("sftp_host", self.sftp_host, workflow_run_context)
         if self.sftp_username:
-            self.sftp_username = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_username, workflow_run_context
+            self.sftp_username = self.render_templatable_field(
+                "sftp_username", self.sftp_username, workflow_run_context
             )
         if self.sftp_password:
-            self.sftp_password = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_password, workflow_run_context
+            self.sftp_password = self.render_templatable_field(
+                "sftp_password", self.sftp_password, workflow_run_context
             )
         if self.sftp_private_key:
-            self.sftp_private_key = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_private_key, workflow_run_context
+            self.sftp_private_key = self.render_templatable_field(
+                "sftp_private_key", self.sftp_private_key, workflow_run_context
             )
         if self.sftp_private_key_passphrase:
-            self.sftp_private_key_passphrase = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_private_key_passphrase, workflow_run_context
+            self.sftp_private_key_passphrase = self.render_templatable_field(
+                "sftp_private_key_passphrase", self.sftp_private_key_passphrase, workflow_run_context
             )
         if self.sftp_remote_path:
-            self.sftp_remote_path = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_remote_path, workflow_run_context
+            self.sftp_remote_path = self.render_templatable_field(
+                "sftp_remote_path", self.sftp_remote_path, workflow_run_context
             )
         if self.sftp_host_key:
-            self.sftp_host_key = self.format_block_parameter_template_from_workflow_run_context(
-                self.sftp_host_key, workflow_run_context
+            self.sftp_host_key = self.render_templatable_field(
+                "sftp_host_key", self.sftp_host_key, workflow_run_context
             )
 
     def _validate_destination_fields(self, storage_type: FileStorageType) -> list[str]:
@@ -9292,13 +9561,13 @@ class FileUploadBlock(FileDestinationBlock):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         context = skyvern_context.current()
@@ -9604,6 +9873,18 @@ class SendEmailBlock(Block):
     # reference a workflow secret parameter.
     custom_smtp_password: str | None = None
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "body",
+            "custom_smtp_host",
+            "custom_smtp_username",
+            "file_attachments",
+            "recipients",
+            "sender",
+            "subject",
+        }
+    )
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -9637,28 +9918,24 @@ class SendEmailBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.sender = self.format_block_parameter_template_from_workflow_run_context(self.sender, workflow_run_context)
-        self.subject = self.format_block_parameter_template_from_workflow_run_context(
-            self.subject, workflow_run_context
-        )
-        self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
+        self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
+        self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
+        self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
         # Format recipients
         formatted_recipients = []
         for recipient in self.recipients:
-            formatted_recipient = self.format_block_parameter_template_from_workflow_run_context(
-                recipient, workflow_run_context
-            )
+            formatted_recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
             formatted_recipients.append(formatted_recipient)
         self.recipients = formatted_recipients
 
         if self.custom_smtp_host:
-            self.custom_smtp_host = self.format_block_parameter_template_from_workflow_run_context(
-                self.custom_smtp_host, workflow_run_context
+            self.custom_smtp_host = self.render_templatable_field(
+                "custom_smtp_host", self.custom_smtp_host, workflow_run_context
             )
         if self.custom_smtp_username:
-            self.custom_smtp_username = self.format_block_parameter_template_from_workflow_run_context(
-                self.custom_smtp_username, workflow_run_context
+            self.custom_smtp_username = self.render_templatable_field(
+                "custom_smtp_username", self.custom_smtp_username, workflow_run_context
             )
         # Only a full "{{ param }}" reference is a template; a literal password that merely
         # contains Jinja-looking characters must never be rendered (it would corrupt the
@@ -9780,7 +10057,7 @@ class SendEmailBlock(Block):
                     file_path=path,
                 )
 
-            path = self.format_block_parameter_template_from_workflow_run_context(path, workflow_run_context)
+            path = self.render_templatable_field("file_attachments", path, workflow_run_context)
             if not is_remote_url(path):
                 path = validate_local_file_path(path, run_id)
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
@@ -9811,7 +10088,7 @@ class SendEmailBlock(Block):
             else:
                 maybe_recipient = recipient
 
-            recipient = self.format_block_parameter_template_from_workflow_run_context(recipient, workflow_run_context)
+            recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
             # check if maybe_recipient is a valid email address
             try:
                 validate_email(maybe_recipient)
@@ -9940,13 +10217,13 @@ class SendEmailBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
         use_custom_smtp = self.has_custom_smtp()
         if not use_custom_smtp:
@@ -10084,6 +10361,8 @@ class FileParserBlock(Block):
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url"})
+
     def get_failure_error_codes(self) -> list[str]:
         return ["FILE_PARSER_ERROR"]
 
@@ -10097,9 +10376,7 @@ class FileParserBlock(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.file_url = self.format_block_parameter_template_from_workflow_run_context(
-            self.file_url, workflow_run_context
-        )
+        self.file_url = self.render_templatable_field("file_url", self.file_url, workflow_run_context)
 
         self._apply_workflow_system_prompt(workflow_run_context)
 
@@ -11049,12 +11326,13 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self._record_failure(
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
-                f"Failed to format jinja template: {str(e)}",
             )
 
         # After Jinja rendering, self.file_url may be a stringified block output
@@ -11215,6 +11493,8 @@ class PDFParserBlock(Block):
     json_schema: dict[str, Any] | None = None
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url"})
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -11225,9 +11505,7 @@ class PDFParserBlock(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.file_url = self.format_block_parameter_template_from_workflow_run_context(
-            self.file_url, workflow_run_context
-        )
+        self.file_url = self.render_templatable_field("file_url", self.file_url, workflow_run_context)
 
         self._apply_workflow_system_prompt(workflow_run_context)
 
@@ -11261,13 +11539,13 @@ class PDFParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         try:
@@ -11485,33 +11763,38 @@ class HumanInteractionBlock(BaseTaskBlock):
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "body",
+            "instructions",
+            "negative_descriptor",
+            "positive_descriptor",
+            "recipients",
+            "subject",
+        }
+    )
+
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         super().format_potential_template_parameters(workflow_run_context)
 
-        self.instructions = self.format_block_parameter_template_from_workflow_run_context(
-            self.instructions, workflow_run_context
-        )
+        self.instructions = self.render_templatable_field("instructions", self.instructions, workflow_run_context)
 
-        self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
+        self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
-        self.subject = self.format_block_parameter_template_from_workflow_run_context(
-            self.subject, workflow_run_context
-        )
+        self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
 
         formatted: list[str] = []
         for recipient in self.recipients:
-            formatted.append(
-                self.format_block_parameter_template_from_workflow_run_context(recipient, workflow_run_context)
-            )
+            formatted.append(self.render_templatable_field("recipients", recipient, workflow_run_context))
 
         self.recipients = formatted
 
-        self.negative_descriptor = self.format_block_parameter_template_from_workflow_run_context(
-            self.negative_descriptor, workflow_run_context
+        self.negative_descriptor = self.render_templatable_field(
+            "negative_descriptor", self.negative_descriptor, workflow_run_context
         )
 
-        self.positive_descriptor = self.format_block_parameter_template_from_workflow_run_context(
-            self.positive_descriptor, workflow_run_context
+        self.positive_descriptor = self.render_templatable_field(
+            "positive_descriptor", self.positive_descriptor, workflow_run_context
         )
 
     async def execute(
@@ -11530,13 +11813,13 @@ class HumanInteractionBlock(BaseTaskBlock):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         await app.DATABASE.observer.update_workflow_run_block(
@@ -11764,13 +12047,122 @@ class NavigationBlock(BaseTaskBlock):
     navigation_goal: str
 
 
-class ExtractionBlock(BaseTaskBlock):
+class ExtractionBlock(ParquetExportMixin, BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
     data_extraction_goal: str
     include_extracted_text: bool = False
+
+    # Export the extracted data as a Parquet file -- an output option of this block
+    # rather than a separate Data Export block. See ParquetExportMixin and
+    # skyvern.forge.sdk.workflow.models.data_export_block.DataExportBlock.
+    export_enabled: bool = False
+    export_data_schema: dict[str, Any] | None = None
+    export_file_name: str | None = None
+    export_records: str | None = None
+
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"export_file_name", "export_records"})
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        super().format_potential_template_parameters(workflow_run_context)
+        # Export fields are only meaningful when export is on; rendering them
+        # unconditionally would fail an otherwise-fine run over a stale
+        # export_records left over from before export was disabled (or a
+        # deleted-block reference), since the strict Jinja env raises on an
+        # undefined binding regardless of the missing-variable preflight.
+        if not self.export_enabled:
+            return
+        if self.export_file_name:
+            self.export_file_name = self.render_templatable_field(
+                "export_file_name", self.export_file_name, workflow_run_context
+            )
+        if self.export_records:
+            self.export_records = self.render_templatable_field(
+                "export_records",
+                self.export_records,
+                workflow_run_context,
+                env=jinja_json_finalize_required_binding_env,
+                skip_missing_variable_preflight=True,
+            )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: Any,
+    ) -> BlockResult:
+        result = await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+        if not self.export_enabled or not result.success or not isinstance(result.output_parameter_value, dict):
+            return result
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            if not self.export_data_schema:
+                raise ParquetExportError("export_data_schema is required when export is enabled")
+            if self.export_records:
+                records = self.parse_export_records(self.export_records)
+            else:
+                extracted = result.output_parameter_value.get("extracted_information")
+                if isinstance(extracted, list):
+                    records = extracted
+                elif isinstance(extracted, Mapping):
+                    records = [extracted]
+                elif extracted is None:
+                    # Nothing to export is a legitimate outcome (e.g. an optional
+                    # extraction that found nothing) -- an honest empty file, not
+                    # a fabricated all-null row.
+                    records = []
+                else:
+                    raise ParquetExportError(
+                        "extracted_information must be an object or a list of objects to export, got "
+                        f"{type(extracted).__name__}"
+                    )
+            export_output = await self.write_parquet_export(
+                records=records,
+                data_schema=self.export_data_schema,
+                file_name=self.export_file_name,
+                label=self.label,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id or workflow_run_context.organization_id,
+            )
+        except ParquetExportError as exc:
+            # Reuse the standard failure path (records output + error_codes +
+            # secret redaction) rather than a bare failed result: the base
+            # execute() already recorded the successful extraction's output,
+            # so without this a downstream block under continue_on_failure
+            # would read stale, pre-export-failure output as if nothing had
+            # gone wrong.
+            return await self._template_format_failure_result(
+                exc,
+                str(exc),
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
+
+        merged_output = {**result.output_parameter_value, "export": export_output}
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, merged_output)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=merged_output,
+            status=result.status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
 
 class LoginBlock(BaseTaskBlock):
@@ -11907,7 +12299,8 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         if not self.url or not self.google_credential_id:
             return None
 
-        source_url = self.format_block_parameter_template_from_workflow_run_context(
+        source_url = self.render_templatable_field(
+            "url",
             self.url,
             workflow_run_context,
         )
@@ -11921,7 +12314,8 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         if not org_id:
             raise ValueError("organization_id is required for authenticated Google Drive downloads")
 
-        formatted_credential_id = self.format_block_parameter_template_from_workflow_run_context(
+        formatted_credential_id = self.render_templatable_field(
+            "google_credential_id",
             self.google_credential_id,
             workflow_run_context,
         )
@@ -12285,6 +12679,15 @@ class TaskV2Block(Block):
         json_schema_extra={"default": 25},
     )
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "prompt",
+            "totp_identifier",
+            "totp_verification_url",
+            "url",
+        }
+    )
+
     def _resolve_totp_identifier(self, workflow_run_context: WorkflowRunContext) -> str | None:
         if self.totp_identifier:
             return self.totp_identifier
@@ -12299,18 +12702,18 @@ class TaskV2Block(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+        self.prompt = self.render_templatable_field("prompt", self.prompt, workflow_run_context)
         if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = self.render_templatable_field("url", self.url, workflow_run_context)
 
         if self.totp_identifier:
-            self.totp_identifier = self.format_block_parameter_template_from_workflow_run_context(
-                self.totp_identifier, workflow_run_context
+            self.totp_identifier = self.render_templatable_field(
+                "totp_identifier", self.totp_identifier, workflow_run_context
             )
 
         if self.totp_verification_url:
-            self.totp_verification_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.totp_verification_url, workflow_run_context
+            self.totp_verification_url = self.render_templatable_field(
+                "totp_verification_url", self.totp_verification_url, workflow_run_context
             )
             self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
@@ -12347,17 +12750,13 @@ class TaskV2Block(Block):
             resolved_totp_verification_url = self.totp_verification_url
 
         except Exception as e:
-            output_reason = f"Failed to format jinja template: {str(e)}"
-            await self.record_output_parameter_value(
-                workflow_run_context, workflow_run_id, {"failure_reason": output_reason}
-            )
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if not resolved_url:
@@ -12600,6 +12999,8 @@ class HttpRequestBlock(Block):
     # Allowed directories for local file access (class variable, not a Pydantic field)
     _allowed_dirs: ClassVar[list[str] | None] = None
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
+
     @classmethod
     def get_allowed_dirs(cls) -> list[str]:
         """Get the list of allowed directories for local file access.
@@ -12636,12 +13037,9 @@ class HttpRequestBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         """Format template parameters in the block fields"""
-        template_kwargs = {"force_include_secrets": True}
 
-        def _render_string(value: str) -> str:
-            rendered = self.format_block_parameter_template_from_workflow_run_context(
-                value, workflow_run_context, **template_kwargs
-            )
+        def _render_string(field: str, value: str) -> str:
+            rendered = self.render_templatable_field(field, value, workflow_run_context, force_include_secrets=True)
             # Boundary check so a longer id sharing a registered token's prefix is not partially replaced.
             for token in dict.fromkeys(workflow_run_context.find_embedded_placeholder_tokens(rendered)):
                 secret_value = str(workflow_run_context.secrets[token])
@@ -12653,19 +13051,28 @@ class HttpRequestBlock(Block):
             return rendered
 
         if self.url:
-            self.url = _render_string(self.url)
+            self.url = _render_string("url", self.url)
 
         if self.body:
-            self.body = cast(dict[str, Any], render_templates_in_json_value(self.body, _render_string))
+            self.body = cast(
+                dict[str, Any],
+                render_templates_in_json_value(self.body, lambda value: _render_string("body", value)),
+            )
 
         if self.files:
-            self.files = cast(dict[str, str], render_templates_in_json_value(self.files, _render_string))
+            self.files = cast(
+                dict[str, str],
+                render_templates_in_json_value(self.files, lambda value: _render_string("files", value)),
+            )
 
         if self.headers:
-            self.headers = cast(dict[str, str], render_templates_in_json_value(self.headers, _render_string))
+            self.headers = cast(
+                dict[str, str],
+                render_templates_in_json_value(self.headers, lambda value: _render_string("headers", value)),
+            )
 
         if self.download_filename:
-            self.download_filename = _render_string(self.download_filename)
+            self.download_filename = _render_string("download_filename", self.download_filename)
 
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
@@ -12778,13 +13185,13 @@ class HttpRequestBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to format jinja template: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         if self.save_response_as_file and self.secret_response_paths:
@@ -13086,6 +13493,8 @@ class PrintPageBlock(Block):
 
     VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"custom_filename"})
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
@@ -13295,9 +13704,7 @@ class PrintPageBlock(Block):
 
         timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         if self.custom_filename:
-            filename = self.format_block_parameter_template_from_workflow_run_context(
-                self.custom_filename, workflow_run_context
-            )
+            filename = self.render_templatable_field("custom_filename", self.custom_filename, workflow_run_context)
             filename = self._sanitize_filename(filename)
             if not filename.endswith(".pdf"):
                 filename += ".pdf"
@@ -14311,14 +14718,17 @@ async def _evaluate_prompt_branch_conditions_batch(
         )
         # The goal was fully rendered above; a second Jinja pass would resolve any `{{...}}` text
         # inlined from stored block outputs against the synthetic block's scope and fail (SKY-14080).
+        # Unlike the loop-value synthetic, this block is NOT excluded from the engine A/B:
+        # eligibility vets prompt-branch conditionals (v3_ab_ineligibility_reason), so the run's
+        # resolved arm covers branch evaluation too.
         extraction_block.mark_data_extraction_goal_prerendered()
-        extraction_block._exclude_from_engine_ab = True
 
         LOG.info(
             "Conditional branch ExtractionBlock created (batched)",
             block_label=log_label,
             prompt_branch_eval_id=prompt_branch_eval_id,
             num_conditions=len(branches),
+            resolved_engine=extraction_block.resolve_engine(workflow_run_id),
             attempt=attempt,
             extraction_goal_preview=attempt_goal[:500] if attempt_goal else None,
             has_browser_session=browser_session_id is not None,
@@ -14788,6 +15198,8 @@ class WorkflowTriggerBlock(Block):
 
     MAX_TRIGGER_DEPTH: ClassVar[int] = 10
 
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"browser_session_id", "payload", "workflow_permanent_id"})
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -14829,8 +15241,8 @@ class WorkflowTriggerBlock(Block):
         if credential_id is not None:
             return credential_id
 
-        rendered = self.format_block_parameter_template_from_workflow_run_context(
-            value, workflow_run_context, env=jinja_json_finalize_strict_env
+        rendered = self.render_templatable_field(
+            "payload", value, workflow_run_context, env=jinja_json_finalize_strict_env
         )
         if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
             json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
@@ -14985,14 +15397,14 @@ class WorkflowTriggerBlock(Block):
         _walk(self.payload, "payload")
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.workflow_permanent_id = self.format_block_parameter_template_from_workflow_run_context(
-            self.workflow_permanent_id, workflow_run_context
+        self.workflow_permanent_id = self.render_templatable_field(
+            "workflow_permanent_id", self.workflow_permanent_id, workflow_run_context
         )
         if self.payload:
             self.payload = self._render_templates_in_payload(self.payload, workflow_run_context)
         if self.browser_session_id:
-            self.browser_session_id = self.format_block_parameter_template_from_workflow_run_context(
-                self.browser_session_id, workflow_run_context
+            self.browser_session_id = self.render_templatable_field(
+                "browser_session_id", self.browser_session_id, workflow_run_context
             )
 
     async def execute(
@@ -15026,7 +15438,14 @@ class WorkflowTriggerBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return await _fail(f"Failed to resolve templates: {str(e)}")
+            return await self._template_format_failure_result(
+                e,
+                f"Failed to resolve templates: {str(e)}",
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
 
         resolved_workflow_permanent_id = self.workflow_permanent_id
         resolved_payload = self.payload
@@ -15200,7 +15619,13 @@ class WorkflowTriggerBlock(Block):
                     if created_fresh_session and resolved_browser_session_id:
                         try:
                             await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                                organization_id, resolved_browser_session_id
+                                organization_id,
+                                resolved_browser_session_id,
+                                reason=(
+                                    BrowserSessionCloseReason.user_requested
+                                    if success
+                                    else BrowserSessionCloseReason.aborted
+                                ),
                             )
                         except Exception:
                             LOG.warning(
@@ -15340,6 +15765,20 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
         return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
+        if isinstance(block, ConditionalBlock):
+            # A prompt-criteria branch evaluates through a synthetic extraction block that follows
+            # the run's arm, so it is a rerouted surface this predicate must count; jinja-only
+            # conditionals are pure control flow and stay invisible to the A/B. Both this type and
+            # the while-loop below skip the pinned-engine/totp checks: neither exposes those fields.
+            if any(isinstance(branch.criteria, PromptBranchCriteria) for branch in block.branch_conditions):
+                reroutable_blocks += 1
+            continue
+        if isinstance(block, WhileLoopBlock):
+            # A while-loop's prompt condition evaluates through the same synthetic extraction path
+            # as a conditional's prompt branch, so it is counted the same way.
+            if isinstance(block.condition, PromptBranchCriteria):
+                reroutable_blocks += 1
+            continue
         if not isinstance(block, BaseTaskBlock):
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:

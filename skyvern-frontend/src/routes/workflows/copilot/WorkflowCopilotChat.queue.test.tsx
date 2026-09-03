@@ -251,6 +251,16 @@ async function submit(value: string) {
   });
 }
 
+// Deliver the first SSE frame of the newest pending stream, which is what arms
+// the stop control.
+async function deliverFirstFrame() {
+  const call = streamCalls[streamCalls.length - 1];
+  if (!call) throw new Error("no pending stream to open");
+  await act(async () => {
+    call.onMessage(turnStart());
+  });
+}
+
 // Drive the oldest pending stream to a clean terminal frame.
 async function completeOldestStream(message: string) {
   const call = streamCalls.find((c) => c.body.message !== undefined);
@@ -347,6 +357,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
     expect(textarea().disabled).toBe(false);
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
@@ -356,6 +367,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
     expect(
       screen.getByText(
@@ -417,6 +429,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
     await submit("second message");
 
@@ -444,21 +457,208 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getAllByText("second message")).toHaveLength(1);
   });
 
-  it("Escape edits the queued message first, preserving the active run", async () => {
+  it("Escape in the composer edits the queued message, preserving the active run", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
     await submit("second message");
 
+    const ambientEscape = vi.fn();
+    window.addEventListener("keydown", ambientEscape);
     await act(async () => {
-      fireEvent.keyDown(window, { key: "Escape" });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
     });
+    window.removeEventListener("keydown", ambientEscape);
+
+    // Consumed at the composer, so sibling window/document Escape listeners never see it.
+    expect(ambientEscape).not.toHaveBeenCalled();
 
     // Queued text returns to the input; the run was not cancelled.
     expect(textarea().value).toBe("second message");
     expect(textarea().disabled).toBe(false);
     expect(cancelPost).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  });
+
+  it("an IME Escape in the composer does not discard the queued message", async () => {
+    // Dismissing a conversion candidate is not abandoning the follow-up. The composer
+    // handler consumes Escape before the window guard can see it, so it has to make the
+    // composition check itself — otherwise the queued text is dropped with no bubble
+    // and no text, because the half-composed input wins the restore tiebreak.
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("second message");
+
+    fireEvent.change(textarea(), { target: { value: "にほんご" } });
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape", isComposing: true });
+    });
+
+    // The queued message survives, and the composition text is left alone.
+    expect(textarea().value).toBe("にほんご");
+    expect(screen.getAllByText("second message").length).toBeGreaterThan(0);
+    expect(cancelPost).not.toHaveBeenCalled();
+  });
+
+  it("an Escape pressed during IME composition never cancels the turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    // Dismissing a conversion candidate, not stopping the turn.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape", isComposing: true });
+      fireEvent.keyDown(outside, { key: "Escape", isComposing: true });
+    });
+
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    outside.remove();
+  });
+
+  it("Escape outside the composer stops the turn and records the gesture", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({
+        cancel_token: expect.any(String),
+        source: "escape_key",
+      }),
+    );
+    outside.remove();
+  });
+
+  it("the stop control does not cancel before the turn's first frame arrives", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Sent, but no SSE frame has been delivered to the reducer yet: the control is
+    // mounted and pressable, so a click on it is the negative arm.
+    const pending = screen.getByRole("button", { name: "Starting…" });
+    expect(pending.hasAttribute("disabled")).toBe(false);
+    expect(pending.getAttribute("aria-busy")).not.toBe("true");
+    await act(async () => {
+      fireEvent.click(pending);
+    });
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+
+    await deliverFirstFrame();
+
+    const stop = screen.getByRole("button", { name: "Cancel run" });
+    await act(async () => {
+      fireEvent.click(stop);
+    });
+
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({
+        cancel_token: expect.any(String),
+        source: "stop_button",
+      }),
+    );
+  });
+
+  it("arms the visible stop shortly after send even when no frame ever streams", async () => {
+    // The gate exists for the second click of a double-tap, not to leave the control a
+    // user reaches for dead while a turn hangs before its first frame.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderChat();
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
+      });
+      expect(cancelPost).not.toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+      );
+
+      // Past the double-tap window, with no frame delivered at any point.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(600);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.objectContaining({ source: "stop_button" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a stalled turn's arming deadline arm the turn its queued prompt drains into", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderChat();
+      await submit("first message");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await submit("second message");
+
+      // Stop just short of the first turn's arming deadline, hand over to the turn its
+      // queued prompt drains into, then cross that deadline: it belongs to the turn that
+      // scheduled it and must not arm the one now running.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(400);
+      });
+      await completeOldestStream("first done");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(200);
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
+      });
+      expect(cancelPost).not.toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+      );
+
+      await deliverFirstFrame();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("clears the queued block-build target on cancel so it cannot leak into the next message", async () => {
@@ -477,7 +677,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     // Cancel the queued block-build before it sends.
     await act(async () => {
-      fireEvent.keyDown(window, { key: "Escape" });
+      fireEvent.keyDown(textarea(), { key: "Escape" });
     });
 
     // Finish the original turn and send an unrelated follow-up.
@@ -741,7 +941,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await act(async () => {
       call.onMessage(turnStart());
       call.onMessage({
-        ...terminalResponse("Cancelled by user."),
+        ...terminalResponse("Stopped. 0 blocks ran this turn."),
         proposal_disposition: "no_proposal",
         cancelled: true,
       });
@@ -1428,6 +1628,7 @@ describe("WorkflowCopilotChat — a stop never replays a queued message", () => 
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
     await submit("also add a login step");
     expect(screen.getAllByText("also add a login step")).toHaveLength(1);
 
@@ -1447,6 +1648,7 @@ describe("WorkflowCopilotChat — a stop never replays a queued message", () => 
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
 
     const stop = screen.getByRole("button", { name: /Cancel run/ });
     expect(stop.hasAttribute("disabled")).toBe(false);
@@ -1493,6 +1695,7 @@ describe("WorkflowCopilotChat — the composer stays usable while a prompt is pa
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
     await submit("queued answer");
     // Half-typed replacement, never submitted.
     fireEvent.change(textarea(), {

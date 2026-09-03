@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLO
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.runs import RunEngine, RunType
 from skyvern.services import script_service, task_v2_service
 from skyvern.utils.files import initialize_skyvern_state_file
@@ -166,6 +167,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                         await app.PERSISTENT_SESSIONS_MANAGER.close_session(
                             organization.organization_id,
                             workflow_run.browser_session_id,
+                            reason=BrowserSessionCloseReason.aborted,
                         )
                     except Exception:
                         LOG.exception(

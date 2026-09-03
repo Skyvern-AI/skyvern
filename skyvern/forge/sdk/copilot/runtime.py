@@ -30,7 +30,10 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailure,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -44,6 +47,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
@@ -355,6 +359,9 @@ class AgentContext:
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
+    # The deadline the current model stream runs under, published by the enforcement loop so a tool
+    # that parks on a user decision can suspend it instead of being cancelled mid-question.
+    model_stream_deadline: asyncio.Timeout | None = None
     # The streaming adapter narrates any context it is handed, so the design-phase latches live here
     # rather than on the copilot subclass it is annotated for.
     design_start_emitted: bool = False
@@ -452,6 +459,9 @@ class AgentContext:
     staged_workflow_yaml: str | None = None
     staged_workflow: Any | None = None
     has_staged_proposal: bool = False
+    # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
+    # staged draft at turn end. None on entrypoints that load no chat row.
+    auto_accept: bool | None = None
     # Server-owned only: maps current raw code-block labels to opaque identities. It is never
     # serialized into the workflow YAML or model-facing repair evidence.
     runner_code_block_associations_by_label: dict[str, str] = field(default_factory=dict)
@@ -926,12 +936,17 @@ async def resolve_persistent_browser_state(
     return await asyncio.shield(_abandonable_browser_state_resolve(session_id, organization_id))
 
 
-async def close_browser_session_quietly(organization_id: str, session_id: str) -> None:
+async def close_browser_session_quietly(
+    organization_id: str,
+    session_id: str,
+    *,
+    reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
+) -> None:
     """Bounded: the session-manager backend is often the reason we are closing at all, so an
     unbounded close could hang the request."""
     try:
         await asyncio.wait_for(
-            app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id),
+            app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason),
             timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
         )
     except Exception:
@@ -1225,12 +1240,13 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
 
 
 def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
+    sentence = build_test_connect_failure_sentence(failure)
     return {
         "ok": False,
-        "error": f"Build-test browser acquisition stopped: {failure.state}.",
+        "error": sentence,
         "data": {
             "overall_status": "setup_failed",
-            "failure_reason": f"Build-test browser acquisition stopped: {failure.state}.",
+            "failure_reason": sentence,
             "browser_session_id": failure.browser_session_id,
             "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=True),
             "blocks": [],
@@ -1287,7 +1303,11 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
                 installed_session_id=ctx.browser_session_id,
                 organization_id=ctx.organization_id,
             )
-            await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+            await close_browser_session_quietly(
+                ctx.organization_id,
+                session.persistent_browser_session_id,
+                reason=BrowserSessionCloseReason.user_requested,
+            )
             session = None
         else:
             ctx.browser_session_id = session.persistent_browser_session_id

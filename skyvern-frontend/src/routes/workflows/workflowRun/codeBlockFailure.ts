@@ -265,6 +265,41 @@ export function failingCodeLineFromActions(
   return failingAction ? actionCodeLine(failingAction) : null;
 }
 
+// unsupported_page_operation is one error code for four different guards, so the code alone
+// cannot pick a remedy. codeblock/workflow.py puts the runner-authored class name on the failure
+// output for exactly this; the names come from SAFE_DENIED_OPERATION_EXCEPTION_CLASSES, which
+// allowlists them as carrying no page or parameter data.
+const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
+  "codeblock.page_operation_broker.PageOperationLimitExceeded": {
+    kind: "limit",
+    title: "The block used too many browser operations",
+    guidance:
+      "This block issued more browser operations in a single run than the per-run limit allows. Split the work across several runs, or narrow what each run processes.",
+    recovery: "fix",
+  },
+  "codeblock.page_operation_broker.BlockedEgressError": {
+    kind: "browser",
+    title: "The block navigated to a blocked destination",
+    guidance:
+      "Navigation is limited to reachable external web addresses. Check the URL this block navigates to \u2014 internal, unroutable, and non-web destinations are refused.",
+    recovery: "fix",
+  },
+};
+
+function denialTemplate(
+  output: WorkflowRunBlock["output"],
+): { template: CodeBlockFailureTemplate; code: string } | null {
+  if (!isRecord(output)) {
+    return null;
+  }
+  const exceptionClass = output.runner_exception_class;
+  if (typeof exceptionClass !== "string") {
+    return null;
+  }
+  const template = DENIAL_TEMPLATES[exceptionClass];
+  return template ? { template, code: exceptionClass } : null;
+}
+
 function templateFor(
   errorCodes: Array<string>,
   reason: string,
@@ -305,6 +340,13 @@ function templateFor(
         recovery: "retry",
       },
     };
+  }
+
+  // Before the code lookup: a named guard is more specific than the code it reports under, and
+  // the code lookup below returns early, so anything after it is unreachable for runner rows.
+  const denial = denialTemplate(output);
+  if (denial) {
+    return { code: runnerCode ?? denial.code, template: denial.template };
   }
 
   if (

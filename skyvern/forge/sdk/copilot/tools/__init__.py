@@ -11,7 +11,6 @@ import structlog
 from agents import FunctionTool, function_tool
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
-from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
@@ -24,6 +23,10 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_pause import (
+    await_pending_credential_pause,
+    release_credential_pause_gate,
+)
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -72,6 +75,8 @@ from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEILING_SECONDS
+from ._shared import AdmittedOutputRead as AdmittedOutputRead
+from ._shared import RequestedOutputRead as RequestedOutputRead
 from ._shared import _composition_get_html as _composition_get_html
 from ._shared import _current_workflow_has_evidence_block as _current_workflow_has_evidence_block
 from ._shared import _fallback_page_info as _fallback_page_info
@@ -80,6 +85,7 @@ from ._shared import _proxy_location_trace_value as _proxy_location_trace_value
 from ._shared import _raw_yaml_proxy_location as _raw_yaml_proxy_location
 from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragment
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
+from ._shared import admitted_requested_output_reads
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
@@ -111,6 +117,7 @@ from .credential_fill import _credential_fill_authority_error as _credential_fil
 from .credential_fill import _credential_fill_prerequisite_error as _credential_fill_prerequisite_error
 from .credential_fill import (
     _fill_credential_field_impl,
+    _request_credential,
 )
 from .credential_fill import _resolve_credential_fill_value as _resolve_credential_fill_value
 from .credentials import _credential_id_misbinding_findings as _credential_id_misbinding_findings
@@ -275,6 +282,10 @@ async def update_workflow_tool(
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
     Returns the validated workflow or validation errors.
+
+    A successful write is staged as a proposal, which the returned `persistence` and
+    `persistence_message` report. The user accepts a staged proposal to save it, or
+    discards it to keep the current version.
 
     Top-level workflow parameter keys appear in the run-input UI. When you
     add runtime inputs in `workflow_definition.parameters`, name keys for the
@@ -463,6 +474,7 @@ async def edit_block_and_run_tool(
     credential and reply with the credential name; do not build or run with the raw value.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     requested_labels = list(block_labels) if block_labels else [label]
@@ -656,39 +668,38 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     )
 
 
-class RequestedOutputRead(TypedDict):
-    """A requested output and the exact label/value the model sees on the current page."""
-
-    output_path: str
-    value_text: str
-    label: str
+SUPERSEDED_BY_VALUE_WITNESS = "superseded-by-value-witness"
 
 
-_MAX_REQUESTED_OUTPUT_READS = 8
+def _witnessed_output_paths(data: object) -> frozenset[str]:
+    """Output paths this call's capture already addressed by the value its screenshot read."""
+    if not isinstance(data, dict):
+        return frozenset()
+    witnesses = data.get("value_witnesses")
+    if not isinstance(witnesses, list):
+        return frozenset()
+    return frozenset(
+        str(witness["output_path"])
+        for witness in witnesses
+        if isinstance(witness, dict) and str(witness.get("output_path") or "")
+    )
 
 
 async def _verify_requested_output_reads(
     copilot_ctx: CopilotContext,
     reads: list[RequestedOutputRead],
+    witnessed_paths: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Verify model-designated rendered values and return page facts without retaining a plan."""
     verified: list[dict[str, Any]] = []
-    unverified: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
-    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
-        unverified.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
-    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
-        raw_path = str(read.get("output_path") or "").strip()
-        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
-        value_text = str(read.get("value_text") or "").strip()
-        label = str(read.get("label") or "").strip()
-        if not raw_path or not value_text:
-            unverified.append({"output_path": raw_path, "reason": "malformed"})
+    admitted, unverified = admitted_requested_output_reads(reads)
+    for read in admitted:
+        output_path = read.output_path
+        value_text = read.value_text
+        label = read.label
+        if output_path in witnessed_paths:
+            unverified.append({"output_path": output_path, "reason": SUPERSEDED_BY_VALUE_WITNESS})
             continue
-        if output_path in seen_paths:
-            unverified.append({"output_path": output_path, "reason": "duplicate-output-path"})
-            continue
-        seen_paths.add(output_path)
         server = copilot_ctx.discovery_mcp_server
         if server is None:
             unverified.append({"output_path": output_path, "reason": "no-browser"})
@@ -789,6 +800,35 @@ async def list_credentials_tool(
     return json.dumps(sanitized)
 
 
+@function_tool(name_override="request_credential")
+async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, reason: str) -> str:
+    """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
+
+    Use this instead of writing a prose question when the turn needs a login and no saved
+    credential covers that site. `login_page_url` must be a page on a site the user themselves
+    provided in this chat; `reason` is one sentence shown to the user saying why the login is
+    needed. The call waits for the user's answer and comes back `connected` with the credential
+    to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
+    carries. One ask per turn.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"login_page_url": login_page_url, "reason": reason}
+    result: dict[str, Any] = {}
+    try:
+        authority_error = _authority_tool_error(copilot_ctx, "request_credential")
+        if authority_error:
+            result = {"ok": False, "error": authority_error}
+        else:
+            result = await _request_credential(login_page_url, reason, copilot_ctx)
+    finally:
+        # A card on screen right now owns the gate; this call must not open it for one it never
+        # raised. Every other exit has to release, including a repeat ask in a later response.
+        if not copilot_ctx.credential_ask_in_flight:
+            release_credential_pause_gate(copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "request_credential", arguments, result)
+    return json.dumps(result)
+
+
 @function_tool(name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
@@ -818,6 +858,14 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
+
+    A `credential_id` may instead be the connection `name` or `email_address`
+    exactly as the user wrote it in this turn. The server resolves it and reports
+    the outcome under `google_connection_resolution` in the `update_workflow`
+    result: `resolved` rewrites the slot to the `connection_id`, while `ambiguous`,
+    `not_found`, `ineligible`, and `not_cited` leave it alone and return the
+    eligible rows to clarify against. A slot still holding an unresolved reference
+    cannot run.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -876,6 +924,7 @@ async def run_blocks_tool(
     evidence instead of retrying guessed URL params or page structure.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
@@ -1020,6 +1069,7 @@ async def update_and_run_blocks_tool(
     do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
@@ -1104,7 +1154,7 @@ def _credential_deferred_combined_tool_result(
     arguments: dict[str, Any],
     update_result: dict[str, Any],
 ) -> str:
-    """Record a persisted draft when a combined edit/update cannot safely run yet."""
+    """Record the staged draft when a combined edit/update cannot safely run yet."""
     copilot_ctx.last_run_skipped_unbound_credentials = True
     skip_result = {
         "ok": True,
@@ -1116,7 +1166,7 @@ def _credential_deferred_combined_tool_result(
             "skip_reason": "workflow_credential_inputs_unbound",
         },
     }
-    carry_author_time_findings(update_result, skip_result)
+    skip_result = carry_author_time_findings(update_result, skip_result)
     record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
     finalize_build_test_result(
         copilot_ctx,
@@ -1175,7 +1225,7 @@ async def _run_updated_workflow_blocks(
                 frontier_start_label=frontier_start_label,
             )
         recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
-        carry_author_time_findings(update_result, run_result)
+        run_result = carry_author_time_findings(update_result, run_result)
         _carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
         finalize_build_test_result(
@@ -1301,15 +1351,23 @@ async def inspect_page_for_composition_tool(
     authority_error = _authority_tool_error(ctx.context, "inspect_page_for_composition")
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, "inspect_page_for_composition", authority_error)
-    result = await _inspect_page_for_composition_impl(ctx.context, target_url)
+    admitted, _ = admitted_requested_output_reads(requested_output_reads or [])
+    result = await _inspect_page_for_composition_impl(ctx.context, target_url, admitted)
     if requested_output_reads and result.get("ok"):
-        verified, unverified = await _verify_requested_output_reads(ctx.context, requested_output_reads)
         data = result.get("data")
+        witnessed_paths = _witnessed_output_paths(data)
+        verified, unverified = await _verify_requested_output_reads(
+            ctx.context, requested_output_reads, witnessed_paths
+        )
         if isinstance(data, dict):
             data["requested_output_designations"] = verified
             if unverified:
                 data["unverified_output_designations"] = unverified
-                retry_paths = [item["output_path"] for item in unverified if item.get("output_path")]
+                retry_paths = [
+                    item["output_path"]
+                    for item in unverified
+                    if item.get("output_path") and item.get("reason") != SUPERSEDED_BY_VALUE_WITNESS
+                ]
                 if retry_paths:
                     data["requested_output_designation_capability"] = requested_output_designation_capability(
                         retry_paths
@@ -1487,4 +1545,5 @@ NATIVE_TOOLS = [
     inspect_page_for_composition_tool,
     inspect_locator_matches_tool,
     fill_credential_field_tool,
+    request_credential_tool,
 ]

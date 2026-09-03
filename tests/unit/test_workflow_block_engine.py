@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,22 +27,31 @@ from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
     Block,
+    BranchCondition,
+    BranchEvaluationContext,
     CodeBlock,
+    ConditionalBlock,
+    ExtractionBlock,
     FileDownloadBlock,
     ForLoopBlock,
     HumanInteractionBlock,
+    JinjaBranchCriteria,
     NavigationBlock,
+    PromptBranchCriteria,
     TaskBlock,
     UrlBlock,
     V3AbIneligibleReason,
     ValidationBlock,
+    WhileLoopBlock,
+    _evaluate_prompt_branch_conditions_batch,
     get_all_blocks,
     run_is_eligible_for_v3_ab,
     v3_ab_ineligibility_reason,
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import BlockResult, BlockType
+from skyvern.services import script_service
 from tests.unit.helpers import make_organization
 from tests.unit.test_agent_task_v3 import _make_block, _make_output_parameter, _run_execute_step_gate
 from tests.unit.test_block_description_caching import _block_result, _setup_mocks
@@ -550,6 +560,45 @@ def _no_reroutable_blocks() -> list[BaseTaskBlock]:
     return [code_block, url_block, human_block]
 
 
+def _conditional_block(criteria: PromptBranchCriteria | JinjaBranchCriteria) -> ConditionalBlock:
+    return ConditionalBlock(
+        label="cond",
+        output_parameter=_make_output_parameter("cond"),
+        branch_conditions=[
+            BranchCondition(criteria=criteria, next_block_label="a"),
+            BranchCondition(is_default=True, next_block_label="b"),
+        ],
+    )
+
+
+def _prompt_branch_conditional_only_blocks() -> list[Block]:
+    return [*_no_reroutable_blocks(), _conditional_block(PromptBranchCriteria(expression="the page shows an error"))]
+
+
+def _jinja_only_conditional_blocks() -> list[Block]:
+    # BranchCondition's validator re-types criteria from expression shape: only a PURE jinja
+    # expression stays JinjaBranchCriteria; jinja mixed with bare text re-types to prompt.
+    return [*_no_reroutable_blocks(), _conditional_block(JinjaBranchCriteria(expression="{{ x == 'y' }}"))]
+
+
+def _while_loop(criteria: PromptBranchCriteria | JinjaBranchCriteria) -> WhileLoopBlock:
+    body = CodeBlock(label="loop_body", output_parameter=_make_output_parameter("loop_body"), code="pass")
+    return WhileLoopBlock(
+        label="while",
+        output_parameter=_make_output_parameter("while"),
+        condition=criteria,
+        loop_blocks=[body],
+    )
+
+
+def _prompt_condition_while_loop_only_blocks() -> list[Block]:
+    return [*_no_reroutable_blocks(), _while_loop(PromptBranchCriteria(expression="the page shows an error"))]
+
+
+def _jinja_condition_while_loop_blocks() -> list[Block]:
+    return [*_no_reroutable_blocks(), _while_loop(JinjaBranchCriteria(expression="{{ x == 'y' }}"))]
+
+
 @pytest.mark.parametrize(
     ("blocks_factory", "is_script_run", "expected_reason"),
     [
@@ -560,6 +609,10 @@ def _no_reroutable_blocks() -> list[BaseTaskBlock]:
         (_totp_blocks, False, V3AbIneligibleReason.block_totp_verification_url),
         (_no_reroutable_blocks, False, V3AbIneligibleReason.no_reroutable_blocks),
         (_eligible_mix_blocks, False, None),
+        (_prompt_branch_conditional_only_blocks, False, None),
+        (_jinja_only_conditional_blocks, False, V3AbIneligibleReason.no_reroutable_blocks),
+        (_prompt_condition_while_loop_only_blocks, False, None),
+        (_jinja_condition_while_loop_blocks, False, V3AbIneligibleReason.no_reroutable_blocks),
     ],
     ids=[
         "script_run",
@@ -569,6 +622,10 @@ def _no_reroutable_blocks() -> list[BaseTaskBlock]:
         "block_totp_verification_url",
         "no_reroutable_blocks",
         "eligible",
+        "prompt_branch_conditional_is_a_reroutable_surface",
+        "jinja_only_conditional_stays_invisible",
+        "prompt_condition_while_loop_is_a_reroutable_surface",
+        "jinja_condition_while_loop_stays_invisible",
     ],
 )
 def test_v3_ab_ineligibility_reason_maps_each_disqualifier(
@@ -606,3 +663,134 @@ async def test_resolver_logs_the_ineligibility_reason(scoped_context: SkyvernCon
     assert resolved_call.kwargs["ineligibility_reason"] == V3AbIneligibleReason.pinned_engine
     # The provider is never even queried for an ineligible run -- nothing to bucket.
     assert provider.calls == []
+
+
+def _branch_eval_stub(captured_engines: list[RunEngine], workflow_run_id: str) -> Any:
+    async def _capture_engine(self: ExtractionBlock, *args: Any, **kwargs: Any) -> BlockResult:
+        # The label prefix is the telemetry handle that lets reads slice branch-eval outcomes
+        # per arm (the spawned task takes it as its title); pinned here so it can't silently drift.
+        assert self.label.startswith("prompt_branch_eval_")
+        captured_engines.append(self.resolve_engine(workflow_run_id))
+        return BlockResult(
+            success=True,
+            output_parameter=self.output_parameter,
+            output_parameter_value={"evaluations": [{"condition_index": 1, "reasoning": "ok", "result": True}]},
+            failure_reason=None,
+        )
+
+    return _capture_engine
+
+
+@pytest.mark.asyncio
+async def test_branch_eval_synthetic_block_honors_v3_override(scoped_context: SkyvernContext) -> None:
+    """The prompt-branch batch evaluator's synthetic ExtractionBlock honors the run-level engine
+    override like an authored block: a treated run evaluates branch conditions on its arm."""
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_branch_eval_v3"
+    scoped_context.workflow_block_engine_override = RunEngine.skyvern_v3
+
+    captured_engines: list[RunEngine] = []
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="x"
+    )
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    with patch.object(ExtractionBlock, "execute", _branch_eval_stub(captured_engines, "wr_branch_eval_v3")):
+        await _evaluate_prompt_branch_conditions_batch(
+            log_label="cond",
+            branches=[branch],
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_branch_eval_v3",
+            workflow_run_block_id="wrb",
+            organization_id="org_1",
+            browser_session_id=None,
+            workflow_id="wf_1",
+        )
+
+    assert captured_engines == [RunEngine.skyvern_v3]
+
+
+@pytest.mark.asyncio
+async def test_branch_eval_synthetic_block_defaults_to_v1_without_override(scoped_context: SkyvernContext) -> None:
+    """With no run-level override pinned at all, the synthetic ExtractionBlock resolves to
+    skyvern_v1 -- control runs stay on v1."""
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_branch_eval_control"
+    scoped_context.workflow_block_engine_override = None
+
+    captured_engines: list[RunEngine] = []
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="x"
+    )
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    with patch.object(ExtractionBlock, "execute", _branch_eval_stub(captured_engines, "wr_branch_eval_control")):
+        await _evaluate_prompt_branch_conditions_batch(
+            log_label="cond",
+            branches=[branch],
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_branch_eval_control",
+            workflow_run_block_id="wrb",
+            organization_id="org_1",
+            browser_session_id=None,
+            workflow_id="wf_1",
+        )
+
+    assert captured_engines == [RunEngine.skyvern_v1]
+
+
+@pytest.mark.asyncio
+async def test_script_create_site_stamps_the_script_run_marker(scoped_context: SkyvernContext) -> None:
+    """A cached-script block never resolves an engine, so `engine IS NULL` alone cannot separate
+    a script-executed block from an agent-executed one whose engine was never written. The script
+    create-site stamps `script_run` at creation, making (engine NULL, script_run NULL) a genuine
+    anomaly instead of an ordinary script run.
+    """
+    scoped_context.workflow_run_id = "wr_script_marker"
+    scoped_context.organization_id = "o_test"
+
+    with patch("skyvern.services.script_service.app") as mock_app:
+        mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(
+            return_value=SimpleNamespace(workflow_run_block_id="wrb_script_marker")
+        )
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        mock_app.DATABASE.tasks.create_task = AsyncMock(
+            return_value=SimpleNamespace(task_id="tsk_script_marker", workflow_run_id="wr_script_marker")
+        )
+        mock_app.DATABASE.tasks.create_step = AsyncMock(return_value=SimpleNamespace(step_id="stp_script_marker"))
+        mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
+
+        block_id, task_id, step_id = await script_service._create_workflow_block_run_and_task(
+            block_type=BlockType.NAVIGATION,
+            label="nav",
+        )
+
+    # Everything after the create call is wrapped in a try/except that collapses to
+    # (None, None, None); asserting the ids proves the whole path ran rather than bailing early.
+    assert (block_id, task_id, step_id) == ("wrb_script_marker", "tsk_script_marker", "stp_script_marker")
+    create_kwargs = mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs
+    assert create_kwargs["ai_fallback_triggered"] is False
+    assert create_kwargs.get("engine") is None
+
+
+@pytest.mark.asyncio
+async def test_agent_create_site_leaves_the_script_run_marker_unset(scoped_context: SkyvernContext) -> None:
+    """The other half of the discriminator: an agent-executed block must NOT carry the marker,
+    or `script_run IS NOT NULL` stops meaning "script-executed". A forward guard on the agent
+    create-site, which this change deliberately leaves alone -- it passes with or without it."""
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_agent_marker"
+    scoped_context.workflow_block_engine_override = RunEngine.skyvern_v3
+    block = _make_block(TaskBlock, label="agent_marker_block")
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+    ):
+        _setup_mocks(mock_app)
+
+        await block.execute_safe(workflow_run_id="wr_agent_marker")
+
+    create_kwargs = mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs
+    assert create_kwargs["engine"] == RunEngine.skyvern_v3
+    assert create_kwargs.get("ai_fallback_triggered") is None

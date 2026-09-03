@@ -7,7 +7,7 @@ the evidence at hand, not a set computed once at turn start.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
@@ -150,12 +150,12 @@ def credential_reference_spans(message: str, reference: str) -> list[tuple[int, 
         start = index + 1
 
 
-def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
-    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
-    candidates = {value for credential in credentials for value in (credential.name, credential.credential_id) if value}
+def grounded_references(message: str, candidates: Iterable[str]) -> set[str]:
+    """Find complete candidate literals in a turn, preferring the longest overlap: a shorter
+    candidate that only occurs inside a longer one is not cited on its own."""
     occurrences = [
         (reference, start, end)
-        for reference in candidates
+        for reference in {candidate for candidate in candidates if candidate}
         for start, end in credential_reference_spans(message, reference)
     ]
     return {
@@ -166,6 +166,13 @@ def grounded_credential_references(message: str, credentials: list[Credential]) 
             for _other, other_start, other_end in occurrences
         )
     }
+
+
+def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
+    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
+    return grounded_references(
+        message, (value for credential in credentials for value in (credential.name, credential.credential_id))
+    )
 
 
 def _match_by_url_tiered(

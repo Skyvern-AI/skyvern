@@ -45,7 +45,7 @@ from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
-from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause
+from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -777,6 +777,10 @@ def _summarize_tool_output(output: str) -> str:
         if isinstance(unresolved, dict) and unresolved:
             synopsis["unresolved_earlier_failure"] = unresolved
 
+        change_identity = data.get("prior_attempt_change_identity")
+        if isinstance(change_identity, dict) and change_identity:
+            synopsis["prior_attempt_change_identity"] = change_identity
+
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
         categories = data.get("failure_categories")
@@ -1160,13 +1164,15 @@ async def _run_streamed_with_deadline(
     against ``TOTAL_TIMEOUT_SECONDS``.
 
     The top-of-loop elapsed check only fires between iterations; a
-    long-running tool inside ``Runner.run_streamed`` needs ``wait_for``
+    long-running tool inside ``Runner.run_streamed`` needs this deadline
     to raise ``CopilotTotalTimeoutError`` mid-tool so the caller's
     ``_build_exit_result`` path emits a non-empty REPLY before the
-    client's own transport timeout closes the stream.
+    client's own transport timeout closes the stream. The live timeout is
+    published on the context so a tool that parks on a user decision (the
+    credential card) can suspend it for the length of that wait.
 
-    ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so
-    ``wait_for(timeout=0)`` never panics on an already-spent budget.
+    ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so a zero
+    timeout never panics on an already-spent budget.
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
@@ -1174,8 +1180,17 @@ async def _run_streamed_with_deadline(
         result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
         try:
             try:
-                await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+                async with asyncio.timeout(remaining) as deadline:
+                    ctx.model_stream_deadline = deadline
+                    await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
+                ctx.model_stream_deadline = None
+                # A request_credential call the SDK rejected before its handler ran leaves the gate
+                # armed with no releaser, and arm_credential_pause_gate skips a stranded Event, so
+                # every later response's run tools would park on it. A rejected call never sets the
+                # in-flight flag, so this still cannot open the gate under a card that is on screen.
+                if not ctx.credential_ask_in_flight:
+                    release_credential_pause_gate(ctx)
                 _accumulate_usage(result, ctx)
         except TimeoutError:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
