@@ -4123,9 +4123,45 @@ class WorkflowService:
             "workflow_permanent_id": workflow_permanent_id,
             "bound_key": browser_session.bound_key,
             "browser_session_id": browser_session.persistent_browser_session_id,
+            "retirement_reason": "below_lifetime_floor",
             "remaining_lifetime_seconds": remaining_lifetime_seconds,
             "min_remaining_lifetime_seconds": REUSE_MIN_REMAINING_LIFETIME_SECONDS,
         }
+
+    async def _reused_session_renewal_failure(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        browser_session: PersistentBrowserSession,
+    ) -> dict[str, object] | None:
+        try:
+            await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
+                browser_session.persistent_browser_session_id,
+                organization_id,
+                workflow_run_id=workflow_run_id,
+            )
+        except BrowserSessionNotRenewable as error:
+            return {
+                "organization_id": organization_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_permanent_id": workflow_permanent_id,
+                "bound_key": browser_session.bound_key,
+                "browser_session_id": browser_session.persistent_browser_session_id,
+                "retirement_reason": "not_renewable",
+                "not_renewable_reason": str(error),
+            }
+        except Exception:
+            LOG.warning(
+                "Could not renew reusable browser session budget; leaving reuse enabled",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                exc_info=True,
+            )
+        return None
 
     async def _adopt_reused_session(
         self,
@@ -4207,20 +4243,29 @@ class WorkflowService:
             stale_owner_released = True
 
         if lifetime_floor_session_id == session_id and (browser_session.runnable_id is None or stale_owner_released):
-            shortfall = await self._reused_session_lifetime_shortfall(
+            retirement = await self._reused_session_lifetime_shortfall(
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=expected_workflow_permanent_id,
                 browser_session=browser_session,
             )
-            if shortfall is not None:
+            # A session's budget starts at started_at, so an unstarted session has nothing to renew.
+            # The OSS manager rejects renewal before that point.
+            if retirement is None and browser_session.started_at is not None:
+                retirement = await self._reused_session_renewal_failure(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=expected_workflow_permanent_id,
+                    browser_session=browser_session,
+                )
+            if retirement is not None:
                 raise ReusedSessionBelowLifetimeFloor(
                     browser_session=(
                         browser_session.model_copy(update={"runnable_id": None})
                         if stale_owner_released
                         else browser_session
                     ),
-                    shortfall=shortfall,
+                    shortfall=retirement,
                 )
 
         try:
@@ -4441,7 +4486,7 @@ class WorkflowService:
                     lifetime_floor_session_id=lifetime_floor_session_id,
                 )
             except ReusedSessionBelowLifetimeFloor as below_floor:
-                LOG.info("Retiring reusable browser session below lifetime floor", **below_floor.shortfall)
+                LOG.info("Retiring reusable browser session before claim", **below_floor.shortfall)
                 adopted_session_id, browser_session = None, below_floor.browser_session
                 close_reason = BrowserSessionCloseReason.expired
             if adopted_session_id is not None:
