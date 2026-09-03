@@ -304,8 +304,26 @@ def test_failed_operation_without_a_crash_keeps_its_own_sentence() -> None:
     message, replaced = render_terminal_message(envelope, "The code run failed.", cancelled=False)
 
     assert replaced is True
-    assert "browser operation failed" in message.lower()
+    assert message.startswith("I stopped after a browser operation failed while testing the workflow.")
+    assert "`" not in message
     assert INTERRUPTED_TERMINAL_HEADLINE not in message
+
+
+def test_failed_operation_sentence_names_the_block_that_failed() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_untested",
+        failed_operation=BuildTestFailedOperation(
+            kind="browser_operation_failed",
+            block_label="continue_to_payment",
+        ),
+        proposal_present=True,
+    )
+    message, replaced = render_terminal_message(envelope, "The code run failed.", cancelled=False)
+
+    assert replaced is True
+    assert message.startswith(
+        "I stopped after a browser operation failed in `continue_to_payment` while testing the workflow."
+    )
 
 
 def test_unexpected_error_exit_renders_interrupted_and_keeps_its_terminal_reason() -> None:

@@ -444,6 +444,14 @@ CANONICAL_LOOP_TOUCHES = 4
 
 PROGRESS_LEDGER_SHADOW_EVENT = "taskv3 loop progress ledger would fail-fast"
 PROGRESS_LEDGER_FINAL_EVENT = "taskv3 loop progress ledger final"
+# The ledger's survival record is gated on ever_armed, so it describes ONLY runs that saw a
+# validation error. Search / filter / navigate / extract runs emitted nothing at all, which makes any
+# fire count taken off that population a floor and never a prevalence. This is the complement record,
+# keyed on the canonical tracker because its counters are the only progress signal defined without a
+# form. The two partition the population: exactly one is emitted per run, so their union is the
+# denominator. Additive — the ledger record's own population and fields are unchanged, so survival
+# data collected before this change stays comparable with data collected after it.
+CANONICAL_SURVIVAL_EVENT = "taskv3 canonical progress final"
 
 
 @dataclass
@@ -942,6 +950,11 @@ class _CanonicalProgressTracker:
     # on a fire rung while churn evicts other keys — a rung is one threshold crossing, not one
     # event per touch spent at it.
     _fired: set[tuple[str, int]] = field(default_factory=set)
+    # Run-level high-water marks, deliberately NOT cleared by progress(): the survival record needs
+    # the worst churn the run ever reached, the same way the ledger keeps peak_actions_since_progress
+    # across its own clears. Clearing these with the ring would report the last streak, not the peak.
+    peak_same_touches: int = 0
+    peak_same_errors: int = 0
 
     def record_touch(self, target_key: str, is_error: bool) -> tuple[int, int]:
         """Record one billable touch; returns (same-target touches, same-target errors) in-window."""
@@ -952,7 +965,10 @@ class _CanonicalProgressTracker:
         # A rung re-arms once the in-window count dips below it: a fresh streak after full eviction
         # is a genuine re-crossing, distinct from a saturated window PARKED on a fire count.
         self._fired = {entry for entry in self._fired if entry[0] != target_key or entry[1] <= len(same)}
-        return len(same), sum(1 for err in same if err)
+        same_errors = sum(1 for err in same if err)
+        self.peak_same_touches = max(self.peak_same_touches, len(same))
+        self.peak_same_errors = max(self.peak_same_errors, same_errors)
+        return len(same), same_errors
 
     def progress(self, evidence: _ProgressEvidence) -> None:
         """The one clear choke point: a caller must name its evidence class, so no site can wipe
@@ -977,6 +993,15 @@ class _CanonicalProgressTracker:
         identity outlives the renumbering."""
         self._touches = [touch for touch in self._touches if not touch[0].startswith("mark=")]
         self._fired = {entry for entry in self._fired if not entry[0].startswith("mark=")}
+
+    def survival_fields(self) -> dict[str, int]:
+        """The per-run survival numbers, read through the class for the same reason progress() is
+        the one write choke point: the ring's state has no references outside this body."""
+        return {
+            "peak_same_touches": self.peak_same_touches,
+            "peak_same_errors": self.peak_same_errors,
+            "looping_targets": self.looping_targets(),
+        }
 
     def looping_targets(self) -> int:
         counts: dict[str, list[bool]] = {}
@@ -2601,6 +2626,20 @@ async def run_agent_tool_loop(
             actions_since_progress=progress.actions_since_progress,
             form_armed=progress.form_armed,
             would_fire=progress.shadow_reported,
+            outcome_status=outcome.status,
+            turns=turns,
+        )
+    else:
+        # The complement: a run that never armed a form. Same terminal join key and the same
+        # outcome/turns tagging as above, so the two read as one population split in two, not as two
+        # unrelated streams. `looping_targets` is the end-state count; the peaks are the run's worst.
+        # Deliberately NOT gated on `progress`: the canonical tracker is built and updated
+        # unconditionally, so this record does not need the ledger to exist. Gating it would drop
+        # BOTH records whenever progress_window is None and silently restore the very hole this
+        # record closes — the partition has to be total for the union to be a denominator.
+        LOG.info(
+            CANONICAL_SURVIVAL_EVENT,
+            **canonical.survival_fields(),
             outcome_status=outcome.status,
             turns=turns,
         )

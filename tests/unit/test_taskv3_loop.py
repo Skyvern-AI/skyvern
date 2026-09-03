@@ -29,6 +29,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
     ACTION_LOOP_REASON_PREFIX,
+    CANONICAL_SURVIVAL_EVENT,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     NAV_DEAD_END_REASON_PREFIX,
@@ -6445,6 +6446,73 @@ async def test_progress_ledger_emits_terminal_survival_record() -> None:
     assert final[0]["outcome_status"] == "completed"
     assert final[0]["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
     assert final[0]["would_fire"] is True
+
+
+@pytest.mark.asyncio
+async def test_non_form_run_emits_its_own_survival_record_keyed_on_canonical_touches() -> None:
+    # The ledger's survival record is gated on ever_armed, so it covers only runs that saw a
+    # validation error. Every search / filter / navigate / extract run — the whole non-form half of
+    # the product — emitted NOTHING, which is why a fire count off that population is a floor and
+    # never a prevalence. This is the complement record, keyed on the canonical tracker's counters
+    # because they are the only progress signal defined without a form.
+    rounds = 6
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [0] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    # One batch against ONE target: touches accumulate inside the turn, so the peak does not depend
+    # on whether a later observe clears the ring.
+    script.append([("click", {"selector": "#stuck"}) for _ in range(4)])
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    survival = [e for e in logs if e.get("event") == CANONICAL_SURVIVAL_EVENT]
+    assert len(survival) == 1, survival
+    assert survival[0]["outcome_status"] == "completed"
+    # Load-bearing: the record has to carry the same-target churn, or it is an empty denominator.
+    assert survival[0]["peak_same_touches"] >= 4, survival[0]
+    # The two records partition the population — a non-form run must not also emit the form one, or
+    # the union double-counts and the denominator is wrong in the other direction.
+    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_a_run_still_gets_exactly_one_survival_record_with_the_ledger_disabled() -> None:
+    # The partition must be TOTAL, not conditional on an unrelated flag. The canonical tracker is
+    # built and updated unconditionally, so its record does not depend on the ledger existing —
+    # gating it on `progress` would drop BOTH records whenever progress_window is None and silently
+    # restore the "floor, not prevalence" hole this record exists to close.
+    rounds = 4
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500, progress_window=None)
+
+    assert outcome.status == "completed"
+    records = [e for e in logs if e.get("event") in (PROGRESS_LEDGER_FINAL_EVENT, CANONICAL_SURVIVAL_EVENT)]
+    assert len(records) == 1, records
+    assert records[0]["event"] == CANONICAL_SURVIVAL_EVENT
+
+
+@pytest.mark.asyncio
+async def test_form_run_still_emits_only_the_ledger_record_and_not_the_non_form_one() -> None:
+    # The other half of the partition, and the compatibility guarantee: the existing record's
+    # population and shape are untouched, so the survival data already collected stays comparable
+    # with everything collected after this change.
+    rounds = 10
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
+    script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    assert len([e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]) == 1
+    assert not [e for e in logs if e.get("event") == CANONICAL_SURVIVAL_EVENT]
 
 
 @pytest.mark.asyncio
