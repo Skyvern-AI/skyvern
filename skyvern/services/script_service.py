@@ -1700,7 +1700,12 @@ async def _fallback_to_ai_run(
                         organization_id=organization_id,
                     )
                     ai_actions = [a for a in all_actions if a.step_id != script_step_id]
-                    agent_action_count = len(ai_actions)
+                    # Decision rows are verdicts, not agent interactions -- exclude them so a
+                    # click-free run still reads as zero agent actions here.
+                    countable_actions = [
+                        a for a in ai_actions if a.action_type not in (ActionType.COMPLETE, ActionType.TERMINATE)
+                    ]
+                    agent_action_count = len(countable_actions)
                     action_summaries = build_action_summaries_with_timing(ai_actions)
                 except Exception:
                     LOG.debug("Could not fetch actions for fallback episode", exc_info=True)

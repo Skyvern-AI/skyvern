@@ -6967,7 +6967,11 @@ class WorkflowService:
                             task_id=wrb.task_id,
                             organization_id=organization_id,
                         )
-                        agent_action_count = len(actions)
+                        # Decision rows are verdicts, not agent interactions.
+                        countable_actions = [
+                            a for a in actions if a.action_type not in (ActionType.COMPLETE, ActionType.TERMINATE)
+                        ]
+                        agent_action_count = len(countable_actions)
                         action_summaries = build_action_summaries_with_timing(actions)
                 except Exception:
                     LOG.debug(

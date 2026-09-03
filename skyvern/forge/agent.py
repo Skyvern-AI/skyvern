@@ -420,6 +420,14 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
         turn_reasoning = fields.pop("reasoning", None)
         reload_reason = str(args.get("reason") or "") or (turn_reasoning or "")
         return ReloadPageAction(reasoning=reload_reason, **fields)
+    if tool_name == "finish":
+        # The finish verdict is v1's complete/terminate decision: its own stated reason outranks the
+        # turn prose (same pop pattern as reload_page).
+        turn_reasoning = fields.pop("reasoning", None)
+        finish_reason = str(args.get("reason") or "") or (turn_reasoning or "")
+        if str(args.get("status") or "") == "completed":
+            return CompleteAction(reasoning=finish_reason, **fields)
+        return TerminateAction(reasoning=finish_reason, **fields)
     return Action(action_type=_TASKV3_TOOL_ACTION_TYPES.get(tool_name, ActionType.CLICK), **fields)
 
 
@@ -2100,6 +2108,60 @@ class ForgeAgent:
         )
         if missing_extraction:
             task_status = TaskStatus.failed
+        # Persist the terminal decision as the run's last action row — v1's step engine always writes
+        # its complete/terminate decision, and this row is the only step detail a click-free
+        # validation/extraction block has to show. Written HERE, after the verdict is
+        # final: a completion the gate or the extraction check rejects records as the FAILED attempt
+        # it was, and a finish the loop rejected mid-run never persists at all.
+        if outcome.status in ("completed", "terminated", "failed"):
+            with contained_effect("task_v3 terminal decision persist", task_id=task.task_id):
+                decision_reason = outcome.reason or ""
+                decision_action_status = ActionStatus.completed
+                if outcome.status == "completed" and (completion_vetoed or missing_extraction):
+                    decision_action_status = ActionStatus.failed
+                    rejection = (
+                        "the completion gate rejected the verdict"
+                        if completion_vetoed
+                        else "completed with no extracted output for a data-extraction goal"
+                    )
+                    decision_reason = f"{decision_reason} — {rejection}" if decision_reason else rejection
+                decision_secrets = (
+                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+                )
+                if decision_secrets:
+                    decision_reason = redact_secrets_from_text(decision_reason, decision_secrets)
+                decision_reason = decision_reason[:_TASKV3_REASONING_MAX_CHARS]
+                decision_screenshot_id: str | None = None
+                if not page_free_validation:
+                    try:
+                        decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+                        decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "task_v3 failed to capture decision screenshot", task_id=task.task_id, exc_info=True
+                        )
+                decision_action = _taskv3_action_for_tool_call(
+                    "finish",
+                    {"status": outcome.status, "reason": decision_reason},
+                    status=decision_action_status,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    # The decision rides on the LAST consumed billable index (or the single Step's own
+                    # order 0): a fresh index would read as a new distinct (task, step_order) pair to
+                    # the workflow-run step budget, the way v1's complete shares its final step.
+                    step_order=max(v3_round_index - 1, 0),
+                    action_order=len(v3_persisted_actions),
+                    description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}finish {outcome.status}",
+                    screenshot_artifact_id=decision_screenshot_id,
+                )
+                v3_persisted_actions.append(decision_action)
+                await app.DATABASE.workflow_params.create_action(action=decision_action)
         completed = task_status == TaskStatus.completed
         if task_status == TaskStatus.canceled:
             step_status = StepStatus.canceled
