@@ -1623,9 +1623,10 @@ class SkyvernFrame:
                         # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
                         await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
                 except asyncio.TimeoutError as error:
-                    LOG.exception(
+                    LOG.warning(
                         "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
                         expression=expression,
+                        exc_info=True,
                     )
                     raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
                 except Exception as inject_err:
@@ -1657,7 +1658,9 @@ class SkyvernFrame:
                 skyvern_context.record_browser_success()
                 return result
             except asyncio.TimeoutError as error:
-                LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
+                LOG.warning(
+                    "Skyvern timed out on retry after JS context re-injection", expression=expression, exc_info=True
+                )
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
             except Exception as retry_err:
                 if not (isinstance(retry_err, RuntimeError) or _is_engine_error(retry_err, engine_selection)):
