@@ -16077,6 +16077,989 @@ async def test_select_combobox_commits_non_virtualized_button_listbox_control() 
         assert value == "Germany", value
 
 
+# --- Duplicate-rendered suggestion rows (SKY-15388). A common a11y/portal pattern paints the SAME
+# candidate as two separate DOM rows -- identical text, no value or (in the b1 fixture) an opaque
+# per-render id that differs -- and today's exact-match tier refuses because it counts DOM rows, not
+# distinct candidate values. `inert=True` rows record which one was clicked but never commit, isolating
+# "the collapse picked a row" from "the click actually landed and verified".
+
+
+def _duplicate_suggestion_html(
+    rows: list[tuple[str, str | None]],
+    *,
+    inert: bool = False,
+    labels: list[str | None] | None = None,
+    attrs: list[dict[str, str]] | None = None,
+) -> str:
+    labels = labels or [None] * len(rows)
+    attrs = attrs or [{} for _ in rows]
+    rows_json = json.dumps(
+        [{"text": t, "value": v, "label": lbl, "attrs": a} for (t, v), lbl, a in zip(rows, labels, attrs)]
+    )
+    return f"""
+<!doctype html><html><body style="margin:0">
+  <input id="addr" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="addr-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    window.__clicked_row_index = null;
+    var ROWS = {rows_json};
+    var INERT = {"true" if inert else "false"};
+    var input = document.getElementById('addr');
+    var list = document.getElementById('addr-list');
+    input.addEventListener('input', function () {{
+      list.innerHTML = '';
+      if (!input.value.trim()) return;
+      ROWS.forEach(function (r, i) {{
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.cssText = 'display:block;width:100%;height:24px';
+        row.textContent = r.text;
+        if (r.value !== null) row.setAttribute('data-value', r.value);
+        if (r.label) row.setAttribute('aria-label', r.label);
+        Object.keys(r.attrs || {{}}).forEach(function (k) {{ row.setAttribute(k, r.attrs[k]); }});
+        row.addEventListener('click', function () {{
+          window.__clicked_row_index = i;
+          // INERT mirrors a genuinely dead row: the click lands (the handler fires, the index is
+          // recorded) but nothing else happens -- the list stays open and the field is untouched, so
+          // the click leaves no reaction a commit-verifier could mistake for a real commit.
+          if (!INERT) {{
+            input.value = r.text;
+            input.setAttribute('data-committed', r.text);
+            list.innerHTML = '';
+          }}
+        }});
+        list.appendChild(row);
+      }});
+    }});
+  </script>
+</body></html>
+"""
+
+
+_DUPLICATE_STREET_ROWS: list[tuple[str, str | None]] = [
+    ("123 Maple Court", None),
+    ("123 Maple Court", None),
+]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_suggestion_rendered_twice() -> None:
+    # RED-first (SKY-15388): the widget paints the one real suggestion as two identical rows (an a11y
+    # duplicate, or a portal+inline copy) -- today's exact tier sees ">=2 rows" and refuses with "matches
+    # several rows", even though there is only one candidate value to pick. The fix collapses identical
+    # duplicates to their FIRST rendered instance and commits through it.
+    async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "ok", r.content
+        assert "matches several rows" not in r.content, r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "123 Maple Court", value
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        assert clicked_index == 0, clicked_index
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_duplicate_rows_still_verifies_commit() -> None:
+    # RED today for the wrong reason (refuses with "matches several rows" before any click is attempted).
+    # After the fix, the collapse picks the first duplicate and clicks it -- but this fixture's rows are
+    # INERT, so the click lands and nothing commits. The accept path must not have bypassed
+    # commit-verification: the tool has to report the did-not-commit failure, not a false "ok".
+    async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS, inert=True)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert "matches several rows" not in r.content, r.content
+        assert "did not commit" in r.content.lower(), r.content
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        assert clicked_index == 0, clicked_index
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_commits_suggestion_rendered_twice() -> None:
+    # RED-first (SKY-15388): the type()->select_combobox redirect must gain the same collapse -- typing
+    # the duplicated row's exact text should commit through the redirect, not refuse.
+    async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#addr", "text": "123 Maple Court"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "123 Maple Court", value
+
+
+_DISTINCT_VALUE_SAME_TEXT_ROWS: list[tuple[str, str | None]] = [
+    ("123 Maple Court", "+9001"),
+    ("123 Maple Court", "+9002"),
+]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_identical_text_rows_with_distinct_values() -> None:
+    # Two rows render the SAME text but carry different values -- text can never disambiguate them, so
+    # this must still refuse (unlike the pure-duplicate case above). The refusal has to name both live
+    # [data-tv3-sugg="N"] selectors and both distinguishing values, and -- because retyping the identical
+    # text could never pick a different row than before -- the query is left typed and the tags stay live
+    # so the caller can click the intended row directly.
+    async with _content_page(_duplicate_suggestion_html(_DISTINCT_VALUE_SAME_TEXT_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-sugg="1"' in r.content, r.content
+        assert 'data-tv3-sugg="2"' in r.content, r.content
+        assert "+9001" in r.content, r.content
+        assert "+9002" in r.content, r.content
+        tagged = await page.query_selector_all("[data-tv3-sugg]")
+        assert len(tagged) >= 2, len(tagged)
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "123 Maple Court", value
+
+
+def _button_listbox_html(
+    rows: list[tuple[str, str | None]],
+    *,
+    anchor_id: str = "cc",
+    labels: list[str | None] | None = None,
+    labelledby: list[str | None] | None = None,
+    wrap_in_span: bool = False,
+    span_label: str | None = None,
+    extra_attrs: list[dict[str, str]] | None = None,
+) -> str:
+    labels = labels or [None] * len(rows)
+    extra_attrs = extra_attrs or [{} for _ in rows]
+    # `labelledby[i]` is the TEXT of a hidden div this row's aria-labelledby points at (not an id) --
+    # the id is minted from the row's own position so each row gets a distinct label target.
+    labelledby = labelledby or [None] * len(rows)
+    hidden_html = "".join(
+        f'<div id="{anchor_id}-lb-{i}" style="display:none">{text}</div>' for i, text in enumerate(labelledby) if text
+    )
+
+    def _row_html(i: int, text: str, value: str | None, label: str | None, lb: str | None) -> str:
+        attrs = f" data-value={value!r}" if value is not None else ""
+        if label:
+            attrs += f" aria-label={label!r}"
+        if lb:
+            attrs += f' aria-labelledby="{anchor_id}-lb-{i}"'
+        for k, v in extra_attrs[i].items():
+            attrs += f" {k}={v!r}"
+        span_attr = f" aria-label={span_label!r}" if span_label else ""
+        inner = f'<span style="cursor:pointer"{span_attr}>{text}</span>' if wrap_in_span else text
+        return f'<li role="option"{attrs}>{inner}</li>'
+
+    li_html = "".join(
+        _row_html(i, text, value, label, lb)
+        for i, ((text, value), label, lb) in enumerate(zip(rows, labels, labelledby))
+    )
+    return f"""
+<div id="{anchor_id}-wrap">
+  <button id="{anchor_id}" type="button" aria-haspopup="listbox" aria-expanded="false"
+          aria-label="Select option" style="width:220px;height:32px">Select</button>
+  <ul id="{anchor_id}-menu" role="listbox" style="position:absolute;left:0;top:36px;width:280px;
+      display:none;background:#fff;list-style:none;margin:0;padding:0">
+    {li_html}
+  </ul>
+  <input id="{anchor_id}-value" type="hidden" name="{anchor_id}" value="">
+  {hidden_html}
+</div>
+<script>
+(function () {{
+  var btn = document.getElementById('{anchor_id}');
+  var menu = document.getElementById('{anchor_id}-menu');
+  var valueInput = document.getElementById('{anchor_id}-value');
+  btn.addEventListener('click', function () {{
+    var open = btn.getAttribute('aria-expanded') === 'true';
+    btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+    menu.style.display = open ? 'none' : 'block';
+  }});
+  menu.addEventListener('click', function (e) {{
+    var row = e.target.closest('[role="option"]');
+    if (!row) return;
+    var text = row.textContent;
+    btn.setAttribute('aria-label', 'Select option: ' + text);
+    if (valueInput) valueInput.value = row.getAttribute('data-value') || text;
+    btn.setAttribute('aria-expanded', 'false');
+    menu.style.display = 'none';
+  }});
+}})();
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_still_refuses_distinct_text_multimatch() -> None:
+    # Path B (click-to-open, non-typeable button anchor, non-virtualized menu). "12 Oak St" is a shared
+    # leading-word prefix of two rows naming two different, genuinely distinct addresses -- this must
+    # keep refusing, and the refusal must name the live [data-tv3-menu="N"] selectors.
+    rows: list[tuple[str, str | None]] = [
+        ("12 Oak St, Springtown", None),
+        ("12 Oak St, Rivertown", None),
+    ]
+    async with _content_page(_button_listbox_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "12 Oak St"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-menu="1"' in r.content, r.content
+        assert 'data-tv3-menu="2"' in r.content, r.content
+        assert "Springtown" in r.content and "Rivertown" in r.content, r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_decorated_rows() -> None:
+    # RED-first (SKY-15388): Path B's forward-token-prefix tier, composed with the collapse. "United
+    # Kingdom" prefix-matches two IDENTICAL "United Kingdom (+44)" rows (a duplicate-rendered decorated
+    # option, same as #16436's single-row case but rendered twice) -- today len(prefixed) == 2 refuses;
+    # the fix collapses the two identical rows to their first instance and commits.
+    rows: list[tuple[str, str | None]] = [
+        ("United Kingdom (+44)", None),
+        ("United Kingdom (+44)", None),
+    ]
+    async with _content_page(_button_listbox_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United Kingdom"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "United Kingdom (+44)", value
+
+
+# --- Round 2 (SKY-15388): text agreement is the load-bearing collapse check; a present label or val is
+# a VETO surface, not a substitute for it -- two rows sharing a generic label but naming genuinely
+# different addresses must never collapse just because the label matches.
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_refuses_distinct_text_rows_sharing_generic_label() -> None:
+    # RED-first (round 2): before the fix, the collapse's identity key preferred the aria-label over the
+    # row's own text, so two rows naming two different streets but sharing one generic "Address
+    # suggestion" label collapsed to a single (wrong) candidate and committed the first one. Text
+    # agreement must be the load-bearing check -- a shared label can never stand in for it.
+    rows: list[tuple[str, str | None]] = [
+        ("12 Oak St, Springtown", None),
+        ("12 Oak St, Rivertown", None),
+    ]
+    async with _content_page(_button_listbox_html(rows, labels=["Address suggestion", "Address suggestion"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "12 Oak St"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+_SAME_TEXT_DISTINCT_LABEL_ROWS: list[tuple[str, str | None]] = [
+    ("Foo", None),
+    ("Foo", None),
+]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_same_text_rows_with_distinct_labels() -> None:
+    # Pins the label-veto: identical text, no vals, but distinct aria-labels -- the rows are still
+    # genuinely distinct candidates and must keep refusing, exactly as before round 2's text-first
+    # rewrite (this scenario already refused, for the label-priority reason; the rewrite must not
+    # accidentally start collapsing it).
+    async with _content_page(
+        _duplicate_suggestion_html(_SAME_TEXT_DISTINCT_LABEL_ROWS, labels=["Foo (+1)", "Foo (+2)"])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-sugg="1"' in r.content, r.content
+        assert 'data-tv3-sugg="2"' in r.content, r.content
+        # The veto came from the labels, so the labels are what the refusal must surface -- an
+        # annotation showing two identical (empty) values would leave nothing to choose by.
+        assert "label 'Foo (+1)'" in r.content, r.content
+        assert "label 'Foo (+2)'" in r.content, r.content
+        tagged = await page.query_selector_all("[data-tv3-sugg]")
+        assert len(tagged) >= 2, len(tagged)
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Foo", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_where_one_data_value_is_explicitly_empty() -> None:
+    # An attribute that EXISTS is a present value even when empty: data-value="" next to data-value="x"
+    # is a real disagreement, the same rule the OPTION branch applies to value="". Collapsing here
+    # silently commits the blank-value row -- a false success.
+    rows: list[tuple[str, str | None]] = [("Foo", ""), ("Foo", "x")]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "error", r.content
+        assert "value ''" in r.content, r.content
+        assert "value 'x'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_with_case_distinct_values() -> None:
+    # Vals are machine identifiers: "ID-A" vs "id-a" must stay two candidates, never case-folded into
+    # agreement the way display text is.
+    rows: list[tuple[str, str | None]] = [("Foo", "ID-A"), ("Foo", "id-a")]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "error", r.content
+        assert "'ID-A'" in r.content, r.content
+        assert "'id-a'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_apostrophe_folded_suggestion_rendered_twice() -> None:
+    # The exact tier folds apostrophes ("Masters" IS "Master's"), so the collapse's row filter must use
+    # the tier's own key: a duplicated "Master's Degree" queried without the apostrophe is still one
+    # candidate rendered twice, not an unmatchable ambiguity.
+    rows: list[tuple[str, str | None]] = [("Master's Degree", None), ("Master's Degree", None)]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Masters Degree"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Master's Degree", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_commits_apostrophe_folded_duplicate_rows() -> None:
+    # Same apostrophe-fold rule on the click-to-open menu path's exact-tier collapse.
+    rows: list[tuple[str, str | None]] = [
+        ("Master's Degree", None),
+        ("Master's Degree", None),
+        ("Doctorate", None),
+    ]
+    async with _content_page(_button_listbox_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Masters Degree"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "Master's Degree", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_identical_text_refusal_restores_a_field_that_held_a_value() -> None:
+    # The leave-the-query-typed escape is only for a field that held nothing: a field with a real prior
+    # value must get it back on refusal, or the leftover query becomes the next call's restore baseline
+    # and the true value is unrecoverable for the rest of the run.
+    async with _content_page(_duplicate_suggestion_html(_DISTINCT_VALUE_SAME_TEXT_ROWS)) as page:
+        await page.eval_on_selector("#addr", "el => el.value = 'Original Entry'")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert "+9001" in r.content, r.content
+        assert "+9002" in r.content, r.content
+        # The restore may have closed the list, so this refusal must not name row selectors it can no
+        # longer promise are live.
+        assert "data-tv3-sugg" not in r.content, r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Original Entry", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refusal_names_labels_when_vals_agree_and_labels_disagree() -> None:
+    # The veto can come from the labels while the vals agree: the refusal must then surface the labels,
+    # or both rows print identical annotations with nothing to choose by.
+    rows: list[tuple[str, str | None]] = [("Foo", "X"), ("Foo", "X")]
+    async with _content_page(_duplicate_suggestion_html(rows, labels=["Alpha branch", "Beta branch"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "error", r.content
+        assert "Alpha branch" in r.content, r.content
+        assert "Beta branch" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_refusal_names_labels_for_duplicate_text_rows() -> None:
+    # The click-open menu's fall-through listing must surface labels too: two same-text rows whose only
+    # distinction is their aria-labels would otherwise print byte-identically beside live selectors.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_button_listbox_html(rows, labels=["Branch A", "Branch B"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert "Branch A" in r.content, r.content
+        assert "Branch B" in r.content, r.content
+        assert 'data-tv3-menu="1"' in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_distinguished_only_by_another_value_surface() -> None:
+    # The commit verifier accepts surfaces beyond value/data-value as a row's committed value
+    # (data-code, data-key, ...). Rows only such a surface tells apart are distinct candidates; the
+    # collapse must not merge them into a silent first-row commit.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "AA"}, {"data-code": "BB"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_rows_sharing_another_value_surface() -> None:
+    # The other direction: duplicates whose extra value surface AGREES are still one candidate.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "AA"}, {"data-code": "AA"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_stale_suggestion_marker_fails_fast_with_reobserve_error() -> None:
+    # The refusal advertises [data-tv3-sugg=N] selectors for direct clicks, so click() must treat them
+    # as owned markers: an absent one gets the fast marker error, not a full actionability timeout.
+    async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": '[data-tv3-sugg="7"]'})
+        assert r.status == "error", r.content
+        assert "markers vanish" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_advertised_suggestion_selector_commits_that_row() -> None:
+    # End-to-end escape: after the identical-text refusal leaves the list open, clicking the advertised
+    # selector commits that row.
+    async with _content_page(_duplicate_suggestion_html(_DISTINCT_VALUE_SAME_TEXT_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-sugg="1"' in r.content, r.content
+        r2 = await _tool(tools, "click").handler({"selector": '[data-tv3-sugg="1"]'})
+        assert r2.status == "ok", r2.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "123 Maple Court", value
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        assert clicked_index == 0, clicked_index
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_identical_text_rows_with_distinct_values() -> None:
+    # The type() redirect shares the selector-escape refusal: same live-tag naming, same values.
+    async with _content_page(_duplicate_suggestion_html(_DISTINCT_VALUE_SAME_TEXT_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#addr", "text": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-sugg="1"' in r.content, r.content
+        assert "+9001" in r.content, r.content
+        assert "+9002" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refusal_shows_each_rows_text_when_fold_equal_rows_differ() -> None:
+    # Two DISTINCT options whose texts differ only by an apostrophe are both "the requested text" to the
+    # fold-insensitive exact tier, so text can never disambiguate them and the selector-escape refusal
+    # fires -- but its listing must show each row's real rendered text, not claim they are identical
+    # with nothing to choose by.
+    rows: list[tuple[str, str | None]] = [("Master's Degree", None), ("Masters Degree", None)]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Masters Degree"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-sugg="1"' in r.content, r.content
+        assert 'data-tv3-sugg="2"' in r.content, r.content
+        assert "Master's Degree" in r.content, r.content
+        assert "Masters Degree" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_commits_stem_matched_duplicate_rows() -> None:
+    # The stem tier commits "Degrees" against a lone "Degree" row; the same value against that row
+    # rendered twice is still one candidate, so the collapse must cover the stem tier too.
+    rows: list[tuple[str, str | None]] = [("Degree", None), ("Degree", None), ("Diploma", None)]
+    async with _content_page(_button_listbox_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Degrees"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "Degree", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_distinguished_by_numeric_codes() -> None:
+    # The verifier's declaredValues drops all-digit values on purpose; the collapse's own veto read
+    # must not, or "101" vs "202" rows merge and the first commits silently.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "101"}, {"data-code": "202"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert "'101'" in r.content, r.content
+        assert "'202'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_rows_sharing_a_numeric_code() -> None:
+    # The accept direction under the unfiltered read: agreeing numeric codes are still one candidate.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "101"}, {"data-code": "101"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_when_shared_leaf_label_masks_distinct_ancestor_names() -> None:
+    # A clickable leaf carrying the same action label on every row ("Choose") must not mask option
+    # ancestors whose accessible names disagree: each name surface vetoes independently.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(rows, labels=["Branch A", "Branch B"], wrap_in_span=True, span_label="Choose")
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_rows_with_whitespace_drifted_code() -> None:
+    # Whitespace drift between a portal copy and an inline copy is the duplicate-render shape itself:
+    # the veto compares trimmed values, so "A1 " vs "A1" still collapse.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "A1 "}, {"data-code": "A1"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_wrapped_rows_with_explicit_empty_vs_set_ancestor_value() -> None:
+    # A wrapped ancestor's explicit data-value="" next to its twin's data-value="x" is a real
+    # disagreement; dropping the empty as absence collapsed them and committed the first.
+    rows: list[tuple[str, str | None]] = [("Depot", ""), ("Depot", "x")]
+    async with _content_page(_button_listbox_html(rows, wrap_in_span=True)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_labels_diverging_past_two_hundred_chars() -> None:
+    # Names are full veto inputs: a slice at the read site would make labels sharing a long prefix
+    # read as equal and collapse distinct rows.
+    prefix = "Branch office of the northern district regional cooperative " * 4
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_duplicate_suggestion_html(rows, labels=[prefix + "ALPHA", prefix + "BETA"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_identical_text_refusal_prints_each_distinguishing_value_once() -> None:
+    # `vals` restates value/data-value; the refusal must not print one value twice per row.
+    async with _content_page(_duplicate_suggestion_html(_DISTINCT_VALUE_SAME_TEXT_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "123 Maple Court"})
+        assert r.status == "error", r.content
+        assert r.content.count("'+9001'") == 1, r.content
+        assert r.content.count("'+9002'") == 1, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_when_generic_aria_label_hides_distinct_labelledby_names() -> None:
+    # aria-labelledby outranks aria-label in accessible-name computation: a generic aria-label shared
+    # by both rows must not mask labelledby targets that name them apart.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(rows, labels=["Choose", "Choose"], labelledby=["Branch A", "Branch B"])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_distinguished_by_long_values() -> None:
+    # Long values are fingerprinted, never dropped: two 600-char codes differing in prefix must veto.
+    long_a = "A" * 600
+    long_b = "B" * 600
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": long_a}, {"data-code": long_b}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_rows_where_the_copy_mirrors_a_subset() -> None:
+    # The a11y copy often mirrors only a subset of the primary row's attributes: nested value sets
+    # carry no disagreement and collapse.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "55", "title": "New York Office"}, {"data-code": "55"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_when_neither_value_set_contains_the_other() -> None:
+    # Non-nested sets carry a genuine disagreement even when they overlap.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "55", "title": "New York Office"}, {"data-code": "66"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_with_crossed_values_across_surfaces() -> None:
+    # Values are keyed by their attribute: data-code="A" data-key="B" beside data-code="B"
+    # data-key="A" is a disagreement an unkeyed set reads as equal.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(
+            rows, attrs=[{"data-code": "A", "data-key": "B"}, {"data-code": "B", "data-key": "A"}]
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+def _grid_suggestion_html(rows: list[tuple[str, str | None]]) -> str:
+    # The ARIA grid-combobox pattern: the tagged leaf is the gridcell, and the candidate's identity
+    # (data-code here) lives on its [role=row] ancestor.
+    rows_json = json.dumps([{"text": t, "code": c} for t, c in rows])
+    return f"""
+<!doctype html><html><body style="margin:0">
+  <input id="addr" type="text" role="combobox" aria-autocomplete="list" aria-haspopup="grid"
+         aria-controls="addr-grid" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="addr-grid" role="grid" style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    var ROWS = {rows_json};
+    var input = document.getElementById('addr');
+    var grid = document.getElementById('addr-grid');
+    input.addEventListener('input', function () {{
+      grid.innerHTML = '';
+      if (!input.value.trim()) return;
+      ROWS.forEach(function (r) {{
+        var row = document.createElement('div');
+        row.setAttribute('role', 'row');
+        if (r.code !== null) row.setAttribute('data-code', r.code);
+        var cell = document.createElement('div');
+        cell.setAttribute('role', 'gridcell');
+        cell.style.cssText = 'display:block;width:100%;height:24px;cursor:pointer';
+        cell.textContent = r.text;
+        cell.addEventListener('click', function () {{
+          input.value = r.text;
+          input.setAttribute('data-committed', r.text);
+          grid.innerHTML = '';
+        }});
+        row.appendChild(cell);
+        grid.appendChild(row);
+      }});
+    }});
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_grid_rows_distinguished_on_the_row_ancestor() -> None:
+    # Grid comboboxes store identity on the [role=row] ancestor of the tagged gridcell: distinct
+    # row-level data-codes must veto the collapse.
+    rows: list[tuple[str, str | None]] = [("Depot", "101"), ("Depot", "202")]
+    async with _content_page(_grid_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_grid_duplicate_rows_sharing_the_row_code() -> None:
+    # The accept direction: duplicate-rendered grid rows sharing one row-level code still collapse.
+    rows: list[tuple[str, str | None]] = [("Depot", "101"), ("Depot", "101")]
+    async with _content_page(_grid_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+
+
+def _duplicate_suggestion_option_html(rows: list[tuple[str, str | None]]) -> str:
+    # OPTION-element rows -- the row-declaration gate matches the literal `[role="option"]` attribute
+    # (not the accessibility tree's implicit role), so each <option> carries it explicitly -- inside a
+    # role="listbox" popup, wired the same way as `_duplicate_suggestion_html`. `value=None` omits the
+    # value attribute entirely (the DOM `.value` IDL then falls back to the option's own text);
+    # `value=""` sets an explicit empty attribute -- the two are genuinely distinct submission values
+    # even though both display as the same text.
+    rows_html = "".join(
+        f'<option role="option"{f" value={value!r}" if value is not None else ""}>{text}</option>'
+        for text, value in rows
+    )
+    return f"""
+<!doctype html><html><body style="margin:0">
+  <input id="addr" type="text" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="addr-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    window.__clicked_row_index = null;
+    var TEMPLATE = {json.dumps(rows_html)};
+    var input = document.getElementById('addr');
+    var list = document.getElementById('addr-list');
+    input.addEventListener('input', function () {{
+      list.innerHTML = input.value.trim() ? TEMPLATE : '';
+      Array.from(list.children).forEach(function (opt, i) {{
+        opt.style.cssText = 'display:block;width:100%;height:24px';
+        opt.addEventListener('click', function () {{
+          window.__clicked_row_index = i;
+          input.value = opt.value;
+          input.setAttribute('data-committed', opt.value);
+          list.innerHTML = '';
+        }});
+      }});
+    }});
+  </script>
+</body></html>
+"""
+
+
+_OPTION_DISTINCT_VALUE_ROWS: list[tuple[str, str | None]] = [
+    ("Foo", ""),
+    ("Foo", None),
+]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_option_rows_with_distinct_submission_values() -> None:
+    # Pins F2: an explicit `value=""` and an absent value attribute (falls back to the option's text,
+    # "Foo") are distinct submission values, so this must refuse even though both rows display "Foo".
+    async with _content_page(_duplicate_suggestion_option_html(_OPTION_DISTINCT_VALUE_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Foo", value
+
+
+_OPTION_DUPLICATE_ROWS: list[tuple[str, str | None]] = [
+    ("Foo", None),
+    ("Foo", None),
+]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_option_rows_rendered_twice() -> None:
+    # Pins F2's other direction: two bare <option>Foo</option> rows with no value attribute at all both
+    # fall back to the same submission value ("Foo"), so they ARE duplicates and must collapse and commit.
+    async with _content_page(_duplicate_suggestion_option_html(_OPTION_DUPLICATE_ROWS)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Foo", value
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        assert clicked_index == 0, clicked_index
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_refusal_names_values_for_identical_text_rows() -> None:
+    # Pins F3: Path B rows with identical text but distinct data-values -- F1 refuses (present vals
+    # disagree, so no collapse), and the fall-through listing must surface each row's value so the
+    # refusal names a convertible distinction, not just the repeated text twice.
+    rows: list[tuple[str, str | None]] = [
+        ("Depot", "A"),
+        ("Depot", "B"),
+    ]
+    async with _content_page(_button_listbox_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert 'data-tv3-menu="1"' in r.content, r.content
+        assert 'data-tv3-menu="2"' in r.content, r.content
+        assert "'A'" in r.content, r.content
+        assert "'B'" in r.content, r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+# --- Round 11 (SKY-15388): winton CHANGES_REQUESTED + codex round 2 + andrew nit.
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_refuses_wrapped_duplicate_text_rows_with_distinct_labels() -> None:
+    # RED-first (round 11, winton F1 BLOCKER): the MENU tagger tags the innermost CLICKABLE leaf, not
+    # the option ancestor -- a row that wraps its text in its own clickable <span> gets that span tagged,
+    # so reading aria-label off the tagged node alone returns null for both rows, the label veto goes
+    # inert, and two genuinely distinct branches collapse to the first and commit (a regression vs main,
+    # which refused).
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_button_listbox_html(rows, labels=["Branch A", "Branch B"], wrap_in_span=True)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_commits_wrapped_duplicate_rows_sharing_outer_label() -> None:
+    # The fix must not over-veto: wrapped rows sharing the SAME outer aria-label still collapse to one
+    # candidate and commit, exactly as an unwrapped duplicate would.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_button_listbox_html(rows, labels=["Branch A", "Branch A"], wrap_in_span=True)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_click_menu_refuses_duplicate_text_rows_distinguished_by_labelledby() -> None:
+    # RED-first (round 11, F1): no aria-label on either row, but each declares aria-labelledby pointing
+    # at its own hidden text -- the accessible-name read must resolve labelledby too, not just aria-label,
+    # or the veto never sees these rows disagree.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_button_listbox_html(rows, labelledby=["Branch A", "Branch B"])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refusal_truncates_a_long_page_controlled_value() -> None:
+    # RED-first (round 11, F2): a page-controlled data-value has no length bound today, so a 500-char
+    # value would blow the refusal message up wholesale. The distinguisher must truncate to 60 chars,
+    # the same bound the row text already carries.
+    rows: list[tuple[str, str | None]] = [("Depot", "A" * 500), ("Depot", "B" * 500)]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert repr("A" * 60) in r.content, r.content
+        assert "A" * 500 not in r.content, r.content
+        assert "B" * 500 not in r.content, r.content
+        assert len(r.content) < 4000, len(r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_identical_text_refusal_carries_the_overflow_note() -> None:
+    # RED-first (round 11, F3): an overflowed declared list correctly skips the duplicate collapse (only
+    # 2 of the declared 40 rows are rendered), so this must still refuse over the fold-equal rendered
+    # rows -- but the refusal must also carry pick.note, so the model learns the intended row may be
+    # unrendered instead of retyping the same identical-looking text forever.
+    rows: list[tuple[str, str | None]] = [("Depot", "V1"), ("Depot", "V2")]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"aria-setsize": "40"}, {"aria-setsize": "40"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#addr", "text": "Depot"})
+        assert r.status == "error", r.content
+        assert "are rendered" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refusal_names_codes_for_rows_distinguished_only_by_another_value_surface() -> None:
+    # RED-first (round 11, F4): rows distinguished only by a value surface beyond val/label (data-code)
+    # must refuse AND name the distinguishing codes -- otherwise the refusal shows two identical entries
+    # with nothing to choose by.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(rows, attrs=[{"data-code": "AA"}, {"data-code": "BB"}])
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert "'AA'" in r.content, r.content
+        assert "'BB'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_first_row_when_one_twin_carries_no_value() -> None:
+    # Pins the asymmetric-presence decision (round 11, winton): a row carrying data-value and its twin
+    # carrying none still collapse -- absence never vetoes. Load-bearing for the a11y-copy class, where
+    # the real row carries the value and its visual copy carries none.
+    rows: list[tuple[str, str | None]] = [("Depot", "x"), ("Depot", None)]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+        clicked_index = await page.evaluate("() => window.__clicked_row_index")
+        assert clicked_index == 0, clicked_index
+
+
 # --- A cascading-address lookup. Three role="combobox" fields (#state, #city, #postal) each own a
 # role="grid" popup of role="row" > role="gridcell" rows -- the ARIA 1.2 grid-combobox pattern, not the
 # role="listbox"/role="option" shape every other fixture in this file uses -- and each row wraps the
