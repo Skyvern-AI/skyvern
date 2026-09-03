@@ -9,7 +9,11 @@ from urllib.parse import urlsplit
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import PERMANENT_NAV_ERRORS, SKIP_INNER_NAV_RETRY_ERRORS
+from skyvern.constants import (
+    EGRESS_ATTRIBUTABLE_NAV_ERRORS,
+    PERMANENT_NAV_ERRORS,
+    SKIP_INNER_NAV_RETRY_ERRORS,
+)
 from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
 from skyvern.utils.url_validators import canonical_navigation_host, is_blocked_host
 
@@ -116,6 +120,10 @@ def is_skip_inner_retry_error(error_message: str) -> bool:
 
 def is_permanent_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in PERMANENT_NAV_ERRORS)
+
+
+def is_egress_attributable_navigation_error(error_message: str) -> bool:
+    return any(pattern in error_message for pattern in EGRESS_ATTRIBUTABLE_NAV_ERRORS)
 
 
 def redact_url_secrets(url: str) -> str:

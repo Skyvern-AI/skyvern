@@ -188,6 +188,7 @@ async def load_custom_llm_configs_for_organization(database: AgentDB, organizati
             LOG.warning(
                 "Skipping invalid custom LLM config",
                 custom_llm_id=token.id,
+                organization_id=token.organization_id,
                 error_type=type(exc).__name__,
             )
             continue
@@ -236,6 +237,7 @@ async def ensure_custom_llm_registered_for_org(
             LOG.warning(
                 "Skipping invalid custom LLM config",
                 custom_llm_id=token.id,
+                organization_id=token.organization_id,
                 error_type=type(exc).__name__,
             )
             return False
@@ -275,6 +277,7 @@ async def load_custom_llm_configs_from_database(database: AgentDB) -> None:
             LOG.warning(
                 "Skipping invalid custom LLM config",
                 custom_llm_id=token.id,
+                organization_id=token.organization_id,
                 error_type=type(exc).__name__,
             )
             continue

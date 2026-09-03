@@ -5038,7 +5038,10 @@ class ActionHandler:
             LOG.exception("LLM error in action handler", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
         except ImaginarySecretValue as e:
-            LOG.exception("Imaginary secret value", action=action, exc_info=True)
+            # The model referenced a secret placeholder that is not in the run's secrets. Handled:
+            # it becomes an ActionFailure below and reaches the run that way. Warning rather than
+            # info because it is secret-adjacent.
+            LOG.warning("Imaginary secret value", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
         except CaptchaSolveError as e:
             LOG.warning(
