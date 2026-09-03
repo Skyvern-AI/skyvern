@@ -96,6 +96,10 @@ class LoopOutcome:
     status: Literal["completed", "failed", "terminated", "budget_exhausted", "loop_error", "canceled"]
     reason: str
     extracted_output: Any = None
+    # The raw budget-cap string (e.g. "max_turns (40) reached") that granted this run its one final
+    # observed turn, carried on whatever outcome the final turn produces — a finish verdict or, if
+    # the model didn't finish, the honest budget_exhausted exit. None for a run that never tripped a cap.
+    cap_trip: str | None = None
     turns: int = 0
     tool_calls: int = 0
     action_steps: int = 0
@@ -215,6 +219,12 @@ ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+
+# Single-shot final-turn grant (budget-exhaustion final turn): the first budget cap trip in a run
+# buys exactly one more unconstrained model turn instead of ending the run immediately, so a model
+# mid-extraction can still call finish with what it has. Facetable — change only with the dashboards
+# that read it.
+FINAL_TURN_GRANTED_EVENT = "taskv3 loop final turn granted"
 
 # Page-state stall policy (SKY-15265): rounds of billable batches that left the page fingerprint
 # byte-identical, with no page-change flag, mean the run is cycling on a frozen document in shapes
@@ -638,6 +648,10 @@ class ActivityRecency:
     # run that reaches the edge and then stops reading that tool altogether leaves this true for the
     # rest of the run, disabling the deferral (same as the argument-blind counter it shipped with).
     perception_stall_imminent: bool = False
+    # True from the moment the loop's granted final turn starts running. A hold asks for a retry
+    # turn that no longer exists — honoring it would silently convert the model's verdict into
+    # budget_exhausted, the exact conversion the hold headroom gates exist to prevent.
+    final_turn_active: bool = False
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -664,6 +678,8 @@ def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | No
     reserves, for the same reason: a token exhaustion and a stall streak one short of its terminator
     each convert the deferral into a verdict the gate did not choose."""
     if activity is not None:
+        if activity.final_turn_active:
+            return False
         if activity.turns_remaining is not None and activity.turns_remaining < FAILURE_EVIDENCE_MIN_TURNS:
             return False
         if (
@@ -837,6 +853,40 @@ def _refresh_nudge_text() -> str:
         "changed: re-observe before acting, and do not re-submit a form until the fresh page shows it "
         "was not already submitted."
     )
+
+
+def _budget_exhausted_observation(cap: str, recency: ActivityRecency | None) -> str:
+    """A typed, model-facing fact (not an instruction) that this is the run's last granted turn.
+    Deliberately silent on what to do next -- finishing with a partial result, retrying, or reporting
+    failure are all legitimate depending on what the model has."""
+    payload = {
+        "budget_exhausted": True,
+        "cap": cap,
+        "headroom": {
+            "tool_calls": recency.tool_calls_remaining if recency is not None else None,
+            "tokens": recency.tokens_remaining if recency is not None else None,
+        },
+    }
+    json_line = json.dumps(payload, separators=(",", ":"))
+    return f"{json_line}\nThe run's budget cap has tripped; this is the final turn before the run ends."
+
+
+def _budget_exhausted_reason(cap_trip: str) -> str:
+    """Human sentence for a no-finish budget exit. Never includes the raw cap literal (that lives
+    only in `cap_trip` and the logs) so a status/reason readout doesn't leak an internal counter."""
+    if "deadline" in cap_trip:
+        axis = "time"
+    elif "max_tokens" in cap_trip:
+        axis = "token"
+    elif "max_turns" in cap_trip:
+        axis = "turn"
+    elif "max_tool_calls" in cap_trip:
+        axis = "tool-call"
+    elif "maximum steps" in cap_trip:
+        axis = "step"
+    else:
+        axis = "run"
+    return f"The run reached its {axis} budget before the model finished; the recorded output may be partial."
 
 
 _TOOL_CALL_RECORD_FIELDS = frozenset(
@@ -1117,7 +1167,14 @@ def make_finish_tool(
                 )
             if verification_message:
                 return ToolResult.error(verification_message)
-        if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
+        if (
+            status == "completed"
+            and page_fingerprint is not None
+            and deferrals < max_settle_deferrals
+            # On the granted final turn the re-verification turn a deferral asks for no longer
+            # exists: holding would convert the verdict into budget_exhausted instead.
+            and not (activity is not None and activity.final_turn_active)
+        ):
             try:
                 settled = await _settled()
             except Exception:
@@ -1137,6 +1194,8 @@ def make_finish_tool(
             and activity is not None
             and page_fingerprint is not None
             and failure_deferrals < max_failure_deferrals
+            # Same rule as the completed-side holds: no retry turn exists on the granted final turn.
+            and not activity.final_turn_active
             and activity.armed()
             # The corrected cycle needs budget for its worst case (wait + observe + re-finish);
             # without headroom on every budget axis a deferral would convert an honest failure
@@ -1287,6 +1346,10 @@ async def run_agent_tool_loop(
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    # One model call's worth of token headroom, reserved so the single-shot final turn (below) is
+    # actually fundable rather than being immediately re-tripped by the same max_tokens check it
+    # was granted under. 0 (the default) reproduces today's unreserved check.
+    final_turn_token_reserve: int = 0,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     outcome: LoopOutcome | None = None
@@ -1336,6 +1399,21 @@ async def run_agent_tool_loop(
     # page-change evidence, and whether the single extension has been spent.
     last_change_evidence_step: int | None = None
     budget_extension_granted = False
+    # Single-shot final-turn grant (budget-exhaustion final turn): mirrors budget_extension_granted's
+    # shape. The first budget-cap trip anywhere in the loop sets this and buys exactly one more
+    # unconstrained model turn; cap_trip_pending remembers which cap granted it, so a finish() outcome
+    # produced on that turn can carry the fact forward even though finish is a different code path.
+    # final_turn_started distinguishes "granted, turn not run yet" from "granted turn already ran": a
+    # mid-batch grant (max_tool_calls, the action-step gate) leaves the SAME counter tripped for the
+    # very next top-of-turn check, one code site removed from the grant with no turn boundary between
+    # them -- without this flag that check would end the run before the granted turn ever started.
+    final_turn_granted = False
+    final_turn_started = False
+    cap_trip_pending: str | None = None
+    # Extraction carried by a finish the granted turn staged but never got honored (skipped behind a
+    # failed or refused call, or refused by a fail-closed blocker). The verdict itself stays
+    # unhonored — its premise didn't hold — but the data rides the spent-grant exit.
+    final_turn_staged_output: Any = None
 
     def _clear_action_state() -> None:
         action_counts.clear()
@@ -1666,18 +1744,51 @@ async def run_agent_tool_loop(
         if should_cancel is not None and await should_cancel():
             outcome = LoopOutcome("canceled", "run canceled")
             break
-        if deadline_seconds is not None and time.monotonic() - started_at > deadline_seconds:
-            outcome = LoopOutcome("budget_exhausted", f"deadline ({deadline_seconds:.0f}s) reached")
+        # The single-shot final-turn grant (see final_turn_granted above): the first budget trip
+        # here buys exactly one more turn instead of ending the run, so the checks below are elif'd
+        # (only the first tripped cap matters this iteration). A spent grant ends the run BEFORE any
+        # counter is consulted: the granted turn may have been granted at a gate no top-of-turn
+        # check re-reads (the action-step gate), so waiting for a counter to re-trip would let a
+        # finish-less granted turn keep looping on other budgets — and the cap that granted the
+        # turn, not whichever counter happens to re-trip first, is the honest fact to report.
+        # final_turn_started (set below, right before the turn actually runs) distinguishes a spent
+        # grant from a mid-batch grant whose turn has not run yet. Cancellation above is exempt: it
+        # is not a budget cap.
+        if final_turn_granted and final_turn_started:
+            outcome = LoopOutcome(
+                "budget_exhausted",
+                _budget_exhausted_reason(cap_trip_pending or "budget"),
+                cap_trip=cap_trip_pending,
+                extracted_output=final_turn_staged_output,
+            )
             break
-        if max_tokens is not None and total_tokens >= max_tokens:
-            outcome = LoopOutcome("budget_exhausted", f"max_tokens ({max_tokens}) reached")
-            break
-        if turns >= max_turns:
-            outcome = LoopOutcome("budget_exhausted", f"max_turns ({max_turns}) reached")
-            break
-        if total_tool_calls >= max_tool_calls:
-            outcome = LoopOutcome("budget_exhausted", f"max_tool_calls ({max_tool_calls}) reached")
-            break
+        # Once the grant fired no top-of-turn cap can trip again, so the checks only run pre-grant.
+        top_of_turn_trip: str | None = None
+        if not final_turn_granted:
+            if deadline_seconds is not None and time.monotonic() - started_at > deadline_seconds:
+                top_of_turn_trip = f"deadline ({deadline_seconds:.0f}s) reached"
+            elif max_tokens is not None and total_tokens >= max(0, max_tokens - final_turn_token_reserve):
+                top_of_turn_trip = f"max_tokens ({max_tokens}) reached"
+            elif turns >= max_turns:
+                top_of_turn_trip = f"max_turns ({max_turns}) reached"
+            elif total_tool_calls >= max_tool_calls:
+                top_of_turn_trip = f"max_tool_calls ({max_tool_calls}) reached"
+        if top_of_turn_trip is not None:
+            final_turn_granted = True
+            cap_trip_pending = top_of_turn_trip
+            LOG.info(
+                FINAL_TURN_GRANTED_EVENT,
+                cap=top_of_turn_trip,
+                turn=turns,
+                tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
+                tokens_remaining=None if activity is None else activity.tokens_remaining,
+            )
+            messages.append({"role": "user", "content": _budget_exhausted_observation(top_of_turn_trip, activity)})
+        if final_turn_granted:
+            final_turn_started = True
+            if activity is not None:
+                # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
+                activity.final_turn_active = True
         turns += 1
         if activity is not None:
             activity.turn = turns
@@ -1813,9 +1924,23 @@ async def run_agent_tool_loop(
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
             # this call nor the rest of the batch executes, so answer them as skipped.
-            if total_tool_calls >= max_tool_calls:
-                outcome = LoopOutcome("budget_exhausted", f"max_tool_calls ({max_tool_calls}) reached")
+            # Gated on `not final_turn_granted`: once the final turn is granted this same counter is
+            # already at (or past) the cap by construction, so re-enforcing it here would block the
+            # granted turn's very first call (including finish) before it ever ran. The top-of-turn
+            # check is what actually ends the run if this granted turn doesn't finish either.
+            if not final_turn_granted and total_tool_calls >= max_tool_calls:
+                mid_batch_trip = f"max_tool_calls ({max_tool_calls}) reached"
+                final_turn_granted = True
+                cap_trip_pending = mid_batch_trip
+                LOG.info(
+                    FINAL_TURN_GRANTED_EVENT,
+                    cap=mid_batch_trip,
+                    turn=turns,
+                    tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
+                    tokens_remaining=None if activity is None else activity.tokens_remaining,
+                )
                 _append_skipped_tool_results(messages, tool_calls[idx:], "tool-call budget reached")
+                messages.append({"role": "user", "content": _budget_exhausted_observation(mid_batch_trip, activity)})
                 break
             if should_cancel is not None and await should_cancel():
                 outcome = LoopOutcome("canceled", "run canceled")
@@ -1949,8 +2074,45 @@ async def run_agent_tool_loop(
                         turn=turns,
                         tool=tool_name,
                     )
-                    outcome = LoopOutcome("budget_exhausted", f"Reached the maximum steps ({max_action_steps})")
+                    step_cap_trip = f"Reached the maximum steps ({max_action_steps})"
                     _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
+                    # Unlike the mid-batch max_tool_calls check above, the step gate is NOT special-cased
+                    # away once the final turn is granted: a billable dispatch on the granted turn still
+                    # hits it, which is the honest exit the grant exists to produce.
+                    if final_turn_granted:
+                        # A finish staged later in this skipped batch: its VERDICT is not honored
+                        # (it presumed the refused action would run — accepting a completed there
+                        # could claim a success that never happened), but the extraction it was
+                        # already carrying is salvaged onto the honest exit.
+                        staged_finish_output = next(
+                            (
+                                t_args.get("extracted_output")
+                                for _t_id, t_name, t_args in tool_calls[idx:]
+                                if t_name == "finish" and isinstance(t_args, dict)
+                            ),
+                            None,
+                        )
+                        # The cap that granted the final turn is the honest fact to report — the
+                        # step gate merely happens to be where the spent grant gets caught.
+                        outcome = LoopOutcome(
+                            "budget_exhausted",
+                            _budget_exhausted_reason(cap_trip_pending or step_cap_trip),
+                            cap_trip=cap_trip_pending or step_cap_trip,
+                            extracted_output=staged_finish_output,
+                        )
+                    else:
+                        final_turn_granted = True
+                        cap_trip_pending = step_cap_trip
+                        LOG.info(
+                            FINAL_TURN_GRANTED_EVENT,
+                            cap=step_cap_trip,
+                            turn=turns,
+                            tool_calls_remaining=None if activity is None else activity.tool_calls_remaining,
+                            tokens_remaining=None if activity is None else activity.tokens_remaining,
+                        )
+                        messages.append(
+                            {"role": "user", "content": _budget_exhausted_observation(step_cap_trip, activity)}
+                        )
                     break
             # Submit-shaped actions (the failure-evidence predicate, minus captcha) are reported BEFORE
             # dispatch, since after it the page may be the confirmation page. A failure here never fails
@@ -2230,6 +2392,9 @@ async def run_agent_tool_loop(
                     status=data.get("status", "completed"),
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
+                    # The model's own verdict wins whether or not it landed on the granted final turn;
+                    # cap_trip just records the fact that a cap forced this to be the last turn.
+                    cap_trip=cap_trip_pending if final_turn_granted else None,
                 )
                 break
 
@@ -2267,6 +2432,23 @@ async def run_agent_tool_loop(
                     batch_had_failure = True
                     if call_selector is not None:
                         failed_selectors.add(call_selector)
+
+        # Whatever skipped or refused a finish once a cap tripped — behind the very call that
+        # tripped it in the GRANTING batch, behind a failed call or fail-closed blocker on the
+        # granted turn, or under a guard that terminated the batch — the extraction it was already
+        # carrying is remembered; the post-loop stamp rides it out on whatever terminal the run
+        # ends with. Last write wins, so a granted-turn restatement supersedes the older capture.
+        if final_turn_granted:
+            staged = next(
+                (
+                    t_args.get("extracted_output")
+                    for _t_id, t_name, t_args in tool_calls
+                    if t_name == "finish" and isinstance(t_args, dict) and t_args.get("extracted_output") is not None
+                ),
+                None,
+            )
+            if staged is not None:
+                final_turn_staged_output = staged
 
         # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
@@ -2392,6 +2574,18 @@ async def run_agent_tool_loop(
 
     if outcome is None:
         outcome = LoopOutcome("loop_error", "loop exited without an outcome")
+
+    # Every model- or loop-produced terminal once the cap tripped — a finish verdict, a guard
+    # termination (even in the granting batch itself), a stall exit, the spent-grant exit —
+    # happened UNDER the cap: it carries the cap fact, and a missing extraction is filled from
+    # what a skipped finish had staged (the model's own earlier data), so no exit path can
+    # re-discard the partial output. A completed verdict that didn't restate its output would
+    # otherwise be demoted for missing extraction.
+    if final_turn_granted and outcome.status in ("completed", "failed", "terminated", "budget_exhausted", "loop_error"):
+        if outcome.cap_trip is None:
+            outcome.cap_trip = cap_trip_pending
+        if outcome.extracted_output is None:
+            outcome.extracted_output = final_turn_staged_output
 
     if progress is not None and progress.ever_armed:
         # Per-run survival record, emitted only for runs that ever saw a form (the population the

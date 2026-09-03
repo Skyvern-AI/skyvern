@@ -2171,7 +2171,15 @@ class ForgeAgent:
         # step even when the task fails. Canceled runs stay unbilled, matching the step engine.
         if step_status == StepStatus.failed and outcome.billable_actions:
             step_status = StepStatus.completed
-        extracted_information = outcome.extracted_output if completed else None
+        # A cap-tripped run that still produced extracted_output (a granted final turn that finished,
+        # or a partial the model had staged before the honest budget_exhausted exit) carries it even
+        # when the terminal status isn't `completed` -- AC-2 is that the cap doesn't discard work the
+        # model already had in hand.
+        extracted_information = (
+            outcome.extracted_output
+            if (completed or (outcome.cap_trip is not None and outcome.extracted_output is not None))
+            else None
+        )
         if completed and task.extracted_information_schema is not None and extracted_information is not None:
             # Repair the model's output against the schema (fill missing required fields, drop
             # hallucinated array items), matching the step engine — but only when the output's shape
@@ -2234,10 +2242,39 @@ class ForgeAgent:
             failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
         else:
             failure_reason = outcome.reason or outcome.status
-        if task_status == TaskStatus.failed:
+        if outcome.cap_trip is not None:
+            # The typed fact a budget cap tripped this run, independent of whether the model went on
+            # to finish on the granted final turn (a completed/failed/terminated verdict) or the loop
+            # gave up honestly without one (budget_exhausted).
+            LOG.info(
+                "task_v3 budget cap tripped",
+                task_id=task.task_id,
+                cap_trip=outcome.cap_trip,
+                final_turn_finished=outcome.status != "budget_exhausted",
+            )
+        # failure_category must agree with failure_reason: a vetoed or extraction-less completion,
+        # a loop_error, and any finish verdict the model delivered on the granted turn all failed
+        # for THEIR reason, not the budget's. BUDGET_EXHAUSTED is reserved for the exits where the
+        # cap genuinely is the cause: the loop gave up without a verdict, or the granted-turn
+        # verdict's reason classifies to nothing (usually the model narrating the truncation).
+        cap_is_the_cause = (
+            outcome.cap_trip is not None
+            and not completion_vetoed
+            and not missing_extraction
+            and outcome.status != "loop_error"
+        )
+        if task_status == TaskStatus.failed and outcome.status == "budget_exhausted" and cap_is_the_cause:
+            failure_category = [
+                {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
+            ]
+        elif task_status == TaskStatus.failed:
             # Same code-level failure classification fail_task records, so v3 failures carry a
             # failure_category like step-engine failures.
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
+            if failure_category is None and cap_is_the_cause:
+                failure_category = [
+                    {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
+                ]
         if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
             # Same user-defined error detection the step engine runs on failure, so workflows that
             # consume configured error codes keep that contract on v3.
