@@ -22,6 +22,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.services import webhook_service
 
 LONG_CREDENTIAL = "templated-password-very-long-13668"
@@ -256,3 +257,32 @@ async def test_inline_code_containment_gate_disabled_would_leak_to_every_sink(
     for payload in (await _sink_payloads(monkeypatch, captured)).values():
         # Presence must come from an attacker-visible string, not an accidental numeric metadata match.
         assert any(CODE_CREDENTIAL in text for text in _string_values(payload))
+
+
+@pytest.mark.asyncio
+async def test_declared_error_code_becomes_the_run_failure_category() -> None:
+    """SKY-15564: a declared ErrorCode raise is the author's own verdict on why the run stopped,
+    so the run must inherit it instead of falling through to the keyword classifier's UNKNOWN."""
+    declared_output = await _inline_failure_output(error_code=SAFE_CODE, reasoning="Invoice not published yet")
+    block = CodeBlock(label="code_1", code="pass", output_parameter=_output_parameter())
+
+    def outcome(output: dict[str, Any]) -> tuple[Any, Any, Any]:
+        return WorkflowService._resolve_block_terminal_outcome(
+            block=block,
+            block_result=BlockResult(
+                success=False,
+                status=BlockStatus.failed,
+                failure_reason="Invoice not published yet",
+                output_parameter=_output_parameter(),
+                output_parameter_value=output,
+            ),
+        )
+
+    _, _, declared_category = outcome(declared_output)
+    assert declared_category == [
+        {"category": SAFE_CODE, "confidence_float": 1.0, "reasoning": "Invoice not published yet"}
+    ]
+
+    # An undeclared failure carries no verdict, so the classifier must still be the one to decide.
+    _, _, undeclared_category = outcome(build_block_failure_output(GENERIC_REASONING, ["user_code_error"]))
+    assert undeclared_category is None

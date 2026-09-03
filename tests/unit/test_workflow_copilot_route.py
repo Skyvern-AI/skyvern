@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -4597,3 +4599,18 @@ async def test_a_request_without_an_eval_entrypoint_url_reaches_the_agent_path_u
     await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
 
     assert new_copilot_mock.await_args.kwargs["eval_entrypoint_url"] is None
+
+
+def test_the_client_recovery_budget_still_outlasts_the_server_abandon_threshold() -> None:
+    """The client's poll budget is a literal in WorkflowCopilotChat.tsx, while the threshold it has to
+    outlast is derived from two env-configurable settings. Raising either without raising the literal
+    would silently strand every recovered turn, so the drift fails here instead."""
+    source = Path("skyvern-frontend/src/routes/workflows/copilot/WorkflowCopilotChat.tsx").read_text()
+    match = re.search(r"const RECOVERY_POLL_BUDGET_MS = ([\d_]+);", source)
+    assert match, "RECOVERY_POLL_BUDGET_MS not found; update this guard if the constant was renamed"
+
+    budget_seconds = int(match.group(1).replace("_", "")) / 1000
+    assert budget_seconds > RECONCILE_ABANDON_AFTER_SECONDS, (
+        f"client recovery budget {budget_seconds}s no longer outlasts the server's "
+        f"{RECONCILE_ABANDON_AFTER_SECONDS}s abandon threshold: a recovered turn would never be read"
+    )
