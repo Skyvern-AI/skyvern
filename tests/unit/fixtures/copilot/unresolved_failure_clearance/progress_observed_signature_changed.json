@@ -1,0 +1,77 @@
+{
+  "provenance": {
+    "kind": "branch_local_witness",
+    "source": "sky-15308-base-20260831-194437/run2-repeat-failure-then-clean/call-0026.json + backend.log.capture-slice",
+    "notes": "Captured trio with the final run recorded as a verified success; only its verdict differs from the capture."
+  },
+  "steps": [
+    {
+      "workflow_yaml": "title: Retrieve deferred freight quote total\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: code\n      label: calculate_and_extract_quote_total\n      prompt: Open quote QF-4821, calculate its shipping-inclusive order total, and return the page-displayed total as a number.\n      code: |\n        await page.goto(\"http://localhost:8900/deferred_total_quote/\")\n        quote_heading = page.get_by_text(\"Quote QF-4821\", exact=True)\n        await quote_heading.wait_for(state=\"visible\", timeout=10000)\n        total_panel = page.locator(\"div.totals\")\n        await total_panel.wait_for(state=\"visible\", timeout=10000)\n        await page.locator(\"#calculate-total\").click()\n        await total_panel.locator(\"strong\").wait_for(state=\"visible\", timeout=10000)\n        total_text = (await total_panel.locator(\"strong\").inner_text()).strip()\n        normalized_total = total_text.replace(\"$\", \"\").replace(\",\", \"\").strip()\n        order_total = float(normalized_total)\n        return {\n          \"quote_id\": \"QF-4821\",\n          \"order_total\": order_total,\n          \"displayed_total\": total_text,\n          \"evidence_text\": (await total_panel.inner_text()).strip()\n        }\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "attempted_block_label": "calculate_and_extract_quote_total",
+        "attempted_call_ref": "locator:div.totals",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "workflow_run_id": "wr_569288173990568574",
+        "block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "executed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "structural_failure_identity": "code-block-exception:wr_569288173990568574"
+      }
+    },
+    {
+      "workflow_yaml": "title: Retrieve deferred freight quote total\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: code\n      label: calculate_and_extract_quote_total\n      prompt: Open quote QF-4821, calculate its shipping-inclusive order total, and return the page-displayed total as a number.\n      code: |\n        await page.goto(\"http://localhost:8900/deferred_total_quote/\")\n        quote_heading = page.get_by_text(\"Quote QF-4821\", exact=True)\n        await quote_heading.wait_for(state=\"visible\", timeout=10000)\n        total_panel = page.locator(\"div.totals\")\n        await total_panel.wait_for(state=\"visible\", timeout=10000)\n        await page.locator(\"#calculate-total\").click()\n        page_total = page.locator(\"#order-total\")\n        await page_total.wait_for(state=\"visible\", timeout=10000)\n        total_text = (await page_total.inner_text()).strip()\n        normalized_total = total_text.replace(\"$\", \"\").replace(\",\", \"\").strip()\n        order_total = float(normalized_total)\n        return {\n          \"quote_id\": \"QF-4821\",\n          \"order_total\": order_total,\n          \"displayed_total\": total_text,\n          \"evidence_text\": (await total_panel.inner_text()).strip()\n        }\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "attempted_block_label": "calculate_and_extract_quote_total",
+        "attempted_call_ref": "",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "workflow_run_id": "wr_569288324314423984",
+        "block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "executed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "structural_failure_identity": "code-block-exception:wr_569288324314423984"
+      }
+    },
+    {
+      "workflow_yaml": "title: Retrieve deferred freight quote total\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: code\n      label: calculate_and_extract_quote_total\n      prompt: Open quote QF-4821, calculate its shipping-inclusive order total, and return the page-displayed total as a number.\n      code: |\n        await page.goto(\"http://localhost:8900/deferred_total_quote/\")\n        quote_heading = page.get_by_text(\"Quote QF-4821\", exact=True)\n        await quote_heading.wait_for(state=\"visible\", timeout=10000)\n        total_panel = page.locator(\"div.totals\")\n        await total_panel.wait_for(state=\"visible\", timeout=10000)\n        await page.locator(\"#calculate-total\").click()\n        page_total = page.locator(\"#order-total\")\n        await page_total.wait_for(state=\"visible\", timeout=10000)\n        total_text = \"\"\n        for _ in range(20):\n          total_text = (await page_total.inner_text()).strip()\n          if total_text.startswith(\"$\"):\n            break\n          await page.wait_for_timeout(500)\n        if not total_text.startswith(\"$\"):\n          raise ValueError(\"The calculated page total did not become available\")\n        normalized_total = total_text.replace(\"$\", \"\").replace(\",\", \"\").strip()\n        order_total = float(normalized_total)\n        return {\n          \"quote_id\": \"QF-4821\",\n          \"order_total\": order_total,\n          \"displayed_total\": total_text,\n          \"evidence_text\": (await total_panel.inner_text()).strip()\n        }\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "verdict": "progress_observed",
+        "reason_code": "verified_success",
+        "workflow_run_id": "wr_569288397328868066",
+        "block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "executed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ],
+        "evidence_refs": [
+          "calculate_and_extract_quote_total_output"
+        ]
+      }
+    }
+  ],
+  "reported_workflow_yaml": null,
+  "expect": {
+    "baseline_disposition": "no_reported_candidate",
+    "baseline_attached": true,
+    "disposition": "executed_snapshot_signature_changed:wr_569288397328868066:calculate_and_extract_quote_total",
+    "attached": false,
+    "history_retains_failure": true
+  }
+}
