@@ -102,6 +102,7 @@ _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _BROWSER_OPERATION_FAILED: BuildTestFailedOperationKind = "browser_operation_failed"
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
 _FAILED_BLOCK_STATUSES = frozenset({"failed", "terminated", "canceled", "timed_out"})
+_COMPLETED_BLOCK_STATUSES = frozenset({BlockStatus.completed.value})
 # Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
 # out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
 # a saturated runner gate says nothing about the code, so rewriting it cannot help.
@@ -409,6 +410,7 @@ class RecordedBuildTestOutcome(BaseModel):
     failed_operation_call_signature: str | None = Field(default=None, exclude=True, repr=False)
     failed_operation_code_signature: str | None = Field(default=None, exclude=True, repr=False)
     executed_block_associations: tuple[str, ...] = Field(default=(), exclude=True, repr=False)
+    completed_block_associations: tuple[str, ...] = Field(default=(), exclude=True, repr=False)
     authored_structure_signature: str | None = None
     display_text: str = ""
     observed_page_value_excerpt: str = ""
@@ -501,6 +503,24 @@ def _history_entry(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuild
     }
 
 
+def _releasing_associations(
+    ctx: _RecordedBuildTestOutcomeContext, failed_operation: BuildTestFailedOperation
+) -> set[str]:
+    """Identities whose completion resolves this failure.
+
+    A full replacement mints a fresh identity for the same label, so the recorded association can
+    never run again; without the label's current identity that repair shape has no way to clear.
+    """
+    releasing: set[str] = set()
+    if failed_operation.block_association:
+        releasing.add(failed_operation.block_association)
+    if failed_operation.block_label:
+        current = ctx.runner_code_block_associations_by_label.get(failed_operation.block_label)
+        if current:
+            releasing.add(current)
+    return releasing
+
+
 def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome | None) -> None:
     if outcome is None:
         latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
@@ -523,22 +543,13 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
             }
         )
     elif prior is not None and prior.failed_operation is not None:
-        source_yaml = _executed_workflow_yaml(ctx)
-        association = prior.failed_operation.block_association
-        tested_code = _code_for_runner_association(ctx, source_yaml, association)
-        changed_attempt_was_tested = (
+        releasing = _releasing_associations(ctx, prior.failed_operation)
+        failed_block_completed_later = (
             outcome.phase == "persisted_block_run"
-            and outcome.verdict == "progress_observed"
             and outcome.workflow_run_id not in (None, prior.failed_operation.workflow_run_id)
-            and association is not None
-            and association in outcome.executed_block_associations
-            and _failed_operation_changed(
-                tested_code,
-                prior.failed_operation_call_signature,
-                prior.failed_operation_code_signature,
-            )
+            and bool(releasing & set(outcome.completed_block_associations))
         )
-        if not changed_attempt_was_tested:
+        if not failed_block_completed_later:
             outcome = outcome.model_copy(
                 update={
                     "failed_operation": prior.failed_operation,
@@ -727,27 +738,6 @@ def _failed_operation_call_signature(code: str | None, failing_line: int | None)
         ),
     )
     return _stable_hash(ast.dump(outermost, include_attributes=False))
-
-
-def _failed_operation_changed(
-    tested_code: str | None,
-    prior_call_signature: str | None,
-    prior_code_signature: str | None,
-) -> bool:
-    """Prove the recorded operation changed, or use whole-block change for a typed line omission."""
-    if not tested_code:
-        return False
-    wrapper = _parse_block_code(tested_code)
-    if wrapper is None:
-        return False
-    current_call_signatures = {
-        _stable_hash(ast.dump(node, include_attributes=False))
-        for node in ast.walk(wrapper)
-        if isinstance(node, ast.Call)
-    }
-    if prior_call_signature is not None:
-        return prior_call_signature not in current_call_signatures
-    return prior_code_signature is not None and _stable_hash(tested_code) != prior_code_signature
 
 
 # Every construct that can reach the end of a block without running something inside it, including
@@ -1405,14 +1395,8 @@ def recorded_outcome_from_run_blocks_result(
             if (redacted := _redacted_terminal_text(_safe_str(block.get("label"))))
         ]
     )
-    executed_block_associations = tuple(
-        dict.fromkeys(
-            association
-            for block in blocks
-            if _safe_str(block.get("status")) in _EXECUTED_BLOCK_STATUSES
-            if (association := (block_associations_by_label or {}).get(_safe_str(block.get("label"))))
-        )
-    )
+    executed_block_associations = _block_associations(blocks, block_associations_by_label, _EXECUTED_BLOCK_STATUSES)
+    completed_block_associations = _block_associations(blocks, block_associations_by_label, _COMPLETED_BLOCK_STATUSES)
     block_shape_hashes = dict(block_shape_hashes or {})
     referenced_unbound_keys = _referenced_unbound_input_keys(
         result,
@@ -1493,6 +1477,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1511,6 +1496,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 verified_progress_marker=verification_identity or "run_completed_verified",
                 page_capture=page_capture,
                 evidence_refs=output_refs,
@@ -1535,6 +1521,7 @@ def recorded_outcome_from_run_blocks_result(
                 failed_block_labels=_failed_block_labels(blocks),
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1568,6 +1555,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1590,6 +1578,7 @@ def recorded_outcome_from_run_blocks_result(
                 executed_block_labels=executed_block_labels,
                 block_shape_hashes=block_shape_hashes,
                 executed_block_associations=executed_block_associations,
+                completed_block_associations=completed_block_associations,
                 page_capture=page_capture,
                 authored_structure_signature=authored_structure_signature,
                 failed_operation=failed_operation,
@@ -1616,6 +1605,7 @@ def recorded_outcome_from_run_blocks_result(
             authored_structure_signature=authored_structure_signature,
             failed_operation=failed_operation,
             executed_block_associations=executed_block_associations,
+            completed_block_associations=completed_block_associations,
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
                 "structural_failure_identity": (
@@ -1740,6 +1730,7 @@ def recorded_outcome_from_run_blocks_result(
         authored_structure_signature=authored_structure_signature,
         failed_operation=failed_operation,
         executed_block_associations=executed_block_associations,
+        completed_block_associations=completed_block_associations,
         observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
         # The failed block's recorded reason carries the exception and its line; the run status is
         # the word "failed" and says nothing a repair can act on.
@@ -1987,6 +1978,21 @@ def _dict(value: object) -> Mapping[str, object]:
 
 def _block_dicts(value: object) -> list[Mapping[str, object]]:
     return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _block_associations(
+    blocks: Sequence[Mapping[str, object]],
+    block_associations_by_label: Mapping[str, str] | None,
+    statuses: frozenset[str],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            association
+            for block in blocks
+            if _safe_str(block.get("status")) in statuses
+            if (association := (block_associations_by_label or {}).get(_safe_str(block.get("label"))))
+        )
+    )
 
 
 def _first_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, object] | None:

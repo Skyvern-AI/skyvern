@@ -294,7 +294,12 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
     if envelope.interruption is not None and not cancelled:
         return render_interrupted_message(envelope.interruption, proposal_present=envelope.proposal_present), True
     if envelope.failed_operation is not None and not cancelled:
-        message = "I stopped after a browser operation failed while testing the workflow."
+        block_label = envelope.failed_operation.block_label
+        message = (
+            f"I stopped after a browser operation failed in `{block_label}` while testing the workflow."
+            if block_label
+            else "I stopped after a browser operation failed while testing the workflow."
+        )
         if envelope.proposal_present:
             message = _append_sentence(
                 message,
