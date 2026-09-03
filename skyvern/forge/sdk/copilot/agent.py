@@ -181,12 +181,17 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    MINIMAL_CANCEL_STOP,
+    TESTED_DRAFT_PRESERVED,
+    UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
     TerminalCause,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
+    is_interim_run_outcome,
     reason_in_reply_shadow,
     render_terminal_message,
+    run_start_unresolved,
     select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
@@ -1480,6 +1485,13 @@ def _terminal_envelope_run_outcomes(ctx: CopilotContext) -> list[RecordedRunOutc
     return [recorded] if isinstance(recorded, RecordedRunOutcome) else []
 
 
+def _blocks_run_this_turn(ctx: CopilotContext) -> int | None:
+    """None while a started run has no recorded result: an unresolved run's block count is unknown, not zero."""
+    if run_start_unresolved(_terminal_envelope_run_outcomes(ctx)):
+        return None
+    return len(ctx.executed_block_labels)
+
+
 def _terminal_halt_fields(ctx: CopilotContext) -> tuple[str | None, str | None]:
     halt = getattr(ctx, "turn_halt", None)
     if not isinstance(halt, TurnHalt):
@@ -1526,13 +1538,15 @@ def _draft_ran_on_current_source(
     facts: NarrativeTurnFacts, unresolved_failure: UnresolvedRuntimeFailure | None
 ) -> bool:
     """A tested draft claims full current-source coverage and a lifecycle that contradicts nothing:
-    a halted turn, an unfinished or unconfirmed run, or an open block failure each disqualify it.
-    ``runCompleted`` is None when no run is anchored to this turn, leaving the source-bound receipts
-    as the only claim."""
+    a halted turn, an unfinished, unresolved or unconfirmed run, or an open block failure each
+    disqualify it. ``runCompleted`` is None both when no run is anchored to this turn and when a
+    started run never resolved, so only the former leaves the source-bound receipts as the claim."""
     authored = facts.get("authoredBlockCount")
     if not facts["factsAvailable"] or not authored or facts.get("matchingSourceBlockCount") != authored:
         return False
     if facts["terminalCause"] is not None or unresolved_failure is not None:
+        return False
+    if facts["runId"] is not None and facts["runCompleted"] is None:
         return False
     return facts["runCompleted"] is not False and facts["evaluationState"] != "not_demonstrated"
 
@@ -1573,9 +1587,12 @@ def _turn_fact_bundle(
     unresolved_failure: UnresolvedRuntimeFailure | None = None,
 ) -> NarrativeTurnFacts:
     run_id = run_outcome.workflow_run_id if run_outcome is not None else None
+    # A run start with no result behind it names a run without adjudicating one, so the
+    # evaluation slot stays empty while the lifecycle keeps the outcome's own unfinished state.
+    resolved_outcome = None if is_interim_run_outcome(run_outcome) else run_outcome
     facts: NarrativeTurnFacts = {
         "factsAvailable": review is not None,
-        "evaluationState": run_outcome.verdict if run_outcome is not None else None,
+        "evaluationState": resolved_outcome.verdict if resolved_outcome is not None else None,
         "runId": (run_id.strip() or None) if isinstance(run_id, str) else None,
         "runCompleted": run_outcome.run_completed if run_outcome is not None else None,
         "terminalCause": terminal_cause,
@@ -1600,7 +1617,7 @@ def _turn_facts_for_context(
         review,
         select_run_outcome_anchor(_terminal_envelope_run_outcomes(ctx)),
         _terminal_cause_for_context(ctx),
-        len(ctx.executed_block_labels),
+        _blocks_run_this_turn(ctx),
         # The proposal these facts describe, not the turn-start persisted workflow. The terminal
         # seam asks whether the workflow the user can run today still carries the failure and is
         # right to read persistence; this pill claims the draft ran clean, so a failure the draft
@@ -1651,7 +1668,7 @@ def _assemble_terminal_envelope_safe(
     response_type: str,
     verified: bool,
     workflow_applied: bool,
-    proposal_disposition: str | None,
+    proposal_disposition: ProposalDisposition | None,
     run_outcomes: Sequence[RecordedRunOutcome],
     blocker_reason: str | None,
     halt_kind: str | None,
@@ -1777,7 +1794,9 @@ def _make_agent_result(
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
     raw_disposition = kwargs.get("proposal_disposition")
-    proposal_disposition: str | None = raw_disposition if isinstance(raw_disposition, str) else None
+    proposal_disposition: ProposalDisposition | None = (
+        raw_disposition if raw_disposition in get_args(ProposalDisposition) else None
+    )
     if turn_facts is not None and proposal_disposition == "review_tested" and not turn_facts["ranCleanOnCurrentSource"]:
         proposal_disposition = "review_untested"
         kwargs["proposal_disposition"] = proposal_disposition
@@ -1901,7 +1920,7 @@ def _make_agent_result(
             response_type=response_type_value,
             verified=bool(outcome_fully_verified(ctx)),
             workflow_applied=False,
-            proposal_disposition=proposal_disposition if isinstance(proposal_disposition, str) else None,
+            proposal_disposition=proposal_disposition,
             run_outcomes=_terminal_envelope_run_outcomes(ctx),
             blocker_reason=blocker_reason,
             halt_kind=halt_kind,
@@ -1910,7 +1929,7 @@ def _make_agent_result(
             workflow_attempted=ctx.has_genuine_workflow_attempt(),
             final_message=str(kwargs.get("user_response") or ""),
             terminal_cause=terminal_cause,
-            blocks_run_this_turn=len(ctx.executed_block_labels),
+            blocks_run_this_turn=_blocks_run_this_turn(ctx),
             failed_operation=failed_operation,
             connect_failure=connect_failure,
             proposal_present=result_carries_workflow,
@@ -2465,12 +2484,10 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
-_CANCEL_REPLY_DEFAULT = "Cancelled by user."
-_CANCEL_REPLY_UNVALIDATED = (
-    "Cancelled. I have a draft workflow you can keep — accept it to save "
-    "(note: it hasn't been verified end-to-end), or discard."
-)
-_CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
+_CANCEL_REPLY_DEFAULT = MINIMAL_CANCEL_STOP
+_CANCEL_REPLY_ACCEPT_OR_DISCARD = "Accept it to save, or discard."
+_CANCEL_REPLY_UNVALIDATED = f"{MINIMAL_CANCEL_STOP} {UNTESTED_DRAFT_PRESERVED} {_CANCEL_REPLY_ACCEPT_OR_DISCARD}"
+_CANCEL_REPLY_TESTED = f"{MINIMAL_CANCEL_STOP} {TESTED_DRAFT_PRESERVED} {_CANCEL_REPLY_ACCEPT_OR_DISCARD}"
 _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
     "I wasn't able to produce a workflow proposal in this turn, and I couldn't identify which details were missing "
     "from this turn. Please retry with the target site, page, or workflow requirement."

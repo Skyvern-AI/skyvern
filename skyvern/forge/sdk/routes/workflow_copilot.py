@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, seri
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_REASON,
+    MINIMAL_CANCEL_STOP,
     InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
     finalize_applied_state,
@@ -81,6 +82,7 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotCancelSource,
     CopilotFailureKind,
     CopilotPendingTurn,
     WorkflowCopilotApplyProposedWorkflowRequest,
@@ -362,18 +364,31 @@ def _copilot_idempotency_digest(
     return hmac.new(settings.SECRET_KEY.encode(), scoped_value, hashlib.sha256).hexdigest()
 
 
+def _coerce_cancel_source(flag: str | bytes | None) -> CopilotCancelSource | None:
+    """Read the cancel source out of the flag value the cancel route wrote.
+
+    Rows written before the source existed hold ``"1"``, which names no gesture.
+    """
+    if isinstance(flag, bytes):
+        flag = flag.decode(errors="replace")
+    if flag in get_args(CopilotCancelSource):
+        return cast(CopilotCancelSource, flag)
+    return None
+
+
 async def _watch_for_cancel(
     cache: Any,
     organization_id: str,
     cancel_token: str,
     handler_task: asyncio.Task,
     observed: list[bool],
+    observed_source: list[CopilotCancelSource | None] | None = None,
 ) -> None:
     """Cancel ``handler_task`` when the matching Redis flag flips truthy.
 
     Sets ``observed[0] = True`` before issuing the cancel so the handler's
     ``except CancelledError`` block can tell a user cancel apart from
-    server shutdown — only the user path writes a ``Cancelled by user.`` row.
+    server shutdown — only the user path writes a stop-report row.
     """
     key = _copilot_cancel_key(organization_id, cancel_token)
     while not handler_task.done():
@@ -384,12 +399,16 @@ async def _watch_for_cancel(
             LOG.debug("Copilot cancel-watcher get failed; will retry", exc_info=True)
             continue
         if flag:
+            source = _coerce_cancel_source(flag)
             LOG.info(
                 "Copilot cancel signal observed; cancelling handler task",
                 cancel_token=cancel_token,
                 organization_id=organization_id,
+                cancel_source=source,
             )
             observed[0] = True
+            if observed_source is not None:
+                observed_source[0] = source
             handler_task.cancel()
             return
 
@@ -599,6 +618,29 @@ def _with_rendered_terminal_text(
     if payload.get("narrativeSummary") is not None:
         payload["narrativeSummary"] = rendered_message
     return payload
+
+
+def _log_terminal_render_decision(
+    envelope: TerminalOutcomeEnvelope,
+    *,
+    flag_enabled: bool,
+    replaced: bool,
+    cancelled: bool,
+    product_action: str | None,
+) -> None:
+    # The envelope's own log fields are stamped pre-render, so this is the only
+    # signal that witnesses the render decision in prod.
+    LOG.info(
+        "copilot_terminal_render_decision",
+        flag_enabled=flag_enabled,
+        product_action=product_action,
+        cancelled=cancelled,
+        replaced=replaced,
+        run_verdict=envelope.run_verdict,
+        next_state=envelope.next_state,
+        response_kind=envelope.response_kind,
+        reason_present=bool(envelope.run_display_reason),
+    )
 
 
 def _build_recoverable_route_agent_result(
@@ -935,6 +977,7 @@ async def _persist_cancel_turn(
     prior_global_llm_context: str | None = None,
     user_row_already_persisted: bool = False,
     record_as_interrupted: bool = False,
+    cancel_source: CopilotCancelSource | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -947,10 +990,12 @@ async def _persist_cancel_turn(
     turn as interrupted, for a cancellation no user asked for.
     """
     turn_outcome: TurnOutcome | None
+    narrative_summary: str | None
+    narrative_payload: TurnNarrativePayload | None
     workflow_applied = False
     canonical_rolled_back = False
     if agent_result is None:
-        user_response = "Cancelled by user."
+        user_response = MINIMAL_CANCEL_STOP
         updated_workflow = None
         updated_global_llm_context = prior_global_llm_context
         total_tokens = None
@@ -962,11 +1007,33 @@ async def _persist_cancel_turn(
             reason_code=USER_CANCELLED_TERMINAL_REASON,
             terminal_reason=USER_CANCELLED_TERMINAL_REASON,
             copilot_turn_id=turn_id,
+            cancel_source=cancel_source,
         )
         response_turn_id = turn_id
-        narrative_summary = None
-        narrative_payload = None
-        terminal_envelope = None
+        # Nothing was dispatched before the agent started, so zero is a recorded fact here
+        # rather than the absent count the mid-run path reports, and no draft is this turn's.
+        terminal_envelope_model = TerminalOutcomeEnvelope(
+            next_state="stopped",
+            verified=False,
+            response_kind="stopped",
+            blocks_run_this_turn=0,
+            cancel_source=cancel_source,
+        )
+        should_render_terminal_from_envelope = await asyncio.shield(
+            app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)
+        )
+        terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
+        user_response, replaced = render_terminal_message(terminal_envelope_model, user_response, cancelled=True)
+        terminal_envelope = terminal_envelope_model.model_dump(mode="json")
+        _log_terminal_render_decision(
+            terminal_envelope_model,
+            flag_enabled=should_render_terminal_from_envelope,
+            replaced=replaced,
+            cancelled=True,
+            product_action=None,
+        )
+        narrative_summary = user_response
+        narrative_payload = _make_error_narrative_payload(turn_id, None, user_response)
         if chat.proposed_workflow is not None and not keep_pending_proposal:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
@@ -1008,6 +1075,8 @@ async def _persist_cancel_turn(
         resolved_model = agent_result.resolved_model
         output_policy_diagnostics = agent_result.output_policy_diagnostics
         turn_outcome = agent_result.turn_outcome
+        if turn_outcome is not None and cancel_source is not None:
+            turn_outcome = turn_outcome.model_copy(update={"cancel_source": cancel_source})
         response_turn_id = turn_id or agent_result.turn_id
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
@@ -1022,14 +1091,27 @@ async def _persist_cancel_turn(
             terminal_envelope = None
         else:
             terminal_envelope_model, terminal_envelope = terminal_envelope_result
-            # Cancelled turns keep the agent text (render_terminal_message
-            # passes them through), so only the flag marker is stamped here.
+            terminal_envelope_model = terminal_envelope_model.model_copy(
+                update={"canonical_rolled_back": canonical_rolled_back, "cancel_source": cancel_source}
+            )
             # Shielded like the persistence writes above: a cancel landing on
             # this await must not skip the chat-row persistence that follows.
-            if await asyncio.shield(app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)):
-                terminal_envelope = terminal_envelope_model.model_copy(
-                    update={"rendered_from_envelope": True}
-                ).model_dump(mode="json")
+            should_render_terminal_from_envelope = await asyncio.shield(
+                app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)
+            )
+            terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
+            user_response, replaced = render_terminal_message(terminal_envelope_model, user_response, cancelled=True)
+            terminal_envelope = terminal_envelope_model.model_dump(mode="json")
+            if replaced:
+                narrative_payload = _with_rendered_terminal_text(narrative_payload, rendered_message=user_response)
+                narrative_summary = user_response
+            _log_terminal_render_decision(
+                terminal_envelope_model,
+                flag_enabled=should_render_terminal_from_envelope,
+                replaced=replaced,
+                cancelled=True,
+                product_action=None,
+            )
 
     if record_as_interrupted:
         facts = _interruption_facts(
@@ -1045,8 +1127,11 @@ async def _persist_cancel_turn(
             prior_turn_outcome=turn_outcome,
         )
         terminal_envelope = interrupted_terminal_envelope(facts).model_dump(mode="json")
+        # Hydration prefers narrativeSummary, so a cancel-rendered summary left in place
+        # would outlive the reply it was rendered for.
+        narrative_summary = user_response
         narrative_payload = (
-            {**narrative_payload, "terminalMessage": user_response}
+            {**narrative_payload, "terminalMessage": user_response, "narrativeSummary": user_response}
             if narrative_payload is not None
             else _make_error_narrative_payload(turn_id or response_turn_id, None, user_response)
         )
@@ -1197,8 +1282,8 @@ async def _finalise_normal_turn(
         )
         replaced = False
         if should_render_terminal_from_envelope and chat_request.product_action != "test_end_to_end":
-            # rendered_from_envelope means "flag on, envelope is display
-            # authority" for the FE — not that this turn's text was replaced.
+            # rendered_from_envelope means the envelope is display authority for the FE, not
+            # that this turn's text was replaced.
             terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
             user_response, replaced = render_terminal_message(
                 terminal_envelope_model,
@@ -1214,17 +1299,12 @@ async def _finalise_normal_turn(
                 # The frame-level summary is preferred by the FE over the
                 # message on hydration, so it must carry the rendered text too.
                 narrative_summary = user_response
-        # The envelope's own log fields are stamped pre-render, so this is the
-        # only signal that witnesses the render decision in prod.
-        LOG.info(
-            "copilot_terminal_render_decision",
+        _log_terminal_render_decision(
+            terminal_envelope_model,
             flag_enabled=should_render_terminal_from_envelope,
-            product_action=chat_request.product_action,
             replaced=replaced,
-            run_verdict=terminal_envelope_model.run_verdict,
-            next_state=terminal_envelope_model.next_state,
-            response_kind=terminal_envelope_model.response_kind,
-            reason_present=bool(terminal_envelope_model.run_display_reason),
+            cancelled=False,
+            product_action=chat_request.product_action,
         )
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
@@ -2014,8 +2094,11 @@ async def _new_copilot_chat_post(
         # The watcher sets [0] = True before issuing handler_task.cancel() so the
         # except CancelledError block can distinguish a user-driven cancel from
         # operational cancels (server shutdown / deploy drain) and only persist
-        # a "Cancelled by user." chat row in the user case.
+        # a stop-report chat row in the user case.
         user_cancel_observed: list[bool] = [False]
+        # Which gesture asked for it, when the client said; None for a legacy
+        # client or a cancel that named no source.
+        user_cancel_source: list[CopilotCancelSource | None] = [None]
 
         try:
             await stream.send(
@@ -2179,6 +2262,7 @@ async def _new_copilot_chat_post(
                             chat_request.cancel_token,
                             handler_task,
                             user_cancel_observed,
+                            user_cancel_source,
                         )
                     )
 
@@ -2295,6 +2379,7 @@ async def _new_copilot_chat_post(
                     keep_pending_proposal=chat_request.keep_pending_proposal,
                     user_row_already_persisted=turn_started,
                     record_as_interrupted=not user_cancel_observed[0],
+                    cancel_source=user_cancel_source[0],
                 )
                 terminal_frame_emitted = True
                 capture_code_mode_opt_out_after_persist()
@@ -2302,6 +2387,7 @@ async def _new_copilot_chat_post(
                     "Workflow copilot v2 turn cancelled",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     user_cancel_observed=user_cancel_observed[0],
+                    cancel_source=user_cancel_source[0],
                 )
                 return
 
@@ -2379,17 +2465,19 @@ async def _new_copilot_chat_post(
                         keep_pending_proposal=chat_request.keep_pending_proposal,
                         prior_global_llm_context=global_llm_context,
                         user_row_already_persisted=turn_started,
+                        cancel_source=user_cancel_source[0],
                     )
                 )
                 terminal_frame_emitted = True
                 LOG.info(
                     "Workflow copilot v2 cancelled by user during pre-agent setup",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                    cancel_source=user_cancel_source[0],
                 )
                 return
             else:
                 # Operational cancel (worker shutdown, deploy drain). Don't manufacture
-                # a "Cancelled by user." chat row — chat history should not record an
+                # a stop-report chat row — chat history should not record an
                 # operational cancel as user intent. When finalisation already started,
                 # its shielded write owns this turn's row and wins; if it dies before
                 # committing, the pending turn is left for reconcile-on-read to recover.
@@ -3052,7 +3140,8 @@ async def workflow_copilot_cancel(
         )
     await cache.set(
         _copilot_cancel_key(organization.organization_id, cancel_request.cancel_token),
-        "1",
+        # A client too old to name its gesture still has to set a truthy flag.
+        cancel_request.source or "1",
         ex=COPILOT_CANCEL_TTL,
     )
 
