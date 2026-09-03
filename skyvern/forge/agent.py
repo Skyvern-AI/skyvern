@@ -67,6 +67,7 @@ from skyvern.exceptions import (
     ScrapingFailed,
     ScreenshotTargetClosed,
     SkyvernException,
+    SkyvernPageAnalysisTimeout,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -5172,6 +5173,8 @@ class ForgeAgent:
             # dead target, so returning here avoids trading this for an ERROR from get_content().
             LOG.info("Skipping post-action artifacts because the browser target closed")
             return
+        except SkyvernPageAnalysisTimeout:
+            LOG.warning("Timed out taking the post-action screenshot, skipping it")
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -5205,6 +5208,8 @@ class ForgeAgent:
                             step=step,
                         )
                     )
+        except SkyvernPageAnalysisTimeout:
+            LOG.warning("Timed out reading the post-action html, skipping it")
         except Exception:
             LOG.exception("Failed to record html after action")
 
