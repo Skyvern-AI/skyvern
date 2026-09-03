@@ -1939,7 +1939,8 @@ describe("a real cancel's backend payload still renders neutrally", () => {
       },
     ],
     terminal: "error",
-    terminalMessage: "Cancelled by user.",
+    terminalMessage:
+      "Stopped. 1 block ran this turn. No workflow draft from this turn was preserved.",
     narrativeSummary: null,
     cancelled: true,
     priorBlockCount: null,

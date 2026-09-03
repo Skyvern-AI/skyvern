@@ -61,8 +61,11 @@ export interface WorkflowCopilotChatRequest {
   supports_credential_pause?: boolean;
 }
 
+export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";
+
 export interface WorkflowCopilotCancelRequest {
   cancel_token: string;
+  source: WorkflowCopilotCancelSource;
 }
 
 export interface WorkflowCopilotChatHistoryMessage {
