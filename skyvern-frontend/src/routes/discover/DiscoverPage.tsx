@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { GetStartedModal } from "@/components/onboarding/GetStartedModal";
 import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingErrorBoundary";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
@@ -12,12 +12,9 @@ import {
 import { WorkflowTemplates } from "./WorkflowTemplates";
 import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
+import { useSearchParams } from "react-router-dom";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
-import { WorkingExampleInspector } from "@/components/onboarding/WorkingExampleInspector";
-import { OnboardingProgressBand } from "@/components/onboarding/OnboardingProgressBand";
-import { useOnboardingProgress } from "./useOnboardingProgress";
-import { onboardingExampleRequest } from "./onboardingExample";
 
 function getIntentExampleKey(
   intent: string | null | undefined,
@@ -34,31 +31,14 @@ function getIntentExampleKey(
   }
 }
 
-function DiscoverPage({
-  trackRemaining = 0,
-  onDismissHandoff,
-  trackDismissed = false,
-  trackPending = false,
-  onRestoreTrack,
-}: {
-  trackRemaining?: number;
-  onDismissHandoff?: () => void;
-  trackDismissed?: boolean;
-  trackPending?: boolean;
-  onRestoreTrack?: () => void;
-} = {}) {
+function DiscoverPage() {
   const enableCopilotHandoff =
     useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
   const createWorkflowMutation = useCreateWorkflowMutation();
   const createInFlight = useRef(false);
   const promptBoxRef = useRef<PromptBoxHandle>(null);
+  const handledFocus = useRef(false);
   const onboarding = useOnboardingStateOptional();
-  const {
-    progress,
-    isPending: onboardingProgressPending,
-    dismiss,
-    restore,
-  } = useOnboardingProgress();
 
   const createWorkflow = (
     request: Parameters<typeof createWorkflowMutation.mutate>[0],
@@ -72,18 +52,37 @@ function DiscoverPage({
     });
   };
 
-  const handleExampleCopy = () => {
-    createWorkflow({
-      ...onboardingExampleRequest,
-      _via: "onboarding_example",
-    });
-  };
-
-  const handleDescribeAgent = () => {
-    promptBoxRef.current?.focusAndPrefillExample(
-      getIntentExampleKey(onboarding?.state?.user_intent),
+  // `/discover?focus=prompt` is the sidebar card's first-agent link: focus + prefill once, then drop the param.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusPrompt = searchParams.get("focus") === "prompt";
+  useEffect(() => {
+    if (!focusPrompt) {
+      handledFocus.current = false;
+      return;
+    }
+    if (onboarding?.isLoading) return;
+    if (!handledFocus.current) {
+      const promptBox = promptBoxRef.current;
+      if (!promptBox) return;
+      handledFocus.current = true;
+      promptBox.focusAndPrefillExample(
+        getIntentExampleKey(onboarding?.state?.user_intent),
+      );
+    }
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("focus");
+        return next;
+      },
+      { replace: true },
     );
-  };
+  }, [
+    focusPrompt,
+    onboarding?.isLoading,
+    onboarding?.state?.user_intent,
+    setSearchParams,
+  ]);
 
   return (
     <div className="space-y-10">
@@ -116,27 +115,6 @@ function DiscoverPage({
           </Button>
         </div>
       </div>
-      <OnboardingProgressBand
-        progress={progress}
-        isPending={onboardingProgressPending}
-        onDismiss={dismiss}
-        onRestore={restore}
-        onDescribeAgent={handleDescribeAgent}
-        trackRemaining={trackRemaining}
-        onDismissHandoff={onDismissHandoff}
-        trackDismissed={trackDismissed}
-        trackPending={trackPending}
-        onRestoreTrack={onRestoreTrack}
-      >
-        {progress?.state === "active" ? (
-          <WorkingExampleInspector
-            isPending={
-              createWorkflowMutation.isPending || onboardingProgressPending
-            }
-            onMakeCopy={handleExampleCopy}
-          />
-        ) : null}
-      </OnboardingProgressBand>
       <WorkflowTemplates />
       {onboarding ? (
         <OnboardingErrorBoundary

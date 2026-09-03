@@ -1405,7 +1405,6 @@ class ForgeAgent:
         close_browser_on_completion: bool,
         browser_session_id: str | None,
         task_block: BaseTaskBlock | None = None,
-        workflow_permanent_id: str | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -2020,10 +2019,6 @@ class ForgeAgent:
                 starting_url=task.url,
                 downloads_dir=get_download_dir(download_id),
                 organization_id=organization.organization_id,
-                task_id=task.task_id,
-                # Task.workflow_permanent_id is never populated on the execution path (get_task
-                # builds Task without it); the caller sources it from the WorkflowRun row.
-                workflow_permanent_id=workflow_permanent_id,
                 max_action_steps=step_cap,
                 max_action_steps_ceiling=workflow_step_ceiling,
                 max_turns=max_turns,
@@ -2558,7 +2553,6 @@ class ForgeAgent:
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                         task_block=task_block,
-                        workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)

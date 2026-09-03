@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { StrictMode, useState } from "react";
+import { StrictMode, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   act,
   cleanup,
@@ -8,7 +8,12 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import {
+  MemoryRouter,
+  useLocation,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ConfirmedPatch,
@@ -19,22 +24,12 @@ import type {
 } from "@/store/onboarding/types";
 import { OnboardingContext } from "@/store/onboarding/useOnboardingState";
 import { DiscoverPage } from "./DiscoverPage";
-import { onboardingExampleRequest } from "./onboardingExample";
-
-type ProgressState = "active" | "dismissed" | "completed" | "ineligible";
-type ProgressActionKey = "first_agent_created" | "first_successful_run";
 
 const mocks = vi.hoisted(() => ({
   confirmed: vi.fn<(patch: ConfirmedPatch) => Promise<ConfirmedWriteResult>>(),
-  progressState: null as ProgressState | null,
-  completedCount: 0 as 0 | 1,
-  firstMilestoneComplete: false,
-  nextActionKey: "first_agent_created" as ProgressActionKey,
   createPending: false,
   createWorkflow: vi.fn(),
-  progressPending: false,
-  dismiss: vi.fn(),
-  restore: vi.fn(),
+  focusAndPrefillExample: vi.fn<(key: string) => void>(),
   telemetry: {
     registerVariant: vi.fn(),
     flowStarted: vi.fn(),
@@ -44,28 +39,6 @@ const mocks = vi.hoisted(() => ({
     modalRenderError: vi.fn(),
   },
 }));
-
-function progressForMocks() {
-  if (mocks.progressState === null) return null;
-  if (mocks.progressState !== "active") {
-    return { state: mocks.progressState };
-  }
-  return {
-    state: mocks.progressState,
-    completed_count: mocks.completedCount,
-    total_count: 2,
-    next_action_key: mocks.nextActionKey,
-    items: [
-      {
-        key: "first_agent_created",
-        completed_at: mocks.firstMilestoneComplete
-          ? "2026-08-20T12:00:00Z"
-          : null,
-      },
-      { key: "first_successful_run", completed_at: null },
-    ],
-  };
-}
 
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => "template-first",
@@ -107,6 +80,7 @@ vi.mock("@/routes/tasks/create/PromptBox", async () => {
       const textareaRef = React.useRef<HTMLTextAreaElement>(null);
       React.useImperativeHandle(ref, () => ({
         focusAndPrefillExample: (key) => {
+          mocks.focusAndPrefillExample(key);
           setValue((current) => (current.trim() ? current : key));
           textareaRef.current?.focus({ preventScroll: true });
         },
@@ -129,14 +103,6 @@ vi.mock("./WorkflowTemplates", () => ({
   WorkflowTemplates: () => (
     <div data-testid="discover-templates">templates</div>
   ),
-}));
-vi.mock("./useOnboardingProgress", () => ({
-  useOnboardingProgress: () => ({
-    progress: progressForMocks(),
-    isPending: mocks.progressPending,
-    dismiss: mocks.dismiss,
-    restore: mocks.restore,
-  }),
 }));
 vi.mock("@/components/onboarding/QuestionnaireDetailsStep", () => ({
   QuestionnaireDetailsStep: ({
@@ -207,19 +173,55 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().search}</span>;
+}
+
+function NavigationProbe() {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate("/discover?focus=prompt")}>
+      Focus prompt
+    </button>
+  );
+}
+
+function PlanCleanup({ children }: { children: ReactNode }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const handled = useRef(false);
+  useEffect(() => {
+    if (handled.current || !searchParams.has("plan")) return;
+    handled.current = true;
+    const next = new URLSearchParams(searchParams);
+    next.delete("plan");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+  return <>{children}</>;
+}
+
 function TestProvider({
   initialState,
   isNewUser = true,
+  initialEntries,
+  isLoading = false,
+  stateOverride,
+  showNavigation = false,
+  withPlanCleanup = false,
 }: {
   initialState: OnboardingState;
   isNewUser?: boolean;
+  initialEntries?: string[];
+  isLoading?: boolean;
+  stateOverride?: OnboardingState | null;
+  showNavigation?: boolean;
+  withPlanCleanup?: boolean;
 }) {
   const [state, setState] = useState(initialState);
   return (
     <OnboardingContext.Provider
       value={{
-        state,
-        isLoading: false,
+        state: stateOverride === undefined ? state : stateOverride,
+        isLoading,
         updateState: (patch) =>
           setState((current) => ({ ...current, ...patch })),
         updateStateConfirmed: async (patch) => {
@@ -234,8 +236,16 @@ function TestProvider({
         recoveryGuidanceAssignment: null,
       }}
     >
-      <MemoryRouter>
-        <DiscoverPage />
+      <MemoryRouter initialEntries={initialEntries}>
+        {withPlanCleanup ? (
+          <PlanCleanup>
+            <DiscoverPage />
+          </PlanCleanup>
+        ) : (
+          <DiscoverPage />
+        )}
+        <LocationProbe />
+        {showNavigation ? <NavigationProbe /> : null}
       </MemoryRouter>
     </OnboardingContext.Provider>
   );
@@ -245,21 +255,21 @@ function renderDiscover(
   initialState: OnboardingState,
   strict = false,
   isNewUser = true,
+  initialEntries?: string[],
 ) {
   const page = (
-    <TestProvider initialState={initialState} isNewUser={isNewUser} />
+    <TestProvider
+      initialState={initialState}
+      isNewUser={isNewUser}
+      initialEntries={initialEntries}
+    />
   );
   return render(strict ? <StrictMode>{page}</StrictMode> : page);
 }
 
 beforeEach(() => {
   sessionStorage.clear();
-  mocks.progressState = null;
   mocks.createPending = false;
-  mocks.completedCount = 0;
-  mocks.firstMilestoneComplete = false;
-  mocks.nextActionKey = "first_agent_created";
-  mocks.progressPending = false;
   mocks.confirmed.mockResolvedValue({
     onboarding_state: baseState,
     launch_date_at_signup: "2026-01-01T00:00:00Z",
@@ -272,6 +282,127 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("DiscoverPage focus param", () => {
+  const resolvedState = {
+    ...baseState,
+    user_intent: "fill_forms",
+    questionnaire_prompted_at: "2026-08-27T00:00:00Z",
+    questionnaire: questionnaire(true),
+  };
+
+  it("focuses and prefills once, preserving unrelated search params", async () => {
+    renderDiscover(resolvedState, false, true, [
+      "/discover?focus=prompt&foo=bar",
+    ]);
+    const prompt = await screen.findByLabelText("Discover prompt");
+    await waitFor(() =>
+      expect(mocks.focusAndPrefillExample).toHaveBeenCalledOnce(),
+    );
+    expect(mocks.focusAndPrefillExample).toHaveBeenCalledWith(
+      "contact_us_forms",
+    );
+    expect((prompt as HTMLTextAreaElement).value).toBe("contact_us_forms");
+    expect(document.activeElement).toBe(prompt);
+    expect(screen.getByTestId("location").textContent).toBe("?foo=bar");
+    expect(mocks.createWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("waits for onboarding intent before consuming the focus param", async () => {
+    const view = render(
+      <TestProvider
+        initialState={resolvedState}
+        stateOverride={null}
+        isLoading
+        initialEntries={["/discover?focus=prompt"]}
+      />,
+    );
+    expect(mocks.focusAndPrefillExample).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location").textContent).toBe("?focus=prompt");
+
+    view.rerender(
+      <TestProvider
+        initialState={resolvedState}
+        stateOverride={resolvedState}
+        initialEntries={["/discover?focus=prompt"]}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(mocks.focusAndPrefillExample).toHaveBeenCalledOnce(),
+    );
+    expect(mocks.focusAndPrefillExample).toHaveBeenCalledWith(
+      "contact_us_forms",
+    );
+    expect(screen.getByTestId("location").textContent).toBe("");
+  });
+
+  it("prefills exactly once in StrictMode", async () => {
+    renderDiscover(resolvedState, true, true, ["/discover?focus=prompt"]);
+    await waitFor(() =>
+      expect(mocks.focusAndPrefillExample).toHaveBeenCalledOnce(),
+    );
+  });
+
+  it("does nothing when the focus param is absent", () => {
+    renderDiscover(resolvedState, false, true, ["/discover?foo=bar"]);
+    expect(mocks.focusAndPrefillExample).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location").textContent).toBe("?foo=bar");
+  });
+
+  it("preserves a typed draft during same-page focus navigation", async () => {
+    render(
+      <TestProvider
+        initialState={resolvedState}
+        initialEntries={["/discover"]}
+        showNavigation
+      />,
+    );
+    const prompt = screen.getByLabelText("Discover prompt");
+    fireEvent.change(prompt, { target: { value: "my draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Focus prompt" }));
+
+    await waitFor(() =>
+      expect(mocks.focusAndPrefillExample).toHaveBeenCalledOnce(),
+    );
+    expect((prompt as HTMLTextAreaElement).value).toBe("my draft");
+    expect(document.activeElement).toBe(prompt);
+    expect(screen.getByTestId("location").textContent).toBe("");
+  });
+
+  it("handles a later same-page focus navigation again", async () => {
+    render(
+      <TestProvider
+        initialState={resolvedState}
+        initialEntries={["/discover?focus=prompt&foo=bar"]}
+        showNavigation
+      />,
+    );
+    await waitFor(() =>
+      expect(mocks.focusAndPrefillExample).toHaveBeenCalledOnce(),
+    );
+    expect(screen.getByTestId("location").textContent).toBe("?foo=bar");
+    fireEvent.click(screen.getByRole("button", { name: "Focus prompt" }));
+    await waitFor(() =>
+      expect(mocks.focusAndPrefillExample).toHaveBeenCalledTimes(2),
+    );
+    expect(screen.getByTestId("location").textContent).toBe("");
+  });
+
+  it("strips the param again when an ancestor writer restores it in the same commit", async () => {
+    render(
+      <TestProvider
+        initialState={resolvedState}
+        initialEntries={["/discover?focus=prompt&plan=pro&foo=bar"]}
+        withPlanCleanup
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("location").textContent).toBe("?foo=bar"),
+    );
+    expect(mocks.focusAndPrefillExample).toHaveBeenCalledOnce();
+  });
+});
+
 describe("DiscoverPage onboarding mount", () => {
   it("preserves content order and mounts over seeded template data", async () => {
     renderDiscover(baseState);
@@ -279,6 +410,9 @@ describe("DiscoverPage onboarding mount", () => {
     expect(content?.textContent).toBe(
       "Create an agentpromptSkip — start with blank canvas →templates",
     );
+    expect(screen.queryByText("Build your first agent")).toBeNull();
+    expect(screen.queryByText(/Keep going/)).toBeNull();
+    expect(screen.queryByText("Resume getting started")).toBeNull();
     expect(await screen.findByRole("dialog")).toBeTruthy();
   });
 
@@ -369,7 +503,11 @@ describe("DiscoverPage onboarding mount", () => {
   });
 
   it("renders without onboarding UI when no provider exists", () => {
-    render(<DiscoverPage />);
+    render(
+      <MemoryRouter>
+        <DiscoverPage />
+      </MemoryRouter>,
+    );
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(mocks.telemetry.modalRenderError).not.toHaveBeenCalled();
   });
@@ -421,149 +559,4 @@ describe("DiscoverPage onboarding mount", () => {
     expect(mocks.telemetry.questionnaireShown).not.toHaveBeenCalled();
     expect(mocks.confirmed).not.toHaveBeenCalled();
   });
-});
-
-describe("DiscoverPage progress surfaces", () => {
-  it("renders after PromptBox without an eager write, single-flights creation, and preserves focus on dismissal", () => {
-    mocks.progressState = "active";
-    const { container, rerender } = render(<DiscoverPage />);
-    expect(container.innerHTML).toMatch(
-      /<h1[^>]*>Create an agent<\/h1>.*prompt.*Build your first agent.*What a finished run looks like.*templates/s,
-    );
-    expect(screen.getByText("1 of 3")).toBeTruthy();
-    expect(mocks.createWorkflow).not.toHaveBeenCalled();
-
-    const describeAgent = screen.getByRole("button", {
-      name: "Describe your first agent",
-    });
-    const prompt = screen.getByRole("textbox", { name: "Discover prompt" });
-    fireEvent.change(prompt, { target: { value: "Keep my typed prompt" } });
-    fireEvent.click(describeAgent);
-    expect((prompt as HTMLTextAreaElement).value).toBe("Keep my typed prompt");
-    expect(document.activeElement).toBe(prompt);
-    expect(mocks.createWorkflow).not.toHaveBeenCalled();
-
-    const workingExampleLink = screen.getByRole("link", {
-      name: "or copy a working example",
-    });
-    const workingExampleHeading = screen.getByRole("heading", {
-      name: "What a finished run looks like",
-    });
-    expect(workingExampleLink.getAttribute("href")).toBe(
-      "#working-example-heading",
-    );
-    expect(workingExampleHeading.getAttribute("tabindex")).toBe("-1");
-    workingExampleLink.focus();
-    expect(document.activeElement).toBe(workingExampleLink);
-    fireEvent.keyDown(workingExampleLink, { key: "Enter" });
-    fireEvent.click(workingExampleLink);
-    expect(document.activeElement).toBe(workingExampleHeading);
-    const copy = screen.getByRole("button", { name: "Make a copy" });
-    const skip = screen.getByRole("button", {
-      name: /Skip — start with blank canvas/,
-    });
-    fireEvent.click(copy);
-    fireEvent.click(skip);
-    expect(mocks.createWorkflow).toHaveBeenCalledTimes(1);
-    expect(mocks.createWorkflow).toHaveBeenCalledWith(
-      {
-        ...onboardingExampleRequest,
-        _via: "onboarding_example",
-      },
-      { onSettled: expect.any(Function) },
-    );
-
-    mocks.createWorkflow.mock.calls[0]?.[1]?.onSettled?.();
-    fireEvent.click(skip);
-    expect(mocks.createWorkflow).toHaveBeenCalledTimes(2);
-
-    const hide = screen.getByRole("button", { name: "Hide setup" });
-    hide.focus();
-    fireEvent.click(hide);
-    expect(mocks.dismiss).toHaveBeenCalledTimes(1);
-
-    mocks.progressPending = true;
-    rerender(<DiscoverPage />);
-    const pendingHide = screen.getByRole("button", { name: "Hide setup" });
-    expect(pendingHide).toBe(hide);
-    expect(document.activeElement).toBe(pendingHide);
-    expect(pendingHide.getAttribute("aria-disabled")).toBe("true");
-    expect(pendingHide.hasAttribute("disabled")).toBe(false);
-    fireEvent.click(pendingHide);
-    expect(mocks.dismiss).toHaveBeenCalledTimes(1);
-
-    mocks.progressState = "dismissed";
-    mocks.progressPending = false;
-    rerender(<DiscoverPage />);
-    const resume = screen.getByRole("button", { name: "Resume setup" });
-    expect(resume).toBe(hide);
-    expect(document.activeElement).toBe(resume);
-    expect(screen.queryByText("What a finished run looks like")).toBeNull();
-    fireEvent.click(resume);
-    expect(mocks.restore).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([
-    ["fill_forms", "contact_us_forms"],
-    ["extract_data", "hackernews"],
-    ["monitor_website", "AAPLStockPrice"],
-    ["something_else", "finditparts"],
-    [null, "finditparts"],
-  ] as const)(
-    "prefills the %s intent example without creating",
-    (intent, key) => {
-      mocks.progressState = "active";
-      renderDiscover({
-        ...baseState,
-        user_intent: intent,
-        questionnaire_prompted_at: "2026-08-27T00:00:00Z",
-        questionnaire: questionnaire(true),
-      });
-
-      fireEvent.click(
-        screen.getByRole("button", { name: "Describe your first agent" }),
-      );
-      const prompt = screen.getByRole("textbox", { name: "Discover prompt" });
-      expect((prompt as HTMLTextAreaElement).value).toBe(key);
-      expect(document.activeElement).toBe(prompt);
-      expect(mocks.createWorkflow).not.toHaveBeenCalled();
-    },
-  );
-
-  it("briefly celebrates an active to completed transition", () => {
-    vi.useFakeTimers();
-    mocks.progressState = "active";
-    mocks.completedCount = 1;
-    mocks.firstMilestoneComplete = true;
-    mocks.nextActionKey = "first_successful_run";
-    const { rerender } = render(
-      <MemoryRouter>
-        <DiscoverPage />
-      </MemoryRouter>,
-    );
-
-    mocks.progressState = "completed";
-    rerender(
-      <MemoryRouter>
-        <DiscoverPage />
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole("status").textContent).toContain("3 of 3 complete");
-    expect(screen.queryByText("What a finished run looks like")).toBeNull();
-
-    act(() => vi.advanceTimersByTime(1800));
-    expect(screen.queryByText("First agent ready")).toBeNull();
-    vi.useRealTimers();
-  });
-
-  it.each(["completed", "ineligible", null] as const)(
-    "retires all progress surfaces for %s progress",
-    (state) => {
-      mocks.progressState = state;
-      render(<DiscoverPage />);
-      expect(document.body.textContent).not.toMatch(
-        /Build your first agent|What a finished run looks like|Hide setup|Resume setup/,
-      );
-    },
-  );
 });
