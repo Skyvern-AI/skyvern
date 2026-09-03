@@ -100,7 +100,6 @@ from skyvern.forge.sdk.copilot.context import (
     record_approved_credentials_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
-from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     _elapsed_run_seconds,
@@ -4838,16 +4837,12 @@ async def _run_copilot_turn_impl(
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
-        preflight_resolution = None
-        if credential_pause_reason(ctx) is not None:
-            preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
-        if preflight_resolution is None:
-            return _build_request_policy_clarification_result(
-                request_policy,
-                prior_global_llm_context=global_llm_context,
-                prior_workflow_yaml=chat_request.workflow_yaml,
-                ctx=ctx,
-            )
+        return _build_request_policy_clarification_result(
+            request_policy,
+            prior_global_llm_context=global_llm_context,
+            prior_workflow_yaml=chat_request.workflow_yaml,
+            ctx=ctx,
+        )
     if request_policy is None:
         raise CopilotRequestPolicyMissingError()
 

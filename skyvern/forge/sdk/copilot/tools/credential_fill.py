@@ -14,7 +14,13 @@ from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
+from skyvern.forge.sdk.copilot.credential_pause import (
+    credential_pause_transport_ready,
+    defang_card_text,
+    request_credential_pause,
+)
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
@@ -356,6 +362,87 @@ def _user_provided_site_url_match(policy: RequestPolicy, page_url: str) -> tuple
         if _still_on_admitted_site(page_url, url):
             return url, False
     return None, False
+
+
+_CREDENTIAL_CARD_FALLBACK = (
+    "Ask the user in prose to add the login on the Credentials page and reply with its exact saved name."
+)
+
+
+def _unprovided_login_page_error(login_page_url: str) -> str:
+    origin = loggable_origin(login_page_url) if login_page_url else "that page"
+    return (
+        f"No credential can be requested for {origin}: that site has not been named in this chat. "
+        "The sign-in page URL has to come from the user before a login can be requested for it."
+    )
+
+
+async def _request_credential(login_page_url: str, reason: str, copilot_ctx: CopilotContext) -> dict[str, Any]:
+    policy = copilot_ctx.request_policy
+    if not isinstance(policy, RequestPolicy) or _user_provided_site_url_match(policy, login_page_url)[0] is None:
+        return {"ok": False, "error": _unprovided_login_page_error(login_page_url)}
+
+    if copilot_ctx.credential_pause_used:
+        return {
+            "ok": True,
+            "status": "already_asked",
+            "outcome": copilot_ctx.credential_pause_outcome or "unanswered",
+            "next": "Continue without re-asking this turn.",
+        }
+
+    config = copilot_ctx.copilot_config
+    if config is None or not credential_pause_transport_ready(copilot_ctx, config):
+        LOG.info(
+            "copilot_credential_card_unavailable",
+            flag_enabled=config is not None and config.credential_pause_enabled,
+            client_supports=copilot_ctx.client_supports_credential_pause,
+            shared_cache=getattr(getattr(app, "CACHE", None), "is_shared", False),
+        )
+        return {
+            "ok": True,
+            "status": "unavailable",
+            "detail": "The in-chat credential card cannot be shown on this turn.",
+            "fallback": _CREDENTIAL_CARD_FALLBACK,
+        }
+
+    policy.credential_ask_login_page_urls = [login_page_url]
+    resolution = await request_credential_pause(
+        copilot_ctx,
+        login_page_url=login_page_url,
+        message=defang_card_text(reason),
+        stream=copilot_ctx.stream,
+        copilot_config=config,
+    )
+    credential = resolution.credential if resolution is not None else None
+    if resolution is None or (resolution.action == "connected" and credential is None):
+        return {
+            "ok": True,
+            "status": "unanswered",
+            "outcome": copilot_ctx.credential_pause_outcome or "timeout",
+            "next": (
+                "The user did not answer the card. Continue without the credential: keep the credential "
+                "parameter placeholder in the draft and do not ask again this turn."
+            ),
+        }
+    if credential is None:
+        return {
+            "ok": True,
+            "status": "skipped",
+            "next": (
+                "The user chose not to connect a credential now. Keep the credential parameter placeholder "
+                "in the draft, do not ask again this turn, and say a test run may stop at the login step."
+            ),
+        }
+    return {
+        "ok": True,
+        "status": "connected",
+        "credential_id": credential.credential_id,
+        "credential_name": credential.name,
+        "next": (
+            "Bind this credential as the workflow's credential parameter and continue the build; run the "
+            "blocks that were waiting on the login."
+        ),
+    }
 
 
 def _request_settled_credential(policy: RequestPolicy, credential_id: str) -> bool:

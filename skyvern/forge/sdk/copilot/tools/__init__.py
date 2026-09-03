@@ -24,6 +24,10 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_pause import (
+    await_pending_credential_pause,
+    release_credential_pause_gate,
+)
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -111,6 +115,7 @@ from .credential_fill import _credential_fill_authority_error as _credential_fil
 from .credential_fill import _credential_fill_prerequisite_error as _credential_fill_prerequisite_error
 from .credential_fill import (
     _fill_credential_field_impl,
+    _request_credential,
 )
 from .credential_fill import _resolve_credential_fill_value as _resolve_credential_fill_value
 from .credentials import _credential_id_misbinding_findings as _credential_id_misbinding_findings
@@ -467,6 +472,7 @@ async def edit_block_and_run_tool(
     credential and reply with the credential name; do not build or run with the raw value.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     requested_labels = list(block_labels) if block_labels else [label]
@@ -793,6 +799,35 @@ async def list_credentials_tool(
     return json.dumps(sanitized)
 
 
+@function_tool(name_override="request_credential")
+async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, reason: str) -> str:
+    """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
+
+    Use this instead of writing a prose question when the turn needs a login and no saved
+    credential covers that site. `login_page_url` must be a page on a site the user themselves
+    provided in this chat; `reason` is one sentence shown to the user saying why the login is
+    needed. The call waits for the user's answer and comes back `connected` with the credential
+    to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
+    carries. One ask per turn.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"login_page_url": login_page_url, "reason": reason}
+    result: dict[str, Any] = {}
+    try:
+        authority_error = _authority_tool_error(copilot_ctx, "request_credential")
+        if authority_error:
+            result = {"ok": False, "error": authority_error}
+        else:
+            result = await _request_credential(login_page_url, reason, copilot_ctx)
+    finally:
+        # A card on screen right now owns the gate; this call must not open it for one it never
+        # raised. Every other exit has to release, including a repeat ask in a later response.
+        if not copilot_ctx.credential_ask_in_flight:
+            release_credential_pause_gate(copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "request_credential", arguments, result)
+    return json.dumps(result)
+
+
 @function_tool(name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
@@ -888,6 +923,7 @@ async def run_blocks_tool(
     evidence instead of retrying guessed URL params or page structure.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
@@ -1032,6 +1068,7 @@ async def update_and_run_blocks_tool(
     do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
+    await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
@@ -1499,4 +1536,5 @@ NATIVE_TOOLS = [
     inspect_page_for_composition_tool,
     inspect_locator_matches_tool,
     fill_credential_field_tool,
+    request_credential_tool,
 ]
