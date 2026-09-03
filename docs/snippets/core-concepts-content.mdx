@@ -188,7 +188,7 @@ A Schedule runs an agent automatically on a recurring basis. You define a cron e
 
 <CodeGroup>
 ```python Python
-result = await client.agent.create_workflow_schedule(
+result = await client.schedules.create(
     workflow_permanent_id="wpid_abc123",
     cron_expression="0 9 * * 1-5",  # Weekdays at 9 AM
     timezone="America/New_York",
