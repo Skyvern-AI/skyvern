@@ -34,6 +34,7 @@ from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.core.script_generations.fuzzy_matcher import (
     match_option_exact_or_stem,
     match_option_exact_or_stem_with_tier,
+    normalize_option_label,
 )
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
 from skyvern.forge.taskv3.loop import (
@@ -64,7 +65,7 @@ OBSERVE_URL_MAX_CHARS = 300
 # click menu probe, data-tv3-act by act-by-mark (written transiently on the look-resolved element
 # just before the action and cleared after). Each exists only where we set it, so one that matches
 # nothing now cannot reappear without a fresh observe / menu-opening click / look.
-_TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act)?="[^"\\]+"\]$')
+_TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act|-sugg)?="[^"\\]+"\]$')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe hands such a
 # selector out under a short alias instead, resolved back before any handler sees it.
@@ -718,7 +719,61 @@ def _match_option_exact(value: str, options: list[dict[str, Any]]) -> int | None
     return rows[idx][0] if idx is not None and tier == "exact" else None
 
 
-def _match_menu_option(value: str, options: list[dict[str, Any]]) -> int | None:
+def _exact_tier_key(text: str) -> str:
+    """The exact tier's own equality key — `_canon_label` plus the shared matcher's case/apostrophe fold —
+    for pre-filters asking "which rows did that tier see as this value". A plain `_canon_label` filter
+    folds less than the tier does and would disagree with it, so pre-filters must use this key instead.
+    """
+    return normalize_option_label(_canon_label(text))
+
+
+def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
+    """Whether ≥2 matched rows are the SAME candidate rendered more than once: canonical TEXT agreement
+    across every row is the load-bearing check, and a present aria-label, `val`, or other declared value
+    is a VETO on top of it — one disagreeing across otherwise-text-identical rows marks them distinct, an
+    absent one never does. Returns the FIRST row's `n` when the whole set collapses to one candidate, else
+    None so the caller keeps refusing.
+    """
+    if len(rows) < 2:
+        return None
+    texts = {_canon_label(str(o.get("text") or "")) for o in rows}
+    if len(texts) != 1:
+        return None
+    # The tagged leaf and its option ancestor are independent name surfaces: a shared leaf label
+    # ("Choose") must not mask ancestors that disagree, so each position vetoes on its own.
+    for surface in range(2):
+        names = {
+            _canon_label(str((o.get("labels") or [None, None])[surface]))
+            for o in rows
+            if (o.get("labels") or [None, None])[surface]
+        }
+        if len(names) >= 2:
+            return None
+    present_labels = {_canon_label(str(o.get("label"))) for o in rows if o.get("label")}
+    if len(present_labels) >= 2:
+        return None
+    # Vals are machine identifiers, not display text: compared byte-exact, never case/Unicode-folded,
+    # so "ID-A" and "id-a" stay two candidates. `vals` is the collapse's OWN read of the other value
+    # surfaces (data-code, data-key, name, title, ...) — unfiltered by the commit verifier's numeric/
+    # length drops, so "101" vs "202" is a real disagreement here. Non-empty sets must agree byte-exact;
+    # an empty set says nothing and cannot contradict.
+    present_vals = {str(o.get("val")) for o in rows if o.get("val") is not None}
+    if len(present_vals) >= 2:
+        return None
+    # Sets must be NESTED, not equal: an a11y copy often mirrors only a subset of the primary row's
+    # attributes ({"55", "New York"} beside {"55"} is one candidate). Two sets neither containing the
+    # other carry a genuine disagreement and refuse.
+    val_sets = [frozenset(str(v) for v in o.get("vals") or []) for o in rows]
+    non_empty_sets = [s for s in val_sets if s]
+    for i, a in enumerate(non_empty_sets):
+        for b in non_empty_sets[i + 1 :]:
+            if not (a <= b or b <= a):
+                return None
+    n = rows[0].get("n")
+    return n if isinstance(n, int) else None
+
+
+def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_duplicates: bool = False) -> int | None:
     """Pick the enumerated menu row (its data-tv3-menu index) whose label matches the wanted value.
 
     Deterministic and site-agnostic, precision-first. Exact/singular-plural-stem matching (apostrophe
@@ -731,6 +786,13 @@ def _match_menu_option(value: str, options: list[dict[str, Any]]) -> int | None:
     inside "Prefer not to answer"). Ambiguity or no match returns None so the caller hands the options
     back to the model. Uniqueness is only meaningful over the COMPLETE list — the caller must not pass a
     truncated slice.
+
+    `collapse_duplicates` is for the one call site that reads the whole, non-overflowed menu: when the
+    exact/stem tier or the prefix tier finds more than one hit, it hands those rows to
+    `_lone_duplicate_candidate` before giving up — a value that matches several DOM rows wearing the
+    same candidate still resolves, while several genuinely distinct rows still refuse. Off by default so
+    a caller working from a partial or reconstructed row set (a virtualised scroll-search window) never
+    collapses on incomplete evidence.
     """
     rows = [(o.get("n"), str(o.get("text") or "")) for o in options if isinstance(o.get("n"), int)]
     if not value or not rows:
@@ -738,9 +800,36 @@ def _match_menu_option(value: str, options: list[dict[str, Any]]) -> int | None:
 
     # Canonicalize before the exact/stem tier — the shared normalizer folds case and apostrophes but
     # not internal spacing, Unicode forms or zero-width characters.
-    hit = match_option_exact_or_stem(_canon_label(value), [_canon_label(label) for _, label in rows])
+    want_canon = _canon_label(value)
+    hit = match_option_exact_or_stem(want_canon, [_canon_label(label) for _, label in rows])
     if hit is not None:
         return rows[hit][0]
+    if collapse_duplicates:
+        want_key = _exact_tier_key(value)
+        exact_matched = [
+            o for o in options if isinstance(o.get("n"), int) and _exact_tier_key(str(o.get("text") or "")) == want_key
+        ]
+        if len(exact_matched) >= 2:
+            collapsed = _lone_duplicate_candidate(exact_matched)
+            if collapsed is not None:
+                return collapsed
+        elif not exact_matched:
+            # Mirror the shared matcher's stem tier (trailing-s stem, 3-char floor) so a duplicated row
+            # that would stem-commit as a lone row still collapses. Only when the exact tier saw
+            # NOTHING — the matcher never consults stems once exact matches exist.
+            want_stem = want_key.rstrip("s")
+            if len(want_stem) >= 3:
+                stem_matched = [
+                    o
+                    for o in options
+                    if isinstance(o.get("n"), int)
+                    and len(k := _exact_tier_key(str(o.get("text") or "")).rstrip("s")) >= 3
+                    and k == want_stem
+                ]
+                if len(stem_matched) >= 2:
+                    collapsed = _lone_duplicate_candidate(stem_matched)
+                    if collapsed is not None:
+                        return collapsed
 
     def toks(s: str) -> list[str]:
         # Fold commas and apostrophes so a short value token-prefix-matches a punctuated label ("Yes" →
@@ -752,7 +841,13 @@ def _match_menu_option(value: str, options: list[dict[str, Any]]) -> int | None:
     if not want:
         return None
     prefixed = [n for n, label in rows if (t := toks(label)) and len(want) < len(t) and t[: len(want)] == want]
-    return prefixed[0] if len(prefixed) == 1 else None
+    if len(prefixed) == 1:
+        return prefixed[0]
+    if collapse_duplicates and len(prefixed) > 1:
+        prefixed_ns = set(prefixed)
+        prefixed_rows = [o for o in options if isinstance(o.get("n"), int) and o.get("n") in prefixed_ns]
+        return _lone_duplicate_candidate(prefixed_rows)
+    return None
 
 
 def _ambiguous_rows_error(
@@ -775,6 +870,61 @@ def _ambiguous_rows_error(
     tail = f" ({note})" if note else ""
     return ToolResult.error(
         f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
+    )
+
+
+def _row_value_suffix(o: dict[str, Any]) -> str:
+    """Every present distinguishing surface for one row — value, accessible label, then any other
+    declared value (data-code, data-key, ...) — each truncated to 60 chars like the row text already is,
+    so a page-controlled attribute can never blow a refusal message up wholesale. Surfaces are additive
+    (not first-match), since the veto may have come from a surface other than the first one present.
+    """
+    parts = ""
+    if o.get("val") is not None:
+        parts += f" (value {str(o.get('val'))[:60]!r})"
+    if o.get("label"):
+        parts += f" (label {str(o.get('label'))[:60]!r})"
+    # `vals` entries are attribute-keyed for comparison; render only the value part, and subtract
+    # what the value surface already showed so a row never prints one value twice.
+    shown_already = {str(o.get("val")).strip()} if o.get("val") is not None else set()
+    vals = [bare[:60] for v in (o.get("vals") or []) if (bare := str(v).split("=", 1)[-1]) not in shown_already]
+    if vals:
+        shown_vals = vals[:3]
+        more = "; ..." if len(vals) > 3 else ""
+        parts += f" (values {'; '.join(repr(v) for v in shown_vals)}{more})"
+    return parts
+
+
+def _identical_text_rows_error(
+    selector: str, value: str, rows: list[dict[str, Any]], *, tags_live: bool = True, note: str | None = None
+) -> ToolResult:
+    """The refusal owed when ≥2 rows match the value at the exact tier and are not one duplicate-rendered
+    candidate: the exact tier folds case/apostrophes, so every row already IS the requested text and only
+    a direct click on a named row can choose between them. With `tags_live` the query stays typed and the
+    rows' [data-tv3-sugg="N"] tags stay clickable; otherwise the field's prior value is restored and the
+    refusal directs a re-open instead.
+    """
+    shown = rows[:15]
+
+    def _sel(o: dict[str, Any]) -> str:
+        # A selector is only named while it can be honored: after a restore the list may have closed
+        # and the stale tags may re-land on different rows at the next scan.
+        return f'[data-tv3-sugg="{o.get("n")}"] ' if tags_live else ""
+
+    listing = "; ".join(f"{_sel(o)}{str(o.get('text') or '')[:60]!r}{_row_value_suffix(o)}" for o in shown)
+    more = len(rows) - len(shown)
+    next_step = (
+        'click the intended row directly by its [data-tv3-sugg="N"] selector; the typed query was left '
+        "in the field to keep the list open for that click"
+        if tags_live
+        else "type the value to reopen the list, then click the intended row directly; the field's "
+        "prior value was put back"
+    )
+    tail = f" ({note})" if note else ""
+    return ToolResult.error(
+        f"{value!r} matches {len(rows)} rows in {selector} whose labels the exact matcher cannot tell "
+        f"apart by text: {listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step} — the field "
+        "is NOT filled"
     )
 
 
@@ -4121,28 +4271,109 @@ _FIND_MENU_JS = (
 # 15th row, or a label longer than 60 chars, is neither missed nor matched on a cut-off token. `nav`
 # marks a row this tool must not auto-click. `arg.attr` selects which tagger's rows to read ("menu" for
 # _FIND_MENU_JS, "sugg" for _FIND_SUGGESTION_JS) so the same full-length read serves both.
+# `val` and `label` are the identity a duplicate-rendered candidate carries when its TEXT does not: a
+# widget that paints the same option as two DOM rows (an a11y copy, a portal+inline render) still gives
+# them the same accessible name, and only a genuinely distinct value ever differs between them.
 _MENU_OPTION_TEXTS_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
+    + _DECLARED_VALUES_JS
     + r"""
   const attr = (arg && arg.attr) || 'menu';
+  // The tagger tags the innermost leaf, which may hold none of a row's accessible-name attributes
+  // (a `<span>` inside `<li role="option" aria-label="...">`) -- so the name is read from BOTH the
+  // tagged leaf and its OPT_SEL ancestor, aria-label before aria-labelledby at each, first non-empty wins.
+  const resolveLabelledby = (node) => {
+    if (!node || !node.getAttribute) return '';
+    const idref = node.getAttribute('aria-labelledby');
+    if (!idref) return '';
+    try {
+      const root = node.getRootNode ? node.getRootNode() : document;
+      const parts = [];
+      for (const id of idref.split(/\s+/).filter(Boolean)) {
+        const ref = root && root.getElementById ? root.getElementById(id) : document.getElementById(id);
+        if (ref) parts.push((ref.textContent || '').trim());
+      }
+      return parts.join(' ').trim();
+    } catch (e) { return ''; }
+  };
+  const accessibleName = (node) => {
+    if (!node || !node.getAttribute) return '';
+    // aria-labelledby outranks aria-label in accessible-name computation: rows sharing a generic
+    // aria-label can still be named apart by their labelledby targets.
+    const lb = resolveLabelledby(node);
+    if (lb) return lb;
+    const al = node.getAttribute('aria-label');
+    return al && al.trim() ? al.trim() : '';
+  };
   return Array.from(pQSA('[data-tv3-' + attr + ']')).map((el) => {
-    // The tagger tags the innermost leaf; an option whose ancestor declares aria-setsize is a child
-    // that declares none, so read the closest declaring ancestor or the incomplete-list guard is bypassed.
+    // An option whose ancestor declares aria-setsize is a child that declares none, so read the
+    // closest declaring ancestor or the incomplete-list guard is bypassed.
     const nav = isNavRow(el);
+    // A grid combobox stores a candidate's identity on the [role=row] ancestor while the tagged
+    // element is its gridcell — the row is the option-equivalent surface for the veto walk.
+    const opt = composedClosest(el, OPT_SEL) || composedClosest(el, '[role="row"]');
     const setEl = composedClosest(el, '[aria-setsize]');
     const setsize = setEl ? parseInt(setEl.getAttribute('aria-setsize'), 10) : NaN;
     // `pos` is the row's top in the scroller's own coordinate space (scroll-invariant), so a row seen
     // in two overlapping windows reads the same and two rows wearing one text read apart.
     const sc = pQS('[data-tv3-menu-scroller]');
     const pos = sc ? Math.round(el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop) : null;
+    let val = null;
+    if (el.tagName === 'OPTION') {
+      // The DOM `.value` IDL is the spec submission value ALREADY -- an explicit `value=""` and an
+      // absent attribute (which falls back to the option's own text) are genuinely distinct submission
+      // values even though both can display identical text, so this always reads it, never null.
+      val = String(el.value);
+    } else {
+      // Same presence rule as the OPTION branch: an attribute that EXISTS is a present value even
+      // when empty -- `data-value=""` next to `data-value="x"` is a real disagreement, not absence.
+      const dv = el.getAttribute('data-value');
+      const va = el.getAttribute('value');
+      val = dv !== null ? dv : va;
+    }
+    // The collapse's OWN value read: the verifier's declaredValues drops all-digit and >40-char
+    // values on purpose (they must not CONFIRM a commit), but for telling two same-text rows apart a
+    // disagreeing "101" vs "202" is exactly the signal — so this keeps every non-empty value on the
+    // same attribute allowlist, from the leaf and its option ancestor.
+    const VETO_ATTR = /^(value|data-value|data-val|data-v|data-code|data-key|data-option-value|name|title)$/;
+    // value/data-value keep presence semantics even when empty: a wrapped ancestor's data-value=""
+    // next to its twin's data-value="x" is a real disagreement, not absence.
+    const VETO_EXPLICIT = /^(value|data-value)$/;
+    const vetoVals = [];
+    try {
+      for (const node of new Set([el, opt || el])) {
+        for (const a of node.attributes) {
+          if (!VETO_ATTR.test(a.name)) continue;
+          // Trimmed for comparison: whitespace drift between a portal copy and an inline copy is
+          // exactly the duplicate-render shape this collapse exists for.
+          let v = String(a.value).trim();
+          if (!v && !VETO_EXPLICIT.test(a.name)) continue;
+          // A long value is fingerprinted (prefix + length), never dropped: dropping it made the
+          // veto blind to distinct long values, while the fingerprint still tells apart any pair
+          // differing in prefix or length. Only identical-prefix-same-length pairs read as equal.
+          if (v.length > 512) v = v.slice(0, 512) + '#len' + v.length;
+          // Keyed by attribute: crossed values across surfaces (data-code="A" data-key="B" beside
+          // data-code="B" data-key="A") are a disagreement an unkeyed set cannot see.
+          vetoVals.push(a.name + '=' + v);
+        }
+      }
+    } catch (e) { /* attributes unreadable: no veto values */ }
     return {
       n: parseInt(el.getAttribute('data-tv3-' + attr), 10),
       text: (el.innerText || el.textContent || '').trim(),
       nav: nav,
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
       pos: pos,
+      val: val,
+      vals: vetoVals.slice(0, 12),
+      // Names are FULL veto inputs (truncation happens only where a message renders them): a slice
+      // here would read two labels diverging past the cut as equal and collapse distinct rows.
+      label: (accessibleName(el) || accessibleName(opt)) || null,
+      // Leaf and ancestor names as separate veto surfaces: a shared leaf label ("Choose") must not
+      // mask option ancestors whose names disagree.
+      labels: [accessibleName(el) || null, opt ? accessibleName(opt) || null : null],
     };
   });
 }"""
@@ -7626,7 +7857,17 @@ def build_browser_tools(
                 rows = await _full_rows()
                 declared_size = max((int(o.get("setsize") or 0) for o in rows), default=0)
                 overflow = declared_size if rows and declared_size > len(rows) else 0
-                return True, rows, _pick(rows), overflow
+                idx = _pick(rows)
+                if idx is None and overflow == 0:
+                    # No exact-label winner over the complete rendered list — but "several rows" may be
+                    # one candidate wearing more than one face (an a11y duplicate, a portal+inline
+                    # render). Collapse only over the FULL list (never a partial/overflowed one), and
+                    # only to a genuinely lone survivor; several distinct candidates still refuse below.
+                    want = _exact_tier_key(value)
+                    matched = [o for o in rows if _exact_tier_key(str(o.get("text") or "")) == want]
+                    if len(matched) >= 2:
+                        idx = _lone_duplicate_candidate(matched)
+                return True, rows, idx, overflow
             return False, tagged, (_match_option_exact(value, tagged) if exact_only else 1), 0
 
         async def _row_info(n: int) -> dict[str, Any]:
@@ -8001,7 +8242,20 @@ def build_browser_tools(
                 # The raw text left behind is exactly what a typeahead discards, so "typed into X" here
                 # is a false success -- name the rows instead and hand the pick to the tool that makes
                 # one. Geometry must not break the tie; only the caller naming a row can. "NOT filled"
-                # has to be true of the field as well as of the widget, so the query goes back out.
+                # has to be true of the field as well as of the widget, so the query goes back out --
+                # unless the rows are text-indisambiguable (same candidate, or a value-only distinction:
+                # see _identical_text_rows_error), where retyping the same text can never pick a
+                # different row and the query stays so the list and the rows' tags stay live instead.
+                text_key = _exact_tier_key(text)
+                same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == text_key]
+                if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
+                    # Leave the query (keeping the list and tags live) only when there is nothing to
+                    # protect: a field that HELD a value must get it back, or the leftover query becomes
+                    # every later call's restore baseline and the true value is gone for the run.
+                    if not pre_value:
+                        return _identical_text_rows_error(selector, text, same_text, note=pick.note)
+                    await _restore_pre_type_value(page, selector, pre_value, [text])
+                    return _identical_text_rows_error(selector, text, same_text, tags_live=False, note=pick.note)
                 await _restore_pre_type_value(page, selector, pre_value, [text])
                 return _ambiguous_rows_error(
                     selector,
@@ -8434,7 +8688,11 @@ def build_browser_tools(
             definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else _rows_cover_extent())
             return None, None, (list(seen.values()) if definitive else current), definitive
 
-        idx = None if overflowed else _match_menu_option(value, options)
+        # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
+        # read in full, so "several rows matched" can safely be checked for one candidate wearing more
+        # than one face. The scroll-search's own `_match_seen` call below builds rows from an
+        # accumulated, possibly-partial scan and must never collapse on that incomplete evidence.
+        idx = None if overflowed else _match_menu_option(value, options, collapse_duplicates=True)
         matched_from_scroll: str | None = None
         scanned_all = False
         if idx is None and overflowed:
@@ -8482,6 +8740,23 @@ def build_browser_tools(
                     f"({listing}) — the list is longer than we could enumerate; scroll or look() to see "
                     'the rest, then click the option by its [data-tv3-menu="N"] selector'
                 )
+            # The list read here is complete (not overflowed), so a canon text shared by ≥2 shown rows is
+            # the SAME case `_lone_duplicate_candidate` already refused: text alone cannot tell them
+            # apart, and only a present `val` or label could. Surface every present one so the escape
+            # this refusal offers is convertible (click the row the value or label names), not just
+            # repeated text.
+            shown_canon_texts = [_canon_label(str(o.get("text") or "")) for o in shown]
+            text_counts: dict[str, int] = {}
+            for t in shown_canon_texts:
+                text_counts[t] = text_counts.get(t, 0) + 1
+
+            def _listed_row(o: dict[str, Any], canon_text: str) -> str:
+                entry = f'[data-tv3-menu="{o.get("n")}"] {str(o.get("text") or "")[:60]!r}'
+                if text_counts[canon_text] >= 2:
+                    entry += _row_value_suffix(o)
+                return entry
+
+            listing = "; ".join(_listed_row(o, t) for o, t in zip(shown, shown_canon_texts))
             not_shown = len(options) - len(shown)
             if not_shown > 0:
                 # More selectable rows exist than we listed — do not claim the value is absent.
@@ -8773,6 +9048,17 @@ def build_browser_tools(
                 # More than one row reacted and none was a unique precision match -- refuse and
                 # report what actually reacted (list order, ≤15) instead of guessing which one was meant.
                 if pick.candidates:
+                    # Text-indisambiguable rows (identical text, distinguishable only by a value the
+                    # model cannot see) get the dedicated refusal instead: "pass the full text" has no
+                    # answer when every candidate already IS the full text.
+                    value_key = _exact_tier_key(value)
+                    same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == value_key]
+                    if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
+                        # Same guard as the type() site: only an empty field may keep the query.
+                        if not pre_value:
+                            return _identical_text_rows_error(selector, value, same_text, note=pick.note)
+                        await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                        return _identical_text_rows_error(selector, value, same_text, tags_live=False, note=pick.note)
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     return _ambiguous_rows_error(
                         selector, value, pick.candidates, next_step="pass the option's full text", note=pick.note
