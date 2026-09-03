@@ -479,6 +479,7 @@ async def test_pinned_connection_verifies_tls_against_the_hostname(tmp_path: Pat
         return web.Response(text="ok")
 
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     server_ctx.load_cert_chain(cert_path, key_path)
     app = web.Application()
     app.router.add_get("/", handler)
