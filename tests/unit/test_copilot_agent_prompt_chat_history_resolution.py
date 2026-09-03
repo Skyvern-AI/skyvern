@@ -44,6 +44,6 @@ def test_prompt_requires_display_ready_plain_text_responses() -> None:
 
     assert "`user_response` is rendered as Markdown." in rendered
     assert "use Markdown lists when a sequence helps" in rendered
-    assert "fenced code blocks for JSON, code, templates" in rendered
+    assert "fenced code blocks for JSON, templates" in rendered
     assert "rather than flattening them" in rendered
     assert "Do not output raw HTML" in rendered

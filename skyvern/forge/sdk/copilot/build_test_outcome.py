@@ -487,6 +487,7 @@ def _history_entry(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuild
         "block_labels": list(outcome.block_labels),
         "attempted_block_label": outcome.attempted_block_label,
         "attempted_block_signature": _attempted_block_signature(ctx, outcome),
+        "attempted_block_code_hash": _attempted_block_code_hash(ctx, outcome),
         "attempted_call_ref": outcome.attempted_call_ref,
         "code_safety_rejection_facts": [fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts],
         "failed_operation": (
@@ -576,6 +577,13 @@ def _attempted_block_signature(ctx: _RecordedBuildTestOutcomeContext, outcome: R
     if outcome.reason_code != "runtime_block_failure" or not outcome.attempted_block_label:
         return ""
     return authored_block_signatures_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
+
+
+def _attempted_block_code_hash(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome) -> str:
+    """Code text alone, so a parameter-only or output-metadata edit cannot read as a code change."""
+    if outcome.reason_code != "runtime_block_failure" or not outcome.attempted_block_label:
+        return ""
+    return authored_block_code_hashes_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
 
 
 def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str:
@@ -930,6 +938,75 @@ def unresolved_runtime_block_failure_with_disposition(
     return None, "no_runtime_failure"
 
 
+class PriorAttemptChangeIdentity(BaseModel):
+    """Whether the code a failing run executed differs from the code the prior failing attempt ran.
+    ``changed`` is ``None`` when ``basis`` is ``unavailable``, which is not the same as "unchanged"."""
+
+    model_config = ConfigDict(frozen=True)
+
+    prior_workflow_run_id: str
+    block_label: str
+    changed: bool | None
+    basis: Literal["code_hash", "unavailable"]
+
+
+def prior_attempt_change_identity(
+    ctx: _RecordedBuildTestOutcomeContext,
+    *,
+    attempted_block_label: str,
+    current_workflow_run_id: str,
+) -> PriorAttemptChangeIdentity | None:
+    """Compare two retained attempts of one block, never a retained attempt against the current draft.
+    The draft moves between the run and the hand-back, so it would answer a different question."""
+    if not attempted_block_label or not current_workflow_run_id:
+        return None
+    history = ctx.recorded_build_test_outcome_history
+    current_index = _latest_runtime_failure_index(
+        history, attempted_block_label, matching_run_id=current_workflow_run_id
+    )
+    if current_index is None:
+        return None
+    prior_index = _latest_runtime_failure_index(
+        history[:current_index], attempted_block_label, excluded_run_id=current_workflow_run_id
+    )
+    if prior_index is None:
+        return None
+    current_hash = _safe_str(history[current_index].get("attempted_block_code_hash"))
+    prior_entry = history[prior_index]
+    prior_hash = _safe_str(prior_entry.get("attempted_block_code_hash"))
+    comparable = bool(current_hash and prior_hash)
+    return PriorAttemptChangeIdentity(
+        prior_workflow_run_id=_safe_str(prior_entry.get("workflow_run_id")),
+        block_label=attempted_block_label,
+        changed=(current_hash != prior_hash) if comparable else None,
+        basis="code_hash" if comparable else "unavailable",
+    )
+
+
+def _latest_runtime_failure_index(
+    history: Sequence[Mapping[str, object]],
+    block_label: str,
+    *,
+    matching_run_id: str | None = None,
+    excluded_run_id: str | None = None,
+) -> int | None:
+    for index in range(len(history) - 1, -1, -1):
+        entry = history[index]
+        if entry.get("reason_code") != "runtime_block_failure":
+            continue
+        if _safe_str(entry.get("attempted_block_label")) != block_label:
+            continue
+        run_id = _safe_str(entry.get("workflow_run_id"))
+        if not run_id:
+            continue
+        if matching_run_id is not None and run_id != matching_run_id:
+            continue
+        if excluded_run_id is not None and run_id == excluded_run_id:
+            continue
+        return index
+    return None
+
+
 def bind_post_run_page_path_failure(
     ctx: _RecordedBuildTestOutcomeContext,
     page_evidence: Mapping[str, object],
@@ -1043,6 +1120,24 @@ def authored_block_signatures_from_workflow(
             }
         )
     return signatures
+
+
+def authored_block_code_hashes_from_workflow(workflow_yaml: str | None) -> dict[str, str]:
+    payload = _authored_structure_payload_from_workflow(workflow_yaml, None)
+    if payload is None:
+        return {}
+    code_blocks = payload.get("code_blocks")
+    if not isinstance(code_blocks, list):
+        return {}
+    hashes: dict[str, str] = {}
+    for block in code_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        label = _safe_str(block.get("label"))
+        code_hash = _safe_str(block.get("code_hash"))
+        if label and code_hash:
+            hashes[label] = code_hash
+    return hashes
 
 
 def authored_block_parameter_keys_from_workflow(

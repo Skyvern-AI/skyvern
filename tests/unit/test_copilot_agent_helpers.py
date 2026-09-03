@@ -5217,6 +5217,13 @@ class TestCopilotConfig:
 
         assert "CUSTOM SECURITY RULE" in prompt
 
+    def test_prompt_makes_untested_drafts_workflow_edits_not_reply_text(self) -> None:
+        prompt = agent_module._build_system_prompt(tool_usage_guide="", config=CopilotConfig())
+
+        assert "fenced code blocks for JSON, templates, or other structured examples" in prompt
+        assert "fenced code blocks for JSON, code," not in prompt
+        assert "it is still an edit to the workflow, not text in the reply, and you say it is untested" in prompt
+
     def test_retriable_llm_error_detects_openai_rate_limit(self) -> None:
         class FakeRateLimitError(Exception):
             pass
