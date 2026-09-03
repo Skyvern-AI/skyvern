@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_MESSAGE,
     INTERRUPTED_TERMINAL_REASON,
+    MINIMAL_CANCEL_STOP,
     InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
@@ -140,7 +141,7 @@ def _terminal_payload(
     workflow_applied: bool,
     workflow_mutated: bool = True,
     workflow_attempted: bool = True,
-    blocks_run_this_turn: int = 0,
+    blocks_run_this_turn: int | None = 0,
 ) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
@@ -664,7 +665,7 @@ async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
     )
     original_workflow = SimpleNamespace(workflow_id="wf-canonical")
     agent_result = AgentResult(
-        user_response="Cancelled by user.",
+        user_response=MINIMAL_CANCEL_STOP,
         updated_workflow=None,
         global_llm_context=None,
         response_type="REPLY",
@@ -716,7 +717,7 @@ async def _persist_cancel_and_read_row(
     )
     original_workflow = SimpleNamespace(workflow_id="wf-canonical", version=7)
     agent_result = AgentResult(
-        user_response="Cancelled by user.",
+        user_response=MINIMAL_CANCEL_STOP,
         updated_workflow=None,
         global_llm_context=None,
         response_type="REPLY",
@@ -778,7 +779,8 @@ async def test_a_user_stop_is_still_recorded_as_the_users_own_cancel(
 ) -> None:
     content, payload = await _persist_cancel_and_read_row(monkeypatch, record_as_interrupted=False)
 
-    assert content == "Cancelled by user."
+    assert "Cancelled by user." not in content
+    assert content.startswith("Stopped.")
     assert payload["terminalEnvelope"].get("interruption") is None
 
 
@@ -1143,7 +1145,7 @@ async def test_terminal_envelope_finalization_failure_omits_envelope(
     updated_workflow = MagicMock()
     updated_workflow.model_dump.return_value = {"workflow_id": "wf-draft"}
     agent_result = AgentResult(
-        user_response="done" if finalizer == "normal" else "Cancelled by user.",
+        user_response="done" if finalizer == "normal" else MINIMAL_CANCEL_STOP,
         updated_workflow=updated_workflow if finalizer == "normal" else None,
         global_llm_context=None,
         response_type="REPLY",
@@ -1283,7 +1285,7 @@ async def test_terminal_envelope_finalization_failure_flag_on_fails_closed_to_le
 
 
 @pytest.mark.asyncio
-async def test_cancel_turn_agent_result_flag_on_marks_envelope_but_keeps_message(
+async def test_cancel_turn_agent_result_flag_on_persists_the_rendered_stop_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1299,14 +1301,14 @@ async def test_cancel_turn_agent_result_flag_on_marks_envelope_but_keeps_message
     )
     original_workflow = SimpleNamespace(workflow_id="wf-canonical")
     agent_result = AgentResult(
-        user_response="Cancelled by user.",
+        user_response=MINIMAL_CANCEL_STOP,
         updated_workflow=None,
         global_llm_context=None,
         response_type="REPLY",
         proposal_disposition="auto_applicable",
         cancelled=True,
         narrative_payload=_narrative_payload(),
-        terminal_envelope=_terminal_payload(verified=True, workflow_applied=True),
+        terminal_envelope=_terminal_payload(verified=True, workflow_applied=True, blocks_run_this_turn=3),
     )
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     stream = MagicMock(send=AsyncMock(return_value=True))
@@ -1322,18 +1324,22 @@ async def test_cancel_turn_agent_result_flag_on_marks_envelope_but_keeps_message
 
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
-    assert response_frame.message == "Cancelled by user."
+    assert "Cancelled by user." not in response_frame.message
+    assert "3 blocks ran this turn." in response_frame.message
     assert response_frame.terminal_envelope is not None
     assert response_frame.terminal_envelope["rendered_from_envelope"] is True
     persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
-    assert persisted_writes[-1].kwargs["content"] == "Cancelled by user."
+    # The reload leg reads this row, so it must carry the same report the frame did.
+    assert persisted_writes[-1].kwargs["content"] == response_frame.message
     persisted_payload = persisted_writes[-1].kwargs["narrative_payload"]
     assert persisted_payload is not None
+    assert persisted_payload["terminalMessage"] == response_frame.message
+    assert persisted_payload["narrativeSummary"] == response_frame.message
     assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
 
 
 @pytest.mark.asyncio
-async def test_pre_agent_cancel_path_keeps_literal_cancelled_by_user(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pre_agent_cancel_path_reports_that_nothing_was_dispatched(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         app.AGENT_FUNCTION,
         "should_render_copilot_terminal_from_envelope",
@@ -1360,10 +1366,12 @@ async def test_pre_agent_cancel_path_keeps_literal_cancelled_by_user(monkeypatch
 
     response_frame = stream.send.await_args.args[0]
     assert isinstance(response_frame, WorkflowCopilotStreamResponseUpdate)
-    assert response_frame.message == "Cancelled by user."
-    assert response_frame.terminal_envelope is None
+    assert "Cancelled by user." not in response_frame.message
+    assert "0 blocks ran this turn." in response_frame.message
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["blocks_run_this_turn"] == 0
     persisted_writes = workflow_params.create_workflow_copilot_chat_message.await_args_list
-    assert persisted_writes[-1].kwargs["content"] == "Cancelled by user."
+    assert persisted_writes[-1].kwargs["content"] == response_frame.message
 
 
 @pytest.mark.asyncio

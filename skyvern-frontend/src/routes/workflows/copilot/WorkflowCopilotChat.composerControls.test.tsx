@@ -7,6 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { COPILOT_WORKING_VERBS } from "./workingVerbs";
 
 import {
@@ -180,12 +181,31 @@ async function submit(value: string) {
   });
 }
 
+async function deliverFirstFrame() {
+  const call = streamCalls[streamCalls.length - 1];
+  if (!call) throw new Error("no pending stream to open");
+  await act(async () => {
+    call.onMessage({
+      type: "turn_start",
+      turn_id: "turn-1",
+      turn_index: 0,
+      mode: "build",
+      timestamp: "2026-05-25T00:00:00Z",
+    });
+  });
+}
+
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  useCopilotActionStore.setState({
+    pendingBuild: null,
+    generatingBlockLabel: null,
+    cancelNonce: 0,
+  });
   historyResponse.data = {
     workflow_copilot_chat_id: null,
     chat_history: [],
@@ -249,6 +269,18 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
+    // Sent but not yet streaming: the control stays pressable, and the cancel
+    // chokepoint - not a disabled attribute - is what issues nothing.
+    const pending = screen.getByRole("button", { name: "Starting…" });
+    expect(pending.hasAttribute("disabled")).toBe(false);
+    expect(pending.getAttribute("aria-busy")).not.toBe("true");
+    await act(async () => {
+      fireEvent.click(pending);
+    });
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    await deliverFirstFrame();
+
     const button = screen.getByRole("button", { name: "Stop" });
     expect(screen.getByTestId("copilot-stop-orbit").className).not.toContain(
       "paused",
@@ -269,6 +301,89 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(cancelPost).toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+    );
+  });
+
+  it("arms stop on the first streamed frame even when that frame carries no turn id", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[streamCalls.length - 1];
+    if (!call) throw new Error("no pending stream to open");
+    await act(async () => {
+      call.onMessage({ type: "condensing" });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    });
+    await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+  });
+
+  it("re-arms stop once a turn has streamed nothing for the arming window", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderChat({ copilotV2: true, codeBlockMode: true });
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      expect(screen.getByRole("button", { name: "Starting…" })).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      });
+      await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a block-level stop before the first frame, when Stop itself would not", async () => {
+    // The arming gate exists so a fast double-click on Send is not "send, then cancel".
+    // A block's own cancel is a deliberate gesture, so it must not go dead during that
+    // window — a turn hanging before its first frame is when someone reaches for it.
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      useCopilotActionStore.getState().requestCancel();
+    });
+    await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({ source: "stop_button" }),
+    );
+  });
+
+  it("hands a queued prompt back to the composer rather than letting the stop auto-fire it", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(textarea(), {
+      target: { value: "also grab the story scores" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Queue for next turn" }),
+      );
+    });
+    expect(textarea().value).toBe("");
+
+    await act(async () => {
+      useCopilotActionStore.getState().requestCancel();
+    });
+
+    // The stop lands, and the queued follow-up is handed back rather than auto-firing.
+    await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(textarea().value).toBe("also grab the story scores"),
     );
   });
 

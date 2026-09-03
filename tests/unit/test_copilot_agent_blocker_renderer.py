@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.terminal_envelope import MINIMAL_CANCEL_STOP
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
@@ -635,7 +636,7 @@ def test_shim_over_a_cancelled_turn_keeps_the_stop_label() -> None:
     ctx = _ctx()
     ctx.blocker_signal = _signal()
     result = AgentResult(
-        user_response="Cancelled by user.",
+        user_response=MINIMAL_CANCEL_STOP,
         updated_workflow=None,
         global_llm_context=None,
         cancelled=True,

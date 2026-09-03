@@ -724,7 +724,7 @@ class AgentResult:
     resolved_model: str | None = None
     # Set when the agent absorbed an asyncio cancellation initiated by an
     # explicit user Stop. Lets the route route to a cancel-specific
-    # persistence path (rollback + ``Cancelled by user.`` chat row) without
+    # persistence path (rollback + stop-report chat row) without
     # losing ``workflow_was_persisted`` the way a re-raise would.
     cancelled: bool = False
     # Facts the route needs to persist an interruption record; the route sees the

@@ -72,6 +72,9 @@ class ConnectedAccountChoiceReference(BaseModel):
     connection_id: str
 
 
+CopilotCancelSource = Literal["escape_key", "stop_button", "api"]
+
+
 class TurnOutcome(BaseModel):
     # extra="ignore" so a rolling deploy that adds a new TurnOutcome field
     # does not make older readers silently treat freshly-written rows as None.
@@ -84,6 +87,9 @@ class TurnOutcome(BaseModel):
     normalized_reply_signature: str = ""
     tool_calls: list[str] = Field(default_factory=list)
     terminal_reason: str | None = None
+    # Sits beside terminal_reason so cancel volume groups by gesture in the same
+    # query that finds the cancels. None when the request named no source.
+    cancel_source: CopilotCancelSource | None = None
     blocked_signatures: list[str] = Field(default_factory=list)
     copilot_effective_mode: Literal["ask", "build", "code"] | None = None
     copilot_code_available: bool = False

@@ -155,6 +155,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
 )
+from skyvern.forge.sdk.copilot.terminal_envelope import interim_run_start_outcome, is_interim_run_outcome
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
@@ -659,6 +660,16 @@ def _forget_browser_position(ctx: CopilotContext) -> None:
     ctx.verified_prefix_block_end_urls = {}
     ctx.verified_prefix_block_end_session_id = None
     ctx.verified_prefix_terminal_label = None
+
+
+def _forget_interim_run_start(ctx: CopilotContext, workflow_run_id: str) -> None:
+    """Drop the run-start record when submission unwound, so no terminal reports a run that never ran."""
+    outcomes = ctx.terminal_envelope_run_outcomes
+    outcomes[:] = [
+        outcome
+        for outcome in outcomes
+        if not (is_interim_run_outcome(outcome) and outcome.workflow_run_id == workflow_run_id)
+    ]
 
 
 def _block_end_urls_by_label(run_block_rows: list[WorkflowRunBlock]) -> dict[str, str]:
@@ -2927,6 +2938,10 @@ async def _run_blocks_and_collect_debug(
     run_task: asyncio.Task | None = None
     sensitive_run_custody_lock: asyncio.Lock | None = None
     sensitive_run_session_id: str | None = None
+    interim_run_id: str | None = None
+    # Set only where the run may already be executing, so an unwind before either executor call
+    # can still retract the run-start record.
+    run_submission_attempted = False
     try:
         workflow_run = await workflow_service.prepare_workflow(
             workflow_id=ctx.workflow_permanent_id,
@@ -2969,6 +2984,10 @@ async def _run_blocks_and_collect_debug(
         # cancellation exits leave by paths a success-only reset never reaches.
         _forget_browser_position(ctx)
 
+        # A run that never returns a result must not read as zero blocks at the terminal;
+        # the tool-return record supersedes this one.
+        interim_run_id = workflow_run.workflow_run_id
+        ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome(interim_run_id))
         await _send_run_started_update(ctx, workflow_run.workflow_run_id)
 
         if dispatch_to_worker:
@@ -2976,6 +2995,7 @@ async def _run_blocks_and_collect_debug(
             # snapshot version, so the worker resolves the exact wrapped definition via
             # run.workflow_id — no workflow_override crosses the wire. block_labels/block_outputs
             # and the shared browser session reproduce the frontier re-run on the worker.
+            run_submission_attempted = True
             await AsyncExecutorFactory.get_executor().execute_workflow(
                 request=None,
                 background_tasks=None,
@@ -3014,6 +3034,7 @@ async def _run_blocks_and_collect_debug(
                 frontier_start_label=frontier_start_label,
             )
             if inline_fence_failure is not None:
+                _forget_interim_run_start(ctx, workflow_run.workflow_run_id)
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=inline_fence_failure["error"],
@@ -3025,6 +3046,7 @@ async def _run_blocks_and_collect_debug(
                 organization_id=ctx.organization_id,
             )
 
+            run_submission_attempted = True
             run_task = asyncio.create_task(
                 app.WORKFLOW_SERVICE.execute_workflow(
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -3053,6 +3075,8 @@ async def _run_blocks_and_collect_debug(
             if sensitive_run_session_id is not None:
                 release_sensitive_origin_run_lease(ctx, workflow_run_id=workflow_run.workflow_run_id)
             sensitive_run_custody_lock.release()
+        if interim_run_id is not None and not run_submission_attempted:
+            _forget_interim_run_start(ctx, interim_run_id)
         raise
 
     active_run_association: ActiveRunSessionAssociation | None = None

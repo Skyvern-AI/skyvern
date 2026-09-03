@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import CopilotCancelSource, TurnOutcome
 
 
 class CopilotPendingTurn(BaseModel):
@@ -192,6 +192,14 @@ class WorkflowCopilotChatRequest(BaseModel):
 
 class WorkflowCopilotCancelRequest(BaseModel):
     cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
+    source: CopilotCancelSource | None = Field(
+        default=None,
+        description=(
+            "Which gesture asked for the cancel, so cancel volume is attributable by source. "
+            "Absent from a client too old to send it, which is recorded as unattributed rather "
+            "than as an API caller."
+        ),
+    )
 
 
 class WorkflowCopilotCredentialResponseRequest(BaseModel):

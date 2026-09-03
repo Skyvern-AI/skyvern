@@ -85,6 +85,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.terminal_envelope import interim_run_start_outcome
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -6525,6 +6526,24 @@ workflow_definition:
         assert rendered["facts"]["evaluationState"] == "not_demonstrated"
         assert rendered["disposition"] == "review_untested"
 
+    def test_an_unresolved_run_start_over_full_coverage_drops_the_tested_pill(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged)
+        ctx.executed_block_fingerprints = {
+            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
+        }
+        ctx.executed_block_labels = {"sign_in", "read_metric"}
+        ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_unresolved"))
+
+        rendered = self._render(ctx, staged)
+
+        assert rendered["facts"]["matchingSourceBlockCount"] == 2
+        assert rendered["facts"]["blocksRunThisTurn"] is None
+        assert rendered["facts"]["runCompleted"] is None
+        assert rendered["facts"]["evaluationState"] is None
+        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
+        assert rendered["disposition"] == "review_untested"
+
     def test_an_edited_block_is_no_longer_counted_against_its_stale_receipt(self) -> None:
         tested = self._two_block_yaml()
         staged = self._two_block_yaml("Read it twice")
@@ -6672,7 +6691,7 @@ workflow_definition:
             terminal_reason="max_turns",
         )
 
-        assert "tested draft" not in result.user_response
+        assert result.user_response != tested_reply
         assert result.user_response == unvalidated_reply
         assert result.proposal_disposition == "review_untested"
 

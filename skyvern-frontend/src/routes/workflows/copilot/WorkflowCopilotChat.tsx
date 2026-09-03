@@ -39,6 +39,7 @@ import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
   WorkflowCopilotCancelRequest,
+  WorkflowCopilotCancelSource,
   WorkflowCopilotChatHistoryResponse,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
@@ -192,6 +193,20 @@ function collectTimelineBlockActions(
 const ASK_GLYPH = "\u275D\uFE0E";
 const BUILD_GLYPH = "\uD83D\uDC09";
 
+// What the arming gate is actually for: the second click of a double-tap on Send, which
+// lands on the morphed control a moment later. That is a sub-second gesture, so the
+// window is sized to it — long enough to swallow the stray click, short enough that the
+// visible Stop is not dead while a turn hangs. The first frame arms sooner and clears it.
+const STOP_ARM_DOUBLE_TAP_MS = 500;
+
+const STOP_UNCONFIRMED_NOTICE =
+  "I sent the stop, but couldn't confirm what this turn recorded. Reload to see the turn's own report.";
+
+// The request itself failed, so the stop never reached the backend and the turn may
+// still be running. Saying "I sent the stop" here would claim something that did not happen.
+const STOP_NOT_SENT_NOTICE =
+  "I couldn't send the stop. Reload to see what this turn recorded.";
+
 const STOP_ORBIT_GRADIENT =
   "conic-gradient(from 0deg, rgba(120,170,255,.08) 0deg, rgba(120,170,255,.08) 120deg, rgba(150,195,255,.55) 250deg, #dbeaff 330deg, rgba(120,170,255,.08) 360deg)";
 
@@ -308,8 +323,8 @@ export interface ChatMessage {
   // so the per-block cards persist as the user scrolls back through past
   // turns. Live in-flight narrative is rendered separately at the bottom.
   narrative?: TurnNarrativeState;
-  // FE-synthetic run status line (never persisted, never sent to the LLM).
-  kind?: "run_lifecycle";
+  // FE-synthetic rows (never persisted, never sent to the LLM).
+  kind?: "run_lifecycle" | "status_notice";
 }
 
 function connectedAccountSelectionReceipt(
@@ -746,6 +761,7 @@ export function WorkflowCopilotChat({
   // A stop is a round trip to the backend; without this the control stays
   // live-looking and users press it repeatedly.
   const [isStopping, setIsStopping] = useState(false);
+  const [stopArmed, setStopArmed] = useState(false);
   useTurnActivityChange(isLoading, onTurnActivityChange);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
@@ -836,6 +852,16 @@ export function WorkflowCopilotChat({
   } | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
+  // Read by cancelSend, which must not re-create on every render of the arming signal.
+  const turnObservablyRunningRef = useRef(false);
+  const stopArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const armStop = useCallback(() => {
+    if (stopArmTimer.current !== null) {
+      clearTimeout(stopArmTimer.current);
+      stopArmTimer.current = null;
+    }
+    setStopArmed(true);
+  }, []);
   const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gateFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Backend cancel watcher polls Redis: a turn can complete normally between
@@ -890,6 +916,10 @@ export function WorkflowCopilotChat({
       if (cancelSafetyTimer.current !== null) {
         clearTimeout(cancelSafetyTimer.current);
         cancelSafetyTimer.current = null;
+      }
+      if (stopArmTimer.current !== null) {
+        clearTimeout(stopArmTimer.current);
+        stopArmTimer.current = null;
       }
       if (gateFlashTimer.current !== null) {
         clearTimeout(gateFlashTimer.current);
@@ -1928,66 +1958,82 @@ export function WorkflowCopilotChat({
     });
   }, [adjustTextareaHeight, updateQueuedPrompt]);
 
-  const cancelSend = useCallback(async () => {
-    // A stop must never let a queued message auto-fire. Hand its text back to
-    // the composer synchronously, before isLoading flips and the drain effect
-    // would otherwise send it as a fresh turn.
-    restoreQueuedPromptToComposer();
+  const cancelSend = useCallback(
+    async (
+      source: WorkflowCopilotCancelSource,
+      // A stop control must not fire before the turn is observably running, or a fast
+      // double-click on Send is "send, then cancel". The deliberate gestures -- Escape,
+      // and a block's own cancel -- are exempt, so a turn that hangs before its first
+      // frame is still stoppable rather than leaving every path dead for that window.
+      { requireArmed = true }: { requireArmed?: boolean } = {},
+    ) => {
+      // A stop must never let a queued message auto-fire. Hand its text back to
+      // the composer synchronously, before isLoading flips and the drain effect
+      // would otherwise send it as a fresh turn.
+      restoreQueuedPromptToComposer();
 
-    // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
-    const controllerAtCancel = streamingAbortController.current;
-    if (!controllerAtCancel) return;
+      if (requireArmed && !turnObservablyRunningRef.current) return;
 
-    const cancelToken = pendingCancelToken.current;
-    pendingCancelToken.current = null;
-    // After the token check, not before: a turn that already finished has no
-    // token, and claiming "Stopping…" for a cancel that never goes out would
-    // rely on the isLoading reset as its only way back.
-    if (!cancelToken) return;
+      // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
+      const controllerAtCancel = streamingAbortController.current;
+      if (!controllerAtCancel) return;
 
-    setIsStopping(true);
+      const cancelToken = pendingCancelToken.current;
+      pendingCancelToken.current = null;
+      // After the token check, not before: a turn that already finished has no
+      // token, and claiming "Stopping…" for a cancel that never goes out would
+      // rely on the isLoading reset as its only way back.
+      if (!cancelToken) return;
 
-    cancelInFlightController.current = controllerAtCancel;
+      setIsStopping(true);
 
-    const appendCancelledBubble = () => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-cancel`,
-          sender: "ai",
-          content: "Cancelled by user.",
-          timestamp: new Date().toISOString(),
-        },
-      ]);
-      // Otherwise the bubble freezes mid-state next to the Cancelled message.
-      setNarrative(EMPTY_NARRATIVE);
-    };
+      cancelInFlightController.current = controllerAtCancel;
 
-    try {
-      const client = await getClient(credentialGetter, "sans-api-v1");
-      await client.post<void>("/workflow/copilot/cancel", {
-        cancel_token: cancelToken,
-      } as WorkflowCopilotCancelRequest);
-      // Safety net: if the SSE channel never resolves, surface a fallback
-      // bubble and abort so handleSend's finally clears "Cancelling...".
-      if (cancelSafetyTimer.current !== null) {
-        clearTimeout(cancelSafetyTimer.current);
-      }
-      cancelSafetyTimer.current = setTimeout(() => {
-        cancelSafetyTimer.current = null;
-        if (streamingAbortController.current !== controllerAtCancel) return;
-        appendCancelledBubble();
+      // The backend is still running when this fires, so it cannot report what the
+      // turn recorded; the persisted row stays authoritative on reload.
+      const appendStopUnconfirmedNotice = (content: string) => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-cancel`,
+            sender: "ai",
+            content,
+            timestamp: new Date().toISOString(),
+            kind: "status_notice",
+          },
+        ]);
+        // Otherwise the working bubble freezes mid-state next to the notice.
+        setNarrative(EMPTY_NARRATIVE);
+      };
+
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        await client.post<void>("/workflow/copilot/cancel", {
+          cancel_token: cancelToken,
+          source,
+        } as WorkflowCopilotCancelRequest);
+        // Safety net: if the SSE channel never resolves, surface a fallback
+        // bubble and abort so handleSend's finally clears "Cancelling...".
+        if (cancelSafetyTimer.current !== null) {
+          clearTimeout(cancelSafetyTimer.current);
+        }
+        cancelSafetyTimer.current = setTimeout(() => {
+          cancelSafetyTimer.current = null;
+          if (streamingAbortController.current !== controllerAtCancel) return;
+          appendStopUnconfirmedNotice(STOP_UNCONFIRMED_NOTICE);
+          controllerAtCancel.abort();
+        }, 15_000);
+      } catch (error) {
+        // 503 (Redis disabled) or network failure: client-side abort still
+        // gives the user immediate feedback; the backend will run to
+        // completion in that environment. Log so we can spot it in dev.
+        console.warn("Workflow copilot cancel POST failed", error);
         controllerAtCancel.abort();
-      }, 15_000);
-    } catch (error) {
-      // 503 (Redis disabled) or network failure: client-side abort still
-      // gives the user immediate feedback; the backend will run to
-      // completion in that environment. Log so we can spot it in dev.
-      console.warn("Workflow copilot cancel POST failed", error);
-      controllerAtCancel.abort();
-      appendCancelledBubble();
-    }
-  }, [credentialGetter, restoreQueuedPromptToComposer]);
+        appendStopUnconfirmedNotice(STOP_NOT_SENT_NOTICE);
+      }
+    },
+    [credentialGetter, restoreQueuedPromptToComposer],
+  );
 
   // The turn ending is the one signal that a stop actually landed — it covers
   // the normal path, the 15s safety-timer abort, and the failed-POST abort.
@@ -2002,12 +2048,17 @@ export function WorkflowCopilotChat({
       if (event.key !== "Escape" || !isOpen) {
         return;
       }
+      // Dismissing an IME conversion candidate fires Escape with isComposing
+      // set; the user is editing text, not stopping their turn.
+      if (event.isComposing) {
+        return;
+      }
       if (queuedPrompt) {
         restoreQueuedPromptToComposer();
         return;
       }
       if (isLoading) {
-        cancelSend();
+        cancelSend("escape_key", { requireArmed: false });
       }
     };
 
@@ -2171,6 +2222,18 @@ export function WorkflowCopilotChat({
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
       streamingAbortController.current = abortController;
+
+      setStopArmed(false);
+      if (stopArmTimer.current !== null) {
+        clearTimeout(stopArmTimer.current);
+      }
+      stopArmTimer.current = setTimeout(() => {
+        stopArmTimer.current = null;
+        // A queued prompt can drain into a next turn before this fires; only the
+        // turn that scheduled it may arm.
+        if (streamingAbortController.current !== abortController) return;
+        setStopArmed(true);
+      }, STOP_ARM_DOUBLE_TAP_MS);
 
       try {
         const saveData = getSaveData();
@@ -2490,6 +2553,11 @@ export function WorkflowCopilotChat({
             supports_credential_pause: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
+            // Same identity check the fallback timer makes: a frame buffered from an
+            // aborted stream must not arm the turn that replaced it.
+            if (streamingAbortController.current === abortController) {
+              armStop();
+            }
             switch (payload.type) {
               case "processing_update":
                 handleProcessingUpdate(payload);
@@ -2654,6 +2722,11 @@ export function WorkflowCopilotChat({
           clearTimeout(cancelSafetyTimer.current);
           cancelSafetyTimer.current = null;
         }
+        if (stopArmTimer.current !== null) {
+          clearTimeout(stopArmTimer.current);
+          stopArmTimer.current = null;
+        }
+        setStopArmed(false);
         pendingMessageId.current = null;
         pendingCancelToken.current = null;
         // Backstop: roll back a continuation that didn't genuinely complete —
@@ -2671,6 +2744,7 @@ export function WorkflowCopilotChat({
     [
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
+      armStop,
       autoAccept,
       codeBlockModeEnabled,
       codeBlockRequestOverride,
@@ -2821,11 +2895,23 @@ export function WorkflowCopilotChat({
         );
         return;
       }
-      void cancelSend();
+      void cancelSend("stop_button", { requireArmed: false });
     }
   }, [blockCancelNonce, cancelSend, updateQueuedPrompt]);
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Escape and Enter both mean something to an IME mid-composition: dismissing a
+    // conversion candidate and committing one. React's synthetic event does not carry
+    // isComposing, so the native one is what can be asked.
+    if (e.nativeEvent.isComposing) {
+      return;
+    }
+    if (e.key === "Escape" && queuedPrompt) {
+      e.preventDefault();
+      e.stopPropagation();
+      restoreQueuedPromptToComposer();
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -3132,6 +3218,20 @@ export function WorkflowCopilotChat({
     [messages],
   );
 
+  // Stoppable between the turn's first streamed frame and its terminal one; isLoading
+  // alone is true from send. Issuing a cancel clears the token, so isStopping holds it.
+  const turnObservablyRunning =
+    isStopping ||
+    (isLoading &&
+      stopArmed &&
+      narrative.terminal === null &&
+      pendingCancelToken.current !== null);
+  // A render-phase write would let a discarded pass latch, and a passive effect
+  // would leave Stop painted armed while cancelSend still reads false.
+  useLayoutEffect(() => {
+    turnObservablyRunningRef.current = turnObservablyRunning;
+  }, [turnObservablyRunning]);
+
   if (!isOpen) {
     return null;
   }
@@ -3187,18 +3287,33 @@ export function WorkflowCopilotChat({
     queuedPrompt.reason === "live_browser" &&
     !messages.some((message) => message.id === queuedPrompt.id),
   );
-  const showsStopGlyph = isStopping || (isLoading && !hasComposerText);
+  const showsStopGlyph =
+    isStopping || (turnObservablyRunning && !hasComposerText);
+  // Sent, no frame yet: the control reports the wait rather than an action, and
+  // cancelSend's own guard is what makes a press in this window issue no cancel.
+  const turnPendingFirstFrame =
+    isLoading && !turnObservablyRunning && narrative.terminal === null;
+  const morphButtonPending = turnPendingFirstFrame && !hasComposerText;
+  const legacyCancelLabel = turnPendingFirstFrame
+    ? "Starting…"
+    : isStopping
+      ? "Stopping…"
+      : "Cancel run";
   const morphButtonLabel = isStopping
     ? "Stopping…"
     : waitingOnQueueOnly
       ? "Send disabled — waiting for live browser"
-      : queuedPrompt && hasComposerText
-        ? "Replace queued message"
-        : !isLoading
-          ? "Send"
-          : hasComposerText
-            ? "Queue for next turn"
-            : "Stop";
+      : morphButtonPending
+        ? "Starting…"
+        : queuedPrompt && hasComposerText
+          ? "Replace queued message"
+          : !turnObservablyRunning
+            ? isLoading
+              ? "Queue for next turn"
+              : "Send"
+            : hasComposerText
+              ? "Queue for next turn"
+              : "Stop";
   // Shared between the legacy fused split-button and the S4 mode pill so the
   // three options never drift between the two composer treatments.
   const modeMenuItems = (
@@ -3394,6 +3509,13 @@ export function WorkflowCopilotChat({
                     key={message.id}
                     content={message.content}
                   />
+                );
+              }
+              if (message.kind === "status_notice") {
+                return (
+                  <div key={message.id} role="status" aria-live="polite">
+                    <MessageItem message={message} />
+                  </div>
                 );
               }
               // Per-message frozen narrative. When an AI message carries a
@@ -3890,7 +4012,9 @@ export function WorkflowCopilotChat({
                   disabled={waitingOnQueueOnly || isStopping}
                   aria-busy={isStopping}
                   onClick={() =>
-                    isLoading && !hasComposerText ? cancelSend() : handleSend()
+                    turnObservablyRunning && !hasComposerText
+                      ? cancelSend("stop_button")
+                      : handleSend()
                   }
                   aria-label={morphButtonLabel}
                   className={cn(
@@ -3942,13 +4066,13 @@ export function WorkflowCopilotChat({
                 Edit queued
               </button>
               <button
-                onClick={cancelSend}
+                onClick={() => cancelSend("stop_button")}
                 disabled={isStopping}
                 aria-busy={isStopping}
-                title={isStopping ? "Stopping…" : "Cancel run"}
+                title={legacyCancelLabel}
                 className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isStopping ? "Stopping…" : "Cancel run"}
+                {legacyCancelLabel}
               </button>
             </>
           ) : isLoading ? (
@@ -3963,13 +4087,13 @@ export function WorkflowCopilotChat({
               </button>
               <button
                 type="button"
-                onClick={cancelSend}
+                onClick={() => cancelSend("stop_button")}
                 disabled={isStopping}
                 aria-busy={isStopping}
-                title={isStopping ? "Stopping…" : "Cancel run"}
+                title={legacyCancelLabel}
                 className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isStopping ? "Stopping…" : "Cancel run"}
+                {legacyCancelLabel}
               </button>
             </>
           ) : queuedPrompt ? (

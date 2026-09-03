@@ -399,6 +399,7 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(withEnvelope.terminalEnvelope).toEqual({
       runVerdict: "not_demonstrated",
       runDisplayReason: "Checkout never reached confirmation.",
+      runOutcomeRole: null,
       connectFailure: null,
     });
 
@@ -412,6 +413,7 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(malformed.terminalEnvelope).toEqual({
       runVerdict: null,
       runDisplayReason: null,
+      runOutcomeRole: null,
       connectFailure: null,
     });
 
@@ -516,6 +518,25 @@ describe("notConfirmedOutcome — envelope-first", () => {
       },
     });
     expect(outcome).toBeNull();
+  });
+
+  it("an interim run-start envelope does not suppress the recorded not-confirmed outcome", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      terminalEnvelope: {
+        runVerdict: "not_evaluated",
+        runDisplayReason: null,
+        runOutcomeRole: "interim_build_test",
+      },
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: "The earlier run never reached the dashboard.",
+      },
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "The earlier run never reached the dashboard.",
+    });
   });
 
   it("envelope without a run verdict falls back to the legacy inference", () => {
@@ -648,6 +669,31 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
     );
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
     expect(card.isFail).toBe(false);
+  });
+
+  it("makes no completion claim when a stop left the run start unresolved", () => {
+    const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
+      turnFacts: Record<string, unknown>;
+    };
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles[CLEAN_RECORDED_TURN] as unknown as Record<string, unknown>),
+      turnFacts: {
+        ...recorded.turnFacts,
+        runId: "wr_1",
+        runCompleted: null,
+        blocksRunThisTurn: null,
+        evaluationState: null,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+    const card = computeTurnSummary(turn);
+
+    expect(turn.turnFacts?.runCompleted).toBeNull();
+    expect(card.stats).toContain("1/1 ran on current source");
+    expect(card.stats).not.toContain("run completed");
+    expect(card.stats).not.toContain("run did not complete");
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
   });
 
   it("withholds success from a fully covered turn whose recorded run failed", () => {
