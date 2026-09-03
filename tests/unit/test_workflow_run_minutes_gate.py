@@ -600,5 +600,5 @@ async def test_duration_log_survives_a_failed_arm_lookup(
 
     duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert len(duration_logs) == 1
-    assert duration_logs[0]["task_v3_ab_arm"] is None
+    assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
     assert record_run_duration.await_count == 1
