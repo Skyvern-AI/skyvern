@@ -278,13 +278,21 @@ class BuildTestPacketFailure(BaseModel):
 class BuildTestPacketRegisteredOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    label: str | None = None
+    status: str | None = None
+    output: JsonValue = None
+    value_complete: bool = True
+
+
+class _RegisteredOutputParameterValue(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
     workflow_run_id: str | None = None
     output_parameter_id: str | None = None
     output_parameter_key: str | None = None
     block_label: str | None = None
     block_type: str | None = None
     value: JsonValue = None
-    value_complete: bool = True
 
 
 class BuildTestPacketRequestedOutput(BaseModel):
@@ -1195,10 +1203,10 @@ def recorded_outcome_from_run_blocks_result(
             _mapping_list(raw_registered_output_payloads) if isinstance(raw_registered_output_payloads, list) else None
         )
     )
-    registered_output_models: list[BuildTestPacketRegisteredOutput] = []
+    registered_output_models: list[_RegisteredOutputParameterValue] = []
     for payload in omission_registered_output_payloads or []:
         try:
-            registered_output_models.append(BuildTestPacketRegisteredOutput.model_validate(payload))
+            registered_output_models.append(_RegisteredOutputParameterValue.model_validate(payload))
         except ValueError:
             continue
     typed_output_omission_facts = _merge_missing_requested_output_facts(
@@ -2253,23 +2261,32 @@ def _missing_requested_output_facts(
 
 def _typed_requested_output_omission_facts(
     requested_outputs: Sequence[BuildTestPacketRequestedOutput],
-    registered_outputs: Sequence[BuildTestPacketRegisteredOutput],
+    registered_outputs: Sequence[_RegisteredOutputParameterValue],
     workflow_run_id: str,
 ) -> list[dict[str, object]]:
     if not workflow_run_id:
         return []
     registered_values_by_id: dict[str, list[JsonValue]] = {}
+    registered_values_by_key: dict[str, list[JsonValue]] = {}
     for output in registered_outputs:
-        if output.workflow_run_id != workflow_run_id or not output.output_parameter_id:
+        if output.workflow_run_id != workflow_run_id:
             continue
-        registered_values_by_id.setdefault(output.output_parameter_id, []).append(output.value)
+        if output.output_parameter_id:
+            registered_values_by_id.setdefault(output.output_parameter_id, []).append(output.value)
+        if output.output_parameter_key:
+            registered_values_by_key.setdefault(output.output_parameter_key, []).append(output.value)
     facts: list[dict[str, object]] = []
     for requested in requested_outputs:
         if requested.workflow_run_id != workflow_run_id:
             continue
         output_parameter_id = requested.output_parameter_id
         output_parameter_key = requested.output_parameter_key
-        registered_values = registered_values_by_id.get(output_parameter_id)
+        # Persisting a run snapshot regenerates output-parameter ids. The semantic key remains
+        # stable across the in-memory draft and the run-pinned definition, so prefer it and retain
+        # the id lookup for older payloads that did not carry a key.
+        registered_values = registered_values_by_key.get(output_parameter_key)
+        if registered_values is None:
+            registered_values = registered_values_by_id.get(output_parameter_id)
         if registered_values is None:
             reason_code, value_status = "registered_output_missing", "not_registered"
         elif all(value is None for value in registered_values):

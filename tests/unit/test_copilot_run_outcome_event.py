@@ -28,7 +28,6 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
-    _INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _record_executed_block_labels,
     _record_run_blocks_result,
@@ -898,31 +897,3 @@ async def test_conclude_cue_absent_when_nothing_verified(monkeypatch: pytest.Mon
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     assert result["data"].get("next_step") is None
-
-
-def test_completed_run_uses_retained_terminal_output_when_parameter_identity_cannot_attach() -> None:
-    """Regression for wr_561146288153685940: a regenerated snapshot id must not erase the run's output."""
-    result = _run_result([_code_block("retrieve_resale_demand_document", {"document_name": None})])
-    result["data"][_INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY] = True
-    ctx = _ctx(result["data"]["blocks"])
-    ctx.verified_terminal_block_outputs = {
-        "retrieve_resale_demand_document": {
-            "document_name": "Resale Demand Package (Required Statement of Fees - Demand)"
-        }
-    }
-
-    outcome = _record_run_blocks_result(ctx, result)
-
-    assert outcome == RecordedRunOutcome(
-        verdict="not_evaluated",
-        workflow_run_id="wr_test",
-        output_report=(
-            'Recorded output from the latest completed run: {"retrieve_resale_demand_document":'
-            '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
-        ),
-        run_completed=True,
-    )
-    assert ctx.last_test_ok is True
-    assert ctx.last_full_workflow_test_ok is True
-    assert ctx.last_test_suspicious_success is False
-    assert ctx.last_test_failure_reason is None

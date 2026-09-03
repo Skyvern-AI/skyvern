@@ -2982,6 +2982,7 @@ workflow_definition:
                 {
                     "label": "inspect_result",
                     "status": "completed",
+                    "output": "prefix customer-secret suffix",
                     "action_trace": [{"action": "click", "status": "completed", "element": "sensitive-target"}],
                 }
             ],
@@ -3023,7 +3024,7 @@ workflow_definition:
     assert packet["attempted_block_labels"] == ["inspect_result"]
     assert packet["executed_block_labels"] == ["inspect_result"]
     assert packet["action_observations"] == ["click completed"]
-    assert packet["registered_outputs"][0]["value"] == "prefix [REDACTED_SECRET] suffix"
+    assert packet["registered_outputs"][0]["output"] == "prefix [REDACTED_SECRET] suffix"
     assert any("registered_outputs redacted" in notice for notice in packet["omission_notices"])
     assert MCP_RESULT_PROVENANCE_KEY not in output
     assert set(output) == {"ok", "data"}
@@ -3366,8 +3367,8 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
             assert packet["attempted_block_labels"] == ["inspect_result"]
             assert packet["executed_block_labels"] == executed_labels
             assert packet["action_observations"] == ["click completed code_line=7"]
-            assert packet["registered_outputs"][0]["output_parameter_key"] == "recorded_result"
-            assert packet["registered_outputs"][0]["value"] == "recorded value"
+            assert packet["registered_outputs"][0]["label"] == "inspect_result"
+            assert packet["registered_outputs"][0]["output"] == "recorded value"
             page_state = packet["failure"]["page_state"]
             assert page_state["current_origin"] == "https://example.test/"
             assert "current_url" not in page_state
@@ -3497,6 +3498,7 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
                 {
                     "label": "inspect_result",
                     "status": "failed",
+                    "output": "recorded value",
                     "failure_reason": f"{hostile_instruction}: {secret_marker}",
                     "error_codes": [hostile_instruction, secret_marker],
                     "action_trace": [

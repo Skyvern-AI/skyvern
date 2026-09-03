@@ -832,7 +832,7 @@ async def test_registered_validation_review_output_from_dict_workflow_merges_int
 
 
 @pytest.mark.asyncio
-async def test_dispatch_version_registered_output_identity_uses_exact_draft_and_rejects_ambiguity(
+async def test_registered_output_adapter_retains_rows_without_workflow_definition_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
@@ -840,13 +840,8 @@ async def test_dispatch_version_registered_output_identity_uses_exact_draft_and_
         return [
             SimpleNamespace(
                 workflow_run_id="wr_dispatch",
-                output_parameter_id="op_dispatch",
-                value={"record_number": "1234567890"},
-            ),
-            SimpleNamespace(
-                workflow_run_id="wr_dispatch",
                 output_parameter_id="op_unknown",
-                value={"record_number": "ambiguous"},
+                value={"record_number": "1234567890"},
             ),
         ]
 
@@ -870,159 +865,26 @@ async def test_dispatch_version_registered_output_identity_uses_exact_draft_and_
             ]
         ),
     )
-    dispatch_workflow = SimpleNamespace(
-        organization_id="o",
-        workflow_definition=SimpleNamespace(
-            blocks=[
-                SimpleNamespace(
-                    label="extract_record",
-                    block_type="CODE",
-                    output_parameter=SimpleNamespace(
-                        output_parameter_id="op_dispatch",
-                        key="extract_record_output",
-                    ),
-                )
-            ]
-        ),
-    )
     data: dict[str, Any] = {"workflow_run_id": "wr_dispatch", "blocks": []}
 
     by_label = await _attach_registered_output_parameter_values(
         workflow_run_id="wr_dispatch",
         workflow=source_workflow,  # type: ignore[arg-type]
-        output_identity_workflow=dispatch_workflow,  # type: ignore[arg-type]
         data=data,
     )
 
-    assert by_label == {"extract_record": {"extract_record_output": {"record_number": "1234567890"}}}
-    assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_dispatch"]
-    assert data["blocks"][0]["extracted_data"] == {"extract_record_output": {"record_number": "1234567890"}}
-
-
-@pytest.mark.asyncio
-async def test_inline_registered_output_identity_uses_runtime_override_when_persisted_ids_differ(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
-        assert workflow_run_id == "wr_inline"
-        return [
-            SimpleNamespace(
-                workflow_run_id="wr_inline",
-                output_parameter_id="op_runtime",
-                value={"record_number": "1234567890"},
-            )
-        ]
-
-    monkeypatch.setattr(
-        run_execution.app.DATABASE,
-        "workflow_runs",
-        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
-    )
-    persisted_workflow = SimpleNamespace(
-        organization_id="o",
-        workflow_definition=SimpleNamespace(
-            blocks=[
-                SimpleNamespace(
-                    label="extract_record",
-                    block_type="CODE",
-                    output_parameter=SimpleNamespace(
-                        output_parameter_id="op_persisted",
-                        key="extract_record_output",
-                    ),
-                )
-            ]
-        ),
-    )
-    runtime_workflow = SimpleNamespace(
-        organization_id="o",
-        workflow_definition=SimpleNamespace(
-            blocks=[
-                SimpleNamespace(
-                    label="extract_record",
-                    block_type="CODE",
-                    output_parameter=SimpleNamespace(
-                        output_parameter_id="op_runtime",
-                        key="extract_record_output",
-                    ),
-                )
-            ]
-        ),
-    )
-    output_identity_workflow = run_execution._registered_output_identity_workflow(
-        dispatch_to_worker=False,
-        dispatch_workflow=None,
-        runtime_workflow=runtime_workflow,  # type: ignore[arg-type]
-    )
-    data: dict[str, Any] = {"workflow_run_id": "wr_inline", "blocks": []}
-
-    by_label = await _attach_registered_output_parameter_values(
-        workflow_run_id="wr_inline",
-        workflow=persisted_workflow,  # type: ignore[arg-type]
-        output_identity_workflow=output_identity_workflow,
-        data=data,
-    )
-
-    assert output_identity_workflow is runtime_workflow
-    assert by_label == {"extract_record": {"extract_record_output": {"record_number": "1234567890"}}}
-    assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_runtime"]
-
-
-@pytest.mark.asyncio
-async def test_inline_prior_draft_registered_output_identity_uses_snapshot_ids(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
-        assert workflow_run_id == "wr_inline_snapshot"
-        return [
-            SimpleNamespace(
-                workflow_run_id="wr_inline_snapshot",
-                output_parameter_id="op_snapshot",
-                value={"record_number": "1234567890"},
-            )
-        ]
-
-    monkeypatch.setattr(
-        run_execution.app.DATABASE,
-        "workflow_runs",
-        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
-    )
-
-    def workflow(output_parameter_id: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            organization_id="o",
-            workflow_definition=SimpleNamespace(
-                blocks=[
-                    SimpleNamespace(
-                        label="extract_record",
-                        block_type="CODE",
-                        output_parameter=SimpleNamespace(
-                            output_parameter_id=output_parameter_id,
-                            key="extract_record_output",
-                        ),
-                    )
-                ]
-            ),
-        )
-
-    runtime_workflow = workflow("op_runtime")
-    snapshot_workflow = workflow("op_snapshot")
-    output_identity_workflow = run_execution._registered_output_identity_workflow(
-        dispatch_to_worker=False,
-        dispatch_workflow=snapshot_workflow,  # type: ignore[arg-type]
-        runtime_workflow=runtime_workflow,  # type: ignore[arg-type]
-    )
-    data: dict[str, Any] = {"workflow_run_id": "wr_inline_snapshot", "blocks": []}
-
-    by_label = await _attach_registered_output_parameter_values(
-        workflow_run_id="wr_inline_snapshot",
-        workflow=runtime_workflow,  # type: ignore[arg-type]
-        output_identity_workflow=output_identity_workflow,
-        data=data,
-    )
-
-    assert output_identity_workflow is snapshot_workflow
-    assert by_label == {"extract_record": {"extract_record_output": {"record_number": "1234567890"}}}
-    assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_snapshot"]
+    assert by_label == {}
+    assert data["registered_output_parameter_values"] == [
+        {
+            "workflow_run_id": "wr_dispatch",
+            "output_parameter_id": "op_unknown",
+            "output_parameter_key": None,
+            "block_label": None,
+            "block_type": None,
+            "value": {"record_number": "1234567890"},
+        }
+    ]
+    assert data["blocks"] == []
 
 
 def test_satisfied_interactive_completion_does_not_make_empty_output_terminal_ready() -> None:

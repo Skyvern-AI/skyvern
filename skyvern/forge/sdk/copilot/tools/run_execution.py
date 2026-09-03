@@ -110,7 +110,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     iter_failure_reasons,
     project_build_test_packet_for_llm,
     sanitize_tool_result_for_llm,
-    truncate_output,
 )
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
@@ -197,7 +196,6 @@ from ._shared import (
     _current_workflow_block_labels,
     _failed_run_block_labels,
     _fallback_page_info,
-    _is_meaningful_extracted_data,
     _unverified_current_workflow_labels,
     _valid_runtime_anchor_url,
     _workflow_definition_block_labels,
@@ -244,7 +242,6 @@ from .scouting import _mark_post_run_page_observed, _redact_codeblock_value
 LOG = structlog.get_logger()
 
 
-_INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY = "_copilot_registered_output_identity_mismatch"
 _MAX_REGISTERED_ARTIFACTS = 3
 _MAX_REGISTERED_ARTIFACT_BYTES = 5 * 1024 * 1024
 _MAX_REGISTERED_ARTIFACT_TEXT_CHARS = 20_000
@@ -526,6 +523,9 @@ def _recorded_run_block_result(block: WorkflowRunBlock) -> dict[str, Any]:
         result["failure_reason"] = block.failure_reason
     if block.error_codes:
         result["error_codes"] = list(block.error_codes)
+    # The persisted row owns null too. Keeping the key distinguishes an explicit null from an
+    # older result that carried no block-output fact at all.
+    result["output"] = block.output
     return result
 
 
@@ -1347,7 +1347,6 @@ def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) 
             block = {
                 "label": label,
                 "block_type": item.get("block_type") or "CODE",
-                "status": WorkflowRunStatus.completed.value,
             }
             blocks.append(block)
             by_label[label] = block
@@ -1358,25 +1357,10 @@ def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) 
             block["extracted_data"] = {key: value}
 
 
-def _registered_output_identity_workflow(
-    *,
-    dispatch_to_worker: bool,
-    dispatch_workflow: Workflow | None,
-    runtime_workflow: Workflow,
-) -> Workflow | None:
-    # Any persisted run snapshot regenerates output-parameter ids, including the inline
-    # prior-draft path. Registered WorkflowRunOutputParameter rows therefore identify the
-    # snapshot definition, not the in-memory runtime workflow.
-    if dispatch_workflow is not None:
-        return dispatch_workflow
-    return runtime_workflow
-
-
 async def _attach_registered_output_parameter_values(
     *,
     workflow_run_id: str,
     workflow: Workflow | None,
-    output_identity_workflow: Workflow | None = None,
     data: dict[str, Any],
     persisted_output_parameters: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -1398,8 +1382,7 @@ async def _attach_registered_output_parameter_values(
         data["registered_output_parameter_values"] = []
         return {}
 
-    exact_output_identity = output_identity_workflow is not None
-    index_by_id, index_by_key = _workflow_output_parameter_indexes(output_identity_workflow or workflow)
+    index_by_id, index_by_key = _workflow_output_parameter_indexes(workflow)
     persisted_key_by_id = {
         output_parameter_id: key
         for parameter in persisted_output_parameters or []
@@ -1408,22 +1391,13 @@ async def _attach_registered_output_parameter_values(
     }
     normalized: list[dict[str, Any]] = []
     values_by_label: dict[str, Any] = {}
-    registered_output_identity_mismatch = False
     for row in registered_rows:
         output_parameter_id = getattr(row, "output_parameter_id", None)
         if not isinstance(output_parameter_id, str) or not output_parameter_id:
             continue
         block_info = dict(index_by_id.get(output_parameter_id, {}))
-        if exact_output_identity and not block_info:
-            registered_output_identity_mismatch = True
-            LOG.info(
-                "Skipped registered output with no exact run-definition identity",
-                workflow_run_id=workflow_run_id,
-                output_parameter_id=output_parameter_id,
-            )
-            continue
         output_parameter_key = block_info.get("output_parameter_key")
-        if not exact_output_identity and (not isinstance(output_parameter_key, str) or not output_parameter_key):
+        if not isinstance(output_parameter_key, str) or not output_parameter_key:
             output_parameter_key = persisted_key_by_id.get(output_parameter_id)
             if isinstance(output_parameter_key, str):
                 block_info["output_parameter_key"] = output_parameter_key
@@ -1444,10 +1418,6 @@ async def _attach_registered_output_parameter_values(
         if isinstance(label, str) and label and isinstance(key, str) and key:
             values_by_label.setdefault(label, {})[key] = value
 
-    if registered_output_identity_mismatch:
-        data[_INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY] = True
-    if not normalized:
-        return {}
     data["registered_output_parameter_values"] = normalized
     _merge_registered_output_parameter_values_into_blocks(data)
     return values_by_label
@@ -2606,10 +2576,6 @@ async def _run_blocks_and_collect_debug(
     ctx.last_frontier_start_label = frontier_start_label
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
-    # This is a current-run fallback for output-parameter identity mismatches,
-    # not cross-run memory. Clear it before any new execution can populate it.
-    ctx.verified_terminal_block_outputs = {}
-
     # Verified state is NOT invalidated pre-run. On a failed / partial run we
     # want the prior verified prefix preserved so the next edit can still use
     # the optimization. YAML-diff-based invalidation for edited/downstream
@@ -3440,23 +3406,15 @@ async def _run_blocks_and_collect_debug(
         if not run_ok and run and getattr(run, "failure_category", None):
             result_data["failure_category"] = run.failure_category
 
-        output_identity_workflow = _registered_output_identity_workflow(
-            dispatch_to_worker=dispatch_to_worker,
-            dispatch_workflow=dispatch_workflow,
-            runtime_workflow=runtime_workflow,
+        output_identity_workflow = dispatch_workflow or runtime_workflow
+        result_data["requested_output_parameter_definitions"] = _requested_output_parameter_definitions(
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow=output_identity_workflow,
         )
-        if output_identity_workflow is None:
-            result_data["requested_output_definitions_omission"] = "the run-pinned workflow snapshot was unavailable"
-        else:
-            result_data["requested_output_parameter_definitions"] = _requested_output_parameter_definitions(
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow=output_identity_workflow,
-            )
 
         registered_outputs_by_label = await _attach_registered_output_parameter_values(
             workflow_run_id=workflow_run.workflow_run_id,
-            workflow=runtime_workflow,
-            output_identity_workflow=output_identity_workflow,
+            workflow=output_identity_workflow,
             data=result_data,
             persisted_output_parameters=all_output_params,
         )
@@ -3475,7 +3433,6 @@ async def _run_blocks_and_collect_debug(
         # extracted_data for terminal replies, so both have to land before it, not after.
         run_fully_completed = run_ok and all(r.get("status") == "completed" for r in results)
         if run_fully_completed:
-            ctx.verified_terminal_block_outputs = dict(block_outputs_by_label)
             existing_prefix = list(ctx.verified_prefix_labels or [])
             existing_set = set(existing_prefix)
             for label in labels_to_execute:
@@ -3657,9 +3614,6 @@ async def _get_run_results(
     results = []
     for block in blocks:
         block_result = _recorded_run_block_result(block)
-        output = truncate_output(getattr(block, "output", None))
-        if output:
-            block_result["output"] = output
         results.append(block_result)
 
     await _attach_action_traces(blocks, results, ctx.organization_id)
@@ -3737,7 +3691,6 @@ async def _get_run_results(
     await _attach_registered_output_parameter_values(
         workflow_run_id=workflow_run_id,
         workflow=run_workflow,
-        output_identity_workflow=run_workflow,
         data=result_data,
         persisted_output_parameters=(
             [parameter for parameter in _workflow_parameters(run_workflow) if isinstance(parameter, OutputParameter)]
@@ -4142,30 +4095,6 @@ def _read_mapping_path(payload: dict[str, Any], path: str) -> Any:
     return current
 
 
-def _retained_terminal_output_has_value(value: Any) -> bool:
-    """Recognize substantive output worth retaining for the model's factual report."""
-    if isinstance(value, (str, bytes)):
-        return bool(value)
-    if isinstance(value, Mapping):
-        structural_keys = {
-            "task_id",
-            "status",
-            "failure_reason",
-            "failure_category",
-            "errors",
-            "task_screenshots",
-            "workflow_screenshots",
-        }
-        return any(
-            _retained_terminal_output_has_value(item)
-            for key, item in value.items()
-            if str(key) not in structural_keys and not str(key).endswith("_artifact_ids")
-        )
-    if isinstance(value, (list, tuple, set)):
-        return any(_retained_terminal_output_has_value(item) for item in value)
-    return _is_meaningful_extracted_data(value)
-
-
 def _record_run_blocks_result(
     copilot_ctx: Any,
     result: dict[str, Any],
@@ -4179,19 +4108,6 @@ def _record_run_blocks_result(
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
     if isinstance(run_id, str) and run_id:
         copilot_ctx.block_run_calls_this_turn = _runs_this_turn(copilot_ctx) + 1
-    if run_ok and isinstance(data, dict):
-        terminal_outputs: dict[str, Any] = {}
-        for block in data.get("blocks") or []:
-            if not isinstance(block, dict):
-                continue
-            label = block.get("label")
-            output = block.get("extracted_data")
-            if isinstance(label, str) and isinstance(output, dict) and output:
-                terminal_outputs[label] = output
-        if _retained_terminal_output_has_value(terminal_outputs):
-            # Prefer the final run-result extracted_data for terminal replies;
-            # it is the same persisted run evidence completion verification saw.
-            copilot_ctx.verified_terminal_block_outputs = terminal_outputs
     # ADR-0025: interactive authoring has no post-run adjudicator. Keep the
     # argument temporarily for callers/tests while making it deliberately inert;
     # the unattended page-observation self-heal verifier remains a separate lane.
@@ -4321,17 +4237,9 @@ def _record_run_blocks_result(
         run_ok = False
 
     if run_ok:
-        registered_output_identity_mismatch = bool(
-            data.pop(_INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY, False) if isinstance(data, dict) else False
-        )
         output_report = recorded_output_report(
             data.get("registered_output_parameter_values") if isinstance(data, dict) else None
         )
-        if output_report is None and registered_output_identity_mismatch:
-            retained_outputs = copilot_ctx.verified_terminal_block_outputs
-            output_report = recorded_output_report(
-                [{"output_parameter_key": label, "value": value} for label, value in retained_outputs.items()]
-            )
         recorded_outcome = _recorded_run_outcome(
             workflow_run_id=run_id if isinstance(run_id, str) else None,
             output_report=output_report,
@@ -4960,46 +4868,112 @@ def _packet_registered_outputs(
     run_id: str | None,
     omission_notices: list[str],
 ) -> list[BuildTestPacketRegisteredOutput]:
-    raw_outputs = data.get("registered_output_parameter_values")
-    if not isinstance(raw_outputs, list):
-        omission = _packet_string(data.get("registered_output_values_omission"))
-        if omission is not None:
-            omission_notices.append(f"registered_outputs omitted: {omission}.")
+    parameter_omission = _packet_string(data.get("registered_output_values_omission"))
+    if parameter_omission is not None:
+        omission_notices.append(f"requested output accounting omitted: {parameter_omission}.")
+    raw_blocks = data.get("blocks")
+    if run_id is None:
         return []
-    outputs: list[BuildTestPacketRegisteredOutput] = []
+    if not isinstance(raw_blocks, list):
+        raw_blocks = []
+    recorded_outputs: list[BuildTestPacketRegisteredOutput] = []
     malformed = 0
-    other_run = 0
     redacted = 0
-    for raw_output in raw_outputs:
-        if not isinstance(raw_output, Mapping):
+    null_block_outputs = 0
+    block_output_labels: set[str] = set()
+    status_by_label: dict[str, str | None] = {}
+    for raw_block in raw_blocks:
+        if not isinstance(raw_block, Mapping):
             malformed += 1
             continue
-        output_run_id = _packet_string(raw_output.get("workflow_run_id"))
-        if run_id is None or output_run_id != run_id:
-            other_run += 1
+        label = _packet_string(raw_block.get("label"))
+        if label is not None:
+            status_by_label.setdefault(label, _packet_string(raw_block.get("status")))
+        if "output" not in raw_block:
             continue
-        raw_value = raw_output.get("value")
-        scrubbed_value = scrub_secrets_from_structure(copilot_ctx, raw_value)
-        value_redacted = scrubbed_value != raw_value
+        if label is not None:
+            block_output_labels.add(label)
+        if raw_block.get("output") is None:
+            null_block_outputs += 1
+            continue
+        raw_output = raw_block.get("output")
+        scrubbed_output = scrub_secrets_from_structure(copilot_ctx, raw_output)
+        output_redacted = scrubbed_output != raw_output
         try:
-            outputs.append(
+            recorded_outputs.append(
                 BuildTestPacketRegisteredOutput(
-                    workflow_run_id=_packet_string(raw_output.get("workflow_run_id")),
-                    output_parameter_id=_packet_string(raw_output.get("output_parameter_id")),
-                    output_parameter_key=_packet_string(raw_output.get("output_parameter_key")),
-                    block_label=_packet_string(raw_output.get("block_label")),
-                    block_type=_packet_string(raw_output.get("block_type")),
-                    value=scrubbed_value,
+                    label=label,
+                    status=_packet_string(raw_block.get("status")),
+                    output=scrubbed_output,
                 )
             )
-            if value_redacted:
+            if output_redacted:
                 redacted += 1
         except ValueError:
             malformed += 1
+
+    # A loop can persist partial output directly on WorkflowRunOutputParameter before its
+    # WorkflowRunBlock row receives an output. Preserve that same-run value in the compact packet
+    # without replacing a real recorded block output when one exists.
+    fallback_by_label: dict[str, dict[str, Any]] = {}
+    fallback_redacted_labels: set[str] = set()
+    other_run = 0
+    unbound = 0
+    raw_registered = data.get("registered_output_parameter_values")
+    for raw_output in raw_registered if isinstance(raw_registered, list) else []:
+        if not isinstance(raw_output, Mapping):
+            malformed += 1
+            continue
+        if _packet_string(raw_output.get("workflow_run_id")) != run_id:
+            other_run += 1
+            continue
+        label = _packet_string(raw_output.get("block_label"))
+        key = _packet_string(raw_output.get("output_parameter_key"))
+        if label is None or key is None:
+            unbound += 1
+            continue
+        if label in block_output_labels:
+            continue
+        raw_value = raw_output.get("value")
+        scrubbed_value = scrub_secrets_from_structure(copilot_ctx, raw_value)
+        fallback_by_label.setdefault(label, {})[key] = scrubbed_value
+        if scrubbed_value != raw_value:
+            fallback_redacted_labels.add(label)
+    fallback_outputs: list[BuildTestPacketRegisteredOutput] = []
+    for label, fallback_output in fallback_by_label.items():
+        try:
+            fallback_outputs.append(
+                BuildTestPacketRegisteredOutput(
+                    label=label,
+                    status=status_by_label.get(label),
+                    output=fallback_output,
+                )
+            )
+        except ValueError:
+            malformed += 1
+    # Partial-loop fallback is the irreplaceable evidence in a died-mid-loop run. Put it before
+    # ordinary block outputs so both the normal 12-item cap and aggregate 6-item cap retain it.
+    outputs = fallback_outputs + recorded_outputs
+    if fallback_by_label:
+        omission_notices.append(
+            "registered_outputs included "
+            f"{len(fallback_by_label)} item(s) reconstructed from same-run output-parameter rows "
+            "because no workflow run block output was recorded."
+        )
+    redacted += len(fallback_redacted_labels)
     if malformed:
         omission_notices.append(f"registered_outputs omitted {malformed} non-JSON or malformed item(s).")
+    if null_block_outputs:
+        omission_notices.append(
+            f"registered_outputs omitted {null_block_outputs} explicit null workflow run block output(s); "
+            "registered output-parameter rows cannot replace them."
+        )
     if other_run:
         omission_notices.append(f"registered_outputs omitted {other_run} item(s) belonging to another or unknown run.")
+    if unbound:
+        omission_notices.append(
+            f"registered_outputs omitted {unbound} output-parameter item(s) with no run-snapshot block mapping."
+        )
     if redacted:
         omission_notices.append(f"registered_outputs redacted {redacted} item(s) containing registered secret values.")
     return outputs
@@ -5234,7 +5208,9 @@ def build_test_evidence_packet(
     requested_outputs = _packet_requested_outputs(data, run_id, omission_notices)
     registered_outputs = _packet_registered_outputs(copilot_ctx, data, run_id, omission_notices)
     if not registered_outputs:
-        omission_notices.append("registered_outputs empty: no output parameter value was recorded.")
+        omission_notices.append(
+            "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
+        )
     downloads = _packet_downloads(copilot_ctx, data, omission_notices)
     if not downloads:
         omission_notices.append("downloads empty: no registered download artifact was recorded.")
