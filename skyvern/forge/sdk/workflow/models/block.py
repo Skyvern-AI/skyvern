@@ -268,7 +268,12 @@ from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
-from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
+from skyvern.webeye.navigation import (
+    default_navigation_settle,
+    is_egress_attributable_navigation_error,
+    navigate_with_retry,
+    redact_url_secrets,
+)
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
@@ -1968,11 +1973,32 @@ class BaseTaskBlock(Block):
                                 )
 
                 except Exception as e:
-                    LOG.exception(
-                        "Failed to get browser state for first task",
-                        task_id=task.task_id,
-                        workflow_run_id=workflow_run_id,
-                    )
+                    if (
+                        isinstance(e, FailedToNavigateToUrl)
+                        and not isinstance(e, BlockedNavigationDestination)
+                        and not is_egress_attributable_navigation_error(e.error_message)
+                    ):
+                        # The target site did not load. Site-caused, and already surfaced on the run
+                        # through the failure_reason recorded below. Two classes stay at error
+                        # because they are ours rather than the site's: BlockedNavigationDestination
+                        # is the SSRF guard tripping, and EGRESS_ATTRIBUTABLE_NAV_ERRORS is our own
+                        # egress failing, which get_or_create_page may recover from on a different
+                        # proxy node. The block-execution handler above applies only the first of
+                        # those two carve-outs; see the PR discussion.
+                        LOG.warning(
+                            "Failed to get browser state for first task",
+                            task_id=task.task_id,
+                            workflow_run_id=workflow_run_id,
+                            url=e.url,
+                            exc_info=True,
+                        )
+                    else:
+                        LOG.exception(
+                            "Failed to get browser state for first task",
+                            task_id=task.task_id,
+                            workflow_run_id=workflow_run_id,
+                            url=getattr(e, "url", None),
+                        )
                     await self._handle_task_failure_with_error_detection(
                         task=task,
                         step=step,
