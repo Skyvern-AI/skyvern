@@ -728,6 +728,19 @@ def build_block_failure_output(failure_reason: str, error_codes: Sequence[str]) 
     }
 
 
+def user_defined_failure_category(error: UserDefinedError) -> list[dict[str, Any]]:
+    """A declared error code is the workflow author's own verdict on why the run stopped.
+    ``_resolve_block_terminal_outcome`` prefers a block output's ``failure_category`` over
+    keyword classification, so carrying it here keeps the run out of UNKNOWN."""
+    return [
+        {
+            "category": error.error_code,
+            "confidence_float": error.confidence_float,
+            "reasoning": error.reasoning,
+        }
+    ]
+
+
 def build_user_defined_error_output(error_code: str, reasoning: str) -> dict[str, Any]:
     """<label>_output payload for a declared ErrorCode raise (SKY-13668): a UserDefinedError
     entry with confidence 1.0, matching UserDefinedError's own serialized shape."""
@@ -736,6 +749,7 @@ def build_user_defined_error_output(error_code: str, reasoning: str) -> dict[str
         "status": BlockStatus.failed.value,
         "failure_reason": reasoning,
         "errors": [error.model_dump(mode="json")],
+        "failure_category": user_defined_failure_category(error),
     }
 
 
