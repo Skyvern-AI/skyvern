@@ -82,6 +82,12 @@ def runner_code_block_associations(
     return associations
 
 
+def dump_workflow_yaml(parsed: dict[str, Any]) -> str:
+    """Serialize a parsed workflow without folding: a wrapped long line reloads as one joined
+    string, which corrupts generated code."""
+    return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH)
+
+
 def reconcile_workflow_completion_contract(
     workflow_yaml: str,
     contract: dict[str, object] | None,
@@ -110,11 +116,11 @@ def reconcile_workflow_completion_contract(
         if definition.get("completion_contract") != previous_contract:
             return workflow_yaml, False
         definition.pop("completion_contract", None)
-        return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH), True
+        return dump_workflow_yaml(parsed), True
     if definition.get("completion_contract") == contract:
         return workflow_yaml, False
     definition["completion_contract"] = contract
-    return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH), False
+    return dump_workflow_yaml(parsed), False
 
 
 def _proxy_location_alias_key(value: str) -> str:

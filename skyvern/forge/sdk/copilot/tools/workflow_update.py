@@ -136,7 +136,11 @@ from .banned_blocks import (
     _task_v3_pure_policy_violations,
     _task_v3_pure_reject_message,
 )
-from .credentials import _credential_id_misbinding_findings, _credential_reference_validation_error
+from .credentials import (
+    _credential_id_misbinding_findings,
+    _credential_reference_validation_error,
+    canonicalize_named_google_sheet_bindings,
+)
 from .frontier import (
     _get_prior_workflow,
     _invalidate_verified_state_on_edit,
@@ -4073,6 +4077,9 @@ async def _update_workflow(
         )
 
     try:
+        # Before redaction: a connection name equal to a registered scrub value would otherwise
+        # reach the resolver already replaced by the placeholder.
+        workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4297,6 +4304,8 @@ async def _update_workflow(
         )
         if findings:
             data["findings"] = findings
+        if google_connection_resolution:
+            data["google_connection_resolution"] = google_connection_resolution
         return {
             "ok": True,
             "data": data,
