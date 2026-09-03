@@ -2761,7 +2761,7 @@ class WorkflowService:
                 if unknown_parameter_keys:
                     # Keys only, never values: an unknown key is the whole diagnosis and a value may
                     # be a credential id or customer data.
-                    LOG.warning(
+                    LOG.info(
                         "Workflow run request sent parameter keys the workflow does not declare",
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_permanent_id=workflow.workflow_permanent_id,
