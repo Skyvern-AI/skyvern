@@ -1100,6 +1100,14 @@ async def test_inline_declared_error_without_download_keeps_typed_output(monkeyp
         ],
         "failure_reason": "report generation failed",
         "status": "failed",
+        # SKY-15564: the run inherits the declared code instead of the classifier's UNKNOWN.
+        "failure_category": [
+            {
+                "category": "report_unavailable",
+                "confidence_float": 1.0,
+                "reasoning": "report generation failed",
+            }
+        ],
     }
     assert result.output_parameter_value == expected_output
     assert "downloaded_files" not in result.output_parameter_value

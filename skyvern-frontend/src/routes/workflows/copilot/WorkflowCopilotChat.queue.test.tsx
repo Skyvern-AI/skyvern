@@ -818,7 +818,9 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     // Resetting the narrative stops the progress/elapsed indicator from
     // ticking forever beside the error message.
     expect(screen.queryAllByRole("status")).toHaveLength(0);
-    expect(screen.getByText(/I encountered an error/)).toBeTruthy();
+    expect(
+      screen.getByText(/Copilot is checking whether this turn finished/),
+    ).toBeTruthy();
   });
 
   it("renders a response-only error narrative payload as halted", async () => {

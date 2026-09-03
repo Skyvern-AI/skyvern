@@ -40,6 +40,7 @@ import { getSseClient } from "@/api/sse";
 import {
   WorkflowCopilotCancelRequest,
   WorkflowCopilotCancelSource,
+  WorkflowCopilotChatHistoryMessage,
   WorkflowCopilotChatHistoryResponse,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
@@ -135,6 +136,30 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
+// A stream that closes with no terminal frame is usually a lost client
+// connection while the server handler runs on to persist the real reply, so the
+// ladder is sized to the server's own turn budget rather than to a short wait.
+const RECOVERY_POLL_DELAYS_MS = [2_000, 3_000, 5_000, 8_000, 12_000, 20_000];
+const RECOVERY_POLL_STEADY_MS = 30_000;
+// The server's RECONCILE_ABANDON_AFTER_SECONDS is 1_320_000ms. The margin holds
+// several 30s reads past it, so a turn whose reply was never persisted reaches
+// both the read that produces its interrupted row and the later one that picks
+// up the real reply if the turn finishes after all.
+const RECOVERY_POLL_BUDGET_MS = 1_500_000;
+const INTERRUPTED_TERMINAL_REASON = "interrupted";
+const SEND_FAILED_MESSAGE = "Sorry, I encountered an error. Please try again.";
+// A severed stream is usually the client losing the network, so recovery reads
+// fail too. Few enough that an offline user gets the plain failure back in
+// seconds; more than one so a single blip does not end a live recovery.
+const RECOVERY_POLL_FAILURE_CEILING = 3;
+// Reads spent watching for the real reply to replace an interrupted row. A turn
+// cancelled operationally never produces one, so this is bounded well short of
+// the budget.
+const RECOVERY_POLL_SUPERSEDE_READS = 4;
+// Says only what is true: the composer stays enabled while this is showing, so
+// it must not claim a retry is being held back.
+const RECOVERY_IN_PROGRESS_MESSAGE =
+  "The connection dropped, so Copilot is checking whether this turn finished.";
 const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
 
 // Cadence for re-fetching a live test run's recorded actions. Mirrors the
@@ -209,6 +234,41 @@ const STOP_NOT_SENT_NOTICE =
 
 const STOP_ORBIT_GRADIENT =
   "conic-gradient(from 0deg, rgba(120,170,255,.08) 0deg, rgba(120,170,255,.08) 120deg, rgba(150,195,255,.55) 250deg, #dbeaff 330deg, rgba(120,170,255,.08) 360deg)";
+
+function parseServerStamp(createdAt: string): number {
+  const stamp = /(Z|[+-]\d{2}:?\d{2})$/.test(createdAt)
+    ? createdAt
+    : `${createdAt}Z`;
+  const parsed = Date.parse(stamp);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function findRecoveredRow(
+  history: WorkflowCopilotChatHistoryMessage[],
+  turnId: string,
+  untaggedBaseline: number | null,
+): WorkflowCopilotChatHistoryMessage | null {
+  const byTurnId = history.find(
+    (message) =>
+      message.sender === "ai" &&
+      message.turn_outcome?.copilot_turn_id === turnId,
+  );
+  if (byTurnId) {
+    return byTurnId;
+  }
+  // turn_outcome is optional on a persisted row, so a reply written without one
+  // carries no id to match. The baseline is a server stamp so both sides of this
+  // comparison come from the same clock; a client clock here let skew adopt
+  // another turn's row or suppress our own.
+  if (untaggedBaseline === null) {
+    return null;
+  }
+  const last = history[history.length - 1];
+  if (!last || last.sender !== "ai" || last.turn_outcome?.copilot_turn_id) {
+    return null;
+  }
+  return parseServerStamp(last.created_at) > untaggedBaseline ? last : null;
+}
 
 function isPictographic(glyph: string): boolean {
   try {
@@ -827,6 +887,10 @@ export function WorkflowCopilotChat({
   // rapid double-submit would run a stale closure and start a second stream;
   // this ref is set before the first await and read at the top of handleSend.
   const inFlightRef = useRef(false);
+  // Counts sends rather than tracking one in progress: a send that both starts
+  // and finishes inside a recovery read leaves inFlightRef false at either end
+  // of it, and applying history fetched before that send would drop its turn.
+  const sendEpoch = useRef(0);
   // This latch closes the same-render double-click window before React can
   // publish isLoading. Once a selection queues behind another turn, isLoading
   // keeps every account row disabled until that queue drains.
@@ -867,6 +931,12 @@ export function WorkflowCopilotChat({
   // Backend cancel watcher polls Redis: a turn can complete normally between
   // the cancel POST and the watcher firing, so the frontend must remember it.
   const cancelInFlightController = useRef<AbortController | null>(null);
+  const recoveryPolls = useRef(new Map<string, () => void>());
+  const recoveryGeneration = useRef(0);
+  // The poll is declared before the reconcile it calls on a recovered row.
+  const reconcileCanonicalWorkflowRef = useRef<(() => Promise<void>) | null>(
+    null,
+  );
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -909,6 +979,7 @@ export function WorkflowCopilotChat({
   }, [workflowCopilotChatId]);
   useEffect(() => {
     const activePolls = actionPollRef.current;
+    const activeRecoveryPolls = recoveryPolls.current;
     return () => {
       streamingAbortController.current?.abort();
       activePolls.forEach((timer) => clearInterval(timer));
@@ -925,6 +996,9 @@ export function WorkflowCopilotChat({
         clearTimeout(gateFlashTimer.current);
         gateFlashTimer.current = null;
       }
+      recoveryGeneration.current += 1;
+      activeRecoveryPolls.forEach((stop) => stop());
+      activeRecoveryPolls.clear();
     };
   }, []);
   const [size, setSize] = useState({
@@ -1445,6 +1519,7 @@ export function WorkflowCopilotChat({
   }, []);
 
   const handleNewChat = () => {
+    stopRecoveryPolls();
     setMessages([]);
     updateQueuedPrompt(null);
     setWorkflowCopilotChatId(null);
@@ -1513,9 +1588,209 @@ export function WorkflowCopilotChat({
     [],
   );
 
+  const stopRecoveryPolls = useCallback(() => {
+    // Bumping the generation also discards responses already in flight, which
+    // clearTimeout alone cannot cancel.
+    recoveryGeneration.current += 1;
+    recoveryPolls.current.forEach((stop) => stop());
+    recoveryPolls.current.clear();
+  }, []);
+
+  const startRecoveryPoll = useCallback(
+    (chatId: string | null, turnId: string) => {
+      if (!workflowPermanentId) {
+        return;
+      }
+      const generation = recoveryGeneration.current;
+      const deadline = Date.now() + RECOVERY_POLL_BUDGET_MS;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let step = 0;
+      let appliedContent: string | null = null;
+      // Latching an id below makes later reads consistent, but an id resolved
+      // from "the workflow's latest chat" is not proof the chat is this turn's,
+      // so what gates the untagged fallback is how the poll started.
+      const scopedToKnownChat = chatId !== null;
+      let untaggedBaseline: number | null = null;
+      let inFlight: AbortController | null = null;
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      let consecutiveFailures = 0;
+      let supersedeReadsLeft = RECOVERY_POLL_SUPERSEDE_READS;
+      let stopped = false;
+
+      const clearTimer = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        // Without this a hung request outlives the budget and unmount cleanup,
+        // which clear only the timer.
+        inFlight?.abort();
+        inFlight = null;
+      };
+      function finish() {
+        stopped = true;
+        clearTimer();
+        if (deadlineTimer !== null) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
+        if (recoveryPolls.current.get(turnId) === finish) {
+          recoveryPolls.current.delete(turnId);
+        }
+      }
+
+      // Ending without the turn's row leaves a notice describing work that has
+      // stopped, so it reverts to the plain failure it replaced.
+      function giveUp() {
+        finish();
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.content === RECOVERY_IN_PROGRESS_MESSAGE
+              ? { ...message, content: SEND_FAILED_MESSAGE }
+              : message,
+          ),
+        );
+      }
+
+      recoveryPolls.current.get(turnId)?.();
+      recoveryPolls.current.set(turnId, finish);
+      // A read that never returns leaves schedule() unreached, so the budget
+      // needs a timer of its own or the deadline can never fire.
+      deadlineTimer = setTimeout(giveUp, RECOVERY_POLL_BUDGET_MS);
+
+      function schedule() {
+        clearTimer();
+        // finish() aborts the in-flight read, which surfaces in tick's catch;
+        // without this the rejection would reschedule a stopped poll.
+        if (stopped || Date.now() >= deadline) {
+          finish();
+          return;
+        }
+        const delay = RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS;
+        step += 1;
+        timer = setTimeout(() => {
+          timer = null;
+          void tick();
+        }, delay);
+      }
+
+      async function tick() {
+        if (recoveryGeneration.current !== generation) {
+          finish();
+          return;
+        }
+        const sendEpochBeforeRead = sendEpoch.current;
+        try {
+          const client = await getClient(credentialGetter, "sans-api-v1");
+          const controller = new AbortController();
+          inFlight = controller;
+          const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+            "/workflow/copilot/chat-history",
+            {
+              params: chatId
+                ? { workflow_copilot_chat_id: chatId }
+                : { workflow_permanent_id: workflowPermanentId },
+              signal: controller.signal,
+            },
+          );
+          if (inFlight === controller) {
+            inFlight = null;
+          }
+          // Without a chat id the read resolves "the workflow's latest chat",
+          // which another tab can move by creating a newer one. Latching the
+          // first id keeps every later read on the chat this turn recovered in.
+          if (chatId === null && response.data.workflow_copilot_chat_id) {
+            chatId = response.data.workflow_copilot_chat_id;
+          }
+          if (recoveryGeneration.current !== generation) {
+            finish();
+            return;
+          }
+          if (untaggedBaseline === null) {
+            // Polling by workflow_permanent_id can resolve to another tab's
+            // chat, so an untagged row there is not ours to adopt. The last row
+            // is excluded so a reply that landed before this first read can
+            // still clear the baseline it would otherwise have set.
+            untaggedBaseline = !scopedToKnownChat
+              ? Number.POSITIVE_INFINITY
+              : response.data.chat_history
+                  .slice(0, -1)
+                  .reduce((newest, message) => {
+                    const stamp = parseServerStamp(message.created_at);
+                    return stamp > newest ? stamp : newest;
+                  }, Number.NEGATIVE_INFINITY);
+          }
+          const row = findRecoveredRow(
+            response.data.chat_history,
+            turnId,
+            untaggedBaseline,
+          );
+          if (row) {
+            // Applying history while a later turn streams would wipe its
+            // optimistic rows, so leave the row for a tick after that send.
+            // The epoch covers a send that began and ended within this read,
+            // which leaves inFlightRef false at both ends of it.
+            if (
+              inFlightRef.current ||
+              sendEpoch.current !== sendEpochBeforeRead
+            ) {
+              schedule();
+              return;
+            }
+            if (row.content !== appliedContent) {
+              appliedContent = row.content;
+              applyHistoryResponse(response.data);
+            }
+            // An interrupted row is replaced by the real reply if the turn
+            // later finishes, so only a finished row ends the poll.
+            if (
+              row.turn_outcome?.terminal_reason !== INTERRUPTED_TERMINAL_REASON
+            ) {
+              void reconcileCanonicalWorkflowRef.current?.();
+              finish();
+              return;
+            }
+            // A turn cancelled operationally (a worker drain) writes this row
+            // and never finishes, so waiting out the budget would have every
+            // open chat polling in lockstep through a deploy. The user already
+            // has a truthful row; only a few reads are spent on a supersede.
+            supersedeReadsLeft -= 1;
+            if (supersedeReadsLeft <= 0) {
+              finish();
+              return;
+            }
+          }
+        } catch (error) {
+          console.warn("Copilot recovery poll failed:", error);
+          if (recoveryGeneration.current !== generation) {
+            finish();
+            return;
+          }
+          // The usual cause of a severed stream is the client losing the
+          // network, and then every read fails too. Rescheduling through that
+          // holds the notice for the whole budget and withholds the error the
+          // user used to get at once, so a run of failures ends the poll.
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= RECOVERY_POLL_FAILURE_CEILING) {
+            giveUp();
+            return;
+          }
+          schedule();
+          return;
+        }
+        consecutiveFailures = 0;
+        schedule();
+      }
+
+      schedule();
+    },
+    [applyHistoryResponse, credentialGetter, workflowPermanentId],
+  );
+
   const loadChatInPlace = useCallback(
     async (chatId: string) => {
       if (!workflowPermanentId) return;
+      stopRecoveryPolls();
       setIsLoadingHistory(true);
       updateQueuedPrompt(null);
       setRejectedTurnIds(new Set());
@@ -1551,6 +1826,7 @@ export function WorkflowCopilotChat({
       credentialGetter,
       workflowPermanentId,
       applyHistoryResponse,
+      stopRecoveryPolls,
       updateQueuedPrompt,
       repin,
     ],
@@ -1615,6 +1891,31 @@ export function WorkflowCopilotChat({
     },
     [onWorkflowUpdate],
   );
+
+  // A turn that auto-committed a build applies it from the terminal frame. A
+  // recovered turn never had that frame, so the editor can still hold the graph
+  // from before the drop and a later save would write it back over the commit.
+  // Reading canonical is the same thing the reload used to do.
+  const reconcileCanonicalWorkflow = useCallback(async () => {
+    if (!workflowPermanentId) {
+      return;
+    }
+    // Unsaved local edits outrank a stale graph: overwriting them would lose
+    // work the user can see, which is worse than the staleness being fixed.
+    if (useWorkflowHasChangesStore.getState().hasChanges) {
+      return;
+    }
+    try {
+      const client = await getClient(credentialGetter);
+      const response = await client.get<WorkflowApiResponse>(
+        `/workflows/${workflowPermanentId}`,
+      );
+      applyWorkflowUpdate(response.data, { persisted: true, applied: true });
+    } catch (error) {
+      console.warn("Failed to re-read the workflow after recovery:", error);
+    }
+  }, [applyWorkflowUpdate, credentialGetter, workflowPermanentId]);
+  reconcileCanonicalWorkflowRef.current = reconcileCanonicalWorkflow;
 
   // Records the accepted turn (for the "Applied changes" relabel) before
   // clearing the pending-gate handle, shared by all three accept outcomes.
@@ -1869,6 +2170,7 @@ export function WorkflowCopilotChat({
 
   useEffect(() => {
     if (!workflowPermanentId) {
+      stopRecoveryPolls();
       setMessages([]);
       updateQueuedPrompt(null);
       setWorkflowCopilotChatId(null);
@@ -1883,6 +2185,9 @@ export function WorkflowCopilotChat({
     if (historyLoadedForRef.current === workflowPermanentId) {
       return;
     }
+    // Reached only when this workflow's transcript is about to replace another's,
+    // so a poll armed against the outgoing chat must not apply history here.
+    stopRecoveryPolls();
 
     let isMounted = true;
 
@@ -1919,6 +2224,7 @@ export function WorkflowCopilotChat({
   }, [
     credentialGetter,
     repin,
+    stopRecoveryPolls,
     updateQueuedPrompt,
     workflowPermanentId,
     applyHistoryResponse,
@@ -2199,6 +2505,7 @@ export function WorkflowCopilotChat({
       }
       setIsLoading(true);
       inFlightRef.current = true;
+      sendEpoch.current += 1;
       // Stamped here, before the awaits below consume messageAudioBlob
       // and blockBuildTargetLabelRef.
       lastTurnRef.current = {
@@ -2222,6 +2529,18 @@ export function WorkflowCopilotChat({
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
       streamingAbortController.current = abortController;
+      // A chat switch or New chat during the stream bumps this, which is how a
+      // turn whose chat the user left is kept from arming a recovery re-read.
+      let sendGeneration = recoveryGeneration.current;
+      let streamTurnId: string | null = null;
+      let streamChatId: string | null = null;
+      let sawTerminalFrame = false;
+      const shouldArmRecovery = () =>
+        streamTurnId !== null &&
+        !sawTerminalFrame &&
+        !abortController.signal.aborted &&
+        cancelInFlightController.current !== abortController &&
+        recoveryGeneration.current === sendGeneration;
 
       setStopArmed(false);
       if (stopArmTimer.current !== null) {
@@ -2637,6 +2956,11 @@ export function WorkflowCopilotChat({
                   map.delete(oldest);
                 }
                 latestTurnId.current = payload.turn_id;
+                streamTurnId = payload.turn_id;
+                // The chat this turn belongs to, read while the server is
+                // announcing it. Reading the ref at arming time instead would
+                // bind the poll to whatever chat the user switched to since.
+                streamChatId = workflowCopilotChatIdRef.current;
                 applyStoredNarrativeEvent(payload, EMPTY_NARRATIVE);
                 return false;
               }
@@ -2671,11 +2995,13 @@ export function WorkflowCopilotChat({
               }
               case "response": {
                 const frozenNarrative = applyStoredNarrativeEvent(payload);
+                sawTerminalFrame = true;
                 handleResponse(payload, frozenNarrative);
                 return true;
               }
               case "error": {
                 const frozenNarrative = applyStoredNarrativeEvent(payload);
+                sawTerminalFrame = true;
                 handleError(payload, frozenNarrative);
                 return true;
               }
@@ -2693,16 +3019,28 @@ export function WorkflowCopilotChat({
         if (options.idempotencyKey !== undefined && workflowCopilotChatId) {
           toast({
             title: "Checking account selection",
-            description:
-              "The connection dropped, so Copilot is refreshing this chat before allowing a retry.",
+            description: RECOVERY_IN_PROGRESS_MESSAGE,
             variant: "destructive",
           });
+          const generationBeforeRefresh = recoveryGeneration.current;
           await loadChatInPlace(workflowCopilotChatId);
+          // loadChatInPlace stops recovery polls; forgive its own bump so this
+          // severed stream still arms, but not a chat the user actually left.
+          // It bumps exactly once, so a larger jump means a switch landed
+          // during the await and this turn must not arm.
+          if (
+            generationBeforeRefresh === sendGeneration &&
+            recoveryGeneration.current === generationBeforeRefresh + 1
+          ) {
+            sendGeneration = recoveryGeneration.current;
+          }
         } else {
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
-            content: "Sorry, I encountered an error. Please try again.",
+            content: shouldArmRecovery()
+              ? RECOVERY_IN_PROGRESS_MESSAGE
+              : SEND_FAILED_MESSAGE,
           };
           setMessages((prev) => [...prev, errorMessage]);
         }
@@ -2711,6 +3049,10 @@ export function WorkflowCopilotChat({
         setNarrative(EMPTY_NARRATIVE);
         setLivePauseFrame(null);
       } finally {
+        // Read before the clears below null cancelInFlightController. A soft Stop
+        // sets it synchronously and only aborts 15s later, so the abort signal
+        // alone would let a user cancel arm the recovery poll.
+        const armRecovery = shouldArmRecovery();
         if (streamingAbortController.current === abortController) {
           streamingAbortController.current = null;
           inFlightRef.current = false;
@@ -2739,6 +3081,12 @@ export function WorkflowCopilotChat({
         stopAllRecordedActionsPolls();
         releaseTurnRun();
         buildFollowEngaged.current = false;
+        if (armRecovery && streamTurnId !== null) {
+          startRecoveryPoll(
+            streamChatId ?? workflowCopilotChatIdRef.current,
+            streamTurnId,
+          );
+        }
       }
     },
     [
@@ -2769,6 +3117,7 @@ export function WorkflowCopilotChat({
       requiresLiveBrowser,
       resyncProposalFromChatRow,
       rollbackPendingTerminalContinuation,
+      startRecoveryPoll,
       stopSpeech,
       takeSpeechAudioBlob,
       updateQueuedPrompt,

@@ -78,6 +78,10 @@ export interface WorkflowCopilotChatHistoryMessage {
   turn_outcome?: {
     response_kind?: string | null;
     connected_account_choices?: ConnectedAccountChoice[] | null;
+    // Server-minted id of the turn that wrote this row; the same id the
+    // turn_start frame carries, so a client can correlate a row to its own send.
+    copilot_turn_id?: string | null;
+    terminal_reason?: string | null;
   } | null;
   narrative_payload?: Record<string, unknown> | null;
 }

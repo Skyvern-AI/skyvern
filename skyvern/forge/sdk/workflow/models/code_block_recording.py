@@ -72,6 +72,20 @@ def _null_redacted_scalars(original: Any, masked: Any) -> Any:
     return masked
 
 
+def _withhold_values(payload: dict[str, Any]) -> dict[str, Any]:
+    # Fail-closed redaction cannot say which leaves are parameter values, so every leaf is withheld:
+    # strings keep the typed field satisfied, anything else nulls so a default cannot restore it.
+    # Only field names survive as keys; nested keys can be page-derived text, so nested dicts collapse.
+    def withhold(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {}
+        if isinstance(value, list):
+            return [withhold(item) for item in value]
+        return "" if isinstance(value, str) else None
+
+    return {field: withhold(value) for field, value in payload.items()}
+
+
 def _page_closed(page: Page) -> bool | None:
     # Separates "page was already gone" from "page was alive but hung" — a screenshot TimeoutError
     # alone cannot tell them apart. Must not raise: the caller is an except handler whose remaining
@@ -284,7 +298,7 @@ class CodeBlockActionRecording:
             masked = app.AGENT_FUNCTION.redact_codeblock_parameter_values(masked, self._redaction_parameters)
             # A matching bool/number becomes a string placeholder, which typed Action fields reject.
             # Null it recursively so subclass defaults cannot silently restore user-controlled values.
-            masked = _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else {}
+            masked = _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else _withhold_values(payload)
             response = masked.get("response")
             if isinstance(response, str):
                 masked["response"] = response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
