@@ -20,6 +20,7 @@ import {
   BlockState,
   RecordedActionSummary,
   TurnNarrativeState,
+  awaitsUserInput,
   formatElapsed,
   humanizeJudgeText,
   isBlockOk,
@@ -35,6 +36,8 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+const QUESTION_PROSE_CLASSES =
+  "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]";
 const TERMINAL_PROSE_GRADIENT_CHARS = 32;
 const TERMINAL_PROSE_GRADIENT_SETTLE_MS = 420;
 
@@ -1607,8 +1610,19 @@ function DetailView({
           </div>
         ) : null}
 
+        {/* terminalProseTone's question branch without its evidence gate: an
+            ask that followed a run keeps the rail here, beside the evidence,
+            rather than replacing the card with prose-only chrome. */}
         {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
-          <div className="text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
+          <div
+            data-testid="copilot-detail-prose"
+            className={[
+              "text-[13px] leading-[1.55]",
+              awaitsUserInput(turn)
+                ? QUESTION_PROSE_CLASSES
+                : "text-foreground dark:text-slate-200",
+            ].join(" ")}
+          >
             <CopilotMarkdown
               text={humanizeJudgeText(
                 turn.narrativeSummary?.trim() ||
@@ -1657,7 +1671,11 @@ function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
   // A terminal question can follow a partial build or test. Keep recorded work
   // on the expandable evidence path rather than losing it to prose-only chrome.
   if (hasRecordedTerminalEvidence(turn)) return null;
-  if (turn.responseKind === "clarify" || turn.responseType === "ASK_QUESTION") {
+  if (
+    awaitsUserInput(turn) ||
+    turn.responseKind === "clarify" ||
+    turn.responseType === "ASK_QUESTION"
+  ) {
     return "question";
   }
   if (
@@ -1734,7 +1752,7 @@ function TerminalProse({
       className={[
         "text-[13px] leading-[1.55]",
         tone === "question"
-          ? "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]"
+          ? QUESTION_PROSE_CLASSES
           : "text-foreground dark:text-slate-200",
       ].join(" ")}
     >

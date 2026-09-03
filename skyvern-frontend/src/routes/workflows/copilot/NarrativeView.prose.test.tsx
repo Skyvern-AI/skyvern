@@ -242,6 +242,61 @@ describe("NarrativeView terminal prose", () => {
     expect(container.querySelector(".rounded-xl")).toBeNull();
   });
 
+  it("keeps the question treatment on an ask that carries recorded evidence", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "clarify",
+          responseType: "REPLY",
+          terminalMessage: "Which **login** should I use?",
+          terminalEnvelope: {
+            nextState: "awaiting_user_input",
+            renderedFromEnvelope: true,
+            runVerdict: null,
+            runDisplayReason: null,
+          },
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: "The sign-in flow did not reach the expected page.",
+          },
+        })}
+      />,
+    );
+
+    // The ask reads as an ask, and the recorded outcome it followed survives.
+    expect(screen.getByTestId("copilot-detail-prose").className).toContain(
+      "border-l-2",
+    );
+    expect(screen.getByText("login", { selector: "strong" })).toBeTruthy();
+    expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
+  });
+
+  it("leaves the ask untreated until the backend stamps the envelope", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "clarify",
+          responseType: "REPLY",
+          terminalMessage: "Which login should I use?",
+          terminalEnvelope: {
+            nextState: "awaiting_user_input",
+            renderedFromEnvelope: false,
+            runVerdict: null,
+            runDisplayReason: null,
+          },
+          lastRunOutcome: {
+            verdict: "not_demonstrated",
+            displayReason: "The sign-in flow did not reach the expected page.",
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("copilot-detail-prose").className).toContain(
+      "text-foreground",
+    );
+  });
+
   it("moves a run-level unconfirmed reason into its failed activity row", () => {
     render(
       <NarrativeView

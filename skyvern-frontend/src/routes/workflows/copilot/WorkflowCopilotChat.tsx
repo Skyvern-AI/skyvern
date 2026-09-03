@@ -83,6 +83,7 @@ import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
+import { QuestionPartsCard } from "./cards/QuestionPartsCard";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
@@ -100,6 +101,7 @@ import {
   RecordedActionSummary,
   TurnNarrativeState,
   applyNarrativeEvent,
+  awaitsUserInput,
   hydrateHistoryNarrative,
   notConfirmedOutcome,
   parseUtcIsoMs,
@@ -318,7 +320,7 @@ function ModeGlyph({
   );
 }
 
-function ConvoAggregatePill({
+export function ConvoAggregatePill({
   messages,
   isInFlight,
 }: {
@@ -352,12 +354,30 @@ function ConvoAggregatePill({
   const anyError = turnsWithNarrative.some(
     (m) => m.narrative?.terminal === "error" && !m.narrative?.cancelled,
   );
-  const status = isInFlight ? "In flight" : anyError ? "Halted" : "Done";
+  // The ask is pending only while it is the tail of the conversation. Reading
+  // the last narrative-bearing turn instead would strand the pill on a question
+  // that the user's own reply, or a later narration-free turn, already moved
+  // past. findLastTurnIndex skips run_lifecycle lines, which are sender "ai"
+  // with no narrative and must not count as an answer.
+  const lastTurn = messages[findLastTurnIndex(messages)];
+  const awaitingUser =
+    lastTurn?.sender === "ai" && awaitsUserInput(lastTurn.narrative);
+  // awaitingUser outranks anyError, which is session-wide: a question asked
+  // after a failed build test is what the user acts on next.
+  const status = isInFlight
+    ? "In flight"
+    : awaitingUser
+      ? "Waiting on you"
+      : anyError
+        ? "Halted"
+        : "Done";
   const dotClass = isInFlight
     ? "bg-blue-400"
-    : anyError
-      ? "bg-rose-400"
-      : "bg-emerald-400";
+    : awaitingUser
+      ? "bg-amber-400"
+      : anyError
+        ? "bg-rose-400"
+        : "bg-emerald-400";
   return (
     <div className="flex justify-center pb-1">
       <span className="inline-flex items-center gap-2 rounded-full border border-border bg-slate-elevation1/60 px-3 py-0.5 text-[11px] text-tertiary-foreground">
@@ -3875,6 +3895,12 @@ export function WorkflowCopilotChat({
               if (message.sender === "ai" && message.narrative) {
                 const turnId = message.narrative.turnId;
                 const choices = message.narrative.connectedAccountChoices;
+                // The account card owns its own choice interaction, so a turn
+                // that raised one never also raises the generic parts card.
+                const questionParts =
+                  choices.length === 0 && awaitsUserInput(message.narrative)
+                    ? (message.narrative.terminalEnvelope?.questionParts ?? [])
+                    : [];
                 const adjacentMessage = messages[index + 1];
                 const selectedConnectionId =
                   adjacentMessage?.sender === "user" &&
@@ -3920,6 +3946,22 @@ export function WorkflowCopilotChat({
                         onSelect={(connectionId) =>
                           handleConnectedAccountChoice(turnId, connectionId)
                         }
+                      />
+                    ) : null}
+                    {questionParts.length > 0 ? (
+                      <QuestionPartsCard
+                        parts={questionParts}
+                        answeredFrom={
+                          adjacentMessage?.sender === "user"
+                            ? adjacentMessage.content
+                            : null
+                        }
+                        disabled={
+                          !isLastMessage ||
+                          isLoading ||
+                          adjacentMessage !== undefined
+                        }
+                        onAnswer={(answer) => void handleSend(answer)}
                       />
                     ) : null}
                     {message.narrative.googleConnectionNotices.map((notice) => (

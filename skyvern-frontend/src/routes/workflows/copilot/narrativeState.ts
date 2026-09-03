@@ -6,6 +6,7 @@
 import { buildRevealOffsets } from "./actionReveal";
 import {
   ConnectedAccountChoice,
+  QuestionPart,
   CopilotResponseType,
   ProposalDisposition,
   RunOutcomeRole,
@@ -165,7 +166,25 @@ function isBuildTestConnectFailureState(
   );
 }
 
+// Closed vocabulary of TerminalOutcomeEnvelope.next_state. The envelope's
+// sibling response_kind and user_action_required carry the same bit for a
+// question turn, so only this one is parsed.
+export type TerminalNextState =
+  | "completed"
+  | "proposal_pending"
+  | "awaiting_user_input"
+  | "stopped";
+
 export interface TerminalEnvelopeFacts {
+  nextState: TerminalNextState | null;
+  // Server-admitted parts of the model's own question, in the order it asked
+  // them. Optional like connectFailure: absent on an envelope an older backend
+  // wrote, and empty on every turn that did not end on an ASK_QUESTION.
+  questionParts?: QuestionPart[];
+  // The backend stamps this only when the terminal-envelope render flag is on
+  // for the org; until then the envelope is carried but is not display
+  // authority, so no surface may key off it.
+  renderedFromEnvelope: boolean;
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
   // Absent on envelopes persisted before the role was carried.
@@ -227,6 +246,30 @@ export interface ReviewProjection {
   }>;
 }
 
+// part_id and the choice strings are minted or admitted server-side, so this
+// only has to drop a payload shape an older backend never sends.
+function parseQuestionParts(raw: unknown): QuestionPart[] {
+  if (!Array.isArray(raw)) return [];
+  const parts: QuestionPart[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const part = entry as Record<string, unknown>;
+    if (typeof part.part_id !== "string" || typeof part.prompt !== "string") {
+      continue;
+    }
+    parts.push({
+      part_id: part.part_id,
+      prompt: part.prompt,
+      choices: Array.isArray(part.choices)
+        ? part.choices.filter(
+            (choice): choice is string => typeof choice === "string",
+          )
+        : [],
+    });
+  }
+  return parts;
+}
+
 // Envelope dicts are backend model_dump output, so keys stay snake_case.
 // The backend anchors run_verdict from final outcomes only, so "evaluating"
 // is not a wire value here and parses to null like any unknown.
@@ -260,7 +303,17 @@ export function parseTerminalEnvelope(
     };
   })();
   const role = obj.run_outcome_role;
+  const nextState = obj.next_state;
   return {
+    questionParts: parseQuestionParts(obj.question_parts),
+    nextState:
+      nextState === "completed" ||
+      nextState === "proposal_pending" ||
+      nextState === "awaiting_user_input" ||
+      nextState === "stopped"
+        ? nextState
+        : null,
+    renderedFromEnvelope: obj.rendered_from_envelope === true,
     runVerdict:
       v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
         ? v
@@ -277,6 +330,27 @@ export function parseTerminalEnvelope(
         : null,
     connectFailure,
   };
+}
+
+// The one typed source for "this turn ended on the user". The backend derives
+// next_state from response_type == ASK_QUESTION and keeps it through a failed
+// build test, so a question asked after scouting or a run still reads as one.
+// Read-gated: the envelope is display authority only once the backend stamped
+// rendered_from_envelope. A user stop is not an ask -- next_state is derived
+// before the cancel lands, so the cancel path persists awaiting_user_input on a
+// turn nobody is waiting on.
+export function awaitsUserInput(
+  turn:
+    | Pick<TurnNarrativeState, "terminalEnvelope" | "cancelled">
+    | null
+    | undefined,
+): boolean {
+  if (!turn || turn.cancelled) return false;
+  const envelope = turn.terminalEnvelope;
+  return (
+    envelope?.renderedFromEnvelope === true &&
+    envelope.nextState === "awaiting_user_input"
+  );
 }
 
 export interface BlockState {
@@ -1771,26 +1845,6 @@ export function hydrateNarrativeFromPayload(
   };
 }
 
-// The chip reflects what the turn ACTUALLY did: its blocks, its response type,
-// and the backend's evidence-derived response kind.
-export function effectiveMode(turn: TurnNarrativeState): string {
-  if (turn.responseType === "ASK_QUESTION") {
-    return "clarify";
-  }
-  const blockCount = turn.draft?.blockCount ?? turn.blocks.length;
-  if (blockCount > 0) {
-    const priorBlocks = turn.priorBlockCount ?? 0;
-    return priorBlocks > 0 ? "edit" : "build";
-  }
-  if (turn.responseKind === "answer") {
-    return "docs_answer";
-  }
-  if (turn.responseKind === "diagnose" || turn.responseKind === "refuse") {
-    return turn.responseKind;
-  }
-  return "clarify";
-}
-
 // History rows persisted before narrative_payload carried responseKind still
 // have the adjacent persisted turn_outcome; graft its response_kind so
 // clarify/refuse/recover history corrects retroactively. Build-kind rows use
@@ -1840,47 +1894,12 @@ export function formatElapsed(
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export interface TurnSummary {
-  headline: string;
-  stats: string[];
-  accent: "ok" | "fail" | "qa" | "warn";
-  glyph: string;
-  isFail: boolean;
-  isStopped: boolean;
-  isQA: boolean;
-  isStoppedWithDraft: boolean;
-}
-
 export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
   const latest = new Map<string, BlockState>();
   for (const block of blocks) {
     latest.set(block.label, block);
   }
   return Array.from(latest.values());
-}
-
-// Legacy prose heuristic, consulted only when the turn has no typed
-// adjudication (responseKind null).
-function asksUserForInput(turn: TurnNarrativeState): boolean {
-  if (turn.responseType === "ASK_QUESTION") {
-    return true;
-  }
-  const text = `${turn.terminalMessage ?? ""} ${turn.narrativeSummary ?? ""}`
-    .toLowerCase()
-    .trim();
-  return (
-    text.includes("please provide") ||
-    text.includes("please share") ||
-    text.includes("could you provide") ||
-    text.includes("can you provide") ||
-    /^(which|what|where|who|when|how)\b[\s\S]*\?/.test(text)
-  );
-}
-
-interface AdjudicatedParts {
-  headline: string;
-  accent: TurnSummary["accent"];
-  glyph: string;
 }
 
 export interface NotConfirmedOutcome {
@@ -1934,61 +1953,6 @@ export function notConfirmedOutcome(
   return null;
 }
 
-// Headline parts for non-build terminal response kinds. Build rows always use
-// lifecycle and run facts rather than a separate verification stamp.
-function adjudicatedSummaryParts(
-  turn: TurnNarrativeState,
-  flags: {
-    needsUntestedProposalReview: boolean;
-    needsTestedProposalReview: boolean;
-    hasEdited: boolean;
-    hasDrafts: boolean;
-  },
-): AdjudicatedParts | null {
-  if (turn.responseKind === null) return null;
-  // Disposition-first (rule A): a pending draft review outranks why the turn
-  // ended, regardless of responseKind (including non-build/clarify turns).
-  if (flags.needsUntestedProposalReview) {
-    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
-  }
-  if (flags.needsTestedProposalReview) {
-    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
-  }
-  if (turn.responseKind !== "build") {
-    if (turn.responseKind === "refuse") {
-      return { headline: "Declined", accent: "qa", glyph: "✦" };
-    }
-    if (turn.responseKind === "answer" || turn.responseKind === "diagnose") {
-      return { headline: "Answered", accent: "qa", glyph: "✦" };
-    }
-    if (
-      turn.responseType !== "ASK_QUESTION" &&
-      notConfirmedOutcome(turn)?.verdict === "not_demonstrated"
-    ) {
-      return { headline: "Outcome not confirmed", accent: "warn", glyph: "!" };
-    }
-    return {
-      headline: "Needs your input",
-      accent: "qa",
-      glyph: "✦",
-    };
-  }
-  if (flags.needsUntestedProposalReview) {
-    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
-  }
-  if (flags.needsTestedProposalReview) {
-    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
-  }
-  if (turn.responseType === "ASK_QUESTION") {
-    return {
-      headline: "Needs your input",
-      accent: "qa",
-      glyph: "✦",
-    };
-  }
-  return null;
-}
-
 // A deadline exit stamps terminal="error" for budget reasons; that is a halt,
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
@@ -1996,174 +1960,4 @@ export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
     turn.turnFacts?.terminalCause === "deadline_expired" &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
   );
-}
-
-export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
-  const rollupBlocks = latestBlocksByLabel(turn.blocks);
-  // A cancelled turn's terminal is "error" purely because the user stopped it,
-  // so that arm must not brand their own stop a failure.
-  const anyBlockFailed = rollupBlocks.some((b) => b.state === "failed");
-  const facts = turn.turnFacts;
-  const deadlineHalt = isDeadlineHalt(turn);
-  const isFail =
-    !turn.cancelled &&
-    !deadlineHalt &&
-    (turn.terminal === "error" || anyBlockFailed);
-  // A stop halts the turn without failing it — a user cancel, or a budget halt
-  // that cancels a block mid-run. It suppresses a success verdict exactly like
-  // a failure, but never wears failure's treatment. `turn.cancelled` is load
-  // bearing on its own: a stop during the thinking phase, or on a QA turn,
-  // touches no block at all and would otherwise read as a clean success.
-  const isStopped =
-    turn.cancelled ||
-    deadlineHalt ||
-    rollupBlocks.some((b) => b.state === "stopped");
-  const mode = effectiveMode(turn);
-  const needsInput = asksUserForInput(turn);
-  const isQA =
-    mode === "docs_answer" ||
-    mode === "diagnose" ||
-    mode === "clarify" ||
-    mode === "refuse";
-  const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
-  const cleanFullCurrentSourceCoverage = ranCleanOnCurrentSource(facts);
-  const needsUntestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_untested";
-  // The tested framing is a claim like any other, so it reads the published verdict
-  // rather than the disposition alone.
-  const needsTestedProposalReview =
-    hasDrafts &&
-    turn.proposalDisposition === "review_tested" &&
-    cleanFullCurrentSourceCoverage;
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-  const authoredBlockCount = facts?.factsAvailable
-    ? facts.authoredBlockCount
-    : null;
-  const matchingSourceBlockCount = facts?.factsAvailable
-    ? facts.matchingSourceBlockCount
-    : null;
-  const coverageKnown =
-    authoredBlockCount !== null &&
-    authoredBlockCount > 0 &&
-    matchingSourceBlockCount !== null;
-  const hasReviewableDraft =
-    hasDrafts &&
-    (turn.proposalDisposition === "review_untested" ||
-      turn.proposalDisposition === "review_tested" ||
-      (turn.cancelled && turn.proposalDisposition !== "no_proposal"));
-  const isStoppedWithDraft = hasReviewableDraft && (isFail || isStopped);
-
-  // Fail/cancel precedence is absolute: a verdict never upgrades a halt.
-  const adjudicated =
-    isStoppedWithDraft || isFail || isStopped
-      ? null
-      : adjudicatedSummaryParts(turn, {
-          needsUntestedProposalReview,
-          needsTestedProposalReview,
-          hasEdited,
-          hasDrafts,
-        });
-
-  const headline = adjudicated
-    ? adjudicated.headline
-    : isStoppedWithDraft
-      ? "Stopped with a draft"
-      : isFail
-        ? "Run halted"
-        : isStopped
-          ? "Stopped"
-          : needsUntestedProposalReview
-            ? "Draft needs review"
-            : needsTestedProposalReview
-              ? "Workflow ready for review"
-              : needsInput
-                ? "Needs your input"
-                : isQA
-                  ? mode === "refuse"
-                    ? "Declined"
-                    : mode === "clarify"
-                      ? "Needs your input"
-                      : "Answered"
-                  : cleanFullCurrentSourceCoverage
-                    ? "Every block ran clean on the current draft"
-                    : hasEdited
-                      ? "Applied edits"
-                      : hasDrafts
-                        ? "Built the workflow"
-                        : "Completed the run";
-
-  const stats: string[] = [];
-  const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
-  if (turnElapsed) stats.push(turnElapsed);
-  if (!isQA) {
-    const ok = rollupBlocks.filter((b) => isBlockOk(b)).length;
-    const failed = rollupBlocks.filter((b) => b.state === "failed").length;
-    const stopped = rollupBlocks.filter((b) => b.state === "stopped").length;
-    const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (coverageKnown) {
-      stats.push(
-        `${authoredBlockCount} block${authoredBlockCount === 1 ? "" : "s"} authored`,
-      );
-      stats.push(
-        `${matchingSourceBlockCount}/${authoredBlockCount} ran on current source`,
-      );
-      if (facts?.runCompleted === true) {
-        stats.push("run completed");
-      } else if (facts?.runCompleted === false) {
-        stats.push("run did not complete");
-      }
-      if (facts?.evaluationState === "not_evaluated") {
-        stats.push("outcome not evaluated");
-      } else if (facts?.evaluationState === "not_demonstrated") {
-        stats.push("outcome not confirmed");
-      }
-      if (facts?.terminalCause === "deadline_expired") {
-        stats.push("time limit reached");
-      }
-    } else {
-      if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-      if (newBlocks) stats.push(`${newBlocks} new`);
-    }
-    if (failed) stats.push(`${failed} failed`);
-    if (stopped) stats.push(`${stopped} stopped`);
-  }
-
-  const accent = adjudicated
-    ? adjudicated.accent
-    : isStoppedWithDraft
-      ? "qa"
-      : isFail
-        ? "fail"
-        : isStopped ||
-            needsUntestedProposalReview ||
-            needsTestedProposalReview ||
-            isQA ||
-            (hasDrafts && !cleanFullCurrentSourceCoverage)
-          ? "qa"
-          : "ok";
-  return {
-    headline,
-    stats,
-    accent,
-    glyph: adjudicated
-      ? adjudicated.glyph
-      : isStoppedWithDraft ||
-          needsUntestedProposalReview ||
-          needsTestedProposalReview ||
-          // A draft still awaiting review never wears a success tick, whether or not
-          // facts back its tested framing.
-          (hasDrafts && turn.proposalDisposition === "review_tested")
-        ? "!"
-        : isFail
-          ? "✕"
-          : isStopped
-            ? "■"
-            : isQA
-              ? "✦"
-              : "✓",
-    isFail,
-    isStopped,
-    isQA,
-    isStoppedWithDraft,
-  };
 }
