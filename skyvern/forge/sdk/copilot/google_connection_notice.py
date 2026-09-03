@@ -52,7 +52,7 @@ def google_sheet_connection_bindings(workflow: Workflow | None) -> tuple[GoogleS
         for block in blocks:
             if isinstance(block, (GoogleSheetsReadBlock, GoogleSheetsWriteBlock)):
                 connection_id = block.credential_id
-                if connection_id:
+                if connection_id and connection_id.startswith("goac_"):
                     result.append((block.label, connection_id))
             elif isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 collect(block.loop_blocks)

@@ -822,6 +822,14 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
+
+    A `credential_id` may instead be the connection `name` or `email_address`
+    exactly as the user wrote it in this turn. The server resolves it and reports
+    the outcome under `google_connection_resolution` in the `update_workflow`
+    result: `resolved` rewrites the slot to the `connection_id`, while `ambiguous`,
+    `not_found`, `ineligible`, and `not_cited` leave it alone and return the
+    eligible rows to clarify against. A slot still holding an unresolved reference
+    cannot run.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}

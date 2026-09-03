@@ -225,6 +225,7 @@ from .credentials import (
     _extract_credential_ids_for_labels,
     _extract_credential_ids_from_tool_value,
     _extract_credential_ids_from_workflow_definition,
+    _google_connection_reference_ids,
     _google_sheet_connection_bindings_from_workflow_definition,
     _server_verified_google_account_choices,
 )
@@ -2704,6 +2705,7 @@ async def _run_blocks_and_collect_debug(
         approval_credential_ids,
         ctx.request_policy,
         additional_approved_ids=dispatch_scoped_sheet_ids,
+        google_reference_ids=_google_connection_reference_ids(workflow.workflow_definition, labels_that_may_execute),
     )
     if google_approval_blocker is not None:
         ctx.connected_account_recovery_choices = (
