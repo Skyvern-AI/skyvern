@@ -4353,9 +4353,21 @@ def _code_block_safe_print(
     print(app.AGENT_FUNCTION.redact_codeblock_parameter_values(rendered.getvalue(), parameters), end="", flush=flush)
 
 
-def _redact_codeblock_failure_text(value: str | None, parameters: dict[str, Any]) -> str | None:
+def _redact_codeblock_failure_text(
+    value: str | None,
+    parameters: dict[str, Any],
+    fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON,
+) -> str | None:
     redacted = app.AGENT_FUNCTION.redact_codeblock_parameter_values(value, parameters)
-    return redacted if isinstance(redacted, str) else None
+    if not isinstance(redacted, str):
+        return None
+    # The scrubber fails closed by returning "" once a parameter budget is blown, which a run
+    # cannot afford for the one field that says why it stopped. codeblock/workflow.py's
+    # scrub_reason guards the runner-side pass the same way. Callers whose value is a code or a
+    # telemetry token rather than user-facing prose pass fallback="" to keep the empty result.
+    if isinstance(value, str) and value.strip() and not redacted.strip():
+        return fallback
+    return redacted
 
 
 def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
@@ -6594,8 +6606,8 @@ async def wrapper({default_args}):
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
 
-        def scrub_failure_value(value: str | None) -> str | None:
-            return _redact_codeblock_failure_text(value, resolved_redaction_parameters)
+        def scrub_failure_value(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
+            return _redact_codeblock_failure_text(value, resolved_redaction_parameters, fallback)
 
         # Capture before the healable branch: a non-healable failure is exactly the case the
         # repair loop has the least to go on.
@@ -6624,7 +6636,7 @@ async def wrapper({default_args}):
                 status="skipped",
                 skip_reason=HealSkipReason.user_defined_error,
                 parameter_binding_keys=self._heal_parameter_binding_keys(workflow_run_context),
-                exception_class=scrub_failure_value("Exception"),
+                exception_class=scrub_failure_value("Exception", fallback=""),
                 failing_line=failing_line,
                 matched_step_index=self._matched_step_index_for_failing_line(failing_line),
                 failure_message=None,
@@ -6745,7 +6757,7 @@ async def wrapper({default_args}):
         workflow_permanent_id = workflow_run_context.workflow_permanent_id
         workflow_id = workflow_run_context.workflow_id
         exception_for_heal = exception or RuntimeError("CodeBlock failed")
-        exception_class = scrub_failure_value("Exception")
+        exception_class = scrub_failure_value("Exception", fallback="")
         matched_step_index = self._matched_step_index_for_failing_line(failing_line)
         parameter_binding_keys = self._heal_parameter_binding_keys(workflow_run_context)
         live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
@@ -7015,7 +7027,7 @@ async def wrapper({default_args}):
                 exception_class=exception_class,
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
-                failure_message=scrub_failure_value("recovery_failed"),
+                failure_message=scrub_failure_value("recovery_failed", fallback=""),
                 wall_clock_ms=None,
                 action_count=None,
                 output_obligation=OutputObligation.none,
@@ -7231,8 +7243,8 @@ async def wrapper({default_args}):
 
         serialized_parameter_values = app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
 
-        def scrub_failure_reason(value: str | None) -> str | None:
-            return _redact_codeblock_failure_text(value, serialized_parameter_values)
+        def scrub_failure_reason(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
+            return _redact_codeblock_failure_text(value, serialized_parameter_values, fallback)
 
         def scrub_failed_block_result(result: BlockResult) -> BlockResult:
             return _redact_codeblock_result(result, serialized_parameter_values)
@@ -7353,13 +7365,12 @@ async def wrapper({default_args}):
                                     engine_block_result.output_parameter_value,
                                 )
                                 return engine_block_result
-                            secure_failure_reason = (
-                                scrub_failure_reason(
-                                    secure_failure.failure_reason or "Code block failed in the secure runner"
-                                )
-                                or ""
-                            )
-                            secure_error_code = scrub_failure_reason(secure_failure.error_code)
+                            # The runner already scrubbed this text against the same serialized
+                            # parameters and guarded the fail-closed case, so re-scrubbing can only
+                            # no-op or empty it; fall back to what the runner reported.
+                            runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
+                            secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+                            secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
                             await self.record_output_parameter_value(
