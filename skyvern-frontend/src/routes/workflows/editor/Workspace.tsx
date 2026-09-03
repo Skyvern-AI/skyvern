@@ -46,7 +46,10 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
-import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
+import {
+  shouldPollDebugSessionInvalidation,
+  useDebugSessionQuery,
+} from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
@@ -1288,10 +1291,13 @@ function Workspace({
   // sustained polling without success.
   useEffect(() => {
     if (
-      (!debugSession || !debugSession.browser_session_id) &&
-      shouldFetchDebugSession &&
-      workflowPermanentId &&
-      !isRateLimited
+      shouldPollDebugSessionInvalidation({
+        debugSession,
+        debugSessionError,
+        shouldFetchDebugSession,
+        workflowPermanentId,
+        isRateLimited,
+      })
     ) {
       if (!pollingStartRef.current) {
         pollingStartRef.current = Date.now();
@@ -1328,6 +1334,7 @@ function Workspace({
     };
   }, [
     debugSession,
+    debugSessionError,
     shouldFetchDebugSession,
     workflowPermanentId,
     queryClient,

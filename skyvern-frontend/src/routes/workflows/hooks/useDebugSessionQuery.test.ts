@@ -6,19 +6,24 @@ import {
   DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS,
   DEBUG_SESSION_MAX_RETRIES,
   getDebugSessionRefetchInterval,
+  shouldPollDebugSessionInvalidation,
   shouldRetryDebugSessionRead,
 } from "./useDebugSessionQuery";
 
-function paymentRequiredError(): AxiosError {
-  const error = new AxiosError("Request failed with status code 402");
+function axiosErrorWithStatus(status: number): AxiosError {
+  const error = new AxiosError(`Request failed with status code ${status}`);
   error.response = {
-    status: 402,
-    statusText: "Payment Required",
+    status,
+    statusText: "",
     data: null,
     headers: {},
     config: { headers: new AxiosHeaders() },
   };
   return error;
+}
+
+function paymentRequiredError(): AxiosError {
+  return axiosErrorWithStatus(402);
 }
 
 describe("getDebugSessionRefetchInterval", () => {
@@ -95,6 +100,97 @@ describe("getDebugSessionRefetchInterval", () => {
       ),
     ).toBe(false);
   });
+
+  test("stops polling on a forbidden or expired session (401/403)", () => {
+    expect(
+      getDebugSessionRefetchInterval(
+        { status: "error", error: axiosErrorWithStatus(403) },
+        false,
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      getDebugSessionRefetchInterval(
+        { status: "error", error: axiosErrorWithStatus(401) },
+        false,
+        true,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("shouldPollDebugSessionInvalidation", () => {
+  const baseState = {
+    debugSession: null,
+    debugSessionError: undefined as unknown,
+    shouldFetchDebugSession: true,
+    workflowPermanentId: "wpid_123",
+    isRateLimited: false,
+  };
+
+  test("polls while waiting for a browser session with no error", () => {
+    expect(shouldPollDebugSessionInvalidation(baseState)).toBe(true);
+  });
+
+  test("keeps polling through a non-terminal error", () => {
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        debugSessionError: new AxiosError("Network Error"),
+      }),
+    ).toBe(true);
+  });
+
+  test("stops polling on a forbidden or expired session (401/403)", () => {
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        debugSessionError: axiosErrorWithStatus(403),
+      }),
+    ).toBe(false);
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        debugSessionError: axiosErrorWithStatus(401),
+      }),
+    ).toBe(false);
+  });
+
+  test("stops polling when the org is out of credits (402)", () => {
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        debugSessionError: paymentRequiredError(),
+      }),
+    ).toBe(false);
+  });
+
+  test("stops once a browser session exists", () => {
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        debugSession: { browser_session_id: "pbs_123" },
+      }),
+    ).toBe(false);
+  });
+
+  test("does not poll while rate limited or when fetching is disabled", () => {
+    expect(
+      shouldPollDebugSessionInvalidation({ ...baseState, isRateLimited: true }),
+    ).toBe(false);
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        shouldFetchDebugSession: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPollDebugSessionInvalidation({
+        ...baseState,
+        workflowPermanentId: undefined,
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("shouldRetryDebugSessionRead", () => {
@@ -111,5 +207,14 @@ describe("shouldRetryDebugSessionRead", () => {
 
   test("does not retry when the org is out of credits", () => {
     expect(shouldRetryDebugSessionRead(0, paymentRequiredError())).toBe(false);
+  });
+
+  test("does not retry a forbidden or expired session (401/403)", () => {
+    expect(shouldRetryDebugSessionRead(0, axiosErrorWithStatus(403))).toBe(
+      false,
+    );
+    expect(shouldRetryDebugSessionRead(0, axiosErrorWithStatus(401))).toBe(
+      false,
+    );
   });
 });
