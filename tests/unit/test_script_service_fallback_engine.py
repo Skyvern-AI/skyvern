@@ -14,12 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus
 
 MODULE = "skyvern.services.script_service"
 
@@ -295,3 +298,47 @@ async def test_block_screenshot_without_browser_state_is_not_a_warning(monkeypat
     log.warning.assert_not_called()
     log.info.assert_called_once()
     assert log.info.call_args.args[0] == "No browser state found when creating workflow_run_block"
+
+
+@pytest.mark.asyncio
+async def test_fallback_episode_excludes_decision_row_from_agent_action_count() -> None:
+    # Twin pin of the workflow/service.py count-filter test: _fallback_to_ai_run keeps its own copy
+    # of the decision-row exclusion, and a verdict row must not count as agent activity here either.
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v1)])
+    workflow.run_with = "code"
+    workflow.code_version = 2
+    app = _make_app(workflow)
+    app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(ai_fallback=True, run_with=None)
+    )
+    app.DATABASE.tasks.get_task = AsyncMock(
+        return_value=SimpleNamespace(url="https://example.com", status=TaskStatus.completed, failure_reason=None)
+    )
+    app.DATABASE.scripts.create_fallback_episode = AsyncMock(return_value=SimpleNamespace(episode_id="cep_1"))
+    update_episode = AsyncMock()
+    app.DATABASE.scripts.update_fallback_episode = update_episode
+    app.DATABASE.tasks.get_task_actions = AsyncMock(
+        return_value=[Action(action_type=ActionType.COMPLETE, status=ActionStatus.completed, step_id="stp_ai_1")]
+    )
+
+    # create_fallback_episode only fires when the context carries a workflow_permanent_id
+    # (is_adaptive_caching's gate); _make_context() leaves it unset for the other tests in
+    # this file, so this test needs its own context with it filled in.
+    context = _make_context()
+    context.workflow_permanent_id = "wpid_test"
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+        )
+
+    update_episode.assert_awaited_once()
+    assert update_episode.await_args.kwargs["fallback_succeeded"] is False
+    assert (
+        update_episode.await_args.kwargs["agent_actions"]["failure_reason"]
+        == script_service.VERIFIER_SWAP_FAILURE_REASON
+    )

@@ -2108,12 +2108,16 @@ class ForgeAgent:
         # its complete/terminate decision, and this row is the only step detail a click-free
         # validation/extraction block has to show. Written HERE, after the verdict is
         # final: a completion the gate or the extraction check rejects records as the FAILED attempt
-        # it was, and a finish the loop rejected mid-run never persists at all.
-        if outcome.status in ("completed", "terminated", "failed"):
+        # it was, and a finish the loop rejected mid-run never persists at all. A verdict-less death
+        # (budget_exhausted/loop_error) records as a FAILED terminate carrying the outcome reason —
+        # those are the runs users most need step details for. Cancellation persists nothing.
+        if outcome.status in ("completed", "terminated", "failed", "budget_exhausted", "loop_error"):
             with contained_effect("task_v3 terminal decision persist", task_id=task.task_id):
                 decision_reason = outcome.reason or ""
                 decision_action_status = ActionStatus.completed
-                if outcome.status == "completed" and (completion_vetoed or missing_extraction):
+                if outcome.status in ("budget_exhausted", "loop_error"):
+                    decision_action_status = ActionStatus.failed
+                elif outcome.status == "completed" and (completion_vetoed or missing_extraction):
                     decision_action_status = ActionStatus.failed
                     rejection = (
                         "the completion gate rejected the verdict"
@@ -2132,10 +2136,13 @@ class ForgeAgent:
                 decision_screenshot_id: str | None = None
                 if not page_free_validation:
                     try:
-                        decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
-                        decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
-                            step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
-                        )
+                        # Bounded like the neighboring persists: the verdict-less death paths reach
+                        # this on exactly the runs whose page is most likely stuck.
+                        async with asyncio.timeout(30):
+                            decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+                            decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
+                                step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
+                            )
                     except Exception:
                         LOG.warning(
                             "task_v3 failed to capture decision screenshot", task_id=task.task_id, exc_info=True
