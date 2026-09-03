@@ -770,7 +770,7 @@ class RealBrowserState(BrowserState):
                         error=repr(e),
                     )
                     continue
-                LOG.exception("Error while reload url after degradation", error=repr(e))
+                LOG.warning("Error while reload url after degradation", error=repr(e), exc_info=True)
                 raise FailedToReloadPage(url=url, error_message=repr(e))
 
     async def scrape_website(
