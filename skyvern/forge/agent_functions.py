@@ -70,7 +70,6 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
-from skyvern.forge.taskv3.auto_observe import AutoObserveDecision, auto_observe_from_setting
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
@@ -890,12 +889,6 @@ class AgentFunction:
         ab_eligible: bool = True,
     ) -> RunEngine:
         return requested_engine
-
-    # OSS resolves auto-observe from the static setting; cloud overrides to bucket a run per task_id.
-    async def resolve_task_v3_auto_observe(
-        self, *, task_id: str | None, organization_id: str | None, workflow_permanent_id: str | None = None
-    ) -> AutoObserveDecision:
-        return auto_observe_from_setting()
 
     # OSS has no ATS-scoped guidance; cloud overrides to supply pre-authorized eligibility defaults
     # behind a flag when the task targets a gated application-tracking-system host.
