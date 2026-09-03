@@ -9,6 +9,7 @@ import { ReactFlowProvider } from "@xyflow/react";
 import { PostHogContext } from "posthog-js/react";
 import type { PostHog } from "posthog-js";
 
+import { Status } from "@/api/types";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import {
   DebugStoreContext,
@@ -20,6 +21,7 @@ import { NodeHeader } from "./NodeHeader";
 
 afterEach(() => {
   cleanup();
+  queryClient.clear();
 });
 
 const queryClient = new QueryClient({
@@ -46,6 +48,7 @@ function renderNodeHeader(
   // The Play control only mounts under debug mode / block runs, so a test that
   // needs it injects the store rather than driving the flag hooks.
   debugStore?: DebugStoreContextType,
+  initialEntry = "/agents/wf-test/build",
 ) {
   const DebugWrapper = ({ children }: { children: React.ReactNode }) =>
     debugStore ? (
@@ -60,7 +63,7 @@ function renderNodeHeader(
       <PostHogContext.Provider
         value={{ client: fakePostHogClient, bootstrap: undefined }}
       >
-        <MemoryRouter initialEntries={["/agents/wf-test/build"]}>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <Routes>
             <Route
               path="/agents/:workflowPermanentId/*"
@@ -141,5 +144,37 @@ describe("NodeHeader block controls are named (SKY-12995)", () => {
     );
     const play = screen.getByRole("button", { name: "Run this block" });
     expect((play as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+// The run-status query keeps serving its last payload after the targeted run
+// changes or clears, which also disables it — so nothing refetches to correct a
+// retained "running" and the block controls stay inert until a reload.
+describe("NodeHeader block controls vs a retained run payload (SKY-15507)", () => {
+  function blockActionsAreInert() {
+    const trigger = screen.getByRole("button", { name: "Block actions" });
+    return Boolean(trigger.closest(".pointer-events-none"));
+  }
+
+  test("a live run targeted by the URL still makes the block controls inert", () => {
+    queryClient.setQueryData(["workflowRun", "wf-test", "wr_1"], {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+    });
+    renderNodeHeader(
+      { blockLabel: "block_1" },
+      undefined,
+      "/agents/wf-test/build?wr=wr_1",
+    );
+    expect(blockActionsAreInert()).toBe(true);
+  });
+
+  test("a payload retained after the targeted run clears does not", () => {
+    queryClient.setQueryData(["workflowRun", "wf-test", undefined], {
+      workflow_run_id: "wr_1",
+      status: Status.Running,
+    });
+    renderNodeHeader({ blockLabel: "block_1" });
+    expect(blockActionsAreInert()).toBe(false);
   });
 });

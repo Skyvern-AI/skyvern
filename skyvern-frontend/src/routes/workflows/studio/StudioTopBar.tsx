@@ -306,10 +306,20 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const { data: workflowRun, isError: statusUnavailable } =
-    useWorkflowRunWithWorkflowQuery(
-      runId ? { workflowRunId: runId } : undefined,
-    );
+  const {
+    data: retainedRun,
+    isError: statusUnavailable,
+    isPlaceholderData,
+  } = useWorkflowRunWithWorkflowQuery(
+    runId ? { workflowRunId: runId } : undefined,
+  );
+  // keepPreviousData serves the last run's payload whenever the focused run
+  // changes or clears, and clearing it also disables the query — so a retained
+  // "running" payload would otherwise stand forever with no error to notice.
+  const workflowRun =
+    isPlaceholderData || retainedRun?.workflow_run_id !== runId
+      ? undefined
+      : retainedRun;
   const activeRunId = workflowRun?.workflow_run_id;
   const running =
     !statusUnavailable &&
@@ -319,9 +329,6 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const isBlockRun = searchParams.has("bl");
   const rerunEligible = Boolean(
     workflowRun &&
-    // keepPreviousData can surface a prior run after the focused run clears/changes;
-    // only treat it as the focused run when its id matches the URL.
-    workflowRun.workflow_run_id === runId &&
     statusIsFinalized(workflowRun) &&
     workflowRun.task_v2 === null &&
     !isBlockRun &&
