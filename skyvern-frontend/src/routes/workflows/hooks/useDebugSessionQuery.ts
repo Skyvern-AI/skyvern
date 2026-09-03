@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { isForbiddenError } from "@/api/forbidden";
 import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -15,14 +16,51 @@ type DebugSessionRefetchState = {
 };
 
 // Reading a debug session creates its browser session when none exists, so an
-// out-of-credits org gets a 402 here. Credits do not come back on their own,
-// so neither retrying nor polling can succeed.
+// out-of-credits org gets a 402 here. A 401/403 means the session is expired or
+// belongs to another org. Neither recovers on its own, so retrying or polling
+// the same request can only reproduce the error — stop in both cases.
+function isTerminalDebugSessionError(error: unknown): boolean {
+  return isPaymentRequiredError(error) || isForbiddenError(error);
+}
+
 function shouldRetryDebugSessionRead(
   failureCount: number,
   error: unknown,
 ): boolean {
   return (
-    !isPaymentRequiredError(error) && failureCount < DEBUG_SESSION_MAX_RETRIES
+    !isTerminalDebugSessionError(error) &&
+    failureCount < DEBUG_SESSION_MAX_RETRIES
+  );
+}
+
+type DebugSessionInvalidationState = {
+  debugSession?: { browser_session_id?: string | null } | null;
+  debugSessionError?: unknown;
+  shouldFetchDebugSession: boolean;
+  workflowPermanentId?: string;
+  isRateLimited: boolean;
+};
+
+// The workflow editor drives its own 5s invalidation loop to acquire a browser
+// session, which refetches the debug-session query independently of the query's
+// refetchInterval. A terminal 401/403/402 can only reproduce itself, so the loop
+// must stop on those just like the query's own polling does — otherwise the
+// forbidden request keeps firing every 5s despite refetchInterval being false.
+function shouldPollDebugSessionInvalidation({
+  debugSession,
+  debugSessionError,
+  shouldFetchDebugSession,
+  workflowPermanentId,
+  isRateLimited,
+}: DebugSessionInvalidationState): boolean {
+  if (isTerminalDebugSessionError(debugSessionError)) {
+    return false;
+  }
+  return (
+    (!debugSession || !debugSession.browser_session_id) &&
+    shouldFetchDebugSession &&
+    !!workflowPermanentId &&
+    !isRateLimited
   );
 }
 
@@ -35,7 +73,7 @@ function getDebugSessionRefetchInterval(
     return false;
   }
   if (queryState.status === "error") {
-    return isPaymentRequiredError(queryState.error)
+    return isTerminalDebugSessionError(queryState.error)
       ? false
       : DEBUG_SESSION_ERROR_REFETCH_INTERVAL_MS;
   }
@@ -95,6 +133,7 @@ export {
   DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS,
   DEBUG_SESSION_MAX_RETRIES,
   getDebugSessionRefetchInterval,
+  shouldPollDebugSessionInvalidation,
   shouldRetryDebugSessionRead,
   useDebugSessionQuery,
 };
