@@ -960,15 +960,9 @@ def _as_utc(dt: datetime) -> datetime:
 
 
 def _task_v3_ab_arm_for_duration_log(workflow_run_id: str) -> str | None:
-    """Best-effort read of the workflow-block engine A/B arm pinned on this run's context.
-
-    Three-way: "treatment"/"control" when this run's own context resolved an arm in-band,
-    None when this run's own context never resolved one, "unknown" when finalization runs
-    out-of-band (API cancel, the stuck-run sweep, copilot cooperative cancel) so no context
-    for this run is current -- attribution is lost, not "never entered the A/B".
-
-    Telemetry only: a lookup failure must never break run finalization, so any exception is
-    swallowed and logged as a warning rather than propagated (SKY-15561, mirrors SKY-15499).
+    """Failure-safe wrapper around ``resolved_workflow_block_engine_arm_label`` (which owns the
+    three-way contract): telemetry only, so a lookup failure must never break run finalization —
+    it logs a warning and returns "unknown" (attribution lost) rather than propagating.
     """
     try:
         return resolved_workflow_block_engine_arm_label(workflow_run_id)
@@ -978,7 +972,9 @@ def _task_v3_ab_arm_for_duration_log(workflow_run_id: str) -> str | None:
             workflow_run_id=workflow_run_id,
             exc_info=True,
         )
-        return None
+        # A failed read is attribution-loss, not "never entered the A/B" — same bucket as the
+        # out-of-band finalizers.
+        return "unknown"
 
 
 def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> float:
