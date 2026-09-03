@@ -484,6 +484,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   error_code_mapping: Record<string, string> | null;
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
+  engine: RunEngine | null;
 };
 
 export type HumanInteractionBlock = WorkflowBlockBase & {
