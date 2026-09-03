@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
@@ -60,6 +60,62 @@ class InterruptedTurnFacts(BaseModel):
     last_recorded_build_test_phase: str | None = None
 
 
+# A part's prompt and each of its choices are model-authored text that reaches the chat
+# unrendered by any other surface, so both are admitted the way every other model-authored
+# envelope string is. The length bound is a render bound, not a budget: a choice label is the
+# answer the user sends, so an over-long one is dropped rather than truncated — a truncated
+# label answers a different question than the one it shows. How many things one question may
+# ask and how many options one of them may offer are independent, so they get their own names.
+QUESTION_PART_TEXT_LIMIT = 200
+QUESTION_PART_LIMIT = 8
+QUESTION_CHOICE_LIMIT = 8
+
+
+class QuestionPart(BaseModel):
+    """One thing a terminal question asks, with the options the model offered for it.
+
+    ``part_id`` is minted server-side in emission order rather than read from the model, so
+    the identity a later answer or event refers to is the one the user actually saw.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    part_id: str
+    prompt: str
+    choices: list[str] = Field(default_factory=list)
+
+
+def admit_question_parts(raw: object) -> list[QuestionPart]:
+    """Typed admission for the ``parts`` array a model emits on an ASK_QUESTION.
+
+    Nothing here refuses the turn: the question's own prose always renders and the composer
+    always takes a free-form answer, so a part that cannot be vouched for is dropped and the
+    user still sees the whole question. A part with no admitted choices is kept — dropping it
+    would hide half of a compound ask behind an affordance for the other half.
+    """
+    if not isinstance(raw, list):
+        return []
+    parts: list[QuestionPart] = []
+    for entry in raw[:QUESTION_PART_LIMIT]:
+        if not isinstance(entry, dict):
+            continue
+        prompt = _safe_question_text(entry.get("prompt"))
+        if prompt is None:
+            continue
+        raw_choices = entry.get("choices")
+        candidates = raw_choices[:QUESTION_CHOICE_LIMIT] if isinstance(raw_choices, list) else []
+        admitted = [_safe_question_text(choice) for choice in candidates]
+        choices = list(dict.fromkeys(choice for choice in admitted if choice is not None))
+        parts.append(QuestionPart(part_id=f"p{len(parts) + 1}", prompt=prompt, choices=choices))
+    return parts
+
+
+def _safe_question_text(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > QUESTION_PART_TEXT_LIMIT:
+        return None
+    return _safe_output_report(value)
+
+
 class TerminalOutcomeEnvelope(BaseModel):
     next_state: TerminalNextState
     verified: bool
@@ -88,6 +144,7 @@ class TerminalOutcomeEnvelope(BaseModel):
     # None when the client named no gesture, so the report stays silent rather
     # than naming one the request never carried.
     cancel_source: CopilotCancelSource | None = None
+    question_parts: list[QuestionPart] = Field(default_factory=list)
     rendered_from_envelope: bool = False
     envelope_version: int = 1
 
@@ -117,6 +174,7 @@ def assemble_terminal_envelope(
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
     interruption: InterruptedTurnFacts | None = None,
+    question_parts: Sequence[QuestionPart] = (),
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = select_run_outcome_anchor(run_outcomes)
     run_outcome_role = run_outcome.role if run_outcome is not None else None
@@ -181,6 +239,8 @@ def assemble_terminal_envelope(
         proposal_present=proposal_present,
         proposal_disposition=proposal_disposition,
         interruption=interruption,
+        # Parts describe a question, so they ride only a turn that actually ended on one.
+        question_parts=list(question_parts) if user_action_required else [],
     )
 
 

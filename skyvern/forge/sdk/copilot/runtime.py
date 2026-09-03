@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.copilot.terminal_envelope import QuestionPart
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
@@ -631,6 +632,9 @@ class AgentContext:
     blocker_signal: CopilotToolBlockerSignal | None = None
     # Presentation-only recovery rows; authority remains in RequestPolicy.
     connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
+    # Admitted parts of the model's own terminal question; set at final translation and read
+    # by the terminal-envelope assembler. Presentation-only, like the rows above.
+    question_parts: list[QuestionPart] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
     # Most recently emitted blocker signal for the current tool output. Unlike
     # blocker_signal, this is last-wins so the activity-log projection can
