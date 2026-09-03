@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -50,6 +51,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockType
+from skyvern.services import script_service
 from tests.unit.helpers import make_organization
 from tests.unit.test_agent_task_v3 import _make_block, _make_output_parameter, _run_execute_step_gate
 from tests.unit.test_block_description_caching import _block_result, _setup_mocks
@@ -735,3 +737,60 @@ async def test_branch_eval_synthetic_block_defaults_to_v1_without_override(scope
         )
 
     assert captured_engines == [RunEngine.skyvern_v1]
+
+
+@pytest.mark.asyncio
+async def test_script_create_site_stamps_the_script_run_marker(scoped_context: SkyvernContext) -> None:
+    """A cached-script block never resolves an engine, so `engine IS NULL` alone cannot separate
+    a script-executed block from an agent-executed one whose engine was never written. The script
+    create-site stamps `script_run` at creation, making (engine NULL, script_run NULL) a genuine
+    anomaly instead of an ordinary script run.
+    """
+    scoped_context.workflow_run_id = "wr_script_marker"
+    scoped_context.organization_id = "o_test"
+
+    with patch("skyvern.services.script_service.app") as mock_app:
+        mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(
+            return_value=SimpleNamespace(workflow_run_block_id="wrb_script_marker")
+        )
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        mock_app.DATABASE.tasks.create_task = AsyncMock(
+            return_value=SimpleNamespace(task_id="tsk_script_marker", workflow_run_id="wr_script_marker")
+        )
+        mock_app.DATABASE.tasks.create_step = AsyncMock(return_value=SimpleNamespace(step_id="stp_script_marker"))
+        mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
+
+        block_id, task_id, step_id = await script_service._create_workflow_block_run_and_task(
+            block_type=BlockType.NAVIGATION,
+            label="nav",
+        )
+
+    # Everything after the create call is wrapped in a try/except that collapses to
+    # (None, None, None); asserting the ids proves the whole path ran rather than bailing early.
+    assert (block_id, task_id, step_id) == ("wrb_script_marker", "tsk_script_marker", "stp_script_marker")
+    create_kwargs = mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs
+    assert create_kwargs["ai_fallback_triggered"] is False
+    assert create_kwargs.get("engine") is None
+
+
+@pytest.mark.asyncio
+async def test_agent_create_site_leaves_the_script_run_marker_unset(scoped_context: SkyvernContext) -> None:
+    """The other half of the discriminator: an agent-executed block must NOT carry the marker,
+    or `script_run IS NOT NULL` stops meaning "script-executed". A forward guard on the agent
+    create-site, which this change deliberately leaves alone -- it passes with or without it."""
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_agent_marker"
+    scoped_context.workflow_block_engine_override = RunEngine.skyvern_v3
+    block = _make_block(TaskBlock, label="agent_marker_block")
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+    ):
+        _setup_mocks(mock_app)
+
+        await block.execute_safe(workflow_run_id="wr_agent_marker")
+
+    create_kwargs = mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs
+    assert create_kwargs["engine"] == RunEngine.skyvern_v3
+    assert create_kwargs.get("ai_fallback_triggered") is None

@@ -342,6 +342,7 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
         *,
         inspected_url: str,
         current_url: str,
+        **_kwargs: object,
     ) -> tuple[dict[str, object], None]:
         return (
             {
@@ -757,6 +758,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
         *,
         inspected_url: str,
         current_url: str,
+        **_kwargs: object,
     ) -> tuple[dict[str, object], None]:
         return (
             {
