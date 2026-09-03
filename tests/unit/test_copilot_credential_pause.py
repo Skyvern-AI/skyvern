@@ -35,7 +35,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
-from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
@@ -46,11 +46,11 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseRejection,
     CredentialPauseResolution,
     _encode_active_pause,
+    await_pending_credential_pause,
     credential_pause_active_key,
     credential_response_cache_key,
     encode_credential_response,
     maybe_credential_pause,
-    preflight_credential_pause,
     resolve_credential_pause,
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -69,22 +69,21 @@ from skyvern.forge.sdk.copilot.enforcement import (
     enforcement_decision,
     run_with_enforcement,
 )
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.request_policy import (
-    CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
-    ClarificationReason,
+    _CREDENTIALS_UI_DIRECTIONS,
     RequestPolicy,
     credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
+from skyvern.forge.sdk.copilot.tools.credential_fill import _request_credential
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.routes.workflow_copilot import (
     WorkflowCopilotCredentialResponseRequest,
     workflow_copilot_credential_response,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
-from skyvern.forge.sdk.schemas.workflow_copilot import (
-    WorkflowCopilotCredentialRequiredUpdate,
-    WorkflowCopilotStreamMessageType,
-)
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 from tests.unit.conftest import make_copilot_context
 
 
@@ -284,6 +283,50 @@ def test_reason_none_when_no_signals_present() -> None:
 # ---------------------------------------------------------------------------
 # 2 - maybe_credential_pause waiter
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_hits_a_login_still_gets_a_card_after_an_unanswered_tool_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-card budget is spent when the tool asks on a guess. A run that then hits a real login
+    has evidence the guess did not, so the guess must not cost the turn its real card."""
+    ctx = make_copilot_context()
+    ctx.organization_id = "org-1"
+    ctx.turn_id = "turn-1"
+    ctx.client_supports_credential_pause = True
+    ctx.workflow_copilot_chat_id = "chat-1"
+    ctx.last_run_skipped_unbound_credentials = True
+    ctx.request_policy = RequestPolicy()
+    # State left by a tool ask the user skipped.
+    ctx.credential_pause_used = True
+    ctx.credential_pause_reaskable_by_run = True
+
+    cache = _FakeCache()
+    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
+        "connected", "cred_1"
+    )
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(
+        credential_pause_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[_make_credential()]))
+        ),
+    )
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+
+    resume_msgs = await maybe_credential_pause(
+        ctx,
+        _fake_result(),
+        _make_stream(),
+        CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5),
+    )
+
+    assert resume_msgs is not None
+    assert ctx.credential_pause_outcome == "connected"
+    # Handed back once only, so the turn cannot loop on repeated cards.
+    assert ctx.credential_pause_reaskable_by_run is False
 
 
 @pytest.mark.asyncio
@@ -547,7 +590,7 @@ async def test_disconnect_racing_the_send_itself_declines_without_waiting(monkey
 async def test_already_disconnected_before_send_declines_without_sending_a_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The predictor (credential_pause_would_fire) excludes the async-only
+    """The predictor (credential_pause_transport_ready) excludes the async-only
     disconnect check by design -- a client gone before the frame is even sent
     must latch and tag 'declined' (not 'timeout') so the caller can fall back
     to a normal nudge instead of treating this like a delivered-and-waited pause."""
@@ -1319,23 +1362,23 @@ def test_copilot_seconds_remaining_credits_pause_time() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_would_fire_false_when_client_does_not_support_pause() -> None:
+def test_transport_not_ready_when_client_does_not_support_pause() -> None:
     ctx = make_copilot_context()
     ctx.last_run_skipped_unbound_credentials = True
     ctx.request_policy = RequestPolicy()
     config = CopilotConfig(credential_pause_enabled=True)
 
-    assert credential_pause_module.credential_pause_would_fire(ctx, config) is False
+    assert credential_pause_module.credential_pause_transport_ready(ctx, config) is False
 
 
-def test_would_fire_true_once_client_support_is_set() -> None:
+def test_transport_ready_once_client_support_is_set() -> None:
     ctx = make_copilot_context()
     ctx.client_supports_credential_pause = True
     ctx.last_run_skipped_unbound_credentials = True
     ctx.request_policy = RequestPolicy()
     config = CopilotConfig(credential_pause_enabled=True)
 
-    assert credential_pause_module.credential_pause_would_fire(ctx, config) is True
+    assert credential_pause_module.credential_pause_transport_ready(ctx, config) is True
 
 
 @pytest.mark.asyncio
@@ -1520,125 +1563,42 @@ def test_credential_pause_resolution_defaults_credential_to_none() -> None:
     assert resolution.credential is None
 
 
-def _blocked_login_policy() -> RequestPolicy:
-    """A policy shaped the way build_request_policy leaves an unresolved login ask."""
-    return RequestPolicy(
-        clarification_reason="login_credentials_unresolved",
-        clarification_question="Connect a saved credential to sign in.",
-        requires_user_clarification=True,
-        user_response_policy="ask_clarification",
-        allow_update_workflow=False,
-        allow_run_blocks=False,
-    )
+def _ask_origin_policy(*ask_login_page_urls: str) -> RequestPolicy:
+    return RequestPolicy(credential_ask_login_page_urls=list(ask_login_page_urls))
 
 
-def _preflight_ctx() -> CopilotContext:
+def _named_site_policy(site_url: str = "https://portal.example.com/login") -> RequestPolicy:
+    return RequestPolicy(user_provided_site_urls=[site_url])
+
+
+def _tool_ctx(monkeypatch: pytest.MonkeyPatch, cache: _FakeCache | None = None) -> CopilotContext:
     ctx = make_copilot_context()
     ctx.organization_id = "org-1"
     ctx.turn_id = "turn-1"
     ctx.workflow_copilot_chat_id = "chat-1"
     ctx.client_supports_credential_pause = True
-    ctx.request_policy = _blocked_login_policy()
+    ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+    ctx.request_policy = _named_site_policy()
+    ctx.stream = _make_stream()
+    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache or _FakeCache(), raising=False)
+    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
     return ctx
 
 
-def test_reason_fires_on_unresolved_login_credentials() -> None:
-    ctx = make_copilot_context()
-    ctx.request_policy = _blocked_login_policy()
-
-    assert credential_pause_module.credential_pause_reason(ctx) == "login_credentials_unresolved"
-
-
-def test_reason_does_not_fire_for_a_login_ask_that_resolved_to_a_credential() -> None:
-    ctx = make_copilot_context()
-    ctx.request_policy = RequestPolicy(clarification_reason="none")
-
-    assert credential_pause_module.credential_pause_reason(ctx) is None
-
-
-def _card_answerable_policy(
-    *,
-    clarification_reason: ClarificationReason = "credential_name_unresolved",
-    clarification_question: str = "Which one should I use?",
-    card_answerable: bool = True,
-    ask_login_page_urls: list[str] | None = None,
-) -> RequestPolicy:
-    """A disambiguation ask the credential card can answer: a different reason to the login ask."""
-    return RequestPolicy(
-        clarification_reason=clarification_reason,
-        clarification_question=clarification_question,
-        requires_user_clarification=True,
-        user_response_policy="ask_clarification",
-        allow_update_workflow=False,
-        allow_run_blocks=False,
-        credential_ask_card_answerable=card_answerable,
-        credential_ask_candidate_ids=["cred_1", "cred_2"] if card_answerable else [],
-        credential_ask_login_page_urls=["https://portal.example.com/login"]
-        if ask_login_page_urls is None
-        else ask_login_page_urls,
-    )
-
-
-def test_reason_fires_on_a_card_answerable_ask_under_a_different_reason() -> None:
-    ctx = make_copilot_context()
-    ctx.request_policy = _card_answerable_policy()
-
-    assert credential_pause_module.credential_pause_reason(ctx) == "login_credentials_unresolved"
-
-
-def test_reason_ignores_a_clarification_the_card_cannot_answer() -> None:
-    ctx = make_copilot_context()
-    ctx.request_policy = _card_answerable_policy(clarification_reason="raw_secret", card_answerable=False)
-
-    assert credential_pause_module.credential_pause_reason(ctx) is None
-
-
-def test_widened_reason_still_builds_a_valid_credential_required_frame() -> None:
-    ctx = make_copilot_context()
-    ctx.request_policy = _card_answerable_policy()
-    reason = credential_pause_module.credential_pause_reason(ctx)
-
-    frame = WorkflowCopilotCredentialRequiredUpdate(
-        type=WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED,
-        turn_id="turn-1",
-        workflow_copilot_chat_id="chat-1",
-        resume_token="rt",
-        reason=reason or "",
-        message="Which one should I use?",
-        login_page_urls=[],
-        credential_refs=[],
-        timeout_seconds=5,
-        expires_at=datetime.now(timezone.utc),
-        timestamp=datetime.now(timezone.utc),
-    )
-
-    assert frame.reason == "login_credentials_unresolved"
+async def _ask(ctx: CopilotContext, login_page_url: str = "https://portal.example.com/login") -> dict[str, Any]:
+    return await _request_credential(login_page_url, "This site needs a sign-in.", ctx)
 
 
 def test_connected_resume_stamps_the_single_ask_origin() -> None:
-    policy = _card_answerable_policy()
-    credential = _make_credential()
+    policy = _ask_origin_policy("https://portal.example.com/login")
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.live_page_admitted_urls == {"cred_1": "https://portal.example.com/login"}
 
 
 def test_connected_resume_stamps_nothing_when_the_ask_spans_several_origins() -> None:
-    policy = _card_answerable_policy(
-        ask_login_page_urls=["https://portal.example.com/login", "https://other.example.com/login"]
-    )
-
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
-
-    assert policy.live_page_admitted_urls == {}
-
-
-def test_connected_resume_never_binds_an_origin_from_prose() -> None:
-    policy = _card_answerable_policy(
-        ask_login_page_urls=[],
-        clarification_question="Sign in at https://prose.example.com/login first. Which one should I use?",
-    )
+    policy = _ask_origin_policy("https://portal.example.com/login", "https://other.example.com/login")
 
     credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
@@ -1648,7 +1608,7 @@ def test_connected_resume_never_binds_an_origin_from_prose() -> None:
 def test_connected_resume_names_the_picked_credential_superseding_an_earlier_mention() -> None:
     """The fill seam's which-credential check is set equality, so a card answer must replace an
     earlier prose mention, not join it."""
-    policy = _card_answerable_policy()
+    policy = _ask_origin_policy("https://portal.example.com/login")
     policy.current_turn_named_credential_ids = {"cred_earlier"}
 
     credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
@@ -1657,7 +1617,7 @@ def test_connected_resume_names_the_picked_credential_superseding_an_earlier_men
 
 
 def test_connected_resume_does_not_duplicate_an_already_resolved_credential() -> None:
-    policy = _card_answerable_policy()
+    policy = _ask_origin_policy("https://portal.example.com/login")
     credential = _make_credential()
     policy.resolved_credentials = [credential]
 
@@ -1668,7 +1628,7 @@ def test_connected_resume_does_not_duplicate_an_already_resolved_credential() ->
 
 def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval() -> None:
     ctx = make_copilot_context()
-    policy = _card_answerable_policy()
+    policy = _ask_origin_policy("https://portal.example.com/login")
     ctx.request_policy = policy
 
     credential_pause_module._apply_connected_credential_to_policy(ctx, policy, _make_credential())
@@ -1679,123 +1639,355 @@ def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval() -> 
     ]
 
 
-@pytest.mark.asyncio
-async def test_preflight_connect_binds_the_credential_and_clears_the_clarification_block(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _preflight_ctx()
+def _answered_cache(action: str, credential_id: str | None = None) -> _FakeCache:
     cache = _FakeCache()
     cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
-        "connected", "cred_1"
+        action, credential_id
     )
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    credential = _make_credential()
+    return cache
+
+
+def _stub_credential_lookup(monkeypatch: pytest.MonkeyPatch, credential: Credential) -> None:
     monkeypatch.setattr(
         credential_pause_module.app,
         "DATABASE",
         SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
     )
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+
+
+@pytest.mark.asyncio
+async def test_the_tool_call_raises_the_card_and_returns_the_connected_credential_to_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails without the tool: nothing pre-run raises the card, so the turn finalizes with a prose
+    ask and no frame. Fails again if the answer is not returned as this call's own typed result."""
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    _stub_credential_lookup(monkeypatch, _make_credential())
+
+    result = await _ask(ctx)
+
+    assert result["status"] == "connected"
+    assert result["credential_id"] == "cred_1"
+    frame = ctx.stream.send.await_args_list[0].args[0]
+    assert frame.type is WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
+    assert frame.reason == "login_credentials_unresolved"
+    assert frame.login_page_urls == ["https://portal.example.com/login"]
+    assert frame.message == "This site needs a sign-in."
+    assert ctx.request_policy.live_page_admitted_urls == {"cred_1": "https://portal.example.com/login"}
+    assert ctx.request_policy.current_turn_named_credential_ids == {"cred_1"}
+    assert ctx.request_policy.allow_run_blocks is True
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_card_returns_skipped_and_spends_the_one_ask_per_turn_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("skip"))
+
+    first = await _ask(ctx)
+    second = await _ask(ctx)
+
+    assert first["status"] == "skipped"
+    assert ctx.credential_pause_outcome == "skipped"
+    assert second["status"] == "already_asked"
+    assert second["outcome"] == "skipped"
+    assert ctx.stream.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_card_returns_a_typed_outcome_rather_than_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The user can walk away from an open card; the model must get a typed arm it can act on
+    instead of a failed call it would retry or narrate as a breakage."""
+    ctx = _tool_ctx(monkeypatch)
+    ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=0)
+
+    result = await _ask(ctx)
+
+    assert result["ok"] is True
+    assert result["status"] == "unanswered"
+    assert result["outcome"] == "timeout"
+    assert result["next"]
+    ctx.stream.send.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_tool_refuses_a_sign_in_site_the_user_never_provided(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The connected credential's origin is bound from this argument, so a model-invented site
+    would hand the card's answer fill authority the user never granted."""
+    ctx = _tool_ctx(monkeypatch)
+
+    result = await _ask(ctx, "https://elsewhere.example.net/login")
+
+    assert result["ok"] is False
+    assert ctx.request_policy.credential_ask_login_page_urls == []
+    ctx.stream.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_tool_reports_unavailable_with_a_prose_fallback_when_the_card_cannot_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _tool_ctx(monkeypatch)
+    ctx.client_supports_credential_pause = False
+
+    result = await _ask(ctx)
+
+    assert result["status"] == "unavailable"
+    assert "Credentials page" in result["fallback"]
+    assert ctx.request_policy.credential_ask_login_page_urls == []
+    ctx.stream.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_tool_reports_unavailable_rather_than_raising_when_no_cache_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment with no cache at all must degrade, not fault the turn on an attribute of None."""
+    ctx = _tool_ctx(monkeypatch)
+    monkeypatch.setattr(app._inst, "CACHE", None, raising=False)
+
+    result = await _ask(ctx)
+
+    assert result["status"] == "unavailable"
+    ctx.stream.send.assert_not_awaited()
+
+
+class _SlowAnswerCache(_FakeCache):
+    """Answers the card only after ``delay_seconds``, standing in for a user who takes a moment."""
+
+    def __init__(self, response_key: str, delay_seconds: float, action: str = "skip") -> None:
+        super().__init__()
+        self._response_key = response_key
+        self._action = action
+        self._ready_at = time.monotonic() + delay_seconds
+
+    async def get(self, key: str) -> Any:
+        if key == self._response_key and time.monotonic() >= self._ready_at:
+            return encode_credential_response(self._action, "cred_1" if self._action == "connected" else None)
+        return await super().get(key)
+
+
+@pytest.mark.asyncio
+async def test_the_card_outlives_the_model_stream_deadline_the_tool_call_ran_under(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ask is raised inside the model stream, which runs under the turn deadline; without
+    suspending that deadline for the wait, a user who takes longer than the budget left has the
+    card cancelled out from under them."""
+    ctx = _tool_ctx(
+        monkeypatch,
+        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 1.6),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 1.0)
+
     stream = _make_stream()
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+    fake_result = _fake_result()
+    calls: list[dict[str, Any]] = []
 
-    resolution = await preflight_credential_pause(ctx, stream, config)
+    def fake_run_streamed(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return fake_result
 
-    assert resolution is not None and resolution.action == "connected"
+    async def fake_stream_to_sse(result: Any, s: Any, c: Any) -> None:
+        await _ask(ctx)
+
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", fake_stream_to_sse)
+
+    returned = await run_with_enforcement(
+        agent=MagicMock(),
+        initial_input="hello",
+        ctx=ctx,
+        stream=stream,
+        run_config=RunConfig(),
+        copilot_config=ctx.copilot_config,
+    )
+
+    assert returned is fake_result
+    assert len(calls) == 1
+    assert ctx.credential_pause_outcome == "skipped"
+    assert ctx.model_stream_deadline is None
+    sent = [str(call.args[0]) for call in ctx.stream.send.await_args_list]
+    assert sum(1 for frame in sent if "credential_required" in frame) == 1
+    assert not any(_CREDENTIALS_UI_DIRECTIONS in frame for frame in sent)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_turn_while_the_card_is_open_stays_a_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The suspended deadline is handed back on the way out; a failure to reschedule it must not
+    replace the cancellation with a RuntimeError the enforcement loop does not handle."""
+    ctx = _tool_ctx(
+        monkeypatch,
+        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 30),
+    )
+
+    async def ask_under_deadline() -> None:
+        async with asyncio.timeout(30) as deadline:
+            ctx.model_stream_deadline = deadline
+            await _ask(ctx)
+
+    task = asyncio.create_task(ask_under_deadline())
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ctx.copilot_credential_pause_seconds > 0
+
+
+_RUN_TOOLS_GATED_ON_AN_OPEN_ASK = [
+    ("run_blocks_and_collect_debug", {"block_labels": ["login"], "parameters": {}}),
+    (
+        "edit_block_and_run",
+        {
+            "label": "login",
+            "expected_code": "old",
+            "replacement_code": "new",
+            "block_labels": ["login"],
+            "parameters": {},
+        },
+    ),
+    ("update_and_run_blocks", {"workflow_yaml": "title: draft", "block_labels": ["login"], "parameters": {}}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool_name", "arguments"), _RUN_TOOLS_GATED_ON_AN_OPEN_ASK)
+async def test_a_run_tool_called_alongside_the_ask_waits_for_the_user_to_answer(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> None:
+    """The provider issues sibling tool calls in one model response, so without this wait the run
+    starts against the pre-card policy and the user answers a login the run already went without."""
+    ctx = _tool_ctx(
+        monkeypatch,
+        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 0.25, "connected"),
+    )
+    _stub_credential_lookup(monkeypatch, _make_credential())
+    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    tool = {
+        "run_blocks_and_collect_debug": tools_module.run_blocks_tool,
+        "edit_block_and_run": tools_module.edit_block_and_run_tool,
+        "update_and_run_blocks": tools_module.update_and_run_blocks_tool,
+    }[tool_name]
+    finished: list[str] = []
+
+    async def ask() -> None:
+        await _ask(ctx)
+        finished.append("ask")
+
+    async def run() -> None:
+        await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool_name), json.dumps(arguments))
+        finished.append("run")
+
+    await asyncio.gather(ask(), run())
+
+    assert finished == ["ask", "run"]
     assert ctx.credential_pause_outcome == "connected"
-    policy = ctx.request_policy
-    assert policy.resolved_credentials == [credential]
-    assert policy.allow_run_blocks is True
-    assert policy.clarification_reason == "none"
-    assert policy.user_response_policy == "proceed"
-    assert policy.allow_update_workflow is True
-    assert policy.requires_user_clarification is False
-    sent_types = [call.args[0].type for call in stream.send.await_args_list]
-    assert sent_types == [WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED]
 
 
-def _preflight_policy_inputs() -> RequestPolicyGuardrailInputs:
-    return RequestPolicyGuardrailInputs(
-        user_message="Log in to https://portal.example.com/login and download the invoices.",
-        workflow_yaml="",
-        chat_history_text="",
-        chat_history_messages=[],
-        global_llm_context="",
-        organization_id="org-1",
-        request_policy_handler=None,
+async def _announce_ask(ctx: CopilotContext) -> None:
+    response = SimpleNamespace(output=[SimpleNamespace(name="request_credential")])
+    await CopilotRunHooks(ctx).on_llm_end(SimpleNamespace(context=ctx), MagicMock(), response)  # type: ignore[arg-type]
+
+
+async def _invoke_ask_tool(ctx: CopilotContext, login_page_url: str) -> None:
+    await tools_module.request_credential_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="request_credential"),  # type: ignore[arg-type]
+        json.dumps({"login_page_url": login_page_url, "reason": "This site needs a sign-in."}),
     )
 
 
+def test_the_ask_tool_is_registered_in_the_production_tool_set() -> None:
+    """Every other test here invokes the tool object directly, so unregistering it would take the
+    whole capability away without reddening one of them."""
+    assert "request_credential" in {tool.name for tool in tools_module.NATIVE_TOOLS}
+
+
 @pytest.mark.asyncio
-async def test_preflight_skip_clears_the_reason_so_the_declined_turn_shows_no_card_cta(
+@pytest.mark.parametrize(("tool_name", "arguments"), _RUN_TOOLS_GATED_ON_AN_OPEN_ASK)
+async def test_a_run_tool_scheduled_ahead_of_the_ask_in_one_response_still_waits(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> None:
+    """Tool calls in one model response run as concurrent tasks in an order the model picks, so a
+    gate armed only inside the ask's own coroutine is passed by whichever sibling is scheduled first."""
+    ctx = _tool_ctx(
+        monkeypatch,
+        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 0.25, "connected"),
+    )
+    _stub_credential_lookup(monkeypatch, _make_credential())
+    await _announce_ask(ctx)
+    finished: list[str] = []
+
+    tool = {
+        "run_blocks_and_collect_debug": tools_module.run_blocks_tool,
+        "edit_block_and_run": tools_module.edit_block_and_run_tool,
+        "update_and_run_blocks": tools_module.update_and_run_blocks_tool,
+    }[tool_name]
+
+    async def run() -> None:
+        await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool_name), json.dumps(arguments))  # type: ignore[arg-type]
+        finished.append("run")
+
+    async def ask() -> None:
+        await _invoke_ask_tool(ctx, "https://portal.example.com/login")
+        finished.append("ask")
+
+    await asyncio.gather(run(), ask())
+
+    # Without this the ask refuses instantly and the ordering is proven around a card that never
+    # opened, which is the one shape the wrapper's release runs in.
+    assert ctx.credential_pause_outcome == "connected"
+    assert finished == ["ask", "run"]
+
+
+@pytest.mark.asyncio
+async def test_an_announced_ask_that_never_reaches_the_card_still_releases_the_waiting_run_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale login_credentials_unresolved would still route through
-    CREDENTIAL_PROMPT_CLARIFICATION_REASONS and stamp a credential CTA on the
-    reply for a turn the user explicitly declined."""
-    ctx = _preflight_ctx()
-    cache = _FakeCache()
-    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response("skip", None)
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-    stream = _make_stream()
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+    """Arming on the response means the gate closes before the ask can refuse, so every exit of the
+    tool has to open it again or the sibling waits out the whole turn."""
+    ctx = _tool_ctx(monkeypatch)
+    await _announce_ask(ctx)
 
-    resolution = await preflight_credential_pause(ctx, stream, config)
+    async def ask() -> None:
+        await _invoke_ask_tool(ctx, "https://elsewhere.example.net/login")
 
-    assert resolution is not None and resolution.action == "skip"
-    policy = ctx.request_policy
-    assert policy.clarification_reason == "none"
-    assert policy.clarification_reason not in CREDENTIAL_PROMPT_CLARIFICATION_REASONS
-    assert policy.requires_user_clarification is False
-    assert policy.allow_missing_credentials_in_draft is True
-    assert policy.user_response_policy == "proceed"
-    assert policy.allow_update_workflow is True
+    await asyncio.wait_for(asyncio.gather(await_pending_credential_pause(ctx), ask()), timeout=5)
+
+    assert ctx.request_policy.credential_ask_login_page_urls == []
+
+
+def test_the_card_message_is_capped_and_stripped_before_the_user_sees_it() -> None:
+    """`reason` is model-authored and leads the card, above the hostname. An unbounded one can push
+    the site the credential is actually for off the viewport."""
+    shouted = 'Connect your bank    login\n"now"' + "!" * 500
+
+    safe = credential_pause_module.defang_card_text(shouted)
+
+    assert len(safe) <= 200
+    assert "\n" not in safe
+    assert '"' not in safe
 
 
 @pytest.mark.asyncio
-async def test_preflight_timeout_leaves_the_clarification_block_for_the_terminal_clarify(
+async def test_a_repeat_ask_in_a_later_response_releases_the_gate_it_armed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = _preflight_ctx()
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", _FakeCache(), raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-    stream = _make_stream()
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=0)
+    """already_asked means a card was raised somewhere this turn, not that one is open now. A later
+    response arms a fresh gate, so refusing to release on that exit parks every sibling on an Event
+    no one owns until the turn times out."""
+    ctx = _tool_ctx(monkeypatch)
+    ctx.credential_pause_used = True
 
-    resolution = await preflight_credential_pause(ctx, stream, config)
+    await _announce_ask(ctx)
+    await _invoke_ask_tool(ctx, "https://portal.example.com/login")
 
-    assert resolution is None
-    assert ctx.credential_pause_outcome == "timeout"
-    policy = ctx.request_policy
-    assert policy.user_response_policy == "ask_clarification"
-    assert policy.clarification_reason == "login_credentials_unresolved"
-
-
-@pytest.mark.asyncio
-async def test_preflight_declines_when_the_client_cannot_render_the_card() -> None:
-    ctx = _preflight_ctx()
-    ctx.client_supports_credential_pause = False
-    stream = _make_stream()
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-
-    assert await preflight_credential_pause(ctx, stream, config) is None
-    stream.send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_preflight_consumes_the_one_pause_per_turn_latch(monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = _preflight_ctx()
-    cache = _FakeCache()
-    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response("skip", None)
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-    stream = _make_stream()
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-
-    await preflight_credential_pause(ctx, stream, config)
-    assert ctx.credential_pause_used is True
-
-    ctx.request_policy = _blocked_login_policy()
-    assert await maybe_credential_pause(ctx, _fake_result(), stream, config) is None
-    assert len(stream.send.await_args_list) == 1
+    await asyncio.wait_for(await_pending_credential_pause(ctx), timeout=1)

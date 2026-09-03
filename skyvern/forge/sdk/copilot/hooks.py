@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from agents.agent import Agent, AgentBase
-from agents.items import TResponseInputItem
+from agents.items import ModelResponse, TResponseInputItem
 from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
 
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.credential_pause import arm_credential_pause_gate
 from skyvern.forge.sdk.copilot.enforcement import (
     gate_decision_trace_fields,
     outcome_fully_verified,
@@ -91,6 +92,16 @@ class CopilotRunHooks(RunHooksBase):
         except Exception:
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",
+                **_copilot_log_fields(self._ctx),
+            )
+
+    async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
+        try:
+            if any(getattr(item, "name", None) == "request_credential" for item in response.output):
+                arm_credential_pause_gate(self._ctx)
+        except Exception:
+            LOG.warning(
+                "CopilotRunHooks.on_llm_end credential gate arming failed",
                 **_copilot_log_fields(self._ctx),
             )
 

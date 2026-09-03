@@ -430,9 +430,10 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
     was_word = "was" if len(missing_credential_ids) == 1 else "were"
     return (
         f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
-        "Stop before creating, updating, or running the workflow. Ask the user to provide/select a valid "
-        "credential ID, create the credential in the Credentials UI and return with its ID, or explicitly "
-        "choose an unvalidated draft workflow that will not be run until credentials are available."
+        "Stop before creating, updating, or running the workflow. Call `request_credential` with the sign-in "
+        "page URL so the user can add or pick one in chat, or, failing that, ask them to create it in the "
+        "Credentials UI and return with its ID, or explicitly choose an unvalidated draft workflow that will "
+        "not be run until credentials are available."
     )
 
 

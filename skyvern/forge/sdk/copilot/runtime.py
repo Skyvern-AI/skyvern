@@ -359,6 +359,9 @@ class AgentContext:
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
+    # The deadline the current model stream runs under, published by the enforcement loop so a tool
+    # that parks on a user decision can suspend it instead of being cancelled mid-question.
+    model_stream_deadline: asyncio.Timeout | None = None
     # The streaming adapter narrates any context it is handed, so the design-phase latches live here
     # rather than on the copilot subclass it is annotated for.
     design_start_emitted: bool = False
