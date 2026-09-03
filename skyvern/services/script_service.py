@@ -651,6 +651,12 @@ async def _create_workflow_block_run_and_task(
         label=label,
         current_value=current_value_str,
         current_index=current_index_val,
+        # Blocks created here always execute from a cached script and never resolve an engine,
+        # so `engine IS NULL` alone cannot distinguish them from an agent block whose engine was
+        # never written. Stamping the initial (no-fallback-yet) state at creation makes
+        # `script_run` the execution-mode marker; the fallback paths overwrite it with True.
+        # Mirrors the run-level `ai_fallback_triggered=False` initialization in `execute_script`.
+        ai_fallback_triggered=False,
     )
 
     workflow_run_block_id = workflow_run_block.workflow_run_block_id

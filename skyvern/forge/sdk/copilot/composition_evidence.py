@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
@@ -417,6 +417,16 @@ def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[s
     )
 
 
+def unresolved_requested_targets(evidence: dict[str, Any], requested_targets: Sequence[str]) -> tuple[str, ...]:
+    """Requested labels the label-first pass could not address to a visible value on this page."""
+    resolved = {
+        str(relation.get("key_text") or "").strip().casefold()
+        for relation in evidence.get("key_value_relations") or []
+        if isinstance(relation, dict) and relation.get("visible") is True and relation.get("value_visible") is True
+    }
+    return tuple(target for target in requested_targets if target.strip() and target.strip().casefold() not in resolved)
+
+
 def merge_visual_composition_evidence(
     evidence: dict[str, Any],
     *,
@@ -450,6 +460,15 @@ def merge_visual_composition_evidence(
         summary = _bounded_string(visual_summary.get("summary"), _MAX_VISUAL_SUMMARY_CHARS)
         if summary:
             merged["visual_evidence_summary"] = summary
+        requested_values = [
+            {"label": _bounded_string(pair.get("label"), 240), "value": _bounded_string(pair.get("value"), 240)}
+            for pair in visual_summary.get("requested_values") or []
+            if isinstance(pair, dict)
+            and _bounded_string(pair.get("label"), 240)
+            and _bounded_string(pair.get("value"), 240)
+        ][:_MAX_KEY_VALUE_RELATIONS]
+        if requested_values:
+            merged["requested_values"] = requested_values
         for item in visual_summary.get("omissions") or []:
             bounded = _bounded_string(item, 160)
             if bounded:
@@ -3496,6 +3515,8 @@ def model_visible_composition_evidence(evidence: dict[str, Any]) -> dict[str, An
     facts retain their original order and values.
     """
 
+    # `expression` embeds a singular selector, its match count and its index in one string, so
+    # dropping only the scalar aliases would let the same facts cross as prose.
     singular_selector_keys = {
         "selector",
         "selector_match_count",
@@ -3504,6 +3525,7 @@ def model_visible_composition_evidence(evidence: dict[str, Any]) -> dict[str, An
         "label_selector",
         "row_selector",
         "expand_toggle_candidates",
+        "expression",
     }
 
     def project(value: Any) -> Any:
