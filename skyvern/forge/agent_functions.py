@@ -236,6 +236,9 @@ class CodeBlockEngineFailure:
     failing_line: int | None
     healability_hint: bool | None
     accepted_user_defined_error: UserDefinedError | None = None
+    # exception_class narrowed to the runner's allowlist of denial guards; the only form of it
+    # that may reach a user-facing payload.
+    denied_exception_class: str | None = None
 
 
 @dataclass(frozen=True)

@@ -7373,6 +7373,8 @@ async def wrapper({default_args}):
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
+                            if secure_failure.denied_exception_class is not None:
+                                failure_output["runner_exception_class"] = secure_failure.denied_exception_class
                             await self.record_output_parameter_value(
                                 workflow_run_context, workflow_run_id, failure_output
                             )
