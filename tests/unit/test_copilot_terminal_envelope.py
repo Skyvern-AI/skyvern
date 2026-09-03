@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +13,7 @@ import structlog.testing
 
 from skyvern.exceptions import get_user_facing_exception_message
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.agent import _CANCEL_REPLY_UNVALIDATED
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
@@ -21,27 +24,41 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    CANCEL_STOP_AT_USER_REQUEST,
     INTERRUPTED_TERMINAL_HEADLINE,
+    MINIMAL_CANCEL_STOP,
     MINIMAL_HONEST_STOP,
+    UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
     finalize_applied_state,
+    interim_run_start_outcome,
+    is_interim_run_outcome,
     reason_in_reply_shadow,
     render_terminal_message,
+    run_start_unresolved,
+    select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _commit_run_blocks_record,
+    _forget_interim_run_start,
     _record_run_blocks_result,
     _stamp_run_side_connect_failure,
     _stash_recorded_run_outcome,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import _record_workflow_update_result
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    HANDBACK_WORKFLOW_YAML,
+    install_run_blocks_harness,
+    make_copilot_ctx,
+)
 
 RUN_SIDE_SHARED_REASON = get_user_facing_exception_message(
     Exception("connect_over_cdp failed: WebSocket error: connection closed")
@@ -560,48 +577,52 @@ def test_anchor_uses_the_latest_final_run_fact() -> None:
     assert envelope.run_display_reason == "A later run completed."
 
 
-def _interim_outcome(verdict: str, display_reason: str | None = None) -> RecordedRunOutcome:
-    return RecordedRunOutcome(verdict=verdict, display_reason=display_reason, role="interim_build_test")
+def test_a_run_start_is_recognised_as_interim_by_its_role_alone() -> None:
+    # The role is the whole marker, so a surface cannot be fooled into reading a run start
+    # as resolved by any lifecycle or verdict value carried alongside it.
+    start = interim_run_start_outcome("wr_1")
+
+    assert start.run_completed is None
+    assert is_interim_run_outcome(start)
+    assert is_interim_run_outcome(replace(start, run_completed=False, verdict="not_demonstrated"))
+    assert not is_interim_run_outcome(RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1"))
 
 
-def test_run_anchor_ignores_interim_not_demonstrated_when_recorded_run_follows() -> None:
+def test_a_result_for_the_same_run_supersedes_that_runs_own_start() -> None:
     envelope = _assemble(
         run_outcomes=[
-            _interim_outcome("not_demonstrated", "The scout has not produced the goal yet."),
-            _run_outcome("not_evaluated", "The later run completed."),
+            interim_run_start_outcome("wr_1"),
+            RecordedRunOutcome(
+                verdict="not_demonstrated",
+                workflow_run_id="wr_1",
+                display_reason="The extraction returned no value.",
+                run_completed=True,
+            ),
         ]
     )
 
-    assert envelope.run_verdict == "not_evaluated"
-    assert envelope.run_display_reason == "The later run completed."
-
-
-def test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome() -> None:
-    # Repair ceiling: the loop stops after a suspicious-success run without ever
-    # producing an adjudicated outcome, so the interim not_demonstrated is the turn's
-    # honest terminal verdict and must still anchor amber.
-    envelope = _assemble(
-        run_outcomes=[
-            _interim_outcome("not_demonstrated", "The run completed but did not demonstrate the goal."),
-        ]
-    )
-
-    assert envelope.run_verdict == "not_demonstrated"
-    assert envelope.run_display_reason == "The run completed but did not demonstrate the goal."
-
-
-def test_run_anchor_prefers_adjudicated_not_demonstrated_over_earlier_interim() -> None:
-    # A genuine adjudicated failure on the completed workflow anchors amber even when an
-    # earlier interim run also went not_demonstrated.
-    envelope = _assemble(
-        run_outcomes=[
-            _interim_outcome("not_demonstrated", "Interim scout, still building."),
-            _run_outcome("not_demonstrated", "The extraction returned no value."),
-        ]
-    )
-
+    assert envelope.run_outcome_role == "recorded"
     assert envelope.run_verdict == "not_demonstrated"
     assert envelope.run_display_reason == "The extraction returned no value."
+    assert envelope.run_completed is True
+
+
+def test_an_unresolved_run_start_leaves_every_lifecycle_facet_unknown() -> None:
+    envelope = _assemble(run_outcomes=[interim_run_start_outcome("wr_1")], blocks_run_this_turn=None)
+
+    assert envelope.run_outcome_role == "interim_build_test"
+    assert envelope.run_id == "wr_1"
+    assert envelope.run_completed is None
+    assert envelope.blocks_run_this_turn is None
+    assert envelope.run_display_reason is None
+    assert envelope.run_output_report is None
+    assert envelope.run_verdict == "not_evaluated"
+
+    message, _ = render_terminal_message(envelope, MINIMAL_CANCEL_STOP, cancelled=True)
+
+    assert "A run was started, and how many of its blocks ran was not confirmed." in message
+    assert "The recorded run's outcome was not evaluated." in message
+    assert "completed" not in message
 
 
 @pytest.mark.parametrize(
@@ -610,7 +631,7 @@ def test_run_anchor_prefers_adjudicated_not_demonstrated_over_earlier_interim() 
         ("ASK_QUESTION", False, False, "no_proposal", "awaiting_user_input"),
         ("REPLY", True, True, "no_proposal", "completed"),
         ("REPLY", False, False, "review_tested", "proposal_pending"),
-        ("REPLY", False, False, "review_required", "stopped"),
+        ("REPLY", False, False, "review_untested", "proposal_pending"),
         ("REPLY", True, False, "auto_applicable", "stopped"),
     ],
 )
@@ -1029,25 +1050,175 @@ def test_render_terminal_message_omits_unsafe_recorded_output_report() -> None:
     assert replaced is False
 
 
-@pytest.mark.parametrize(
-    ("next_state", "cancelled"),
-    [
-        ("completed", False),
-        ("proposal_pending", False),
-        ("awaiting_user_input", False),
-        ("stopped", True),
-    ],
-)
-def test_render_terminal_message_passthrough_for_non_stopped_or_cancelled(next_state: str, cancelled: bool) -> None:
+@pytest.mark.parametrize("next_state", ["completed", "proposal_pending", "awaiting_user_input"])
+def test_render_terminal_message_passthrough_for_non_stopped(next_state: str) -> None:
     envelope = TerminalOutcomeEnvelope(
         next_state=next_state, verified=False, run_verdict="not_demonstrated", response_kind="stopped"
     )
     message = "keep-agent-message"
 
-    rendered, replaced = render_terminal_message(envelope, message, cancelled=cancelled)
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
 
     assert rendered == message
     assert replaced is False
+
+
+@pytest.mark.parametrize("next_state", ["stopped", "proposal_pending"])
+def test_render_terminal_message_cancelled_reports_recorded_facts_in_any_state(next_state: str) -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state=next_state,
+        verified=False,
+        run_verdict="not_demonstrated",
+        response_kind="stopped",
+        blocks_run_this_turn=2,
+        proposal_present=next_state == "proposal_pending",
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "keep-agent-message", cancelled=True)
+
+    assert rendered.startswith("keep-agent-message")
+    assert "2 blocks ran this turn." in rendered
+    assert "outcome did not confirm the goal was met." in rendered
+    assert replaced is True
+
+
+def test_render_terminal_message_cancelled_mid_run_reports_unknown_never_zero() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        blocks_run_this_turn=None,
+        run_id="wr_1",
+        run_verdict="not_evaluated",
+    )
+
+    rendered, _ = render_terminal_message(envelope, MINIMAL_CANCEL_STOP, cancelled=True)
+
+    assert "A run was started, and how many of its blocks ran was not confirmed." in rendered
+    assert "0 blocks ran" not in rendered
+
+
+def test_render_terminal_message_cancelled_names_a_tested_draft_from_the_seed_disposition() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="proposal_pending",
+        verified=False,
+        response_kind="update",
+        blocks_run_this_turn=0,
+        proposal_present=True,
+        proposal_disposition="review_tested",
+    )
+    seed = "Stopped. The tested draft from this turn was preserved for review."
+
+    rendered, _ = render_terminal_message(envelope, seed, cancelled=True)
+
+    assert rendered.count("The tested draft from this turn was preserved for review.") == 1
+    assert "untested draft" not in rendered
+
+
+def test_render_terminal_message_cancelled_never_ships_two_draft_dispositions() -> None:
+    # The seed reply and the envelope disagree; one bubble still carries one disposition.
+    envelope = TerminalOutcomeEnvelope(
+        next_state="proposal_pending",
+        verified=True,
+        response_kind="update",
+        blocks_run_this_turn=0,
+        proposal_present=True,
+        proposal_disposition="review_untested",
+    )
+    seed = "Stopped. The tested draft from this turn was preserved for review."
+
+    rendered, _ = render_terminal_message(envelope, seed, cancelled=True)
+
+    assert rendered.count("draft from this turn was preserved for review.") == 1
+
+
+def test_render_terminal_message_cancelled_is_stable_across_a_second_render() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        run_verdict="not_demonstrated",
+        run_display_reason="The sign-in never reached the dashboard.",
+        blocks_run_this_turn=2,
+        proposal_present=True,
+        proposal_disposition="review_untested",
+        canonical_rolled_back=True,
+        failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+    )
+
+    first, _ = render_terminal_message(envelope, "keep-agent-message", cancelled=True)
+    second, replaced = render_terminal_message(envelope, first, cancelled=True)
+
+    assert second == first
+    assert replaced is False
+    assert first.count("2 blocks ran this turn.") == 1
+    assert first.count("The saved workflow was rolled back to its state before this turn.") == 1
+
+
+def test_cancelled_render_appends_to_agent_text_even_with_a_failure_recorded() -> None:
+    """Every replacing branch is guarded ``not cancelled``, which is why the stop report ships ungated."""
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        blocks_run_this_turn=2,
+        terminal_cause="cdp_connect_failed",
+        connect_failure=BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id="pbs_1"),
+        failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+    )
+
+    rendered, replaced = render_terminal_message(envelope, "keep-agent-message", cancelled=True)
+
+    assert rendered.startswith("keep-agent-message")
+    assert "Build testing stopped with browser connection state" not in rendered
+    assert "I stopped after a browser operation failed" not in rendered
+    assert "2 blocks ran this turn." in rendered
+    assert replaced is True
+
+
+def test_render_terminal_message_cancelled_names_the_rollback() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        blocks_run_this_turn=1,
+        canonical_rolled_back=True,
+    )
+
+    rendered, _ = render_terminal_message(envelope, MINIMAL_CANCEL_STOP, cancelled=True)
+
+    assert "The saved workflow was rolled back to its state before this turn." in rendered
+
+
+def test_an_unresolved_run_start_is_not_an_explicit_stop() -> None:
+    envelope = _assemble(
+        workflow_attempted=False,
+        run_outcomes=[interim_run_start_outcome("wr_1")],
+    )
+
+    assert envelope.run_outcome_role == "interim_build_test"
+    assert envelope.response_kind == "answer"
+
+
+def test_a_resolved_run_outcome_still_reports_an_explicit_stop() -> None:
+    envelope = _assemble(
+        workflow_attempted=False,
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1")],
+    )
+
+    assert envelope.run_outcome_role == "recorded"
+    assert envelope.response_kind == "stopped"
+
+
+def test_an_unresolved_run_start_leaves_the_turn_facts_evaluation_empty() -> None:
+    ctx = make_copilot_ctx()
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_1"))
+
+    facts = agent_module._turn_facts_for_context(ctx, None, None)
+
+    assert facts["runId"] == "wr_1"
+    assert facts["evaluationState"] is None
+    assert facts["runCompleted"] is None
 
 
 def test_render_terminal_message_keeps_answer_kind_replies_on_stopped_state() -> None:
@@ -1128,10 +1299,10 @@ def test_render_terminal_message_held_draft_unreplaced_without_deadline_cause() 
 def test_render_terminal_message_cancelled_turn_ignores_deadline_cause() -> None:
     envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
 
-    rendered, replaced = render_terminal_message(envelope, "cancelled-text", cancelled=True)
+    rendered, _ = render_terminal_message(envelope, "cancelled-text", cancelled=True)
 
-    assert rendered == "cancelled-text"
-    assert replaced is False
+    assert rendered.startswith("cancelled-text")
+    assert "time limit" not in rendered
 
 
 def test_render_terminal_message_completed_turn_is_not_stamped_by_deadline_cause() -> None:
@@ -1368,3 +1539,187 @@ def test_run_lifecycle_and_run_id_name_the_same_archived_outcome() -> None:
 
     assert halted.run_id == "wr_2"
     assert halted.run_completed is False
+
+
+def test_blocks_run_this_turn_is_absent_while_a_started_run_has_no_result() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = set()
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_1"))
+
+    assert agent_module._blocks_run_this_turn(ctx) is None
+
+
+def test_blocks_run_this_turn_reports_the_count_once_the_run_result_lands() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = {"sign_in", "extract"}
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_1"))
+    _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1"))
+
+    assert agent_module._blocks_run_this_turn(ctx) == 2
+
+
+def test_an_unwound_run_start_is_dropped_and_a_recorded_outcome_is_kept() -> None:
+    ctx = make_copilot_ctx()
+    _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1"))
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_2"))
+
+    _forget_interim_run_start(ctx, "wr_2")
+
+    assert [outcome.workflow_run_id for outcome in ctx.terminal_envelope_run_outcomes] == ["wr_1"]
+    assert agent_module._blocks_run_this_turn(ctx) == 0
+
+
+def test_one_stop_report_reads_its_verdict_and_block_count_from_the_same_run() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = {"sign_in", "extract"}
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_a"))
+    _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="not_demonstrated", workflow_run_id="wr_a"))
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_b"))
+
+    anchor = select_run_outcome_anchor(ctx.terminal_envelope_run_outcomes)
+
+    assert anchor is not None
+    assert anchor.workflow_run_id == "wr_b"
+    assert run_start_unresolved(ctx.terminal_envelope_run_outcomes)
+    assert agent_module._blocks_run_this_turn(ctx) is None
+
+
+def test_a_run_started_after_a_demonstrated_run_reports_the_new_run_unresolved() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = {"sign_in", "extract"}
+    _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_a"))
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_b"))
+
+    anchor = select_run_outcome_anchor(ctx.terminal_envelope_run_outcomes)
+
+    assert anchor is not None
+    assert anchor.workflow_run_id == "wr_b"
+    assert run_start_unresolved(ctx.terminal_envelope_run_outcomes)
+    assert agent_module._blocks_run_this_turn(ctx) is None
+
+
+def test_a_run_that_demonstrated_the_goal_reports_its_real_block_count() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = {"sign_in"}
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_1"))
+    _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_1"))
+
+    assert agent_module._blocks_run_this_turn(ctx) == 1
+
+
+def test_a_run_that_lost_its_browser_session_supersedes_its_own_run_start() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = set()
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_run_side"))
+
+    _commit_run_blocks_record(ctx, _run_side_failed_result(reason_code="browser_session_closed"))
+
+    assert not run_start_unresolved(ctx.terminal_envelope_run_outcomes)
+    assert agent_module._blocks_run_this_turn(ctx) == 0
+
+
+def test_a_stop_on_a_run_that_lost_its_browser_session_never_says_the_count_was_unconfirmed() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = set()
+    ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome("wr_run_side"))
+    _commit_run_blocks_record(ctx, _run_side_failed_result(reason_code="browser_session_closed"))
+
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        blocks_run_this_turn=agent_module._blocks_run_this_turn(ctx),
+        run_id="wr_run_side",
+        run_verdict="not_evaluated",
+    )
+    rendered, _ = render_terminal_message(envelope, MINIMAL_CANCEL_STOP, cancelled=True)
+
+    assert "how many of its blocks ran was not confirmed" not in rendered
+    assert "0 blocks ran this turn." in rendered
+
+
+def test_blocks_run_this_turn_reports_zero_when_no_run_was_started() -> None:
+    ctx = make_copilot_ctx()
+    ctx.executed_block_labels = set()
+
+    assert agent_module._blocks_run_this_turn(ctx) == 0
+
+
+async def _run_blocks_cancelling_at(monkeypatch: pytest.MonkeyPatch, *, cancel_at: str | None) -> CopilotContext:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=cancel_at is None,
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    async def _cancel(*_args: Any, **_kwargs: Any) -> None:
+        raise asyncio.CancelledError
+
+    if cancel_at is None:
+        harness["worker_execute"].side_effect = _cancel
+    else:
+        monkeypatch.setattr(run_execution_module, cancel_at, _cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["extract_heading"], "parameters": {}}, ctx
+        )
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_before_the_inline_run_starts_leaves_no_run_start_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await _run_blocks_cancelling_at(monkeypatch, cancel_at="initialize_skyvern_state_file")
+
+    assert ctx.terminal_envelope_run_outcomes == []
+    assert agent_module._blocks_run_this_turn(ctx) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_once_the_run_is_submitted_keeps_its_unresolved_run_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await _run_blocks_cancelling_at(monkeypatch, cancel_at=None)
+
+    assert [outcome.role for outcome in ctx.terminal_envelope_run_outcomes] == ["interim_build_test"]
+    assert agent_module._blocks_run_this_turn(ctx) is None
+
+
+def test_only_a_stop_click_is_reported_as_the_user_asking() -> None:
+    """A Stop click is the user asking; an ambient Escape is the very thing this
+    ticket says the product cannot attribute, so it must not claim their intent."""
+
+    def render(source: str | None) -> str:
+        envelope = TerminalOutcomeEnvelope(
+            next_state="stopped",
+            verified=False,
+            response_kind="stopped",
+            blocks_run_this_turn=0,
+            cancel_source=source,
+        )
+        return render_terminal_message(envelope, MINIMAL_CANCEL_STOP, cancelled=True)[0]
+
+    assert render("stop_button").startswith(CANCEL_STOP_AT_USER_REQUEST)
+    for unattributed in ("escape_key", "api", None):
+        assert render(unattributed).startswith(MINIMAL_CANCEL_STOP)
+        assert "your request" not in render(unattributed)
+
+    # The ordinary build stop preserves a draft, so its seed reply is longer than the
+    # bare opening; the upgrade has to replace that opening rather than skip the turn.
+    with_draft = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        blocks_run_this_turn=0,
+        cancel_source="stop_button",
+        proposal_present=True,
+        proposal_disposition="review_untested",
+    )
+    drafted = render_terminal_message(with_draft, _CANCEL_REPLY_UNVALIDATED, cancelled=True)[0]
+    assert drafted.startswith(CANCEL_STOP_AT_USER_REQUEST)
+    assert UNTESTED_DRAFT_PRESERVED in drafted
