@@ -32,9 +32,11 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_HEADLINE,
     MINIMAL_CANCEL_STOP,
     MINIMAL_HONEST_STOP,
+    QUESTION_PART_TEXT_LIMIT,
     UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
+    admit_question_parts,
     assemble_terminal_envelope,
     finalize_applied_state,
     interim_run_start_outcome,
@@ -1741,3 +1743,22 @@ def test_only_a_stop_click_is_reported_as_the_user_asking() -> None:
     drafted = render_terminal_message(with_draft, _CANCEL_REPLY_UNVALIDATED, cancelled=True)[0]
     assert drafted.startswith(CANCEL_STOP_AT_USER_REQUEST)
     assert UNTESTED_DRAFT_PRESERVED in drafted
+
+
+def test_admission_keeps_only_parts_the_server_can_vouch_for() -> None:
+    parts = admit_question_parts(
+        [
+            {"prompt": "Which store?", "choices": ["Acme", "Borough", "Acme", 7]},
+            "not a part",
+            {"prompt": "Which email?", "choices": []},
+            {"choices": ["no prompt"]},
+            {"prompt": "x" * (QUESTION_PART_TEXT_LIMIT + 1), "choices": ["kept out with its part"]},
+            {"prompt": "Which day?", "choices": ["Monday", "y" * (QUESTION_PART_TEXT_LIMIT + 1)]},
+        ]
+    )
+
+    assert [(part.part_id, part.prompt, part.choices) for part in parts] == [
+        ("p1", "Which store?", ["Acme", "Borough"]),
+        ("p2", "Which email?", []),
+        ("p3", "Which day?", ["Monday"]),
+    ]
