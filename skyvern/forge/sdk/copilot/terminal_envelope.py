@@ -96,6 +96,7 @@ def assemble_terminal_envelope(
     failed_operation: BuildTestFailedOperation | None = None,
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
+    interruption: InterruptedTurnFacts | None = None,
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = select_run_outcome_anchor(run_outcomes)
     run_verdict = run_outcome.verdict if run_outcome is not None else None
@@ -155,6 +156,7 @@ def assemble_terminal_envelope(
         failed_operation=failed_operation,
         connect_failure=connect_failure,
         proposal_present=proposal_present,
+        interruption=interruption,
     )
 
 
@@ -208,7 +210,7 @@ def interrupted_terminal_envelope(facts: InterruptedTurnFacts | None = None) -> 
     )
 
 
-def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str:
+def render_interrupted_message(facts: InterruptedTurnFacts | None = None, *, proposal_present: bool = False) -> str:
     """User-facing copy for an interrupted turn: what is known, and never why it stopped."""
     message = INTERRUPTED_TERMINAL_HEADLINE
     if facts is not None:
@@ -228,6 +230,10 @@ def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str
             message = _append_sentence(
                 message, f"Last recorded build-test phase: {facts.last_recorded_build_test_phase}."
             )
+    if proposal_present:
+        # The Accept/Discard card stays on screen for an untested draft, so a message that did not
+        # mention it would contradict what the user is looking at.
+        message = _append_sentence(message, "The untested draft is available for review.")
     return _append_sentence(message, INTERRUPTED_TERMINAL_RETRY)
 
 
@@ -258,6 +264,11 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
                 return agent_message, False
             message = _append_sentence(message, f"{pending_question_intro}: {agent_message}")
         return message, True
+    # A crash and a failed test are different endings, and the latch a crash inherits from an
+    # earlier build test in the same turn would otherwise render both with the same sentence.
+    # A connect failure still outranks this: it names identities the operator needs.
+    if envelope.interruption is not None and not cancelled:
+        return render_interrupted_message(envelope.interruption, proposal_present=envelope.proposal_present), True
     if envelope.failed_operation is not None and not cancelled:
         message = "I stopped after a browser operation failed while testing the workflow."
         if envelope.proposal_present:
