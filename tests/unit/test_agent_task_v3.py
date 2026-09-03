@@ -2694,6 +2694,164 @@ async def test_execute_task_v3_failed_run_carries_failure_category(
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_budget_exit_carries_typed_category_and_partial_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A cap-tripped run that never finished: the human sentence (not the raw cap literal) is the
+    # failure_reason, the raw literal rides the BUDGET_EXHAUSTED category's reasoning, and a partial
+    # extraction the model had staged is not discarded with the failure.
+    outcome = LoopOutcome(
+        status="budget_exhausted",
+        reason="The run reached its turn budget before the model finished; the recorded output may be partial.",
+        cap_trip="max_turns (40) reached",
+        billable_actions=["click"],
+        extracted_output={"partial": True},
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.failed
+    update_kwargs = loop_mock.update_task_kwargs
+    assert "max_turns (" not in (update_kwargs.get("failure_reason") or "")
+    assert update_kwargs.get("failure_category") == [
+        {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": "max_turns (40) reached"}
+    ]
+    assert update_kwargs.get("extracted_information") == {"partial": True}
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_cap_tripped_finish_keeps_output_and_decision_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A finish delivered on the granted final turn: the model's verdict and reason stand, the
+    # extracted_output persists despite the non-completed status, the category classifies from the
+    # model's reason (a captcha block is anti-bot, not budget — the cap merely coincided), and the
+    # terminal decision row is written like any other finish.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(
+        status="failed",
+        reason="blocked by a captcha",
+        cap_trip="Reached the maximum steps (25)",
+        billable_actions=[],
+        extracted_output={"rows": [1]},
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
+    assert task.status == TaskStatus.failed
+    update_kwargs = loop_mock.update_task_kwargs
+    assert update_kwargs.get("failure_reason") == "blocked by a captcha"
+    category = update_kwargs.get("failure_category")
+    assert category and category[0]["category"] == "ANTI_BOT_DETECTION", category
+    assert update_kwargs.get("extracted_information") == {"rows": [1]}
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert persisted.action_type == ActionType.TERMINATE
+    assert persisted.reasoning == "blocked by a captcha"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_cap_tripped_finish_with_unclassifiable_reason_falls_back_to_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A granted-turn failed verdict whose reason carries no classifiable signal is usually the
+    # model narrating the truncation: the typed cap fact beats an UNKNOWN keyword fallback.
+    outcome = LoopOutcome(
+        status="failed",
+        reason="could not finish filling in the remaining sections",
+        cap_trip="max_turns (40) reached",
+        billable_actions=["click"],
+        extracted_output={"partial": True},
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
+    assert task.status == TaskStatus.failed
+    category = loop_mock.update_task_kwargs.get("failure_category")
+    assert category == [
+        {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": "max_turns (40) reached"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_cap_tripped_guard_termination_is_not_budget_categorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A repeat-guard termination on the granted turn terminated for the guard's reason (its typed
+    # prefix rides failure_reason); stamping BUDGET_EXHAUSTED over it would mix the label axes.
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="action_loop: repeated identical click on the same target",
+        cap_trip="max_turns (40) reached",
+        billable_actions=["click"],
+        extracted_output=None,
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.terminated
+    assert loop_mock.update_task_kwargs.get("failure_category") is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_cap_tripped_missing_extraction_keeps_its_own_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A completion demoted for missing extraction failed for THAT reason even when it landed on a
+    # granted final turn: failure_category must agree with failure_reason, not read BUDGET_EXHAUSTED.
+    outcome = LoopOutcome(
+        status="completed",
+        reason="done",
+        cap_trip="max_turns (40) reached",
+        billable_actions=["type"],
+        extracted_output=None,
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal="Extract the rows", extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.failed
+    category = loop_mock.update_task_kwargs.get("failure_category")
+    assert category, category
+    assert category[0]["category"] != "BUDGET_EXHAUSTED", category
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_and_partial_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A provider failure on the granted call is an infra failure that merely happened after the
+    # cap tripped: the category must reflect the error (not BUDGET_EXHAUSTED), while the staged
+    # extraction the loop salvaged still persists through the relaxed gate.
+    outcome = LoopOutcome(
+        status="loop_error",
+        reason="llm_call_failed: RuntimeError: provider unavailable",
+        cap_trip="max_tool_calls (100) reached",
+        billable_actions=[],
+        extracted_output={"rows": [8]},
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.failed
+    category = loop_mock.update_task_kwargs.get("failure_category")
+    assert category, category
+    assert category[0]["category"] != "BUDGET_EXHAUSTED", category
+    assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [8]}
+
+
+def test_task_validate_update_allows_partial_extraction_on_failed_and_terminated() -> None:
+    # The budget-cap final turn persists PARTIAL extraction with a failed/terminated verdict. The
+    # execute harness stubs update_task, so the real contract is pinned here: failed/terminated
+    # accept data, pre-run statuses keep rejecting it.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    make_task(now, organization, status=TaskStatus.running).validate_update(
+        TaskStatus.failed, {"partial": 1}, "budget capped"
+    )
+    make_task(now, organization, status=TaskStatus.running).validate_update(
+        TaskStatus.terminated, {"partial": 1}, "budget capped"
+    )
+    with pytest.raises(ValueError):
+        make_task(now, organization, status=TaskStatus.created).validate_update(TaskStatus.running, {"partial": 1})
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
