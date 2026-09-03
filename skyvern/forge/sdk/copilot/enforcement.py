@@ -777,6 +777,10 @@ def _summarize_tool_output(output: str) -> str:
         if isinstance(unresolved, dict) and unresolved:
             synopsis["unresolved_earlier_failure"] = unresolved
 
+        change_identity = data.get("prior_attempt_change_identity")
+        if isinstance(change_identity, dict) and change_identity:
+            synopsis["prior_attempt_change_identity"] = change_identity
+
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
         categories = data.get("failure_categories")

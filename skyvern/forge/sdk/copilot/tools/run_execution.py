@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     connect_failure_from_run_blocks_result,
     failed_operation_from_run_blocks_result,
     post_run_page_capture_from_result,
+    prior_attempt_change_identity,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
     unresolved_runtime_block_failure_with_disposition,
@@ -2406,12 +2407,15 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
         definition_unpersisted=True,
     )
     recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
-    return finalize_build_test_result(
+    finalized = finalize_build_test_result(
         ctx,
         source_tool="run_blocks_and_collect_debug",
         result=result,
         recorded_outcome=recorded_outcome,
     )
+    if not finalized.get("ok"):
+        _carry_prior_attempt_change_identity_into_result(ctx, finalized.get("data"), "test_end_to_end")
+    return finalized
 
 
 async def _attach_post_run_browser_enrichment(
@@ -4596,9 +4600,10 @@ def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, An
     not interpreted - which run failed, at which block, how, and that this success did not establish
     the failure was resolved. The model still owns what to do about it.
     """
-    if not result.get("ok"):
-        return
     data = result.get("data")
+    if not result.get("ok"):
+        _carry_prior_attempt_change_identity_into_result(copilot_ctx, data, tool_name)
+        return
     this_run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
     unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
         copilot_ctx,
@@ -4637,6 +4642,37 @@ def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, An
         workflow_run_id=unresolved.workflow_run_id,
         block_label=unresolved.block_label,
         failure_kind=failure_kind,
+    )
+
+
+def _carry_prior_attempt_change_identity_into_result(
+    copilot_ctx: CopilotContext, data: dict[str, Any] | None, tool_name: str
+) -> None:
+    """Tell a repeat failing hand-back whether the code it just ran differs from the code that raised.
+    The rendered source binding compares the latest attempt to the current definition, which on a
+    repeat failure reads as a match and says nothing about the prior attempt."""
+    if not isinstance(data, dict):
+        return
+    run_id = data.get("workflow_run_id")
+    latest = copilot_ctx.latest_recorded_build_test_outcome
+    if not isinstance(run_id, str) or not isinstance(latest, RecordedBuildTestOutcome):
+        return
+    identity = prior_attempt_change_identity(
+        copilot_ctx,
+        attempted_block_label=latest.attempted_block_label or "",
+        current_workflow_run_id=run_id,
+    )
+    if identity is None:
+        return
+    data["prior_attempt_change_identity"] = identity.model_dump(mode="json")
+    LOG.info(
+        "copilot carried prior-attempt change identity into failing run result",
+        tool_name=tool_name,
+        workflow_run_id=run_id,
+        prior_workflow_run_id=identity.prior_workflow_run_id,
+        block_label=identity.block_label,
+        changed=identity.changed,
+        basis=identity.basis,
     )
 
 

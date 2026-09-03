@@ -2259,6 +2259,9 @@ async def _run_end_to_end_test_turn(
                 handoff_data["overall_status"] = run["status"]
     elif isinstance(sanitized_data, dict) and isinstance(sanitized_data.get("build_test_packet_omitted"), str):
         handoff_data["build_test_packet_omitted"] = sanitized_data["build_test_packet_omitted"]
+    change_identity = sanitized_data.get("prior_attempt_change_identity") if isinstance(sanitized_data, dict) else None
+    if isinstance(change_identity, dict) and change_identity:
+        handoff_data["prior_attempt_change_identity"] = change_identity
     control_signal = sanitized_data.get("control_signal") if isinstance(sanitized_data, dict) else None
     control_kind = control_signal.get("kind") if isinstance(control_signal, dict) else None
     watchdog_control_kinds = {
