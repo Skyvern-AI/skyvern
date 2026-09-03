@@ -218,6 +218,12 @@ class PersistentSessionsManager(Protocol):
         """
         ...
 
+    async def remaining_lifetime_seconds(self, session_id: str, organization_id: str) -> float | None:
+        """Seconds until this session ends regardless of activity or renewal, measured on the clock its own
+        retirement uses and bounded by a pinned-infrastructure deadline. None when no such deadline exists or
+        it cannot be read."""
+        ...
+
     async def update_status(
         self, session_id: str, organization_id: str, status: str
     ) -> PersistentBrowserSession | None:

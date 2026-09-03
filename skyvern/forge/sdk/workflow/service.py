@@ -204,6 +204,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_timeouts import REUSE_MIN_REMAINING_LIFETIME_SECONDS
 from skyvern.schemas.proxy_pinning import (
     derive_proxy_session_id,
     redact_proxy_session_id,
@@ -1199,6 +1200,13 @@ class ReusedSessionOwnerProof:
             and self.router_activity_is_stale
             and self.observed_last_activity_at is not None
         )
+
+
+class ReusedSessionBelowLifetimeFloor(Exception):
+    def __init__(self, *, browser_session: PersistentBrowserSession, shortfall: dict[str, object]) -> None:
+        super().__init__(browser_session.persistent_browser_session_id)
+        self.browser_session = browser_session
+        self.shortfall = shortfall
 
 
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
@@ -3864,11 +3872,14 @@ class WorkflowService:
         return bool(profile and profile.is_managed)
 
     @staticmethod
-    async def _close_reused_session_best_effort(*, organization_id: str, session_id: str) -> None:
+    async def _close_reused_session_best_effort(
+        *,
+        organization_id: str,
+        session_id: str,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
+    ) -> None:
         try:
-            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                organization_id, session_id, reason=BrowserSessionCloseReason.aborted
-            )
+            await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason)
         except Exception:
             LOG.warning(
                 "Failed to close unusable reused browser session",
@@ -4060,6 +4071,41 @@ class WorkflowService:
         current_context.browser_session_runnable_generation_id = lease_generation_id
         return session_id
 
+    async def _reused_session_lifetime_shortfall(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        browser_session: PersistentBrowserSession,
+    ) -> dict[str, object] | None:
+        try:
+            remaining_lifetime_seconds = await app.PERSISTENT_SESSIONS_MANAGER.remaining_lifetime_seconds(
+                browser_session.persistent_browser_session_id,
+                organization_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Could not evaluate reusable browser session remaining lifetime; leaving reuse enabled",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                exc_info=True,
+            )
+            return None
+        if remaining_lifetime_seconds is None or remaining_lifetime_seconds >= REUSE_MIN_REMAINING_LIFETIME_SECONDS:
+            return None
+        return {
+            "organization_id": organization_id,
+            "workflow_run_id": workflow_run_id,
+            "workflow_permanent_id": workflow_permanent_id,
+            "bound_key": browser_session.bound_key,
+            "browser_session_id": browser_session.persistent_browser_session_id,
+            "remaining_lifetime_seconds": remaining_lifetime_seconds,
+            "min_remaining_lifetime_seconds": REUSE_MIN_REMAINING_LIFETIME_SECONDS,
+        }
+
     async def _adopt_reused_session(
         self,
         *,
@@ -4068,6 +4114,7 @@ class WorkflowService:
         expected_workflow_permanent_id: str,
         expected_bound_key: str | None,
         browser_session: PersistentBrowserSession,
+        lifetime_floor_session_id: str | None = None,
     ) -> str | None:
         session_id = browser_session.persistent_browser_session_id
         workflow_identity_matches = browser_session.bound_workflow_permanent_id == expected_workflow_permanent_id or (
@@ -4094,7 +4141,7 @@ class WorkflowService:
             if latest is None or is_final_status(latest.status):
                 return None
             raise BrowserSessionAlreadyOccupiedError(session_id, latest.runnable_id or "unknown")
-
+        stale_owner_released = False
         stale_owner_id = browser_session.runnable_id
         if stale_owner_id and stale_owner_id != workflow_run_id:
             owner_proof = await self._read_reused_session_owner_proof(
@@ -4135,6 +4182,25 @@ class WorkflowService:
                 stale_runnable_id=stale_owner_id,
                 browser_session_id=session_id,
             )
+            # A trusted stale-owner release clears runnable_id in the stored row; mirror that state for retirement.
+            stale_owner_released = True
+
+        if lifetime_floor_session_id == session_id and (browser_session.runnable_id is None or stale_owner_released):
+            shortfall = await self._reused_session_lifetime_shortfall(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=expected_workflow_permanent_id,
+                browser_session=browser_session,
+            )
+            if shortfall is not None:
+                raise ReusedSessionBelowLifetimeFloor(
+                    browser_session=(
+                        browser_session.model_copy(update={"runnable_id": None})
+                        if stale_owner_released
+                        else browser_session
+                    ),
+                    shortfall=shortfall,
+                )
 
         try:
             return await self._claim_reused_session(
@@ -4164,6 +4230,7 @@ class WorkflowService:
         workflow_permanent_id: str,
         bound_key: str | None,
         browser_session: PersistentBrowserSession,
+        lifetime_floor_session_id: str | None = None,
     ) -> tuple[str | None, PersistentBrowserSession]:
         candidate = browser_session
         for attempt in range(2):
@@ -4175,6 +4242,7 @@ class WorkflowService:
                         expected_workflow_permanent_id=workflow_permanent_id,
                         expected_bound_key=bound_key,
                         browser_session=candidate,
+                        lifetime_floor_session_id=lifetime_floor_session_id,
                     ),
                     candidate,
                 )
@@ -4205,6 +4273,8 @@ class WorkflowService:
         workflow_permanent_id: str,
         bound_key: str | None,
         browser_session: PersistentBrowserSession,
+        reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
+        lifetime_floor_session_id: str | None = None,
     ) -> str | None:
         session_id = browser_session.persistent_browser_session_id
         observed_workflow_permanent_id = browser_session.bound_workflow_permanent_id
@@ -4212,6 +4282,7 @@ class WorkflowService:
             await self._close_reused_session_best_effort(
                 organization_id=organization_id,
                 session_id=session_id,
+                reason=reason,
             )
             return None
         occupied_owner_id = browser_session.runnable_id
@@ -4235,13 +4306,21 @@ class WorkflowService:
             )
             if latest is None:
                 return None
-            adopted_session_id, latest = await self._adopt_reused_session_with_occupancy_retry(
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                bound_key=bound_key,
-                browser_session=latest,
-            )
+            try:
+                adopted_session_id, latest = await self._adopt_reused_session_with_occupancy_retry(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                    browser_session=latest,
+                    lifetime_floor_session_id=lifetime_floor_session_id,
+                )
+                latest_reason = (
+                    reason if latest.persistent_browser_session_id == session_id else BrowserSessionCloseReason.aborted
+                )
+            except ReusedSessionBelowLifetimeFloor as below_floor:
+                adopted_session_id, latest = None, below_floor.browser_session
+                latest_reason = BrowserSessionCloseReason.expired
             if adopted_session_id is not None:
                 return adopted_session_id
             latest_workflow_permanent_id = latest.bound_workflow_permanent_id
@@ -4265,6 +4344,7 @@ class WorkflowService:
                 await self._close_reused_session_best_effort(
                     organization_id=organization_id,
                     session_id=latest.persistent_browser_session_id,
+                    reason=latest_reason,
                 )
             return None
         if occupied_owner_id is not None:
@@ -4279,6 +4359,7 @@ class WorkflowService:
         await self._close_reused_session_best_effort(
             organization_id=organization_id,
             session_id=session_id,
+            reason=reason,
         )
         return None
 
@@ -4327,13 +4408,21 @@ class WorkflowService:
             bound_key=bound_key,
         )
         if browser_session is not None:
-            adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                bound_key=bound_key,
-                browser_session=browser_session,
-            )
+            lifetime_floor_session_id = browser_session.persistent_browser_session_id
+            close_reason = BrowserSessionCloseReason.aborted
+            try:
+                adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                    browser_session=browser_session,
+                    lifetime_floor_session_id=lifetime_floor_session_id,
+                )
+            except ReusedSessionBelowLifetimeFloor as below_floor:
+                LOG.info("Retiring reusable browser session below lifetime floor", **below_floor.shortfall)
+                adopted_session_id, browser_session = None, below_floor.browser_session
+                close_reason = BrowserSessionCloseReason.expired
             if adopted_session_id is not None:
                 return adopted_session_id
             LOG.info(
@@ -4351,6 +4440,8 @@ class WorkflowService:
                 workflow_permanent_id=workflow_permanent_id,
                 bound_key=bound_key,
                 browser_session=browser_session,
+                reason=close_reason,
+                lifetime_floor_session_id=lifetime_floor_session_id,
             )
             if adopted_after_unbind_race is not None:
                 return adopted_after_unbind_race

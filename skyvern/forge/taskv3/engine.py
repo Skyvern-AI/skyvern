@@ -369,6 +369,7 @@ async def run_task_v3_agent_loop(
             page_probe=None if page_free else page_probe,
             page_fingerprint=None if page_free else page_fingerprint,
             reload_page=None if page_free else reload_page,
+            final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire

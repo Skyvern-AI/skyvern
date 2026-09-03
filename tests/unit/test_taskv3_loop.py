@@ -327,8 +327,12 @@ async def test_max_turns_budget_exhausted() -> None:
     outcome, _ = await _run(script, tools, max_turns=3)
 
     assert outcome.status == "budget_exhausted"
-    assert "max_turns" in outcome.reason
-    assert outcome.turns == 3
+    # Deliberate contract change: the first trip grants one final observed turn instead of ending
+    # the run immediately, so `reason` is now a human sentence (never the raw cap literal) and the
+    # raw fact lives on `cap_trip`; the granted turn (turn 4) still had nothing but click to call.
+    assert "max_turns" not in outcome.reason
+    assert outcome.cap_trip == "max_turns (3) reached"
+    assert outcome.turns == 4
 
 
 @pytest.mark.asyncio
@@ -339,8 +343,11 @@ async def test_max_tool_calls_budget_exhausted() -> None:
     outcome, _ = await _run(script, tools, max_tool_calls=2)
 
     assert outcome.status == "budget_exhausted"
-    assert "max_tool_calls" in outcome.reason
-    assert outcome.tool_calls == 2
+    # Deliberate contract change: the top-of-turn trip grants one final observed turn (an entire
+    # batch here, since the script always calls two clicks per turn) before ending the run.
+    assert "max_tool_calls" not in outcome.reason
+    assert outcome.cap_trip == "max_tool_calls (2) reached"
+    assert outcome.tool_calls == 4
 
 
 @pytest.mark.asyncio
@@ -679,8 +686,11 @@ async def test_deadline_seconds_exhausts_budget(monkeypatch: pytest.MonkeyPatch)
         deadline_seconds=60.0,
     )
     assert outcome.status == "budget_exhausted"
-    assert "deadline" in outcome.reason
-    assert caller.calls == 0  # tripped before any LLM call
+    # Deliberate contract change: the deadline trip grants one final observed turn before the run
+    # actually ends, so one LLM call now runs (the raw literal moved to cap_trip).
+    assert "deadline" not in outcome.reason
+    assert outcome.cap_trip == "deadline (60s) reached"
+    assert caller.calls == 1
 
 
 @pytest.mark.asyncio
@@ -697,8 +707,11 @@ async def test_max_tokens_exhausts_budget() -> None:
         max_tokens=10,
     )
     assert outcome.status == "budget_exhausted"
-    assert "max_tokens" in outcome.reason
-    assert caller.calls == 1  # one turn ran, then the token budget stopped it
+    # Deliberate contract change: the trip after turn 1 grants one more observed turn (turn 2) before
+    # the run actually ends, so two turns now run instead of one.
+    assert "max_tokens" not in outcome.reason
+    assert outcome.cap_trip == "max_tokens (10) reached"
+    assert caller.calls == 2  # the granted turn ran before the run actually ended
 
 
 @pytest.mark.asyncio
@@ -733,7 +746,14 @@ async def test_tool_call_cap_stops_mid_batch() -> None:
     observe_calls: list[tuple[str, dict[str, Any]]] = []
     tools = [_recording_tool("observe", observe_calls), make_finish_tool()]
     outcome = await run_agent_tool_loop(
-        llm_caller=_ScriptedCaller([[("observe", {}), ("observe", {})]]),  # two tool calls in one turn
+        llm_caller=_ScriptedCaller(
+            [
+                [("observe", {}), ("observe", {})],  # two tool calls in one turn
+                # Deliberate contract change: the mid-batch trip grants one final observed turn
+                # (unconstrained -- the cap that stopped the batch above is not re-enforced here).
+                [("observe", {})],
+            ]
+        ),
         system_prompt="sys",
         user_prompt="goal",
         tools=tools,
@@ -741,7 +761,312 @@ async def test_tool_call_cap_stops_mid_batch() -> None:
         max_tool_calls=1,  # only one dispatch allowed
     )
     assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert len(observe_calls) == 2  # 1 from the capped batch + 1 from the granted final turn
+
+
+@pytest.mark.asyncio
+async def test_budget_trip_grants_one_final_observed_turn() -> None:
+    # The core of the grant: a run that trips its cap mid-extraction gets exactly one more turn, the
+    # trip is announced as a typed observation, and a finish on that turn carries its output out.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("click", click_calls), make_finish_tool()]
+    script = [
+        [("click", {})],
+        [("click", {})],
+        [("finish", {"status": "completed", "reason": "got what was needed", "extracted_output": {"partial": 1}})],
+    ]
+    outcome, caller = await _run(script, tools, max_turns=2)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "got what was needed"
+    assert outcome.extracted_output == {"partial": 1}
+    assert outcome.cap_trip == "max_turns (2) reached"
+    assert caller.calls == 3  # the 2 budgeted turns plus exactly one granted final turn
+    budget_msgs = [
+        m
+        for m in caller.message_history
+        if m.get("role") == "user" and '"budget_exhausted":true' in str(m.get("content"))
+    ]
+    assert len(budget_msgs) == 1
+    assert '"cap":"max_turns (2) reached"' in budget_msgs[0]["content"]
+    assert '"tool_calls"' in budget_msgs[0]["content"] and '"tokens"' in budget_msgs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_final_turn_without_finish_exits_honestly() -> None:
+    # Single-shot: a granted turn that observes instead of finishing ends the run — no second
+    # observation, no second grant, and the reason is a sentence while the raw cap rides cap_trip.
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("observe", observe_calls), make_finish_tool()]
+    script = [[("observe", {})], [("observe", {})], [("observe", {})]]
+    outcome, caller = await _run(script, tools, max_turns=2)
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_turns (2) reached"
+    assert "max_turns (" not in outcome.reason
+    assert caller.calls == 3  # exactly one bonus turn
+    budget_msgs = [
+        m
+        for m in caller.message_history
+        if m.get("role") == "user" and '"budget_exhausted":true' in str(m.get("content"))
+    ]
+    assert len(budget_msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_token_reserve_trips_early_and_funds_the_final_turn() -> None:
+    # The scripted caller reports 15 tokens/turn. Raw max_tokens=25 would allow a second unremarked
+    # turn; the 15-token reserve trips the adjusted check after one turn (15 >= 25-15), so the second
+    # turn is the granted final turn — proven by cap_trip being set at all.
+    tools = [_recording_tool("observe", []), make_finish_tool()]
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok", "extracted_output": {"k": 2}})],
+    ]
+    outcome, caller = await _run(script, tools, max_tokens=25, final_turn_token_reserve=15)
+
+    assert outcome.status == "completed"
+    assert outcome.cap_trip == "max_tokens (25) reached"
+    assert outcome.extracted_output == {"k": 2}
+    assert caller.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_midbatch_tool_call_trip_answers_skips_then_grants_final_turn() -> None:
+    # A mid-batch trip must leave a valid transcript: the undispatched calls get skipped answers
+    # BEFORE the typed observation, and the granted turn's finish still carries its output out.
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("observe", observe_calls), make_finish_tool()]
+    script = [
+        [("observe", {}), ("observe", {}), ("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok", "extracted_output": {"n": 3}})],
+    ]
+    outcome, caller = await _run(script, tools, max_tool_calls=1)
+
+    assert outcome.status == "completed"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert outcome.extracted_output == {"n": 3}
     assert len(observe_calls) == 1  # the cap stopped the batch after the first dispatch
+    history = caller.message_history
+    skipped_idx = [i for i, m in enumerate(history) if m.get("role") == "tool" and "skipped:" in str(m.get("content"))]
+    budget_idx = [
+        i
+        for i, m in enumerate(history)
+        if m.get("role") == "user" and '"budget_exhausted":true' in str(m.get("content"))
+    ]
+    assert len(skipped_idx) == 2 and len(budget_idx) == 1
+    assert max(skipped_idx) < budget_idx[0]
+
+
+@pytest.mark.asyncio
+async def test_step_cap_trip_after_refused_extension_grants_final_turn() -> None:
+    # The step gate (post-extension-refusal) is a grant site like every other cap, and a finish on
+    # the granted turn keeps the model's own verdict — a failed status with its reason verbatim.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    script = [
+        [("click", {})],
+        [("click", {})],
+        [("finish", {"status": "failed", "reason": "blocked by a captcha", "extracted_output": {"rows": [1]}})],
+    ]
+    outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=1, max_turns=20)
+
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked by a captcha"
+    assert outcome.extracted_output == {"rows": [1]}
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert len(click_calls) == 1  # round 2 was blocked at the gate; the granted turn chose to finish
+
+
+@pytest.mark.asyncio
+async def test_spent_grant_caught_at_the_step_gate_reports_the_granting_cap() -> None:
+    # Cross-axis: max_turns granted the final turn, whose billable dispatch then hits the step
+    # gate. The cap that granted the turn is the honest fact — not the gate that caught it.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    script = [[("click", {})], [("click", {})]]
+    outcome, _ = await _run(script, [click, make_finish_tool()], max_turns=1, max_action_steps=1)
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_turns (1) reached"
+    assert "turn budget" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_step_gate_on_the_granted_turn_salvages_a_staged_finish_output() -> None:
+    # The granted turn batches an over-cap action AND a finish: the refused action voids the
+    # verdict (its premise never ran, so a completed claim there could be a success that never
+    # happened) but the extraction the finish already carried must not be re-discarded.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    script = [
+        [("click", {})],
+        [("click", {})],
+        [("click", {}), ("finish", {"status": "completed", "reason": "done", "extracted_output": {"rows": [7]}})],
+    ]
+    outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=1, max_turns=20)
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.extracted_output == {"rows": [7]}
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert len(click_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_skipped_finish_on_the_granted_turn_still_carries_its_extraction() -> None:
+    # The granted turn batches an erroring action with a finish queued behind it: the failure skip
+    # voids the verdict (written before the model saw the error), but the extraction it staged
+    # rides the spent-grant exit instead of being re-discarded.
+    async def err_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("boom")
+
+    err_click = ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=err_handler,
+        billable=True,
+    )
+    script = [
+        [("observe", {})],
+        [("click", {}), ("finish", {"status": "completed", "reason": "done", "extracted_output": {"rows": [9]}})],
+    ]
+    outcome, _ = await _run(script, [err_click, _recording_tool("observe", []), make_finish_tool()], max_turns=1)
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.extracted_output == {"rows": [9]}
+    assert outcome.cap_trip == "max_turns (1) reached"
+
+
+@pytest.mark.asyncio
+async def test_guard_terminal_on_the_granted_turn_carries_the_cap_and_staged_extraction() -> None:
+    # A terminal the loop itself creates on the granted turn (the action-loop terminator here,
+    # skipping the finish batched behind the repeated click) still happened under the cap grant:
+    # it must carry cap_trip and the staged extraction, or the consumer never sees the data.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [
+            ("click", {"selector": "#submit"}),
+            ("finish", {"status": "completed", "reason": "done", "extracted_output": {"rows": [3]}}),
+        ],
+    ]
+    outcome, _ = await _run(script, tools, max_turns=1, action_nudge_after=None, action_terminate_after=2)
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.cap_trip == "max_turns (1) reached"
+    assert outcome.extracted_output == {"rows": [3]}
+
+
+@pytest.mark.asyncio
+async def test_finish_staged_in_the_cap_granting_batch_is_salvaged_if_not_restated() -> None:
+    # The batch that TRIPS the cap can itself stage a finish behind the over-cap call; when the
+    # granted turn doesn't restate it, that extraction still rides the spent-grant exit.
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("observe", observe_calls), make_finish_tool()]
+    script = [
+        [
+            ("observe", {}),
+            ("observe", {}),
+            ("finish", {"status": "completed", "reason": "done", "extracted_output": {"rows": [5]}}),
+        ],
+        [("observe", {})],
+    ]
+    outcome, _ = await _run(script, tools, max_tool_calls=1)
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert outcome.extracted_output == {"rows": [5]}
+
+
+@pytest.mark.asyncio
+async def test_completed_final_turn_without_restated_output_is_filled_from_the_staged_finish() -> None:
+    # The granted turn's finish(completed) needn't re-type the extraction its skipped attempt
+    # already staged: the missing output is filled from it, or an otherwise successful extraction
+    # run gets demoted for missing extraction downstream.
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("observe", observe_calls), make_finish_tool()]
+    script = [
+        [
+            ("observe", {}),
+            ("observe", {}),
+            ("finish", {"status": "completed", "reason": "done", "extracted_output": {"rows": [5]}}),
+        ],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(script, tools, max_tool_calls=1)
+
+    assert outcome.status == "completed"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert outcome.extracted_output == {"rows": [5]}
+
+
+@pytest.mark.asyncio
+async def test_loop_error_on_the_granted_call_still_carries_the_staged_extraction() -> None:
+    # The granted LLM call itself failing (provider error) must not re-discard what the granting
+    # batch staged: the loop_error keeps its own reason, but cap_trip and the extraction ride out.
+    class _FailsSecondCallCaller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls >= 1:
+                self.calls += 1
+                raise RuntimeError("provider unavailable")
+            return await super().call(**kwargs)
+
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("observe", observe_calls), make_finish_tool()]
+    caller = _FailsSecondCallCaller(
+        [
+            [
+                ("observe", {}),
+                ("observe", {}),
+                ("finish", {"status": "completed", "reason": "done", "extracted_output": {"rows": [8]}}),
+            ]
+        ]
+    )
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=1,
+    )
+
+    assert outcome.status == "loop_error"
+    assert "llm_call_failed" in outcome.reason
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert outcome.extracted_output == {"rows": [8]}
+
+
+@pytest.mark.asyncio
+async def test_finish_on_the_granted_turn_is_not_held_for_settling() -> None:
+    # The settle hold's retry turn no longer exists on the granted final turn: holding there would
+    # silently convert the model's verdict into budget_exhausted — the verdict must stand instead.
+    fp = {"n": 0}
+
+    async def page_fingerprint() -> str:
+        fp["n"] += 1
+        return f"fp-{fp['n']}"  # never settles: every sample differs
+
+    activity = ActivityRecency()
+    finish = make_finish_tool(page_fingerprint=page_fingerprint, activity=activity, settle_wait_seconds=0.0)
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("observe", observe_calls), finish]
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "done", "extracted_output": {"k": 1}})],
+    ]
+    outcome, _ = await _run(script, tools, max_turns=1, activity=activity)
+
+    assert outcome.status == "completed"
+    assert outcome.extracted_output == {"k": 1}
+    assert outcome.cap_trip == "max_turns (1) reached"
 
 
 @pytest.mark.asyncio
@@ -1435,12 +1760,16 @@ async def test_action_step_budget_counts_rounds_not_individual_actions() -> None
         [("click", {}), ("type", {"t": "a"})],  # action round 1 (2 actions)
         [("click", {}), ("type", {"t": "b"})],  # action round 2 (2 actions)
         [("click", {}), ("type", {"t": "c"})],  # round 3 -> blocked by the 2-step budget
+        # Deliberate contract change: the block above grants one final observed turn; retrying the
+        # same over-cap round on it hits the gate again and ends the run for real.
+        [("click", {}), ("type", {"t": "d"})],
     ]
     outcome, _ = await _run(script, [click, type_, make_finish_tool()], max_action_steps=2, max_turns=20)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert outcome.action_steps == 2  # two action rounds counted, exposed on the outcome
-    # 2 rounds (4 actions) ran; the 3rd was blocked at the top -> per-round, not per-action, counting.
+    # 2 rounds (4 actions) ran; rounds 3 and 4 were both blocked at the top -> per-round counting.
     assert len(click_calls) == 2 and len(type_calls) == 2
 
 
@@ -1471,12 +1800,15 @@ async def test_action_step_budget_terminates_only_on_action_beyond_budget() -> N
     click_calls: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", click_calls)
     click.billable = True
-    script = [[("click", {})], [("click", {})]]  # 2nd click is the (cap+1)th action round
+    # 2nd and 3rd clicks are both beyond-cap attempts; the 3rd is the deliberate contract change:
+    # the 2nd blocked attempt grants one final observed turn, and retrying on it ends the run for real.
+    script = [[("click", {})], [("click", {})], [("click", {})]]
     outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=1, max_turns=20)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (1)" in outcome.reason
+    assert "maximum steps (1)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
     assert outcome.action_steps == 1
-    assert len(click_calls) == 1  # the over-budget action was refused, not executed
+    assert len(click_calls) == 1  # both over-budget actions were refused, not executed
 
 
 @pytest.mark.asyncio
@@ -1524,14 +1856,22 @@ async def test_action_step_budget_no_extension_without_page_change_evidence() ->
     # refused at the original cap exactly as before, and the refusal is a queryable event.
     clicks: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", clicks, billable=True)
-    script = [[("click", {"selector": "#a"})], [("click", {"selector": "#b"})], [("click", {"selector": "#c"})]]
+    script = [
+        [("click", {"selector": "#a"})],
+        [("click", {"selector": "#b"})],
+        [("click", {"selector": "#c"})],
+        # Deliberate contract change: the #c block above grants one final observed turn; retrying
+        # the same over-cap click on it hits the gate again (still no evidence) and ends the run.
+        [("click", {"selector": "#c"})],
+    ]
     with capture_logs() as logs:
         outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=2, max_turns=20)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
-    assert len(refused) == 1 and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
+    assert len(refused) == 2 and all(r["gate_reason"] == "no_recent_page_change_evidence" for r in refused)
 
 
 @pytest.mark.asyncio
@@ -1550,10 +1890,14 @@ async def test_action_step_budget_extension_is_granted_at_most_once() -> None:
         [("click", {"selector": "#c"})],  # extension: cap 2 -> 3
         [("observe", {})],
         [("click", {"selector": "#d"})],  # beyond the extended cap: refused for good
+        # Deliberate contract change: the #d block above grants one final observed turn; retrying
+        # the same beyond-cap click on it hits the gate again ("already_extended") and ends the run.
+        [("click", {"selector": "#d"})],
     ]
     outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=2, max_turns=30)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (3)" in outcome.reason
+    assert "maximum steps (3)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (3)"
     assert len(clicks) == 3
 
 
@@ -1571,6 +1915,7 @@ async def test_action_step_budget_extension_refused_without_turn_headroom() -> N
         [("click", {"selector": "#b"})],
         [("observe", {})],
         [("click", {"selector": "#c"})],
+        [("click", {"selector": "#c"})],
     ]
     outcome, _ = await _run(
         script,
@@ -1580,7 +1925,7 @@ async def test_action_step_budget_extension_refused_without_turn_headroom() -> N
         activity=ActivityRecency(),
     )
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
 
 
@@ -1692,7 +2037,10 @@ async def test_action_step_budget_extension_not_granted_on_pre_reload_evidence()
         skyvern_context.reset()
     assert len(reload_calls) == 1
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
 
@@ -1721,7 +2069,10 @@ async def test_action_step_budget_extension_respects_workflow_run_ceiling() -> N
             max_turns=20,
         )
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "hard_step_ceiling"
@@ -1784,7 +2135,10 @@ async def test_action_step_budget_extension_not_laundered_by_same_url_reload() -
     with capture_logs() as logs:
         outcome, _ = await _run(script, [click, navigate, make_finish_tool()], max_action_steps=2, max_turns=20)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
@@ -1827,7 +2181,10 @@ async def test_action_step_budget_extension_deferred_while_a_refresh_is_pending(
     finally:
         skyvern_context.reset()
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "refresh_pending"
@@ -1871,7 +2228,10 @@ async def test_action_step_budget_extension_not_stamped_by_nav_revisit() -> None
         )
     assert len(fresh_nav_calls) == 1
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
 
@@ -1905,7 +2265,10 @@ async def test_action_step_budget_extension_not_laundered_by_post_reload_observe
             script, [click, navigate, observe, make_finish_tool()], max_action_steps=2, max_turns=20
         )
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
@@ -1937,7 +2300,10 @@ async def test_action_step_budget_extension_not_stamped_by_url_only_transitions(
     with capture_logs() as logs:
         outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=2, max_turns=20)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     assert len(clicks) == 2
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
@@ -2012,7 +2378,10 @@ async def test_action_step_budget_extension_dries_up_on_content_oscillation() ->
     with capture_logs() as logs:
         outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=10, max_turns=60)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (10)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (10)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (10)"
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
 
@@ -2045,7 +2414,10 @@ async def test_action_step_budget_extension_not_stamped_by_replayed_download_not
     with capture_logs() as logs:
         outcome, _ = await _run(script, [click, observe, make_finish_tool()], max_action_steps=2, max_turns=20)
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (2)" in outcome.reason
+    # Deliberate contract change: the refused-extension step-cap exit grants one final observed
+    # turn first, and the raw cap literal lives on cap_trip while reason is a human sentence.
+    assert "maximum steps (2)" not in outcome.reason
+    assert outcome.cap_trip == "Reached the maximum steps (2)"
     refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
     assert refused and refused[0]["gate_reason"] == "no_recent_page_change_evidence"
 
@@ -4634,7 +5006,11 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     )
     elapsed = time.monotonic() - started
 
-    assert outcome.status == "budget_exhausted"
+    # Deliberate contract change: the elapsed deadline grants one final observed turn instead of
+    # ending the run, and the scripted finish on that turn wins; cap_trip carries the deadline fact.
+    # The hang guard is unchanged: the sampler must stay un-awaited on the granted turn too.
+    assert outcome.status == "completed"
+    assert outcome.cap_trip is not None and "deadline" in outcome.cap_trip
     assert fp_calls["n"] == 0  # deadline already gone -- the hanging sampler was never awaited
     assert elapsed <= 0.3
 

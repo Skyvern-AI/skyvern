@@ -749,6 +749,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """These sessions run on browsers this process owns, which can always be given longer."""
         return None
 
+    async def remaining_lifetime_seconds(self, session_id: str, organization_id: str) -> float | None:
+        """This manager enforces no lifetime cap of its own, so there is no deadline the run cannot renew past."""
+        return None
+
     async def update_status(
         self,
         session_id: str,

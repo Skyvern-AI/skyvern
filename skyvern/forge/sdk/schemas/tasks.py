@@ -292,12 +292,12 @@ class TaskStatus(StrEnum):
         return self in status_requires_extracted_information
 
     def cant_have_extracted_info(self) -> bool:
+        # failed/terminated may carry a PARTIAL extraction — a budget-capped run's staged output
+        # survives the failure rather than being discarded with it. Pre-run statuses cannot.
         status_cant_have_extracted_information = {
             TaskStatus.created,
             TaskStatus.queued,
             TaskStatus.running,
-            TaskStatus.failed,
-            TaskStatus.terminated,
         }
         return self in status_cant_have_extracted_information
 
