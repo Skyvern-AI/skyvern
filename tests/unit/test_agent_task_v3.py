@@ -2392,11 +2392,13 @@ async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.Mon
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
     )
     create_action = agent_module.app.DATABASE.workflow_params.create_action
-    # The terminal decision row (appended last) is stamped separately; slice it off to check only
-    # the per-action rows this test is about.
     action_rows = create_action.await_args_list[:-1]
     stamped = [(c.kwargs["action"].step_order, c.kwargs["action"].action_order) for c in action_rows]
     assert stamped == [(0, 0), (0, 1), (1, 2)]
+    # The terminal decision row rides the LAST consumed billable index — a fresh index would read
+    # as a new distinct (task, step_order) pair to the workflow-run step budget.
+    decision = create_action.await_args_list[-1].kwargs["action"]
+    assert (decision.step_order, decision.action_order) == (1, 3)
 
 
 @pytest.mark.asyncio
@@ -2833,6 +2835,69 @@ async def test_execute_task_v3_cap_tripped_loop_error_keeps_provider_category_an
     assert category, category
     assert category[0]["category"] != "BUDGET_EXHAUSTED", category
     assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [8]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        ("budget_exhausted", "The run reached its turn budget before the model finished."),
+        ("loop_error", "llm_call_failed: RuntimeError: provider unavailable"),
+    ],
+)
+async def test_execute_task_v3_verdictless_death_persists_a_failed_decision_row(
+    monkeypatch: pytest.MonkeyPatch, status: str, reason: str
+) -> None:
+    # A death with no agent verdict is exactly the run a click-free block has no step details for:
+    # the terminal decision row is synthesized as a FAILED terminate carrying the outcome reason.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status=status, reason=reason, billable_actions=["click"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.failed
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert persisted.action_type == ActionType.TERMINATE
+    assert persisted.status == ActionStatus.failed
+    assert persisted.reasoning == reason
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_verdictless_death_with_salvaged_output_still_fails_the_decision_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The decision row records whether the agent gave a verdict, not whether data survived: a
+    # cap-tripped death still persists FAILED even though AC-2 carries the staged extraction
+    # through. Coupling the row's status to the salvage would hide these runs from the
+    # failed-decision-row taxonomy the docs point at.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(
+        status="budget_exhausted",
+        reason="The run reached its turn budget before the model finished.",
+        cap_trip="max_turns (40) reached",
+        billable_actions=["click"],
+        extracted_output={"rows": [3]},
+    )
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.failed
+    assert loop_mock.update_task_kwargs.get("extracted_information") == {"rows": [3]}
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert persisted.action_type == ActionType.TERMINATE
+    assert persisted.status == ActionStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_canceled_death_persists_no_decision_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cancellation is the user's decision, not a run verdict — no synthesized row.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="canceled", reason="run canceled", billable_actions=[])
+    await _run_execute_task_v3(monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None)
+    assert agent_mod.app.DATABASE.workflow_params.create_action.await_args is None
 
 
 def test_task_validate_update_allows_partial_extraction_on_failed_and_terminated() -> None:

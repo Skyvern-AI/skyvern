@@ -31,6 +31,7 @@ from skyvern.schemas.scripts import ScriptBlock
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
@@ -596,7 +597,7 @@ async def test_enrich_fallback_episode_excludes_decision_row_from_agent_action_c
     monkeypatch.setattr(
         app.DATABASE.tasks,
         "get_task_actions",
-        AsyncMock(return_value=[SimpleNamespace(action_type=ActionType.COMPLETE)]),
+        AsyncMock(return_value=[Action(action_type=ActionType.COMPLETE)]),
     )
     update_episode = AsyncMock()
     monkeypatch.setattr(app.DATABASE.scripts, "update_fallback_episode", update_episode)
@@ -611,6 +612,10 @@ async def test_enrich_fallback_episode_excludes_decision_row_from_agent_action_c
 
     update_episode.assert_awaited_once()
     assert update_episode.await_args.kwargs["fallback_succeeded"] is False
+    # The happy-path summary must exist (a raising summarizer would fall into the except arm and
+    # leave this test unable to discriminate the count filter).
+    summarized = update_episode.await_args.kwargs["agent_actions"]["actions"]
+    assert [entry["action_type"] for entry in summarized] == [ActionType.COMPLETE]
     assert (
         update_episode.await_args.kwargs["agent_actions"]["failure_reason"]
         == script_service.VERIFIER_SWAP_FAILURE_REASON
