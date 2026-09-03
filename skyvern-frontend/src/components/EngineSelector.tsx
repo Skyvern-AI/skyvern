@@ -64,6 +64,7 @@ const allEngineOptions: Array<EngineOption> = [
 // Default engines for blocks that don't support V2 mode
 const defaultEngines: Array<RunEngine> = [
   RunEngine.SkyvernV1,
+  RunEngine.SkyvernV3,
   RunEngine.OpenaiCua,
   RunEngine.AnthropicCua,
 ];

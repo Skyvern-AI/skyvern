@@ -773,6 +773,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -3074,6 +3075,7 @@ function getWorkflowBlock(
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
+        engine: node.data.engine,
       };
     }
     case "human_interaction": {
@@ -4531,6 +4533,7 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
+          engine: block.engine,
         };
         return blockYaml;
       }
