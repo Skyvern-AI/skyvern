@@ -25,7 +25,7 @@ import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
 import { BuildModeOnly } from "../BuildModeOnly";
 import { isLoopNode } from "../LoopNode/types";
-import { WorkflowInputsCard } from "../../WorkflowInputs";
+import { WorkflowInputsSection } from "../../WorkflowInputs";
 import { WorkflowSettingsEditor } from "./WorkflowSettingsEditor";
 
 interface StartSettings {
@@ -166,72 +166,68 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
 
   if (data.withWorkflowSettings) {
     return (
-      <div className="space-y-3">
-        <BuildModeOnly renderInReadOnlyComparison={false}>
-          <WorkflowInputsCard editable={data.editable} />
-        </BuildModeOnly>
-        <Flippable facing={facing} preserveFrontsideHeight={true}>
-          <div>
-            <Handle
-              type="source"
-              position={Position.Bottom}
-              id="a"
-              className="opacity-0"
-            />
-            <div
-              className={cn(
-                "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 text-center",
-                { "h-[20rem] overflow-hidden": facing === "back" },
-              )}
-            >
-              <div className="relative">
-                <header className="mb-6 mt-2">Start</header>
-                <Separator />
-                <BuildModeOnly renderInReadOnlyComparison={false}>
-                  <Accordion
-                    type="single"
-                    collapsible
-                    value={settingsAccordionValue}
-                    onValueChange={(value) => {
-                      setSettingsAccordionValue(value);
-                      rerender.bump();
-                    }}
-                  >
-                    <AccordionItem value="settings" className="mt-4 border-b-0">
-                      <AccordionTrigger className="py-2">
-                        {/* Wrapped so the open-state chevron rotation targets
+      <Flippable facing={facing} preserveFrontsideHeight={true}>
+        <div>
+          <Handle
+            type="source"
+            position={Position.Bottom}
+            id="a"
+            className="opacity-0"
+          />
+          <div
+            className={cn(
+              "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 text-center",
+              { "h-[20rem] overflow-hidden": facing === "back" },
+            )}
+          >
+            <div className="relative">
+              <header className="mb-4 mt-2">Start</header>
+              <Separator />
+              <BuildModeOnly renderInReadOnlyComparison={false}>
+                <WorkflowInputsSection editable={data.editable} />
+                <Accordion
+                  type="single"
+                  collapsible
+                  value={settingsAccordionValue}
+                  onValueChange={(value) => {
+                    setSettingsAccordionValue(value);
+                    rerender.bump();
+                  }}
+                >
+                  <AccordionItem value="settings" className="mt-1 border-b-0">
+                    <AccordionTrigger className="py-2">
+                      {/* Wrapped so the open-state chevron rotation targets
                           only the trigger's own direct svg. */}
-                        <span className="flex items-center gap-2">
-                          <GearIcon
-                            className="h-4 w-4 text-muted-foreground"
-                            aria-hidden
-                          />
-                          Workflow Settings
-                        </span>
-                      </AccordionTrigger>
-                      <AccordionContent className="pl-6 pr-1 pt-1">
-                        <div key={rerender.key}>
-                          <WorkflowSettingsEditor blockId={id} />
-                        </div>
-                      </AccordionContent>
-                    </AccordionItem>
-                  </Accordion>
-                </BuildModeOnly>
-              </div>
+                      <span className="flex items-center gap-2">
+                        <GearIcon
+                          className="h-4 w-4 text-muted-foreground"
+                          aria-hidden
+                        />
+                        Workflow Settings
+                      </span>
+                    </AccordionTrigger>
+                    <AccordionContent className="pl-6 pr-1 pt-1">
+                      <div key={rerender.key}>
+                        <WorkflowSettingsEditor blockId={id} />
+                      </div>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+              </BuildModeOnly>
             </div>
           </div>
+        </div>
 
-          <BlockCodeEditor
-            blockLabel="__start_block__"
-            title="Start"
-            script={script}
-            onExit={() => {
-              hideAllScripts();
-              return false;
-            }}
-          />
-        </Flippable>
-      </div>
+        <BlockCodeEditor
+          blockLabel="__start_block__"
+          title="Start"
+          script={script}
+          onExit={() => {
+            hideAllScripts();
+            return false;
+          }}
+        />
+      </Flippable>
     );
   }
 
