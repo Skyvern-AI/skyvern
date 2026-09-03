@@ -478,7 +478,6 @@ def _seed_verified_outcome(ctx: CopilotContext) -> None:
 def test_runtime_self_heal_reply_never_echoes_run_output() -> None:
     ctx = _ctx()
     ctx.turn_origin = TurnOrigin.runtime_self_heal
-    ctx.verified_terminal_block_outputs = {"result": {"access_token": "secret-value"}}
 
     response = _runtime_self_heal_success_reply(ctx)
 

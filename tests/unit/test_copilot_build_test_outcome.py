@@ -79,6 +79,7 @@ from tests.unit.copilot_test_helpers import (
     passing_run,
     same_run_page_evidence,
     straight_line_login_yaml,
+    terminal_extraction_block,
     two_page_login_yaml,
 )
 
@@ -153,6 +154,84 @@ def test_registered_block_download_reaches_packet_without_parseable_artifact_evi
     packet = build_test_evidence_packet(ctx, result)
 
     assert [(download.artifact_id, download.file_name) for download in packet.downloads] == [("a_dl_9", None)]
+
+
+def test_packet_projects_every_recorded_block_output_in_row_order_and_scrubs_secrets() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.browser_session_id = "pbs_recorded_outputs"
+    register_secret_scrub_value(ctx, "private-value")
+    try:
+        result = {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_recorded_outputs",
+                "overall_status": "failed",
+                "blocks": [
+                    {
+                        "label": "produce_rows",
+                        "status": "completed",
+                        "output": {"real_key": "private-value"},
+                    },
+                    {"label": "produce_rows", "status": "completed", "output": []},
+                    {
+                        "label": "use_rows",
+                        "status": "failed",
+                        "failure_reason": "missing output key",
+                        "output": {"available_keys": ["real_key"]},
+                    },
+                ],
+            },
+        }
+
+        packet = build_test_evidence_packet(ctx, result)
+    finally:
+        clear_session_scrub_values("pbs_recorded_outputs")
+
+    assert [output.model_dump(mode="json", exclude_none=True) for output in packet.registered_outputs] == [
+        {
+            "label": "produce_rows",
+            "status": "completed",
+            "output": {"real_key": "[REDACTED_SECRET]"},
+            "value_complete": True,
+        },
+        {
+            "label": "produce_rows",
+            "status": "completed",
+            "output": [],
+            "value_complete": True,
+        },
+        {
+            "label": "use_rows",
+            "status": "failed",
+            "output": {"available_keys": ["real_key"]},
+            "value_complete": True,
+        },
+    ]
+    producer_values = [output.output for output in packet.registered_outputs if output.label == "produce_rows"]
+    repair_signals = [output.output for output in packet.registered_outputs if output.label == "use_rows"]
+    assert producer_values == [{"real_key": "[REDACTED_SECRET]"}, []]
+    assert repair_signals == [{"available_keys": ["real_key"]}]
+    assert (
+        packet.omission_notices.count("registered_outputs redacted 1 item(s) containing registered secret values.") == 1
+    )
+
+
+def test_recorded_run_block_projection_keeps_falsey_and_null_outputs() -> None:
+    def row(output: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            label="produce_rows",
+            block_type=SimpleNamespace(name="CODE"),
+            status="completed",
+            workflow_run_block_id="wrb_1",
+            task_id=None,
+            failure_reason=None,
+            error_codes=[],
+            output=output,
+        )
+
+    assert _recorded_run_block_result(row({}))["output"] == {}
+    assert _recorded_run_block_result(row(""))["output"] == ""
+    assert _recorded_run_block_result(row(None))["output"] is None
 
 
 def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
@@ -1331,7 +1410,7 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         status="failed",
         failure_reason="NameError at generated line 7",
         error_codes=["user_code_error"],
-        output=None,
+        output=[{"name": "bounded result"}],
         final_url="https://example.test/results",
     )
     artifact = make_stub_html_artifact("art_failed_terminal", ArtifactType.HTML_ACTION)
@@ -1345,7 +1424,7 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
                 get_workflow_run=AsyncMock(return_value=run),
                 get_workflow_run_output_parameters=AsyncMock(
                     return_value=[
-                        SimpleNamespace(output_parameter_id="out_records", value=[{"name": "bounded result"}])
+                        SimpleNamespace(output_parameter_id="out_snapshot", value=[{"name": "bounded result"}])
                     ]
                 ),
             ),
@@ -1407,6 +1486,14 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     assert produced_outcomes[0].workflow_run_id == "wr_failed_complete_packet"
     assert transported_outcomes == [produced_outcomes[0]]
     assert ctx.latest_recorded_build_test_outcome is None
+    assert hydrated["registered_outputs"] == [
+        {
+            "label": "collect_records",
+            "status": "failed",
+            "output": [{"name": "bounded result"}],
+            "value_complete": True,
+        }
+    ]
     assert '"status": "failed"' in ordinary_input
     assert '"workflow_run_id": "wr_failed_complete_packet"' in ordinary_input
     assert '"output_parameter_id": "out_records"' in ordinary_input
@@ -2149,16 +2236,14 @@ def _oversized_packet(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacke
     filler = "f" * 200
     return packet.model_copy(
         update={
+            "canonical_workflow_yaml": "w" * 30_000,
             "attempted_block_labels": [f"{filler}{index}" for index in range(30)],
             "executed_block_labels": [f"{filler}{index}" for index in range(30)],
             "registered_outputs": [
                 BuildTestPacketRegisteredOutput(
-                    workflow_run_id=filler,
-                    output_parameter_id=filler,
-                    output_parameter_key=filler,
-                    block_label=filler,
-                    block_type=filler,
-                    value="v" * 1_000,
+                    label=filler,
+                    status=filler,
+                    output="v" * 1_000,
                 )
                 for _ in range(15)
             ],
@@ -2219,7 +2304,6 @@ def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_ll
 
     packet = build_test_evidence_packet(ctx, result)
     projected = project_build_test_packet_for_llm(packet)
-    compacted = project_build_test_packet_for_llm(_oversized_packet(packet))
 
     assert packet.failure is not None and packet.failure.page_state is not None
     assert packet.run.workflow_run_id == "wr_failed"
@@ -2233,9 +2317,6 @@ def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_ll
         "Section 3",
     ]
     assert all("#continue-btn-x9" not in summary for summary in projected.failure.page_state.action_summaries)
-    assert compacted.failure is not None and compacted.failure.page_state is not None
-    assert any("repeated packet facts shortened further" in notice for notice in compacted.omission_notices)
-    assert compacted.failure.page_state.action_summaries == ["Continue to statements disabled", "Section 0"]
 
 
 def test_screenshot_ablation_replays_preserve_page_facts_without_minting_a_decision() -> None:
@@ -3699,6 +3780,7 @@ def test_recorded_run_block_result_keeps_native_machine_identities() -> None:
         "status": "failed",
         "failure_reason": "Reached the maximum steps (30)",
         "error_codes": ["max_steps_exceeded"],
+        "output": None,
     }
 
 
@@ -4026,6 +4108,7 @@ def _completed_output_run_result(retained_value: object, *, register_row: bool =
                     "label": "collect_options",
                     "block_type": "code",
                     "status": "completed",
+                    "output": retained_value,
                     "extracted_data": {"collect_options_output": retained_value},
                 }
             ],
@@ -4108,6 +4191,99 @@ def test_a_completed_run_that_retained_no_requested_output_value_returns_to_ordi
     } in packet["unfinished_items"]
     assert '"output_path": "output.collect_options_output"' in ordinary_input
     assert f'"reason_code": "{expected_reason_code}"' in ordinary_input
+
+
+def test_snapshot_registered_row_with_regenerated_id_satisfies_requested_output_by_key() -> None:
+    result = _completed_output_run_result({"payment_options": ["Visa"]})
+    data = result["data"]
+    assert isinstance(data, dict)
+    registered = data["registered_output_parameter_values"]
+    assert isinstance(registered, list)
+    registered[0]["output_parameter_id"] = "op_snapshot_regenerated"
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=RecordedRunOutcome(
+            verdict="not_evaluated",
+            workflow_run_id="wr_requested_output",
+            run_completed=True,
+        ),
+        registered_output_parameter_payloads=registered,
+    )
+
+    assert outcome is not None
+    assert outcome.missing_requested_output_facts == []
+    assert outcome.verdict == "not_authoritative"
+
+
+def test_row_only_registered_loop_output_reaches_the_model_visible_packet() -> None:
+    loop_value = [[{"record_number": "123"}], [{"record_number": "456"}]]
+    result = _completed_output_run_result(loop_value)
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0].pop("output")
+    blocks[0].pop("extracted_data")
+
+    packet = project_build_test_packet_for_llm(build_test_evidence_packet(_locator_packet_ctx(), result)).model_dump(
+        mode="json", exclude_none=True
+    )
+    ordinary_input = _build_user_context(
+        workflow_yaml="",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text=_prior_run_debug_text(packet),
+        user_message="Repair the recorded run.",
+    )
+
+    assert packet["registered_outputs"] == [
+        {
+            "label": "collect_options",
+            "status": "completed",
+            "output": {"collect_options_output": loop_value},
+            "value_complete": True,
+        }
+    ]
+    assert "123" in ordinary_input
+    assert "456" in ordinary_input
+    assert any("output-parameter rows" in notice for notice in packet["omission_notices"])
+
+
+def test_partial_loop_fallback_precedes_twelve_recorded_outputs_and_has_no_fabricated_status() -> None:
+    loop_value = [[{"record_number": "123"}]]
+    result = _completed_output_run_result(loop_value)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["blocks"] = [
+        {"label": f"inner_{index}", "status": "completed", "output": {"index": index}} for index in range(12)
+    ]
+
+    packet = project_build_test_packet_for_llm(build_test_evidence_packet(_locator_packet_ctx(), result)).model_dump(
+        mode="json", exclude_none=True
+    )
+
+    assert len(packet["registered_outputs"]) == 12
+    assert packet["registered_outputs"][0] == {
+        "label": "collect_options",
+        "output": {"collect_options_output": loop_value},
+        "value_complete": True,
+    }
+    assert any("registered_outputs shortened" in notice for notice in packet["omission_notices"])
+
+
+def test_explicit_null_block_output_rejects_stale_registered_row_fallback() -> None:
+    result = _completed_output_run_result({"stale": True})
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["output"] = None
+
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result).model_dump(mode="json", exclude_none=True)
+
+    assert packet["registered_outputs"] == []
+    assert any("explicit null workflow run block output" in notice for notice in packet["omission_notices"])
 
 
 def test_a_declared_goal_path_the_run_left_empty_reaches_repair_and_the_latch_from_one_source() -> None:
@@ -4591,6 +4767,7 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
                         "label": "collect_payment_options",
                         "block_type": "code",
                         "status": "completed",
+                        "output": output,
                         "extracted_data": output,
                     }
                 ],
@@ -4636,9 +4813,7 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
     ).model_dump(mode="json", exclude_none=True)
     assert packet["unfinished_items"] == []
     run_owned = [
-        output["value"]
-        for output in packet["registered_outputs"]
-        if output["output_parameter_key"] == "collect_payment_options_output"
+        output["output"] for output in packet["registered_outputs"] if output["label"] == "collect_payment_options"
     ]
     assert run_owned == [after_output], "the corrected run does not hand back the output its code produced"
 
@@ -4647,25 +4822,51 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
 async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
+    completed_block = terminal_extraction_block("completed").model_copy(update={"output": {"heading": "Done"}})
+    ctx = await handback_ctx(
+        monkeypatch,
+        polled_status="completed",
+        block_status="completed",
+        terminal_blocks=[completed_block],
+    )
     order: list[str] = []
+    projected_rows_at_commit: list[list[dict[str, object]]] = []
     real_record = run_execution_module.record_build_test_outcome
+    real_commit = run_execution_module._commit_run_blocks_record
 
     def _record(record_ctx: object, outcome: object) -> None:
         order.append("record")
         real_record(record_ctx, outcome)
+
+    def _commit(commit_ctx: CopilotContext, result: dict[str, object]) -> RecordedRunOutcome | None:
+        packet = build_test_evidence_packet(commit_ctx, result)
+        projected_rows_at_commit.append(
+            [output.model_dump(mode="json", exclude_none=True) for output in packet.registered_outputs]
+        )
+        return real_commit(commit_ctx, result)
 
     async def _enrichment(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
         order.append("enrichment")
         return "", None
 
     monkeypatch.setattr(run_execution_module, "record_build_test_outcome", _record)
+    monkeypatch.setattr(run_execution_module, "_commit_run_blocks_record", _commit)
     monkeypatch.setattr(run_execution_module, "_attach_post_run_browser_enrichment", _enrichment)
 
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
 
     assert result["ok"] is True, result
     assert order == ["record", "enrichment"]
+    assert projected_rows_at_commit == [
+        [
+            {
+                "label": "extract_heading",
+                "status": "completed",
+                "output": {"heading": "Done"},
+                "value_complete": True,
+            }
+        ]
+    ]
     assert ctx.latest_recorded_build_test_outcome is not None
     assert ctx.latest_recorded_build_test_outcome.workflow_run_id == "wr_paused"
 

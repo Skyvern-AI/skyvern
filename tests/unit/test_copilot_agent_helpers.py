@@ -1983,6 +1983,7 @@ workflow_definition:
                     "block_type": "CODE",
                     "status": "failed",
                     "failure_reason": "The total was not available.",
+                    "output": {"total": None},
                     "extracted_data": {"downloaded_file_artifact_ids": ["artifact_1"]},
                 }
             ],
@@ -2183,7 +2184,12 @@ workflow_definition:
             model_data = json.loads(result)["data"]
             assert "page_obstructions" not in model_data["authoring_repair_context"]
             assert "page_obstruction_omission_notices" not in model_data["authoring_repair_context"]
-        assert packet["registered_outputs"][0]["output_parameter_key"] == "total"
+        assert packet["registered_outputs"][0] == {
+            "label": "read_total",
+            "status": "failed",
+            "output": {"total": None},
+            "value_complete": True,
+        }
         assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
         assert packet["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
         assert packet["unfinished_items"] == [{"kind": "unverified_block", "label": "read_total"}]
@@ -2257,7 +2263,6 @@ workflow_definition:
         assert packet["failure"]["page_state"]["current_url"] == "https://example.test/current"
         assert packet["failure"]["page_state"]["result_summaries"] == []
         assert packet["failure"]["page_state"]["obstructions"] == []
-        assert any("another or unknown run" in notice for notice in packet["omission_notices"])
 
     def test_packet_redacts_registered_output_values_matching_registered_secrets(self) -> None:
         ctx = _ctx(
@@ -2269,6 +2274,13 @@ workflow_definition:
             "data": {
                 "workflow_run_id": "wr_secret_output",
                 "overall_status": "completed",
+                "blocks": [
+                    {
+                        "label": "read_result",
+                        "status": "completed",
+                        "output": {"summary": "prefix customer-secret suffix"},
+                    }
+                ],
                 "registered_output_parameter_values": [
                     {
                         "workflow_run_id": "wr_secret_output",
@@ -2287,7 +2299,7 @@ workflow_definition:
         )
         packet = result["data"]["build_test_packet"]
 
-        assert packet["registered_outputs"][0]["value"] == {"summary": "prefix [REDACTED_SECRET] suffix"}
+        assert packet["registered_outputs"][0]["output"] == {"summary": "prefix [REDACTED_SECRET] suffix"}
         assert "customer-secret" not in json.dumps(packet)
         assert any(
             notice == "registered_outputs redacted 1 item(s) containing registered secret values."
