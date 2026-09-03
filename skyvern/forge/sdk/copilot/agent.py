@@ -182,6 +182,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    InterruptedTurnFacts,
     TerminalCause,
     TerminalOutcomeEnvelope,
     assemble_terminal_envelope,
@@ -210,6 +211,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CANCEL_TERMINAL_REASON,
+    UNEXPECTED_ERROR_TERMINAL_REASON,
     apply_repeated_reply_guard,
     connected_account_choice_context,
     selected_connected_account_id,
@@ -1622,6 +1624,29 @@ def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | 
     return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
 
 
+def _crash_exit_interruption(
+    ctx: CopilotContext,
+    turn_outcome: TurnOutcome | None,
+    failed_operation: BuildTestFailedOperation | None,
+) -> InterruptedTurnFacts | None:
+    """A turn that died in the error handler stopped; it never reported a test result.
+
+    Scoped to a crash that inherited a `failed_operation` from an earlier build test in the same
+    turn, because that latch is the only thing that would otherwise author the reply. A crash with
+    no latch already renders the recoverable-failure text, which names an error reference this
+    would drop. The latch itself is kept: it still drives the unverified/unapplied terminal state.
+    """
+    if failed_operation is None:
+        return None
+    if turn_outcome is None or turn_outcome.terminal_reason != UNEXPECTED_ERROR_TERMINAL_REASON:
+        return None
+    # Only the identity is known here. ``workflow_persisted`` is always False under staging, which
+    # is the population this path serves, and ``last_workflow`` is stamped version=1 by the YAML
+    # parse rather than carrying the workflow's real version, so both would state something about
+    # the turn that this site cannot observe.
+    return InterruptedTurnFacts(workflow_permanent_id=ctx.workflow_permanent_id)
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
@@ -1640,6 +1665,7 @@ def _assemble_terminal_envelope_safe(
     failed_operation: BuildTestFailedOperation | None = None,
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
+    interruption: InterruptedTurnFacts | None = None,
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1658,6 +1684,7 @@ def _assemble_terminal_envelope_safe(
             failed_operation=failed_operation,
             connect_failure=connect_failure,
             proposal_present=proposal_present,
+            interruption=interruption,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1887,9 +1914,12 @@ def _make_agent_result(
             failed_operation=failed_operation,
             connect_failure=connect_failure,
             proposal_present=result_carries_workflow,
+            interruption=_crash_exit_interruption(ctx, turn_outcome, failed_operation),
         )
     if terminal_envelope is not None and (
-        terminal_envelope.get("failed_operation") is not None or terminal_envelope.get("connect_failure") is not None
+        terminal_envelope.get("failed_operation") is not None
+        or terminal_envelope.get("connect_failure") is not None
+        or terminal_envelope.get("interruption") is not None
     ):
         envelope = TerminalOutcomeEnvelope.model_validate(terminal_envelope)
         terminal_message, replaced = render_terminal_message(
@@ -3212,7 +3242,7 @@ def _build_unexpected_error_exit_result(
         default_reply=default_reply,
         unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
         tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
-        terminal_reason="unexpected_error",
+        terminal_reason=UNEXPECTED_ERROR_TERMINAL_REASON,
     )
     LOG.warning(
         "Copilot unexpected error translated to recoverable reply",
