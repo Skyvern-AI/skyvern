@@ -29,6 +29,8 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import DebugSessionProfileDecision, WorkflowService
 from skyvern.schemas.scripts import ScriptBlock
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from skyvern.services import script_service
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
@@ -568,3 +570,48 @@ async def test_adaptive_caching_conditional_records_conditional_episode(monkeypa
     assert branch_metadata == metadata
     assert block_result is result
     assert should_stop is False
+
+
+@pytest.mark.asyncio
+async def test_enrich_fallback_episode_excludes_decision_row_from_agent_action_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every terminal v3 task run now persists a synthesized COMPLETE/TERMINATE decision row even
+    # when the agent made zero real page actions. If that row counted toward agent_action_count,
+    # a script that silently mis-verified a run (the verifier-swap failure mode this downgrade
+    # exists to catch) would read as "the agent did something" and keep fallback_succeeded=True.
+    service = WorkflowService()
+    block = _navigation_block("cached_nav")
+    block_result = BlockResult(
+        success=True,
+        output_parameter=block.output_parameter,
+        status=BlockStatus.completed,
+        workflow_run_block_id="wrb_1",
+    )
+    monkeypatch.setattr(
+        app.DATABASE.observer,
+        "get_workflow_run_block",
+        AsyncMock(return_value=SimpleNamespace(task_id="tsk_1")),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.tasks,
+        "get_task_actions",
+        AsyncMock(return_value=[SimpleNamespace(action_type=ActionType.COMPLETE)]),
+    )
+    update_episode = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.scripts, "update_fallback_episode", update_episode)
+
+    await service._enrich_fallback_episode_with_agent_actions(
+        block=block,
+        workflow_run_block_result=block_result,
+        fallback_episode_id="ep_1",
+        form_fields_for_episode=None,
+        organization_id="org_test",
+    )
+
+    update_episode.assert_awaited_once()
+    assert update_episode.await_args.kwargs["fallback_succeeded"] is False
+    assert (
+        update_episode.await_args.kwargs["agent_actions"]["failure_reason"]
+        == script_service.VERIFIER_SWAP_FAILURE_REASON
+    )

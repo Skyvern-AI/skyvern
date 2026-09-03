@@ -574,7 +574,9 @@ async def test_execute_task_v3_scrubs_registered_secret_from_persisted_action_re
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    # The type action's row, not the terminal decision row appended after it — the decision row
+    # carries the loop's own "done" reason, not this round's turn_reasoning.
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert "sk4829137765" not in (persisted.reasoning or "")
     assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
 
@@ -806,10 +808,11 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
         extracted_information_schema=None,
     )
     assert step.status == StepStatus.completed
-    # One SCREENSHOT_ACTION artifact per action round; one actions-table row per action.
-    assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 2
-    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 3
-    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    # One SCREENSHOT_ACTION artifact per action round plus one for the terminal decision row;
+    # one actions-table row per action plus the decision row itself.
+    assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 3
+    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 4
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[:-1]]
     # organization_id/task_id/step_id must be set, or GET /tasks/{id}/actions filters the rows out;
     # workflow_run_id must carry through for workflow-level action attribution (parity with the step engine).
     assert all(a.organization_id == task.organization_id for a in persisted)
@@ -840,21 +843,30 @@ async def test_execute_task_v3_persists_action_row_when_screenshot_fails(monkeyp
     )
     assert step.status == StepStatus.completed
     assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 0  # capture raised before create
-    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 1
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    # The click row plus the terminal decision row (its screenshot capture also raises, via the
+    # same mocked take_post_action_screenshot).
+    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 2
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert persisted.screenshot_artifact_id is None
     assert persisted.organization_id == task.organization_id
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_no_action_rounds_persists_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A run with no successful action rounds (e.g. terminate) persists no per-action artifacts/rows.
+async def test_execute_task_v3_no_action_rounds_persist_only_the_terminal_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A click-free terminal run (e.g. a captcha-blocked terminate) has no per-action rows, but the
+    # run's own verdict still persists as exactly one decision row with its own screenshot — the
+    # step-detail view for a click-free block has no other row to show.
     from skyvern.forge import agent as agent_mod
 
     outcome = LoopOutcome(status="terminated", reason="blocked", billable_actions=[])
     await _run_execute_task_v3(monkeypatch, outcome, action_rounds=None)
-    assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 0
-    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 0
+    assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 1
+    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 1
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert persisted.action_type == ActionType.TERMINATE
+    assert persisted.screenshot_artifact_id == "artifact-1"
 
 
 @pytest.mark.asyncio
@@ -2421,7 +2433,10 @@ async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.Mon
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
     )
     create_action = agent_module.app.DATABASE.workflow_params.create_action
-    stamped = [(c.kwargs["action"].step_order, c.kwargs["action"].action_order) for c in create_action.await_args_list]
+    # The terminal decision row (appended last) is stamped separately; slice it off to check only
+    # the per-action rows this test is about.
+    action_rows = create_action.await_args_list[:-1]
+    stamped = [(c.kwargs["action"].step_order, c.kwargs["action"].action_order) for c in action_rows]
     assert stamped == [(0, 0), (0, 1), (1, 2)]
 
 
@@ -2695,7 +2710,9 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
     )
     create_action = agent_module.app.DATABASE.workflow_params.create_action
-    stamped = [(c.kwargs["action"].action_type, c.kwargs["action"].step_order) for c in create_action.await_args_list]
+    # Slice off the trailing terminal decision row — its own stamping is covered elsewhere.
+    action_rows = create_action.await_args_list[:-1]
+    stamped = [(c.kwargs["action"].action_type, c.kwargs["action"].step_order) for c in action_rows]
     assert stamped == [
         (ActionType.GOTO_URL, 0),
         (ActionType.CLICK, 0),
@@ -2846,7 +2863,9 @@ async def test_execute_task_v3_persists_typed_actions_that_hydrate_as_their_subc
         extracted_information_schema=None,
     )
 
-    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    all_persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    # The terminal decision row is appended after the 8 tool-call rows this test is about.
+    persisted = all_persisted[:-1]
     assert [a.description for a in persisted[:2]] == ["task_v3 click #go", "task_v3 hover #menu"]
     click, hover, typed, selected, combobox, keypress, upload, captcha = (
         hydrate_action(make_action_row(action_type=a.action_type, element_id=a.element_id, action_json=a.model_dump()))
@@ -2894,7 +2913,8 @@ async def test_execute_task_v3_redacts_registered_secrets_from_persisted_action_
         extracted_information_schema=None,
     )
 
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    # The type action's own row, not the terminal decision row appended after it.
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert isinstance(persisted, InputTextAction)
     assert persisted.element_id == "#otp"
     assert "482913" not in persisted.model_dump_json()
@@ -3385,7 +3405,8 @@ async def test_execute_task_v3_floors_runtime_secrets_when_redaction_disabled(
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    # The type action's own row, not the terminal decision row appended after it.
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert "73914268" not in (persisted.reasoning or "")
     assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
 
@@ -3394,7 +3415,8 @@ async def test_execute_task_v3_floors_runtime_secrets_when_redaction_disabled(
 async def test_execute_task_v3_caps_persisted_reasoning_length(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge import agent as agent_mod
 
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    # A long outcome reason exercises the cap on the decision row too, alongside the action row.
+    outcome = LoopOutcome(status="completed", reason="y" * 5000, billable_actions=["click"])
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
@@ -3404,8 +3426,11 @@ async def test_execute_task_v3_caps_persisted_reasoning_length(monkeypatch: pyte
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
-    assert len(persisted.reasoning or "") == agent_mod._TASKV3_REASONING_MAX_CHARS
+    action_row, decision_row = (
+        c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+    )
+    assert len(action_row.reasoning or "") == agent_mod._TASKV3_REASONING_MAX_CHARS
+    assert len(decision_row.reasoning or "") == agent_mod._TASKV3_REASONING_MAX_CHARS
 
 
 @pytest.mark.asyncio
@@ -3424,6 +3449,7 @@ async def test_execute_task_v3_persists_reload_row_with_its_own_reason(monkeypat
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
-    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 1
-    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    # The reload row plus the terminal decision row appended after it.
+    assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 2
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert persisted.reasoning == "a page-level handler requested a refresh"
