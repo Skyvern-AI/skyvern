@@ -46,10 +46,12 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     project_build_test_packet_for_llm,
+    sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
@@ -58,6 +60,7 @@ from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_modul
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _authored_literal_locator_selectors,
+    _carry_unresolved_failure_into_result,
     _failed_block_code,
     _failing_code_line,
     _first_failed_result,
@@ -1644,7 +1647,18 @@ def _raising_code_workflow_yaml(code: str) -> str:
 def _generated_code_exception_result(
     workflow_run_id: str,
     failure_reason: str,
+    downloaded_file_artifact_ids: list[str] | None = None,
 ) -> dict[str, object]:
+    block: dict[str, object] = {
+        "label": "book_trip",
+        "block_type": "CODE",
+        "status": "failed",
+        "workflow_run_block_id": "wrb_trip",
+        "failure_reason": failure_reason,
+        "error_codes": ["user_code_error"],
+    }
+    if downloaded_file_artifact_ids:
+        block["extracted_data"] = {"downloaded_file_artifact_ids": downloaded_file_artifact_ids}
     return {
         "ok": False,
         "data": {
@@ -1656,16 +1670,7 @@ def _generated_code_exception_result(
             # The run reached the page but retained no usable evidence of it, which is the shape
             # that used to erase the whole outcome.
             "post_run_page_capture": {"status": "unavailable", "omission": "page_capture_unavailable"},
-            "blocks": [
-                {
-                    "label": "book_trip",
-                    "block_type": "CODE",
-                    "status": "failed",
-                    "workflow_run_block_id": "wrb_trip",
-                    "failure_reason": failure_reason,
-                    "error_codes": ["user_code_error"],
-                }
-            ],
+            "blocks": [block],
         },
     }
 
@@ -4071,6 +4076,13 @@ def test_every_run_surface_attaches_through_the_same_helper() -> None:
     assert "_verify_and_record_run_blocks_result" in window
     assert "record_tool_step_result_for_ctx" in window
 
+    # `run_workflow_end_to_end` is the third run surface and builds its own hand-back.
+    end_to_end = _Path(__file__).resolve().parents[2] / "skyvern/forge/sdk/copilot/tools/run_execution.py"
+    end_to_end_source = end_to_end.read_text()
+    body_start = end_to_end_source.index("async def run_workflow_end_to_end(")
+    body = end_to_end_source[body_start : end_to_end_source.index("async def _run_blocks_and_collect_debug(")]
+    assert "_carry_prior_attempt_change_identity_into_result(" in body
+
 
 def test_the_carried_field_claims_only_that_the_pass_proves_nothing() -> None:
     """It reports a fact and prescribes no repair; the model still owns the branch."""
@@ -4087,6 +4099,115 @@ def test_the_carried_field_claims_only_that_the_pass_proves_nothing() -> None:
     assert carried["note"] == "this run passing does not establish that the earlier failure was resolved"
     for forbidden in ("add", "guard", "should", "must", "conditional", "if "):
         assert forbidden not in carried["note"].lower(), "the note prescribes a fix"
+
+
+_REPEAT_FAILURE_REASON = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
+_REPEAT_RAISING_CODE = "total = passenger_count * fare\n"
+_REPEAT_CHANGED_CODE = "total = int(await page.locator('#pax').input_value()) * fare\n"
+
+
+def _record_failing_attempt(ctx: SimpleNamespace, code: str, workflow_run_id: str) -> dict:
+    """Run one failing attempt of the same block against `code`, returning that run's own result.
+    The failing block registers a download, because a failing hand-back is not a minimal payload."""
+    ctx.workflow_yaml = _raising_code_workflow_yaml(code)
+    ctx.persisted_workflow_yaml = ctx.workflow_yaml
+    result = _generated_code_exception_result(
+        workflow_run_id,
+        _REPEAT_FAILURE_REASON,
+        downloaded_file_artifact_ids=[f"a_dl_{workflow_run_id}"],
+    )
+    record_build_test_outcome(
+        ctx,
+        recorded_outcome_from_run_blocks_result(
+            result,
+            recorded_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="blocker_reported",
+                display_reason=_REPEAT_FAILURE_REASON,
+                workflow_run_id=workflow_run_id,
+                run_completed=False,
+            ),
+        ),
+    )
+    return result
+
+
+def test_a_repeat_failing_run_reports_whether_the_code_it_ran_changed() -> None:
+    """Nothing else answers it: the rendered source binding compares the latest attempt to the current
+    definition, which on a repeat failure reads as a match and says nothing about the prior attempt."""
+    ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
+
+    first = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
+    _carry_unresolved_failure_into_result(ctx, first, "edit_block_and_run")
+    assert "prior_attempt_change_identity" not in first["data"]
+
+    resubmitted = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
+    _carry_unresolved_failure_into_result(ctx, resubmitted, "edit_block_and_run")
+    assert resubmitted["data"]["prior_attempt_change_identity"] == {
+        "prior_workflow_run_id": "wr_1",
+        "block_label": "book_trip",
+        "changed": False,
+        "basis": "code_hash",
+    }
+
+    repaired = _record_failing_attempt(ctx, _REPEAT_CHANGED_CODE, "wr_3")
+    _carry_unresolved_failure_into_result(ctx, repaired, "edit_block_and_run")
+    assert repaired["data"]["prior_attempt_change_identity"] == {
+        "prior_workflow_run_id": "wr_2",
+        "block_label": "book_trip",
+        "changed": True,
+        "basis": "code_hash",
+    }
+    assert repaired["data"]["blocks"][0]["extracted_data"] == {"downloaded_file_artifact_ids": ["a_dl_wr_3"]}
+
+
+def test_legs_that_re_ran_no_code_carry_no_change_identity() -> None:
+    """The validation and update legs return before any run, and a passing run is the other seam's
+    question; a comparison reported on either would stand behind no execution."""
+    ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
+    _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
+    _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
+
+    rejected = {"ok": False, "error": "block_labels must include the edited block 'book_trip'."}
+    _carry_unresolved_failure_into_result(ctx, rejected, "edit_block_and_run")
+    assert rejected == {"ok": False, "error": "block_labels must include the edited block 'book_trip'."}
+
+    passing = {"ok": True, "data": {"workflow_run_id": "wr_3", "overall_status": "completed"}}
+    _carry_unresolved_failure_into_result(ctx, passing, "edit_block_and_run")
+    assert "prior_attempt_change_identity" not in passing["data"]
+
+
+def test_the_change_identity_survives_sanitization_and_compaction() -> None:
+    """The model may reach the repair several turns later, after the output has been compacted."""
+    ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
+    _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
+    resubmitted = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
+    _carry_unresolved_failure_into_result(ctx, resubmitted, "edit_block_and_run")
+    carried = resubmitted["data"]["prior_attempt_change_identity"]
+
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", resubmitted)
+    assert sanitized["data"]["prior_attempt_change_identity"] == carried
+
+    compacted = json.loads(_summarize_tool_output(json.dumps(resubmitted)))
+    assert compacted["prior_attempt_change_identity"] == carried
+
+
+def test_an_attempt_recorded_before_this_field_existed_reports_unavailable_not_unchanged() -> None:
+    """A turn already in flight when this ships has a prior entry with no code hash, and reporting
+    that silence as `changed: False` would accuse the model of resubmitting code nobody compared."""
+    ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
+    _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
+    ctx.recorded_build_test_outcome_history[0].pop("attempted_block_code_hash")
+
+    resubmitted = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
+    _carry_unresolved_failure_into_result(ctx, resubmitted, "edit_block_and_run")
+
+    assert resubmitted["data"]["prior_attempt_change_identity"] == {
+        "prior_workflow_run_id": "wr_1",
+        "block_label": "book_trip",
+        "changed": None,
+        "basis": "unavailable",
+    }
 
 
 def _completed_output_run_result(retained_value: object, *, register_row: bool = True) -> dict[str, object]:

@@ -3086,6 +3086,42 @@ async def test_test_end_to_end_provider_input_excludes_target_controlled_action_
 
 
 @pytest.mark.asyncio
+async def test_test_end_to_end_handoff_keeps_prior_attempt_change_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This handoff rebuilds its data from a whitelist, so a fact the run attached is dropped unless
+    it is named here — and this is the surface where a repeat failing attempt reaches the model."""
+    change_identity = {
+        "prior_workflow_run_id": "wr_first_attempt",
+        "block_label": "price_the_trip",
+        "changed": False,
+        "basis": "code_hash",
+    }
+    monkeypatch.setattr(
+        agent_module,
+        "run_workflow_end_to_end",
+        AsyncMock(
+            return_value={
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_second_attempt",
+                    "overall_status": "failed",
+                    "requested_block_labels": ["price_the_trip"],
+                    "executed_block_labels": ["price_the_trip"],
+                    "prior_attempt_change_identity": change_identity,
+                },
+            }
+        ),
+    )
+    ctx = _make_ctx(workflow_permanent_id="wpid_repeat_failing_attempt")
+
+    handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
+
+    provider_input = json.loads(handoff[1]["output"])
+    assert provider_input["data"]["prior_attempt_change_identity"] == change_identity
+
+
+@pytest.mark.asyncio
 async def test_test_end_to_end_packet_projection_validation_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
