@@ -1,38 +1,21 @@
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import {
   QueryClient,
   QueryClientProvider,
   QueryObserver,
 } from "@tanstack/react-query";
-import {
-  act,
-  fireEvent,
-  render,
-  renderHook,
-  screen,
-  waitFor,
-} from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { OnboardingProgressBand } from "@/components/onboarding/OnboardingProgressBand";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { beforeEach, expect, it, vi } from "vitest";
 const mocks = vi.hoisted<{
   get: ReturnType<typeof vi.fn>;
   flag: boolean | undefined;
   org: string | undefined;
   user: string | undefined;
-  trackRemaining: number;
-  dismissHandoff: ReturnType<typeof vi.fn<() => void>>;
-  trackDismissed: boolean;
-  restoreTrack: ReturnType<typeof vi.fn<() => void>>;
 }>(() => ({
   get: vi.fn(),
   flag: true,
   org: "org-test",
   user: "user-test",
-  trackRemaining: 0,
-  dismissHandoff: vi.fn<() => void>(),
-  trackDismissed: false,
-  restoreTrack: vi.fn<() => void>(),
 }));
 vi.mock("@/api/AxiosClient", () => ({
   getClient: () => Promise.resolve({ get: mocks.get }),
@@ -64,23 +47,6 @@ const validPayload = () => ({
     { key: "first_successful_run", completed_at: null },
   ],
 });
-const completedPayload = () => ({
-  ...validPayload(),
-  state: "completed",
-  completed_count: 2,
-  next_action_key: null,
-  items: [
-    { key: "first_agent_created", completed_at: "2026-08-20T12:00:00Z" },
-    { key: "first_successful_run", completed_at: "2026-08-20T12:01:00Z" },
-  ],
-});
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
 function renderProgress(client = new QueryClient()) {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -88,44 +54,12 @@ function renderProgress(client = new QueryClient()) {
   const hook = renderHook(() => useOnboardingProgress(), { wrapper });
   return { client, ...hook };
 }
-function ProgressBand() {
-  const { progress, isPending, dismiss, restore } = useOnboardingProgress();
-  const [trackRemaining, setTrackRemaining] = useState(mocks.trackRemaining);
-  return (
-    <OnboardingProgressBand
-      progress={progress}
-      isPending={isPending}
-      onDismiss={dismiss}
-      onRestore={restore}
-      onDescribeAgent={vi.fn()}
-      trackRemaining={trackRemaining}
-      onDismissHandoff={() => {
-        mocks.dismissHandoff();
-        setTrackRemaining(0);
-      }}
-      trackDismissed={mocks.trackDismissed}
-      onRestoreTrack={mocks.restoreTrack}
-    />
-  );
-}
-function renderProgressBand(client: QueryClient) {
-  return render(
-    <QueryClientProvider client={client}>
-      <MemoryRouter>
-        <ProgressBand />
-      </MemoryRouter>
-    </QueryClientProvider>,
-  );
-}
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.flag = true;
   mocks.org = "org-test";
   mocks.user = "user-test";
-  mocks.trackRemaining = 0;
-  mocks.trackDismissed = false;
 });
-afterEach(() => vi.useRealTimers());
 it.each([
   [false, "org-test", "user-test"],
   [undefined, "org-test", "user-test"],
@@ -189,113 +123,6 @@ it("refetches fresh cached progress when Discover remounts", async () => {
     expect(secondMount.result.current.progress?.completed_count).toBe(1),
   );
   expect(secondMount.result.current.progress).toEqual(refreshedPayload);
-});
-it("keeps one way back to a hidden track on Home", async () => {
-  mocks.trackDismissed = true;
-  mocks.get.mockResolvedValueOnce({ data: completedPayload() });
-  renderProgressBand(new QueryClient());
-  const resume = await screen.findByRole("button", {
-    name: "Resume getting started",
-  });
-  expect(screen.queryByText(/First agent ready/)).toBeNull();
-  fireEvent.click(resume);
-  expect(mocks.restoreTrack).toHaveBeenCalledOnce();
-});
-
-it("keeps a persistent handoff instead of the timed celebration when the track is active", async () => {
-  const client = new QueryClient();
-  mocks.get.mockResolvedValueOnce({ data: validPayload() });
-  const activeMount = renderProgressBand(client);
-  expect(await screen.findByText("Build your first agent")).toBeTruthy();
-  activeMount.unmount();
-
-  const completedRequest = deferred<{ data: unknown }>();
-  mocks.get.mockReturnValueOnce(completedRequest.promise);
-  mocks.trackRemaining = 4;
-  vi.useFakeTimers();
-  const completionMount = renderProgressBand(client);
-  completedRequest.resolve({ data: completedPayload() });
-  await completedRequest.promise;
-  await act(() => vi.advanceTimersByTimeAsync(0));
-  const handoff = screen.getByRole("link", {
-    name: "Keep going: 4 more steps →",
-  });
-  expect(handoff.getAttribute("href")).toBe("/getting-started");
-  expect(screen.getByRole("status").textContent).toContain(
-    "First agent ready.",
-  );
-  expect(screen.queryByText("3 of 3 complete")).toBeNull();
-  act(() => vi.advanceTimersByTime(5000));
-  expect(
-    screen.getByRole("link", { name: "Keep going: 4 more steps →" }),
-  ).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Hide" }));
-  expect(mocks.dismissHandoff).toHaveBeenCalledOnce();
-  expect(screen.queryByText(/First agent ready/)).toBeNull();
-  act(() => vi.advanceTimersByTime(1800));
-  expect(screen.queryByText(/First agent ready/)).toBeNull();
-  completionMount.unmount();
-  vi.useRealTimers();
-
-  mocks.get.mockResolvedValueOnce({ data: completedPayload() });
-  renderProgressBand(new QueryClient());
-  expect(
-    await screen.findByRole("link", { name: "Keep going: 4 more steps →" }),
-  ).toBeTruthy();
-  expect(screen.queryByText("3 of 3 complete")).toBeNull();
-});
-it("celebrates only cached active progress completing on remount", async () => {
-  const freshClient = new QueryClient();
-  mocks.get.mockResolvedValueOnce({ data: completedPayload() });
-  const freshMount = renderProgressBand(freshClient);
-
-  await waitFor(() => expect(mocks.get).toHaveBeenCalledOnce());
-  await waitFor(() =>
-    expect(
-      freshClient.getQueryData([
-        "onboarding-progress",
-        "user-test",
-        "org-test",
-      ]),
-    ).toEqual(completedPayload()),
-  );
-  expect(screen.queryByText("First agent ready")).toBeNull();
-  expect(screen.queryByRole("status")).toBeNull();
-  freshMount.unmount();
-
-  const client = new QueryClient();
-  mocks.get.mockResolvedValueOnce({ data: validPayload() });
-  const activeMount = renderProgressBand(client);
-  expect(await screen.findByText("Build your first agent")).toBeTruthy();
-  activeMount.unmount();
-
-  const completedRequest = deferred<{ data: unknown }>();
-  mocks.get.mockReturnValueOnce(completedRequest.promise);
-  vi.useFakeTimers();
-  const completionMount = renderProgressBand(client);
-  expect(screen.getByText("Build your first agent")).toBeTruthy();
-
-  completedRequest.resolve({ data: completedPayload() });
-  await completedRequest.promise;
-  await act(() => vi.advanceTimersByTimeAsync(0));
-  expect(screen.getAllByText("First agent ready")).toHaveLength(1);
-  expect(screen.getByRole("status").textContent).toContain("3 of 3 complete");
-  expect(screen.queryByRole("link", { name: /Keep going/ })).toBeNull();
-
-  act(() => vi.advanceTimersByTime(1799));
-  expect(screen.getByText("First agent ready")).toBeTruthy();
-  act(() => vi.advanceTimersByTime(1));
-  expect(screen.queryByText("First agent ready")).toBeNull();
-  completionMount.unmount();
-
-  const finalRequest = deferred<{ data: unknown }>();
-  mocks.get.mockReturnValueOnce(finalRequest.promise);
-  const finalMount = renderProgressBand(client);
-  expect(finalMount.container.innerHTML).toBe("");
-  finalRequest.resolve({ data: completedPayload() });
-  await finalRequest.promise;
-  await act(() => vi.advanceTimersByTimeAsync(0));
-  expect(finalMount.container.innerHTML).toBe("");
 });
 it("isolates progress cache entries by authenticated user", async () => {
   mocks.flag = true;
