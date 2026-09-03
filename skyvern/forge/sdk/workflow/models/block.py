@@ -1576,10 +1576,11 @@ class BaseTaskBlock(Block):
     def mark_data_extraction_goal_prerendered(self) -> None:
         self._data_extraction_goal_is_prerendered = True
 
-    # Blocks built at runtime for internal machinery (loop-value and branch-condition extraction)
-    # are not part of the workflow definition, so the run-level engine A/B never saw them and must
-    # not reroute them. Private so an internal experiment toggle stays out of the published block
-    # schemas and out of stored workflow definitions.
+    # Blocks built at runtime for internal machinery the eligibility check never vetted (loop-value
+    # extraction) must not be rerouted by the run-level engine A/B. Branch-condition extraction is
+    # the deliberate exception: v3_ab_ineligibility_reason vets prompt-branch conditionals, so that
+    # synthetic block follows the run's arm. Private so an internal experiment toggle stays out of
+    # the published block schemas and out of stored workflow definitions.
     _exclude_from_engine_ab: bool = PrivateAttr(default=False)
 
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
@@ -14704,14 +14705,17 @@ async def _evaluate_prompt_branch_conditions_batch(
         )
         # The goal was fully rendered above; a second Jinja pass would resolve any `{{...}}` text
         # inlined from stored block outputs against the synthetic block's scope and fail (SKY-14080).
+        # Unlike the loop-value synthetic, this block is NOT excluded from the engine A/B:
+        # eligibility vets prompt-branch conditionals (v3_ab_ineligibility_reason), so the run's
+        # resolved arm covers branch evaluation too.
         extraction_block.mark_data_extraction_goal_prerendered()
-        extraction_block._exclude_from_engine_ab = True
 
         LOG.info(
             "Conditional branch ExtractionBlock created (batched)",
             block_label=log_label,
             prompt_branch_eval_id=prompt_branch_eval_id,
             num_conditions=len(branches),
+            resolved_engine=extraction_block.resolve_engine(workflow_run_id),
             attempt=attempt,
             extraction_goal_preview=attempt_goal[:500] if attempt_goal else None,
             has_browser_session=browser_session_id is not None,
@@ -15748,6 +15752,20 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
         return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
+        if isinstance(block, ConditionalBlock):
+            # A prompt-criteria branch evaluates through a synthetic extraction block that follows
+            # the run's arm, so it is a rerouted surface this predicate must count; jinja-only
+            # conditionals are pure control flow and stay invisible to the A/B. Both this type and
+            # the while-loop below skip the pinned-engine/totp checks: neither exposes those fields.
+            if any(isinstance(branch.criteria, PromptBranchCriteria) for branch in block.branch_conditions):
+                reroutable_blocks += 1
+            continue
+        if isinstance(block, WhileLoopBlock):
+            # A while-loop's prompt condition evaluates through the same synthetic extraction path
+            # as a conditional's prompt branch, so it is counted the same way.
+            if isinstance(block.condition, PromptBranchCriteria):
+                reroutable_blocks += 1
+            continue
         if not isinstance(block, BaseTaskBlock):
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
