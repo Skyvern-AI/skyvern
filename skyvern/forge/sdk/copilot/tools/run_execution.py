@@ -4580,6 +4580,7 @@ def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, An
         copilot_ctx,
         reported_workflow_yaml=copilot_ctx.persisted_workflow_yaml,
         pending_later_run_id=this_run_id if isinstance(this_run_id, str) else None,
+        reported_workflow_is_persisted=True,
     )
     # This seam is load-bearing for repair: a failure it fails to carry is one the model decides
     # without. One bounded event per successful hand-back, so a miss is attributable rather than

@@ -107,3 +107,26 @@ def workflow_block_engine_override(workflow_run_id: str | None) -> RunEngine | N
     if context is None or context.workflow_block_engine_resolved_run_id != workflow_run_id:
         return None
     return context.workflow_block_engine_override
+
+
+def resolved_workflow_block_engine_arm_label(workflow_run_id: str | None) -> str | None:
+    """Three-way arm label for finalize-time telemetry: "treatment"/"control" when this run's
+    own context resolved an arm, None when this run's own context is current but never
+    resolved one, "unknown" when a different (or no) context is current.
+
+    The third case is the shape every out-of-band finalizer has -- API cancel, the stuck-run
+    sweep, copilot cooperative cancel -- which runs in a different task/process than the one
+    that resolved the arm, so its own context (if any) is either absent or belongs to whatever
+    request triggered it, not to this workflow run. Collapsing that into None would read as
+    "never entered the A/B", silently biasing per-arm duration reads against exactly the
+    canceled/timed-out population; "unknown" keeps that attribution-lost mass a visible facet
+    instead (SKY-15561).
+    """
+    if not workflow_run_id:
+        return "unknown"
+    context = skyvern_context.current()
+    if context is None or context.workflow_run_id != workflow_run_id:
+        return "unknown"
+    if context.workflow_block_engine_resolved_run_id != workflow_run_id:
+        return None
+    return "treatment" if context.workflow_block_engine_override == RunEngine.skyvern_v3 else "control"

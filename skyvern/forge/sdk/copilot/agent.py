@@ -1850,16 +1850,17 @@ def _make_agent_result(
     unresolved_failure = None
     detector_disposition = "not_evaluated"
     if ctx is not None and note_eligible:
-        # Only the workflow the user can actually run clears a failure. A staged proposal may be
-        # shown, tested, or auto-applied later, but this terminal is assembled before the route
-        # commits it, so at claim time it is not yet what anyone would run. `workflow_was_persisted`
-        # records a mid-turn canonical write that can still be rolled back, so it proves nothing here.
+        # Only the workflow the user can actually run clears a failure, and while one is saved a
+        # staged proposal is not it: this terminal is assembled before the route commits the proposal,
+        # and `workflow_was_persisted` records a mid-turn write that can still be rolled back. With
+        # nothing saved there is no such workflow, so a run's own receipts stand in -- hence the
+        # persisted flag below, which says that is what an absent report means here.
         # Deliberately a different question from the tested pill above, which judges the proposal:
         # both can hold at once, and a turn that repairs a block it authored this turn will say the
         # draft tested clean while its saved workflow still carries the failure.
         reported_workflow_yaml = ctx.persisted_workflow_yaml
         unresolved_failure, detector_disposition = unresolved_runtime_block_failure_with_disposition(
-            ctx, reported_workflow_yaml=reported_workflow_yaml
+            ctx, reported_workflow_yaml=reported_workflow_yaml, reported_workflow_is_persisted=True
         )
     if ctx is not None and history_has_runtime_block_failure(ctx):
         # A turn that sets a runtime failure aside otherwise leaves no record of having done so, which

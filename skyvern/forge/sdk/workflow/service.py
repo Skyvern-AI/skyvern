@@ -90,7 +90,10 @@ from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workf
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
-from skyvern.forge.sdk.experimentation.workflow_block_engine import resolve_workflow_block_engine_arm
+from skyvern.forge.sdk.experimentation.workflow_block_engine import (
+    resolve_workflow_block_engine_arm,
+    resolved_workflow_block_engine_arm_label,
+)
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
@@ -954,6 +957,28 @@ class DebugSessionProfileDecision:
 
 def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _task_v3_ab_arm_for_duration_log(workflow_run_id: str) -> str | None:
+    """Best-effort read of the workflow-block engine A/B arm pinned on this run's context.
+
+    Three-way: "treatment"/"control" when this run's own context resolved an arm in-band,
+    None when this run's own context never resolved one, "unknown" when finalization runs
+    out-of-band (API cancel, the stuck-run sweep, copilot cooperative cancel) so no context
+    for this run is current -- attribution is lost, not "never entered the A/B".
+
+    Telemetry only: a lookup failure must never break run finalization, so any exception is
+    swallowed and logged as a warning rather than propagated (SKY-15561, mirrors SKY-15499).
+    """
+    try:
+        return resolved_workflow_block_engine_arm_label(workflow_run_id)
+    except Exception:
+        LOG.warning(
+            "task_v3_ab_arm resolution for duration metrics failed",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
 
 
 def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> float:
@@ -9554,6 +9579,7 @@ class WorkflowService:
                 ai_fallback=workflow_run.ai_fallback,
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
+                task_v3_ab_arm=_task_v3_ab_arm_for_duration_log(workflow_run_id),
             )
             # Run minutes measure compute. A run finalized without ever reaching
             # `running` held no pod, and the created_at fallback above would bill its
@@ -10065,6 +10091,7 @@ class WorkflowService:
             ai_fallback=updated.ai_fallback,
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
+            task_v3_ab_arm=_task_v3_ab_arm_for_duration_log(workflow_run_id),
         )
         # Same compute gate as ``_after_workflow_run_status_write``: cancelling a run
         # that never started bills queue age, not compute, so it records as a tagged
