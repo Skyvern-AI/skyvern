@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
+    bind_post_run_page_evidence,
     observed_value_extraction_scaffold_lines,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
@@ -56,6 +57,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
+from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, render_terminal_message
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -3004,7 +3006,7 @@ def test_browser_operation_structural_key_ignores_transient_run_and_block_ids() 
     assert first_outcome.structural_key == second_outcome.structural_key
 
 
-def test_browser_operation_failure_survives_non_clearing_outcomes_until_changed_attempt_is_tested() -> None:
+def test_browser_operation_failure_survives_non_clearing_outcomes_until_the_block_completes() -> None:
     failed_workflow = """title: retain browser failure
 workflow_definition:
   parameters: []
@@ -3014,7 +3016,6 @@ workflow_definition:
       code: |
         return {"failure_rate": await page.locator("canvas.failure-rate").inner_text()}
 """
-    repaired_workflow = failed_workflow.replace("canvas.failure-rate", "[data-testid='failure-rate']")
     ctx = _locator_packet_ctx()
     ctx.workflow_yaml = failed_workflow
     ctx.persisted_workflow_yaml = failed_workflow
@@ -3070,20 +3071,18 @@ workflow_definition:
     assert ctx.latest_recorded_build_test_outcome is not None
     assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
 
-    ctx.workflow_yaml = repaired_workflow
-    ctx.persisted_workflow_yaml = repaired_workflow
     record_build_test_outcome(
         ctx,
         RecordedBuildTestOutcome(
             phase="persisted_block_run",
             attempted_tool="update_and_run_blocks",
-            verdict="progress_observed",
-            reason_code="verified_success",
-            workflow_run_id="wr_changed_but_not_executed",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_block_failed_again",
             block_labels=["collect_failure_rate"],
             requested_block_labels=["collect_failure_rate"],
-            executed_block_labels=[],
-            verified_progress_marker="run-completed",
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=("cba_collect_failure_rate",),
         ),
     )
     assert ctx.latest_recorded_build_test_outcome is not None
@@ -3094,75 +3093,21 @@ workflow_definition:
         RecordedBuildTestOutcome(
             phase="persisted_block_run",
             attempted_tool="update_and_run_blocks",
-            verdict="progress_observed",
-            reason_code="verified_success",
-            workflow_run_id="wr_changed_and_tested",
+            verdict="not_authoritative",
+            reason_code="run_completed_unevaluated",
+            workflow_run_id="wr_block_completed",
             block_labels=["collect_failure_rate"],
             requested_block_labels=["collect_failure_rate"],
             executed_block_labels=["collect_failure_rate"],
             executed_block_associations=("cba_collect_failure_rate",),
-            verified_progress_marker="run-completed",
+            completed_block_associations=("cba_collect_failure_rate",),
         ),
     )
     assert ctx.latest_recorded_build_test_outcome is not None
     assert ctx.latest_recorded_build_test_outcome.failed_operation is None
 
 
-def test_existing_workflow_failure_and_retest_use_the_exact_unmasked_staged_snapshots() -> None:
-    turn_start_workflow = """workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: code
-      label: collect_failure_rate
-      code: |
-        return await page.locator("[data-testid='turn-start']").inner_text()
-"""
-    failed_snapshot = turn_start_workflow.replace("[data-testid='turn-start']", "canvas.failure-rate")
-    repaired_snapshot = turn_start_workflow.replace("[data-testid='turn-start']", "[data-testid='failure-rate']")
-    ctx = _locator_packet_ctx()
-    ctx.persisted_workflow_yaml = turn_start_workflow
-    ctx.workflow_yaml = failed_snapshot
-    ctx.staged_workflow_yaml = failed_snapshot
-    ctx.runner_code_block_associations_by_label = {"collect_failure_rate": "cba_collect_failure_rate"}
-    failed_operation = BuildTestFailedOperation(
-        kind="browser_operation_failed",
-        workflow_run_id="wr_failed",
-        block_label="collect_failure_rate",
-        failing_line=1,
-        block_association="cba_collect_failure_rate",
-    )
-
-    record_build_test_outcome(
-        ctx,
-        RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            verdict="repairable_failure",
-            reason_code="runtime_block_failure",
-            workflow_run_id="wr_failed",
-            structural_failure_identity="browser-operation",
-            failed_operation=failed_operation,
-        ),
-    )
-    ctx.workflow_yaml = repaired_snapshot
-    ctx.staged_workflow_yaml = repaired_snapshot
-    record_build_test_outcome(
-        ctx,
-        RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            verdict="progress_observed",
-            reason_code="verified_success",
-            workflow_run_id="wr_retested",
-            executed_block_labels=["collect_failure_rate"],
-            executed_block_associations=("cba_collect_failure_rate",),
-            verified_progress_marker="run-completed",
-        ),
-    )
-
-    assert ctx.latest_recorded_build_test_outcome is not None
-    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
-
-
-def test_verified_retest_clears_a_changed_outer_browser_operation_not_its_nested_locator() -> None:
+def test_unevaluated_later_run_that_completed_the_failed_block_clears_the_stop() -> None:
     failed_workflow = """workflow_definition:
   parameters: []
   blocks:
@@ -3192,17 +3137,15 @@ def test_verified_retest_clears_a_changed_outer_browser_operation_not_its_nested
             ),
         ),
     )
-    ctx.workflow_yaml = failed_workflow.replace("timeout=1000", "timeout=5000")
-    ctx.persisted_workflow_yaml = ctx.workflow_yaml
     record_build_test_outcome(
         ctx,
         RecordedBuildTestOutcome(
             phase="persisted_block_run",
-            verdict="progress_observed",
-            reason_code="verified_success",
+            verdict="not_authoritative",
+            reason_code="run_completed_unevaluated",
             workflow_run_id="wr_retested",
             executed_block_associations=("cba_submit",),
-            verified_progress_marker="run-completed",
+            completed_block_associations=("cba_submit",),
         ),
     )
 
@@ -3210,7 +3153,7 @@ def test_verified_retest_clears_a_changed_outer_browser_operation_not_its_nested
     assert ctx.latest_recorded_build_test_outcome.failed_operation is None
 
 
-def test_browser_operation_failure_is_not_cleared_when_full_replacement_copies_its_old_association() -> None:
+def test_browser_operation_failure_clears_when_a_full_replacement_completes_the_block() -> None:
     failed_workflow = """workflow_definition:
   parameters: []
   blocks:
@@ -3269,6 +3212,22 @@ def test_browser_operation_failure_is_not_cleared_when_full_replacement_copies_i
     )
     replacement_association = ctx.runner_code_block_associations_by_label["collect_failure_rate"]
     assert replacement_association != "cba_original"
+
+    # Running the replacement without completing it resolves nothing.
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            verdict="not_authoritative",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_replacement_failed",
+            executed_block_labels=["collect_failure_rate"],
+            executed_block_associations=(replacement_association,),
+        ),
+    )
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
     record_build_test_outcome(
         ctx,
         RecordedBuildTestOutcome(
@@ -3278,12 +3237,15 @@ def test_browser_operation_failure_is_not_cleared_when_full_replacement_copies_i
             workflow_run_id="wr_replacement",
             executed_block_labels=["collect_failure_rate"],
             executed_block_associations=(replacement_association,),
+            completed_block_associations=(replacement_association,),
             verified_progress_marker="run-completed",
         ),
     )
 
+    # The replacement carries a fresh identity, so the recorded association can never run again;
+    # the label's current identity completing is the only route by which this repair can clear.
     assert ctx.latest_recorded_build_test_outcome is not None
-    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
 
 
 def test_code_block_association_covers_conditional_blocks_without_entering_packet_projection() -> None:
@@ -3356,7 +3318,7 @@ def test_recorded_outcome_execution_receipts_come_from_block_status_not_requeste
     assert outcome.executed_block_labels == ["executed"]
 
 
-def test_browser_operation_failure_is_not_cleared_by_unrelated_edit_in_executed_block() -> None:
+def test_browser_operation_failure_without_a_block_association_is_never_cleared() -> None:
     failed_workflow = """title: retain browser failure
 workflow_definition:
   parameters: []
@@ -3389,22 +3351,17 @@ workflow_definition:
         ),
     )
 
-    unrelated_edit = failed_workflow.replace(
-        'return {"failure_rate": value}',
-        'return {"failure_rate": value, "note": "unchanged locator"}',
-    )
-    ctx.workflow_yaml = unrelated_edit
-    ctx.persisted_workflow_yaml = unrelated_edit
     record_build_test_outcome(
         ctx,
         RecordedBuildTestOutcome(
             phase="persisted_block_run",
-            verdict="progress_observed",
-            reason_code="verified_success",
-            workflow_run_id="wr_unrelated_edit",
+            verdict="not_authoritative",
+            reason_code="run_completed_unevaluated",
+            workflow_run_id="wr_later_completed_run",
             requested_block_labels=["collect_failure_rate"],
             executed_block_labels=["collect_failure_rate"],
-            verified_progress_marker="run-completed",
+            executed_block_associations=("cba_collect_failure_rate",),
+            completed_block_associations=("cba_collect_failure_rate",),
         ),
     )
 
@@ -3448,6 +3405,203 @@ workflow_definition:
     ctx.workflow_yaml = failed_workflow.replace("canvas.failure-rate", "[data-testid='failure-rate']")
     ctx.persisted_workflow_yaml = ctx.workflow_yaml
     record_build_test_outcome(ctx, None)
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
+
+
+def test_failure_in_the_latest_run_keeps_the_stop_and_names_its_block() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.runner_code_block_associations_by_label = {"continue_to_payment": "cba_continue_to_payment"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_latest",
+        workflow_run_block_id="wrb_latest",
+        block_label="continue_to_payment",
+        failing_line=3,
+        block_association="cba_continue_to_payment",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_latest",
+            attempted_block_label="continue_to_payment",
+            block_labels=["search_tomorrow_trip", "continue_to_payment"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="not_authoritative",
+            reason_code="blocker_reported",
+            workflow_run_id="wr_latest",
+            block_labels=["search_tomorrow_trip", "continue_to_payment"],
+        ),
+    )
+
+    latest = ctx.latest_recorded_build_test_outcome
+    assert latest is not None
+    assert latest.failed_operation == failed_operation
+    assert latest.completed_block_associations == ()
+
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=False,
+        workflow_applied=False,
+        proposal_disposition="review_untested",
+        run_outcomes=[],
+        blocker_reason=None,
+        halt_kind=None,
+        attempted=None,
+        workflow_mutated=True,
+        workflow_attempted=True,
+        failed_operation=latest.failed_operation,
+        proposal_present=True,
+        interruption=None,
+    )
+    assert envelope is not None
+    assert envelope.terminal_cause == "browser_operation_failed"
+    message, replaced = render_terminal_message(envelope, "End-to-end test did not complete.", cancelled=False)
+
+    assert replaced is True
+    assert message.startswith(
+        "I stopped after a browser operation failed in `continue_to_payment` while testing the workflow."
+    )
+
+
+def test_stop_clears_when_the_failed_block_completed_even_though_a_later_block_failed() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.runner_code_block_associations_by_label = {"log_in": "cba_log_in", "collect_titles": "cba_collect_titles"}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_login_failed",
+            block_labels=["log_in", "collect_titles"],
+            structural_failure_identity="browser-operation",
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_login_failed",
+                block_label="log_in",
+                failing_line=2,
+                block_association="cba_log_in",
+            ),
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_collect_failed",
+            block_labels=["log_in", "collect_titles"],
+            executed_block_labels=["log_in", "collect_titles"],
+            executed_block_associations=("cba_log_in", "cba_collect_titles"),
+            completed_block_associations=("cba_log_in",),
+        ),
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_post_run_enrichment_does_not_resurrect_a_released_stop() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.runner_code_block_associations_by_label = {"log_in": "cba_log_in"}
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_login_failed",
+            block_labels=["log_in"],
+            structural_failure_identity="browser-operation",
+            failed_operation=BuildTestFailedOperation(
+                kind="browser_operation_failed",
+                workflow_run_id="wr_login_failed",
+                block_label="log_in",
+                failing_line=2,
+                block_association="cba_log_in",
+            ),
+        ),
+    )
+    released = RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="not_authoritative",
+        reason_code="run_completed_unevaluated",
+        workflow_run_id="wr_login_completed",
+        block_labels=["log_in"],
+        executed_block_labels=["log_in"],
+        executed_block_associations=("cba_log_in",),
+        completed_block_associations=("cba_log_in",),
+    )
+    record_build_test_outcome(ctx, released)
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+    assert bind_post_run_page_evidence(
+        ctx,
+        {"workflow_run_id": "wr_login_completed"},
+        None,
+        regraded=released,
+    )
+
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.failed_operation is None
+
+
+def test_stop_holds_when_the_failed_block_only_terminated_in_the_later_run() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.runner_code_block_associations_by_label = {"log_in": "cba_log_in"}
+    failed_operation = BuildTestFailedOperation(
+        kind="browser_operation_failed",
+        workflow_run_id="wr_login_failed",
+        block_label="log_in",
+        failing_line=2,
+        block_association="cba_log_in",
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_login_failed",
+            block_labels=["log_in"],
+            structural_failure_identity="browser-operation",
+            failed_operation=failed_operation,
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="not_authoritative",
+            reason_code="terminal_challenge_blocker",
+            workflow_run_id="wr_login_terminated",
+            block_labels=["log_in"],
+            executed_block_labels=["log_in"],
+            executed_block_associations=("cba_log_in",),
+        ),
+    )
 
     assert ctx.latest_recorded_build_test_outcome is not None
     assert ctx.latest_recorded_build_test_outcome.failed_operation == failed_operation
@@ -3562,6 +3716,7 @@ workflow_definition:
                 reason_code="verified_success",
                 workflow_run_id="wr_retested_repair",
                 executed_block_associations=("cba_collect_failure_rate",),
+                completed_block_associations=("cba_collect_failure_rate",),
                 verified_progress_marker="run-completed",
             ),
         )
