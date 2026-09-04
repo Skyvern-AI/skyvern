@@ -38,6 +38,9 @@ from skyvern.forge.taskv3.loop import (
     PAGE_REFRESH_EXHAUSTED_REASON_PREFIX,
     PAGE_STATE_STALL_SHADOW_EVENT,
     PAGE_UNAVAILABLE_ERROR,
+    PERCEPTION_REVISIT_EVENT,
+    PERCEPTION_REVISIT_LOG_AFTER,
+    PERCEPTION_RING,
     PERCEPTION_STALL_NUDGE_AFTER,
     PERCEPTION_STALL_REASON_PREFIX,
     PERCEPTION_STALL_SHADOW_EVENT,
@@ -56,6 +59,7 @@ from skyvern.forge.taskv3.loop import (
     _canonical_perception_content,
     _PerceptionLedger,
     _ProgressLedger,
+    _RevisitMemory,
     make_finish_tool,
     run_agent_tool_loop,
 )
@@ -6205,6 +6209,22 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
 # --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
 
 
+def _cycling_observe(name: str, period: int) -> ToolSpec:
+    """Observe fake whose content REPEATS with the given period: call i returns state (i % period).
+    A period longer than PERCEPTION_RING is invisible to the ring-bounded revisit guards, which is
+    the detection limit the run-scoped memory exists to lift."""
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        state = calls["n"] % period
+        calls["n"] += 1
+        return ToolResult.ok(f"url=x state={state}", data={"summary": {"invalid_fields": 0}})
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
+    )
+
+
 def _form_observe(name: str, invalid_seq: list[int]) -> ToolSpec:
     """Observe fake: call i returns UNIQUE content plus summary.invalid_fields=invalid_seq[i] (last
     value repeats). Unique content each call keeps the perception-stall / oscillation guards from
@@ -6446,6 +6466,98 @@ async def test_progress_ledger_emits_terminal_survival_record() -> None:
     assert final[0]["outcome_status"] == "completed"
     assert final[0]["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
     assert final[0]["would_fire"] is True
+
+
+@pytest.mark.asyncio
+async def test_revisit_memory_sees_a_cycle_longer_than_the_perception_ring() -> None:
+    # The detection limit this exists to lift: PERCEPTION_RING is 8, and its own comment says that
+    # length IS the longest oscillation period that can be recognised. A run cycling with period 12
+    # returns to states the ring has already evicted, so every ring-bounded guard is structurally
+    # blind to it. The run-scoped memory is not.
+    period = PERCEPTION_RING + 4
+    rounds = period * PERCEPTION_REVISIT_LOG_AFTER + period
+    tools = [_cycling_observe("observe", period), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    revisits = [e for e in logs if e.get("event") == PERCEPTION_REVISIT_EVENT]
+    assert revisits, "a cycle longer than the ring must still be seen"
+    assert max(e["revisit_count"] for e in revisits) >= PERCEPTION_REVISIT_LOG_AFTER
+    # Log-only: the run is not terminated and no verdict is taken on this signal.
+    assert outcome.status == "completed"
+
+
+def test_revisit_memory_refuses_new_states_at_the_cap_without_evicting_known_ones() -> None:
+    # The storage bound, pinned rather than asserted in a comment. Evicting a held state to admit a
+    # new one would reset the very streak the memory exists to keep, so at the cap it REFUSES new
+    # states and keeps counting the ones it holds — degrading to a smaller memory, never to none.
+    memory = _RevisitMemory(cap=2)
+    assert memory.record("a") == (1, 0)
+    assert memory.record("b") == (1, 0)
+    assert memory.capped is False
+
+    assert memory.record("c") == (0, 0), "a refused state must not report a count"
+    assert memory.capped is True, "a truncated run must never read as a complete one"
+
+    # "b" was the only state admitted after "a" was last seen, so returning to "a" has one new
+    # state behind it; returning again straight away has none.
+    assert memory.record("a") == (2, 1)
+    assert memory.record("a") == (3, 0)
+    assert memory.peak_revisits == 3
+    assert memory.distinct_states == 2
+
+
+@pytest.mark.asyncio
+async def test_revisit_memory_stays_quiet_on_a_healthy_drill_down() -> None:
+    # The false-positive case that decides whether this signal is worth collecting. A drill-down
+    # returns to its list page over and over — a revisit every other touch — but opens a NEW item
+    # in between, so it is progressing. Reporting it would fire identically on healthy and stuck
+    # runs and leave the precision read this feeds unable to separate them.
+    items = 12
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        # list, item-0, list, item-1, list, item-2, ... the list recurs, each item is new.
+        i = calls["n"]
+        calls["n"] += 1
+        content = "url=x list" if i % 2 == 0 else f"url=x item-{i // 2}"
+        return ToolResult.ok(content, data={"summary": {"invalid_fields": 0}})
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(items * 2)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [observe, make_finish_tool()], max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PERCEPTION_REVISIT_EVENT], (
+        "a run covering fresh ground between returns to its list is progressing, not looping"
+    )
+
+
+@pytest.mark.asyncio
+async def test_revisit_memory_silent_when_every_perception_state_is_new() -> None:
+    # A run that never returns to a state has no revisit to report. This is the false-positive
+    # direction that matters: a shadow signal headed for a future verdict must stay quiet on a run
+    # that is genuinely moving through fresh pages.
+    rounds = 20
+    tools = [_form_observe("observe", [0] * rounds), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PERCEPTION_REVISIT_EVENT]
 
 
 @pytest.mark.asyncio
