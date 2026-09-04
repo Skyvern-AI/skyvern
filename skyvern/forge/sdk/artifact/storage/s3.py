@@ -5,7 +5,7 @@ import shutil
 import uuid
 import zipfile
 from datetime import datetime, timezone
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 import structlog
 import zstandard as zstd
@@ -37,6 +37,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     key_is_org_scoped,
     presign_with_sensitive_cap,
 )
+from skyvern.forge.sdk.artifact.storage.bounded_file import BoundedFileReader
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
     RUN_RECORDING_PATH_SEGMENT,
@@ -185,7 +186,13 @@ class S3Storage(BaseStorage):
             file_path=file_path,
         )
 
-    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+    async def store_artifact(
+        self,
+        artifact: Artifact,
+        data: bytes,
+        supersede_queued_prefixes: bool = False,
+        prefix_uri: str | None = None,
+    ) -> None:
         # We compress HAR files with zstd level 3 to reduce storage size.
         # HARs are easily compressible because they are mostly JSON.
         # Other artifacts are not compressed because they are not easily compressible.
@@ -202,7 +209,20 @@ class S3Storage(BaseStorage):
             uri=uri,
             storage_class=sc,
         )
-        await self.async_client.upload_file(uri, data, storage_class=sc)
+        # A recording's per-step prefixes stream to the key they were registered under, and its terminal
+        # finalize must serialize against them so a stale detached prefix can never overwrite the finalized
+        # object. The finalize can rename the object (.webm prefixes -> .mp4 terminal), so serialize on the
+        # key the prefixes actually queued to (prefix_uri when the finalize renamed, else this uri); the
+        # terminal still writes `uri`. supersede_queued_prefixes (the finalize) additionally skips prefixes
+        # still queued behind the active transfer.
+        serialize_key = (prefix_uri or uri) if artifact.artifact_type == ArtifactType.RECORDING else None
+        if supersede_queued_prefixes and serialize_key is not None:
+            # Terminal finalize does a full replacement that can rewrite earlier bytes, so any Phase 2
+            # compose base cached for this key is now stale and must not seed a later copy.
+            self.async_client.forget_compose_state(serialize_key)
+        await self.async_client.upload_file(
+            uri, data, storage_class=sc, serialize_key=serialize_key, supersede_queued=supersede_queued_prefixes
+        )
 
     async def _get_storage_class_for_org(
         self,
@@ -277,6 +297,45 @@ class S3Storage(BaseStorage):
             path=path,
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc)
+
+    async def store_artifact_prefix_from_path(self, artifact: Artifact, path: str, length: int) -> None:
+        # A compressed-suffix URI must be compressed in full (HAR only); recordings never use it, so
+        # fall back to the buffered default rather than stream a raw prefix under a .zst key.
+        if artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX):
+            await super().store_artifact_prefix_from_path(artifact, path, length)
+            return
+        sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, length)
+        LOG.debug(
+            "Streaming artifact prefix from path",
+            artifact_id=artifact.artifact_id,
+            organization_id=artifact.organization_id,
+            uri=artifact.uri,
+            storage_class=sc,
+            path=path,
+            length=length,
+        )
+        # Phase 2 (SKY-15288): when enabled, advance the recording object in place by copying the already
+        # uploaded prefix server-side and uploading only the new tail. The compose method owns the whole
+        # step — including the Phase 1 full-prefix fallback for unsupported steps — inside ONE serialized
+        # write slot, so a later step can never interleave between a failed compose and its fallback.
+        if settings.RECORDING_INCREMENTAL_COMPOSE_ENABLED and artifact.artifact_type == ArtifactType.RECORDING:
+            await self.async_client.store_recording_prefix(
+                artifact.uri, path, length, storage_class=sc, serialize_key=artifact.uri
+            )
+            return
+
+        # Feature off (or non-recording): the exact Phase 1 path — hand the reader's lifetime to
+        # upload_file_stream: the transfer can be detached on caller cancel and keep reading, so it must
+        # close the reader only after the real transfer finishes.
+        reader = BoundedFileReader(path, length)
+        # serialize_key fences this prefix ahead of the terminal write to the same uri (see store_artifact).
+        await self.async_client.upload_file_stream(
+            artifact.uri,
+            cast(BinaryIO, reader),
+            storage_class=sc,
+            close_file_obj=True,
+            serialize_key=artifact.uri,
+        )
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"

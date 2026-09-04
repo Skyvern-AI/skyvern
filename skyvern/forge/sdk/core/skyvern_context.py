@@ -394,6 +394,13 @@ class SkyvernContext:
     # next blocks won't consider the page as a magic link page
     magic_link_pages: dict[str, Page] = field(default_factory=dict)
 
+    # Exact popup Page objects opened by a download click, keyed by the task that opened them. A
+    # download credited after the action seam returns (the CDP monitor / file-scan task lifecycle,
+    # which never fires a Playwright popup download event) can then close the never-committed marker
+    # popup it stranded. Task-keyed and dropped on task teardown so a claim never leaks into a later
+    # task/run/persistent-session scope.
+    download_popup_claims: dict[str, list[Page]] = field(default_factory=dict)
+
     # parallel verification optimization
     # stores pre-scraped data for next step to avoid re-scraping
     next_step_pre_scraped_data: dict[str, Any] | None = None
@@ -589,6 +596,17 @@ class SkyvernContext:
             self.magic_link_pages.pop(task_id)
             return False
         return True
+
+    def record_download_popup_claim(self, task_id: str, page: Page) -> None:
+        claims = self.download_popup_claims.setdefault(task_id, [])
+        if all(existing is not page for existing in claims):
+            claims.append(page)
+
+    def take_download_popup_claims(self, task_id: str) -> list[Page]:
+        return self.download_popup_claims.pop(task_id, [])
+
+    def clear_download_popup_claims(self, task_id: str) -> None:
+        self.download_popup_claims.pop(task_id, None)
 
     def flush_feature_flags(self) -> None:
         if not self.feature_flag_entries:

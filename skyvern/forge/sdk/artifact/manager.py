@@ -1277,6 +1277,7 @@ class ArtifactManager:
         data: bytes,
         primary_key: str = "task_id",
         file_extension: str | None = None,
+        supersede_queued_prefixes: bool = False,
     ) -> str | None:
         if not artifact_id or not organization_id:
             return None
@@ -1292,10 +1293,12 @@ class ArtifactManager:
             data,
             workflow_run_id=artifact.workflow_run_id,
         )
+        prefix_uri: str | None = None
         if file_extension and artifact.artifact_type == ArtifactType.RECORDING:
-            next_uri = replace_file_extension(artifact.uri, file_extension)
+            old_uri = artifact.uri
+            next_uri = replace_file_extension(old_uri, file_extension)
             file_size = len(data)
-            if next_uri != artifact.uri or artifact.file_size != file_size:
+            if next_uri != old_uri or artifact.file_size != file_size:
                 updated_artifact = await app.DATABASE.artifacts.update_artifact_uri(
                     artifact_id=artifact.artifact_id,
                     organization_id=organization_id,
@@ -1309,12 +1312,66 @@ class ArtifactManager:
                         f"Failed to update recording artifact metadata before upload: {artifact.artifact_id}"
                     )
                 artifact = updated_artifact
+            if next_uri != old_uri:
+                # The finalize renamed the object (e.g. .webm -> .mp4); the per-step prefixes queued to the
+                # pre-rename key, so pass it as prefix_uri to seal/supersede THAT key rather than the new one
+                # nothing queued to.
+                prefix_uri = old_uri
 
-        # Fire and forget
-        aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
+        # Fire and forget. Only a terminal recording finalize (supersede_queued_prefixes=True, passed by
+        # the terminal persistence sites) supersedes queued prefixes; the generic path — including the
+        # mid-step byte fallback in _sync_video_artifact_after_step — must not seal.
+        aio_task = asyncio.create_task(
+            app.STORAGE.store_artifact(
+                artifact, data, supersede_queued_prefixes=supersede_queued_prefixes, prefix_uri=prefix_uri
+            )
+        )
 
         # A code-block recording artifact is workflow-run-block-scoped rather than task-scoped, so
         # key the upload tracking on the first available scope id instead of failing on a null task_id.
+        aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
+        if not aio_task_key:
+            raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")
+        self._track_upload_aiotask(aio_task_key, aio_task, artifact=artifact)
+        return aio_task_key
+
+    async def stream_artifact_prefix_from_path(
+        self,
+        artifact_id: str | None,
+        organization_id: str | None,
+        path: str,
+        length: int,
+        primary_key: str = "task_id",
+    ) -> str | None:
+        """Per-step recording sync: upload exactly ``[0, length)`` of ``path`` by streaming it, without
+        buffering the whole growing prefix as ``bytes``. RECORDING is not redactable, so (unlike
+        ``update_artifact_data``) no redaction pass is needed."""
+        if not artifact_id or not organization_id:
+            return None
+        artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
+        if not artifact:
+            return None
+        if artifact.artifact_type == ArtifactType.UNKNOWN:
+            LOG.warning("Refusing to stream data for an artifact of unknown type", artifact_id=artifact_id)
+            return None
+
+        async def _store_prefix() -> None:
+            # The recording file can be removed concurrently; the read now happens in this fire-and-forget
+            # task (not the caller's try/except), so swallow a vanished/unreadable file the way the old
+            # synchronous per-step read did, rather than let it surface unhandled in wait_for_upload_aiotasks.
+            try:
+                await app.STORAGE.store_artifact_prefix_from_path(artifact, path, length)
+            except OSError:
+                LOG.warning(
+                    "Skipping recording prefix upload; file unavailable",
+                    artifact_id=artifact_id,
+                    path=path,
+                    exc_info=True,
+                )
+
+        # Fire and forget
+        aio_task = asyncio.create_task(_store_prefix())
+
         aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
         if not aio_task_key:
             raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")

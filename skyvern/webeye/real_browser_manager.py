@@ -31,7 +31,7 @@ from skyvern.forge.sdk.streaming.registries import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
-from skyvern.webeye.browser_artifacts import DownloadBinding, VideoArtifact
+from skyvern.webeye.browser_artifacts import DownloadBinding, RecordingPrefixSnapshot, VideoArtifact
 from skyvern.webeye.browser_engine import (
     BrowserEngineBootstrapError,
     BrowserEngineContext,
@@ -1240,6 +1240,39 @@ class RealBrowserManager(BrowserManager):
                 )
 
         return browser_state.browser_artifacts.video_artifacts
+
+    def snapshot_recording_prefixes(
+        self,
+        browser_state: BrowserState,
+        task_id: str = "",
+    ) -> list[RecordingPrefixSnapshot] | None:
+        """Plan a per-step recording sync without reading any bytes.
+
+        Mirrors the per-step branch of ``get_video_artifacts(finalize=False)`` for the shipped Playwright
+        per-page recording: returns ``[]`` when there is nothing to sync, a per-artifact prefix plan (a
+        size snapshot of each ordinary growing WebM recording) for the fast streaming path, or ``None`` to
+        fall back to the byte-based path whenever an artifact is non-WebM, not yet registered, or missing on
+        disk.
+        """
+        video_artifacts = browser_state.browser_artifacts.video_artifacts
+        if len(video_artifacts) == 0:
+            return []
+
+        snapshots: list[RecordingPrefixSnapshot] = []
+        for video_artifact in video_artifacts:
+            path = video_artifact.video_path
+            if not video_artifact.video_artifact_id or not path or not os.path.exists(path=path):
+                return None
+            if not path.lower().endswith(".webm"):
+                return None
+            snapshots.append(
+                RecordingPrefixSnapshot(
+                    video_artifact_id=video_artifact.video_artifact_id,
+                    path=path,
+                    prefix_len=os.path.getsize(path),
+                )
+            )
+        return snapshots
 
     async def get_har_data(
         self,

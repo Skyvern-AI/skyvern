@@ -110,6 +110,10 @@ class Settings(BaseSettings):
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
     VIDEO_COMPRESSION_ENABLED: bool = True
+    # SKY-15288: when enabled, in-progress recording snapshots copy the already-uploaded prefix
+    # server-side (UploadPartCopy against the prior ETag) and upload only the new tail; any unsupported
+    # condition or failure falls back to the Phase 1 full-prefix stream. Off by default.
+    RECORDING_INCREMENTAL_COMPOSE_ENABLED: bool = False
     VIDEO_COMPRESSION_CRF: int = 28
     VIDEO_COMPRESSION_PRESET: str = "veryfast"
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
