@@ -2278,6 +2278,33 @@ if settings.ENABLE_OLLAMA:
             ),
         )
 
+if settings.ENABLE_TRUSTEDROUTER:
+    # Register TrustedRouter model configured in settings.
+    #
+    # Dispatched through litellm's openai provider with an explicit api_base rather
+    # than a "trustedrouter/" prefix: litellm strips the first path segment as the
+    # provider, and TrustedRouter model ids are namespaced ("anthropic/claude-opus-4-7",
+    # "trustedrouter/auto"), so a prefixed id would reach the API with its namespace
+    # removed and be rejected.
+    if settings.TRUSTEDROUTER_MODEL:
+        trustedrouter_model_name = settings.TRUSTEDROUTER_MODEL
+        LLMConfigRegistry.register_config(
+            "TRUSTEDROUTER",
+            LLMConfig(
+                f"openai/{trustedrouter_model_name}",
+                ["TRUSTEDROUTER_API_KEY", "TRUSTEDROUTER_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.TRUSTEDROUTER_API_KEY,
+                    api_base=settings.TRUSTEDROUTER_API_BASE,
+                    api_version=None,
+                    model_info={"model_name": f"openai/{trustedrouter_model_name}"},
+                ),
+            ),
+        )
+
 if settings.ENABLE_OPENROUTER:
     # Register OpenRouter model configured in settings
     if settings.OPENROUTER_MODEL:
