@@ -15,6 +15,7 @@ keywords:
   - login block
   - validation block
   - file download block
+  - data export block
   - conditional block
 ---
 
@@ -33,7 +34,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
 | [Data and Extraction](#data-and-extraction) | Text Prompt, File Parser |
 | [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
-| [Files](#files) | File Download, Cloud Storage Upload |
+| [Files](#files) | File Download, Data Export, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction |
 
 ---
@@ -381,6 +382,19 @@ Additional fields in **Advanced Settings:**
 <Frame>
 <img width="400" src="/images/cloud/download_block.png" alt="File Download block configuration with URL, Download Goal, and Download Timeout fields" />
 </Frame>
+
+### Data Export
+
+Write schema-defined records to a Parquet file. The file is registered as a download on the run, alongside browser downloads.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Records** | text | The records to export. Usually a parameter reference such as `{{ extraction_output.extracted_information }}`. Must resolve to a JSON array of object records. |
+| **Data Schema** | JSON | [JSON Schema](https://json-schema.org/) with `type: array` and an `items` object. The item properties define the Parquet columns. Missing properties and values that don't match their declared type become null. |
+| **Filename** | text | Optional filename for the export. Defaults to the block label. The `.parquet` extension is added automatically. Inside a loop, each iteration's file gets a numeric suffix (`-0001`, `-0002`, ...). |
+| **Parameters** | select | Output parameters from previous blocks to make available in the Records template |
+
+In the API, this block uses `block_type: data_export` with `data`, `data_schema`, and optional `file_name` and `parameter_keys` fields.
 
 ### Cloud Storage Upload
 
