@@ -228,6 +228,8 @@ from skyvern.schemas.runs import (
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFallbackEpisode, ScriptStatus, WorkflowScript
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
+    ERROR_CODE_MAX_LENGTH,
+    ERROR_CODE_REASONING_MAX_LENGTH,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -323,11 +325,11 @@ def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
         type(value["error_code"]) is not str
         or not value["error_code"]
         or value["error_code"] != value["error_code"].strip()
-        or len(value["error_code"]) > 128
+        or len(value["error_code"]) > ERROR_CODE_MAX_LENGTH
         or type(value["reasoning"]) is not str
         or not value["reasoning"]
         or value["reasoning"] != value["reasoning"].strip()
-        or len(value["reasoning"]) > 2000
+        or len(value["reasoning"]) > ERROR_CODE_REASONING_MAX_LENGTH
         or type(value["confidence_float"]) is not float
         or not 0 <= value["confidence_float"] <= 1
         or type(value["error_type"]) is not str

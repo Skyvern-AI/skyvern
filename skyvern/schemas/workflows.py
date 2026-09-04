@@ -919,6 +919,62 @@ def _contains_unicode_category_c(value: str) -> bool:
     return any(unicodedata.category(character).startswith("C") for character in value)
 
 
+def error_code_key_error(code: Any) -> str | None:
+    """Whether a key is unusable, as a reason string.
+
+    Split out from the whole-entry check because a key and a description fail differently. A key IS
+    the identifier the model names and the customer matches on, so an unusable one cannot be repaired
+    and the entry has to go. A description is prose; see normalize_error_code_description.
+    """
+    if type(code) is not str or not code or code != code.strip() or len(code) > ERROR_CODE_MAX_LENGTH:
+        return "error code keys must be trimmed, non-empty strings of at most 128 characters"
+    if _contains_unicode_category_c(code):
+        return "error code keys must not contain Unicode category-C characters"
+    return None
+
+
+def normalize_error_code_description(description: Any) -> str | None:
+    """Make a rendered description usable, or None if there is nothing to salvage.
+
+    Repair rather than reject. These rules were written where the mapping feeds generated code; on a
+    task block the description is prose shown to a model, and prose legitimately carries newlines and
+    surrounding whitespace. Dropping the entry over that deletes a customer's error code -- and if it
+    was the only entry the mapping goes falsy, which turns error detection off silently. Measured on
+    production: 3,691 tasks in a week carry an untrimmed description and 90 would lose every entry.
+    """
+    if type(description) is not str:
+        return None
+    collapsed = "".join(
+        " " if unicodedata.category(character).startswith("C") else character for character in description
+    )
+    collapsed = collapsed.strip()
+    if not collapsed:
+        return None
+    return collapsed[:ERROR_CODE_REASONING_MAX_LENGTH]
+
+
+def error_code_mapping_entry_error(code: Any, description: Any) -> str | None:
+    """The per-entry rules, as a reason string rather than an exception.
+
+    Two callers need the same rules with opposite dispositions: the code-block schema rejects the
+    whole mapping at author time, while the runtime render path drops the offending entry. Both read
+    from here so a rule cannot be enforced in one place and quietly not the other.
+    """
+    key_reason = error_code_key_error(code)
+    if key_reason:
+        return key_reason
+    if (
+        type(description) is not str
+        or not description
+        or description != description.strip()
+        or len(description) > ERROR_CODE_REASONING_MAX_LENGTH
+    ):
+        return "error code descriptions must be trimmed, non-empty strings of at most 2000 characters"
+    if _contains_unicode_category_c(description):
+        return "error code descriptions must not contain Unicode category-C characters"
+    return None
+
+
 def _validate_code_block_error_code_mapping(mapping: Any) -> None:
     if mapping is None:
         return
@@ -928,19 +984,9 @@ def _validate_code_block_error_code_mapping(mapping: Any) -> None:
         raise ValueError("error_code_mapping must contain at most 64 entries")
     aggregate_size = 0
     for code, description in mapping.items():
-        if type(code) is not str or not code or code != code.strip() or len(code) > ERROR_CODE_MAX_LENGTH:
-            raise ValueError("error code keys must be trimmed, non-empty strings of at most 128 characters")
-        if _contains_unicode_category_c(code):
-            raise ValueError("error code keys must not contain Unicode category-C characters")
-        if (
-            type(description) is not str
-            or not description
-            or description != description.strip()
-            or len(description) > ERROR_CODE_REASONING_MAX_LENGTH
-        ):
-            raise ValueError("error code descriptions must be trimmed, non-empty strings of at most 2000 characters")
-        if _contains_unicode_category_c(description):
-            raise ValueError("error code descriptions must not contain Unicode category-C characters")
+        reason = error_code_mapping_entry_error(code, description)
+        if reason:
+            raise ValueError(reason)
         aggregate_size += len(code.encode("utf-8")) + len(description.encode("utf-8"))
     if aggregate_size > ERROR_CODE_MAPPING_MAX_UTF8_BYTES:
         raise ValueError("error_code_mapping keys and values must total at most 32768 UTF-8 bytes")

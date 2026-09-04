@@ -2685,6 +2685,20 @@ class AgentFunction:
         """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
         return None
 
+    async def on_task_completed(
+        self,
+        *,
+        organization_id: str,
+        task_id: str,
+        status: TaskStatus,
+    ) -> None:
+        """Fired after a top-level (non-workflow) task is persisted as completed.
+
+        Not exactly-once: concurrent finalizers can both observe the completed row, so overrides
+        must be idempotent and must never raise.
+        """
+        return None
+
     async def on_credential_saved(
         self,
         *,
