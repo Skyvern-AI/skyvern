@@ -82,6 +82,8 @@ Both contain the same `status` field.
 
 The `status` field is at the top level of both responses.
 
+`output` is not always `null` on failure. Runs that end in `failed` or `terminated` can include data extracted before the run stopped. Check `status` to decide whether the run succeeded, not `output`.
+
 ### For tasks
 
 Poll `get_run` until the status is terminal:
