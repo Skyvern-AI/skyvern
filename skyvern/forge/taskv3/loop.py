@@ -203,7 +203,20 @@ PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
 # returning different content, or a download landing; a first-time probe has no baseline and is
 # evidence of nothing, so varied-selector probing cannot launder repetition into "progress".
 ACTION_LOOP_NUDGE_AFTER = 3
-ACTION_LOOP_TERMINATE_AFTER = 6
+# 8, not 6: RAW repeats of one action key peak at 6 across 50 completed prod runs while stuck runs
+# reach 36, so 6 sat on the completed population's edge. DO NOT LOWER THIS. The effective
+# post-clearing counter — what this constant is actually compared against — was then measured by
+# replaying the clearing rule over per-call telemetry, and NO SEPARATION WAS OBSERVED: two completed
+# runs peaked at 2 and 4, four stuck runs at 1, 3, 3 and below (upper bounds, computed identically
+# on both sides), and the highest observed value fell in a COMPLETED run. n=6 is far too small to
+# establish inversion as a property of either population — that spread is also consistent with
+# noise — but it is no evidence FOR a lower threshold either, and lowering a safety threshold
+# requires positive evidence. 8 is above everything observed, which is why the change is safe; it
+# is also why nothing in the sample fires. REVISIT if the effective distribution ever becomes
+# measurable at population scale; do not lower it before then. Repeat count may not be a stuck-ness
+# signal at all: SKY-15602 tracks the real problem, which is that the loop has no definition of
+# goal progress, only of page change.
+ACTION_LOOP_TERMINATE_AFTER = 8
 
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
@@ -1706,14 +1719,22 @@ async def run_agent_tool_loop(
             # (e.g. "next") on every page relies on THIS clear to survive — page_transitioned alone
             # deliberately does not clear the action-loop guard (see below), so only a progressed
             # snapshot does.
-            _clear_action_state()
+            ring = ledger.content_only.get(action_key) if content_only_digest is not None else None
+            # INVARIANT: this test and the budget-evidence test below must both refuse a return to
+            # the ring. They answer one question — did the run reach ground it has not already
+            # covered? — and relaxing either alone silently reopens SKY-14998: a page that CYCLES
+            # moves on every probe, so `progressed` holds every round, and an unconditional clear
+            # let the action DRIVING the oscillation reset its own counter forever (one production
+            # key ran 11 times against a threshold of 6 while the nudge fired once).
+            returned_to_known_ground = ring is not None and content_only_digest in ring
+            if not returned_to_known_ground:
+                _clear_action_state()
             # Two landed digests that differ are positive evidence, exactly like a fingerprint
             # mismatch — and the only movement evidence there is when page_fingerprint is absent.
             canonical.progress(_ProgressEvidence.PERCEPTION_DIGEST)
             # Evidence requires NEW content: a URL-only flip (history.pushState) still clears the
             # repeat guards above but earns no budget, and neither does a return to a content state
             # in the probe's recent ring (a panel toggling open and shut).
-            ring = ledger.content_only.get(action_key) if content_only_digest is not None else None
             if ring and content_only_digest not in ring:
                 _note_page_change_evidence()
         if content_only_digest is not None:

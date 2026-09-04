@@ -760,14 +760,29 @@ def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
     present_vals = {str(o.get("val")) for o in rows if o.get("val") is not None}
     if len(present_vals) >= 2:
         return None
-    # Sets must be NESTED, not equal: an a11y copy often mirrors only a subset of the primary row's
-    # attributes ({"55", "New York"} beside {"55"} is one candidate). Two sets neither containing the
-    # other carry a genuine disagreement and refuse.
-    val_sets = [frozenset(str(v) for v in o.get("vals") or []) for o in rows]
-    non_empty_sets = [s for s in val_sets if s]
-    for i, a in enumerate(non_empty_sets):
-        for b in non_empty_sets[i + 1 :]:
-            if not (a <= b or b <= a):
+    # Two-rule agreement over the surface+attribute-keyed entries. (1) A key present on BOTH rows
+    # must carry one value — crossed values across surfaces refuse, while a value carried on one
+    # row's surface only says nothing against the other row. (2) The depth-blind floor: one row's
+    # flattened attr=value pairs must nest inside the other's. Rows declaring identity on disjoint
+    # attributes cannot be confirmed the same, and an agreeing generic attribute (a shared title)
+    # beside disjoint identifiers is ordinary markup, not identity evidence — the pairs don't nest,
+    # so it refuses. A row declaring NOTHING still constrains nothing (its empty set nests, so an
+    # attribute-less a11y copy collapses).
+    val_maps: list[dict[str, str]] = []
+    for o in rows:
+        entries: dict[str, str] = {}
+        for raw in o.get("vals") or []:
+            key, _, val_part = str(raw).partition("=")
+            entries[key] = val_part
+        val_maps.append(entries)
+    for i, first in enumerate(val_maps):
+        for second in val_maps[i + 1 :]:
+            for shared in first.keys() & second.keys():
+                if first[shared] != second[shared]:
+                    return None
+            flat_first = {f"{k.partition(':')[2]}={v}" for k, v in first.items()}
+            flat_second = {f"{k.partition(':')[2]}={v}" for k, v in second.items()}
+            if not (flat_first <= flat_second or flat_second <= flat_first):
                 return None
     n = rows[0].get("n")
     return n if isinstance(n, int) else None
@@ -873,21 +888,43 @@ def _ambiguous_rows_error(
     )
 
 
-def _row_value_suffix(o: dict[str, Any]) -> str:
+def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     """Every present distinguishing surface for one row — value, accessible label, then any other
     declared value (data-code, data-key, ...) — each truncated to 60 chars like the row text already is,
     so a page-controlled attribute can never blow a refusal message up wholesale. Surfaces are additive
     (not first-match), since the veto may have come from a surface other than the first one present.
+    `rows` is the same-text row set the refusal lists: a surface that agrees across every row
+    distinguishes nothing, so the row-label clause prints only when the names disagree, and the
+    capped vals render entries that differ across rows first.
     """
     parts = ""
     if o.get("val") is not None:
         parts += f" (value {str(o.get('val'))[:60]!r})"
     if o.get("label"):
         parts += f" (label {str(o.get('label'))[:60]!r})"
+    # The ancestor's name is its own surface: when it differs from the preferred display label (a
+    # shared leaf label masking distinct row names) AND disagrees across the rows, the disagreeing
+    # name is the one that converts — gated like the veto itself, on cross-row disagreement.
+    ancestor_name = (o.get("labels") or [None, None])[1]
+    ancestor_names = {str((p.get("labels") or [None, None])[1]) for p in rows if (p.get("labels") or [None, None])[1]}
+    if ancestor_name and str(ancestor_name) != str(o.get("label") or "") and len(ancestor_names) >= 2:
+        parts += f" (row label {str(ancestor_name)[:60]!r})"
     # `vals` entries are attribute-keyed for comparison; render only the value part, and subtract
     # what the value surface already showed so a row never prints one value twice.
     shown_already = {str(o.get("val")).strip()} if o.get("val") is not None else set()
-    vals = [bare[:60] for v in (o.get("vals") or []) if (bare := str(v).split("=", 1)[-1]) not in shown_already]
+    raw_vals = [str(v) for v in (o.get("vals") or [])]
+    # The caller is being asked to pick between these rows: entries every row carries identically
+    # cannot be what tells them apart, so the ones that differ print first (the cap must not hide
+    # the distinguishing value behind agreeing generic ones).
+    common_to_all = set(raw_vals)
+    for p in rows:
+        if p is not o:
+            common_to_all &= {str(v) for v in (p.get("vals") or [])}
+    vals = [
+        bare[:60]
+        for v in sorted(raw_vals, key=lambda v: v in common_to_all)
+        if (bare := v.split("=", 1)[-1]) not in shown_already
+    ]
     if vals:
         shown_vals = vals[:3]
         more = "; ..." if len(vals) > 3 else ""
@@ -911,7 +948,7 @@ def _identical_text_rows_error(
         # and the stale tags may re-land on different rows at the next scan.
         return f'[data-tv3-sugg="{o.get("n")}"] ' if tags_live else ""
 
-    listing = "; ".join(f"{_sel(o)}{str(o.get('text') or '')[:60]!r}{_row_value_suffix(o)}" for o in shown)
+    listing = "; ".join(f"{_sel(o)}{str(o.get('text') or '')[:60]!r}{_row_value_suffix(o, rows)}" for o in shown)
     more = len(rows) - len(shown)
     next_step = (
         'click the intended row directly by its [data-tv3-sugg="N"] selector; the typed query was left '
@@ -4325,13 +4362,17 @@ _MENU_OPTION_TEXTS_JS = (
       // The DOM `.value` IDL is the spec submission value ALREADY -- an explicit `value=""` and an
       // absent attribute (which falls back to the option's own text) are genuinely distinct submission
       // values even though both can display identical text, so this always reads it, never null.
+      // NOT trimmed: the DOM preserves whitespace in option submission values, so "x" and "x " are
+      // genuinely distinct — the trim rule covers attribute-authoring drift, not submission values.
       val = String(el.value);
     } else {
       // Same presence rule as the OPTION branch: an attribute that EXISTS is a present value even
       // when empty -- `data-value=""` next to `data-value="x"` is a real disagreement, not absence.
       const dv = el.getAttribute('data-value');
       const va = el.getAttribute('value');
-      val = dv !== null ? dv : va;
+      // data-value is authoring metadata (whitespace drift between copies is presentational); a
+      // `value` attribute is a submission value and stays byte-exact like the OPTION branch above.
+      val = dv !== null ? String(dv).trim() : va !== null ? String(va) : null;
     }
     // The collapse's OWN value read: the verifier's declaredValues drops all-digit and >40-char
     // values on purpose (they must not CONFIRM a commit), but for telling two same-text rows apart a
@@ -4344,6 +4385,11 @@ _MENU_OPTION_TEXTS_JS = (
     const vetoVals = [];
     try {
       for (const node of new Set([el, opt || el])) {
+        // Keyed by SURFACE and attribute ("a:" the option row, "l:" a leaf inside it): crossed
+        // values across surfaces are disagreements a flat set cannot see. The key must come from
+        // DOM structure, not tagging depth — a self-tagged row and its twin tagged at a leaf must
+        // read the row's attributes under the same key, or equal renders refuse each other.
+        const where = node === (opt || el) ? 'a:' : 'l:';
         for (const a of node.attributes) {
           if (!VETO_ATTR.test(a.name)) continue;
           // Trimmed for comparison: whitespace drift between a portal copy and an inline copy is
@@ -4354,9 +4400,7 @@ _MENU_OPTION_TEXTS_JS = (
           // veto blind to distinct long values, while the fingerprint still tells apart any pair
           // differing in prefix or length. Only identical-prefix-same-length pairs read as equal.
           if (v.length > 512) v = v.slice(0, 512) + '#len' + v.length;
-          // Keyed by attribute: crossed values across surfaces (data-code="A" data-key="B" beside
-          // data-code="B" data-key="A") are a disagreement an unkeyed set cannot see.
-          vetoVals.push(a.name + '=' + v);
+          vetoVals.push(where + a.name + '=' + v);
         }
       }
     } catch (e) { /* attributes unreadable: no veto values */ }
@@ -4367,7 +4411,8 @@ _MENU_OPTION_TEXTS_JS = (
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
       pos: pos,
       val: val,
-      vals: vetoVals.slice(0, 12),
+      // 9 allowlisted attributes x 2 nodes = 18 possible entries; 24 can never truncate.
+      vals: vetoVals.slice(0, 24),
       // Names are FULL veto inputs (truncation happens only where a message renders them): a slice
       // here would read two labels diverging past the cut as equal and collapse distinct rows.
       label: (accessibleName(el) || accessibleName(opt)) || null,
@@ -5180,6 +5225,9 @@ async () => {
   // diverge whenever a retained control is dropped later for having no selector that names it.
   let hiddenKept = 0;
   let hiddenListed = 0;
+  // Candidates the visibility gates below drop. Those drops are silent, so a page whose whole app
+  // shell is behind a boot gate renders exactly like an empty one; this is what tells the two apart.
+  let hiddenDropped = 0;
   let phantomDropped = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
@@ -5293,12 +5341,12 @@ async () => {
     // like v1 (whose center_x check is only reached for a non-zero rect), so the zero-size
     // skinned-proxy carve-out below still runs for an off-screen-positioned skinned control.
     const centerX = (gr.left + gr.width) / 2 + window.scrollX;
-    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { continue; }
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && centerX < 0 && !_hScrolledAncestor(gateEl)) { hiddenDropped++; continue; }
     // v1's isElementStyleVisibilityVisible (domUtils.js) drops a control whose own computed
     // visibility is not 'visible'. Scoped to non-zero-rect elements so the zero-size skinned-proxy
     // carve-out below still runs; visibility is read per-element, so a visibility:visible child of a
     // hidden ancestor is kept. A native checkbox/radio judges the parent here instead of itself.
-    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { continue; }
+    if (ownGated && gr.width !== 0 && gr.height !== 0 && window.getComputedStyle(gateEl).visibility !== 'visible') { hiddenDropped++; continue; }
     let hidden = false;
     if (r.width === 0 || r.height === 0) {
       // Design systems skin a native SELECT/checkbox/radio/file input at zero size behind a styled
@@ -5319,6 +5367,7 @@ async () => {
         // only when it actually renders visible content, as v1's recursion does -- an empty,
         // all-hidden, or all-off-canvas host is a phantom.
       } else {
+        hiddenDropped++;
         continue;
       }
     }
@@ -5834,7 +5883,7 @@ async () => {
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
 
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
 }
 """
 )
@@ -6577,6 +6626,20 @@ def build_browser_tools(
             lines.append(
                 f"note: {hidden_kept} native control(s) hidden behind styled proxies are listed with [hidden-native]"
             )
+        hidden_dropped = data.get("hiddenDropped") or 0
+        # Scoped to total blindness: present-but-hidden chrome (closed menus, inactive tabs) is on
+        # nearly every page, so an unconditional note would cost the prefix on every call to say
+        # nothing. With no element listed the count is the whole signal -- it separates an app shell
+        # still behind its boot gate from a page that genuinely has no controls, which is the one
+        # distinction the model cannot otherwise make and will poll wait->observe for turns to guess.
+        # Deliberately time-neutral: a boot gate resolves on its own and a stuck one never does, and
+        # this cannot tell which, so the wording must not imply that waiting is what fixes it.
+        if not elements and hidden_dropped:
+            lines.append(
+                f"note: the page has {hidden_dropped} control(s) that are present but not visible "
+                "(CSS-hidden or positioned off-canvas): the DOM is populated but none of it is "
+                "currently actionable"
+            )
         phantom_dropped = data.get("phantomDropped") or 0
         if phantom_dropped:
             lines.append(
@@ -6753,6 +6816,7 @@ def build_browser_tools(
         summary = {
             "text_dropped": text_dropped,
             "hidden_listed": hidden_kept,
+            "hidden_dropped": hidden_dropped,
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
@@ -8753,7 +8817,8 @@ def build_browser_tools(
             def _listed_row(o: dict[str, Any], canon_text: str) -> str:
                 entry = f'[data-tv3-menu="{o.get("n")}"] {str(o.get("text") or "")[:60]!r}'
                 if text_counts[canon_text] >= 2:
-                    entry += _row_value_suffix(o)
+                    same_text = [p for p, pt in zip(shown, shown_canon_texts) if pt == canon_text]
+                    entry += _row_value_suffix(o, same_text)
                 return entry
 
             listing = "; ".join(_listed_row(o, t) for o, t in zip(shown, shown_canon_texts))
