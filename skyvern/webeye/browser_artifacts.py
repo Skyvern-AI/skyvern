@@ -56,6 +56,15 @@ class VideoArtifact(BaseModel):
     video_data: bytes = b""
 
 
+class RecordingPrefixSnapshot(BaseModel):
+    """A per-step upload plan for one growing recording: upload exactly ``prefix_len`` bytes of ``path``
+    (captured once) to the existing ``video_artifact_id``, streamed rather than buffered."""
+
+    video_artifact_id: str
+    path: str
+    prefix_len: int
+
+
 class BrowserArtifacts(BaseModel):
     video_artifacts: list[VideoArtifact] = []
     har_path: str | None = None

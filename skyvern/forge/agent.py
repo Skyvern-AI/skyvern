@@ -27,6 +27,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOAD_TIMEOUT,
     BROWSER_DOWNLOADING_SUFFIX,
+    BROWSER_PAGE_CLOSE_TIMEOUT,
     DEFAULT_MAX_SCREENSHOT_SCROLLS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
@@ -1102,6 +1103,57 @@ class ForgeAgent:
             )
 
         return files_to_rename
+
+    async def _close_claimed_download_popups(
+        self, task: Task, browser_state: BrowserState | None, claims: list[Page]
+    ) -> None:
+        """Bounded best-effort close of exactly the given recorded download-popup claims.
+
+        A file-download click that opens a new page is expected to have that page closed once the
+        download finishes, regardless of its URL. On dynamic/remote-CDP runs the download is carried by
+        the CDP monitor and credited by the file-scan task lifecycle after the action seam has returned,
+        so no Playwright popup download event fires and the in-seam cleanup never sees it — the popup
+        lingers and the next task can select it as the working page, wedging on screenshot/scrape/reload.
+        Called only once a download is durably credited, this closes exactly the recorded popup Pages
+        that are still open and still live in this run; an absent/closed page or a listing/close failure
+        never closes an unrelated page, and the opener (never recorded as a claim) is never touched.
+        """
+        if browser_state is None or not claims:
+            return
+        try:
+            valid_pages = await browser_state.list_valid_pages()
+        except Exception:
+            LOG.warning(
+                "Failed to list valid pages while closing credited download popups",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return
+        for popup in claims:
+            try:
+                if popup.is_closed():
+                    continue
+                if not any(candidate is popup for candidate in valid_pages):
+                    continue
+                # Bound the close so a hung popup cannot block the completed-task handoff.
+                async with asyncio.timeout(BROWSER_PAGE_CLOSE_TIMEOUT):
+                    await popup.close()
+                LOG.info("Closed credited download popup", task_id=task.task_id)
+            except Exception:
+                LOG.warning(
+                    "Failed to close credited download popup",
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
+
+    async def _close_credited_download_popups(self, task: Task, browser_state: BrowserState | None) -> None:
+        """complete_on_download credit seam: take this task's recorded download-popup claims and close
+        the popups the download action opened."""
+        context = skyvern_context.current()
+        if context is None:
+            return
+        claims = context.take_download_popup_claims(task.task_id)
+        await self._close_claimed_download_popups(task, browser_state, claims)
 
     async def _wait_for_in_flight_downloads(
         self,
@@ -2765,6 +2817,9 @@ class ForgeAgent:
                         num_files_after=len(list_files_before) + len(files_to_rename),
                         new_files=files_to_rename,
                     )
+                    # The download is durably credited now; close the popup(s) the download action
+                    # opened so the next task does not select one as its working page.
+                    await self._close_credited_download_popups(task, browser_state)
                     last_step = await self.update_step(step, is_last=True)
                     completed_task = await self.update_task(
                         task,
@@ -5172,14 +5227,46 @@ class ForgeAgent:
         if not browser_state:
             return
         try:
-            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state, finalize=False
+            snapshots = app.BROWSER_MANAGER.snapshot_recording_prefixes(
+                browser_state=browser_state, task_id=task.task_id
             )
-            for video_artifact in video_artifacts:
-                await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
+            if snapshots is None:
+                # An artifact needs the remux/finalize (or first-registration) semantics owned by the
+                # byte-based path; preserve it exactly rather than stream a partial prefix.
+                video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                    task_id=task.task_id, browser_state=browser_state, finalize=False
+                )
+                for video_artifact in video_artifacts:
+                    registered_video_path = video_artifact.video_path
+                    if (
+                        video_artifact.video_artifact_id
+                        and registered_video_path
+                        and not os.path.exists(registered_video_path)
+                    ):
+                        # Local file raced teardown: get_video_artifacts returned stale cached bytes.
+                        # Writing them would clobber the newer streamed prefix (see cleanup_and_persist_task).
+                        LOG.info(
+                            "Registered recording path missing; preserving latest stored prefix",
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            video_artifact_id=video_artifact.video_artifact_id,
+                            video_path=registered_video_path,
+                        )
+                        continue
+                    # Mid-step fallback, not a terminal finalize: must not seal/supersede a queued prefix.
+                    await app.ARTIFACT_MANAGER.update_artifact_data(
+                        artifact_id=video_artifact.video_artifact_id,
+                        organization_id=task.organization_id,
+                        data=video_artifact.video_data,
+                        supersede_queued_prefixes=False,
+                    )
+                return
+            for snapshot in snapshots:
+                await app.ARTIFACT_MANAGER.stream_artifact_prefix_from_path(
+                    artifact_id=snapshot.video_artifact_id,
                     organization_id=task.organization_id,
-                    data=video_artifact.video_data,
+                    path=snapshot.path,
+                    length=snapshot.prefix_len,
                 )
         except Exception:
             LOG.warning(
@@ -5411,19 +5498,28 @@ class ForgeAgent:
         # The recording file is still open here, so skip the ffmpeg remux — matches the
         # per-step sync path; the finalized upload happens in cleanup_and_persist_task.
         if browser_state and browser_state.browser_artifacts:
-            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
-                task_id=task.task_id, browser_state=browser_state, finalize=False
-            )
-            for idx, video_artifact in enumerate(video_artifacts):
-                if video_artifact.video_artifact_id:
-                    continue
-                video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.RECORDING,
-                    data=video_artifact.video_data,
+            # Only read recording bytes to register a not-yet-tracked recording: the empty/initial
+            # list (first registration, incl. vendor/CDP browsers whose recordings attach later) or a
+            # later popup/new-page recording that still lacks an id. Once every tracked recording is
+            # registered, the per-step streaming sync path grows it without re-reading the whole
+            # (growing) file here every step.
+            tracked_video_artifacts = browser_state.browser_artifacts.video_artifacts
+            if not tracked_video_artifacts or any(
+                not video_artifact.video_artifact_id for video_artifact in tracked_video_artifacts
+            ):
+                video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                    task_id=task.task_id, browser_state=browser_state, finalize=False
                 )
-                video_artifacts[idx].video_artifact_id = video_artifact_id
-            app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
+                for idx, video_artifact in enumerate(video_artifacts):
+                    if video_artifact.video_artifact_id:
+                        continue
+                    video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                    )
+                    video_artifacts[idx].video_artifact_id = video_artifact_id
+                app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
 
         detailed_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -6683,6 +6779,17 @@ class ForgeAgent:
         """
         send the task response to the webhook callback url
         """
+        # Task-terminal expiry for download-popup claims: clean_up_task runs exactly when a task
+        # reaches a terminal state (and not on retries, where the same task's next step may still
+        # credit the download). Take (and drop) the claims into a local now, so terminal expiry holds
+        # even if the DB refresh or later cleanup raises; if cleanup's own download finalization proves
+        # a durable credit below, these held claims get the same bounded popup close as the
+        # complete_on_download seam, otherwise they simply expire. (That seam already popped its own
+        # claims, so this is empty on the completed-download path.)
+        _claim_context = skyvern_context.current()
+        cleanup_download_popup_claims = (
+            _claim_context.take_download_popup_claims(task.task_id) if _claim_context is not None else []
+        )
         _cleanup_span = otel_trace.get_current_span()
         # task_id, workflow_run_id auto-attached by @traced from SkyvernContext.
         _cleanup_span.set_attribute("close_browser_on_completion", bool(close_browser_on_completion))
@@ -6756,13 +6863,20 @@ class ForgeAgent:
                         async with settle_browser_downloads_for_context(browser_context):
                             pass
                         if download_suffix and list_files_before is not None:
-                            await self._finalize_downloaded_files_for_task(
+                            cleanup_finalized_files = await self._finalize_downloaded_files_for_task(
                                 task,
                                 organization_id=task.organization_id,
                                 download_suffix=download_suffix,
                                 list_files_before=list_files_before,
                                 randomize_if_missing=False,
                             )
+                            # Cleanup finalization is the second durable-credit seam: only when it
+                            # proves a new file did the download land, so only then close the popups the
+                            # download action opened (using the claims taken at cleanup entry).
+                            if cleanup_finalized_files:
+                                await self._close_claimed_download_popups(
+                                    task, browser_state, cleanup_download_popup_claims
+                                )
                         try:
                             await app.STORAGE.save_downloaded_files(
                                 organization_id=task.organization_id,
@@ -7167,19 +7281,37 @@ class ForgeAgent:
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 if video_artifact.video_artifact_id:
+                    registered_video_path = video_artifact.video_path
+                    if registered_video_path and not os.path.exists(registered_video_path):
+                        # The local file is gone (path raced teardown) so get_video_artifacts could not
+                        # refresh the cached bytes; writing them would clobber the newer streamed prefix.
+                        LOG.info(
+                            "Registered recording path missing; preserving latest stored prefix",
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            video_artifact_id=video_artifact.video_artifact_id,
+                            video_path=registered_video_path,
+                        )
+                        continue
                     try:
+                        # Only a true terminal finalize (browser closed -> recording complete) may
+                        # supersede queued prefixes. On an intermediate cleanup the recording is still
+                        # growing and its prefixes are still legitimately being streamed, so sealing the
+                        # live key would kill per-step visibility (see manager.update_artifact_data).
                         if video_artifact.video_file_extension:
                             await app.ARTIFACT_MANAGER.update_artifact_data(
                                 artifact_id=video_artifact.video_artifact_id,
                                 organization_id=task.organization_id,
                                 data=video_artifact.video_data,
                                 file_extension=video_artifact.video_file_extension,
+                                supersede_queued_prefixes=close_browser_on_completion,
                             )
                         else:
                             await app.ARTIFACT_MANAGER.update_artifact_data(
                                 artifact_id=video_artifact.video_artifact_id,
                                 organization_id=task.organization_id,
                                 data=video_artifact.video_data,
+                                supersede_queued_prefixes=close_browser_on_completion,
                             )
                     except Exception:
                         LOG.warning(

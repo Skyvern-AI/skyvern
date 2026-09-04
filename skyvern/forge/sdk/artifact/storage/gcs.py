@@ -137,7 +137,13 @@ class GcsStorage(BaseStorage):
             file_path=file_path,
         )
 
-    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+    async def store_artifact(
+        self,
+        artifact: Artifact,
+        data: bytes,
+        supersede_queued_prefixes: bool = False,
+        prefix_uri: str | None = None,
+    ) -> None:
         storage_class = await self._get_storage_class_for_org(artifact.organization_id)
         tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(

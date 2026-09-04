@@ -226,7 +226,18 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+    async def store_artifact(
+        self,
+        artifact: Artifact,
+        data: bytes,
+        supersede_queued_prefixes: bool = False,
+        prefix_uri: str | None = None,
+    ) -> None:
+        # supersede_queued_prefixes marks a recording's finalize write and prefix_uri names the pre-finalize
+        # key its per-step prefixes queued to (when the finalize renames the object, e.g. .webm -> .mp4).
+        # Only the S3 backend serializes prefix vs finalize writes and acts on these; other backends ignore
+        # them and just overwrite, so the stale-prefix-cannot-overwrite-the-finalized-object ordering
+        # guarantee holds on S3 only (see store_artifact_prefix_from_path).
         pass
 
     @abstractmethod
@@ -252,6 +263,18 @@ class BaseStorage(ABC):
     @abstractmethod
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         pass
+
+    async def store_artifact_prefix_from_path(self, artifact: Artifact, path: str, length: int) -> None:
+        """Upload exactly the first ``length`` bytes of ``path`` (a snapshot of a still-growing file).
+
+        The default reads that bounded prefix and delegates to ``store_artifact``; backends that can
+        stream override this to avoid materializing the prefix in memory. The default buffers, so on
+        local/GCS/Azure a per-step prefix is not serialized against the finalize write — only S3 orders
+        them so a stale prefix cannot overwrite the finalized object.
+        """
+        with open(path, "rb") as f:
+            data = f.read(length)
+        await self.store_artifact(artifact, data)
 
     @abstractmethod
     async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:

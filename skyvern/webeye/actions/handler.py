@@ -4040,6 +4040,13 @@ class ActionHandler:
 
                         download_page.on("download", capture_download)
                         download_callbacks.append((download_page, capture_download))
+                        # Record identity for the task-scoped late cleanup too: if the download is
+                        # credited only after this seam returns, the credit path can still close the
+                        # marker popup. In-seam cleanup below stays the primary close; the claim is a
+                        # superset backstop, deduped by exact Page identity.
+                        _claim_context = skyvern_context.current()
+                        if _claim_context is not None:
+                            _claim_context.record_download_popup_claim(task.task_id, download_page)
 
                     page.on("popup", on_popup)
 
@@ -4192,6 +4199,16 @@ class ActionHandler:
             popup_page.on("download", _capture_download_event)
             download_popup_callbacks.append((popup_page, _capture_download_event))
 
+        def _record_download_popup_claim(popup_page: Page) -> None:
+            # Record popup identity only (no download-listener wiring, so managed-session download
+            # behavior is unchanged). Ungated by browser_session_id: a dynamic/remote-CDP run mints the
+            # download through the CDP monitor + file-scan task credit, which fires no Playwright popup
+            # download event and lands after this seam returns, so the never-committed marker popup must
+            # be recorded here for the task's credit seam to close it later.
+            _claim_context = skyvern_context.current()
+            if _claim_context is not None:
+                _claim_context.record_download_popup_claim(task.task_id, popup_page)
+
         def _download_signal_identity(file: str) -> str:
             return file.removesuffix(BROWSER_DOWNLOADING_SUFFIX)
 
@@ -4314,6 +4331,8 @@ class ActionHandler:
             workflow_run_id=task.workflow_run_id,
         )
         page.on("download", _capture_download_event)
+        # Identity-only recorder for the task-scoped late cleanup, armed for every download click.
+        page.on("popup", _record_download_popup_claim)
         # Popup-owned blob downloads only matter for adopted/persistent sessions; managed sessions
         # keep their existing single-page download behavior with no popup-download wiring.
         if task.browser_session_id:
@@ -4865,6 +4884,11 @@ class ActionHandler:
                     _remove_download_listener(observed_popup, popup_callback)
                 except Exception:
                     LOG.warning("Failed to remove download popup listener", exc_info=True)
+            try:
+                _remove_popup_listener(page, _record_download_popup_claim)
+            except Exception:
+                with contained_effect("remove download popup claim recorder"):
+                    LOG.warning("Failed to remove download popup claim recorder", exc_info=True)
             if task.browser_session_id:
                 try:
                     _remove_popup_listener(page, _register_download_popup)

@@ -130,7 +130,13 @@ class LocalStorage(BaseStorage):
             file_path=file_path,
         )
 
-    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+    async def store_artifact(
+        self,
+        artifact: Artifact,
+        data: bytes,
+        supersede_queued_prefixes: bool = False,
+        prefix_uri: str | None = None,
+    ) -> None:
         file_path = None
         try:
             file_path = Path(parse_uri_to_path(artifact.uri))

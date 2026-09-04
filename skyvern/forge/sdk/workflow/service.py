@@ -11769,19 +11769,38 @@ class WorkflowService:
         last_step_resolved = False
         for video_artifact in video_artifacts:
             if video_artifact.video_artifact_id:
+                registered_video_path = video_artifact.video_path
+                if registered_video_path and not os.path.exists(registered_video_path):
+                    # The local file is gone (path raced teardown) so get_video_artifacts could not
+                    # refresh the cached bytes; writing them would clobber the newer streamed prefix.
+                    LOG.info(
+                        "Registered recording path missing; preserving latest stored prefix",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=workflow_run.organization_id,
+                        video_artifact_id=video_artifact.video_artifact_id,
+                        video_path=registered_video_path,
+                    )
+                    continue
                 try:
+                    # Only a true terminal finalize (workflow / task-v2 / code-block, browser closed ->
+                    # recording complete) may supersede queued prefixes. On an intermediate persist the
+                    # recording is still growing and its prefixes are still legitimately streaming, so
+                    # sealing the live key would kill per-step visibility (see manager.update_artifact_data).
                     if video_artifact.video_file_extension:
                         upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
                             artifact_id=video_artifact.video_artifact_id,
                             organization_id=workflow_run.organization_id,
                             data=video_artifact.video_data,
                             file_extension=video_artifact.video_file_extension,
+                            supersede_queued_prefixes=close_browser_on_completion,
                         )
                     else:
                         upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
                             artifact_id=video_artifact.video_artifact_id,
                             organization_id=workflow_run.organization_id,
                             data=video_artifact.video_data,
+                            supersede_queued_prefixes=close_browser_on_completion,
                         )
                 except Exception:
                     LOG.warning(

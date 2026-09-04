@@ -20,6 +20,7 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import BlockedHost
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import (
     ActionStatus,
@@ -2676,10 +2677,14 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
     assert results[-1].followup_message == DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
     assert wait_for_downloads.await_count == 0
     page.off.assert_any_call("download", download_listeners["download"])
-    # Managed (non-adopted) sessions must not gain popup-download-event wiring.
-    assert "popup" not in download_listeners
-    assert not any(c.args and c.args[0] == "popup" for c in page.on.call_args_list)
-    assert not any(c.args and c.args[0] == "popup" for c in page.off.call_args_list)
+    # Managed (non-adopted) sessions now gain the identity-only download-popup claim recorder, but
+    # must not gain popup-download-EVENT wiring: firing the recorded popup listener attaches no
+    # download listener to the popup (SKY-12621 invariant preserved).
+    popup_cb = download_listeners.get("popup")
+    assert popup_cb is not None
+    sentinel_popup = MagicMock()
+    popup_cb(sentinel_popup)
+    sentinel_popup.on.assert_not_called()
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_signal_observed"] is False
     assert span_attrs["download_wait_extended_for_in_flight_request"] is False
@@ -6145,8 +6150,13 @@ async def test_handle_action_managed_session_disables_eager_and_popup_wiring() -
             )
 
     assert captured_kwargs.get("enabled") is False
-    assert "popup" not in page_listeners
-    assert not any(c.args and c.args[0] == "popup" for c in page.on.call_args_list)
+    # Managed sessions now gain the identity-only download-popup claim recorder, but no popup-download
+    # -event wiring: firing the recorded popup listener attaches no download listener to the popup.
+    popup_cb = page_listeners.get("popup")
+    assert popup_cb is not None
+    sentinel_popup = MagicMock()
+    popup_cb(sentinel_popup)
+    sentinel_popup.on.assert_not_called()
 
 
 def _blob_download(url: str, suggested_filename: str) -> MagicMock:
@@ -7130,3 +7140,83 @@ async def test_local_artifact_skips_provider_at_finalization_without_duplicate()
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == action.downloaded_files == ["report.pdf"]
     assert observation.poll_deadlines == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_download_marker_popup_recorded_as_claim(tmp_path: Path) -> None:
+    """SKY-15371 follow-up, deployed-#16476 reproduction: an explicit ``action.download=True`` click on
+    a run with no ``browser_session_id`` opens a never-committed ``":"`` popup and mints no Playwright
+    download event, so the action returns ``download_triggered=False`` and the popup is left open. The
+    exact popup Page must be recorded as a task-scoped claim so a download credited later (via the CDP
+    monitor / file-scan task lifecycle, which never fires a Playwright popup download event) can close
+    it. Pre-fix the only popup recorder was gated behind ``browser_session_id``, so nothing was recorded
+    for these dynamic-CDP runs and the marker popup leaked into the next task's working-page selection."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.test/documents",
+    )
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    page.context._skyvern_cdp_download_active = False
+
+    popup_callbacks: list[Callable] = []
+
+    def _capture_on(event: str, callback: Callable) -> None:
+        if event == "popup":
+            popup_callbacks.append(callback)
+
+    page.on.side_effect = _capture_on
+
+    marker_popup = MagicMock(url=":")
+    marker_popup.is_closed.return_value = False
+    marker_popup.close = AsyncMock()
+
+    async def click_opens_marker_popup(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        # The click opens the download popup; no Playwright download event ever fires on it.
+        for callback in popup_callbacks:
+            callback(marker_popup)
+        return [ActionSuccess()]
+
+    ctx = SkyvernContext(
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        organization_id=organization.organization_id,
+    )
+    xhr_capture = MagicMock(has_in_flight_requests=False)
+    xhr_capture.drain = AsyncMock(return_value=False)
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with (
+        patch.object(ActionHandler, "_handle_action", side_effect=click_opens_marker_popup),
+        patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
+        patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+        patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=xhr_capture),
+        patch(
+            "skyvern.webeye.actions.handler._recover_blocked_inline_pdf_download",
+            new=AsyncMock(return_value=None),
+        ),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=ctx),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        results = await ActionHandler.handle_action(
+            scraped_page=scraped_page,
+            task=task,
+            step=step,
+            page=page,
+            action=action,
+        )
+
+    assert results[-1].download_triggered is False
+    # handle_action itself must not close the popup; closing is deferred to the durable credit seam.
+    marker_popup.close.assert_not_called()
+    claims = ctx.download_popup_claims.get(task.task_id, [])
+    assert any(candidate is marker_popup for candidate in claims), (
+        "explicit-download marker popup must be recorded as a task-scoped claim"
+    )
