@@ -10,7 +10,7 @@ import asyncio
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -52,6 +52,7 @@ def make_workflow_run(
 
 def configure_browser_context_acquired_hook(mock_app: MagicMock) -> None:
     mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+    mock_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock()
 
 
 class _StopBeforeBrowserContext(Exception):
@@ -1269,6 +1270,60 @@ async def test_script_acquisition_reports_a_live_session_before_the_lease_exists
     # The lease takes over with no gap once the attach completes.
     assert manager._persistent_session_leases["s_attach"].runnable_id == "s_attach"
     assert manager.live_session_runnable_ids() == {"s_attach"}
+
+
+@pytest.mark.asyncio
+async def test_attached_run_renews_the_session_activity_lease() -> None:
+    # Only the CDP proxy wrote last_activity_at, so a run attached off-proxy read as never-active and
+    # its session was closed mid-step (SKY-15568).
+    manager = RealBrowserManager()
+    pbs_state = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch.object(real_browser_manager, "SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS", 0.01),
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(return_value="gen_renew")
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        touch = AsyncMock()
+        mock_app.DATABASE.browser_sessions.touch_last_activity = touch
+
+        try:
+            await manager.get_or_create_for_script(
+                script_id="s_renew",
+                browser_session_id="pbs_renew",
+                organization_id="org_test",
+            )
+
+            await asyncio.sleep(0.05)
+            assert touch.await_args_list.count(call("pbs_renew")) > 0
+
+            # A failed release keeps the lease for cleanup attribution; renewal must still stop there.
+            mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session = AsyncMock(return_value=False)
+            await manager._release_persistent_session(
+                "pbs_renew", "org_test", manager._persistent_session_leases["s_renew"]
+            )
+            assert "s_renew" in manager._persistent_session_leases, "the lease is retained on a failed release"
+
+            touch.reset_mock()
+            await asyncio.sleep(0.05)
+            assert touch.await_args_list == []
+
+            # A successful release drops the lease and its marker, and the renewer exits with nothing left.
+            pbs_state.close = AsyncMock()
+            pbs_state.browser_artifacts.traces_dir = None
+            mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session = AsyncMock(return_value=True)
+            await manager.cleanup_for_script("s_renew", browser_session_id="pbs_renew", organization_id="org_test")
+            assert "s_renew" not in manager._persistent_session_leases
+            assert manager._released_session_ids == set()
+            await asyncio.sleep(0.05)
+            assert manager._session_activity_renewer is not None and manager._session_activity_renewer.done()
+        finally:
+            if manager._session_activity_renewer is not None:
+                manager._session_activity_renewer.cancel()
 
 
 @pytest.mark.asyncio

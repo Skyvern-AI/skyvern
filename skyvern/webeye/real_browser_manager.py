@@ -55,6 +55,10 @@ LOG = structlog.get_logger()
 
 _WORKFLOW_RUN_KEY_PREFIX = f"{WORKFLOW_RUN_PREFIX}_"
 
+# Matched to the CDP proxy's own stamp throttle: the idle budget it feeds is minutes (MIN_TIMEOUT is
+# 5), so a stamp this stale still resolves the session active.
+SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS = 30.0
+
 # Only driver/transport-level CDP drops trigger the cached-PBS evict + reconnect path.
 # Playwright also surfaces page/context-only closes ("Target page, context or browser
 # has been closed") with text that overlaps a transport drop; treating those as cached
@@ -273,6 +277,11 @@ class RealBrowserManager(BrowserManager):
         # ``_start_frame_publisher`` so concurrent attaches for one stream key
         # cannot orphan a publisher loop.
         self._publisher_lock = asyncio.Lock()
+        # Started at the first lease: no event loop runs when the process-wide manager is built.
+        self._session_activity_renewer: asyncio.Task[None] | None = None
+        # A failed release retains its lease for cleanup attribution but must stop renewing: the
+        # stamp outlives this process and would hold a browser past every deadline that reclaims it.
+        self._released_session_ids: set[str] = set()
 
     @staticmethod
     def _matching_session_lease(
@@ -290,6 +299,7 @@ class RealBrowserManager(BrowserManager):
         organization_id: str,
         lease: _PersistentSessionLease | None,
     ) -> bool:
+        self._released_session_ids.add(session_id)
         owner = self._matching_session_lease(lease, session_id, organization_id)
         context = skyvern_context.current()
         expected_runnable_id: str | None = context.browser_session_runnable_id if context else None
@@ -313,6 +323,7 @@ class RealBrowserManager(BrowserManager):
     def _discard_session_lease(self, run_id: str, lease: _PersistentSessionLease | None) -> None:
         if lease is not None and self._persistent_session_leases.get(run_id) is lease:
             self._persistent_session_leases.pop(run_id, None)
+            self._released_session_ids.discard(lease.session_id)
 
     @asynccontextmanager
     async def acquiring_session_runnable(self, runnable_id: str | None) -> AsyncIterator[None]:
@@ -330,6 +341,35 @@ class RealBrowserManager(BrowserManager):
                     acquiring_runnables[runnable_id] = remaining
                 else:
                     acquiring_runnables.pop(runnable_id, None)
+
+    def _store_session_lease(self, run_id: str, lease: _PersistentSessionLease) -> None:
+        self._persistent_session_leases[run_id] = lease
+        self._released_session_ids.discard(lease.session_id)
+        if self._session_activity_renewer is None or self._session_activity_renewer.done():
+            self._session_activity_renewer = asyncio.create_task(
+                self._renew_session_activity_leases(), name="persistent_session_activity_renewal"
+            )
+
+    def _renewable_session_ids(self) -> set[str]:
+        held = {lease.session_id for lease in self._persistent_session_leases.values()}
+        return held - self._released_session_ids
+
+    async def _renew_session_activity_leases(self) -> None:
+        # The session Pod ends a session on last_activity_at alone, and only the CDP proxy wrote it, so
+        # a run driving a browser it did not reach through the proxy was closed mid-step (SKY-15568).
+        # Sleeps before the first stamp: the base budget covers a fresh attach, and a run shorter than
+        # the interval never writes. Exits once nothing is renewable; the next lease starts a fresh task.
+        while self._renewable_session_ids():
+            await asyncio.sleep(SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS)
+            for session_id in self._renewable_session_ids():
+                try:
+                    await app.DATABASE.browser_sessions.touch_last_activity(session_id)
+                except Exception:
+                    LOG.warning(
+                        "Failed to renew browser session activity lease",
+                        browser_session_id=session_id,
+                        exc_info=True,
+                    )
 
     def live_session_runnable_ids(self) -> set[str]:
         lease_runnable_ids = {lease.runnable_id for lease in self._persistent_session_leases.values()}
@@ -751,12 +791,15 @@ class RealBrowserManager(BrowserManager):
                     else:
                         LOG.warning("Organization ID is not set for task", task_id=task.task_id)
                     await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
-                    self._persistent_session_leases[expected_runnable_id] = _PersistentSessionLease(
-                        session_id=browser_session_id,
-                        organization_id=task.organization_id,
-                        runnable_id=expected_runnable_id,
-                        runnable_generation_id=expected_runnable_generation_id,
-                        browser_state=browser_state,
+                    self._store_session_lease(
+                        expected_runnable_id,
+                        _PersistentSessionLease(
+                            session_id=browser_session_id,
+                            organization_id=task.organization_id,
+                            runnable_id=expected_runnable_id,
+                            runnable_generation_id=expected_runnable_generation_id,
+                            browser_state=browser_state,
+                        ),
                     )
             if browser_state is not None:
                 page = await browser_state.get_working_page()
@@ -964,12 +1007,15 @@ class RealBrowserManager(BrowserManager):
                     # It cannot rebind that runnable's download directory or acquire a cleanup lease.
                     if expected_runnable_id is not None:
                         await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
-                        self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
-                            session_id=browser_session_id,
-                            organization_id=workflow_run.organization_id,
-                            runnable_id=expected_runnable_id,
-                            runnable_generation_id=expected_runnable_generation_id,
-                            browser_state=browser_state,
+                        self._store_session_lease(
+                            workflow_run.workflow_run_id,
+                            _PersistentSessionLease(
+                                session_id=browser_session_id,
+                                organization_id=workflow_run.organization_id,
+                                runnable_id=expected_runnable_id,
+                                runnable_generation_id=expected_runnable_generation_id,
+                                browser_state=browser_state,
+                            ),
                         )
             if browser_state is None:
                 LOG.warning(
@@ -1020,12 +1066,15 @@ class RealBrowserManager(BrowserManager):
                             if browser_state is None:
                                 raise
                             if expected_runnable_id is not None:
-                                self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
-                                    session_id=browser_session_id,
-                                    organization_id=workflow_run.organization_id,
-                                    runnable_id=expected_runnable_id,
-                                    runnable_generation_id=expected_runnable_generation_id,
-                                    browser_state=browser_state,
+                                self._store_session_lease(
+                                    workflow_run.workflow_run_id,
+                                    _PersistentSessionLease(
+                                        session_id=browser_session_id,
+                                        organization_id=workflow_run.organization_id,
+                                        runnable_id=expected_runnable_id,
+                                        runnable_generation_id=expected_runnable_generation_id,
+                                        browser_state=browser_state,
+                                    ),
                                 )
                                 await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                             page = await browser_state.get_working_page()
@@ -1232,6 +1281,9 @@ class RealBrowserManager(BrowserManager):
 
     async def close(self) -> None:
         LOG.info("Closing BrowserManager")
+        if self._session_activity_renewer is not None:
+            self._session_activity_renewer.cancel()
+            self._session_activity_renewer = None
         # Stop all streaming frame publishers before closing browsers so CDP
         # sessions detach cleanly. Cancellation here is best-effort and must
         # not block manager shutdown.
@@ -1566,12 +1618,15 @@ class RealBrowserManager(BrowserManager):
                     # browser below would produce an unregistered state that terminal cleanup misclassifies as
                     # a reusable persistent session (keyed off browser_session_id) and leaks instead of closes.
                     raise MissingBrowserStateForBrowserSession(browser_session_id)
-                self._persistent_session_leases[script_id] = _PersistentSessionLease(
-                    session_id=browser_session_id,
-                    organization_id=organization_id,
-                    runnable_id=script_id,
-                    runnable_generation_id=expected_runnable_generation_id,
-                    browser_state=browser_state,
+                self._store_session_lease(
+                    script_id,
+                    _PersistentSessionLease(
+                        session_id=browser_session_id,
+                        organization_id=organization_id,
+                        runnable_id=script_id,
+                        runnable_generation_id=expected_runnable_generation_id,
+                        browser_state=browser_state,
+                    ),
                 )
             page = await browser_state.get_working_page()
             if not page:
