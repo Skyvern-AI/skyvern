@@ -30,6 +30,9 @@ Skyvern-AI/skyvern-cloud:
   - source: docs/
     dest: docs/
     deleteOrphaned: true
+  - source: blogs/
+    dest: blogs/
+    deleteOrphaned: true
   - source: tests/__init__.py
     dest: tests/__init__.py
   - source: tests/conftest.py
@@ -45,3 +48,4 @@ Skyvern-AI/skyvern-cloud:
   - source: tests/smoke_tests/
     dest: tests/smoke_tests/
     deleteOrphaned: true
+

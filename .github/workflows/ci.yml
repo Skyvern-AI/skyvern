@@ -34,11 +34,75 @@ jobs:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
         with:
           persist-credentials: false
+          fetch-depth: 0
       # If you wanted to use multiple Python versions, you'd have specify a matrix in the job and
       # reference the matrixe python version here.
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.11"
+      - name: Install blog validator dependencies
+        run: >-
+          python3 -m pip install --disable-pip-version-check --no-deps
+          markdown-it-py==4.2.0 linkify-it-py==2.0.3
+          mdit-py-plugins==0.6.1 mdurl==0.1.2 uc-micro-py==2.0.0
+      - name: Validate blog content
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          base_ref="${PR_BASE_SHA:-}"
+          if [[ -z "$base_ref" && -n "${PUSH_BASE_SHA:-}" && ! "$PUSH_BASE_SHA" =~ ^0+$ ]]; then
+            base_ref="$PUSH_BASE_SHA"
+          elif [[ -z "$base_ref" ]] && git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base_ref="HEAD^"
+          fi
+
+          guarded_paths=(
+            blogs/
+            .github/sync.yml
+            .github/workflows/ci.yml
+            scripts/validate_blog_content.py
+            scripts/tests/test_validate_blog_content.py
+            scripts/blog_content_contract.json
+            scripts/blog_content_bootstrap_hashes.json
+            scripts/blog_content_published_slugs.txt
+          )
+
+          if [[ -n "$base_ref" ]] && git cat-file -e "${base_ref}:scripts/validate_blog_content.py" 2>/dev/null; then
+            trusted_root="$RUNNER_TEMP/blog-validator-base"
+            rm -rf "$trusted_root"
+            mkdir -p "$trusted_root"
+            base_archive_paths=("${guarded_paths[@]:1}")
+            while IFS= read -r path; do
+              relative_path="${path#blogs/}"
+              if [[ "$relative_path" == *.md && "$relative_path" != */* ]]; then
+                base_archive_paths+=("$path")
+              fi
+            done < <(git ls-tree -r --name-only "$base_ref" -- blogs/)
+            git archive "$base_ref" -- "${base_archive_paths[@]}" | tar -xf - -C "$trusted_root"
+
+            (
+              cd "$trusted_root"
+              python3 -m unittest -v scripts.tests.test_validate_blog_content
+            )
+            python3 "$trusted_root/scripts/validate_blog_content.py" \
+              --root "$GITHUB_WORKSPACE" \
+              --base-root "$trusted_root"
+            exit 0
+          fi
+
+          python3 -m unittest -v scripts.tests.test_validate_blog_content
+          validator_args=(--root "$GITHUB_WORKSPACE" --bootstrap)
+          if python3 -c 'import json; from pathlib import Path; raise SystemExit(json.loads(Path("scripts/blog_content_contract.json").read_text())["bootstrapComplete"] is not False)'; then
+            validator_args+=(--pre-apply)
+          fi
+          if [[ -n "$base_ref" ]]; then
+            validator_args+=(--base-ref "$base_ref")
+          fi
+          python3 scripts/validate_blog_content.py "${validator_args[@]}"
       # Install uv (fast, single-file binary)
       - name: Install uv
         run: |
@@ -162,3 +226,4 @@ jobs:
           cache-dependency-path: skyvern-frontend/package-lock.json
       - name: Run pip package smoke tests
         run: PYTHON_IMAGE=python:${{ matrix.python-version }}-slim scripts/test-pip-ui-package.sh
+
