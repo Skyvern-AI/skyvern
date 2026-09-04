@@ -8,6 +8,9 @@ before and after every extraction.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -26,7 +29,11 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.sdk.workflow.service import DebugSessionProfileDecision, WorkflowService
+from skyvern.forge.sdk.workflow.service import (
+    DebugSessionProfileDecision,
+    WorkflowRunDispatchStopped,
+    WorkflowService,
+)
 from skyvern.schemas.scripts import ScriptBlock
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.services import script_service
@@ -154,6 +161,188 @@ def _stub_run_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     # get_all_parameters needs a sync context object; the stub app's auto-AsyncMock returns a coroutine.
     monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", MagicMock(return_value=MagicMock()))
 
+    @asynccontextmanager
+    async def admit_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield _workflow_run()
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", admit_dispatch)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_waits_for_successful_admission_scope_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope_exiting = asyncio.Event()
+    release_scope = asyncio.Event()
+    executor_started = asyncio.Event()
+
+    @asynccontextmanager
+    async def admit_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield _workflow_run()
+        scope_exiting.set()
+        await release_scope.wait()
+
+    async def execute() -> str:
+        executor_started.set()
+        return "executed"
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", admit_dispatch)
+    dispatch_task = asyncio.create_task(WorkflowService()._dispatch_workflow_run_block("wr_test", execute))
+
+    await scope_exiting.wait()
+    next_turn = asyncio.get_running_loop().create_future()
+    asyncio.get_running_loop().call_soon(next_turn.set_result, None)
+    await next_turn
+    assert executor_started.is_set() is False
+
+    release_scope.set()
+    assert await dispatch_task == "executed"
+    assert executor_started.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_cancels_dormant_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope_exiting = asyncio.Event()
+    release_scope = asyncio.Event()
+    execute = AsyncMock()
+
+    @asynccontextmanager
+    async def admit_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield _workflow_run()
+        scope_exiting.set()
+        await release_scope.wait()
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", admit_dispatch)
+    dispatch_task = asyncio.create_task(WorkflowService()._dispatch_workflow_run_block("wr_test", execute))
+    await scope_exiting.wait()
+
+    dispatch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch_task
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_propagates_executor_exception_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    execute = AsyncMock(side_effect=RuntimeError("executor failed"))
+
+    with pytest.raises(RuntimeError, match="executor failed"):
+        await WorkflowService()._dispatch_workflow_run_block("wr_test", execute)
+
+    execute.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scope_failure_cancels_dormant_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    execute = AsyncMock(return_value="must not run")
+
+    @asynccontextmanager
+    async def admit_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield _workflow_run()
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", admit_dispatch)
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await WorkflowService()._dispatch_workflow_run_block("wr_test", execute)
+
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_initial_read_prevents_agent_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    canceled_run = _workflow_run()
+    canceled_run.status = WorkflowRunStatus.canceled
+
+    @asynccontextmanager
+    async def deny_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield canceled_run
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", deny_dispatch)
+    execute_safe = AsyncMock()
+    monkeypatch.setattr(NavigationBlock, "execute_safe", execute_safe)
+
+    workflow_run, _, block_result, should_stop, _ = await _run_single_block(WorkflowService(), _navigation_block("nav"))
+
+    assert workflow_run is canceled_run
+    assert block_result is None
+    assert should_stop is True
+    execute_safe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_script_handoff_prevents_script_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    canceled_run = _workflow_run()
+    canceled_run.status = WorkflowRunStatus.canceled
+
+    @asynccontextmanager
+    async def deny_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield canceled_run
+
+    script_calls: list[str] = []
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", deny_dispatch)
+    observer_read = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_blocks", observer_read)
+
+    workflow_run, _, block_result, should_stop, _ = await _run_single_block(
+        WorkflowService(),
+        _navigation_block("cached_nav"),
+        is_script_run=True,
+        script_blocks_by_label={"cached_nav": _script_block("cached_nav", "record_dispatch()")},
+        loaded_script_module=SimpleNamespace(record_dispatch=lambda: script_calls.append("called")),
+    )
+
+    assert workflow_run is canceled_run
+    assert block_result is None
+    assert should_stop is True
+    assert script_calls == []
+    observer_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_script_fallback_prevents_agent_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    running_run = _workflow_run()
+    canceled_run = _workflow_run()
+    canceled_run.status = WorkflowRunStatus.canceled
+    admissions = iter((running_run, canceled_run))
+
+    @asynccontextmanager
+    async def admit_then_deny(_: str) -> AsyncIterator[MagicMock]:
+        yield next(admissions)
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", admit_then_deny)
+    execute_safe = AsyncMock()
+    monkeypatch.setattr(NavigationBlock, "execute_safe", execute_safe)
+
+    workflow_run, _, block_result, should_stop, _ = await _run_single_block(
+        WorkflowService(),
+        _navigation_block("cached_nav"),
+        is_script_run=True,
+        script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 / 0")},
+        loaded_script_module=SimpleNamespace(),
+    )
+
+    assert workflow_run is canceled_run
+    assert block_result is None
+    assert should_stop is True
+    execute_safe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_denial_returns_typed_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    canceled_run = _workflow_run()
+    canceled_run.status = WorkflowRunStatus.canceled
+    execute = AsyncMock()
+
+    @asynccontextmanager
+    async def deny_dispatch(_: str) -> AsyncIterator[MagicMock]:
+        yield canceled_run
+
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "admit_workflow_run_block_dispatch", deny_dispatch)
+
+    result = await WorkflowService()._dispatch_workflow_run_block("wr_test", execute)
+
+    assert result == WorkflowRunDispatchStopped(workflow_run=canceled_run)
+    execute.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_returns_early_when_run_already_final(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,7 +396,7 @@ async def test_missing_block_result_marks_run_failed(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(NavigationBlock, "execute_safe", AsyncMock(return_value=None))
     failed_run = MagicMock()
     mark_failed = AsyncMock(return_value=failed_run)
-    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed", mark_failed)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
 
     workflow_run, _, block_result, should_stop, _ = await _run_single_block(service, _navigation_block("nav"))
 
@@ -218,12 +407,71 @@ async def test_missing_block_result_marks_run_failed(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_missing_result_cannot_overwrite_concurrent_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = WorkflowService()
+    canceled_run = _workflow_run()
+    canceled_run.status = WorkflowRunStatus.canceled
+    monkeypatch.setattr(NavigationBlock, "execute_safe", AsyncMock(return_value=None))
+    conditional_failure = AsyncMock(return_value=None)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", conditional_failure)
+    monkeypatch.setattr(service, "_current_row_after_lost_finalize", AsyncMock(return_value=canceled_run))
+
+    workflow_run, _, block_result, should_stop, _ = await _run_single_block(service, _navigation_block("nav"))
+
+    assert workflow_run is canceled_run
+    assert block_result is None
+    assert should_stop is True
+    conditional_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_status", "conditional_method"),
+    [
+        (BlockStatus.failed, "mark_workflow_run_as_failed_if_not_final"),
+        (BlockStatus.terminated, "mark_workflow_run_as_terminated_if_not_final"),
+    ],
+)
+async def test_block_terminal_outcome_cannot_overwrite_concurrent_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    block_status: BlockStatus,
+    conditional_method: str,
+) -> None:
+    service = WorkflowService()
+    block = _navigation_block("nav")
+    block_result = BlockResult(
+        success=False,
+        failure_reason="block stopped",
+        output_parameter=block.output_parameter,
+        status=block_status,
+    )
+    canceled_run = _workflow_run()
+    canceled_run.status = WorkflowRunStatus.canceled
+    conditional_terminal = AsyncMock(return_value=None)
+    monkeypatch.setattr(service, conditional_method, conditional_terminal)
+    monkeypatch.setattr(service, "_current_row_after_lost_finalize", AsyncMock(return_value=canceled_run))
+
+    workflow_run, should_stop = await service._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=1,
+        block_result=block_result,
+        workflow_run=_workflow_run(),
+        workflow_run_id="wr_test",
+    )
+
+    assert workflow_run is canceled_run
+    assert should_stop is True
+    conditional_terminal.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_block_exception_marks_run_failed_with_block_type_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     service = WorkflowService()
     monkeypatch.setattr(NavigationBlock, "execute_safe", AsyncMock(side_effect=RuntimeError("boom")))
     failed_run = MagicMock()
     mark_failed = AsyncMock(return_value=failed_run)
-    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed", mark_failed)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
 
     workflow_run, _, _, should_stop, _ = await _run_single_block(service, _navigation_block("nav"))
 
@@ -259,7 +507,7 @@ async def test_ai_fallback_disabled_keeps_script_failure(monkeypatch: pytest.Mon
     monkeypatch.setattr(NavigationBlock, "_apply_workflow_system_prompt", lambda self, ctx: None)
     failed_run = MagicMock()
     mark_failed = AsyncMock(return_value=failed_run)
-    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed", mark_failed)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
 
     workflow_run, _, _, should_stop, _ = await _run_single_block(
         service,

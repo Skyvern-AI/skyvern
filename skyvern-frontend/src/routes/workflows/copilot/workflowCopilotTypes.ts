@@ -109,6 +109,8 @@ export interface WorkflowCopilotChatSummary {
   title: string;
   created_at: string;
   modified_at: string;
+  // Absent on responses from a backend that predates the marker.
+  awaiting_user_input?: boolean;
 }
 
 export interface WorkflowCopilotClearProposedWorkflowRequest {

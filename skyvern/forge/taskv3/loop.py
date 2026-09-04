@@ -317,6 +317,69 @@ def _content_only_perception(content: str) -> str:
 # be recognised, so it is a detection limit and not a memory tuning knob.
 PERCEPTION_RING = 8
 
+# Run-scoped revisit memory (SKY-14998). The ring above is a DETECTION LIMIT: a run that cycles with
+# a period longer than it returns to states the ring has already evicted, so every ring-bounded guard
+# is structurally blind to the loop rather than judging it wrongly. Measured production case: a
+# macro-cycle of period ~44 billable touches, against a ring of 8 and a canonical window of 10.
+# This remembers perception states for the WHOLE run instead, which is what makes a long cycle
+# visible at all. It is a memory, not a verdict: LOG-ONLY, nothing reads it for control flow.
+PERCEPTION_REVISIT_EVENT = "taskv3 perception state revisited"
+# Two returns to a state is a panel toggling; the third is the earliest a cycle is worth reporting.
+PERCEPTION_REVISIT_LOG_AFTER = 3
+# Bounded storage: one 64-char digest per DISTINCT perception state, so the worst case is ~32KB of digests per
+# run. At the cap the memory stops admitting NEW states and keeps counting the ones it already
+# holds — it degrades to a smaller memory rather than growing without bound, and every emission says
+# whether it was capped so a truncated run is never read as a complete one.
+PERCEPTION_REVISIT_CAP = 512
+
+
+@dataclass
+class _RevisitMemory:
+    """How many times each perception state has been seen this run, unbounded in time and bounded in
+    size. Distinct from _ProbeStreak's ring, which only remembers the last PERCEPTION_RING states and
+    therefore cannot see a cycle longer than that."""
+
+    cap: int = PERCEPTION_REVISIT_CAP
+    # digest -> (times seen, novel-state count at its last sighting)
+    _seen: dict[str, tuple[int, int]] = field(default_factory=dict)
+    capped: bool = False
+    distinct_states: int = 0
+    peak_revisits: int = 0
+    # Revisits that had fresh ground covered since the last sighting, so they were not reported.
+    # Kept as a count so the healthy population stays measurable in aggregate without a line each.
+    progressed_revisits: int = 0
+    _novel_states: int = 0
+
+    def record(self, digest: str) -> tuple[int, int]:
+        """Returns (times this state has now been seen, distinct NEW states seen since it was last
+        seen). Zero new states between two sightings is a replay; a drill-down that opens a fresh
+        page between returns to its list is not, and that difference is what makes the signal
+        filterable rather than firing on healthy and stuck runs alike.
+
+        Novelty is measured against the WHOLE run, not the probe's ring: the ring is bounded at
+        PERCEPTION_RING, so a cycle longer than it reads as fresh content there — the exact
+        blindness this memory exists to lift, and reusing that derivation would reintroduce it.
+        """
+        entry = self._seen.get(digest)
+        if entry is None:
+            if len(self._seen) >= self.cap:
+                # Refused, not evicted: dropping a known state to admit a new one would reset a
+                # streak that is the whole point of the memory.
+                self.capped = True
+                return 0, 0
+            self._novel_states += 1
+            self._seen[digest] = (1, self._novel_states)
+            self.distinct_states = len(self._seen)
+            return 1, 0
+        seen, novel_at_last_sighting = entry
+        seen += 1
+        new_states_since = self._novel_states - novel_at_last_sighting
+        self._seen[digest] = (seen, self._novel_states)
+        self.peak_revisits = max(self.peak_revisits, seen)
+        if new_states_since:
+            self.progressed_revisits += 1
+        return seen, new_states_since
+
 
 @dataclass
 class _ProbeStreak:
@@ -1414,6 +1477,7 @@ async def run_agent_tool_loop(
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress = _ProgressLedger(window=progress_window) if progress_window is not None else None
     canonical = _CanonicalProgressTracker()
+    revisit_memory = _RevisitMemory()
     # The action-loop counter: (repeat count, first turn of the streak) per billable action
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
@@ -2208,6 +2272,25 @@ async def run_agent_tool_loop(
                 content_digest = hashlib.sha256(_canonical_perception_content(result.content).encode()).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
                 attribution["probe_first_time"] = perception.first_time(action_key)
+                # Emitted on its own record, never folded into the one above: the tool-call record's
+                # fields are a stable contract and this signal must not perturb them.
+                seen_count, new_states_since = revisit_memory.record(content_digest)
+                # A revisit with fresh ground covered in between is a drill-down returning to its
+                # list, not a replay. Reporting those too would fire the signal identically on
+                # healthy and stuck runs and leave the precision read it exists to feed unable to
+                # tell them apart.
+                if seen_count >= PERCEPTION_REVISIT_LOG_AFTER and not new_states_since:
+                    LOG.info(
+                        PERCEPTION_REVISIT_EVENT,
+                        revisit_count=seen_count,
+                        distinct_states=revisit_memory.distinct_states,
+                        peak_revisits=revisit_memory.peak_revisits,
+                        progressed_revisits=revisit_memory.progressed_revisits,
+                        capped=revisit_memory.capped,
+                        tool=tool_name,
+                        turn=turns,
+                        **attribution,
+                    )
             # The only per-tool-call timing the engine has: tool execution is the majority of a v3
             # run's wall-clock and otherwise emits nothing at all. Names, sizes and booleans only —
             # argument values and result content carry end-user data and must not be logged.

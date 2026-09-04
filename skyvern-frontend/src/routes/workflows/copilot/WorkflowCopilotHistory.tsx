@@ -118,8 +118,19 @@ function WorkflowCopilotHistoryContent({
                     <span className="line-clamp-2 break-words [overflow-wrap:anywhere]">
                       {chat.title || "Untitled chat"}
                     </span>
-                    <span className="truncate text-xs text-muted-foreground">
-                      {compactLocalDateTime(chat.created_at)}
+                    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <span className="truncate">
+                        {compactLocalDateTime(chat.created_at)}
+                      </span>
+                      {chat.awaiting_user_input ? (
+                        <span className="inline-flex shrink-0 items-center gap-1 text-amber-700 dark:text-amber-300">
+                          <span
+                            aria-hidden="true"
+                            className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400"
+                          />
+                          Waiting on you
+                        </span>
+                      ) : null}
                     </span>
                   </div>
                   {isCurrent && (
