@@ -2785,6 +2785,50 @@ async def test_execute_task_v3_scrubs_a_registered_secret_from_the_chosen_codes_
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_caps_the_chosen_codes_reasoning_after_redacting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The two sibling reasoning persists (action row, decision row) both cap at
+    # _TASKV3_REASONING_MAX_CHARS; the code's reasoning is the only one that reaches the customer's
+    # webhook and was the only one uncapped.
+    # The secret straddles the cap boundary, so this also pins the ORDER: redact, then truncate.
+    # Truncating first would cut the secret in half, leaving a fragment the redactor can no longer
+    # match, and publish it.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    straddling = "a" * (agent_mod._TASKV3_REASONING_MAX_CHARS - 5) + "sk4829137765" + "b" * 4000
+    outcome = LoopOutcome(
+        status="terminated",
+        reason=straddling,
+        billable_actions=[],
+        error_code="COVERAGE_NOT_ACTIVE",
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert len(persisted["reasoning"]) == agent_mod._TASKV3_REASONING_MAX_CHARS
+    assert "sk48" not in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_records_the_models_own_account_not_the_gate_veto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2823,9 +2867,8 @@ async def test_execute_task_v3_records_the_models_own_account_not_the_gate_veto(
 async def test_execute_task_v3_leaves_unasked_failures_to_the_detector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The scope guard. Every v1 caller and every v3 task without a mapping has error_codes_offered
-    # False, and those runs -- ~15.9k USER_DEFINED_ERROR failures a week across 18 orgs (08-27 to
-    # 09-03) -- must keep exactly today's behavior.
+    # The scope guard: every v1 caller and every v3 task without a mapping has error_codes_offered
+    # False, and those runs must keep exactly today's behavior -- the detector still runs.
     detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
