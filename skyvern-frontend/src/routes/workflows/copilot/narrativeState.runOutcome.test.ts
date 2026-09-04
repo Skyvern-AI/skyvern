@@ -5,10 +5,12 @@ import { getReviewGateVerdict } from "./cards/ReviewGateCard";
 import {
   EMPTY_NARRATIVE,
   TurnNarrativeState,
+  TerminalEnvelopeFacts,
   applyNarrativeEvent,
-  computeTurnSummary,
+  awaitsUserInput,
   hydrateNarrativeFromPayload,
   isBlockOk,
+  isDeadlineHalt,
   notConfirmedOutcome,
   ranCleanOnCurrentSource,
 } from "./narrativeState";
@@ -81,6 +83,16 @@ const bothBlocksRan = [
   blockProgress({ block_label: "search_person", status: "running" }),
   blockProgress({ block_label: "search_person", status: "completed" }),
 ];
+
+const envelopeFacts = (
+  facts: Partial<TerminalEnvelopeFacts>,
+): TerminalEnvelopeFacts => ({
+  nextState: null,
+  renderedFromEnvelope: false,
+  runVerdict: null,
+  runDisplayReason: null,
+  ...facts,
+});
 
 describe("applyNarrativeEvent — run_outcome", () => {
   it("negative verdict withholds the success affordance from completed rows", () => {
@@ -397,11 +409,51 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
       },
     })!;
     expect(withEnvelope.terminalEnvelope).toEqual({
+      nextState: "stopped",
+      questionParts: [],
+      renderedFromEnvelope: false,
       runVerdict: "not_demonstrated",
       runDisplayReason: "Checkout never reached confirmation.",
       runOutcomeRole: null,
       connectFailure: null,
     });
+
+    const question = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        next_state: "awaiting_user_input",
+        response_kind: "question",
+        user_action_required: true,
+        rendered_from_envelope: true,
+      },
+    })!;
+    expect(question.terminalEnvelope).toEqual({
+      nextState: "awaiting_user_input",
+      questionParts: [],
+      renderedFromEnvelope: true,
+      runVerdict: null,
+      runDisplayReason: null,
+      runOutcomeRole: null,
+      connectFailure: null,
+    });
+    expect(awaitsUserInput(question)).toBe(true);
+    // Unstamped envelope: carried, but not display authority.
+    expect(
+      awaitsUserInput({
+        cancelled: false,
+        terminalEnvelope: {
+          ...question.terminalEnvelope!,
+          renderedFromEnvelope: false,
+        },
+      }),
+    ).toBe(false);
+    // The cancel path persists this envelope verbatim, so the stop has to win.
+    expect(
+      awaitsUserInput({
+        cancelled: true,
+        terminalEnvelope: question.terminalEnvelope,
+      }),
+    ).toBe(false);
 
     const legacy = hydrateNarrativeFromPayload(payload([]))!;
     expect(legacy.terminalEnvelope).toBeNull();
@@ -411,6 +463,9 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
       terminalEnvelope: { run_verdict: "maybe", run_display_reason: 7 },
     })!;
     expect(malformed.terminalEnvelope).toEqual({
+      nextState: null,
+      questionParts: [],
+      renderedFromEnvelope: false,
       runVerdict: null,
       runDisplayReason: null,
       runOutcomeRole: null,
@@ -471,10 +526,10 @@ describe("notConfirmedOutcome — envelope-first", () => {
   it("envelope not_demonstrated wins even when a later pointer says demonstrated", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: {
+      terminalEnvelope: envelopeFacts({
         runVerdict: "not_demonstrated",
         runDisplayReason: "Cart never showed the item.",
-      },
+      }),
       lastRunOutcome: {
         verdict: "demonstrated",
         displayReason: null,
@@ -489,7 +544,7 @@ describe("notConfirmedOutcome — envelope-first", () => {
   it("envelope demonstrated suppresses the block-derived not_demonstrated", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: { runVerdict: "demonstrated", runDisplayReason: null },
+      terminalEnvelope: envelopeFacts({ runVerdict: "demonstrated" }),
       blocks: [
         {
           workflowRunBlockId: "wrb_1",
@@ -511,7 +566,7 @@ describe("notConfirmedOutcome — envelope-first", () => {
   it("envelope not_evaluated suppresses not-confirmed like demonstrated does", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: { runVerdict: "not_evaluated", runDisplayReason: null },
+      terminalEnvelope: envelopeFacts({ runVerdict: "not_evaluated" }),
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "Stale pointer.",
@@ -523,11 +578,10 @@ describe("notConfirmedOutcome — envelope-first", () => {
   it("an interim run-start envelope does not suppress the recorded not-confirmed outcome", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: {
+      terminalEnvelope: envelopeFacts({
         runVerdict: "not_evaluated",
-        runDisplayReason: null,
         runOutcomeRole: "interim_build_test",
-      },
+      }),
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "The earlier run never reached the dashboard.",
@@ -542,7 +596,7 @@ describe("notConfirmedOutcome — envelope-first", () => {
   it("envelope without a run verdict falls back to the legacy inference", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: { runVerdict: null, runDisplayReason: null },
+      terminalEnvelope: envelopeFacts({}),
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "Legacy pointer reason.",
@@ -559,7 +613,7 @@ describe("notConfirmedOutcome — envelope-first", () => {
 // the staged source.
 const CLEAN_RECORDED_TURN = "surface-20260820T082523349904";
 
-describe("canonical turn facts — card, pill and prose over one bundle", () => {
+describe("canonical turn facts — pill and prose over one bundle", () => {
   const surfaces = (leg: keyof typeof bundles) => {
     const turn = hydrateNarrativeFromPayload(
       bundles[leg] as unknown as Record<string, unknown>,
@@ -567,32 +621,27 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
     if (!turn) throw new Error(`fixture ${leg} did not hydrate`);
     return {
       turn,
-      card: computeTurnSummary(turn),
       pill: getReviewGateVerdict(turn, null),
       prose: turn.terminalMessage ?? "",
     };
   };
 
   it("states coverage and evaluation as independent facts when one of three blocks ran", () => {
-    const { card, pill, prose } = surfaces("partial-coverage");
+    const { turn, pill, prose } = surfaces("partial-coverage");
 
-    expect(card.headline).not.toBe("Built and tested the workflow");
-    expect(card.stats).toContain("3 blocks authored");
-    expect(card.stats).toContain("1/3 ran on current source");
-    expect(card.stats).toContain("outcome not evaluated");
-    expect(card.stats.join(" ")).not.toContain("wr_");
-    expect(card.accent).not.toBe("ok");
-    expect(card.isFail).toBe(false);
+    expect(turn.turnFacts?.authoredBlockCount).toBe(3);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(1);
+    expect(turn.turnFacts?.evaluationState).toBe("not_evaluated");
     expect(pill).toBe("untested");
     expect(prose).not.toContain("tested draft");
   });
 
   it("reports a deadline halt without a failure row or a tested pill", () => {
-    const { card, pill, prose } = surfaces("deadline-after-one-clean-run");
+    const { turn, pill, prose } = surfaces("deadline-after-one-clean-run");
 
-    expect(card.isFail).toBe(false);
-    expect(card.accent).not.toBe("fail");
-    expect(card.stats).toContain("time limit reached");
+    expect(turn.turnFacts?.terminalCause).toBe("deadline_expired");
+    expect(turn.blocks.some((block) => block.state === "failed")).toBe(false);
+    expect(isDeadlineHalt(turn)).toBe(true);
     expect(pill).toBe("untested");
     expect(prose).toContain("1 block ran this turn");
     expect(prose).toContain("outcome was not evaluated");
@@ -600,7 +649,7 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
   });
 
   it("marks an edited block as run against different source, never as failed", () => {
-    const { turn, card, pill } = surfaces("different-source-edit-one-of-two");
+    const { turn, pill } = surfaces("different-source-edit-one-of-two");
 
     expect(
       turn.review?.blocks.map((block) => [block.label, block.coverage]),
@@ -609,46 +658,31 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       ["append_star_count_to_sheet", "never_run"],
       ["append_star_count_to_sales_marketing", "never_run"],
     ]);
-    expect(card.isFail).toBe(false);
+    expect(turn.blocks.some((block) => block.state === "failed")).toBe(false);
     expect(pill).toBe("untested");
   });
 
-  it("excludes a removed block from the authored count", () => {
-    const { card } = surfaces("mixed-edit-and-delete");
-
-    expect(card.stats).toContain("2 blocks authored");
-    expect(card.stats).toContain("1/2 ran on current source");
-  });
-
   it("names clean lifecycle plus full current-source coverage on the satisfaction path", () => {
-    const { card, pill, prose } = surfaces("satisfaction");
+    const { turn, pill, prose } = surfaces("satisfaction");
 
-    expect(card.stats).toContain("3 blocks authored");
-    expect(card.stats).toContain("3/3 ran on current source");
-    expect(card.stats).toContain("run completed");
-    expect(card.headline).toBe("Every block ran clean on the current draft");
-    expect(card.accent).toBe("ok");
-    expect(card.isFail).toBe(false);
+    expect(turn.turnFacts?.authoredBlockCount).toBe(3);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(3);
+    expect(turn.turnFacts?.runCompleted).toBe(true);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(true);
     expect(pill).toBe("tested");
-    for (const claim of [/verified/i, /demonstrated/i, /goal/i, /confirm/i]) {
-      expect(card.headline).not.toMatch(claim);
-    }
     expect(prose).not.toMatch(/verified|demonstrated/i);
   });
 
   it("states its counts without a completion claim when no run is anchored to the turn", () => {
-    const { turn, card } = surfaces(CLEAN_RECORDED_TURN);
+    const { turn } = surfaces(CLEAN_RECORDED_TURN);
 
     expect(turn.blocks.map((block) => block.state)).toEqual(["completed"]);
     expect(turn.turnFacts?.runCompleted).toBeNull();
-    expect(card.stats).toContain("1 block authored");
-    expect(card.stats).toContain("1/1 ran on current source");
-    expect(card.stats).not.toContain("run completed");
-    expect(card.stats).not.toContain("run did not complete");
-    expect(card.isFail).toBe(false);
+    expect(turn.turnFacts?.authoredBlockCount).toBe(1);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(1);
   });
 
-  it("withholds the satisfaction headline when the recorded run did not complete", () => {
+  it("withholds the tested pill when the recorded run did not complete", () => {
     const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
       turnFacts: Record<string, unknown>;
     };
@@ -661,14 +695,10 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       },
     });
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
-    expect(card.stats).toContain("run did not complete");
-    expect(card.headline).not.toBe(
-      "Every block ran clean on the current draft",
-    );
+    expect(turn.turnFacts?.runCompleted).toBe(false);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
-    expect(card.isFail).toBe(false);
   });
 
   it("makes no completion claim when a stop left the run start unresolved", () => {
@@ -687,35 +717,16 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       },
     });
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
     expect(turn.turnFacts?.runCompleted).toBeNull();
-    expect(card.stats).toContain("1/1 ran on current source");
-    expect(card.stats).not.toContain("run completed");
-    expect(card.stats).not.toContain("run did not complete");
+    expect(turn.turnFacts?.authoredBlockCount).toBe(1);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(1);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
   });
 
-  it("withholds success from a fully covered turn whose recorded run failed", () => {
-    const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
-      blocks: Array<Record<string, unknown>>;
-    };
-    const turn = hydrateNarrativeFromPayload({
-      ...(bundles[CLEAN_RECORDED_TURN] as unknown as Record<string, unknown>),
-      blocks: recorded.blocks.map((block) => ({ ...block, state: "failed" })),
-    });
-    if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
-
-    expect(card.headline).not.toBe(
-      "Every block ran clean on the current draft",
-    );
-    expect(card.isFail).toBe(true);
-    expect(card.accent).toBe("fail");
-  });
-
-  it("says a renamed block is untested under this name across card and pill", () => {
-    const { turn, card, pill } = surfaces("renamed-block");
+  it("says a renamed block is untested under this name across review and pill", () => {
+    const { turn, pill } = surfaces("renamed-block");
 
     expect(
       turn.review?.blocks.map((block) => [block.label, block.coverage]),
@@ -725,8 +736,7 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       ["append_star_count_to_sales_marketing", "current_source"],
       ["extract_github_star_count", undefined],
     ]);
-    expect(card.stats).toContain("2/3 ran on current source");
-    expect(card.isFail).toBe(false);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(2);
     expect(pill).toBe("untested");
   });
 
@@ -748,41 +758,9 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       ],
     });
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
     expect(turn.blocks.map((block) => block.state)).toEqual(["stopped"]);
-    expect(card.isFail).toBe(false);
-    expect(card.accent).not.toBe("fail");
-  });
-
-  it("does not call a deadline halt that delivered nothing a completed run", () => {
-    const turn = hydrateNarrativeFromPayload({
-      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
-        string,
-        unknown
-      >),
-      proposalDisposition: "no_proposal",
-      draft: null,
-      terminal: "error",
-      blocks: [
-        {
-          workflowRunBlockId: "wrb_1",
-          label: "append_star_count_to_sheet",
-          blockType: "code",
-          state: "completed",
-          lastSeenIteration: 0,
-          activity: [],
-        },
-      ],
-    });
-    if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
-
-    // Suppressing the failure treatment for a deadline must not promote the turn
-    // into a success: it ran out of time and handed nothing back.
-    expect(card.isFail).toBe(false);
-    expect(card.accent).not.toBe("ok");
-    expect(card.headline).not.toMatch(/completed the run/i);
+    expect(isDeadlineHalt(turn)).toBe(true);
   });
 
   it("keeps a failed block a failure even when the deadline expired", () => {
@@ -803,11 +781,9 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       ],
     });
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
     expect(turn.turnFacts?.terminalCause).toBe("deadline_expired");
-    expect(card.isFail).toBe(true);
-    expect(card.stats).toContain("1 failed");
+    expect(isDeadlineHalt(turn)).toBe(false);
   });
 
   it("makes no tested claim for a turn that published no facts or coverage", () => {
@@ -829,13 +805,10 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       },
     });
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
     expect(turn.turnFacts).toBeNull();
     expect(turn.review?.blocks[0]?.coverage).toBeUndefined();
-    expect(card.headline).not.toMatch(/tested/i);
-    expect(card.accent).not.toBe("ok");
-    expect(card.stats.join(" ")).not.toMatch(/ran on current source|authored/);
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
   });
 
   it("keeps the review when the backend sends a coverage value it does not know", () => {
@@ -865,20 +838,13 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       bundles["facts-absent"] as unknown as Record<string, unknown>,
     );
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
     expect(turn.turnFacts).toBeNull();
     expect(turn.proposalDisposition).toBe("review_tested");
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
-    // The tested branch is named "Workflow ready for review", which contains no literal
-    // "tested" — assert the branch, not the substring.
-    expect(card.headline).not.toBe("Workflow ready for review");
-    expect(card.headline).toBe("Built the workflow");
-    expect(card.glyph).not.toBe("\u2713");
-    expect(card.accent).not.toBe("ok");
   });
 
-  it("keeps card and pill telling one story when the envelope is missing", () => {
+  it("keeps facts and pill telling one story when the envelope is missing", () => {
     const full = bundles["full-coverage"] as unknown as Record<string, unknown>;
     const facts = full.turnFacts as Record<string, unknown>;
     const turn = hydrateNarrativeFromPayload({
@@ -893,15 +859,13 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
       },
     });
     if (!turn) throw new Error("fixture did not hydrate");
-    const card = computeTurnSummary(turn);
 
     expect(turn.turnFacts?.factsAvailable).toBe(true);
     expect(turn.turnFacts?.authoredBlockCount).toBe(facts.authoredBlockCount);
-    expect(card.stats).toContain(
-      `${facts.matchingSourceBlockCount}/${facts.authoredBlockCount} ran on current source`,
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(
+      facts.matchingSourceBlockCount,
     );
-    expect(card.stats).not.toContain("run completed");
-    expect(card.isFail).toBe(false);
+    expect(turn.turnFacts?.runCompleted).toBeNull();
     expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(true);
     expect(getReviewGateVerdict(turn, null)).toBe("tested");
   });
@@ -921,9 +885,7 @@ describe("canonical turn facts — card, pill and prose over one bundle", () => 
     });
     if (!turn) throw new Error("fixture did not hydrate");
 
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
-    expect(computeTurnSummary(turn).headline).not.toBe(
-      "Every block ran clean on the current draft",
-    );
   });
 });

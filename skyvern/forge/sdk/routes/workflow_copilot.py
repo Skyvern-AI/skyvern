@@ -942,7 +942,7 @@ async def _persist_interrupted_turn(
     narrative_payload = _with_terminal_narrative_metadata(
         _make_error_narrative_payload(turn_id, None, message),
         # An interrupted turn halted; it did not fail. The FE reads this flag to
-        # keep the row out of failure treatment (computeTurnSummary, narrativeState.ts).
+        # keep the row out of failure treatment (derivePhases, copilotPhases.ts).
         cancelled=True,
         proposal_disposition=_proposal_disposition(None),
         terminal_envelope=interrupted_terminal_envelope(facts).model_dump(mode="json"),

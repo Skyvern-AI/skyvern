@@ -185,8 +185,10 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     TESTED_DRAFT_PRESERVED,
     UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
+    QuestionPart,
     TerminalCause,
     TerminalOutcomeEnvelope,
+    admit_question_parts,
     assemble_terminal_envelope,
     is_interim_run_outcome,
     reason_in_reply_shadow,
@@ -1682,6 +1684,7 @@ def _assemble_terminal_envelope_safe(
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
     interruption: InterruptedTurnFacts | None = None,
+    question_parts: Sequence[QuestionPart] = (),
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1701,6 +1704,7 @@ def _assemble_terminal_envelope_safe(
             connect_failure=connect_failure,
             proposal_present=proposal_present,
             interruption=interruption,
+            question_parts=question_parts,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1934,6 +1938,7 @@ def _make_agent_result(
             connect_failure=connect_failure,
             proposal_present=result_carries_workflow,
             interruption=_crash_exit_interruption(ctx, turn_outcome, failed_operation),
+            question_parts=ctx.question_parts,
         )
     if terminal_envelope is not None and (
         terminal_envelope.get("failed_operation") is not None
@@ -3472,7 +3477,7 @@ async def _translate_to_agent_result(
     normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
     resp_type = normalized_scaffolding.response_type
     user_response = normalized_scaffolding.user_response or "Done."
-    model_authored_account_choice_ask = resp_type == "ASK_QUESTION"
+    model_authored_ask = resp_type == "ASK_QUESTION"
 
     # Bind the signal to a local so the proposal-cascade gating below can't
     # desync from the inline override if ctx mutates mid-translate.
@@ -3802,7 +3807,7 @@ async def _translate_to_agent_result(
     final_user_response = str(user_response)
     connected_account_choices = await _verified_connected_account_choices(
         action_data,
-        response_type=resp_type if model_authored_account_choice_ask else "REPLY",
+        response_type=resp_type if model_authored_ask else "REPLY",
         organization_id=organization_id,
     )
     if connected_account_choices:
@@ -3810,6 +3815,12 @@ async def _translate_to_agent_result(
         # copy owns the choice interaction. Do not let model prose invite an
         # account-name reply or mix password credentials into this OAuth path.
         final_user_response = _connected_google_account_choice_reply()
+    # Parts describe the model's own question, so every path that replaces the reply with
+    # server-authored copy leaves them describing text the user never sees.
+    server_authored_reply = blocker_active or unbacked_workflow_delivery_rewritten or bool(connected_account_choices)
+    ctx.question_parts = (
+        admit_question_parts(action_data.get("parts")) if model_authored_ask and not server_authored_reply else []
+    )
     attempted_kind = _concrete_narrative_response_kind(
         response_type=resp_type,
         has_workflow_attempt=ctx.has_genuine_workflow_attempt(),
