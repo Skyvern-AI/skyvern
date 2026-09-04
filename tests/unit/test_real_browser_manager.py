@@ -21,7 +21,12 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.streaming import registries
 from skyvern.webeye import real_browser_manager
-from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
+from skyvern.webeye.browser_artifacts import (
+    BrowserArtifacts,
+    DownloadBinding,
+    RecordingPrefixSnapshot,
+    VideoArtifact,
+)
 from skyvern.webeye.browser_engine import (
     BrowserEngineBootstrapError,
     BrowserEngineMetadata,
@@ -2665,3 +2670,57 @@ def test_the_browser_manager_never_drags_in_the_http_route_layer() -> None:
     )
     result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, f"route layer leaked into the browser manager import graph\n{result.stderr[-800:]}"
+
+
+def _browser_state_for_snapshot(artifacts: list[VideoArtifact]) -> MagicMock:
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = artifacts
+    return browser_state
+
+
+def test_snapshot_recording_prefixes_empty_when_no_artifacts() -> None:
+    manager = RealBrowserManager()
+    browser_state = _browser_state_for_snapshot([])
+    assert manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t") == []
+
+
+def test_snapshot_recording_prefixes_plans_growing_webm(tmp_path) -> None:
+    """The plan captures the current on-disk length as the snapshot bound, not the live EOF."""
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.webm"
+    src.write_bytes(b"x" * 321)
+    artifact = VideoArtifact(video_path=str(src), video_artifact_id="vid-0")
+    browser_state = _browser_state_for_snapshot([artifact])
+
+    plan = manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t")
+
+    src.write_bytes(b"x" * 10_000)  # a snapshot taken now must not be enlarged by later growth
+    assert plan == [RecordingPrefixSnapshot(video_artifact_id="vid-0", path=str(src), prefix_len=321)]
+
+
+def test_snapshot_recording_prefixes_none_when_non_webm(tmp_path) -> None:
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(b"mp4")
+    artifact = VideoArtifact(video_path=str(src), video_artifact_id="vid-0")
+    browser_state = _browser_state_for_snapshot([artifact])
+
+    assert manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t") is None
+
+
+def test_snapshot_recording_prefixes_none_when_missing_artifact_id(tmp_path) -> None:
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.webm"
+    src.write_bytes(b"x")
+    artifact = VideoArtifact(video_path=str(src), video_artifact_id=None)
+    browser_state = _browser_state_for_snapshot([artifact])
+
+    assert manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t") is None
+
+
+def test_snapshot_recording_prefixes_none_when_path_absent(tmp_path) -> None:
+    manager = RealBrowserManager()
+    artifact = VideoArtifact(video_path=str(tmp_path / "missing.webm"), video_artifact_id="vid-0")
+    browser_state = _browser_state_for_snapshot([artifact])
+
+    assert manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t") is None

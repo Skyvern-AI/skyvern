@@ -376,10 +376,10 @@ class TestPersistVideoDataFlushesUploads:
     clean_up_workflow's task-id drain never awaits — persist_video_data must flush those keys itself."""
 
     @pytest.mark.asyncio
-    async def test_flushes_the_keys_it_enqueued(self) -> None:
-        video_artifacts = [
-            VideoArtifact(video_path="/tmp/recording.webm", video_artifact_id="a_recording", video_data=b"video")
-        ]
+    async def test_flushes_the_keys_it_enqueued(self, tmp_path: Path) -> None:
+        webm = tmp_path / "recording.webm"
+        webm.write_bytes(b"video")
+        video_artifacts = [VideoArtifact(video_path=str(webm), video_artifact_id="a_recording", video_data=b"video")]
         get_video = AsyncMock(return_value=video_artifacts)
         update_data = AsyncMock(return_value="wrb_1")
         wait_for_uploads = AsyncMock()
@@ -529,9 +529,11 @@ class TestPersistVideoDataPathFallback:
     async def test_preserves_update_path_for_pre_registered_artifact(self, tmp_path: Path) -> None:
         # A code-block recording arrives pre-registered (``_ensure_run_recording_artifact``); the
         # existing data-update path stays in charge and the new path-upload helper stays idle.
+        webm = tmp_path / "code-block.webm"
+        webm.write_bytes(b"video")
         video_artifacts = [
             VideoArtifact(
-                video_path=str(tmp_path / "code-block.webm"),
+                video_path=str(webm),
                 video_artifact_id="a_existing",
                 video_data=b"video",
             )
