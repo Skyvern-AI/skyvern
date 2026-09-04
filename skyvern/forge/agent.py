@@ -2345,6 +2345,9 @@ class ForgeAgent:
                 if run_secrets:
                     # task.errors reaches the customer's webhook, so this string leaves the system.
                     code_reasoning = redact_secrets_from_text(code_reasoning, run_secrets)
+                # Truncate after redacting, like the sibling persists: cutting first can split a
+                # secret into a fragment the redactor no longer matches.
+                code_reasoning = code_reasoning[:_TASKV3_REASONING_MAX_CHARS]
                 await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
                     organization_id=task.organization_id,
