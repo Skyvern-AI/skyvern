@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { Status } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
@@ -26,10 +27,25 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(options);
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
+  const runIsLive = !!workflowRun && statusIsNotFinalized(workflowRun);
+  // Only a running run writes timeline rows. Created, queued and paused are live but idle, and a
+  // paused run waits on a human for as long as that takes.
+  const runIsWriting = workflowRun?.status === Status.Running;
 
   return useQuery<Array<WorkflowRunTimelineItem>>({
+    // The run's status is part of what was read: a timeline fetched while the run was still
+    // writing is a different, incomplete answer than one fetched after it stopped. Keying on it
+    // makes reaching a terminal state re-read exactly once — the poll cannot be relied on for
+    // that, because the run-status query can report the terminal state between two ticks and
+    // cancel the timer before it fires again. keepPreviousData holds the last rows on screen
+    // across the swap.
     queryKey: getOrgScopedQueryKey(
-      ["workflowRunTimeline", workflowPermanentId, workflowRunId],
+      [
+        "workflowRunTimeline",
+        workflowPermanentId,
+        workflowRunId,
+        workflowRun?.status,
+      ],
       activeOrgQueryKeyScope,
     ),
     queryFn: async ({ signal }) => {
@@ -61,17 +77,17 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
       if (query.state.status === "error") {
         return false;
       }
-      return workflowRun && statusIsNotFinalized(workflowRun)
-        ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS
-        : false;
+      return runIsLive ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS : false;
     },
+    // The interval otherwise pauses while the window is unfocused, and a run watched from another
+    // window keeps writing blocks the whole time. Scoped to a running run so a backgrounded tab
+    // does not poll through an idle one — a paused run can sit there for hours.
+    refetchIntervalInBackground: runIsWriting,
     placeholderData: keepPreviousData,
-    refetchOnMount:
-      workflowRun && statusIsNotFinalized(workflowRun) ? "always" : false,
-    refetchOnWindowFocus:
-      workflowRun && statusIsNotFinalized(workflowRun) ? "always" : false,
+    refetchOnMount: runIsLive ? "always" : false,
+    refetchOnWindowFocus: runIsLive ? "always" : false,
     enabled: !!globalWorkflows && !!workflowPermanentId && !!workflowRunId,
   });
 }
 
-export { useWorkflowRunTimelineQuery };
+export { RUNNING_TIMELINE_REFETCH_INTERVAL_MS, useWorkflowRunTimelineQuery };
