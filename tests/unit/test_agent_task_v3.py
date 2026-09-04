@@ -2483,6 +2483,375 @@ async def test_execute_task_v3_detects_user_defined_errors_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_actually_delivers_the_codes_to_the_loop_and_the_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Wiring test. Without it the whole feature can be deleted -- the mapping pass-through, the engine
+    # kwarg, or the goal block -- and every other test here still passes, because they call
+    # make_finish_tool directly or inject a hand-built LoopOutcome. This is the only one that fails if
+    # the codes never reach the model.
+    mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.resolve_task_v3_error_code_choice",
+        AsyncMock(return_value=True),
+    )
+    outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping=mapping)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping=mapping,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["error_code_mapping"] == mapping
+
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "COVERAGE_NOT_ACTIVE" in goal
+    assert "The member has no active plan today." in goal
+    # The rule is pinned as content, not left to survive a prompt edit by luck. It is drawn on OUR
+    # side of the line: our own failures may not wear a code, while a site problem the customer
+    # defined a code for still can.
+    assert "failure of YOU or the browser" in goal
+    assert "problem with the SITE may take a code" in goal
+    # The example has to name OUR disorientation, not the page's state: "losing the page" sat
+    # directly opposite a customer code for a tab that could not render because of a portal-side
+    # failure -- the exact code the rule above must leave reachable.
+    assert "losing track of which page you are on" in goal
+    assert "losing the page" not in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_flag_off_keeps_the_codes_out_of_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Off-state must be byte-identical to before this feature existed: no mapping reaches the loop,
+    # nothing is added to the goal, and error_codes_offered stays False so every downstream branch
+    # falls through to the detector exactly as today.
+    mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.resolve_task_v3_error_code_choice",
+        AsyncMock(return_value=False),
+    )
+    outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping=mapping)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping=mapping,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["error_code_mapping"] is None
+    assert "COVERAGE_NOT_ACTIVE" not in loop_mock.await_args.kwargs["goal"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_chosen_code_on_a_completed_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A named code is an answer about WHAT HAPPENED, so it survives whatever status the run reached.
+    # Discarding it on `completed` would throw away the business-outcome verdict this change exists
+    # to capture -- and the prompt actively tells the model to choose its status on the run's merits,
+    # so it steers exactly that class of run here.
+    detect_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="completed",
+        reason="the member has no active plan today",
+        billable_actions=[],
+        error_code="COVERAGE_NOT_ACTIVE",
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_not_awaited()
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert persisted["error_code"] == "COVERAGE_NOT_ACTIVE"
+    # failure_reason is None on a clean completion, so the model's own finish reason is the account.
+    assert persisted["reasoning"] == "the member has no active plan today"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_prefers_the_models_own_code_over_the_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-15586. Once the model is shown the codes it finishes deliberately, so ITS verdict is the
+    # answer -- re-running the detector would put a guess back on top of a choice.
+    detect_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="no active plan",
+        billable_actions=[],
+        error_code="COVERAGE_NOT_ACTIVE",
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "no plan"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "no plan"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_not_awaited()
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert persisted["error_code"] == "COVERAGE_NOT_ACTIVE"
+    assert persisted["confidence_float"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_terminal_block_that_names_no_code_gets_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A model that was offered the codes and named none must end with NO business code at all. This
+    # is the case the detector cannot get right on its own: it sees a page, not the question, so on a
+    # block whose terminal reason none of the codes describes it can still match one from the page.
+    detect_mock = AsyncMock(return_value=[SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="the control this block needs was never reachable",
+        billable_actions=[],
+        error_code=None,
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Log out", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_not_awaited()
+    errors_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_declining_a_code_holds_on_the_failed_path_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate is error_codes_offered, NOT status. Honoring the choice only on terminated would leave
+    # the failed path running the detector over `failure_reason` -- which on a deliberate finish is
+    # the model's own free text, now written with the code descriptions in front of it. The
+    # detector's last resort substring-matches a description with no negation handling, so a model
+    # explaining "this was NOT <description>" would persist that code at confidence 1.0: the very
+    # defect this PR exists to fix.
+    detect_mock = AsyncMock(return_value=[SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="failed",
+        reason="the coverage tab was present, so this was not a portal-side failure",
+        billable_actions=[],
+        error_code=None,
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_not_awaited()
+    errors_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_model_chosen_code_on_a_failed_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A code is about what happened, not about which status was reached. If only terminated could
+    # carry one, a mapped task ending in a model-declared failure would end with no code at all --
+    # the detector is skipped whenever codes were offered.
+    detect_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="failed",
+        reason="no active plan on file",
+        billable_actions=[],
+        error_code="COVERAGE_NOT_ACTIVE",
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_not_awaited()
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert persisted["error_code"] == "COVERAGE_NOT_ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_vetoed_completion_still_reaches_the_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A completion the gate vetoes is demoted to failed, but the MODEL said "completed" -- it was
+    # never asked which business outcome explains a failure, so its silence is not a deliberate
+    # decline and must not suppress the detector. Gating on task_status alone would swallow it.
+    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})]
+    detect_mock = AsyncMock(return_value=detected)
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="completed",
+        reason="done",
+        billable_actions=[],
+        error_code=None,
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        completion_gate_vetoes=True,
+    )
+    detect_mock.assert_awaited_once()
+    assert errors_update.await_args.kwargs["errors"] == [{"error_code": "COVERAGE_NOT_ACTIVE"}]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_scrubs_a_registered_secret_from_the_chosen_codes_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # task.errors is aggregated into the workflow run's top-level errors[] and goes out over the
+    # customer's webhook, so this string LEAVES the system. The sibling decision row built from the
+    # same outcome.reason is already scrubbed; a code's reasoning that skipped the pass would publish
+    # a secret the row next to it redacts.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="the portal rejected the keysk4829137765I was given",
+        billable_actions=[],
+        error_code="COVERAGE_NOT_ACTIVE",
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert "sk4829137765" not in persisted["reasoning"]
+    assert REDACTED_SECRET_PLACEHOLDER in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_records_the_models_own_account_not_the_gate_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The one path where failure_reason and the model's finish reason disagree: the gate demotes a
+    # completion to failed and writes its own text, which explains the DEMOTION, not why the model
+    # named this code. Reading failure_reason first would file the business code under "the gate
+    # rejected it" and lose the only account of the code.
+    detect_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="completed",
+        reason="the member has no active plan today",
+        billable_actions=[],
+        error_code="COVERAGE_NOT_ACTIVE",
+        error_codes_offered=True,
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        completion_gate_vetoes=True,
+    )
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert persisted["error_code"] == "COVERAGE_NOT_ACTIVE"
+    assert persisted["reasoning"] == "the member has no active plan today"
+    assert "completion gate" not in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_leaves_unasked_failures_to_the_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The scope guard. Every v1 caller and every v3 task without a mapping has error_codes_offered
+    # False, and those runs -- ~15.9k USER_DEFINED_ERROR failures a week across 18 orgs (08-27 to
+    # 09-03) -- must keep exactly today's behavior.
+    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})]
+    detect_mock = AsyncMock(return_value=detected)
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="failed",
+        reason="the page never loaded",
+        billable_actions=[],
+        error_code=None,
+        error_codes_offered=False,  # never asked
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_awaited_once()
+    assert errors_update.await_args.kwargs["errors"] == [{"error_code": "COVERAGE_NOT_ACTIVE"}]
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_router_selected_data_only_validation_goes_page_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

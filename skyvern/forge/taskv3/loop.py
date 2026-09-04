@@ -96,6 +96,14 @@ class LoopOutcome:
     status: Literal["completed", "failed", "terminated", "budget_exhausted", "loop_error", "canceled"]
     reason: str
     extracted_output: Any = None
+    # A user-defined error code the MODEL chose when finishing, drawn from the task's
+    # error_code_mapping. Only ever set on a deliberate finish; None means the model was offered codes
+    # and picked none, or was never offered any (the two are distinguished by error_codes_offered).
+    error_code: str | None = None
+    # Whether the finish tool exposed the customer's codes at all. Lets the caller tell "the model
+    # declined to name a code" from "the model was never asked", so a post-hoc detector can stay out
+    # of the way of a deliberate choice without also going silent on tasks that never had one.
+    error_codes_offered: bool = False
     # The raw budget-cap string (e.g. "max_turns (40) reached") that granted this run its one final
     # observed turn, carried on whatever outcome the final turn produces — a finish verdict or, if
     # the model didn't finish, the honest budget_exhausted exit. None for a run that never tripped a cap.
@@ -1115,6 +1123,7 @@ def _append_skipped_tool_results(
 
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    error_code_mapping: dict[str, str] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     deadline_at: float | None = None,
@@ -1339,12 +1348,29 @@ def make_finish_tool(
                     "positive confirmation at all, finish with status=failed again and the verdict "
                     "will stand."
                 )
+        raw_code = args.get("error_code")
+        # isinstance first: a model can answer with a non-string (a list, a number), and `in` against
+        # a dict would raise TypeError on an unhashable one and take the whole finish down.
+        chosen_code = raw_code if isinstance(raw_code, str) and raw_code in (error_code_mapping or {}) else None
+        if error_code_mapping:
+            # The A/B and the ramp read need to split "was a code offered" from "did the model take
+            # one", and a dropped invented code must not vanish silently -- filter_to_user_defined_codes
+            # returns its dropped set for exactly this reason and every other caller logs it.
+            LOG.info(
+                "taskv3 finish user-defined error code",
+                status=status,
+                chosen_error_code=chosen_code,
+                declined=chosen_code is None and raw_code is None,
+                dropped_error_code=raw_code if chosen_code is None and raw_code is not None else None,
+            )
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
                 "status": status,
                 "reason": args.get("reason") or "",
                 "extracted_output": args.get("extracted_output"),
+                "error_code": chosen_code,
+                "error_codes_offered": bool(error_code_mapping),
             },
         )
 
@@ -1360,6 +1386,29 @@ def make_finish_tool(
                 "status": {"type": "string", "enum": ["completed", "failed", "terminated"]},
                 "reason": {"type": "string", "maxLength": 2000},
                 "extracted_output": {"description": "Structured output requested by the goal, if any."},
+                # Offered ONLY when the task configured codes, and enum-bound to those keys: a task
+                # without a mapping keeps today's exact finish schema, and a model with a mapping
+                # cannot invent a code the customer never defined.
+                **(
+                    {
+                        "error_code": {
+                            "type": "string",
+                            "enum": sorted(error_code_mapping),
+                            "description": (
+                                "Set when one of these descriptions is what actually happened, on "
+                                "whatever finish status is honest — choose the status on its own "
+                                "merits, never to make a code fit. Never use a code to describe a "
+                                "failure of you or the browser: being stuck, losing track of which "
+                                "page you are on, running out of steps, or simply not managing the "
+                                "task are reported without a code. A problem with the SITE may take "
+                                "a code when the user defined one whose description names that "
+                                "problem."
+                            ),
+                        }
+                    }
+                    if error_code_mapping
+                    else {}
+                ),
             },
             "required": ["status", "reason"],
         },
@@ -2521,6 +2570,8 @@ async def run_agent_tool_loop(
                     status=data.get("status", "completed"),
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
+                    error_code=data.get("error_code"),
+                    error_codes_offered=bool(data.get("error_codes_offered")),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=cap_trip_pending if final_turn_granted else None,

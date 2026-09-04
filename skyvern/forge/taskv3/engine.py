@@ -212,6 +212,9 @@ async def run_task_v3_agent_loop(
     llm_caller: Any,
     goal: str,
     parameters: dict[str, Any] | None = None,
+    # The customer's configured business outcomes. Offered to the model on the finish tool so a
+    # terminal verdict names its own code deliberately, instead of one being matched on afterwards.
+    error_code_mapping: dict[str, str] | None = None,
     starting_url: str | None = None,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
@@ -317,6 +320,7 @@ async def run_task_v3_agent_loop(
         verification_blocker = None
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
+        error_code_mapping=error_code_mapping,
         max_settle_deferrals=max_settle_deferrals,
         pending_marker=None if page_free else pending_marker,
         submit_watch=None if page_free else submit_watch,

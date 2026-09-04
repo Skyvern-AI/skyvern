@@ -898,6 +898,13 @@ class AgentFunction:
     async def resolve_task_v3_extra_guidance(self, *, task: Task, organization: Organization) -> str | None:
         return None
 
+    # Whether v3 offers the task's configured error codes to the model, so a terminal verdict names
+    # its own business outcome instead of having one matched on afterwards (SKY-15586). Cloud
+    # overrides behind a flag; False keeps codes out of the loop entirely, which makes the whole
+    # feature byte-identical to before it existed.
+    async def resolve_task_v3_error_code_choice(self, *, task: Task, organization: Organization) -> bool:
+        return False
+
     async def record_run_duration(
         self,
         run_type: str,

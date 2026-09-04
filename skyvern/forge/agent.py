@@ -1498,6 +1498,42 @@ class ForgeAgent:
             goal = (
                 f"{goal}\n\nIf this becomes true, stop and finish with status=terminated: {task.terminate_criterion}"
             ).strip()
+        offer_error_codes = False
+        if task.error_code_mapping:
+            try:
+                offer_error_codes = await app.AGENT_FUNCTION.resolve_task_v3_error_code_choice(
+                    task=task, organization=organization
+                )
+            except Exception:
+                LOG.warning(
+                    "resolve_task_v3_error_code_choice failed; leaving codes out of the loop",
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
+        if offer_error_codes and task.error_code_mapping:
+            # v1 shows the model these codes in-loop (see the error_code_mapping_str prompt sites), so
+            # a v1 terminal verdict names its own code. v3 did not, and the codes were instead matched
+            # on afterwards by the detector — which let a block with no adjudication criteria acquire a
+            # business code it never reasoned about (SKY-15586).
+            #
+            # The exclusion is drawn on OUR side of the line, not around the customer's taxonomy: a
+            # code must not stand in for a failure of this agent or the browser, because those are
+            # ours and have to surface uncoded. A site or portal problem MAY carry a code when the
+            # customer defined one for it -- several such codes exist precisely to trigger a retry,
+            # and a rule of ours that made them unreachable would break the workflow it was meant to
+            # protect. The description match is what does the real work.
+            goal = (
+                f"{goal}\n\nThe user defined these business outcomes and their descriptions:\n"
+                f"```\n{json.dumps(task.error_code_mapping, indent=2)}\n```\n"
+                "If one of these descriptions is what actually happened, set error_code to exactly "
+                "that code, on whatever finish status is honest -- choose the status on its own "
+                "merits, never to make a code fit. Do not return a code the user did not define, and "
+                "do not stretch a description to cover something it does not say. Never use a code to "
+                "describe a failure of YOU or the browser -- being stuck, losing track of which page "
+                "you are on, running out of steps, or simply not managing the task are ours to "
+                "report, so finish those WITHOUT an error_code. A problem with the SITE may take a "
+                "code when the user defined one whose description names that problem."
+            ).strip()
         page_free_validation = bool(
             task_block is not None
             and task.task_type == TaskType.validation
@@ -1998,6 +2034,7 @@ class ForgeAgent:
                     )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
+                error_code_mapping=task.error_code_mapping if offer_error_codes else None,
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
@@ -2111,6 +2148,14 @@ class ForgeAgent:
         # it was, and a finish the loop rejected mid-run never persists at all. A verdict-less death
         # (budget_exhausted/loop_error) records as a FAILED terminate carrying the outcome reason —
         # those are the runs users most need step details for. Cancellation persists nothing.
+        # One lookup for every model-authored string this method persists. Kept out of the branches
+        # below because they must agree: a path that skipped it would publish a secret the sibling
+        # path redacts.
+        run_secrets = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+        )
         if outcome.status in ("completed", "terminated", "failed", "budget_exhausted", "loop_error"):
             with contained_effect("task_v3 terminal decision persist", task_id=task.task_id):
                 decision_reason = outcome.reason or ""
@@ -2125,13 +2170,8 @@ class ForgeAgent:
                         else "completed with no extracted output for a data-extraction goal"
                     )
                     decision_reason = f"{decision_reason} — {rejection}" if decision_reason else rejection
-                decision_secrets = (
-                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
-                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
-                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-                )
-                if decision_secrets:
-                    decision_reason = redact_secrets_from_text(decision_reason, decision_secrets)
+                if run_secrets:
+                    decision_reason = redact_secrets_from_text(decision_reason, run_secrets)
                 decision_reason = decision_reason[:_TASKV3_REASONING_MAX_CHARS]
                 decision_screenshot_id: str | None = None
                 if not page_free_validation:
@@ -2282,9 +2322,53 @@ class ForgeAgent:
                 failure_category = [
                     {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
                 ]
-        if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
-            # Same user-defined error detection the step engine runs on failure, so workflows that
-            # consume configured error codes keep that contract on v3.
+        # Three cases, and the first is status-INDEPENDENT on purpose. A model that named a code has
+        # answered the question; discarding that answer because the run also finished `completed`
+        # would throw away exactly the business-outcome verdict this change exists to capture, and
+        # the prompt actively tells the model to pick its status on the run's merits.
+        model_chose_code = bool(task.error_code_mapping and outcome.error_codes_offered and outcome.error_code)
+        model_declined_code = bool(
+            task.error_code_mapping
+            and outcome.error_codes_offered
+            and not outcome.error_code
+            # The MODEL's verdict, not the derived one: a completion the gate vetoes is demoted to
+            # failed above, but the model said "completed" and was never asked which business outcome
+            # explains a failure, so its silence is not a deliberate decline.
+            and outcome.status in ("failed", "terminated")
+        )
+        if model_chose_code:
+            with contained_effect("task_v3 model-chosen error code persist", task_id=task.task_id, exc_info=True):
+                # The model's own finish reason first: it is the account of why THIS code was named.
+                # failure_reason can be the system's veto text (a completion the gate rejected),
+                # which explains something else.
+                code_reasoning = outcome.reason or failure_reason or ""
+                if run_secrets:
+                    # task.errors reaches the customer's webhook, so this string leaves the system.
+                    code_reasoning = redact_secrets_from_text(code_reasoning, run_secrets)
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    errors=[
+                        UserDefinedError(
+                            error_code=outcome.error_code or "",
+                            reasoning=code_reasoning,
+                            confidence_float=1.0,
+                        ).model_dump()
+                    ],
+                )
+        elif model_declined_code:
+            # A deliberate "none of these applied" is the answer. Running the detector here would put
+            # a guess back on top of a choice -- and on a failed finish it would read `failure_reason`,
+            # the model's own text, written with these descriptions in front of it, through a
+            # substring match with no negation handling (SKY-15591).
+            LOG.info(
+                "taskv3 user-defined error code declined by the model",
+                task_id=task.task_id,
+                task_status=task_status,
+            )
+        elif task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
+            # Unchanged for every run whose finish never offered codes -- which is all of them while
+            # the flag is off, plus v1, whose fail_task runs this same detector.
             try:
                 detected_errors = await detect_user_defined_errors_for_task(
                     task=task,
