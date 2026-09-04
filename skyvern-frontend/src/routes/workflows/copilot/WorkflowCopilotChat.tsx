@@ -83,6 +83,9 @@ import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
+import { QuestionPartsCard } from "./cards/QuestionPartsCard";
+import { questionCardAdjacency } from "./cardAdjacency";
+import { composerPlaceholder } from "./composerPlaceholder";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
@@ -100,6 +103,7 @@ import {
   RecordedActionSummary,
   TurnNarrativeState,
   applyNarrativeEvent,
+  awaitsUserInput,
   hydrateHistoryNarrative,
   notConfirmedOutcome,
   parseUtcIsoMs,
@@ -318,7 +322,7 @@ function ModeGlyph({
   );
 }
 
-function ConvoAggregatePill({
+export function ConvoAggregatePill({
   messages,
   isInFlight,
 }: {
@@ -352,12 +356,30 @@ function ConvoAggregatePill({
   const anyError = turnsWithNarrative.some(
     (m) => m.narrative?.terminal === "error" && !m.narrative?.cancelled,
   );
-  const status = isInFlight ? "In flight" : anyError ? "Halted" : "Done";
+  // The ask is pending only while it is the tail of the conversation. Reading
+  // the last narrative-bearing turn instead would strand the pill on a question
+  // that the user's own reply, or a later narration-free turn, already moved
+  // past. findLastTurnIndex skips run_lifecycle lines, which are sender "ai"
+  // with no narrative and must not count as an answer.
+  const lastTurn = messages[findLastTurnIndex(messages)];
+  const awaitingUser =
+    lastTurn?.sender === "ai" && awaitsUserInput(lastTurn.narrative);
+  // awaitingUser outranks anyError, which is session-wide: a question asked
+  // after a failed build test is what the user acts on next.
+  const status = isInFlight
+    ? "In flight"
+    : awaitingUser
+      ? "Waiting on you"
+      : anyError
+        ? "Halted"
+        : "Done";
   const dotClass = isInFlight
     ? "bg-blue-400"
-    : anyError
-      ? "bg-rose-400"
-      : "bg-emerald-400";
+    : awaitingUser
+      ? "bg-amber-400"
+      : anyError
+        ? "bg-rose-400"
+        : "bg-emerald-400";
   return (
     <div className="flex justify-center pb-1">
       <span className="inline-flex items-center gap-2 rounded-full border border-border bg-slate-elevation1/60 px-3 py-0.5 text-[11px] text-tertiary-foreground">
@@ -3609,6 +3631,12 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
   const lastTurnIndex = findLastTurnIndex(messages);
+  // Same tail rule the session pill uses: the ask is live only while it is the end of the
+  // conversation. The composer is the answer path for anything the card cannot take, so while a
+  // question is pending it says so rather than inviting a new request.
+  const latestTurnIsAsk =
+    messages[lastTurnIndex]?.sender === "ai" &&
+    awaitsUserInput(messages[lastTurnIndex]?.narrative);
   // A bypassed proposal's gate stays attached to its owning turn (not
   // necessarily the last message) so a chip can jump back to it.
   const gateOwnerIndex = pendingProposalTurnId
@@ -3875,7 +3903,16 @@ export function WorkflowCopilotChat({
               if (message.sender === "ai" && message.narrative) {
                 const turnId = message.narrative.turnId;
                 const choices = message.narrative.connectedAccountChoices;
+                // The account card owns its own choice interaction, so a turn
+                // that raised one never also raises the generic parts card.
+                const questionParts =
+                  choices.length === 0 && awaitsUserInput(message.narrative)
+                    ? (message.narrative.terminalEnvelope?.questionParts ?? [])
+                    : [];
                 const adjacentMessage = messages[index + 1];
+                // The parts card must not treat a synthetic row as an answer; both of its
+                // adjacency props come from one shared function so neither can drift back.
+                const cardAdjacency = questionCardAdjacency(messages, index);
                 const selectedConnectionId =
                   adjacentMessage?.sender === "user" &&
                   choices.some(
@@ -3920,6 +3957,18 @@ export function WorkflowCopilotChat({
                         onSelect={(connectionId) =>
                           handleConnectedAccountChoice(turnId, connectionId)
                         }
+                      />
+                    ) : null}
+                    {questionParts.length > 0 ? (
+                      <QuestionPartsCard
+                        parts={questionParts}
+                        answeredFrom={cardAdjacency.answeredFrom}
+                        disabled={
+                          !isLastMessage ||
+                          isLoading ||
+                          cardAdjacency.hasFollowingMessage
+                        }
+                        onAnswer={(answer) => void handleSend(answer)}
                       />
                     ) : null}
                     {message.narrative.googleConnectionNotices.map((notice) => (
@@ -4314,17 +4363,13 @@ export function WorkflowCopilotChat({
           )}
           <textarea
             ref={setTextareaRef}
-            placeholder={
-              queuedPrompt
-                ? "Type to replace the queued message…"
-                : isLoading
-                  ? "Type to queue a message…"
-                  : isWaitingForLiveBrowser
-                    ? "Type a prompt to send when ready..."
-                    : copilotV2Enabled
-                      ? "Ask Copilot to build or change your workflow…"
-                      : "Message Skyvern Copilot, or paste recorded steps…"
-            }
+            placeholder={composerPlaceholder({
+              queuedPrompt: Boolean(queuedPrompt),
+              isLoading,
+              isWaitingForLiveBrowser,
+              latestTurnIsAsk,
+              copilotV2Enabled,
+            })}
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}

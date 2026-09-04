@@ -11,6 +11,14 @@ export type ProposalDisposition =
   | "review_tested";
 export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
+// One thing a terminal ASK_QUESTION asks. `choices` is what the model offered,
+// never the set of answers accepted: the composer always takes free-form text.
+export interface QuestionPart {
+  part_id: string;
+  prompt: string;
+  choices: string[];
+}
+
 export interface ConnectedAccountChoice {
   connection_id: string;
   name: string;
@@ -101,6 +109,8 @@ export interface WorkflowCopilotChatSummary {
   title: string;
   created_at: string;
   modified_at: string;
+  // Absent on responses from a backend that predates the marker.
+  awaiting_user_input?: boolean;
 }
 
 export interface WorkflowCopilotClearProposedWorkflowRequest {

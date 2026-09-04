@@ -96,6 +96,14 @@ class LoopOutcome:
     status: Literal["completed", "failed", "terminated", "budget_exhausted", "loop_error", "canceled"]
     reason: str
     extracted_output: Any = None
+    # A user-defined error code the MODEL chose when finishing, drawn from the task's
+    # error_code_mapping. Only ever set on a deliberate finish; None means the model was offered codes
+    # and picked none, or was never offered any (the two are distinguished by error_codes_offered).
+    error_code: str | None = None
+    # Whether the finish tool exposed the customer's codes at all. Lets the caller tell "the model
+    # declined to name a code" from "the model was never asked", so a post-hoc detector can stay out
+    # of the way of a deliberate choice without also going silent on tasks that never had one.
+    error_codes_offered: bool = False
     # The raw budget-cap string (e.g. "max_turns (40) reached") that granted this run its one final
     # observed turn, carried on whatever outcome the final turn produces — a finish verdict or, if
     # the model didn't finish, the honest budget_exhausted exit. None for a run that never tripped a cap.
@@ -203,7 +211,20 @@ PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
 # returning different content, or a download landing; a first-time probe has no baseline and is
 # evidence of nothing, so varied-selector probing cannot launder repetition into "progress".
 ACTION_LOOP_NUDGE_AFTER = 3
-ACTION_LOOP_TERMINATE_AFTER = 6
+# 8, not 6: RAW repeats of one action key peak at 6 across 50 completed prod runs while stuck runs
+# reach 36, so 6 sat on the completed population's edge. DO NOT LOWER THIS. The effective
+# post-clearing counter — what this constant is actually compared against — was then measured by
+# replaying the clearing rule over per-call telemetry, and NO SEPARATION WAS OBSERVED: two completed
+# runs peaked at 2 and 4, four stuck runs at 1, 3, 3 and below (upper bounds, computed identically
+# on both sides), and the highest observed value fell in a COMPLETED run. n=6 is far too small to
+# establish inversion as a property of either population — that spread is also consistent with
+# noise — but it is no evidence FOR a lower threshold either, and lowering a safety threshold
+# requires positive evidence. 8 is above everything observed, which is why the change is safe; it
+# is also why nothing in the sample fires. REVISIT if the effective distribution ever becomes
+# measurable at population scale; do not lower it before then. Repeat count may not be a stuck-ness
+# signal at all: SKY-15602 tracks the real problem, which is that the loop has no definition of
+# goal progress, only of page change.
+ACTION_LOOP_TERMINATE_AFTER = 8
 
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
@@ -316,6 +337,69 @@ def _content_only_perception(content: str) -> str:
 # How many recent states a probe remembers. This length IS the longest oscillation period that can
 # be recognised, so it is a detection limit and not a memory tuning knob.
 PERCEPTION_RING = 8
+
+# Run-scoped revisit memory (SKY-14998). The ring above is a DETECTION LIMIT: a run that cycles with
+# a period longer than it returns to states the ring has already evicted, so every ring-bounded guard
+# is structurally blind to the loop rather than judging it wrongly. Measured production case: a
+# macro-cycle of period ~44 billable touches, against a ring of 8 and a canonical window of 10.
+# This remembers perception states for the WHOLE run instead, which is what makes a long cycle
+# visible at all. It is a memory, not a verdict: LOG-ONLY, nothing reads it for control flow.
+PERCEPTION_REVISIT_EVENT = "taskv3 perception state revisited"
+# Two returns to a state is a panel toggling; the third is the earliest a cycle is worth reporting.
+PERCEPTION_REVISIT_LOG_AFTER = 3
+# Bounded storage: one 64-char digest per DISTINCT perception state, so the worst case is ~32KB of digests per
+# run. At the cap the memory stops admitting NEW states and keeps counting the ones it already
+# holds — it degrades to a smaller memory rather than growing without bound, and every emission says
+# whether it was capped so a truncated run is never read as a complete one.
+PERCEPTION_REVISIT_CAP = 512
+
+
+@dataclass
+class _RevisitMemory:
+    """How many times each perception state has been seen this run, unbounded in time and bounded in
+    size. Distinct from _ProbeStreak's ring, which only remembers the last PERCEPTION_RING states and
+    therefore cannot see a cycle longer than that."""
+
+    cap: int = PERCEPTION_REVISIT_CAP
+    # digest -> (times seen, novel-state count at its last sighting)
+    _seen: dict[str, tuple[int, int]] = field(default_factory=dict)
+    capped: bool = False
+    distinct_states: int = 0
+    peak_revisits: int = 0
+    # Revisits that had fresh ground covered since the last sighting, so they were not reported.
+    # Kept as a count so the healthy population stays measurable in aggregate without a line each.
+    progressed_revisits: int = 0
+    _novel_states: int = 0
+
+    def record(self, digest: str) -> tuple[int, int]:
+        """Returns (times this state has now been seen, distinct NEW states seen since it was last
+        seen). Zero new states between two sightings is a replay; a drill-down that opens a fresh
+        page between returns to its list is not, and that difference is what makes the signal
+        filterable rather than firing on healthy and stuck runs alike.
+
+        Novelty is measured against the WHOLE run, not the probe's ring: the ring is bounded at
+        PERCEPTION_RING, so a cycle longer than it reads as fresh content there — the exact
+        blindness this memory exists to lift, and reusing that derivation would reintroduce it.
+        """
+        entry = self._seen.get(digest)
+        if entry is None:
+            if len(self._seen) >= self.cap:
+                # Refused, not evicted: dropping a known state to admit a new one would reset a
+                # streak that is the whole point of the memory.
+                self.capped = True
+                return 0, 0
+            self._novel_states += 1
+            self._seen[digest] = (1, self._novel_states)
+            self.distinct_states = len(self._seen)
+            return 1, 0
+        seen, novel_at_last_sighting = entry
+        seen += 1
+        new_states_since = self._novel_states - novel_at_last_sighting
+        self._seen[digest] = (seen, self._novel_states)
+        self.peak_revisits = max(self.peak_revisits, seen)
+        if new_states_since:
+            self.progressed_revisits += 1
+        return seen, new_states_since
 
 
 @dataclass
@@ -1039,6 +1123,7 @@ def _append_skipped_tool_results(
 
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    error_code_mapping: dict[str, str] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     deadline_at: float | None = None,
@@ -1263,12 +1348,29 @@ def make_finish_tool(
                     "positive confirmation at all, finish with status=failed again and the verdict "
                     "will stand."
                 )
+        raw_code = args.get("error_code")
+        # isinstance first: a model can answer with a non-string (a list, a number), and `in` against
+        # a dict would raise TypeError on an unhashable one and take the whole finish down.
+        chosen_code = raw_code if isinstance(raw_code, str) and raw_code in (error_code_mapping or {}) else None
+        if error_code_mapping:
+            # The A/B and the ramp read need to split "was a code offered" from "did the model take
+            # one", and a dropped invented code must not vanish silently -- filter_to_user_defined_codes
+            # returns its dropped set for exactly this reason and every other caller logs it.
+            LOG.info(
+                "taskv3 finish user-defined error code",
+                status=status,
+                chosen_error_code=chosen_code,
+                declined=chosen_code is None and raw_code is None,
+                dropped_error_code=raw_code if chosen_code is None and raw_code is not None else None,
+            )
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
                 "status": status,
                 "reason": args.get("reason") or "",
                 "extracted_output": args.get("extracted_output"),
+                "error_code": chosen_code,
+                "error_codes_offered": bool(error_code_mapping),
             },
         )
 
@@ -1284,6 +1386,29 @@ def make_finish_tool(
                 "status": {"type": "string", "enum": ["completed", "failed", "terminated"]},
                 "reason": {"type": "string", "maxLength": 2000},
                 "extracted_output": {"description": "Structured output requested by the goal, if any."},
+                # Offered ONLY when the task configured codes, and enum-bound to those keys: a task
+                # without a mapping keeps today's exact finish schema, and a model with a mapping
+                # cannot invent a code the customer never defined.
+                **(
+                    {
+                        "error_code": {
+                            "type": "string",
+                            "enum": sorted(error_code_mapping),
+                            "description": (
+                                "Set when one of these descriptions is what actually happened, on "
+                                "whatever finish status is honest — choose the status on its own "
+                                "merits, never to make a code fit. Never use a code to describe a "
+                                "failure of you or the browser: being stuck, losing track of which "
+                                "page you are on, running out of steps, or simply not managing the "
+                                "task are reported without a code. A problem with the SITE may take "
+                                "a code when the user defined one whose description names that "
+                                "problem."
+                            ),
+                        }
+                    }
+                    if error_code_mapping
+                    else {}
+                ),
             },
             "required": ["status", "reason"],
         },
@@ -1414,6 +1539,7 @@ async def run_agent_tool_loop(
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress = _ProgressLedger(window=progress_window) if progress_window is not None else None
     canonical = _CanonicalProgressTracker()
+    revisit_memory = _RevisitMemory()
     # The action-loop counter: (repeat count, first turn of the streak) per billable action
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
@@ -1642,14 +1768,22 @@ async def run_agent_tool_loop(
             # (e.g. "next") on every page relies on THIS clear to survive — page_transitioned alone
             # deliberately does not clear the action-loop guard (see below), so only a progressed
             # snapshot does.
-            _clear_action_state()
+            ring = ledger.content_only.get(action_key) if content_only_digest is not None else None
+            # INVARIANT: this test and the budget-evidence test below must both refuse a return to
+            # the ring. They answer one question — did the run reach ground it has not already
+            # covered? — and relaxing either alone silently reopens SKY-14998: a page that CYCLES
+            # moves on every probe, so `progressed` holds every round, and an unconditional clear
+            # let the action DRIVING the oscillation reset its own counter forever (one production
+            # key ran 11 times against a threshold of 6 while the nudge fired once).
+            returned_to_known_ground = ring is not None and content_only_digest in ring
+            if not returned_to_known_ground:
+                _clear_action_state()
             # Two landed digests that differ are positive evidence, exactly like a fingerprint
             # mismatch — and the only movement evidence there is when page_fingerprint is absent.
             canonical.progress(_ProgressEvidence.PERCEPTION_DIGEST)
             # Evidence requires NEW content: a URL-only flip (history.pushState) still clears the
             # repeat guards above but earns no budget, and neither does a return to a content state
             # in the probe's recent ring (a panel toggling open and shut).
-            ring = ledger.content_only.get(action_key) if content_only_digest is not None else None
             if ring and content_only_digest not in ring:
                 _note_page_change_evidence()
         if content_only_digest is not None:
@@ -2208,6 +2342,25 @@ async def run_agent_tool_loop(
                 content_digest = hashlib.sha256(_canonical_perception_content(result.content).encode()).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
                 attribution["probe_first_time"] = perception.first_time(action_key)
+                # Emitted on its own record, never folded into the one above: the tool-call record's
+                # fields are a stable contract and this signal must not perturb them.
+                seen_count, new_states_since = revisit_memory.record(content_digest)
+                # A revisit with fresh ground covered in between is a drill-down returning to its
+                # list, not a replay. Reporting those too would fire the signal identically on
+                # healthy and stuck runs and leave the precision read it exists to feed unable to
+                # tell them apart.
+                if seen_count >= PERCEPTION_REVISIT_LOG_AFTER and not new_states_since:
+                    LOG.info(
+                        PERCEPTION_REVISIT_EVENT,
+                        revisit_count=seen_count,
+                        distinct_states=revisit_memory.distinct_states,
+                        peak_revisits=revisit_memory.peak_revisits,
+                        progressed_revisits=revisit_memory.progressed_revisits,
+                        capped=revisit_memory.capped,
+                        tool=tool_name,
+                        turn=turns,
+                        **attribution,
+                    )
             # The only per-tool-call timing the engine has: tool execution is the majority of a v3
             # run's wall-clock and otherwise emits nothing at all. Names, sizes and booleans only —
             # argument values and result content carry end-user data and must not be logged.
@@ -2417,6 +2570,8 @@ async def run_agent_tool_loop(
                     status=data.get("status", "completed"),
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
+                    error_code=data.get("error_code"),
+                    error_codes_offered=bool(data.get("error_codes_offered")),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=cap_trip_pending if final_turn_granted else None,

@@ -15,6 +15,10 @@ sync workflow, and `scripts/sync_openapi_docs.py --check`.
 import json
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.boundary
+
 COMMITTED_SPEC = Path(__file__).resolve().parents[2] / "docs" / "api-reference" / "openapi.json"
 
 # Capitalized resource tags — kept in lockstep with .agents/skills/api-docs-audit/SKILL.md.

@@ -28,7 +28,9 @@ from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
+    ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_REASON_PREFIX,
+    ACTION_LOOP_TERMINATE_AFTER,
     CANONICAL_SURVIVAL_EVENT,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -38,6 +40,9 @@ from skyvern.forge.taskv3.loop import (
     PAGE_REFRESH_EXHAUSTED_REASON_PREFIX,
     PAGE_STATE_STALL_SHADOW_EVENT,
     PAGE_UNAVAILABLE_ERROR,
+    PERCEPTION_REVISIT_EVENT,
+    PERCEPTION_REVISIT_LOG_AFTER,
+    PERCEPTION_RING,
     PERCEPTION_STALL_NUDGE_AFTER,
     PERCEPTION_STALL_REASON_PREFIX,
     PERCEPTION_STALL_SHADOW_EVENT,
@@ -56,6 +61,7 @@ from skyvern.forge.taskv3.loop import (
     _canonical_perception_content,
     _PerceptionLedger,
     _ProgressLedger,
+    _RevisitMemory,
     make_finish_tool,
     run_agent_tool_loop,
 )
@@ -3539,6 +3545,44 @@ async def test_action_loop_catches_varied_probe_evasion() -> None:
     assert caller.calls <= 15
 
 
+def test_action_loop_terminate_threshold_is_pinned_to_its_measured_value() -> None:
+    # The other action-loop tests read this constant so they track policy instead of drifting, which
+    # leaves nothing asserting the VALUE — someone could set it to 50 and the suite would stay green.
+    # Pinning it makes any change deliberate and visible in a diff, and sends the reader to the
+    # do-not-lower note at the constant: the effective post-clearing counter was measured, showed no
+    # separation between completed and stuck runs, and its highest observed value fell in a completed
+    # run — so there is no positive evidence supporting a lower threshold.
+    assert ACTION_LOOP_TERMINATE_AFTER == 8
+    assert ACTION_LOOP_NUDGE_AFTER < ACTION_LOOP_TERMINATE_AFTER
+
+
+@pytest.mark.asyncio
+async def test_action_loop_survives_a_page_that_oscillates_between_two_known_states() -> None:
+    # The production shape the guard was structurally blind to (SKY-14998, tsk in wr_568475173904014164):
+    # one action key ran 11 times against a terminate threshold of 6, and the repeat nudge fired
+    # exactly ONCE at repeat_count=3 before the run died on the token cap. A page that CYCLES rather
+    # than freezes moves on every probe, so `snap.progressed` held every round and wiped the whole
+    # repeat ledger — the action driving the oscillation reset its own counter forever. Returning to
+    # a state this probe has already seen is not progress and must not clear the guard.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    panel = ["url=x text: 'filters panel open'", "url=x text: 'filters panel shut'"]
+    contents = [panel[i % 2] for i in range(16)]
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for _ in range(16):
+        script.append([("click", {"selector": "#apply"})])
+        script.append([("observe", {})])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert "#apply" in outcome.reason
+    # Bounded well below the 16 the script offers, and below the 11 the production run reached.
+    assert len(clicks) <= 10, len(clicks)
+
+
 @pytest.mark.asyncio
 async def test_pagination_with_changing_page_content_never_trips_action_loop() -> None:
     # Healthy pagination clicks the same Next selector many times, but each page's observe differs —
@@ -3633,7 +3677,8 @@ async def test_action_loop_warn_and_terminate_emit_facetable_logs() -> None:
     warned = [entry for entry in logs if entry["event"] == "taskv3 loop action repeat nudged"]
     terminated = [entry for entry in logs if entry["event"] == "taskv3 loop action repeated"]
     assert len(warned) == 1 and warned[0]["tool"] == "click" and warned[0]["repeat_count"] == 3
-    assert len(terminated) == 1 and terminated[0]["tool"] == "click" and terminated[0]["repeat_count"] == 6
+    assert len(terminated) == 1 and terminated[0]["tool"] == "click"
+    assert terminated[0]["repeat_count"] == ACTION_LOOP_TERMINATE_AFTER
 
 
 @pytest.mark.asyncio
@@ -4067,7 +4112,9 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
     from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
 
     script = [
-        [("click", {"selector": "#submit"})] * 5,
+        # The burst must cross the terminate threshold inside ONE turn, or the property under test
+        # (no verdict before a delivered warning) is never exercised.
+        [("click", {"selector": "#submit"})] * ACTION_LOOP_TERMINATE_AFTER,
         [("click", {"selector": "#submit"})],
         [("click", {"selector": "#submit"})],
     ]
@@ -4076,7 +4123,8 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
     assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert len(clicks) == 7  # 5 burst + 1 post-warn-queue + 1 post-warn-delivery
+    # burst + 1 post-warn-queue + 1 post-warn-delivery
+    assert len(clicks) == ACTION_LOOP_TERMINATE_AFTER + 2
     warns = [m for m in outcome.messages if m.get("role") == "user" and "#submit" in str(m.get("content"))]
     assert len(warns) == 1
     assert outcome.messages.index(warns[0]) < len(outcome.messages) - 1
@@ -4091,11 +4139,11 @@ async def test_action_loop_counts_errored_attempts() -> None:
     clicks: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", clicks, raises=True)
     click.billable = True
-    script = [[("click", {"selector": "#dead"})] for _ in range(10)]
+    script = [[("click", {"selector": "#dead"})] for _ in range(ACTION_LOOP_TERMINATE_AFTER + 4)]
     outcome, _ = await _run(script, [click, make_finish_tool()], max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
     assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert len(clicks) == 6
+    assert len(clicks) == ACTION_LOOP_TERMINATE_AFTER
 
 
 @pytest.mark.asyncio
@@ -6205,6 +6253,22 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
 # --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
 
 
+def _cycling_observe(name: str, period: int) -> ToolSpec:
+    """Observe fake whose content REPEATS with the given period: call i returns state (i % period).
+    A period longer than PERCEPTION_RING is invisible to the ring-bounded revisit guards, which is
+    the detection limit the run-scoped memory exists to lift."""
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        state = calls["n"] % period
+        calls["n"] += 1
+        return ToolResult.ok(f"url=x state={state}", data={"summary": {"invalid_fields": 0}})
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
+    )
+
+
 def _form_observe(name: str, invalid_seq: list[int]) -> ToolSpec:
     """Observe fake: call i returns UNIQUE content plus summary.invalid_fields=invalid_seq[i] (last
     value repeats). Unique content each call keeps the perception-stall / oscillation guards from
@@ -6446,6 +6510,98 @@ async def test_progress_ledger_emits_terminal_survival_record() -> None:
     assert final[0]["outcome_status"] == "completed"
     assert final[0]["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
     assert final[0]["would_fire"] is True
+
+
+@pytest.mark.asyncio
+async def test_revisit_memory_sees_a_cycle_longer_than_the_perception_ring() -> None:
+    # The detection limit this exists to lift: PERCEPTION_RING is 8, and its own comment says that
+    # length IS the longest oscillation period that can be recognised. A run cycling with period 12
+    # returns to states the ring has already evicted, so every ring-bounded guard is structurally
+    # blind to it. The run-scoped memory is not.
+    period = PERCEPTION_RING + 4
+    rounds = period * PERCEPTION_REVISIT_LOG_AFTER + period
+    tools = [_cycling_observe("observe", period), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    revisits = [e for e in logs if e.get("event") == PERCEPTION_REVISIT_EVENT]
+    assert revisits, "a cycle longer than the ring must still be seen"
+    assert max(e["revisit_count"] for e in revisits) >= PERCEPTION_REVISIT_LOG_AFTER
+    # Log-only: the run is not terminated and no verdict is taken on this signal.
+    assert outcome.status == "completed"
+
+
+def test_revisit_memory_refuses_new_states_at_the_cap_without_evicting_known_ones() -> None:
+    # The storage bound, pinned rather than asserted in a comment. Evicting a held state to admit a
+    # new one would reset the very streak the memory exists to keep, so at the cap it REFUSES new
+    # states and keeps counting the ones it holds — degrading to a smaller memory, never to none.
+    memory = _RevisitMemory(cap=2)
+    assert memory.record("a") == (1, 0)
+    assert memory.record("b") == (1, 0)
+    assert memory.capped is False
+
+    assert memory.record("c") == (0, 0), "a refused state must not report a count"
+    assert memory.capped is True, "a truncated run must never read as a complete one"
+
+    # "b" was the only state admitted after "a" was last seen, so returning to "a" has one new
+    # state behind it; returning again straight away has none.
+    assert memory.record("a") == (2, 1)
+    assert memory.record("a") == (3, 0)
+    assert memory.peak_revisits == 3
+    assert memory.distinct_states == 2
+
+
+@pytest.mark.asyncio
+async def test_revisit_memory_stays_quiet_on_a_healthy_drill_down() -> None:
+    # The false-positive case that decides whether this signal is worth collecting. A drill-down
+    # returns to its list page over and over — a revisit every other touch — but opens a NEW item
+    # in between, so it is progressing. Reporting it would fire identically on healthy and stuck
+    # runs and leave the precision read this feeds unable to separate them.
+    items = 12
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        # list, item-0, list, item-1, list, item-2, ... the list recurs, each item is new.
+        i = calls["n"]
+        calls["n"] += 1
+        content = "url=x list" if i % 2 == 0 else f"url=x item-{i // 2}"
+        return ToolResult.ok(content, data={"summary": {"invalid_fields": 0}})
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(items * 2)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [observe, make_finish_tool()], max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PERCEPTION_REVISIT_EVENT], (
+        "a run covering fresh ground between returns to its list is progressing, not looping"
+    )
+
+
+@pytest.mark.asyncio
+async def test_revisit_memory_silent_when_every_perception_state_is_new() -> None:
+    # A run that never returns to a state has no revisit to report. This is the false-positive
+    # direction that matters: a shadow signal headed for a future verdict must stay quiet on a run
+    # that is genuinely moving through fresh pages.
+    rounds = 20
+    tools = [_form_observe("observe", [0] * rounds), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(rounds)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "completed"
+    assert not [e for e in logs if e.get("event") == PERCEPTION_REVISIT_EVENT]
 
 
 @pytest.mark.asyncio
@@ -7997,3 +8153,80 @@ async def test_canonical_loop_cleared_by_positive_probe_mismatch_on_a_failed_cal
     assert outcome.status == "failed"
     assert len(touches) == 4
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+_COVERAGE_CODES = {
+    "COVERAGE_NOT_ACTIVE": "The coverage tab loaded but the member has no active plan today.",
+    "COVERAGE_TAB_UNAVAILABLE": "The coverage tab could not be rendered because of a portal-side failure.",
+}
+
+
+@pytest.mark.asyncio
+async def test_finish_offers_configured_codes_and_carries_a_deliberate_choice() -> None:
+    # v1 shows the model the user's codes in-loop, so a v1 terminal verdict names its own code. v3
+    # did not, and codes were matched on afterwards instead -- so a block that never reasoned about
+    # coverage could still be handed a coverage outcome (SKY-15586). The model must be able to say it.
+    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
+    assert finish.parameters["properties"]["error_code"]["enum"] == sorted(_COVERAGE_CODES)
+
+    script = [[("finish", {"status": "terminated", "reason": "no active plan", "error_code": "COVERAGE_NOT_ACTIVE"})]]
+    outcome, _ = await _run(script, [finish])
+    assert outcome.status == "terminated"
+    assert outcome.error_code == "COVERAGE_NOT_ACTIVE"
+    assert outcome.error_codes_offered is True
+
+
+@pytest.mark.asyncio
+async def test_a_block_with_no_business_outcome_acquires_no_code() -> None:
+    # The load-bearing case: a block that reaches a terminal state for a reason none of the codes
+    # describes must end with NO code. Today nothing asks the model, so a detector matches one on
+    # from the page afterwards; once asked, a verdict that names none must REPORT none -- and stay
+    # distinguishable from a task that was never offered any.
+    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
+    script = [[("finish", {"status": "terminated", "reason": "could not reach the logout control"})]]
+    outcome, _ = await _run(script, [finish])
+    assert outcome.error_code is None
+    assert outcome.error_codes_offered is True  # asked and declined -- not merely unasked
+
+
+@pytest.mark.asyncio
+async def test_a_code_the_user_never_defined_is_refused() -> None:
+    # Same guarantee filter_to_user_defined_codes gives the step engine: only configured codes may
+    # reach the customer's webhooks, whatever the model returns.
+    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
+    script = [[("finish", {"status": "terminated", "reason": "made one up", "error_code": "INVENTED_CODE"})]]
+    outcome, _ = await _run(script, [finish])
+    assert outcome.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_a_task_without_configured_codes_keeps_todays_finish_schema() -> None:
+    # Out-of-scope guard: tasks with no mapping must see byte-identical finish parameters, so this
+    # change cannot alter behavior for the overwhelming majority of runs.
+    assert "error_code" not in make_finish_tool().parameters["properties"]
+    assert make_finish_tool().parameters == make_finish_tool(error_code_mapping=None).parameters
+
+    script = [[("finish", {"status": "terminated", "reason": "done"})]]
+    outcome, _ = await _run(script, [make_finish_tool()])
+    assert outcome.error_code is None
+    assert outcome.error_codes_offered is False  # never asked -- the detector must stay in charge
+
+
+@pytest.mark.asyncio
+async def test_a_code_is_accepted_on_a_failed_finish_too() -> None:
+    # The schema and the goal must agree that a code is about WHAT HAPPENED, not about which status
+    # was reached. A schema saying "terminated only" would both re-create the pressure to terminate
+    # in order to fit a code, and -- since the detector is now skipped whenever codes were offered --
+    # leave a model-declared failure with no user-defined code at all.
+    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
+    # Assert the absence of ONLY-ness, not of the word: accurate future wording may well mention a
+    # status, and pinning the word would block it.
+    assert "ONLY with status" not in finish.parameters["properties"]["error_code"]["description"]
+    # The twin of the goal text, and it drifts the same way: an example of OUR failure that reads
+    # as a broken page would tell the model to withhold the very code the site problem earns.
+    assert "losing the page" not in finish.parameters["properties"]["error_code"]["description"]
+
+    script = [[("finish", {"status": "failed", "reason": "no active plan", "error_code": "COVERAGE_NOT_ACTIVE"})]]
+    outcome, _ = await _run(script, [finish])
+    assert outcome.status == "failed"
+    assert outcome.error_code == "COVERAGE_NOT_ACTIVE"

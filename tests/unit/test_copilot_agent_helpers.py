@@ -2541,6 +2541,50 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
 
+    def test_model_authored_ask_carries_its_parts_onto_the_terminal_envelope(self) -> None:
+        ctx = _ctx()
+        result = _fake_run_result(
+            {
+                "type": "ASK_QUESTION",
+                "user_response": "Which store, and how should I pick the items?",
+                "parts": [
+                    {"prompt": "Which store?", "choices": ["Acme Supply", "Borough Goods"]},
+                    {"prompt": "Which email should get the receipt?", "choices": []},
+                ],
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.terminal_envelope is not None
+        assert agent_result.terminal_envelope["question_parts"] == [
+            {"part_id": "p1", "prompt": "Which store?", "choices": ["Acme Supply", "Borough Goods"]},
+            {"part_id": "p2", "prompt": "Which email should get the receipt?", "choices": []},
+        ]
+
+    def test_a_reply_never_carries_question_parts(self) -> None:
+        ctx = _ctx()
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "Done.",
+                "parts": [{"prompt": "Which store?", "choices": ["Acme Supply"]}],
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.terminal_envelope is not None
+        assert agent_result.terminal_envelope["question_parts"] == []
+
     def test_request_policy_actuation_claim_does_not_rewrite_model_reply(self) -> None:
         ctx = _ctx(
             request_policy=RequestPolicy(

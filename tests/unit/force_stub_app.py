@@ -1,10 +1,12 @@
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from skyvern.config import settings
 from skyvern.forge import set_force_app_instance
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
 def create_forge_stub_app() -> ForgeApp:
@@ -88,6 +90,11 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
     fake_app_module.DATABASE.tasks.get_last_task_for_workflow_run = AsyncMock()
     fake_app_module.DATABASE.workflow_runs.get_workflow_run = AsyncMock()
+    fake_app_module.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = MagicMock(
+        side_effect=lambda workflow_run_id: nullcontext(
+            SimpleNamespace(workflow_run_id=workflow_run_id, status=WorkflowRunStatus.running)
+        )
+    )
     fake_app_module.DATABASE.workflow_runs.get_secure_runner_pin = AsyncMock(return_value=None)
     fake_app_module.DATABASE.observer.get_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.tasks.get_task = AsyncMock()

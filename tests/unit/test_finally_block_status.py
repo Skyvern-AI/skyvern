@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -5,7 +7,7 @@ import pytest
 
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.forge.sdk.workflow.service import WorkflowRunDispatchStopped, WorkflowService
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 
 
@@ -42,6 +44,55 @@ def _workflow_run(
     )
 
 
+@pytest.fixture(autouse=True)
+def _allow_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    @asynccontextmanager
+    async def admit_dispatch(_: str) -> AsyncIterator[SimpleNamespace]:
+        yield _workflow_run(WorkflowRunStatus.running)
+
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_runs,
+        "admit_workflow_run_block_dispatch",
+        admit_dispatch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_finally_handoff_prevents_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    canceled_run = _workflow_run(WorkflowRunStatus.canceled)
+    block = _block()
+    block.get_all_parameters = Mock(return_value=[])
+    block.execute_safe = AsyncMock()
+    workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(finally_block_label=block.label, blocks=[block]),
+    )
+
+    @asynccontextmanager
+    async def deny_dispatch(_: str) -> AsyncIterator[SimpleNamespace]:
+        yield canceled_run
+
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_runs,
+        "admit_workflow_run_block_dispatch",
+        deny_dispatch,
+    )
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(register_block_parameters_for_workflow_run=AsyncMock()),
+    )
+
+    result = await WorkflowService()._execute_finally_block_if_configured(
+        workflow=workflow,
+        workflow_run=_workflow_run(WorkflowRunStatus.running),
+        organization=SimpleNamespace(organization_id="org_test"),
+        browser_session_id=None,
+    )
+
+    assert result == WorkflowRunDispatchStopped(workflow_run=canceled_run)
+    block.execute_safe.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_execute_finally_block_returns_block_result(monkeypatch: pytest.MonkeyPatch) -> None:
     block_result = _block_result(BlockStatus.failed, failure_reason="upload failed")
@@ -75,8 +126,10 @@ async def test_execute_finally_block_returns_block_result(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["executor", "admission", "commit"])
 async def test_execute_finally_block_converts_exception_to_failed_result(
     monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
 ) -> None:
     block = _block()
     block.get_all_parameters = Mock(return_value=[])
@@ -87,7 +140,7 @@ async def test_execute_finally_block_converts_exception_to_failed_result(
             blocks=[block],
         )
     )
-    workflow_run = _workflow_run(WorkflowRunStatus.completed)
+    workflow_run = _workflow_run(WorkflowRunStatus.running)
     organization = SimpleNamespace(organization_id="org_test")
     monkeypatch.setattr(
         service_module.app,
@@ -95,7 +148,23 @@ async def test_execute_finally_block_converts_exception_to_failed_result(
         SimpleNamespace(register_block_parameters_for_workflow_run=AsyncMock()),
     )
 
-    result = await WorkflowService()._execute_finally_block_if_configured(
+    if failure_phase != "executor":
+
+        @asynccontextmanager
+        async def fail_admission(_: str) -> AsyncIterator[SimpleNamespace]:
+            if failure_phase == "admission":
+                raise RuntimeError("upload exploded")
+            yield workflow_run
+            raise RuntimeError("upload exploded")
+
+        monkeypatch.setattr(
+            service_module.app.DATABASE.workflow_runs,
+            "admit_workflow_run_block_dispatch",
+            fail_admission,
+        )
+
+    service = WorkflowService()
+    result = await service._execute_finally_block_if_configured(
         workflow=workflow,
         workflow_run=workflow_run,
         organization=organization,
@@ -109,6 +178,18 @@ async def test_execute_finally_block_converts_exception_to_failed_result(
     assert block_result.success is False
     assert block_result.status == BlockStatus.failed
     assert block_result.failure_reason == "Unexpected error: upload exploded"
+    if failure_phase != "executor":
+        block.execute_safe.assert_not_awaited()
+
+    _, terminal_intent, _ = await service._apply_finally_block_result(
+        block=block,
+        block_result=block_result,
+        workflow_run=workflow_run,
+        pre_finally_status=workflow_run.status,
+        pre_finally_failure_reason=None,
+        defer_status_write=True,
+    )
+    assert terminal_intent == WorkflowRunStatus.failed
 
 
 @pytest.mark.asyncio

@@ -195,6 +195,8 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         turn={turn({
           proposalDisposition: "review_untested",
           terminalEnvelope: {
+            nextState: "stopped",
+            renderedFromEnvelope: false,
             runVerdict: null,
             runDisplayReason: null,
             connectFailure: {

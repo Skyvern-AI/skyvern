@@ -251,6 +251,10 @@ class WorkflowCopilotChatSummary(BaseModel):
     title: str = Field(..., description="Single-line preview derived from the chat's first message")
     created_at: datetime = Field(..., description="When the chat was created")
     modified_at: datetime = Field(..., description="When the chat was last modified")
+    awaiting_user_input: bool = Field(
+        False,
+        description="Whether the chat's most recent message is a copilot turn that asked the user a question",
+    )
 
 
 class WorkflowCopilotAudioUploadResponse(BaseModel):

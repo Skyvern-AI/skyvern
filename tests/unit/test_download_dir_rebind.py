@@ -1392,12 +1392,10 @@ async def test_real_browser_manager_adoption_resolves_context_run_id() -> None:
     """SKY-11153 / COMP-2: the RealBrowserManager adoption seam rebinds the adopted session's
     download dir to context.run_id-first, matching the block seam and FileUploadBlock."""
 
-    manager = RealBrowserManager.__new__(RealBrowserManager)
-    manager.pages = {}
+    manager = RealBrowserManager()
     workflow_run = MagicMock(
         workflow_run_id="wr_x", parent_workflow_run_id=None, browser_profile_id=None, organization_id="org_1"
     )
-    manager._persistent_session_leases = {}
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=None)
     browser_state.get_or_create_page = AsyncMock()
@@ -1411,6 +1409,7 @@ async def test_real_browser_manager_adoption_resolves_context_run_id() -> None:
     ):
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
+        mock_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(workflow_run, browser_session_id="bs")
 
     assert result is browser_state

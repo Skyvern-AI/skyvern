@@ -245,7 +245,9 @@ from skyvern.schemas.workflows import (
     _direct_code_block_error_code_raises,
     _normalize_optional_endpoint_url,
     _validate_code_block_error_code_calls,
-    _validate_code_block_error_code_mapping,
+    error_code_key_error,
+    error_code_mapping_entry_error,
+    normalize_error_code_description,
 )
 from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
@@ -253,6 +255,7 @@ from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
+from skyvern.utils.secret_redaction import MIN_NUMERIC_SECRET_LENGTH, MIN_SECRET_LENGTH
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_available_keys, get_missing_variables
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
@@ -834,13 +837,119 @@ class Block(BaseModel, abc.ABC):
 
     @classmethod
     def _contains_registered_secret(cls, value: str, workflow_run_context: WorkflowRunContext) -> bool:
+        """Whether `value` carries a registered secret, at ANY length.
+
+        Deliberately unfloored: the code-escalation path uses this to refuse an error code that would
+        carry a secret into generated code and into persisted failure artifacts, where catching a
+        short embedded credential matters more than the odd false positive. Callers that DELETE
+        ordinary customer data on a hit want the floored form -- see _contains_registered_secret_floored.
+        """
         return any(secret in value for secret in cls._registered_secret_values(workflow_run_context))
+
+    @classmethod
+    def _contains_registered_secret_floored(cls, value: str, workflow_run_context: WorkflowRunContext) -> bool:
+        """The same test with the redaction stack's own length floors applied.
+
+        For callers that DELETE on a hit. Unfloored, a two-character secret such as a card expiry
+        makes HTTP_405_DECLINED look secret-bearing and removes a legitimate error code -- a guard
+        destroying the output it exists to protect.
+        """
+        return any(
+            secret in value
+            for secret in cls._registered_secret_values(workflow_run_context)
+            if len(secret) >= MIN_SECRET_LENGTH and not (secret.isdigit() and len(secret) < MIN_NUMERIC_SECRET_LENGTH)
+        )
 
     @classmethod
     def _redact_registered_secrets(cls, value: str, workflow_run_context: WorkflowRunContext) -> str:
         for secret in sorted(cls._registered_secret_values(workflow_run_context), key=len, reverse=True):
             value = value.replace(secret, "[redacted]")
         return value
+
+    def _render_error_code_mapping(
+        self,
+        block_mapping: dict[str, str] | None,
+        workflow_mapping: dict[str, str] | None,
+        workflow_run_context: WorkflowRunContext,
+        *,
+        for_generated_code: bool,
+    ) -> dict[str, str] | None:
+        """Render a block's error_code_mapping, inheriting the workflow's, and repair what it can.
+
+        The MERGE ORDER is part of what the two callers must agree on, so it lives here rather than
+        with each of them. Block entries are offered FIRST: a colliding key keeps the block's value
+        (the documented block-over-workflow precedence), and when the aggregate cap binds it is the
+        workflow's entries that are dropped rather than the block's own.
+
+        error_code_mapping is templatable, so the author-time schema validates a string that is not
+        yet the string the model will see. A rendered KEY that is unusable means the entry goes -- it
+        is the identifier the model names and the customer matches on, and it cannot be repaired. A
+        rendered DESCRIPTION is prose and IS repairable, so it is normalized, not dropped: deleting an
+        entry over a trailing newline removes a customer's error code, and if it was the only entry
+        the mapping goes falsy and error detection is skipped entirely.
+        """
+        ordered: list[tuple[str, str]] = list((block_mapping or {}).items())
+        seen_source_keys = {code for code, _ in ordered}
+        ordered += [(code, text) for code, text in (workflow_mapping or {}).items() if code not in seen_source_keys]
+
+        rendered_mapping: dict[str, str] = {}
+        rendered_mapping_utf8_bytes = 0
+        dropped_reasons: list[str] = []
+        for error_code, error_description in ordered:
+            rendered_code = self.render_templatable_field("error_code_mapping", error_code, workflow_run_context)
+            if rendered_code in rendered_mapping:
+                # Block entries come first, so an earlier occupant is the one precedence keeps.
+                continue
+            rendered_description = self.render_templatable_field(
+                "error_code_mapping", error_description, workflow_run_context
+            )
+            rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
+            secret_bearing_key = (
+                self._contains_registered_secret(rendered_code, workflow_run_context)
+                if for_generated_code
+                else self._contains_registered_secret_floored(rendered_code, workflow_run_context)
+            )
+            if secret_bearing_key or workflow_run_context.mask_secrets_in_data(rendered_code) != rendered_code:
+                dropped_reasons.append("error code keys must not contain a registered secret")
+                continue
+            key_reason = error_code_key_error(rendered_code)
+            if key_reason:
+                # The reason, not the code: the key is customer-authored text and this log is not
+                # covered by the run-secret scrub (SKY-15586 F2, pre-existing).
+                dropped_reasons.append(key_reason)
+                continue
+            if not for_generated_code:
+                normalized_description = normalize_error_code_description(rendered_description)
+                if normalized_description is None:
+                    dropped_reasons.append("error code descriptions must contain something after normalization")
+                    continue
+            else:
+                description_reason = error_code_mapping_entry_error(rendered_code, rendered_description)
+                if description_reason:
+                    dropped_reasons.append(description_reason)
+                    continue
+                normalized_description = rendered_description
+            rendered_entry_utf8_bytes = len(rendered_code.encode("utf-8")) + len(normalized_description.encode("utf-8"))
+            candidate_utf8_bytes = rendered_mapping_utf8_bytes + rendered_entry_utf8_bytes
+            if (
+                len(rendered_mapping) + 1 > ERROR_CODE_MAPPING_MAX_ENTRIES
+                or candidate_utf8_bytes > ERROR_CODE_MAPPING_MAX_UTF8_BYTES
+            ):
+                # Per-entry rules bound one string; only a running total bounds what rendering can
+                # expand a whole mapping into, and this mapping is JSON-dumped into the prompt.
+                dropped_reasons.append("error_code_mapping exceeded its aggregate entry or byte cap")
+                continue
+            rendered_mapping[rendered_code] = normalized_description
+            rendered_mapping_utf8_bytes = candidate_utf8_bytes
+        if dropped_reasons:
+            LOG.warning(
+                "error_code_mapping entries dropped after template rendering",
+                block_label=self.label,
+                dropped=len(dropped_reasons),
+                kept=len(rendered_mapping),
+                reasons=sorted(set(dropped_reasons)),
+            )
+        return rendered_mapping or None
 
     def _own_llm_key(self) -> str | None:
         return None
@@ -1697,14 +1806,12 @@ class BaseTaskBlock(Block):
             workflow_error_code_mapping = workflow.workflow_definition.error_code_mapping
 
         if workflow_error_code_mapping or self.error_code_mapping:
-            merged_mapping = dict(workflow_error_code_mapping or {})
-            merged_mapping.update(self.error_code_mapping or {})
-            self.error_code_mapping = {
-                self.render_templatable_field("error_code_mapping", error_code, workflow_run_context): (
-                    self.render_templatable_field("error_code_mapping", error_description, workflow_run_context)
-                )
-                for error_code, error_description in merged_mapping.items()
-            }
+            self.error_code_mapping = self._render_error_code_mapping(
+                self.error_code_mapping,
+                workflow_error_code_mapping,
+                workflow_run_context,
+                for_generated_code=False,
+            )
 
         # Materialize the workflow-level workflow_system_prompt onto this block so
         # ForgeAgent.create_task can hand it off to the Task row verbatim.
@@ -5241,44 +5348,12 @@ async def wrapper({default_args}):
             if isinstance(definition, dict)
             else getattr(definition, "error_code_mapping", None)
         )
-        merged_mapping = dict(workflow_mapping or {})
-        merged_mapping.update(self.error_code_mapping or {})
-        rendered_mapping: dict[str, str] = {}
-        rendered_mapping_utf8_bytes = 0
-        for error_code, error_description in merged_mapping.items():
-            rendered_code = self.render_templatable_field("error_code_mapping", error_code, workflow_run_context)
-            rendered_description = self.render_templatable_field(
-                "error_code_mapping", error_description, workflow_run_context
-            )
-            rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
-            if (
-                self._contains_registered_secret(rendered_code, workflow_run_context)
-                or workflow_run_context.mask_secrets_in_data(rendered_code) != rendered_code
-            ):
-                continue
-            try:
-                _validate_code_block_error_code_mapping({rendered_code: rendered_description})
-            except ValueError:
-                continue
-            rendered_entry_utf8_bytes = len(rendered_code.encode("utf-8")) + len(rendered_description.encode("utf-8"))
-            previous_description = rendered_mapping.get(rendered_code)
-            previous_entry_utf8_bytes = (
-                len(rendered_code.encode("utf-8")) + len(previous_description.encode("utf-8"))
-                if previous_description is not None
-                else 0
-            )
-            candidate_entry_count = len(rendered_mapping) + (previous_description is None)
-            candidate_utf8_bytes = rendered_mapping_utf8_bytes - previous_entry_utf8_bytes + rendered_entry_utf8_bytes
-            # Aggregate caps mirror ERROR_CODE_MAPPING_MAX_ENTRIES and
-            # ERROR_CODE_MAPPING_MAX_UTF8_BYTES; all per-entry rules stay in the shared validator.
-            if (
-                candidate_entry_count > ERROR_CODE_MAPPING_MAX_ENTRIES
-                or candidate_utf8_bytes > ERROR_CODE_MAPPING_MAX_UTF8_BYTES
-            ):
-                continue
-            rendered_mapping[rendered_code] = rendered_description
-            rendered_mapping_utf8_bytes = candidate_utf8_bytes
-        self.error_code_mapping = rendered_mapping or None
+        self.error_code_mapping = self._render_error_code_mapping(
+            self.error_code_mapping,
+            workflow_mapping,
+            workflow_run_context,
+            for_generated_code=True,
+        )
 
     async def _claim_session_download_artifacts(
         self,

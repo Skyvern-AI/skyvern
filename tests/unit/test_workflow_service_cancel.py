@@ -406,6 +406,63 @@ async def test_mark_canceled_raises_when_row_missing(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.workflow import service as service_module
+    from skyvern.forge.sdk.workflow.service import WorkflowBrowserCleanupResult, WorkflowService
+
+    running_run = _make_updated_row()
+    running_run.workflow_run_id = "wr_canceled_during_cleanup"
+    running_run.status = WorkflowRunStatus.running
+    canceled_run = _make_updated_row()
+    canceled_run.workflow_run_id = running_run.workflow_run_id
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_grade_completion_contract", AsyncMock(return_value=None))
+    conditional_finalize = AsyncMock(return_value=None)
+    monkeypatch.setattr(svc, "_update_workflow_run_status_if_not_final", conditional_finalize)
+    monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=canceled_run))
+
+    webhook_statuses: list[WorkflowRunStatus] = []
+
+    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None) -> None:
+        webhook_statuses.append(workflow_run.status)
+
+    monkeypatch.setattr(svc, "execute_workflow_webhook", record_webhook)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "on_workflow_run_terminal", AsyncMock())
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
+    monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
+    monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", AsyncMock())
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "remove_workflow_run_context", MagicMock())
+
+    finalized_run = await svc._finalize_workflow_run_status(
+        workflow_run_id=running_run.workflow_run_id,
+        workflow_run=running_run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+    )
+    await svc.clean_up_workflow(
+        workflow=MagicMock(),
+        workflow_run=finalized_run,
+        browser_cleanup_result=WorkflowBrowserCleanupResult(
+            browser_state=None,
+            tasks=[],
+            all_workflow_task_ids=[],
+            child_workflow_run_ids=[],
+            close_browser_on_completion=True,
+        ),
+        schedule_credential_fallback_retry=False,
+    )
+
+    conditional_finalize.assert_awaited_once_with(
+        workflow_run_id=running_run.workflow_run_id,
+        status=WorkflowRunStatus.completed,
+    )
+    assert finalized_run is canceled_run
+    assert webhook_statuses == [WorkflowRunStatus.canceled]
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_webhook_tolerates_soft_deleted_workflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

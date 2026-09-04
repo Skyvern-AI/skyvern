@@ -32,10 +32,13 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_HEADLINE,
     MINIMAL_CANCEL_STOP,
     MINIMAL_HONEST_STOP,
+    QUESTION_PART_TEXT_LIMIT,
     UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
+    admit_question_parts,
     assemble_terminal_envelope,
+    chat_awaits_user_input,
     finalize_applied_state,
     interim_run_start_outcome,
     is_interim_run_outcome,
@@ -1741,3 +1744,69 @@ def test_only_a_stop_click_is_reported_as_the_user_asking() -> None:
     drafted = render_terminal_message(with_draft, _CANCEL_REPLY_UNVALIDATED, cancelled=True)[0]
     assert drafted.startswith(CANCEL_STOP_AT_USER_REQUEST)
     assert UNTESTED_DRAFT_PRESERVED in drafted
+
+
+def test_admission_keeps_only_parts_the_server_can_vouch_for() -> None:
+    parts = admit_question_parts(
+        [
+            {"prompt": "Which store?", "choices": ["Acme", "Borough", "Acme", 7]},
+            "not a part",
+            {"prompt": "Which email?", "choices": []},
+            {"choices": ["no prompt"]},
+            {"prompt": "x" * (QUESTION_PART_TEXT_LIMIT + 1), "choices": ["kept out with its part"]},
+            {"prompt": "Which day?", "choices": ["Monday", "y" * (QUESTION_PART_TEXT_LIMIT + 1)]},
+        ]
+    )
+
+    assert [(part.part_id, part.prompt, part.choices) for part in parts] == [
+        ("p1", "Which store?", ["Acme", "Borough"]),
+        ("p2", "Which email?", []),
+        ("p3", "Which day?", ["Monday"]),
+    ]
+
+
+def _asking_row(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "cancelled": False,
+        "terminalEnvelope": {
+            "next_state": "awaiting_user_input",
+            "response_kind": "question",
+            "user_action_required": True,
+            "rendered_from_envelope": True,
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_the_last_message_asking_marks_the_chat_awaiting() -> None:
+    assert chat_awaits_user_input(sender="ai", narrative_payload=_asking_row()) is True
+
+
+def test_a_user_reply_after_the_ask_clears_it() -> None:
+    # The user answered; the tail of the chat is theirs, so nothing is pending.
+    assert chat_awaits_user_input(sender="user", narrative_payload=_asking_row()) is False
+
+
+def test_a_stop_is_not_an_ask() -> None:
+    # The cancel path persists the pre-cancel envelope verbatim.
+    assert chat_awaits_user_input(sender="ai", narrative_payload=_asking_row(cancelled=True)) is False
+
+
+def test_an_unstamped_envelope_is_not_display_authority() -> None:
+    row = _asking_row()
+    row["terminalEnvelope"]["rendered_from_envelope"] = False
+    assert chat_awaits_user_input(sender="ai", narrative_payload=row) is False
+
+
+def test_a_terminal_state_other_than_awaiting_is_not_an_ask() -> None:
+    row = _asking_row()
+    row["terminalEnvelope"]["next_state"] = "completed"
+    assert chat_awaits_user_input(sender="ai", narrative_payload=row) is False
+
+
+def test_rows_without_an_envelope_are_not_asks() -> None:
+    assert chat_awaits_user_input(sender="ai", narrative_payload=None) is False
+    assert chat_awaits_user_input(sender="ai", narrative_payload={}) is False
+    assert chat_awaits_user_input(sender="ai", narrative_payload={"terminalEnvelope": None}) is False
+    assert chat_awaits_user_input(sender="ai", narrative_payload={"terminalEnvelope": "nonsense"}) is False

@@ -14,6 +14,7 @@ import unicodedata
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -227,6 +228,8 @@ from skyvern.schemas.runs import (
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFallbackEpisode, ScriptStatus, WorkflowScript
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
+    ERROR_CODE_MAX_LENGTH,
+    ERROR_CODE_REASONING_MAX_LENGTH,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -322,11 +325,11 @@ def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
         type(value["error_code"]) is not str
         or not value["error_code"]
         or value["error_code"] != value["error_code"].strip()
-        or len(value["error_code"]) > 128
+        or len(value["error_code"]) > ERROR_CODE_MAX_LENGTH
         or type(value["reasoning"]) is not str
         or not value["reasoning"]
         or value["reasoning"] != value["reasoning"].strip()
-        or len(value["reasoning"]) > 2000
+        or len(value["reasoning"]) > ERROR_CODE_REASONING_MAX_LENGTH
         or type(value["confidence_float"]) is not float
         or not 0 <= value["confidence_float"] <= 1
         or type(value["error_type"]) is not str
@@ -1192,6 +1195,15 @@ class ScriptBlockAttempt:
     fallback_episode_id: str | None
     form_fields_for_episode: list | None
     script_exception: Exception | None
+
+
+@dataclass(frozen=True)
+class WorkflowRunDispatchStopped:
+    workflow_run: WorkflowRun
+
+
+class _WorkflowRunDispatchScopeError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -5439,7 +5451,12 @@ class WorkflowService:
                             organization=organization,
                             browser_session_id=browser_session_id,
                         )
-                        if finally_block_execution is not None:
+                        if isinstance(finally_block_execution, WorkflowRunDispatchStopped):
+                            workflow_run = finally_block_execution.workflow_run
+                            pre_finally_status = workflow_run.status
+                            pre_finally_failure_reason = workflow_run.failure_reason
+                            pre_finally_failure_category = workflow_run.failure_category
+                        elif finally_block_execution is not None:
                             finally_block, finally_block_result = finally_block_execution
                             assert pre_finally_status is not None
                             status_before_finally_result = pre_finally_status
@@ -6523,7 +6540,7 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                 )
 
-            attempt = await self._try_execute_block_with_script(
+            attempt_or_stop = await self._try_execute_block_with_script(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 block=block,
@@ -6533,12 +6550,15 @@ class WorkflowService:
                 loaded_script_module=loaded_script_module,
                 is_script_run=is_script_run,
             )
+            if isinstance(attempt_or_stop, WorkflowRunDispatchStopped):
+                return attempt_or_stop.workflow_run, blocks_to_update, None, True, branch_metadata
+            attempt = attempt_or_stop
             workflow_run_block_result = attempt.block_result
             block_executed_with_code = attempt.executed_with_code
             block_requires_agent = attempt.block_requires_agent
 
             if not block_executed_with_code:
-                workflow_run_block_result, block_requires_agent = await self._execute_block_via_agent_if_allowed(
+                agent_execution = await self._execute_block_via_agent_if_allowed(
                     block=block,
                     workflow_run=workflow_run,
                     workflow_run_id=workflow_run_id,
@@ -6549,6 +6569,9 @@ class WorkflowService:
                     script_blocks_by_label=script_blocks_by_label,
                     attempt=attempt,
                 )
+                if isinstance(agent_execution, WorkflowRunDispatchStopped):
+                    return agent_execution.workflow_run, blocks_to_update, None, True, branch_metadata
+                workflow_run_block_result, block_requires_agent = agent_execution
                 if attempt.fallback_episode_id and workflow_run_block_result:
                     await self._enrich_fallback_episode_with_agent_actions(
                         block=block,
@@ -6596,8 +6619,11 @@ class WorkflowService:
                     no_block_result_reason = f"Script error ({type(attempt.script_exception).__name__}): {exc_message}"
                 else:
                     no_block_result_reason = "Block result is None"
-                workflow_run = await self.mark_workflow_run_as_failed(
+                updated_workflow_run = await self.mark_workflow_run_as_failed_if_not_final(
                     workflow_run_id=workflow_run_id, failure_reason=no_block_result_reason
+                )
+                workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
+                    workflow_run_id, workflow_run
                 )
                 return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
 
@@ -6627,6 +6653,8 @@ class WorkflowService:
 
             return workflow_run, blocks_to_update, workflow_run_block_result, should_stop, branch_metadata
 
+        except _WorkflowRunDispatchScopeError:
+            raise
         except Exception as e:
             LOG.exception(
                 f"Error while executing workflow run {workflow_run_id}",
@@ -6639,10 +6667,43 @@ class WorkflowService:
             exception_message = get_user_facing_exception_message(e)
 
             failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
-            workflow_run = await self.mark_workflow_run_as_failed(
+            updated_workflow_run = await self.mark_workflow_run_as_failed_if_not_final(
                 workflow_run_id=workflow_run_id, failure_reason=failure_reason
             )
+            workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
+                workflow_run_id, workflow_run
+            )
             return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+    async def _dispatch_workflow_run_block(
+        self,
+        workflow_run_id: str,
+        execute: Callable[[], Awaitable[_T1]],
+    ) -> _T1 | WorkflowRunDispatchStopped:
+        start_gate = asyncio.Event()
+        executor_task: asyncio.Task[_T1] | None = None
+
+        async def execute_after_admission() -> _T1:
+            await start_gate.wait()
+            return await execute()
+
+        try:
+            async with app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch(workflow_run_id) as workflow_run:
+                if workflow_run.status.is_final():
+                    return WorkflowRunDispatchStopped(workflow_run=workflow_run)
+                executor_task = asyncio.create_task(execute_after_admission())
+        except BaseException as exc:
+            if executor_task is not None:
+                executor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await executor_task
+            if not isinstance(exc, Exception):
+                raise
+            raise _WorkflowRunDispatchScopeError(str(exc)) from exc
+
+        start_gate.set()
+        assert executor_task is not None
+        return await executor_task
 
     async def _record_conditional_agent_episode(
         self,
@@ -6796,7 +6857,7 @@ class WorkflowService:
         script_blocks_by_label: dict[str, Any],
         loaded_script_module: Any,
         is_script_run: bool,
-    ) -> ScriptBlockAttempt:
+    ) -> ScriptBlockAttempt | WorkflowRunDispatchStopped:
         workflow_run_block_result: BlockResult | None = None
         block_executed_with_code = False
         valid_to_run_code = (
@@ -6892,7 +6953,13 @@ class WorkflowService:
                 try:
                     exec_code = compile(wrapper_code, "<run_signature>", "exec")
                     exec(exec_code, exec_globals)
-                    output_value = await exec_globals["__run_signature_wrapper"]()
+                    script_execution = await self._dispatch_workflow_run_block(
+                        workflow_run_id,
+                        exec_globals["__run_signature_wrapper"],
+                    )
+                    if isinstance(script_execution, WorkflowRunDispatchStopped):
+                        return script_execution
+                    output_value = script_execution
                 except ScriptTerminationException as e:
                     LOG.warning(
                         "Script termination",
@@ -6967,6 +7034,8 @@ class WorkflowService:
                         duration_ms=block_exec_duration_ms,
                     )
                     block_executed_with_code = False
+            except _WorkflowRunDispatchScopeError:
+                raise
             except Exception as e:
                 block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
                 script_exception = e
@@ -7014,7 +7083,7 @@ class WorkflowService:
         is_script_run: bool,
         script_blocks_by_label: dict[str, Any],
         attempt: ScriptBlockAttempt,
-    ) -> tuple[BlockResult | None, bool]:
+    ) -> tuple[BlockResult | None, bool] | WorkflowRunDispatchStopped:
         workflow_run_block_result = attempt.block_result
         # Check if this block is designated as requires_agent by the script reviewer.
         # These blocks must execute via agent even when ai_fallback=False.
@@ -7069,12 +7138,18 @@ class WorkflowService:
                 block_type=block.block_type,
                 agent_reason=agent_reason,
             )
-            workflow_run_block_result = await block.execute_safe(
-                workflow_run_id=workflow_run_id,
-                parent_workflow_run_block_id=parent_workflow_run_block_id,
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
+            agent_execution = await self._dispatch_workflow_run_block(
+                workflow_run_id,
+                lambda: block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    parent_workflow_run_block_id=parent_workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                ),
             )
+            if isinstance(agent_execution, WorkflowRunDispatchStopped):
+                return agent_execution
+            workflow_run_block_result = agent_execution
             # Record that this run experienced a script → AI fallback if
             # the agent execution we just ran was a consequence of a failed
             # script attempt. The gate correctly excludes:
@@ -8005,16 +8080,22 @@ class WorkflowService:
                 return workflow_run, False
 
         if target_status == WorkflowRunStatus.failed:
-            workflow_run = await self.mark_workflow_run_as_failed(
+            updated_workflow_run = await self.mark_workflow_run_as_failed_if_not_final(
                 workflow_run_id=workflow_run_id,
                 failure_reason=failure_reason,
                 failure_category=task_failure_category,
             )
+            workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
+                workflow_run_id, workflow_run
+            )
         elif target_status == WorkflowRunStatus.terminated:
-            workflow_run = await self.mark_workflow_run_as_terminated(
+            updated_workflow_run = await self.mark_workflow_run_as_terminated_if_not_final(
                 workflow_run_id=workflow_run_id,
                 failure_reason=failure_reason,
                 failure_category=task_failure_category,
+            )
+            workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
+                workflow_run_id, workflow_run
             )
         else:
             LOG.warning(
@@ -8124,7 +8205,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         organization: Organization,
         browser_session_id: str | None,
-    ) -> tuple[BlockTypeVar, BlockResult] | None:
+    ) -> tuple[BlockTypeVar, BlockResult] | WorkflowRunDispatchStopped | None:
         finally_block_label = workflow.workflow_definition.finally_block_label
         if not finally_block_label:
             return None
@@ -8145,11 +8226,17 @@ class WorkflowService:
             await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                 workflow_run.workflow_run_id, parameters, organization
             )
-            block_result = await block.execute_safe(
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization.organization_id,
-                browser_session_id=browser_session_id,
+            finally_execution = await self._dispatch_workflow_run_block(
+                workflow_run.workflow_run_id,
+                lambda: block.execute_safe(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    browser_session_id=browser_session_id,
+                ),
             )
+            if isinstance(finally_execution, WorkflowRunDispatchStopped):
+                return finally_execution
+            block_result = finally_execution
             return block, block_result
         except Exception as e:
             LOG.warning(
@@ -10049,6 +10136,35 @@ class WorkflowService:
             status=WorkflowRunStatus.terminated,
             failure_reason=failure_reason,
             run_with=run_with,
+            failure_category=failure_category,
+        )
+        return workflow_run
+
+    async def mark_workflow_run_as_terminated_if_not_final(
+        self,
+        workflow_run_id: str,
+        failure_reason: str | None,
+        failure_category: list[dict] | None = None,
+    ) -> WorkflowRun | None:
+        if failure_category is None:
+            failure_category = self._classify_workflow_terminal_failure(
+                WorkflowRunStatus.terminated,
+                failure_reason,
+            )
+
+        workflow_run = await self._update_workflow_run_status_if_not_final(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.terminated,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+        )
+        if workflow_run is None:
+            return None
+
+        otel_trace.get_current_span().set_attribute("task.completion_status", WorkflowRunStatus.terminated)
+        LOG.info(
+            f"Marked workflow run {workflow_run_id} as terminated (conditional)",
+            workflow_run_id=workflow_run_id,
             failure_category=failure_category,
         )
         return workflow_run
