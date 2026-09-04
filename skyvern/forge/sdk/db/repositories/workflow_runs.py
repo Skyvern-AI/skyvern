@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 from typing import cast as typing_cast
 
 import structlog
@@ -602,6 +603,21 @@ class WorkflowRunsRepository(BaseRepository):
             # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
             await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
+
+    @asynccontextmanager
+    async def admit_workflow_run_block_dispatch(self, workflow_run_id: str) -> AsyncIterator[WorkflowRun]:
+        """Hold the workflow-run row lock through the caller's scheduler handoff."""
+        async with self.Session() as session:
+            workflow_run_model = (
+                await session.scalars(
+                    select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id).with_for_update()
+                )
+            ).one_or_none()
+            if workflow_run_model is None:
+                raise WorkflowRunNotFound(workflow_run_id)
+
+            yield convert_to_workflow_run(workflow_run_model)
+            await session.commit()
 
     @db_operation("finish_preexisting_timed_out_workflow_run")
     async def finish_preexisting_timed_out_workflow_run(

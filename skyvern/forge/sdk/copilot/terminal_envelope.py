@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.context import ProposalDisposition
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeRole
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import CopilotCancelSource
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
@@ -154,6 +155,23 @@ class TerminalOutcomeEnvelope(BaseModel):
             self.verified = False
             self.workflow_applied = False
         return self
+
+
+def chat_awaits_user_input(*, sender: str, narrative_payload: object) -> bool:
+    """Whether a chat is blocked on the user, given its most recent message row.
+
+    Keyed on the tail of the conversation, not on the last assistant turn: a user reply
+    answers the ask. The cancel path persists the pre-cancel envelope verbatim, so a stop
+    still carries ``awaiting_user_input`` and must not read as a question.
+    """
+    if sender != WorkflowCopilotChatSender.AI:
+        return False
+    if not isinstance(narrative_payload, dict) or narrative_payload.get("cancelled") is True:
+        return False
+    envelope = narrative_payload.get("terminalEnvelope")
+    if not isinstance(envelope, dict):
+        return False
+    return envelope.get("rendered_from_envelope") is True and envelope.get("next_state") == "awaiting_user_input"
 
 
 def assemble_terminal_envelope(
