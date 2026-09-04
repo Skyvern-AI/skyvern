@@ -1295,3 +1295,35 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
         )
     terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
     assert terminal[0]["block_type"] is None  # bare task: no block context
+
+
+@pytest.mark.asyncio
+async def test_engine_forwards_the_error_code_mapping_to_the_finish_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The engine hop is the one link no other test covers: the agent-side wiring test mocks the loop,
+    # the loop tests call make_finish_tool directly, and the agent tests hand-build a LoopOutcome. Drop
+    # this pass-through and the codes silently stop reaching the model in production.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    finish_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        return LoopOutcome(status="completed", reason="ok")
+
+    real_make_finish_tool = engine_mod.make_finish_tool
+
+    def capturing_make_finish_tool(*args: Any, **kwargs: Any) -> Any:
+        finish_kwargs.update(kwargs)
+        return real_make_finish_tool(*args, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
+
+    mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="check coverage",
+        error_code_mapping=mapping,
+    )
+    assert finish_kwargs["error_code_mapping"] == mapping
