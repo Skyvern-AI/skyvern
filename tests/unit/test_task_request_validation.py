@@ -487,3 +487,17 @@ def test_workflow_request_body_allows_profile_or_start_fresh_alone() -> None:
 
     WorkflowRequestBody(browser_profile_id="bp_1")
     WorkflowRequestBody(start_fresh_browser=True)
+
+
+def test_task_models_still_hydrate_a_legacy_error_code_mapping() -> None:
+    # Deliberately permissive, and this is the reason: error_code_mapping lives on TaskBase, which
+    # Task (the DB-hydrated model) shares with TaskRequest, and run_service rebuilds a TaskRunRequest
+    # from a stored task on the read path. Rejecting a loose mapping at the schema would not reject
+    # an inbound request -- it would fail to LOAD historical rows. The strictness belongs at the
+    # render boundary instead (test_workflow_error_code_mapping_inheritance.py).
+    from skyvern.forge.sdk.schemas.tasks import TaskRequest
+    from skyvern.schemas.runs import TaskRunRequest
+
+    legacy = {"legacy_code": "", "  padded  ": "d", "x" * 200: "d"}
+    assert TaskRequest(url="https://example.com", error_code_mapping=legacy).error_code_mapping == legacy
+    assert TaskRunRequest(prompt="go", error_code_mapping=legacy).error_code_mapping == legacy
