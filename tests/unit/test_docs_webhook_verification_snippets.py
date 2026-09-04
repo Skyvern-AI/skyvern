@@ -18,6 +18,8 @@ import pytest
 
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 
+pytestmark = pytest.mark.boundary
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SNIPPET = REPO_ROOT / "docs/snippets/webhook-signature-verification.mdx"
 
