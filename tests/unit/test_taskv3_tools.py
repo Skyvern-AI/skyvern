@@ -1679,6 +1679,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
     assert set(summary) == {
         "text_dropped",
         "hidden_listed",
+        "hidden_dropped",
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
@@ -16226,12 +16227,15 @@ def _button_listbox_html(
     anchor_id: str = "cc",
     labels: list[str | None] | None = None,
     labelledby: list[str | None] | None = None,
-    wrap_in_span: bool = False,
+    wrap_in_span: bool | list[bool] = False,
     span_label: str | None = None,
+    span_attrs: list[dict[str, str]] | None = None,
     extra_attrs: list[dict[str, str]] | None = None,
 ) -> str:
     labels = labels or [None] * len(rows)
     extra_attrs = extra_attrs or [{} for _ in rows]
+    span_attrs = span_attrs or [{} for _ in rows]
+    wraps = wrap_in_span if isinstance(wrap_in_span, list) else [wrap_in_span] * len(rows)
     # `labelledby[i]` is the TEXT of a hidden div this row's aria-labelledby points at (not an id) --
     # the id is minted from the row's own position so each row gets a distinct label target.
     labelledby = labelledby or [None] * len(rows)
@@ -16248,7 +16252,9 @@ def _button_listbox_html(
         for k, v in extra_attrs[i].items():
             attrs += f" {k}={v!r}"
         span_attr = f" aria-label={span_label!r}" if span_label else ""
-        inner = f'<span style="cursor:pointer"{span_attr}>{text}</span>' if wrap_in_span else text
+        for k, v in span_attrs[i].items():
+            span_attr += f" {k}={v!r}"
+        inner = f'<span style="cursor:pointer"{span_attr}>{text}</span>' if wraps[i] else text
         return f'<li role="option"{attrs}>{inner}</li>'
 
     li_html = "".join(
@@ -16778,6 +16784,95 @@ async def test_select_combobox_refuses_rows_with_crossed_values_across_surfaces(
         assert r.status == "error", r.content
 
 
+def test_lone_duplicate_candidate_refuses_crossed_leaf_and_ancestor_values() -> None:
+    # The node dimension matters: leaf/ancestor data-code A/B beside A/A share the leaf value but
+    # disagree on the ancestor's — a flat set would read the second as a subset and collapse.
+    from skyvern.forge.taskv3.tools import _lone_duplicate_candidate
+
+    rows = [
+        {"n": 1, "text": "Depot", "vals": ["l:data-code=A", "a:data-code=B"]},
+        {"n": 2, "text": "Depot", "vals": ["l:data-code=A", "a:data-code=A"]},
+    ]
+    assert _lone_duplicate_candidate(rows) is None
+
+
+def test_lone_duplicate_candidate_collapses_same_value_at_a_different_depth() -> None:
+    # A copy carrying the same value on a different node is structural variance, not disagreement:
+    # only keys present on BOTH rows compare.
+    from skyvern.forge.taskv3.tools import _lone_duplicate_candidate
+
+    rows = [
+        {"n": 1, "text": "Depot", "vals": ["l:data-code=55"]},
+        {"n": 2, "text": "Depot", "vals": ["a:data-code=55"]},
+    ]
+    assert _lone_duplicate_candidate(rows) == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_rows_with_whitespace_drifted_data_value() -> None:
+    # The primary value surface trims like every other veto surface: data-value "x " beside "x" is
+    # whitespace drift between copies, not a disagreement.
+    rows: list[tuple[str, str | None]] = [("Depot", "x "), ("Depot", "x")]
+    async with _content_page(_duplicate_suggestion_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#addr", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_shared_leaf_label_refusal_names_the_disagreeing_ancestor_labels() -> None:
+    # When a shared leaf action label masks distinct row names, the refusal must surface the names
+    # that actually disagree, or both rows print identically beside their selectors.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(rows, labels=["Branch A", "Branch B"], wrap_in_span=True, span_label="Choose")
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert "Branch A" in r.content, r.content
+        assert "Branch B" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_declaring_identity_on_disjoint_attributes() -> None:
+    # Two rows that each declare identity on entirely different surfaces cannot be confirmed the
+    # same candidate (data-code "A" beside data-key "B" refused on main and must keep refusing).
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_duplicate_suggestion_html(rows, attrs=[{"data-code": "A"}, {"data-key": "B"}])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+def test_lone_duplicate_candidate_refuses_same_attribute_with_disjoint_values_across_depths() -> None:
+    # The same surface naming disjoint values at different depths is a disagreement even though no
+    # node+attr key is shared.
+    from skyvern.forge.taskv3.tools import _lone_duplicate_candidate
+
+    rows = [
+        {"n": 1, "text": "Depot", "vals": ["l:data-code=A"]},
+        {"n": 2, "text": "Depot", "vals": ["a:data-code=B"]},
+    ]
+    assert _lone_duplicate_candidate(rows) is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_option_rows_with_whitespace_distinct_submission_values() -> None:
+    # The DOM preserves whitespace in option submission values: "x " and "x" are distinct choices.
+    rows: list[tuple[str, str | None]] = [("Foo", "x "), ("Foo", "x")]
+    async with _content_page(_duplicate_suggestion_option_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Foo"})
+        assert r.status == "error", r.content
+
+
 def _grid_suggestion_html(rows: list[tuple[str, str | None]]) -> str:
     # The ARIA grid-combobox pattern: the tagged leaf is the gridcell, and the candidate's identity
     # (data-code here) lives on its [role=row] ancestor.
@@ -16838,6 +16933,199 @@ async def test_select_combobox_commits_grid_duplicate_rows_sharing_the_row_code(
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
         assert r.status == "ok", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_disjoint_identifiers_despite_shared_generic_attribute() -> None:
+    # A generic attribute agreeing across rows (a shared tooltip) is ordinary markup, not identity
+    # evidence: rows declaring identity on disjoint attributes must keep refusing even when a title
+    # happens to agree on both.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(
+            rows, attrs=[{"data-code": "A", "title": "Choose"}, {"data-key": "B", "title": "Choose"}]
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+        committed = await page.eval_on_selector("#addr", "el => el.getAttribute('data-committed')")
+        assert committed is None, committed
+
+
+def test_lone_duplicate_candidate_refuses_disjoint_identifiers_with_shared_generic_attribute() -> None:
+    # Any agreeing shared attribute must not stand in for the disjoint identifiers beside it: the
+    # flattened pair sets do not nest, so there is no affirmative evidence of one candidate.
+    from skyvern.forge.taskv3.tools import _lone_duplicate_candidate
+
+    rows = [
+        {"n": 1, "text": "Depot", "vals": ["a:data-code=A", "a:title=Choose"]},
+        {"n": 2, "text": "Depot", "vals": ["a:data-key=B", "a:title=Choose"]},
+    ]
+    assert _lone_duplicate_candidate(rows) is None
+
+
+def test_lone_duplicate_candidate_refuses_agreement_on_one_identifier_beside_disjoint_declarations() -> None:
+    # Deliberately conservative: rows agreeing on their one shared attribute while each declaring
+    # other, disjoint surfaces still refuse — a false collapse silently commits the wrong row, while
+    # a refusal only hands the pick back to the caller.
+    from skyvern.forge.taskv3.tools import _lone_duplicate_candidate
+
+    rows = [
+        {"n": 1, "text": "Depot", "vals": ["a:data-code=A", "a:title=T"]},
+        {"n": 2, "text": "Depot", "vals": ["a:data-code=A", "l:name=N"]},
+    ]
+    assert _lone_duplicate_candidate(rows) is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_equal_renders_tagged_at_different_depths() -> None:
+    # One candidate rendered as a wrapped leaf beside a flattened copy: the tagger lands on the span
+    # in one row and on the row element itself in the other. Tagging depth is structural variance,
+    # not identity — the same DOM must read the same way and collapse.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(
+            rows,
+            wrap_in_span=[True, False],
+            extra_attrs=[{"title": "Depot, Main St"}, {"title": "Depot, Main St"}],
+            span_attrs=[{"title": "Depot"}, {}],
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_leaf_values_disagreeing_under_agreeing_row_values() -> None:
+    # The mirror of the crossed-depth case: leaves declare A beside B while both rows declare Z. A
+    # depth-blind read would let the agreeing row value shadow the leaf disagreement and collapse
+    # two distinct rows.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(
+            rows,
+            wrap_in_span=True,
+            extra_attrs=[{"data-code": "Z"}, {"data-code": "Z"}],
+            span_attrs=[{"data-code": "A"}, {"data-code": "B"}],
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_duplicate_rows_carrying_the_same_attribute_at_both_depths() -> None:
+    # The accept direction of the two-depth read: twin renders agreeing at the leaf AND the row.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(
+            rows,
+            wrap_in_span=True,
+            extra_attrs=[{"data-code": "Z"}, {"data-code": "Z"}],
+            span_attrs=[{"data-code": "A"}, {"data-code": "A"}],
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "ok", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "Depot", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_whose_distinguishing_value_sits_past_twelve_entries() -> None:
+    # The value list must never truncate ahead of the disagreeing entry: nine allowlisted leaf
+    # attributes plus the row's own push the rows' disagreeing data-code to position 13, which a
+    # 12-entry cap discarded — both rows then read identical and the first was committed.
+    nine = {
+        "value": "v",
+        "data-value": "v",
+        "data-val": "v",
+        "data-v": "v",
+        "data-code": "C",
+        "data-key": "k",
+        "data-option-value": "o",
+        "name": "n",
+        "title": "t",
+    }
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _button_listbox_html(
+            rows,
+            wrap_in_span=True,
+            span_attrs=[dict(nine), dict(nine)],
+            extra_attrs=[
+                {"title": "t", "name": "n", "value": "v", "data-code": "ROW-A"},
+                {"title": "t", "name": "n", "value": "v", "data-code": "ROW-B"},
+            ],
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        value = await page.eval_on_selector("#cc-value", "el => el.value")
+        assert value == "", value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_rows_with_whitespace_distinct_value_attribute() -> None:
+    # A `value` attribute is a submission value like OPTION.value, not authoring metadata: "x " and
+    # "x" are two choices, so byte-exact comparison covers it and only data-value gets the drift trim.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(_duplicate_suggestion_html(rows, attrs=[{"value": "x "}, {"value": "x"}])) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_identical_text_refusal_omits_row_labels_that_agree_across_rows() -> None:
+    # The row-label clause exists to surface the surface that DISAGREES; when every row wears the
+    # same ancestor name the clause distinguishes nothing and must not print at all.
+    rows: list[tuple[str, str | None]] = [("Depot", "v1"), ("Depot", "v2")]
+    async with _content_page(
+        _button_listbox_html(rows, labels=["Same Branch", "Same Branch"], wrap_in_span=True, span_label="Choose")
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert "row label" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_identical_text_refusal_leads_with_the_value_that_disagrees() -> None:
+    # Agreeing generic values must not crowd the disagreeing identity out of the capped suffix —
+    # the caller is being asked to pick between the rows, so what differs prints first.
+    rows: list[tuple[str, str | None]] = [("Depot", None), ("Depot", None)]
+    async with _content_page(
+        _duplicate_suggestion_html(
+            rows,
+            attrs=[
+                {"title": "T", "name": "N", "data-val": "V", "data-code": "AAA"},
+                {"title": "T", "name": "N", "data-val": "V", "data-code": "BBB"},
+            ],
+        )
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#addr", "value": "Depot"})
+        assert r.status == "error", r.content
+        assert "AAA" in r.content, r.content
+        assert "BBB" in r.content, r.content
         value = await page.eval_on_selector("#addr", "el => el.value")
         assert value == "Depot", value
 
@@ -20849,3 +21137,58 @@ async def test_semantic_verify_kill_switch_keeps_commits_working(monkeypatch: py
             {"selector": "#city", "value": "Springfield, Sangamon, IL"}
         )
         assert picked.status == "ok", picked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_discloses_that_a_populated_page_was_dropped_whole_by_the_visibility_gates() -> None:
+    # An app shell that keeps its content in the DOM behind a boot gate renders `(0 interactive
+    # elements)` -- byte-identical to a genuinely empty page, because the visibility gates drop
+    # silently. That ambiguity is what makes a model poll wait->observe for turns on end: nothing in
+    # the payload says the page is full and unreadable rather than still loading. v1 is equally blind
+    # here (measured), so the gates stay; only the disclosure is new.
+    html = (
+        "<!doctype html><html><head><title>Portal</title>"
+        "<style>#shell { visibility: hidden; }</style></head><body>"
+        '<div id="shell">'
+        '<nav><a href="#/home">Home</a><a href="#/logout">Logout</a></nav>'
+        "<h1>Document Portal</h1><p>Welcome back.</p>"
+        '<button id="newdoc">New Document</button>'
+        '<input id="q" type="text" placeholder="Search documents">'
+        '<div role="status">Signed in successfully</div>'
+        "</div>"
+        # Outside the hidden shell, so it is the off-canvas gate that drops this one and not the
+        # visibility gate: the count then discriminates both gates rather than only the second.
+        '<button id="ghost" style="position:absolute;left:-9999px">Ghost</button>'
+        "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+
+    assert r.status == "ok", r.content
+    assert "(0 interactive elements)" in r.content, r.content
+    assert "note: the page has 5 control(s) that are present but not visible" in r.content, r.content
+    assert r.data is not None and r.data["summary"]["hidden_dropped"] == 5
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_stays_silent_about_hidden_chrome_when_it_can_still_see_the_page() -> None:
+    # The note is scoped to total blindness on purpose: site chrome is routinely present-but-hidden
+    # (closed menus, inactive tabs), so a note on every observe would be noise on the one channel
+    # whose cost is ~linear in the prefix. A page the model can act on says nothing.
+    html = (
+        "<!doctype html><html><head><title>Portal</title></head><body>"
+        '<button id="go">Go</button>'
+        '<div style="display:none"><button id="hidden-menu">Archive</button></div>'
+        "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+
+    assert r.status == "ok", r.content
+    assert "(1 interactive elements)" in r.content, r.content
+    assert "present but not visible" not in r.content, r.content
+    assert r.data is not None and r.data["summary"]["hidden_dropped"] == 1

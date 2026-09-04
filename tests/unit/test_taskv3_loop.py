@@ -28,7 +28,9 @@ from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
+    ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_REASON_PREFIX,
+    ACTION_LOOP_TERMINATE_AFTER,
     CANONICAL_SURVIVAL_EVENT,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -3543,6 +3545,44 @@ async def test_action_loop_catches_varied_probe_evasion() -> None:
     assert caller.calls <= 15
 
 
+def test_action_loop_terminate_threshold_is_pinned_to_its_measured_value() -> None:
+    # The other action-loop tests read this constant so they track policy instead of drifting, which
+    # leaves nothing asserting the VALUE — someone could set it to 50 and the suite would stay green.
+    # Pinning it makes any change deliberate and visible in a diff, and sends the reader to the
+    # do-not-lower note at the constant: the effective post-clearing counter was measured, showed no
+    # separation between completed and stuck runs, and its highest observed value fell in a completed
+    # run — so there is no positive evidence supporting a lower threshold.
+    assert ACTION_LOOP_TERMINATE_AFTER == 8
+    assert ACTION_LOOP_NUDGE_AFTER < ACTION_LOOP_TERMINATE_AFTER
+
+
+@pytest.mark.asyncio
+async def test_action_loop_survives_a_page_that_oscillates_between_two_known_states() -> None:
+    # The production shape the guard was structurally blind to (SKY-14998, tsk in wr_568475173904014164):
+    # one action key ran 11 times against a terminate threshold of 6, and the repeat nudge fired
+    # exactly ONCE at repeat_count=3 before the run died on the token cap. A page that CYCLES rather
+    # than freezes moves on every probe, so `snap.progressed` held every round and wiped the whole
+    # repeat ledger — the action driving the oscillation reset its own counter forever. Returning to
+    # a state this probe has already seen is not progress and must not clear the guard.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    panel = ["url=x text: 'filters panel open'", "url=x text: 'filters panel shut'"]
+    contents = [panel[i % 2] for i in range(16)]
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for _ in range(16):
+        script.append([("click", {"selector": "#apply"})])
+        script.append([("observe", {})])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert "#apply" in outcome.reason
+    # Bounded well below the 16 the script offers, and below the 11 the production run reached.
+    assert len(clicks) <= 10, len(clicks)
+
+
 @pytest.mark.asyncio
 async def test_pagination_with_changing_page_content_never_trips_action_loop() -> None:
     # Healthy pagination clicks the same Next selector many times, but each page's observe differs —
@@ -3637,7 +3677,8 @@ async def test_action_loop_warn_and_terminate_emit_facetable_logs() -> None:
     warned = [entry for entry in logs if entry["event"] == "taskv3 loop action repeat nudged"]
     terminated = [entry for entry in logs if entry["event"] == "taskv3 loop action repeated"]
     assert len(warned) == 1 and warned[0]["tool"] == "click" and warned[0]["repeat_count"] == 3
-    assert len(terminated) == 1 and terminated[0]["tool"] == "click" and terminated[0]["repeat_count"] == 6
+    assert len(terminated) == 1 and terminated[0]["tool"] == "click"
+    assert terminated[0]["repeat_count"] == ACTION_LOOP_TERMINATE_AFTER
 
 
 @pytest.mark.asyncio
@@ -4071,7 +4112,9 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
     from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
 
     script = [
-        [("click", {"selector": "#submit"})] * 5,
+        # The burst must cross the terminate threshold inside ONE turn, or the property under test
+        # (no verdict before a delivered warning) is never exercised.
+        [("click", {"selector": "#submit"})] * ACTION_LOOP_TERMINATE_AFTER,
         [("click", {"selector": "#submit"})],
         [("click", {"selector": "#submit"})],
     ]
@@ -4080,7 +4123,8 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
     assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert len(clicks) == 7  # 5 burst + 1 post-warn-queue + 1 post-warn-delivery
+    # burst + 1 post-warn-queue + 1 post-warn-delivery
+    assert len(clicks) == ACTION_LOOP_TERMINATE_AFTER + 2
     warns = [m for m in outcome.messages if m.get("role") == "user" and "#submit" in str(m.get("content"))]
     assert len(warns) == 1
     assert outcome.messages.index(warns[0]) < len(outcome.messages) - 1
@@ -4095,11 +4139,11 @@ async def test_action_loop_counts_errored_attempts() -> None:
     clicks: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", clicks, raises=True)
     click.billable = True
-    script = [[("click", {"selector": "#dead"})] for _ in range(10)]
+    script = [[("click", {"selector": "#dead"})] for _ in range(ACTION_LOOP_TERMINATE_AFTER + 4)]
     outcome, _ = await _run(script, [click, make_finish_tool()], max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
     assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert len(clicks) == 6
+    assert len(clicks) == ACTION_LOOP_TERMINATE_AFTER
 
 
 @pytest.mark.asyncio
