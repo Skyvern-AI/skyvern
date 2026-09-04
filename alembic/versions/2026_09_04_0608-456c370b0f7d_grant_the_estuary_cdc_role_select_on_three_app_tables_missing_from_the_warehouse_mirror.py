@@ -6,17 +6,15 @@ Create Date: 2026-09-04T06:08:50.733883+00:00
 
 """
 
-from typing import Sequence, Union
-
-import sqlalchemy as sa
+from collections.abc import Sequence
 
 from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "456c370b0f7d"
-down_revision: Union[str, None] = "ac35398557c1"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "ac35398557c1"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 _CDC_ROLE = "flow_capture"
 _PUBLICATION = "flow_publication"
