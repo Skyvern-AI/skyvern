@@ -7405,20 +7405,30 @@ class ForgeAgent:
         # exclusion come from the post-claim row, never the entry read: a worker can
         # stamp started_at between the two, and the stale read would bill that
         # compute as never_started.
-        if updated_task.workflow_run_id is None and finish_claimed:
-            if updated_task.started_at and updated_task.finished_at:
-                await app.AGENT_FUNCTION.record_run_duration(
-                    run_type="task_v1",
-                    status=str(status),
-                    duration_seconds=(updated_task.finished_at - updated_task.started_at).total_seconds(),
-                )
-            else:
-                # Never started: no compute, but export the exclusion.
-                await app.AGENT_FUNCTION.record_run_duration(
-                    run_type="task_v1",
-                    status=str(status),
-                    duration_seconds=0.0,
-                    excluded_reason="never_started",
+        if updated_task.workflow_run_id is None:
+            if finish_claimed:
+                if updated_task.started_at and updated_task.finished_at:
+                    await app.AGENT_FUNCTION.record_run_duration(
+                        run_type="task_v1",
+                        status=str(status),
+                        duration_seconds=(updated_task.finished_at - updated_task.started_at).total_seconds(),
+                    )
+                else:
+                    # Never started: no compute, but export the exclusion.
+                    await app.AGENT_FUNCTION.record_run_duration(
+                        run_type="task_v1",
+                        status=str(status),
+                        duration_seconds=0.0,
+                        excluded_reason="never_started",
+                    )
+            # Keyed on the persisted status, not finish_claimed: a sweep can claim the finish with
+            # timed_out before the agent's completed write lands, and the org-level milestone claim
+            # inside the hook is what makes repeats a no-op.
+            if updated_task.status == TaskStatus.completed:
+                await app.AGENT_FUNCTION.on_task_completed(
+                    organization_id=updated_task.organization_id,
+                    task_id=updated_task.task_id,
+                    status=updated_task.status,
                 )
         return updated_task
 
