@@ -84,6 +84,8 @@ import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
 import { QuestionPartsCard } from "./cards/QuestionPartsCard";
+import { questionCardAdjacency } from "./cardAdjacency";
+import { composerPlaceholder } from "./composerPlaceholder";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
@@ -3629,6 +3631,12 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
   const lastTurnIndex = findLastTurnIndex(messages);
+  // Same tail rule the session pill uses: the ask is live only while it is the end of the
+  // conversation. The composer is the answer path for anything the card cannot take, so while a
+  // question is pending it says so rather than inviting a new request.
+  const latestTurnIsAsk =
+    messages[lastTurnIndex]?.sender === "ai" &&
+    awaitsUserInput(messages[lastTurnIndex]?.narrative);
   // A bypassed proposal's gate stays attached to its owning turn (not
   // necessarily the last message) so a chip can jump back to it.
   const gateOwnerIndex = pendingProposalTurnId
@@ -3902,6 +3910,9 @@ export function WorkflowCopilotChat({
                     ? (message.narrative.terminalEnvelope?.questionParts ?? [])
                     : [];
                 const adjacentMessage = messages[index + 1];
+                // The parts card must not treat a synthetic row as an answer; both of its
+                // adjacency props come from one shared function so neither can drift back.
+                const cardAdjacency = questionCardAdjacency(messages, index);
                 const selectedConnectionId =
                   adjacentMessage?.sender === "user" &&
                   choices.some(
@@ -3951,15 +3962,11 @@ export function WorkflowCopilotChat({
                     {questionParts.length > 0 ? (
                       <QuestionPartsCard
                         parts={questionParts}
-                        answeredFrom={
-                          adjacentMessage?.sender === "user"
-                            ? adjacentMessage.content
-                            : null
-                        }
+                        answeredFrom={cardAdjacency.answeredFrom}
                         disabled={
                           !isLastMessage ||
                           isLoading ||
-                          adjacentMessage !== undefined
+                          cardAdjacency.hasFollowingMessage
                         }
                         onAnswer={(answer) => void handleSend(answer)}
                       />
@@ -4356,17 +4363,13 @@ export function WorkflowCopilotChat({
           )}
           <textarea
             ref={setTextareaRef}
-            placeholder={
-              queuedPrompt
-                ? "Type to replace the queued message…"
-                : isLoading
-                  ? "Type to queue a message…"
-                  : isWaitingForLiveBrowser
-                    ? "Type a prompt to send when ready..."
-                    : copilotV2Enabled
-                      ? "Ask Copilot to build or change your workflow…"
-                      : "Message Skyvern Copilot, or paste recorded steps…"
-            }
+            placeholder={composerPlaceholder({
+              queuedPrompt: Boolean(queuedPrompt),
+              isLoading,
+              isWaitingForLiveBrowser,
+              latestTurnIsAsk,
+              copilotV2Enabled,
+            })}
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}

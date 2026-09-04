@@ -1123,3 +1123,65 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(renderedText()).not.toContain(capturedAiText);
   });
 });
+
+// A mounted assertion, not a helper one. The adjacency helper has its own unit tests, but those
+// stay green if either QuestionPartsCard prop in the JSX reverts to raw messages[index + 1] —
+// verified by mutation, both reverts passed the whole suite. Only rendering the chat catches it.
+describe("WorkflowCopilotChat — question card survives a synthetic row", () => {
+  it("keeps the answer fields live when a lifecycle row lands after the ask", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        chat_history: [
+          aiHistoryMessage(
+            narrativePayload({
+              turnId: "turn-ask",
+              responseType: "ASK_QUESTION",
+              terminalMessage: "Which store?",
+              narrativeSummary: "Which store?",
+              terminalEnvelope: {
+                next_state: "awaiting_user_input",
+                rendered_from_envelope: true,
+                question_parts: [
+                  { part_id: "p1", prompt: "Which store?", choices: [] },
+                ],
+              },
+            }),
+            "Which store?",
+          ),
+        ],
+      }),
+    );
+
+    // The card's own field, distinct from the composer textarea.
+    await waitFor(() =>
+      expect(screen.getByLabelText("Which store?")).toBeTruthy(),
+    );
+
+    // A run-lifecycle row is synthetic; it is not the user answering.
+    await act(async () => {
+      announceRef.current?.({
+        id: "lifecycle-1",
+        sender: "ai",
+        content: "Run started",
+        kind: "run_lifecycle",
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByLabelText("Which store?")).toBeTruthy();
+
+    // Now the real answer arrives AFTER the synthetic row. With raw adjacency the synthetic row
+    // is what the card reads, so no receipt renders and the user's answer is lost from the card.
+    const composer = screen.getByPlaceholderText("Answer Copilot…");
+    fireEvent.change(composer, {
+      target: { value: "Which store? — acme.example" },
+    });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByText("acme.example")).toBeTruthy());
+  });
+});
