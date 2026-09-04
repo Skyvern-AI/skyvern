@@ -18,6 +18,7 @@ from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
+from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
 from skyvern.forge.sdk.routes.streaming.screencast import (
     _resolve_working_page,
     release_browser_state,
@@ -39,7 +40,17 @@ from skyvern.webeye.navigation import revalidate_redirect_chain, validate_naviga
 LOG = structlog.get_logger()
 
 _INPUT_KIND_LABELS = frozenset(
-    {"mouseEvent", "keyEvent", "wheelEvent", "navigateEvent", "goBackEvent", "goForwardEvent", "reloadEvent"}
+    {
+        "mouseEvent",
+        "keyEvent",
+        "wheelEvent",
+        "insertText",
+        "copySelectedText",
+        "navigateEvent",
+        "goBackEvent",
+        "goForwardEvent",
+        "reloadEvent",
+    }
 )
 _LATENCY_BUCKETS_SECONDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.045, 0.06, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
 _meter = metrics.get_meter("skyvern.live_view")
@@ -65,17 +76,57 @@ _MAX_KEY_LEN = 32
 _MAX_CODE_LEN = 32
 _MODIFIER_MASK = 0xF
 _MAX_VK_CODE = 0xFE
+_MAX_MOUSE_BUTTONS_MASK = 0x7
 # Matches the length Skyvern's own InvalidUrl exception documents as its supported max.
 _MAX_URL_LEN = 2083
 ACTIVE_PAGE_INPUT_REFRESH_INTERVAL = 0.5
 _NAVIGATION_RESET_TIMEOUT_MS = 5_000
 _TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedError"})
-_PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent"})
+_PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent", "insertText"})
 _MAX_IN_FLIGHT_INPUT_DISPATCHES = 32
 
 
 def _input_kind_label(kind: object) -> str:
     return kind if isinstance(kind, str) and kind in _INPUT_KIND_LABELS else "other"
+
+
+_VALID_EDITING_COMMANDS = {
+    "deleteBackward",
+    "deleteForward",
+    "insertNewline",
+    "moveWordLeft",
+    "moveWordLeftAndModifySelection",
+    "moveWordRight",
+    "moveWordRightAndModifySelection",
+    "moveToLeftEndOfLine",
+    "moveToLeftEndOfLineAndModifySelection",
+    "moveToRightEndOfLine",
+    "moveToRightEndOfLineAndModifySelection",
+    "selectAll",
+}
+
+_COPY_SELECTED_TEXT_EXPRESSION = """
+(() => {
+  const active = document.activeElement;
+  if (active) {
+    const tag = active.tagName?.toLowerCase();
+    const type = active.type?.toLowerCase();
+    const selectableField =
+      tag === "textarea" ||
+      (tag === "input" && type !== "password");
+    if (
+      selectableField &&
+      typeof active.selectionStart === "number" &&
+      typeof active.selectionEnd === "number"
+    ) {
+      const start = Math.min(active.selectionStart, active.selectionEnd);
+      const end = Math.max(active.selectionStart, active.selectionEnd);
+      if (start !== end) return String(active.value ?? "").slice(start, end);
+    }
+  }
+  return window.getSelection()?.toString() ?? "";
+})()
+"""
 
 
 @dataclasses.dataclass
@@ -223,11 +274,17 @@ def _validate_mouse_event(msg: dict) -> dict | None:
         click_count = 0
     click_count = max(0, min(click_count, 3))
 
+    buttons = msg.get("buttons", 0)
+    if not isinstance(buttons, int):
+        buttons = 0
+    buttons = max(0, min(buttons, _MAX_MOUSE_BUTTONS_MASK))
+
     return {
         "type": event_type,
         "x": x,
         "y": y,
         "button": button,
+        "buttons": buttons,
         "clickCount": click_count,
         "modifiers": _validated_modifiers(msg),
     }
@@ -264,6 +321,14 @@ def _validate_key_event(msg: dict) -> dict | None:
     if isinstance(vk, int) and 0 <= vk <= _MAX_VK_CODE:
         result["windowsVirtualKeyCode"] = vk
 
+    commands = msg.get("commands")
+    if isinstance(commands, list):
+        validated_commands = [
+            command for command in commands if isinstance(command, str) and command in _VALID_EDITING_COMMANDS
+        ]
+        if validated_commands:
+            result["commands"] = validated_commands
+
     return result
 
 
@@ -292,6 +357,15 @@ def _validate_wheel_event(msg: dict) -> dict | None:
     }
 
 
+def _validate_insert_text(msg: dict) -> dict | None:
+    text = msg.get("text")
+    if not isinstance(text, str):
+        return None
+    if len(text.encode("utf-8")) > MAX_CLIPBOARD_PASTE_BYTES:
+        return None
+    return {"text": text}
+
+
 async def _close_ws_safely(websocket: WebSocket, code: int, reason: str = "") -> None:
     try:
         await websocket.close(code=code, reason=reason)
@@ -303,6 +377,7 @@ _EVENT_DISPATCH_MAP: dict[str, tuple[t.Callable[[dict], dict | None], str]] = {
     "mouseEvent": (_validate_mouse_event, "Input.dispatchMouseEvent"),
     "keyEvent": (_validate_key_event, "Input.dispatchKeyEvent"),
     "wheelEvent": (_validate_wheel_event, "Input.dispatchMouseEvent"),
+    "insertText": (_validate_insert_text, "Input.insertText"),
 }
 
 
@@ -342,6 +417,28 @@ async def _reset_page_after_navigation_failure(
 
 def _is_navigation_target_loss(error: BaseException) -> bool:
     return type(error).__name__ in _TARGET_CLOSED_ERROR_TYPES or is_target_closed_message(str(error))
+
+
+async def _copy_selected_text(websocket: WebSocket, cdp_session: CDPSession) -> None:
+    result = await cdp_session.send(
+        "Runtime.evaluate",
+        {
+            "expression": _COPY_SELECTED_TEXT_EXPRESSION,
+            "returnByValue": True,
+        },
+    )
+    if not isinstance(result, dict) or result.get("exceptionDetails"):
+        await websocket.send_json({"kind": "copied-text", "text": ""})
+        return
+
+    remote_result = result.get("result")
+    copied_text = remote_result.get("value", "") if isinstance(remote_result, dict) else ""
+    if not isinstance(copied_text, str):
+        copied_text = ""
+    encoded = copied_text.encode("utf-8")
+    if len(encoded) > MAX_CLIPBOARD_PASTE_BYTES:
+        copied_text = encoded[:MAX_CLIPBOARD_PASTE_BYTES].decode("utf-8", errors="ignore")
+    await websocket.send_json({"kind": "copied-text", "text": copied_text})
 
 
 async def _dispatch_navigate_event(
@@ -465,6 +562,10 @@ async def _dispatch_event(
 
     if kind in _HISTORY_EVENT_OFFSETS:
         await _dispatch_history_event(cdp_session, kind, log_id_key, log_id_value, websocket)
+        return
+
+    if kind == "copySelectedText":
+        await _copy_selected_text(websocket, cdp_session)
         return
 
     dispatch = _validate_cdp_dispatch(kind, msg, log_id_key, log_id_value)

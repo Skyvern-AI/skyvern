@@ -6,6 +6,7 @@ import { useCdpInput } from "./useCdpInput";
 const mocks = vi.hoisted(() => ({
   credentialGetter: vi.fn(async () => null),
   getCredentialParam: vi.fn(async () => "token=Bearer+test-token"),
+  copyText: vi.fn(async () => true),
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
@@ -19,6 +20,10 @@ vi.mock("@/store/useClientIdStore", () => ({
 
 vi.mock("@/util/env", () => ({
   getCredentialParam: mocks.getCredentialParam,
+}));
+
+vi.mock("@/util/copyText", () => ({
+  copyText: mocks.copyText,
 }));
 
 type SocketListener = (event: Event) => void;
@@ -154,16 +159,32 @@ function fakeKeyboardEvent(
     metaKey: modifiers.metaKey ?? false,
     shiftKey: modifiers.shiftKey ?? false,
     preventDefault: vi.fn(),
+    stopPropagation: vi.fn(),
   } as unknown as React.KeyboardEvent;
 }
 
+type FakeMouseEventOptions = {
+  clientX?: number;
+  clientY?: number;
+  button?: number;
+  buttons?: number;
+  detail?: number;
+};
+
 function fakeMouseEvent(
-  clientX: number,
-  clientY: number,
+  xOrOptions: number | FakeMouseEventOptions = {},
+  y?: number,
 ): React.MouseEvent<HTMLImageElement> {
+  const options =
+    typeof xOrOptions === "number"
+      ? { clientX: xOrOptions, clientY: y }
+      : xOrOptions;
   return {
-    clientX,
-    clientY,
+    button: options.button ?? 0,
+    buttons: options.buttons ?? 0,
+    detail: options.detail ?? 1,
+    clientX: options.clientX ?? 640,
+    clientY: options.clientY ?? 360,
     altKey: false,
     ctrlKey: false,
     metaKey: false,
@@ -453,6 +474,7 @@ describe("useCdpInput mouse move handling", () => {
         x: 500,
         y: 600,
         button: "none",
+        buttons: 0,
         clickCount: 0,
         modifiers: 0,
       }),
@@ -471,6 +493,7 @@ describe("useCdpInput mouse move handling", () => {
         x: 700,
         y: 650,
         button: "none",
+        buttons: 0,
         clickCount: 0,
         modifiers: 0,
       }),
@@ -480,7 +503,9 @@ describe("useCdpInput mouse move handling", () => {
     socket.bufferedAmount = 64 * 1024 + 1;
     act(() => {
       result.current.handlers.handleMouseMove(fakeMouseEvent(800, 700));
-      result.current.handlers.handleMouseDown(fakeMouseEvent(900, 700));
+      result.current.handlers.handleMouseDown(
+        fakeMouseEvent({ clientX: 900, clientY: 700, buttons: 1 }),
+      );
     });
 
     expect(socket.send).toHaveBeenCalledTimes(3);
@@ -491,6 +516,7 @@ describe("useCdpInput mouse move handling", () => {
         x: 900,
         y: 700,
         button: "left",
+        buttons: 1,
         clickCount: 1,
         modifiers: 0,
       }),
@@ -539,6 +565,7 @@ describe("useCdpInput key handling", () => {
         text: "",
         modifiers: 0,
         windowsVirtualKeyCode: 46,
+        commands: ["deleteForward"],
       }),
     );
   });
@@ -562,6 +589,7 @@ describe("useCdpInput key handling", () => {
         text: "",
         modifiers: 0,
         windowsVirtualKeyCode: 8,
+        commands: ["deleteBackward"],
       }),
     );
   });
@@ -587,6 +615,7 @@ describe("useCdpInput key handling", () => {
         text: "",
         modifiers: 0,
         windowsVirtualKeyCode: 46,
+        commands: ["deleteForward"],
       }),
     );
   });
@@ -629,6 +658,283 @@ describe("useCdpInput key handling", () => {
         code: "Delete",
         modifiers: 0,
         windowsVirtualKeyCode: 46,
+      }),
+    );
+  });
+
+  it("sends selectAll instead of printable text for Command+A", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("a", "KeyA", { metaKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "a",
+        code: "KeyA",
+        text: "",
+        modifiers: 4,
+        commands: ["selectAll"],
+      }),
+    );
+  });
+
+  it("maps Command+ArrowLeft to the macOS line-boundary command", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("ArrowLeft", "ArrowLeft", { metaKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "ArrowLeft",
+        code: "ArrowLeft",
+        text: "",
+        modifiers: 4,
+        windowsVirtualKeyCode: 37,
+        commands: ["moveToLeftEndOfLine"],
+      }),
+    );
+  });
+
+  it("maps Command+Shift+ArrowRight to line selection", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("ArrowRight", "ArrowRight", {
+          metaKey: true,
+          shiftKey: true,
+        }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "ArrowRight",
+        code: "ArrowRight",
+        text: "",
+        modifiers: 12,
+        windowsVirtualKeyCode: 39,
+        commands: ["moveToRightEndOfLineAndModifySelection"],
+      }),
+    );
+  });
+
+  it("maps Option+ArrowLeft to word-boundary movement", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("ArrowLeft", "ArrowLeft", { altKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "ArrowLeft",
+        code: "ArrowLeft",
+        text: "",
+        modifiers: 1,
+        windowsVirtualKeyCode: 37,
+        commands: ["moveWordLeft"],
+      }),
+    );
+  });
+
+  it("maps Option+Shift+ArrowRight to word selection", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("ArrowRight", "ArrowRight", {
+          altKey: true,
+          shiftKey: true,
+        }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "ArrowRight",
+        code: "ArrowRight",
+        text: "",
+        modifiers: 9,
+        windowsVirtualKeyCode: 39,
+        commands: ["moveWordRightAndModifySelection"],
+      }),
+    );
+  });
+
+  it("maps Option+Enter to newline insertion", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("Enter", "Enter", { altKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "Enter",
+        code: "Enter",
+        text: "",
+        modifiers: 1,
+        windowsVirtualKeyCode: 13,
+        commands: ["insertNewline"],
+      }),
+    );
+  });
+
+  it("sends insertNewline for Shift+Enter", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("Enter", "Enter", { shiftKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "Enter",
+        code: "Enter",
+        text: "",
+        modifiers: 8,
+        windowsVirtualKeyCode: 13,
+        commands: ["insertNewline"],
+      }),
+    );
+  });
+
+  it("copies through direct CDP when no recording callback is present", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("c", "KeyC", { metaKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenLastCalledWith(
+      JSON.stringify({ type: "copySelectedText" }),
+    );
+
+    act(() => {
+      MockWebSocket.instances
+        .at(-1)
+        ?.emitMessage(
+          JSON.stringify({ kind: "copied-text", text: "selected remotely" }),
+        );
+    });
+    expect(mocks.copyText).toHaveBeenCalledWith("selected remotely");
+  });
+
+  it("copies through the recording callback when one is present", async () => {
+    const onClipboardCopy = vi.fn();
+    const result = await renderControllingInputHook({ onClipboardCopy });
+    const send = latestSocketSend();
+    send.mockClear();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("c", "KeyC", { metaKey: true }),
+      );
+    });
+
+    expect(onClipboardCopy).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("inserts text from a local paste event when no recording callback is present", async () => {
+    const result = await renderControllingInputHook();
+    const send = latestSocketSend();
+    send.mockClear();
+    const keyDown = fakeKeyboardEvent("v", "KeyV", { metaKey: true });
+
+    act(() => {
+      result.current.handlers.handleKeyDown(keyDown);
+    });
+
+    const pasteEvent = {
+      clipboardData: {
+        getData: vi.fn(() => "pasted locally"),
+      },
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+    } as unknown as React.ClipboardEvent;
+    act(() => {
+      result.current.handlers.handlePaste(pasteEvent);
+    });
+
+    expect(keyDown.preventDefault).not.toHaveBeenCalled();
+    expect(send).toHaveBeenLastCalledWith(
+      JSON.stringify({ type: "insertText", text: "pasted locally" }),
+    );
+    expect(pasteEvent.preventDefault).toHaveBeenCalled();
+  });
+
+  it("preserves the pressed button mask while moving the mouse", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleMouseMove(fakeMouseEvent({ buttons: 1 }));
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "mouseEvent",
+        eventType: "mouseMoved",
+        x: 640,
+        y: 360,
+        button: "left",
+        buttons: 1,
+        clickCount: 0,
+        modifiers: 0,
+      }),
+    );
+  });
+
+  it("forwards the browser click count for double-click selection", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleMouseDown(
+        fakeMouseEvent({ button: 0, buttons: 1, detail: 2 }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "mouseEvent",
+        eventType: "mousePressed",
+        x: 640,
+        y: 360,
+        button: "left",
+        buttons: 1,
+        clickCount: 2,
+        modifiers: 0,
       }),
     );
   });
