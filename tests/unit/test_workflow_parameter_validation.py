@@ -129,6 +129,31 @@ class TestReplaceJinjaReference:
             ),
             pytest.param("{{ old_key_extended }}", "{{ old_key_extended }}", id="partial-match-unchanged"),
             pytest.param("{{ other_key }}", "{{ other_key }}", id="different-key-unchanged"),
+            pytest.param(
+                "{{ current_index < old_key }}",
+                "{{ current_index < new_key }}",
+                id="mid-expression-reference",
+            ),
+            pytest.param(
+                "{% if old_key %}go{% endif %}",
+                "{% if new_key %}go{% endif %}",
+                id="statement-block-reference",
+            ),
+            pytest.param(
+                "{% for item in old_key %}{{ item }}{% endfor %}",
+                "{% for item in new_key %}{{ item }}{% endfor %}",
+                id="for-statement-reference",
+            ),
+            pytest.param(
+                "{{ old_key | default('old_key') }}",
+                "{{ new_key | default('old_key') }}",
+                id="quoted-literal-unchanged",
+            ),
+            pytest.param(
+                "{% if other_old_key %}go{% endif %}",
+                "{% if other_old_key %}go{% endif %}",
+                id="statement-partial-match-unchanged",
+            ),
         ],
     )
     def test_replace_jinja_reference(self, text: str, expected: str) -> None:
