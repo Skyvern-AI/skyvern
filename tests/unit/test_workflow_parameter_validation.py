@@ -4,6 +4,7 @@ These tests ensure that parameter keys and block labels are valid Python/Jinja2 
 preventing runtime errors like "'State_' is undefined" when using keys like "State_/_Province".
 """
 
+import time
 from collections.abc import Callable
 
 import pytest
@@ -129,10 +130,99 @@ class TestReplaceJinjaReference:
             ),
             pytest.param("{{ old_key_extended }}", "{{ old_key_extended }}", id="partial-match-unchanged"),
             pytest.param("{{ other_key }}", "{{ other_key }}", id="different-key-unchanged"),
+            pytest.param(
+                "{{ current_index < old_key }}",
+                "{{ current_index < new_key }}",
+                id="mid-expression-comparison",
+            ),
+            pytest.param(
+                "{{ old_key + old_key }}",
+                "{{ new_key + new_key }}",
+                id="repeated-within-expression",
+            ),
+            pytest.param("{% if old_key %}yes{% endif %}", "{% if new_key %}yes{% endif %}", id="if-statement"),
+            pytest.param(
+                "{% for item in old_key %}{{ item }}{% endfor %}",
+                "{% for item in new_key %}{{ item }}{% endfor %}",
+                id="for-statement",
+            ),
+            pytest.param("{%- if old_key -%}", "{%- if new_key -%}", id="whitespace-control-statement"),
+            pytest.param("{{\n  old_key\n  | trim }}", "{{\n  new_key\n  | trim }}", id="multiline-expression"),
+            pytest.param("{% if old_key_extended %}", "{% if old_key_extended %}", id="statement-partial-unchanged"),
+            pytest.param("{{ foo.old_key }}", "{{ foo.old_key }}", id="attribute-position-unchanged"),
+            pytest.param("{{ func('old_key') }}", "{{ func('old_key') }}", id="string-literal-unchanged"),
+            pytest.param(
+                "{{ notify('ping old_key now') }}",
+                "{{ notify('ping old_key now') }}",
+                id="embedded-in-single-quoted-literal-unchanged",
+            ),
+            pytest.param(
+                '{{ notify("ping old_key now") }}',
+                '{{ notify("ping old_key now") }}',
+                id="embedded-in-double-quoted-literal-unchanged",
+            ),
+            pytest.param(
+                "{% if 'use old_key here' == mode %}",
+                "{% if 'use old_key here' == mode %}",
+                id="embedded-in-statement-literal-unchanged",
+            ),
+            pytest.param(
+                r"{{ f('it\'s old_key here') }}",
+                r"{{ f('it\'s old_key here') }}",
+                id="escaped-quote-literal-unchanged",
+            ),
+            pytest.param(
+                "{{ f('old_key') + old_key }}",
+                "{{ f('old_key') + new_key }}",
+                id="literal-preserved-bare-token-rewritten",
+            ),
+            pytest.param(
+                "old_key outside delimiters",
+                "old_key outside delimiters",
+                id="outside-delimiters-unchanged",
+            ),
+            pytest.param("{{ old_key", "{{ new_key", id="unclosed-expression-leading-rewritten"),
+            pytest.param(
+                "{{ oops {% if old_key %}",
+                "{{ oops {% if new_key %}",
+                id="closed-statement-after-unclosed-expression-rewritten",
+            ),
+            pytest.param(
+                "{% oops {{ x < old_key }}",
+                "{% oops {{ x < new_key }}",
+                id="closed-expression-after-unclosed-statement-rewritten",
+            ),
+            pytest.param(
+                "{{ old_key {{ old_key",
+                "{{ new_key {{ new_key",
+                id="repeated-unclosed-leading-rewritten",
+            ),
         ],
     )
     def test_replace_jinja_reference(self, text: str, expected: str) -> None:
         assert replace_jinja_reference(text, "old_key", "new_key") == expected
+
+    @pytest.mark.parametrize(
+        ("malformed",),
+        [
+            pytest.param("{{ " * 65536 + "old_key", id="unmatched-openers-with-spaces"),
+            pytest.param("{{" * 65536 + "old_key", id="unmatched-openers-dense"),
+            pytest.param("{% " * 65536 + "old_key", id="unmatched-statement-openers"),
+        ],
+    )
+    def test_malformed_delimiters_scan_linearly(self, malformed: str) -> None:
+        """Unmatched openers must not trigger quadratic rescans.
+
+        The span search resumes where the previous span ended, so an input full of
+        unmatched braces is scanned once. A lazy-regex implementation rescanned to the
+        end of the input from every opener (~0.5s at 16k openers, quadrupling with input
+        size); the generous absolute bound below fails that implementation at this size
+        while leaving two orders of magnitude of headroom for a linear scan on slow CI.
+        """
+        start = time.perf_counter()
+        replace_jinja_reference(malformed, "old_key", "new_key")
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"malformed-delimiter scan took {elapsed:.2f}s — quadratic rescan regression"
 
 
 class TestSanitizeWorkflowYamlWithReferences:
@@ -245,6 +335,54 @@ class TestSanitizeWorkflowYamlWithReferences:
         result = sanitize_workflow_yaml_with_references(workflow_yaml)
         assert result["workflow_definition"]["blocks"][0]["label"] == "block_1"
         assert result["workflow_definition"]["parameters"][0]["source_parameter_key"] == "block_1_output"
+
+    def test_sanitize_updates_references_in_statements_and_mid_expression(self) -> None:
+        """Renamed keys are rewritten inside {% ... %} statements and mid-expression, not just after {{."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [{"key": "max attempts", "parameter_type": "workflow"}],
+                "blocks": [
+                    {
+                        "label": "retry_loop",
+                        "block_type": "while_loop",
+                        "complete_criterion": "{{ current_index < max attempts }}",
+                        "loop_blocks": [],
+                    },
+                    {
+                        "label": "notify",
+                        "block_type": "task",
+                        "navigation_goal": "{% if max attempts %}Retry up to {{ max attempts }} times{% endif %}",
+                    },
+                ],
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        blocks = result["workflow_definition"]["blocks"]
+        assert result["workflow_definition"]["parameters"][0]["key"] == "max_attempts"
+        assert blocks[0]["complete_criterion"] == "{{ current_index < max_attempts }}"
+        assert blocks[1]["navigation_goal"] == "{% if max_attempts %}Retry up to {{ max_attempts }} times{% endif %}"
+
+    def test_sanitize_updates_output_references_in_statements(self) -> None:
+        """Renamed block labels are rewritten in {label}_output references inside {% ... %} statements."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {"label": "my-block", "block_type": "task"},
+                    {
+                        "label": "guard",
+                        "block_type": "task",
+                        "navigation_goal": "{% if my-block_output.success %}Continue{% endif %}",
+                    },
+                ],
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        blocks = result["workflow_definition"]["blocks"]
+        assert blocks[0]["label"] == "my_block"
+        assert blocks[1]["navigation_goal"] == "{% if my_block_output.success %}Continue{% endif %}"
 
     def test_sanitize_parameter_key(self) -> None:
         """Test that parameter keys with invalid characters are sanitized."""
