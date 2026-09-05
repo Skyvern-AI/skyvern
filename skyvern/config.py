@@ -712,6 +712,12 @@ class Settings(BaseSettings):
     GROQ_MODEL: str | None = None
     GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
 
+    # ATLAS CLOUD
+    ENABLE_ATLASCLOUD: bool = False
+    ATLASCLOUD_API_KEY: str | None = None
+    ATLASCLOUD_MODEL: str | None = None
+    ATLASCLOUD_API_BASE: str = "https://api.atlascloud.ai/v1"
+
     # MOONSHOT AI
     ENABLE_MOONSHOT: bool = False
     MOONSHOT_API_KEY: str | None = None

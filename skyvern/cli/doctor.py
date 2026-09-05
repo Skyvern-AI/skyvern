@@ -495,6 +495,11 @@ def _check_llm_config() -> CheckResult:
         "OLLAMA": {"enable": "ENABLE_OLLAMA", "key": None},
         "OPENROUTER": {"enable": "ENABLE_OPENROUTER", "key": "OPENROUTER_API_KEY"},
         "GROQ": {"enable": "ENABLE_GROQ", "key": "GROQ_API_KEY"},
+        "ATLASCLOUD": {
+            "enable": "ENABLE_ATLASCLOUD",
+            # config_registry.py needs both to register the provider.
+            "key": ("ATLASCLOUD_API_KEY", "ATLASCLOUD_MODEL"),
+        },
         "OPENAI_COMPATIBLE": {
             "enable": "ENABLE_OPENAI_COMPATIBLE",
             # config_registry.py requires all three to register the provider.
