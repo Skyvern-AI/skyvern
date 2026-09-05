@@ -148,6 +148,8 @@ If the status does not turn Active, verify that your service account token has a
 
 In the agent editor, add a **Credential Parameter** and select **1Password** as the source. Provide the **Vault ID** and **Item ID**. You can find both IDs in the URL when viewing an item in the 1Password web app.
 
+For password credentials, you can also set the optional **1Password TOTP Field**. Set it to the id or label of the item field that holds the TOTP secret. Use this when the OTP is stored in a plain custom field (for example, one named "digits") rather than 1Password's native one-time password field type. Leave it empty to auto-detect.
+
 <Warning>
 Credit cards from 1Password need a custom text field named **"Expire Date"**, **"Expiry Date"**, or **"Expiration Date"** in `MM/YYYY` or `MM/YY` format. 1Password does not expose the native expiration field through its API, so Skyvern reads this custom text field instead.
 </Warning>
