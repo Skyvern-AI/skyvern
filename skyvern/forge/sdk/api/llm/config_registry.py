@@ -2381,6 +2381,29 @@ if settings.ENABLE_GROQ:
             ),
         )
 
+if settings.ENABLE_ATLASCLOUD:
+    # Register the Atlas Cloud model configured in settings. Atlas is
+    # OpenAI-compatible, so the litellm route is the `openai/` prefix with an
+    # api_base override — the same shape the Novita and Inception entries use.
+    if settings.ATLASCLOUD_MODEL:
+        atlascloud_model_name = settings.ATLASCLOUD_MODEL
+        LLMConfigRegistry.register_config(
+            "ATLASCLOUD",
+            LLMConfig(
+                f"openai/{atlascloud_model_name}",
+                ["ATLASCLOUD_API_KEY", "ATLASCLOUD_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.ATLASCLOUD_API_KEY,
+                    api_base=settings.ATLASCLOUD_API_BASE,
+                    api_version=None,
+                    model_info={"model_name": f"openai/{atlascloud_model_name}"},
+                ),
+            ),
+        )
+
 if settings.ENABLE_MOONSHOT:
     LLMConfigRegistry.register_config(
         "MOONSHOT_KIMI_K2",
