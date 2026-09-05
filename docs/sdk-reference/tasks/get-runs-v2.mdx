@@ -32,6 +32,22 @@ for (const run of runs) {
 
 ### Returns `list[TaskRunListItem]`
 
+### Filtering by failure category
+
+The underlying List Runs endpoint accepts a `failure_category` query parameter that the SDK method does not expose as a named argument. Pass it through request options to filter runs by their top classifier failure category (`failure_category[0].category`), matched exactly.
+
+```python Python
+from skyvern.client.core import RequestOptions
+
+runs = await client.get_runs_v2(
+    request_options=RequestOptions(
+        additional_query_parameters={"failure_category": "AUTH_FAILURE"},
+    ),
+)
+```
+
+Only `failed`, `terminated`, and `timed_out` runs are eligible for this filter. Canceled runs are never returned. The filter applies to workflow runs only. Combining it with a task run type matches nothing.
+
 ---
 
 ### Request options
