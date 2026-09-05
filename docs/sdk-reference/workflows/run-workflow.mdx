@@ -55,7 +55,7 @@ console.log(result.output);
 | `user_agent` | `str` | No | `None` | Custom User-Agent header for the browser. |
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
 | `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. |
-| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address. Must be an `http`, `https`, `ws`, or `wss` URL with a resolvable host that passes network policy. Invalid or blocked addresses return a 422 validation error. |
 | `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
 
 ### Returns `WorkflowRunResponse`
