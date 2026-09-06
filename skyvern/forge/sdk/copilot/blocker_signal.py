@@ -80,6 +80,7 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "get_run_results",
     "inspect_page_for_composition",
     "discover_workflow_entrypoint",
+    "search_web",
     "get_browser_screenshot",
     "list_credentials",
     "list_integrations",

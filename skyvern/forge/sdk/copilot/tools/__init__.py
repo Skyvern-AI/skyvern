@@ -232,6 +232,7 @@ from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
+from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
@@ -1322,6 +1323,37 @@ async def discover_workflow_entrypoint_tool(
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
+@function_tool(name_override="search_web", strict_mode=False)
+async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int = 10) -> str:
+    """Search the web for pages matching a query, when you need candidate sites rather than one known page.
+
+    Use this while scouting -- to find companies, suppliers, listings, or
+    documentation pages the user described but did not name. ``results`` holds
+    up to ``max_results`` entries with ``title``, ``url`` and ``snippet``, each
+    ``url`` a direct absolute link to the result site.
+
+    The rest of the reply is what the search actually did, so you can tell the
+    cases apart yourself: ``extracted_count`` is how many results the page
+    carried, ``withheld_count`` how many of those were withheld because their
+    destination is not allowed, ``http_status`` how the page was served (null
+    here, since this tab does not report one), ``error_kind`` the failure if the
+    fetch itself failed, and ``page_title`` the title served. An empty
+    ``results`` with a non-zero ``withheld_count`` is a filtered page; with
+    ``extracted_count`` zero it is a page carrying no results, which is a
+    refusal page as often as a genuine miss -- ``page_title`` usually says
+    which. Do not report a failed fetch as "no matches".
+
+    This navigates the scouting tab away from whatever page it was on. The
+    same search is available inside a code block as
+    ``await search_web(query, max_results=10)``, returning the same shape.
+    """
+    authority_error = _authority_tool_error(ctx.context, "search_web")
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, "search_web", authority_error)
+    result = await _search_web_impl(ctx.context, query, max_results)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
 @function_tool(name_override="inspect_page_for_composition", strict_mode=False)
 async def inspect_page_for_composition_tool(
     ctx: RunContextWrapper,
@@ -1564,6 +1596,7 @@ NATIVE_TOOLS = [
     get_run_results_tool,
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,
+    search_web_tool,
     inspect_page_for_composition_tool,
     inspect_locator_matches_tool,
     fill_credential_field_tool,

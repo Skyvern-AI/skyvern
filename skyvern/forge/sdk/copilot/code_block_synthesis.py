@@ -332,6 +332,7 @@ _RESERVED_PARAM_NAMES = frozenset(
         "totp_identifier",
         "otp",
         "solve_captcha",
+        "search_web",
         DOWNLOAD_CLAIM_HELPER_NAME,
         "print",
         "len",

@@ -160,6 +160,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
+from skyvern.forge.sdk.workflow import web_search
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -5076,6 +5077,25 @@ def _bind_code_block_download_claim(
     return click_and_claim_download
 
 
+def _bind_code_block_search_web(
+    page: Page | RecordingPage | None,
+) -> Callable[[str, int], Awaitable[web_search.WebSearchObservation]]:
+    """Closure rather than a `partial`: a keyword default on a `partial` would let block code
+    override the page whose browser context the search is fetched through."""
+
+    async def search_web(query: str, max_results: int = 10) -> web_search.WebSearchObservation:
+        if page is None:
+            raise RuntimeError("search_web is only supported while the run browser is open.")
+        return await web_search.search_web(
+            app.AGENT_FUNCTION.web_search_provider(),
+            web_search.RunBrowserTransport(page.context),
+            query,
+            max_results,
+        )
+
+    return search_web
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -5194,6 +5214,7 @@ class CodeBlock(Block):
             "click_and_claim_download": _bind_code_block_download_claim(
                 organization_id=None, workflow_run_id=None, download_binding=None
             ),
+            "search_web": _bind_code_block_search_web(None),
         }
 
     def generate_async_user_function(
@@ -5253,6 +5274,7 @@ class CodeBlock(Block):
             download_binding=download_binding,
             download_evidence=download_evidence,
         )
+        safe_vars["search_web"] = _bind_code_block_search_web(page)
         parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():

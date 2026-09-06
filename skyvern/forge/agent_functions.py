@@ -70,6 +70,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.sdk.workflow.web_search import WebSearchProvider
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
@@ -1155,6 +1156,11 @@ class AgentFunction:
         return parameters
 
     def page_operation_contracts(self) -> PageOperationContracts | None:
+        return None
+
+    def web_search_provider(self) -> WebSearchProvider | None:
+        """No search engine is configured in OSS; reading a provider's result markup is
+        deployment configuration. Cloud overrides this with its configured provider."""
         return None
 
     def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:

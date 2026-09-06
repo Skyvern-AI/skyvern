@@ -65,6 +65,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
 
 from ._shared import (
@@ -490,6 +491,7 @@ async def _get_block_schema_post_hook(
             data["code_only_note"] = _code_only_browser_unavailable_summary()
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
+            data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
             page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
             if page_operation_contracts is not None:
                 data["page_operation_contracts"] = page_operation_contracts

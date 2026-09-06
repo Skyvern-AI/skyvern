@@ -106,6 +106,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "list_integrations": "Checking connected integrations",
     "inspect_current_workflow": "Inspecting workflow",
     "discover_workflow_entrypoint": "Finding the entry page",
+    "search_web": "Searching the web",
     "inspect_page_for_composition": "Inspecting the page",
     "inspect_locator_matches": "Comparing locator candidates",
     "list_credentials": "Checking saved credentials",
