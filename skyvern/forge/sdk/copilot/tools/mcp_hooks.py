@@ -29,7 +29,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
     SchemaOverlay,
-    _scrub_tool_result,
+    scrub_model_facing_tool_result,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     requested_output_designation_capability,
@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     clear_sensitive_origin_page_taint,
+    sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
 )
@@ -131,11 +132,25 @@ def _sensitive_origin_page_refusal(ctx: AgentContext) -> dict[str, Any] | None:
     return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
 
 
+def _sensitive_origin_page_action_refusal(ctx: AgentContext) -> dict[str, Any] | None:
+    """Refuse an action only while the page's facts cannot be scrubbed on the terminal-run route."""
+    if not sensitive_origin_page_facts_withheld(ctx, getattr(ctx, "last_run_blocks_workflow_run_id", None)):
+        return None
+    return _sensitive_origin_page_refusal(ctx)
+
+
 async def _sensitive_origin_page_pre_hook(
     _params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     return _sensitive_origin_page_refusal(ctx)
+
+
+async def _sensitive_origin_page_action_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _sensitive_origin_page_action_refusal(ctx)
 
 
 async def _sensitive_origin_page_post_hook(
@@ -239,7 +254,7 @@ _FAILED_CLICK_TRUNCATION_SUFFIX = "... [truncated]"
 def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> None:
     """Bound the complete model-visible failure while retaining typed control/error facts."""
 
-    scrubbed = _scrub_tool_result(ctx, result)
+    scrubbed = scrub_model_facing_tool_result(ctx, result)
     if isinstance(scrubbed, dict) and scrubbed is not result:
         result.clear()
         result.update(scrubbed)
@@ -651,12 +666,7 @@ async def _evaluate_pre_hook(
     # call's post-hook to consume.
     ctx.pending_scout_read_expression = None
     ctx.pending_scout_read_output_path = None
-    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
-    sensitive_page_refusal = None
-    if sensitive_origin_page_has_active_run(ctx) or (
-        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
-    ):
-        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     raw_expression = params.get("expression")
@@ -678,7 +688,7 @@ async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[st
     intent = params.get("intent")
     if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
         return {"ok": False, "error": "AI-assisted scrolling is unavailable during runtime self-heal."}
-    return _sensitive_origin_page_refusal(ctx)
+    return _sensitive_origin_page_action_refusal(ctx)
 
 
 def _code_only_has_target_page_evidence(data: object) -> bool:
@@ -706,7 +716,7 @@ async def _click_pre_hook(
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -728,7 +738,7 @@ async def _type_text_pre_hook(
 ) -> dict[str, Any] | None:
     _clear_pending_scout_selector_facts(ctx)
     ctx.pending_scout_input_value = None
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -757,7 +767,7 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -769,7 +779,7 @@ async def _press_key_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
@@ -891,7 +901,7 @@ async def _wait_for_either_state_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     data = result.get("data")
@@ -947,7 +957,7 @@ async def _click_post_hook(
     captured_url: str | None = None
     observation_step: int | None = None
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
@@ -1265,7 +1275,7 @@ async def _type_text_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         ctx.pending_scout_input_value = None
         return sensitive_page_refusal
@@ -1514,12 +1524,8 @@ async def _evaluate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     ctx.scout_observation_contract = None
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
-    sensitive_page_refusal = None
-    if sensitive_origin_page_has_active_run(ctx) or (
-        sensitive_origin_page_is_tainted(ctx) and not matching_registry_is_scrubbable
-    ):
-        sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
     if sensitive_page_refusal is not None:
         ctx.pending_scout_read_expression = None
         ctx.pending_scout_read_output_path = None
@@ -1624,7 +1630,7 @@ async def _scroll_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     if result.get("ok") and result.get("data"):
@@ -1644,7 +1650,7 @@ async def _select_option_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
@@ -1727,7 +1733,7 @@ async def _press_key_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
+    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
@@ -1963,6 +1969,7 @@ def _build_skyvern_mcp_overlays(
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             timeout=15,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_click_pre_hook,
             post_hook=_click_post_hook,
         ),
@@ -1985,6 +1992,7 @@ def _build_skyvern_mcp_overlays(
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             timeout=15,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_type_text_pre_hook,
             post_hook=_type_text_post_hook,
         ),
@@ -1997,6 +2005,7 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_scroll_pre_hook,
             post_hook=_scroll_post_hook,
         ),
@@ -2024,6 +2033,7 @@ def _build_skyvern_mcp_overlays(
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             timeout=15,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_select_option_pre_hook,
             post_hook=_select_option_post_hook,
         ),
@@ -2037,6 +2047,7 @@ def _build_skyvern_mcp_overlays(
             required_overrides=["key"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
+            redacts_sensitive_origin_structured_result=True,
             pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
         ),
@@ -2044,7 +2055,8 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
+            redacts_sensitive_origin_structured_result=True,
+            pre_hook=_sensitive_origin_page_action_pre_hook,
             post_hook=_wait_for_either_state_post_hook,
         ),
         "skyvern_frame_list": SchemaOverlay(

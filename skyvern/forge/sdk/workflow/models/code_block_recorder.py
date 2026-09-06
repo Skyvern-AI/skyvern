@@ -59,6 +59,33 @@ PENDING_CALL_DELAY_SECONDS = 20.0
 RECORDED_FAILURE_RESPONSE_MAX_CHARS = 1000
 RECORDED_FAILURE_CAPTURE_MAX_CHARS = 8000
 
+# Kept in the OSS workflow runtime because the standalone CodeBlock runner image
+# ships only `codeblock/`; its matching worker copy lives in failure_page_state.py.
+COVERING_ELEMENT_SCRIPT = """el => {
+  if (!(el instanceof Element)) return null;
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+  const doc = el.ownerDocument;
+  if (x < 0 || y < 0 || x >= doc.documentElement.clientWidth || y >= doc.documentElement.clientHeight) return null;
+  const hit = doc.elementFromPoint(x, y);
+  if (!hit || hit === el || el.contains(hit)) return null;
+  return '<' + hit.tagName.toLowerCase() + (hit.id ? ' id=' + JSON.stringify(hit.id) : '') + (hit.getAttribute('class') ? ' class=' + JSON.stringify(hit.getAttribute('class')) : '') + '>';
+}"""
+
+
+def append_failure_page_state(
+    reason: str,
+    *,
+    final_url: str | None = None,
+    page_title: str | None = None,
+    covering_element: str | None = None,
+) -> str:
+    """Append already-masked facts. Callers must redact before this bounded projection."""
+    facts = [("Final URL", final_url), ("Page title", page_title), ("Covering element", covering_element)]
+    return reason + "".join(f"\n{label}: {value[:1000]}" for label, value in facts if value)
+
+
 _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "goto": ActionType.GOTO_URL,
     "go_back": ActionType.GO_BACK,
@@ -333,6 +360,9 @@ class _Recorder:
     ) -> None:
         self.actions: list[Action] = []
         self.last_exception: BaseException | None = None
+        self.failed_locator: Locator | None = None
+        self.failed_locator_exception: BaseException | None = None
+        self.failure_operation_generation = 0
         self._on_action = on_action
         self._on_pending_action = on_pending_action
         self.credential_release_guard = credential_release_guard
@@ -390,6 +420,12 @@ class _Recorder:
         if self.credential_release_guard is not None:
             await self.credential_release_guard.enforce(target, name, args, kwargs)
 
+    def begin_failure_operation(self) -> int:
+        self.failure_operation_generation += 1
+        self.failed_locator_exception = None
+        self.failed_locator = None
+        return self.failure_operation_generation
+
     async def record(
         self,
         action_type: ActionType,
@@ -399,7 +435,9 @@ class _Recorder:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         description: str | None = None,
+        failure_locator: Locator | None = None,
     ) -> Any:
+        generation = self.begin_failure_operation()
         started = time.monotonic()
         started_wall = naive_utc_now()
         code_line = _frame_user_line()
@@ -449,6 +487,9 @@ class _Recorder:
                 captured = ""
             action.response = captured or type(exc).__name__
             self.last_exception = exc
+            if generation == self.failure_operation_generation:
+                self.failed_locator_exception = exc
+                self.failed_locator = failure_locator
             raise
         finally:
             if pending_handle is not None:
@@ -526,7 +567,21 @@ class RecordingLocator:
         if action_type is None:
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
-                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector, f"locator.{name}")
+                generation = self.__recorder.begin_failure_operation()
+                value = _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector, f"locator.{name}")
+                if not inspect.isawaitable(value):
+                    return value
+
+                async def resolve() -> Any:
+                    try:
+                        return await value
+                    except Exception as exc:
+                        if generation == self.__recorder.failure_operation_generation:
+                            self.__recorder.failed_locator_exception = exc
+                            self.__recorder.failed_locator = self.__locator
+                        raise
+
+                return resolve()
 
             return forwarded
 
@@ -570,7 +625,9 @@ class RecordingLocator:
                             )
                 return await attr(*args, **kwargs)
 
-            return await self.__recorder.record(action_type, f"locator.{name}", self.__selector, call, args, kwargs)
+            return await self.__recorder.record(
+                action_type, f"locator.{name}", self.__selector, call, args, kwargs, failure_locator=self.__locator
+            )
 
         return recorded
 
@@ -588,6 +645,8 @@ class RecordingKeyboard:
         if name in ("type", "insert_text"):
 
             async def guarded(*args: Any, **kwargs: Any) -> Any:
+                self.__recorder.begin_failure_operation()
+
                 async def call() -> Any:
                     await self.__recorder.enforce_credential_release(self.__page, f"keyboard.{name}", args, kwargs)
                     return await attr(*args, **kwargs)
@@ -598,6 +657,7 @@ class RecordingKeyboard:
         if name != "press":
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
+                self.__recorder.begin_failure_operation()
                 return _wrap_call_result(attr(*args, **kwargs), self.__recorder, None, f"keyboard.{name}")
 
             return forwarded
@@ -656,6 +716,9 @@ class RecordingPage:
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.__recorder.last_exception
+
+    def failure_locator(self, exception: BaseException) -> Locator | None:
+        return self.__recorder.failed_locator if self.__recorder.failed_locator_exception is exception else None
 
     def _brokered_default_timeout(self, scope: Literal["page", "context"]) -> float | None:
         """Return the trusted timeout that a secure-runner block must restore."""
@@ -730,6 +793,7 @@ class RecordingPage:
         if action_type is None:
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
+                self.__recorder.begin_failure_operation()
                 return _wrap_call_result(
                     attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), f"page.{name}"
                 )

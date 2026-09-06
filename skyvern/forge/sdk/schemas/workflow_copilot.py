@@ -5,10 +5,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import CopilotCancelSource, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotCancelSource,
+    PersistedCopilotComposerMode,
+    TurnOutcome,
+)
 
 
 class CopilotPendingTurn(BaseModel):
@@ -26,11 +31,20 @@ class CopilotPendingTurn(BaseModel):
     pre_turn_proposed_workflow: dict[str, Any] | None = None
     keep_pending_proposal: bool = False
     idempotency_digest: str | None = None
+    copilot_effective_mode: PersistedCopilotComposerMode | None = None
+    copilot_code_available: bool = False
     user_message_id: str | None = None
     recovering_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
     # never wrote canonical, so it owns no write to roll back.
     canonical_write_fingerprint: str | None = None
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    question_heartbeat_at: datetime | None = None
+    question_client_seen_at: datetime | None = None
+    cancel_token: str | None = None
+    # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
+    # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
+    superseded_build_test_run_ids: list[str] = Field(default_factory=list)
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -91,6 +105,18 @@ class NonAdoptableCriteriaSet:
 class WorkflowCopilotChatSender(StrEnum):
     USER = "user"
     AI = "ai"
+    PRODUCT = "product"
+
+
+# A product row records a click the user made, so it opens a turn on the human side of
+# the conversation; it is never rendered to the model as an assistant utterance.
+TURN_OPENER_SENDERS = frozenset({WorkflowCopilotChatSender.USER, WorkflowCopilotChatSender.PRODUCT})
+
+
+def chat_history_role(sender: WorkflowCopilotChatSender) -> str:
+    """The label a transcript line carries into the model. ``product`` is not a role the model is
+    told about, so a product row speaks in the same voice as the user whose click created it."""
+    return WorkflowCopilotChatSender.USER.value if sender in TURN_OPENER_SENDERS else sender.value
 
 
 class WorkflowCopilotChatMessage(BaseModel):
@@ -121,16 +147,21 @@ class WorkflowCopilotChatRequest(BaseModel):
         description="Optional persistent browser session ID to reuse instead of creating a new one.",
     )
     message: str = Field(..., description="The message that user sends")
+    selected_connected_account_id: str | None = Field(
+        None, description="Google account explicitly selected in the chat picker; validated against this organization."
+    )
     audio_artifact_id: str | None = Field(
         None,
         description="Artifact ID for audio captured while dictating this message.",
     )
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
-    mode: Literal["ask", "build"] | None = Field(
-        None, description="Per-request copilot path selector; None falls back to feature flags."
+    mode: Literal["build"] | None = Field(
+        None,
+        description="Deprecated Build-only compatibility field; cached Build clients may still send it.",
     )
     code_block: bool | None = Field(
-        None, description="Per-request code-block authoring; honored only on the build/v2 path."
+        None,
+        description="Per-request code-block authoring selection. Omission means plain non-code Build.",
     )
     cancel_token: str | None = Field(
         None,
@@ -158,6 +189,7 @@ class WorkflowCopilotChatRequest(BaseModel):
             "resolving references like 'this block' — never a directive to act on that block."
         ),
     )
+    supports_question_tool: bool = Field(False, description="The client can display and answer ask_user requests.")
     supports_credential_pause: bool = Field(
         False,
         description=(
@@ -173,12 +205,12 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
-    product_action: Literal["test_end_to_end"] | None = Field(
+    product_action: Literal["test_end_to_end", "diagnose_run"] | None = Field(
         None,
         description=(
             "Structured product action for this turn, dispatched by the server instead of the agent. "
             "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
-            "for that run."
+            "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id."
         ),
     )
     eval_entrypoint_url: str | None = Field(
@@ -191,6 +223,7 @@ class WorkflowCopilotChatRequest(BaseModel):
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
+    workflow_copilot_chat_id: str | None = None
     cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
     source: CopilotCancelSource | None = Field(
         default=None,
@@ -200,6 +233,11 @@ class WorkflowCopilotCancelRequest(BaseModel):
             "than as an API caller."
         ),
     )
+
+
+class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
+    workflow_copilot_chat_id: str
+    interaction_id: str
 
 
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
@@ -236,6 +274,8 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
 
 
 class WorkflowCopilotChatHistoryResponse(BaseModel):
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    pending_question_cancel_token: str | None = None
     workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")

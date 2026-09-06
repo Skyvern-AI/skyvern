@@ -725,12 +725,23 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
     return entry
 
 
-def _reference_is_typed_resume(reference: str, policy: RequestPolicy) -> bool:
-    return any(
+_DENIED_PASS_ROUTES = ["typed_resume", "request_credential_tool", "literal_credential_id"]
+
+
+def _typed_resume_arm(reference: str, policy: RequestPolicy) -> str | None:
+    """Which server record already answered which credential this reference names, if any. Both arms
+    are server-owned records of an identifier, never an interpretation of prose: the user settled the
+    id this turn, or the server bound it from a login page it admitted.
+    """
+    if any(
         credential.credential_id in policy.current_turn_named_credential_ids
         and reference in {credential.credential_id, credential.name}
         for credential in policy.resolved_credentials
-    )
+    ):
+        return "user_named_this_turn"
+    if any(reference in {credential.credential_id, credential.name} for credential in policy.auto_bound_credentials):
+        return "server_auto_bound"
+    return None
 
 
 async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[str, Any]:
@@ -754,18 +765,26 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     }
     matches = list(matches_by_id.values())
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
-    typed_resume = _reference_is_typed_resume(reference, policy)
+    typed_resume_arm = _typed_resume_arm(reference, policy)
     # The agent owns natural-language interpretation. This boundary verifies only
     # objective provenance and identity: the proposed exact reference must be a
     # complete saved reference in the literal current turn. It deliberately does
     # not implement a second English policy language beside the agent.
-    if not typed_resume and reference not in grounded_references and (matches or not literal_reference):
+    if typed_resume_arm is None and reference not in grounded_references and (matches or not literal_reference):
+        LOG.info(
+            "copilot_credential_reference_not_literal",
+            reference_is_saved_credential=bool(matches),
+            named_credential_id_count=len(policy.current_turn_named_credential_ids),
+            auto_bound_credential_id_count=len(policy.auto_bound_credentials),
+            pass_routes=_DENIED_PASS_ROUTES,
+        )
         return {
             "ok": False,
             "data": {
                 "status": "denied",
                 "reference": reference,
                 "reason": "reference_not_literal_in_current_user_turn",
+                "pass_routes": _DENIED_PASS_ROUTES,
             },
         }
     if len(matches) != 1:
@@ -784,7 +803,24 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
         *[item for item in policy.resolved_credentials if item.credential_id != credential.credential_id],
         credential,
     ]
-    policy.current_turn_named_credential_ids.add(credential.credential_id)
+    user_named = typed_resume_arm is None or reference in grounded_references or literal_reference
+    if user_named:
+        policy.current_turn_named_credential_ids.add(credential.credential_id)
+        # A carried origin answers where the secret belongs only while nobody better has. The user
+        # naming the credential for a site they gave this turn is better, and the fill seam reads the
+        # origin ahead of every other route, so a stale one would refuse the site they just named.
+        if credential.credential_id in policy.seeded_proposal_credential_ids:
+            policy.live_page_admitted_urls.pop(credential.credential_id, None)
+    if typed_resume_arm == "server_auto_bound" and credential.credential_id in policy.seeded_proposal_credential_ids:
+        # The carry passed this citation. Whether it stands as the user's answer is decided at turn
+        # end, when what they settled is final — the card resume and a second resolve both write that
+        # set after this point, so deciding here would read it before the answer landed.
+        policy.carry_cited_credential_ids.add(credential.credential_id)
+    LOG.info(
+        "copilot_credential_reference_resolved",
+        credential_id=credential.credential_id,
+        pass_arm=typed_resume_arm or "literal_in_current_user_turn",
+    )
     return {
         "ok": True,
         "data": {

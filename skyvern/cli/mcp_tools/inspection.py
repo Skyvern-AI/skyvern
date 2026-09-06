@@ -931,7 +931,7 @@ async def skyvern_page(
             "skyvern_page",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.INVALID_INPUT, str(exc), exc.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(exc), exc.hint, exc=exc),
         )
     except Exception as exc:
         return make_result(
@@ -942,6 +942,7 @@ async def skyvern_page(
                 ErrorCode.ACTION_FAILED,
                 str(exc),
                 "Check the selector and current page/frame, then retry without a cursor",
+                exc=exc,
             ),
         )
 
@@ -983,7 +984,9 @@ async def skyvern_get_html(
             "skyvern_get_html",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page"),
+            error=make_error(
+                ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page", exc=e
+            ),
         )
 
 
@@ -1018,7 +1021,10 @@ async def skyvern_get_value(
             ok=False,
             browser_context=ctx,
             error=make_error(
-                ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an input/textarea/select element"
+                ErrorCode.ACTION_FAILED,
+                str(e),
+                "Check that the selector matches an input/textarea/select element",
+                exc=e,
             ),
         )
 
@@ -1056,7 +1062,9 @@ async def skyvern_get_styles(
             "skyvern_get_styles",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page"),
+            error=make_error(
+                ErrorCode.ACTION_FAILED, str(e), "Check that the selector matches an element on the page", exc=e
+            ),
         )
 
 
@@ -1162,7 +1170,7 @@ async def skyvern_network_route(
             "skyvern_network_route",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(exc), "Check the URL pattern syntax"),
+            error=make_error(ErrorCode.ACTION_FAILED, str(exc), "Check the URL pattern syntax", exc=exc),
         )
 
     return make_result(
@@ -1205,7 +1213,7 @@ async def skyvern_network_unroute(
             "skyvern_network_unroute",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(exc), "Check the URL pattern"),
+            error=make_error(ErrorCode.ACTION_FAILED, str(exc), "Check the URL pattern", exc=exc),
         )
 
     return make_result(

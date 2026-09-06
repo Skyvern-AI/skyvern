@@ -60,7 +60,7 @@ async def skyvern_get_session_storage(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded", exc=e),
             )
 
 
@@ -98,7 +98,7 @@ async def skyvern_set_session_storage(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded", exc=e),
             )
 
 
@@ -133,7 +133,7 @@ async def skyvern_clear_session_storage(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded", exc=e),
             )
 
 
@@ -169,5 +169,5 @@ async def skyvern_clear_local_storage(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check page has loaded", exc=e),
             )

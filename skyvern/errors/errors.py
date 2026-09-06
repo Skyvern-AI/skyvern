@@ -1,7 +1,9 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
 
 
 class ErrorType(StrEnum):
@@ -14,6 +16,23 @@ class UserDefinedError(BaseModel):
     reasoning: str
     confidence_float: float = Field(..., ge=0, le=1)
     error_type: Literal[ErrorType.USER_DEFINED_ERROR] = ErrorType.USER_DEFINED_ERROR
+
+    @field_validator("reasoning")
+    @classmethod
+    def _bound_reasoning(cls, value: str) -> str:
+        # reasoning is LLM-authored and reaches the customer over the task webhook, in a column that
+        # appends rather than replaces. Truncate rather than reject: dropping the error would lose
+        # the error_code, which is the half callers act on, to save the narration tail.
+        # rstrip because _strict_user_defined_error_payload drops any reasoning that is not
+        # strip()-clean, so a cut landing on whitespace would discard the whole row.
+        # NOT a universal guarantee: model_copy(update=...) skips field validators, so a caller
+        # rebuilding reasoning that way must bound it itself.
+        if len(value) <= ERROR_CODE_REASONING_MAX_LENGTH:
+            return value
+        cut = value[:ERROR_CODE_REASONING_MAX_LENGTH]
+        # Fall back to the un-stripped slice rather than emptying it: the payload check drops an
+        # empty reasoning too, which loses the error_code this truncation exists to preserve.
+        return cut.rstrip() or cut
 
     def __repr__(self) -> str:
         return f"{self.reasoning}(error_code={self.error_code}, confidence_float={self.confidence_float})"

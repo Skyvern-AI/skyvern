@@ -2,13 +2,11 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
-import time
+import re
 import uuid
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Iterator, cast, get_args
 from urllib.parse import urlparse
 
@@ -23,28 +21,26 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge import app
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse, question_wait_is_live
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
+from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
-from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     ProposalDisposition,
     TurnNarrativePayload,
-    adopt_model_authored_context,
-    sanitize_global_llm_context_for_prompt,
+    clear_proposed_credential,
 )
 from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseRejection,
     check_credential_pause_resumable,
     resolve_credential_pause,
 )
-from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
 from skyvern.forge.sdk.copilot.recoverable_failure import (
@@ -53,6 +49,8 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     format_recoverable_failure_reply,
     merge_failure_into_context,
 )
+from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, resolve_repair_origin_binding
+from skyvern.forge.sdk.copilot.request_policy import _screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.terminal_envelope import (
@@ -72,16 +70,17 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_copilot_code_mode_metadata,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _normalize_copilot_yaml
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import with_workflow_yaml_title
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
-from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError
+from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError, NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    TURN_OPENER_SENDERS,
     CopilotCancelSource,
     CopilotFailureKind,
     CopilotPendingTurn,
@@ -99,6 +98,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotCredentialResponseRequest,
     WorkflowCopilotProcessingUpdate,
+    WorkflowCopilotQuestionResponseRequest,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotStreamResponseUpdate,
@@ -115,21 +115,21 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
-from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
 from skyvern.utils.secret_headers import merge_masked_headers
-from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.url_validators import is_blocked_host
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
+
+# Compatibility export for callers and tests that predate ownership moving to
+# copilot.workflow_yaml. The legacy Ask runtime itself remains deleted.
+_process_workflow_yaml = _copilot_process_workflow_yaml
 
 # Wall clock, unlike TOTAL_TIMEOUT_SECONDS: that budget excludes time parked in a
 # credential pause, so a legitimately live turn can outlast it in real time.
 RECONCILE_ABANDON_AFTER_SECONDS = (
     TOTAL_TIMEOUT_SECONDS + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 120
 )
-WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS = 3_000_000
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
     "audio/mpeg",
@@ -171,26 +171,102 @@ def bind_copilot_session_id(chat_id: str | None) -> Iterator[None]:
 
 
 COPILOT_CODE_MODE_OPT_OUT_EVENT = "copilot_code_mode_opt_out"
+UNSCREENED_MESSAGE_PLACEHOLDER = "[Message unavailable because safety screening did not complete]"
 COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON = "copilot_recoverable_failure"
 USER_CANCELLED_TERMINAL_REASON = "user_cancelled"
 TEST_END_TO_END_TURN_MESSAGE = "Test this workflow end to end."
+DIAGNOSE_RUN_TURN_MESSAGE = "Diagnose run {run_id} and repair the workflow."
 
 
-def _effective_copilot_composer_mode(
+# The id is interpolated into a row the transcript renders as a product utterance, so anything
+# that could read as prose is refused rather than echoed.
+_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_[A-Za-z0-9]{1,40}\Z")
+
+_UNUSABLE_DIAGNOSE_RUN_REFUSALS = frozenset(
+    {
+        RepairOriginRefusal.RUN_NOT_FOUND,
+        RepairOriginRefusal.FOREIGN_ORGANIZATION,
+        RepairOriginRefusal.WORKFLOW_MISMATCH,
+    }
+)
+
+
+def _turn_opener_sender(chat_request: WorkflowCopilotChatRequest) -> WorkflowCopilotChatSender:
+    if chat_request.product_action == "diagnose_run":
+        return WorkflowCopilotChatSender.PRODUCT
+    return WorkflowCopilotChatSender.USER
+
+
+async def _apply_diagnose_run_action(
     chat_request: WorkflowCopilotChatRequest,
     *,
-    uses_v2: bool,
+    organization_id: str,
+    workflow_permanent_id: str,
+) -> None:
+    """Replace the caller's prose with the server's own receipt, or refuse the action.
+
+    The receipt is written before the first await, so no failure inside this function can reach a
+    writer while the request still holds caller text under the product sender.
+    """
+    if chat_request.product_action != "diagnose_run":
+        return
+    if not chat_request.workflow_run_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="workflow_run_id is required to diagnose a run.",
+        )
+    if not _WORKFLOW_RUN_ID_RE.match(chat_request.workflow_run_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="workflow_run_id is not a valid run id.",
+        )
+    # The id is validated, so the receipt can be written now — ahead of the first await, whose
+    # failure would otherwise reach the recovery writer with the caller's text still in place.
+    chat_request.message = DIAGNOSE_RUN_TURN_MESSAGE.format(run_id=chat_request.workflow_run_id)
+    binding = await resolve_repair_origin_binding(
+        workflow_run_id=chat_request.workflow_run_id,
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+    if binding.refusal in _UNUSABLE_DIAGNOSE_RUN_REFUSALS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="workflow_run_id does not name a run of this workflow.",
+        )
+    # Only a settled run has a packet to hydrate; without this the turn would reach the model
+    # carrying nothing but the receipt.
+    if not binding.finished:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="workflow_run_id names a run that is still in progress.",
+        )
+
+
+def _effective_copilot_build_mode(
+    chat_request: WorkflowCopilotChatRequest,
+    *,
     code_mode_fallback: bool = False,
 ) -> CopilotComposerMode:
-    if chat_request.mode == "ask":
-        return "ask"
-    if chat_request.mode == "build":
+    if chat_request.code_block is not None:
         return "code" if chat_request.code_block is True else "build"
-    if uses_v2:
-        if chat_request.code_block is not None:
-            return "code" if chat_request.code_block is True else "build"
-        return "code" if code_mode_fallback else "build"
-    return "ask"
+    return "code" if code_mode_fallback else "build"
+
+
+def _prior_global_llm_context(chat_messages: list[WorkflowCopilotChatMessage]) -> str | None:
+    latest = next(
+        (message.global_llm_context for message in reversed(chat_messages) if message.global_llm_context is not None),
+        None,
+    )
+    # Credential proposals grant authority for one adjacent turn only. An
+    # interrupted assistant row persists a null context, so do not scan past it
+    # and revive an older proposal on the following turn.
+    last_assistant_context = next(
+        (message.global_llm_context for message in reversed(chat_messages) if message.turn_outcome is not None),
+        None,
+    )
+    if last_assistant_context is None:
+        return clear_proposed_credential(latest)
+    return latest
 
 
 def _latest_assistant_turn_outcome(chat_messages: list[WorkflowCopilotChatMessage]) -> TurnOutcome | None:
@@ -217,20 +293,13 @@ def _should_emit_copilot_code_mode_opt_out(
     *,
     prior_turn_outcome: TurnOutcome | None,
     to_mode: CopilotComposerMode,
-    current_code_available: bool,
 ) -> bool:
     if prior_turn_outcome is None:
         return False
     from_mode = prior_turn_outcome.copilot_effective_mode
     if from_mode is None or from_mode == to_mode:
         return False
-    if from_mode == "code" and to_mode != "code":
-        return True
-    return (
-        from_mode == "build"
-        and to_mode == "ask"
-        and (prior_turn_outcome.copilot_code_available or current_code_available)
-    )
+    return from_mode == "code" and to_mode == "build"
 
 
 def _reason_category_for_copilot_code_mode_opt_out(
@@ -250,7 +319,6 @@ def _capture_copilot_code_mode_opt_out(
     *,
     prior_turn_outcome: TurnOutcome | None,
     to_mode: CopilotComposerMode,
-    current_code_available: bool,
     workflow_copilot_chat_id: str,
     workflow_permanent_id: str,
     organization_id: str,
@@ -259,7 +327,6 @@ def _capture_copilot_code_mode_opt_out(
     if prior_turn_outcome is None or not _should_emit_copilot_code_mode_opt_out(
         prior_turn_outcome=prior_turn_outcome,
         to_mode=to_mode,
-        current_code_available=current_code_available,
     ):
         return
     try:
@@ -288,30 +355,16 @@ def _capture_copilot_code_mode_opt_out(
         )
 
 
-async def _resolve_copilot_code_available(
+async def _resolve_copilot_request_config(
     organization_id: str,
     chat_request: WorkflowCopilotChatRequest,
-) -> bool:
-    try:
-        has_code_block_access = await app.AGENT_FUNCTION.has_code_block_access(organization_id)
-    except Exception:
-        LOG.warning("Failed to resolve copilot code block access", organization_id=organization_id, exc_info=True)
-        return False
-    if not has_code_block_access:
-        return False
-    if chat_request.code_block is not None:
-        return True
-    try:
-        copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
-            organization_id,
-            code_block_mode=None,
-        )
-    except Exception:
-        LOG.warning("Failed to resolve copilot code mode availability", organization_id=organization_id, exc_info=True)
-        return False
-    return (
-        normalize_block_authoring_policy(getattr(copilot_config, "block_authoring_policy", None))
-        == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+) -> CopilotConfig:
+    copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
+        organization_id,
+        code_block_mode=chat_request.code_block,
+    )
+    return copilot_config or CopilotConfig(
+        block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE,
     )
 
 
@@ -330,15 +383,6 @@ def _with_current_copilot_code_mode_metadata(
         code_available=code_available,
         turn_id=turn_id,
     )
-
-
-@dataclass(frozen=True)
-class RunInfo:
-    block_label: str | None
-    block_type: str
-    block_status: str | None
-    failure_reason: str | None
-    html: str | None
 
 
 COPILOT_CANCEL_TTL = timedelta(minutes=5)
@@ -566,6 +610,7 @@ def _finalized_terminal_envelope(
     workflow_applied: bool,
     final_message: str,
     response_type: str,
+    proposal_disposition: ProposalDisposition | None = None,
 ) -> tuple[TerminalOutcomeEnvelope, dict[str, Any]] | None:
     payload = _agent_terminal_envelope(agent_result)
     if payload is None:
@@ -578,8 +623,18 @@ def _finalized_terminal_envelope(
         getattr(agent_result, "has_staged_proposal", False)
     )
     try:
+        envelope = TerminalOutcomeEnvelope.model_validate(payload)
+        envelope_updates: dict[str, Any] = {
+            "proposal_present": proposal_present,
+            "proposal_disposition": proposal_disposition or envelope.proposal_disposition,
+        }
+        # Do not let an agent-authored pending state survive when the finalized
+        # result carries no workflow proposal.
+        if proposal_present is False and envelope.next_state == "proposal_pending":
+            envelope_updates.update(next_state="stopped", response_kind="stopped")
+        envelope = envelope.model_copy(update=envelope_updates)
         finalized = finalize_applied_state(
-            TerminalOutcomeEnvelope.model_validate(payload),
+            envelope,
             applied=workflow_applied and proposal_present,
             proposal_present=proposal_present,
         )
@@ -664,7 +719,7 @@ def _build_recoverable_route_agent_result(
     agent_result = AgentResult(
         user_response=user_response,
         updated_workflow=None,
-        global_llm_context=merge_failure_into_context(global_llm_context, failure),
+        global_llm_context=clear_proposed_credential(merge_failure_into_context(global_llm_context, failure)),
         workflow_was_persisted=False,
         proposal_disposition="no_proposal",
         clear_proposed_workflow=clear_proposed_workflow,
@@ -814,6 +869,7 @@ async def _persist_turn_messages(
     global_llm_context: str | None,
     turn_outcome: TurnOutcome | None,
     narrative_payload: TurnNarrativePayload | None,
+    sender: WorkflowCopilotChatSender,
 ) -> WorkflowCopilotChatMessage | None:
     """The only writer of a copilot turn's chat rows; idempotent per ``turn_id``.
 
@@ -823,12 +879,25 @@ async def _persist_turn_messages(
     if turn_id is not None and turn_outcome is not None and not turn_outcome.copilot_turn_id:
         turn_outcome = turn_outcome.model_copy(update={"copilot_turn_id": turn_id})
 
+    if turn_id is not None:
+        stored_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            chat.organization_id, chat.workflow_copilot_chat_id
+        )
+        if isinstance(stored_chat, WorkflowCopilotChat):
+            pending = stored_chat.pending_turns.get(turn_id)
+            if pending is not None and pending.question_interactions:
+                if narrative_payload is None:
+                    narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
+                narrative_payload["questionInteractions"] = [
+                    item.model_dump(mode="json") for item in pending.question_interactions
+                ]
+
     if not user_row_already_persisted:
         await asyncio.shield(
             app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                sender=WorkflowCopilotChatSender.USER,
+                sender=sender,
                 content=user_message,
                 audio_artifact_id=audio_artifact_id,
             )
@@ -884,6 +953,28 @@ async def _persist_turn_messages(
     return assistant_message
 
 
+async def _marked_superseded(
+    chat: WorkflowCopilotChat, facts: InterruptedTurnFacts | None
+) -> InterruptedTurnFacts | None:
+    """Stamp the supersede marker when the run this turn was testing already carries it.
+
+    Read inside the persist coroutine so a cancelled handler still writes the row it shields.
+    """
+    if facts is None or not facts.run_id or facts.superseded_by_newer_test:
+        return facts
+    try:
+        run = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id=facts.run_id,
+            organization_id=chat.organization_id,
+        )
+    except Exception:
+        LOG.warning("Could not read the interrupted turn's run", workflow_run_id=facts.run_id, exc_info=True)
+        return facts
+    if run is None or run.failure_reason != SUPERSEDED_BY_NEWER_TEST_REASON:
+        return facts
+    return facts.model_copy(update={"superseded_by_newer_test": True})
+
+
 def _interruption_facts(
     chat: WorkflowCopilotChat,
     workflow: Workflow | None,
@@ -891,6 +982,7 @@ def _interruption_facts(
     *,
     authored_edits_saved: bool | None,
 ) -> InterruptedTurnFacts:
+    run_id = agent_result.cancellation_workflow_run_id if agent_result is not None else None
     return InterruptedTurnFacts(
         recorded_at=datetime.now(timezone.utc).isoformat(),
         iteration=agent_result.cancellation_iteration if agent_result is not None else None,
@@ -900,6 +992,7 @@ def _interruption_facts(
         last_recorded_build_test_phase=(
             agent_result.cancellation_last_recorded_phase if agent_result is not None else None
         ),
+        run_id=run_id,
     )
 
 
@@ -908,16 +1001,21 @@ def _interrupted_turn_outcome(
     *,
     idempotency_digest: str | None,
     prior_turn_outcome: TurnOutcome | None,
+    effective_mode: PersistedCopilotComposerMode | None = None,
+    code_available: bool | None = None,
 ) -> TurnOutcome:
     return TurnOutcome(
         response_kind=ResponseKind.RECOVER,
         reason_code=INTERRUPTED_TERMINAL_REASON,
         terminal_reason=INTERRUPTED_TERMINAL_REASON,
+        copilot_runtime="agent",
         copilot_turn_id=turn_id,
         idempotency_digest=idempotency_digest,
         connected_account_choices=(
             prior_turn_outcome.connected_account_choices if prior_turn_outcome is not None else None
         ),
+        copilot_effective_mode=effective_mode,
+        copilot_code_available=code_available or False,
     )
 
 
@@ -929,6 +1027,9 @@ async def _persist_interrupted_turn(
     idempotency_digest: str | None = None,
     user_message: str = "",
     user_row_already_persisted: bool = True,
+    sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
+    effective_mode: PersistedCopilotComposerMode | None = None,
+    code_available: bool | None = None,
 ) -> None:
     """Write the assistant row for a turn that stopped before it finished.
 
@@ -938,6 +1039,7 @@ async def _persist_interrupted_turn(
     chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
     )
+    facts = await _marked_superseded(chat, facts)
     message = render_interrupted_message(facts)
     narrative_payload = _with_terminal_narrative_metadata(
         _make_error_narrative_payload(turn_id, None, message),
@@ -953,12 +1055,15 @@ async def _persist_interrupted_turn(
         user_message=user_message,
         audio_artifact_id=None,
         user_row_already_persisted=user_row_already_persisted,
+        sender=sender,
         assistant_content=message,
         global_llm_context=None,
         turn_outcome=_interrupted_turn_outcome(
             turn_id,
             idempotency_digest=idempotency_digest,
             prior_turn_outcome=_latest_assistant_turn_outcome(chat_messages),
+            effective_mode=effective_mode,
+            code_available=code_available,
         ),
         narrative_payload=narrative_payload,
     )
@@ -978,6 +1083,9 @@ async def _persist_cancel_turn(
     user_row_already_persisted: bool = False,
     record_as_interrupted: bool = False,
     cancel_source: CopilotCancelSource | None = None,
+    sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
+    effective_mode: PersistedCopilotComposerMode | None = None,
+    code_available: bool | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -997,7 +1105,7 @@ async def _persist_cancel_turn(
     if agent_result is None:
         user_response = MINIMAL_CANCEL_STOP
         updated_workflow = None
-        updated_global_llm_context = prior_global_llm_context
+        updated_global_llm_context = clear_proposed_credential(prior_global_llm_context)
         total_tokens = None
         response_type = "REPLY"
         resolved_model = None
@@ -1006,8 +1114,11 @@ async def _persist_cancel_turn(
             response_kind=ResponseKind.RECOVER,
             reason_code=USER_CANCELLED_TERMINAL_REASON,
             terminal_reason=USER_CANCELLED_TERMINAL_REASON,
+            copilot_runtime="agent",
             copilot_turn_id=turn_id,
             cancel_source=cancel_source,
+            copilot_effective_mode=effective_mode,
+            copilot_code_available=code_available or False,
         )
         response_turn_id = turn_id
         # Nothing was dispatched before the agent started, so zero is a recorded fact here
@@ -1086,6 +1197,7 @@ async def _persist_cancel_turn(
             workflow_applied=workflow_applied,
             final_message=user_response,
             response_type=response_type,
+            proposal_disposition=_proposal_disposition(agent_result),
         )
         if terminal_envelope_result is None:
             terminal_envelope = None
@@ -1114,17 +1226,22 @@ async def _persist_cancel_turn(
             )
 
     if record_as_interrupted:
-        facts = _interruption_facts(
+        facts = await _marked_superseded(
             chat,
-            original_workflow,
-            agent_result,
-            authored_edits_saved=False if canonical_rolled_back else None,
+            _interruption_facts(
+                chat,
+                original_workflow,
+                agent_result,
+                authored_edits_saved=False if canonical_rolled_back else None,
+            ),
         )
         user_response = render_interrupted_message(facts)
         turn_outcome = _interrupted_turn_outcome(
             turn_id or response_turn_id,
             idempotency_digest=turn_outcome.idempotency_digest if turn_outcome is not None else None,
             prior_turn_outcome=turn_outcome,
+            effective_mode=effective_mode,
+            code_available=code_available,
         )
         terminal_envelope = interrupted_terminal_envelope(facts).model_dump(mode="json")
         # Hydration prefers narrativeSummary, so a cancel-rendered summary left in place
@@ -1150,6 +1267,7 @@ async def _persist_cancel_turn(
         user_message=user_message,
         audio_artifact_id=audio_artifact_id,
         user_row_already_persisted=user_row_already_persisted,
+        sender=sender,
         assistant_content=user_response,
         global_llm_context=updated_global_llm_context,
         turn_outcome=turn_outcome,
@@ -1270,6 +1388,7 @@ async def _finalise_normal_turn(
         workflow_applied=workflow_applied,
         final_message=user_response,
         response_type=agent_result.response_type,
+        proposal_disposition=proposal_disposition,
     )
     narrative_payload = agent_result.narrative_payload
     narrative_summary = agent_result.narrative_summary
@@ -1319,6 +1438,7 @@ async def _finalise_normal_turn(
         user_message=chat_request.message,
         audio_artifact_id=chat_request.audio_artifact_id,
         user_row_already_persisted=user_row_already_persisted,
+        sender=_turn_opener_sender(chat_request),
         assistant_content=user_response,
         global_llm_context=updated_global_llm_context,
         turn_outcome=agent_result.turn_outcome,
@@ -1459,301 +1579,6 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         edited_by=original_workflow.edited_by,
         preserve_completion_contract=False,
     )
-
-
-async def _get_debug_artifact(organization_id: str, workflow_run_id: str) -> Artifact | None:
-    artifacts = await app.DATABASE.artifacts.get_artifacts_for_run(
-        run_id=workflow_run_id, organization_id=organization_id, artifact_types=[ArtifactType.VISIBLE_ELEMENTS_TREE]
-    )
-    return artifacts[0] if isinstance(artifacts, list) and artifacts else None
-
-
-async def _get_debug_html(organization_id: str, workflow_run_id: str) -> str | None:
-    artifact = await _get_debug_artifact(organization_id, workflow_run_id)
-    if not artifact:
-        return None
-    artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-    if not artifact_bytes:
-        return None
-    # The extreme-size cap can drop middle-tree evidence; move to structure-aware
-    # selection if that trade-off causes copilot regressions.
-    return truncate_page_html_for_summary(
-        artifact_bytes.decode("utf-8"),
-        max_chars=WORKFLOW_COPILOT_DEBUG_HTML_MAX_CHARS,
-    )
-
-
-async def _get_debug_run_info(organization_id: str, workflow_run_id: str | None) -> RunInfo | None:
-    if not workflow_run_id:
-        return None
-
-    blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-        workflow_run_id=workflow_run_id, organization_id=organization_id
-    )
-    if not blocks:
-        return None
-
-    block = blocks[0]
-
-    html = await _get_debug_html(organization_id, workflow_run_id)
-
-    return RunInfo(
-        block_label=block.label,
-        block_type=block.block_type.name,
-        block_status=block.status,
-        failure_reason=block.failure_reason,
-        html=html,
-    )
-
-
-def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
-    chat_history_text = ""
-    if chat_history:
-        history_lines = [f"{msg.sender}: {msg.content}" for msg in chat_history]
-        chat_history_text = "\n".join(history_lines)
-    return chat_history_text
-
-
-def _parse_llm_response(llm_response: dict[str, Any] | Any) -> Any:
-    if isinstance(llm_response, dict) and "output" in llm_response:
-        action_data = llm_response["output"]
-    else:
-        action_data = llm_response
-
-    if not isinstance(action_data, dict):
-        LOG.error(
-            "LLM response is not valid JSON",
-            response_type=type(action_data).__name__,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Invalid response from LLM",
-        )
-    return action_data
-
-
-async def copilot_call_llm(
-    stream: EventSourceStream,
-    organization_id: str,
-    chat_request: WorkflowCopilotChatRequest,
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    global_llm_context: str | None,
-    debug_run_info_text: str,
-) -> tuple[str, Workflow | None, str | None, str | None]:
-    """Returns (user_response, updated_workflow, global_llm_context, workflow_yaml).
-
-    workflow_yaml is the raw YAML used to build updated_workflow — callers stash
-    it on the persisted proposal so /apply-proposed-workflow can re-create the
-    workflow version. Without it the V1 proposal can't be applied (SKY-9206).
-    """
-    chat_history_text = _format_chat_history(chat_history)
-
-    workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-
-    # Render system prompt (trusted content only, security rules injected via AgentFunction)
-    security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
-    system_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-system",
-        workflow_knowledge_base=workflow_knowledge_base,
-        current_datetime=datetime.now(timezone.utc).isoformat(),
-        security_rules=security_rules,
-    )
-
-    # Render user prompt (untrusted content, each variable in code fences)
-    # Escape triple backticks to prevent code fence breakout
-    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
-    user_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-user",
-        workflow_yaml=escape_code_fences(chat_request.workflow_yaml or ""),
-        user_message=escape_code_fences(chat_request.message),
-        chat_history=escape_code_fences(chat_history_text),
-        global_llm_context=escape_code_fences(prompt_global_llm_context),
-        loaded_result_context="",
-        debug_run_info=escape_code_fences(debug_run_info_text),
-    )
-
-    LOG.info(
-        "Calling LLM",
-        workflow_permanent_id=chat_request.workflow_permanent_id,
-        workflow_id=chat_request.workflow_id,
-        user_message_len=len(chat_request.message),
-        user_message=chat_request.message,
-        workflow_yaml_len=len(chat_request.workflow_yaml or ""),
-        workflow_yaml=chat_request.workflow_yaml or "",
-        chat_history_len=len(chat_history_text),
-        chat_history=chat_history_text,
-        global_llm_context_len=len(global_llm_context or ""),
-        global_llm_context=global_llm_context or "",
-        workflow_knowledge_base_len=len(workflow_knowledge_base),
-        debug_run_info_len=len(debug_run_info_text),
-        system_prompt_len=len(system_prompt),
-        user_prompt_len=len(user_prompt),
-    )
-    llm_api_handler = await _resolve_copilot_agent_handler(chat_request.workflow_permanent_id, organization_id)
-    llm_start_time = time.monotonic()
-    llm_response = await llm_api_handler(
-        prompt=user_prompt,
-        prompt_name="workflow-copilot",
-        organization_id=organization_id,
-        system_prompt=system_prompt,
-    )
-    LOG.info(
-        "LLM response",
-        workflow_permanent_id=chat_request.workflow_permanent_id,
-        workflow_id=chat_request.workflow_id,
-        duration_seconds=time.monotonic() - llm_start_time,
-        user_message_len=len(chat_request.message),
-        workflow_yaml_len=len(chat_request.workflow_yaml or ""),
-        chat_history_len=len(chat_history_text),
-        global_llm_context_len=len(global_llm_context or ""),
-        debug_run_info_len=len(debug_run_info_text),
-        workflow_knowledge_base_len=len(workflow_knowledge_base),
-        llm_response_len=len(llm_response),
-        llm_response=llm_response,
-    )
-
-    action_data = _parse_llm_response(llm_response)
-
-    action_type = action_data.get("type")
-    user_response_value = action_data.get("user_response")
-    if user_response_value is None:
-        user_response = "I received your request but I'm not sure how to help. Could you rephrase?"
-    else:
-        user_response = str(user_response_value)
-    LOG.info(
-        "LLM response received",
-        workflow_permanent_id=chat_request.workflow_permanent_id,
-        workflow_id=chat_request.workflow_id,
-        organization_id=organization_id,
-        action_type=action_type,
-    )
-
-    model_authored_context = action_data.get("global_llm_context")
-    if model_authored_context is not None:
-        global_llm_context = sanitize_global_llm_context_for_prompt(
-            adopt_model_authored_context(global_llm_context, model_authored_context).to_json_str()
-        )
-
-    if action_type == "REPLACE_WORKFLOW":
-        llm_workflow_yaml = default_data_write_continue_on_failure(
-            action_data.get("workflow_yaml", ""), chat_request.workflow_yaml
-        )
-        # The conversion seam binds a block's declared parameters into its parameter_keys against
-        # a copy that does not leave it, so bind here too: this text is what Accept saves, and an
-        # unbound copy would give the saved block no value for a parameter its code reads.
-        llm_workflow_yaml = bind_referenced_parameters_in_yaml(llm_workflow_yaml)
-        applied_workflow_yaml = llm_workflow_yaml
-        try:
-            updated_workflow = await _process_workflow_yaml(
-                workflow_id=chat_request.workflow_id,
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                organization_id=organization_id,
-                workflow_yaml=llm_workflow_yaml,
-                settings_fallback_yaml=chat_request.workflow_yaml,
-            )
-        except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
-            await stream.send(
-                WorkflowCopilotProcessingUpdate(
-                    type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
-                    status="Validating workflow definition...",
-                    timestamp=datetime.now(timezone.utc),
-                )
-            )
-            corrected_workflow_yaml = default_data_write_continue_on_failure(
-                await _auto_correct_workflow_yaml(
-                    llm_api_handler=llm_api_handler,
-                    organization_id=organization_id,
-                    user_response=user_response,
-                    workflow_yaml=llm_workflow_yaml,
-                    chat_history=chat_history,
-                    global_llm_context=global_llm_context,
-                    debug_run_info_text=debug_run_info_text,
-                    error=e,
-                ),
-                chat_request.workflow_yaml,
-            )
-            corrected_workflow_yaml = bind_referenced_parameters_in_yaml(corrected_workflow_yaml)
-            updated_workflow = await _process_workflow_yaml(
-                workflow_id=chat_request.workflow_id,
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                organization_id=organization_id,
-                workflow_yaml=corrected_workflow_yaml,
-                settings_fallback_yaml=chat_request.workflow_yaml,
-            )
-            applied_workflow_yaml = corrected_workflow_yaml
-
-        return user_response, updated_workflow, global_llm_context, applied_workflow_yaml
-    elif action_type == "REPLY":
-        return user_response, None, global_llm_context, None
-    elif action_type == "ASK_QUESTION":
-        return user_response, None, global_llm_context, None
-    else:
-        LOG.error(
-            "Unknown action type from LLM",
-            organization_id=organization_id,
-            action_type=action_type,
-        )
-        return "I received your request but I'm not sure how to help. Could you rephrase?", None, None, None
-
-
-async def _auto_correct_workflow_yaml(
-    llm_api_handler: LLMAPIHandler,
-    organization_id: str,
-    user_response: str,
-    workflow_yaml: str,
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    global_llm_context: str | None,
-    debug_run_info_text: str,
-    error: Exception,
-) -> str:
-    failure_reason = f"{error.__class__.__name__}: {error}"
-
-    new_chat_history = chat_history[:]
-    new_chat_history.append(
-        WorkflowCopilotChatHistoryMessage(
-            sender=WorkflowCopilotChatSender.AI,
-            content=user_response,
-            created_at=datetime.now(timezone.utc),
-        )
-    )
-
-    workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-
-    security_rules = app.AGENT_FUNCTION.get_copilot_security_rules()
-    system_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-system",
-        workflow_knowledge_base=workflow_knowledge_base,
-        current_datetime=datetime.now(timezone.utc).isoformat(),
-        security_rules=security_rules,
-    )
-
-    prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
-    user_prompt = prompt_engine.load_prompt(
-        template="workflow-copilot-user",
-        workflow_yaml=escape_code_fences(workflow_yaml),
-        user_message=escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
-        chat_history=escape_code_fences(_format_chat_history(new_chat_history)),
-        global_llm_context=escape_code_fences(prompt_global_llm_context),
-        loaded_result_context="",
-        debug_run_info=escape_code_fences(debug_run_info_text),
-    )
-
-    llm_start_time = time.monotonic()
-    llm_response = await llm_api_handler(
-        prompt=user_prompt,
-        prompt_name="workflow-copilot",
-        organization_id=organization_id,
-        system_prompt=system_prompt,
-    )
-    LOG.info(
-        "Auto-correction LLM response",
-        duration_seconds=time.monotonic() - llm_start_time,
-        llm_response_len=len(llm_response),
-        llm_response=llm_response,
-    )
-    action_data = _parse_llm_response(llm_response)
-
-    return action_data.get("workflow_yaml", workflow_yaml)
 
 
 def _blockless_submission_fallback(
@@ -1913,7 +1738,7 @@ def _ensure_copilot_workflow_yaml(
         return
 
     LOG.warning(
-        "Copilot V2 chat request had no workflow blocks; using persisted workflow YAML",
+        "Copilot agent chat request had no workflow blocks; using persisted workflow YAML",
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_id=original_workflow.workflow_id,
         submitted_workflow_yaml_length=len(chat_request.workflow_yaml or ""),
@@ -1931,9 +1756,7 @@ async def _new_copilot_chat_post(
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
 ) -> EventSourceResponse:
-    """ENABLE_WORKFLOW_COPILOT_V2 dispatch target.
-
-    Runs the openai-agents-SDK copilot (skyvern.forge.sdk.copilot.agent) and
+    """Run the OpenAI Agents SDK copilot and
     streams responses in the same SSE shape the frontend consumes. On
     mid-stream failure (HTTPException, LLMProviderError, asyncio.CancelledError,
     or unexpected exception), rolls the workflow definition back to
@@ -1943,7 +1766,7 @@ async def _new_copilot_chat_post(
 
     async def stream_handler(stream: EventSourceStream) -> None:
         LOG.info(
-            "Workflow copilot v2 chat request",
+            "Workflow copilot agent chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
             workflow_run_id=chat_request.workflow_run_id,
             **_workflow_copilot_ingress_log_fields(chat_request.message),
@@ -1974,7 +1797,7 @@ async def _new_copilot_chat_post(
         cancel_watcher: asyncio.Task[None] | None = None
         current_code_available = False
         turn_index = 0
-        effective_mode = _effective_copilot_composer_mode(chat_request, uses_v2=True)
+        effective_mode = _effective_copilot_build_mode(chat_request)
         prior_turn_outcome: TurnOutcome | None = None
 
         def capture_code_mode_opt_out_after_persist() -> None:
@@ -1983,7 +1806,6 @@ async def _new_copilot_chat_post(
             _capture_copilot_code_mode_opt_out(
                 prior_turn_outcome=prior_turn_outcome,
                 to_mode=effective_mode,
-                current_code_available=current_code_available,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 workflow_permanent_id=chat.workflow_permanent_id,
                 organization_id=organization.organization_id,
@@ -2002,7 +1824,10 @@ async def _new_copilot_chat_post(
             """Shared by the LLMProviderError and generic Exception handlers below —
             only their log/user-facing strings and failure kind differ."""
             nonlocal terminal_frame_emitted
-            restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+            restored = chat is not None and _should_restore_persisted_workflow(
+                chat.auto_accept,
+                agent_result,
+            )
             restore_failed = False
             if restored:
                 try:
@@ -2024,20 +1849,22 @@ async def _new_copilot_chat_post(
                     # agent_result is the real completed result when the exception hit AFTER
                     # run_copilot_agent returned (e.g. mid-finalisation) — honor its own
                     # explicit clear decision the same way the non-recovery path does.
-                    clear_proposed_workflow=(restored and not chat_request.keep_pending_proposal)
-                    or workflow_modified
-                    or getattr(agent_result, "clear_proposed_workflow", False)
-                    # A staged commit that already succeeded before this exception fired
-                    # still invalidates a stale kept proposal, same as the non-recovery path.
-                    or _should_commit_staged_workflow(chat.auto_accept, agent_result)
-                    # A failed rollback leaves canonical's true state unverified — don't
-                    # honor keep_pending_proposal against an assumption that didn't hold.
-                    or restore_failed
-                    # Compares against the turn-start snapshot, not agent_result.updated_workflow:
-                    # that field only means a write was ATTEMPTED, not that it SUCCEEDED — if the
-                    # write itself is what raised, chat.proposed_workflow never changed and an
-                    # older, legitimately keep_pending_proposal-protected proposal must survive.
-                    or chat.proposed_workflow is not proposed_workflow_at_turn_start,
+                    clear_proposed_workflow=(
+                        (restored and not chat_request.keep_pending_proposal)
+                        or workflow_modified
+                        or getattr(agent_result, "clear_proposed_workflow", False)
+                        # A staged commit that already succeeded before this exception fired
+                        # still invalidates a stale kept proposal, same as the non-recovery path.
+                        or _should_commit_staged_workflow(chat.auto_accept, agent_result)
+                        # A failed rollback leaves canonical's true state unverified — don't
+                        # honor keep_pending_proposal against an assumption that didn't hold.
+                        or restore_failed
+                        # Compares against the turn-start snapshot, not agent_result.updated_workflow:
+                        # that field only means a write was ATTEMPTED, not that it SUCCEEDED — if the
+                        # write itself is what raised, chat.proposed_workflow never changed and an
+                        # older, legitimately keep_pending_proposal-protected proposal must survive.
+                        or chat.proposed_workflow is not proposed_workflow_at_turn_start
+                    ),
                     global_llm_context=global_llm_context,
                     turn_id=turn_id,
                     turn_index=turn_index,
@@ -2058,13 +1885,19 @@ async def _new_copilot_chat_post(
                     exception_type=failure.exception_type,
                     exc_info=True,
                 )
+                opener_is_server_authored = _turn_opener_sender(chat_request) == WorkflowCopilotChatSender.PRODUCT
+                recovery_chat_request = (
+                    chat_request
+                    if turn_started or opener_is_server_authored
+                    else chat_request.model_copy(update={"message": UNSCREENED_MESSAGE_PLACEHOLDER})
+                )
                 await asyncio.shield(
                     _finalise_normal_turn(
                         stream=stream,
                         chat=chat,
                         organization_id=organization.organization_id,
                         original_workflow=original_workflow,
-                        chat_request=chat_request,
+                        chat_request=recovery_chat_request,
                         agent_result=recovered_result,
                         turn_id=turn_id,
                         user_row_already_persisted=turn_started,
@@ -2116,6 +1949,13 @@ async def _new_copilot_chat_post(
             )
             proposed_workflow_at_turn_start = chat.proposed_workflow
             chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
+            # Before any await that could raise into the recovery writer: that writer opens the row
+            # with the product sender, so the caller's prose must already be gone.
+            await _apply_diagnose_run_action(
+                chat_request,
+                organization_id=chat.organization_id,
+                workflow_permanent_id=chat.workflow_permanent_id,
+            )
             chat_request.audio_artifact_id = await _validate_copilot_audio_artifact_id(
                 audio_artifact_id=chat_request.audio_artifact_id,
                 organization_id=organization.organization_id,
@@ -2126,19 +1966,13 @@ async def _new_copilot_chat_post(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             )
             prior_turn_outcome = _latest_assistant_turn_outcome(chat_messages)
-            current_code_available = await _resolve_copilot_code_available(
+            copilot_config = await _resolve_copilot_request_config(
                 organization.organization_id,
                 chat_request,
             )
-            effective_mode = _effective_copilot_composer_mode(
-                chat_request,
-                uses_v2=True,
-                code_mode_fallback=current_code_available,
-            )
-            for message in reversed(chat_messages):
-                if message.global_llm_context is not None:
-                    global_llm_context = message.global_llm_context
-                    break
+            current_code_available = copilot_config.code_block_available
+            effective_mode = "code" if copilot_config.effective_code_block_mode else "build"
+            global_llm_context = _prior_global_llm_context(chat_messages)
 
             blockless_fallback = _blockless_submission_fallback(
                 proposed_workflow=chat.proposed_workflow,
@@ -2221,7 +2055,7 @@ async def _new_copilot_chat_post(
 
             if not api_key:
                 LOG.warning(
-                    "Copilot V2 cannot resolve an org API token; refusing to start the agent",
+                    "Copilot cannot resolve an org API token; refusing to start the agent",
                     organization_id=organization.organization_id,
                     workflow_permanent_id=chat.workflow_permanent_id,
                 )
@@ -2239,38 +2073,11 @@ async def _new_copilot_chat_post(
                 )
                 return
 
-            copilot_config = (
-                await app.AGENT_FUNCTION.get_copilot_config_for_request(
-                    organization.organization_id,
-                    code_block_mode=chat_request.code_block,
-                    composer_mode=chat_request.mode,
-                )
-            ) or CopilotConfig()
-
-            # Spawn the cancel watcher only after the chat row exists; cancels
-            # that land during pre-agent setup are not user-cancellable
-            # (setup is short and the watcher needs a chat row to attach
-            # any cancellation messages to).
-            cache = getattr(app, "CACHE", None)
-            if chat_request.cancel_token and cache is not None:
-                handler_task = asyncio.current_task()
-                if handler_task is not None:
-                    cancel_watcher = asyncio.create_task(
-                        _watch_for_cancel(
-                            cache,
-                            organization.organization_id,
-                            chat_request.cancel_token,
-                            handler_task,
-                            user_cancel_observed,
-                            user_cancel_source,
-                        )
-                    )
-
             # Zero-based turn ordinal. The current user message has not been
             # appended to chat_messages at this point, so ``sum(...)`` already
             # counts only prior user turns and equals the index of the
             # about-to-start turn.
-            turn_index = sum(1 for m in chat_messages if m.sender == WorkflowCopilotChatSender.USER)
+            turn_index = sum(1 for m in chat_messages if m.sender in TURN_OPENER_SENDERS)
 
             # Prefer the FE-submitted yaml — canonical still has 0 blocks
             # mid-iteration before Accept and would mis-classify the chip.
@@ -2288,9 +2095,12 @@ async def _new_copilot_chat_post(
                     pending_turn=CopilotPendingTurn(
                         turn_id=turn_id,
                         started_at=datetime.now(timezone.utc),
+                        cancel_token=chat_request.cancel_token,
                         pre_turn_workflow=original_workflow.model_dump(mode="json"),
                         pre_turn_proposed_workflow=proposed_workflow_at_turn_start,
                         keep_pending_proposal=chat_request.keep_pending_proposal,
+                        copilot_effective_mode=effective_mode,
+                        copilot_code_available=current_code_available,
                         idempotency_digest=_copilot_idempotency_digest(
                             organization.organization_id,
                             chat.workflow_copilot_chat_id,
@@ -2300,8 +2110,9 @@ async def _new_copilot_chat_post(
                     # The semantic safety screen runs inside the agent guardrail. Persisting the
                     # literal before that screen would leave a cross-turn disclosure path if the
                     # dedicated classifier finds a secret outside deterministic redaction patterns.
-                    user_message="[Message unavailable because safety screening did not complete]",
+                    user_message=UNSCREENED_MESSAGE_PLACEHOLDER,
                     audio_artifact_id=chat_request.audio_artifact_id,
+                    sender=_turn_opener_sender(chat_request),
                 )
             except DuplicateCopilotTurnError as exc:
                 terminal_frame_emitted = True
@@ -2315,6 +2126,24 @@ async def _new_copilot_chat_post(
                 )
                 return
             turn_started = True
+
+            # Cancellation becomes user-actionable only after the durable safety
+            # placeholder exists. This ordering closes the race where Stop could
+            # otherwise persist the unscreened request while starting the turn.
+            cache = getattr(app, "CACHE", None)
+            if chat_request.cancel_token and cache is not None:
+                handler_task = asyncio.current_task()
+                if handler_task is not None:
+                    cancel_watcher = asyncio.create_task(
+                        _watch_for_cancel(
+                            cache,
+                            organization.organization_id,
+                            chat_request.cancel_token,
+                            handler_task,
+                            user_cancel_observed,
+                            user_cancel_source,
+                        )
+                    )
 
             async def persist_canonical_user_message(content: str) -> None:
                 await app.DATABASE.workflow_params.replace_workflow_copilot_chat_message(
@@ -2378,13 +2207,16 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                     keep_pending_proposal=chat_request.keep_pending_proposal,
                     user_row_already_persisted=turn_started,
+                    sender=_turn_opener_sender(chat_request),
                     record_as_interrupted=not user_cancel_observed[0],
                     cancel_source=user_cancel_source[0],
+                    effective_mode=effective_mode,
+                    code_available=current_code_available,
                 )
                 terminal_frame_emitted = True
                 capture_code_mode_opt_out_after_persist()
                 LOG.info(
-                    "Workflow copilot v2 turn cancelled",
+                    "Workflow copilot agent turn cancelled",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     user_cancel_observed=user_cancel_observed[0],
                     cancel_source=user_cancel_source[0],
@@ -2410,7 +2242,10 @@ async def _new_copilot_chat_post(
             terminal_frame_emitted = True
             capture_code_mode_opt_out_after_persist()
         except HTTPException as exc:
-            if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
+            if chat is not None and _should_restore_persisted_workflow(
+                chat.auto_accept,
+                agent_result,
+            ):
                 try:
                     await _restore_workflow_definition(original_workflow, organization.organization_id)
                 except Exception:
@@ -2433,13 +2268,16 @@ async def _new_copilot_chat_post(
             await _recover_from_route_exception(
                 exc,
                 restore_log_context="LLMProviderError handler",
-                translated_log_message="LLM provider error translated to recoverable workflow copilot v2 reply",
-                none_chat_log_message="LLM provider error (copilot v2)",
+                translated_log_message="LLM provider error translated to recoverable workflow copilot reply",
+                none_chat_log_message="LLM provider error (workflow copilot)",
                 none_chat_user_message="Failed to process your request. Please try again.",
                 failure_kind="provider",
             )
         except asyncio.CancelledError:
-            if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
+            if chat is not None and _should_restore_persisted_workflow(
+                chat.auto_accept,
+                agent_result,
+            ):
                 try:
                     await asyncio.shield(_restore_workflow_definition(original_workflow, organization.organization_id))
                 except Exception:
@@ -2466,11 +2304,14 @@ async def _new_copilot_chat_post(
                         prior_global_llm_context=global_llm_context,
                         user_row_already_persisted=turn_started,
                         cancel_source=user_cancel_source[0],
+                        sender=_turn_opener_sender(chat_request),
+                        effective_mode=effective_mode,
+                        code_available=current_code_available,
                     )
                 )
                 terminal_frame_emitted = True
                 LOG.info(
-                    "Workflow copilot v2 cancelled by user during pre-agent setup",
+                    "Workflow copilot agent cancelled by user during pre-agent setup",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     cancel_source=user_cancel_source[0],
                 )
@@ -2482,7 +2323,7 @@ async def _new_copilot_chat_post(
                 # its shielded write owns this turn's row and wins; if it dies before
                 # committing, the pending turn is left for reconcile-on-read to recover.
                 LOG.info(
-                    "Workflow copilot v2 task cancelled (operational or post-finalisation)",
+                    "Workflow copilot agent task cancelled (operational or post-finalisation)",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     user_cancel_observed=user_cancel_observed[0],
                     finalise_started=finalise_started,
@@ -2502,6 +2343,9 @@ async def _new_copilot_chat_post(
                             ),
                             user_message=chat_request.message,
                             user_row_already_persisted=turn_started,
+                            sender=_turn_opener_sender(chat_request),
+                            effective_mode=effective_mode,
+                            code_available=current_code_available,
                         )
                     )
                 raise
@@ -2509,8 +2353,8 @@ async def _new_copilot_chat_post(
             await _recover_from_route_exception(
                 exc,
                 restore_log_context="generic-error handler",
-                translated_log_message="Unexpected workflow copilot v2 error translated to recoverable reply",
-                none_chat_log_message="Unexpected error in workflow copilot v2",
+                translated_log_message="Unexpected workflow copilot error translated to recoverable reply",
+                none_chat_log_message="Unexpected error in workflow copilot",
                 none_chat_user_message="An error occurred. Please try again.",
                 failure_kind="server",
             )
@@ -2531,35 +2375,6 @@ async def _new_copilot_chat_post(
                     )
 
     return FastAPIEventSourceStream.create(request, stream_handler)
-
-
-COPILOT_V2_FLAG_KEY = "ENABLE_WORKFLOW_COPILOT_V2"
-
-
-async def _should_use_copilot_v2(
-    organization: Organization, workflow_permanent_id: str, mode: str | None = None
-) -> bool:
-    if mode is not None:
-        return mode == "build"
-    if settings.ENABLE_WORKFLOW_COPILOT_V2:
-        return True
-    try:
-        # distinct_id is the org (not a run id) because this gate is an org-sticky rollout:
-        # copilot chat may not have a stable run at dispatch time, and we want each org to
-        # see the same path across sessions. Contrast with backend.md's default of run-level
-        # ids for per-run randomized experiments.
-        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-            COPILOT_V2_FLAG_KEY,
-            distinct_id=organization.organization_id,
-            properties={"organization_id": organization.organization_id},
-        )
-    except Exception:
-        LOG.exception(
-            "Failed to evaluate copilot-v2 feature flag; falling back to legacy copilot",
-            organization_id=organization.organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-        return False
 
 
 async def _get_or_create_workflow_copilot_chat(
@@ -2745,213 +2560,12 @@ async def workflow_copilot_chat_post(
             eval_entrypoint_url=eval_entrypoint_url,
         )
 
-    if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id, mode=chat_request.mode):
-        return await _new_copilot_chat_post(
-            request,
-            chat_request,
-            organization,
-            eval_entrypoint_url=eval_entrypoint_url,
-        )
-    if eval_entrypoint_url is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="eval_entrypoint_url requires the copilot v2 agent path",
-        )
-
-    async def stream_handler(stream: EventSourceStream) -> None:
-        turn_id = uuid.uuid4().hex
-        LOG.info(
-            "Workflow copilot chat request",
-            workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-            workflow_run_id=chat_request.workflow_run_id,
-            message=chat_request.message,
-            workflow_yaml_length=len(chat_request.workflow_yaml),
-            organization_id=organization.organization_id,
-        )
-
-        terminal_frame_emitted = False
-        try:
-            await stream.send(
-                WorkflowCopilotProcessingUpdate(
-                    type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
-                    status="Processing...",
-                    timestamp=datetime.now(timezone.utc),
-                )
-            )
-
-            chat = await _get_or_create_workflow_copilot_chat(
-                organization_id=organization.organization_id,
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-            )
-            chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
-            chat_request.audio_artifact_id = await _validate_copilot_audio_artifact_id(
-                audio_artifact_id=chat_request.audio_artifact_id,
-                organization_id=organization.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            )
-
-            chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            )
-            prior_turn_outcome = _latest_assistant_turn_outcome(chat_messages)
-            current_code_available = await _resolve_copilot_code_available(
-                organization.organization_id,
-                chat_request,
-            )
-            effective_mode = _effective_copilot_composer_mode(
-                chat_request,
-                uses_v2=False,
-                code_mode_fallback=current_code_available,
-            )
-            global_llm_context = None
-            for message in reversed(chat_messages):
-                if message.global_llm_context is not None:
-                    global_llm_context = message.global_llm_context
-                    break
-
-            debug_run_info = await _get_debug_run_info(organization.organization_id, chat_request.workflow_run_id)
-
-            # Format debug run info for prompt
-            debug_run_info_text = ""
-            if debug_run_info:
-                debug_run_info_text = f"Block Label: {debug_run_info.block_label}"
-                debug_run_info_text += f" Block Type: {debug_run_info.block_type}"
-                debug_run_info_text += f" Status: {debug_run_info.block_status}"
-                if debug_run_info.failure_reason:
-                    debug_run_info_text += f"\nFailure Reason: {debug_run_info.failure_reason}"
-                if debug_run_info.html:
-                    debug_run_info_text += f"\n\nVisible Elements Tree (HTML):\n{debug_run_info.html}"
-
-            await stream.send(
-                WorkflowCopilotProcessingUpdate(
-                    type=WorkflowCopilotStreamMessageType.PROCESSING_UPDATE,
-                    status="Thinking...",
-                    timestamp=datetime.now(timezone.utc),
-                )
-            )
-
-            # SKY-8986: do not short-circuit on client disconnect. The LLM
-            # call and the DB persistence below must complete so the reply
-            # is in the chat history when the user reconnects.
-            with bind_copilot_session_id(chat.workflow_copilot_chat_id):
-                (
-                    user_response,
-                    updated_workflow,
-                    updated_global_llm_context,
-                    updated_workflow_yaml,
-                ) = await copilot_call_llm(
-                    stream,
-                    organization.organization_id,
-                    chat_request,
-                    convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
-                    global_llm_context,
-                    debug_run_info_text,
-                )
-
-            legacy_turn_outcome = _with_current_copilot_code_mode_metadata(
-                build_minimal_turn_outcome(
-                    user_response,
-                    response_kind=ResponseKind.CLARIFY if effective_mode == "ask" else ResponseKind.BUILD,
-                ),
-                effective_mode=effective_mode,
-                code_available=current_code_available,
-                turn_id=turn_id,
-            )
-
-            if updated_workflow and chat.auto_accept is not True:
-                proposed_data = updated_workflow.model_dump(mode="json")
-                # _copilot_yaml is what /apply-proposed-workflow re-parses into
-                # WorkflowCreateYAMLRequest. Without it, Accept 400s.
-                if updated_workflow_yaml:
-                    proposed_data["_copilot_yaml"] = with_workflow_yaml_title(
-                        updated_workflow_yaml, updated_workflow.title
-                    )
-                await app.DATABASE.workflow_params.update_workflow_copilot_chat(
-                    organization_id=chat.organization_id,
-                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    proposed_workflow=proposed_data,
-                )
-
-            await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
-                organization_id=chat.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                sender=WorkflowCopilotChatSender.USER,
-                content=chat_request.message,
-                audio_artifact_id=chat_request.audio_artifact_id,
-            )
-
-            assistant_message = await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
-                organization_id=chat.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                sender=WorkflowCopilotChatSender.AI,
-                content=user_response,
-                global_llm_context=updated_global_llm_context,
-                turn_outcome=legacy_turn_outcome,
-            )
-
-            _capture_copilot_code_mode_opt_out(
-                prior_turn_outcome=prior_turn_outcome,
-                to_mode=effective_mode,
-                current_code_available=current_code_available,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                workflow_permanent_id=chat.workflow_permanent_id,
-                organization_id=organization.organization_id,
-                turn_id=turn_id,
-            )
-            terminal_frame_emitted = True
-            await stream.send(
-                WorkflowCopilotStreamResponseUpdate(
-                    type=WorkflowCopilotStreamMessageType.RESPONSE,
-                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    message=user_response,
-                    updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
-                    response_time=assistant_message.created_at,
-                )
-            )
-        except HTTPException as exc:
-            terminal_frame_emitted = True
-            await stream.send(
-                WorkflowCopilotStreamErrorUpdate(
-                    type=WorkflowCopilotStreamMessageType.ERROR,
-                    error=exc.detail,
-                    failure_kind=_http_exception_failure_kind(exc),
-                )
-            )
-        except LLMProviderError as exc:
-            LOG.error(
-                "LLM provider error",
-                organization_id=organization.organization_id,
-                error=str(exc),
-                exc_info=True,
-            )
-            terminal_frame_emitted = True
-            await stream.send(
-                WorkflowCopilotStreamErrorUpdate(
-                    type=WorkflowCopilotStreamMessageType.ERROR,
-                    error="Failed to process your request. Please try again.",
-                    failure_kind="provider",
-                )
-            )
-        except Exception as exc:
-            LOG.error(
-                "Unexpected error in workflow copilot",
-                organization_id=organization.organization_id,
-                error=str(exc),
-                exc_info=True,
-            )
-            terminal_frame_emitted = True
-            await stream.send(
-                WorkflowCopilotStreamErrorUpdate(
-                    type=WorkflowCopilotStreamMessageType.ERROR,
-                    error="An error occurred. Please try again.",
-                    failure_kind="server",
-                )
-            )
-        finally:
-            await _ensure_terminal_frame(stream, terminal_frame_emitted, turn_id=turn_id)
-
-    return FastAPIEventSourceStream.create(request, stream_handler)
+    return await _new_copilot_chat_post(
+        request,
+        chat_request,
+        organization,
+        eval_entrypoint_url=eval_entrypoint_url,
+    )
 
 
 @base_router.get("/workflow/copilot/chats", include_in_schema=False)
@@ -3045,6 +2659,8 @@ async def _recover_interrupted_copilot_turn(
             authored_edits_saved=False if canonical_rolled_back else None,
         ),
         idempotency_digest=entry.idempotency_digest,
+        effective_mode=entry.copilot_effective_mode,
+        code_available=entry.copilot_code_available,
     )
     LOG.info(
         "Recovered an interrupted copilot turn on read",
@@ -3058,7 +2674,26 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
         return
     abandoned_before = datetime.now(timezone.utc) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
     for entry in sorted(chat.pending_turns.values(), key=lambda item: _as_utc(item.started_at)):
-        if _as_utc(entry.started_at) > abandoned_before:
+        pending_questions = [item for item in entry.question_interactions if item.status == "pending"]
+        if pending_questions:
+            if question_wait_is_live(entry.question_heartbeat_at, datetime.now(timezone.utc)):
+                continue
+            for item in pending_questions:
+                recorded = await app.DATABASE.workflow_params.interrupt_copilot_question(
+                    organization_id, chat.workflow_copilot_chat_id, item.interaction_id, stale_only=True
+                )
+                if recorded is not None:
+                    entry.question_interactions = [
+                        recorded if prior.interaction_id == item.interaction_id else prior
+                        for prior in entry.question_interactions
+                    ]
+        last_activity = max(
+            [
+                _as_utc(entry.started_at),
+                *[item.resolved_at for item in entry.question_interactions if item.resolved_at is not None],
+            ]
+        )
+        if last_activity > abandoned_before:
             continue
         claimed = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
             organization_id=organization_id,
@@ -3101,6 +2736,12 @@ async def workflow_copilot_chat_history(
             detail="workflow_permanent_id or workflow_copilot_chat_id is required",
         )
     if chat:
+        if any(
+            item.status == "pending" for entry in chat.pending_turns.values() for item in entry.question_interactions
+        ):
+            chat.pending_turns = await app.DATABASE.workflow_params.refresh_copilot_question_client(
+                organization.organization_id, chat.workflow_copilot_chat_id
+            )
         await _reconcile_interrupted_copilot_turns(chat, organization.organization_id)
         chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
             chat.workflow_copilot_chat_id
@@ -3109,10 +2750,86 @@ async def workflow_copilot_chat_history(
         chat_messages = []
     return WorkflowCopilotChatHistoryResponse(
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
+        question_interactions=list(
+            {
+                item.interaction_id: item
+                for item in (
+                    [
+                        QuestionInteraction.model_validate(raw)
+                        for message in chat_messages
+                        if message.narrative_payload is not None
+                        for raw in message.narrative_payload.get("questionInteractions", [])
+                    ]
+                    + [
+                        item
+                        for entry in (chat.pending_turns.values() if chat else [])
+                        for item in entry.question_interactions
+                    ]
+                )
+            }.values()
+        ),
+        pending_question_cancel_token=next(
+            (
+                entry.cancel_token
+                for entry in (chat.pending_turns.values() if chat else [])
+                if any(item.status == "pending" for item in entry.question_interactions)
+            ),
+            None,
+        ),
         chat_history=convert_to_history_messages(chat_messages),
         proposed_workflow=chat.proposed_workflow if chat else None,
         auto_accept=chat.auto_accept if chat else None,
     )
+
+
+@base_router.post("/workflow/copilot/question-response", include_in_schema=False)
+async def workflow_copilot_question_response(
+    question_response: WorkflowCopilotQuestionResponseRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> QuestionInteraction:
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization.organization_id, question_response.workflow_copilot_chat_id
+    )
+    if chat is None:
+        raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    response = QuestionResponse(
+        answers=question_response.answers, text=question_response.text, skipped=question_response.skipped
+    )
+
+    async def resolve(*, preflight_only: bool = False) -> QuestionInteraction:
+        try:
+            return await app.DATABASE.workflow_params.resolve_copilot_question(
+                organization.organization_id,
+                chat.workflow_copilot_chat_id,
+                question_response.interaction_id,
+                response,
+                preflight_only=preflight_only,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Unknown Copilot question") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    recorded = await resolve(preflight_only=True)
+    if recorded.status == "resolved":
+        return recorded
+    if response.text is not None or any(answer.text is not None for answer in response.answers):
+        handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
+
+        async def screen_text(text: str) -> str:
+            safety = await _screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
+            if safety.status == "blocked":
+                raise HTTPException(
+                    status_code=503, detail="The safety screen is unavailable. Please retry your answer."
+                )
+            return safety.canonical_user_message
+
+        if response.text is not None:
+            response.text = await screen_text(response.text)
+        for answer in response.answers:
+            if answer.text is not None:
+                answer.text = await screen_text(answer.text)
+    return await resolve()
 
 
 @base_router.post("/workflow/copilot/cancel", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
@@ -3120,7 +2837,7 @@ async def workflow_copilot_cancel(
     cancel_request: WorkflowCopilotCancelRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
-    """Hard-cancel an in-progress workflow copilot v2 turn.
+    """Hard-cancel an in-progress workflow copilot turn.
 
     Sets a per-token Redis flag the SSE handler's cancel-watcher polls; the
     watcher cancels the handler task, propagating ``CancelledError`` into
@@ -3128,8 +2845,18 @@ async def workflow_copilot_cancel(
     write). Returns 503 when ``app.CACHE`` is absent — the FE Stop button
     still aborts client-side, but the backend can't signal the running handler.
     """
+    cancelled_questions = False
+    if cancel_request.workflow_copilot_chat_id:
+        try:
+            cancelled_questions = await app.DATABASE.workflow_params.cancel_copilot_questions(
+                organization.organization_id, cancel_request.workflow_copilot_chat_id, cancel_request.cancel_token
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Unknown Copilot chat") from exc
     cache = getattr(app, "CACHE", None)
     if cache is None:
+        if cancelled_questions:
+            return
         LOG.warning(
             "Workflow copilot cancel attempted without cache",
             organization_id=organization.organization_id,
@@ -3255,6 +2982,27 @@ async def workflow_copilot_apply_proposed_workflow(
 
     try:
         yaml_request = _normalize_copilot_yaml(copilot_yaml)
+        clears_headers = (
+            "cdp_connect_headers" in yaml_request.model_fields_set and yaml_request.cdp_connect_headers is None
+        )
+        if "workflow_definition" in proposal:
+            # The proposal carries resolved settings from earlier edits that its final YAML
+            # may omit. Preserve explicit nulls too, rather than inheriting saved settings.
+            resolved = Workflow.model_validate(proposal).model_dump(mode="json")
+            if (
+                "max_elapsed_time_minutes" not in yaml_request.model_fields_set
+                and resolved["max_elapsed_time_minutes"] is None
+            ):
+                # Pre-upgrade proposals used null for an omitted limit; retain save-service inheritance.
+                resolved.pop("max_elapsed_time_minutes")
+            resolved.update(yaml_request.model_dump(exclude_unset=True))
+            if "cdp_connect_headers" in yaml_request.model_fields_set:
+                resolved["cdp_connect_headers"] = yaml_request.cdp_connect_headers
+            yaml_request = WorkflowCreateYAMLRequest.model_validate(resolved)
+        if clears_headers:
+            # The save service uses an empty mapping to clear headers; None inherits them.
+            yaml_request.cdp_connect_headers = {}
+
     except (yaml.YAMLError, ValidationError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

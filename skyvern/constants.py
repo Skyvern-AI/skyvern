@@ -12,6 +12,11 @@ SKYVERN_MCP_USER_AGENT: str = "skyvern-mcp"
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
 
+# Bounds the reasoning that user-defined errors carry to the customer webhook, and the
+# descriptions in an error_code_mapping. Lives here so the leaf error models and the workflow
+# schema can share one number without the models depending on the schema package.
+ERROR_CODE_REASONING_MAX_LENGTH = 2000
+
 INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
@@ -111,7 +116,7 @@ DEFAULT_LOGIN_COMPLETE_CRITERION = (
 )
 
 # Template for wrapping a block-level mini-goal with the user's original prompt as context.
-# Used by both TaskV2 planning and the workflow-copilot-v2 tool handler so that every block's
+# Used by both TaskV2 planning and the Workflow Copilot tool handler so that every block's
 # navigation_goal carries the user's overarching intent — the verifier (complete_verify) can
 # then reason about completion against the user's goal rather than the block's narrow action
 # decomposition.

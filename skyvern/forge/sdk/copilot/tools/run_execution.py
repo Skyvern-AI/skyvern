@@ -28,7 +28,9 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locat
 from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.budget_expiry import budget_run_denial
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
     BuildTestConnectFailureState,
     build_test_connect_failure_sentence,
@@ -132,6 +134,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     RegisteredArtifactEvidence,
     browser_page_custody_lock,
     ensure_build_test_browser_session,
+    record_sensitive_origin_run_taint,
     register_sensitive_origin_run_lease,
     release_sensitive_origin_run_lease,
     resolve_persistent_browser_state,
@@ -158,7 +161,10 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import interim_run_start_outcome, is_interim_run_outcome
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_halt import (
+    stash_build_test_superseded_halt,
+    stash_turn_halt_from_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -357,12 +363,9 @@ async def _cooperative_cancel_dispatched_run(workflow_run_id: str) -> None:
 async def _delete_dispatch_draft(workflow_id: str, organization_id: str) -> None:
     """Best-effort soft-delete of the copilot dispatch version once the run is done.
 
-    The dispatch version is written at version=latest+1, so without this it would become the
-    latest version returned by edit/view/GET /workflows/{wpid} resolution (latest-by-permanent-id)
-    and show the wrapped snapshot. Soft-deleting it restores the user's real latest version
-    (get_workflow_by_permanent_id excludes soft-deleted rows). The dispatched run already ran
-    against this version (worker resolved it by run.workflow_id before terminal), so deleting it
-    afterward does not affect execution. Best-effort: a failure here must never fail the run.
+    Test versions are excluded from saved-workflow resolution while still addressable by exact
+    ID. Terminal cleanup retires the version after its executor has finished; a cleanup failure
+    does not expose the proposal as the saved version and must never fail the run.
     """
     try:
         await app.DATABASE.workflows.soft_delete_workflow_by_id(
@@ -371,7 +374,7 @@ async def _delete_dispatch_draft(workflow_id: str, organization_id: str) -> None
         )
     except Exception:
         LOG.warning(
-            "Failed to soft-delete copilot dispatch draft; it may linger as the latest version",
+            "Failed to soft-delete copilot dispatch draft",
             workflow_id=workflow_id,
             organization_id=organization_id,
             exc_info=True,
@@ -399,6 +402,18 @@ async def _delete_dispatch_draft_if_run_final(workflow_id: str, workflow_run_id:
         )
         return
     await _delete_dispatch_draft(workflow_id, organization_id)
+
+
+async def _retire_snapshot_after_execution(
+    run_task: asyncio.Task,
+    workflow_id: str,
+    workflow_run_id: str,
+    organization_id: str,
+) -> None:
+    try:
+        await asyncio.shield(run_task)
+    finally:
+        await _delete_dispatch_draft_if_run_final(workflow_id, workflow_run_id, organization_id)
 
 
 def _log_detached_cleanup_failure(task: asyncio.Task) -> None:
@@ -758,7 +773,9 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
         code_line = entry.get("code_line")
         bits = [str(action)]
         if element:
-            bits.append(str(element))
+            # A selector the block built from runtime page text is in no secret registry, the same
+            # residual the response screen below exists for.
+            bits.append(redact_raw_secrets_for_prompt(str(element)))
         if status:
             bits.append(str(status))
         if isinstance(response, str) and response:
@@ -810,7 +827,7 @@ def _failure_action_trace_summary(failed_result: Mapping[str, Any] | None) -> li
     if failed_result is None:
         return []
     action_trace = failed_result.get("action_trace")
-    if _failing_code_line(action_trace) is not None:
+    if str(failed_result.get("block_type") or "").upper() == BlockType.CODE.name and isinstance(action_trace, list):
         return _summarize_action_trace(action_trace)
     return _retained_action_observations([failed_result])
 
@@ -1329,6 +1346,72 @@ def _workflow_parameters(workflow: Workflow | None) -> list[Any]:
         else getattr(workflow_definition, "parameters", None)
     )
     return parameters if isinstance(parameters, list) else []
+
+
+ExecutionSnapshotProvenance = Literal["canonical", "staged"]
+
+
+@dataclass(frozen=True)
+class CopilotExecutionSnapshot:
+    """One provenance-closed workflow definition and the rows a run binds against."""
+
+    provenance: ExecutionSnapshotProvenance
+    workflow: Workflow
+    workflow_parameters: tuple[WorkflowParameter, ...]
+    output_parameters: tuple[OutputParameter, ...]
+
+
+def _declared_execution_snapshot(workflow: Workflow) -> CopilotExecutionSnapshot:
+    workflow = workflow.model_copy(deep=True)
+    parameters = _workflow_parameters(workflow)
+    return CopilotExecutionSnapshot(
+        provenance="staged",
+        workflow=workflow,
+        workflow_parameters=tuple(parameter for parameter in parameters if isinstance(parameter, WorkflowParameter)),
+        output_parameters=tuple(parameter for parameter in parameters if isinstance(parameter, OutputParameter)),
+    )
+
+
+async def _select_execution_snapshot(
+    ctx: CopilotContext,
+    requested_labels: Sequence[str],
+) -> CopilotExecutionSnapshot | None:
+    """Select staged bytes or one exact committed version; never combine their declarations."""
+    if ctx.staged_workflow is not None:
+        return _declared_execution_snapshot(ctx.staged_workflow)
+
+    workflow = await app.DATABASE.workflows.get_workflow(
+        workflow_id=ctx.workflow_id,
+        organization_id=ctx.organization_id,
+    )
+    if not _workflow_has_blocks(workflow):
+        prior_draft = await _workflow_from_prior_draft(ctx, list(requested_labels))
+        if prior_draft is not None:
+            return _declared_execution_snapshot(prior_draft)
+    if workflow is None:
+        return None
+
+    workflow_parameters, output_parameters = await asyncio.gather(
+        app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id),
+        app.DATABASE.workflow_params.get_workflow_output_parameters(workflow_id=workflow.workflow_id),
+    )
+    return CopilotExecutionSnapshot(
+        provenance="canonical",
+        workflow=workflow,
+        workflow_parameters=tuple(workflow_parameters),
+        output_parameters=tuple(output_parameters),
+    )
+
+
+def _materialized_execution_snapshot(source: CopilotExecutionSnapshot, workflow: Workflow) -> CopilotExecutionSnapshot:
+    """Replace a staged source with the immutable version returned by normal persistence."""
+    parameters = _workflow_parameters(workflow)
+    return CopilotExecutionSnapshot(
+        provenance=source.provenance,
+        workflow=workflow,
+        workflow_parameters=tuple(parameter for parameter in parameters if isinstance(parameter, WorkflowParameter)),
+        output_parameters=tuple(parameter for parameter in parameters if isinstance(parameter, OutputParameter)),
+    )
 
 
 def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) -> None:
@@ -2239,7 +2322,7 @@ async def _bind_origin_run_redaction_registry(
         artifact_parameters=dict(serialized_artifact_parameters),
     )
     ctx.origin_run_redaction_registry = registry
-    if registry.contains_sensitive_values:
+    if registry.contains_sensitive_values and not register_matching_origin_run_redaction_values(ctx, workflow_run_id):
         register_secret_scrub_values_from_structure(ctx, registry.parameters)
     return registry
 
@@ -2275,8 +2358,7 @@ async def _complete_origin_run_redaction_registry_from_runtime(
         artifact_parameters=artifact_parameters,
     )
     ctx.origin_run_redaction_registry = completed
-    if completed.contains_all_sensitive_values:
-        register_secret_scrub_values_from_structure(ctx, completed.parameters)
+    register_matching_origin_run_redaction_values(ctx, workflow_run_id)
     return completed
 
 
@@ -2343,7 +2425,11 @@ async def acquire_build_test_browser_session(ctx: CopilotContext, *, fresh: bool
     """The single initial-acquisition seam used by every build-test run."""
     if fresh:
         return await ensure_build_test_browser_session(ctx)
-    return await verify_build_test_browser_session_by_attaching(ctx)
+    return await verify_build_test_browser_session_by_attaching(
+        ctx,
+        copilot_chat_id=ctx.workflow_copilot_chat_id,
+        copilot_turn_id=ctx.turn_id,
+    )
 
 
 def _with_build_test_acquisition_context(
@@ -2377,7 +2463,8 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
         workflow_permanent_id=ctx.workflow_permanent_id,
         organization_id=ctx.organization_id,
         workflow_yaml=workflow_yaml,
-        settings_fallback_yaml=ctx.persisted_workflow_yaml,
+        settings_fallback_yaml=ctx.staged_workflow_yaml or ctx.persisted_workflow_yaml,
+        settings_fallback_workflow=ctx.staged_workflow,
     )
     # Checked before anything is staged: a blockless candidate would otherwise replace the good
     # in-memory workflow on its way to returning an error.
@@ -2387,6 +2474,7 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
 
     ctx.staged_workflow = workflow
     ctx.staged_workflow_yaml = workflow_yaml
+    ctx.has_staged_proposal = True
     ctx.workflow_yaml = workflow_yaml
     ctx.last_workflow = workflow
     ctx.last_workflow_yaml = workflow_yaml
@@ -2404,7 +2492,6 @@ async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> di
         labels_to_execute=labels,
         frontier_start_label=labels[0],
         force_fresh_session=True,
-        definition_unpersisted=True,
     )
     recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
     finalized = finalize_build_test_result(
@@ -2553,6 +2640,34 @@ async def _attach_post_run_browser_enrichment(
     return current_url, post_run_page_evidence
 
 
+async def _halt_turn_if_superseded(
+    ctx: CopilotContext,
+    run: WorkflowRun | None,
+    *,
+    workflow_run_id: str,
+) -> None:
+    """A run this turn dispatched that a newer test in the same chat cancelled is not a repairable
+    failure, so the turn drains instead of handing the model a result to retry.
+
+    The run row's reason is the fast path. Copilot's own record is consulted when it does not
+    match, because the superseded run's finalizer can overwrite that reason with its own.
+    """
+    if run is None or workflow_run_id not in ctx.dispatched_run_ids_this_turn:
+        return
+    if run.failure_reason != SUPERSEDED_BY_NEWER_TEST_REASON:
+        # A run that ended without a failure reason was never superseded, so the fallback read is
+        # reserved for the one case that can have lost the marker: a run that ended badly.
+        if not run.failure_reason or not ctx.workflow_copilot_chat_id:
+            return
+        if not await app.DATABASE.workflow_params.build_test_run_was_superseded(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+            workflow_run_id=workflow_run_id,
+        ):
+            return
+    stash_build_test_superseded_halt(ctx, workflow_run_id=workflow_run_id)
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -2561,8 +2676,10 @@ async def _run_blocks_and_collect_debug(
     block_outputs_to_seed: dict[str, Any] | None = None,
     frontier_start_label: str | None = None,
     force_fresh_session: bool = False,
-    definition_unpersisted: bool = False,
 ) -> dict[str, Any]:
+    if ctx.budget_expiry_state.drain_active:
+        return dict(budget_run_denial(ctx.budget_expiry_state))
+
     # Older drafts predate server-owned block associations. Associate their current raw snapshot
     # once before outcome collection without adding anything to model-controlled YAML.
     if not ctx.runner_code_block_associations_by_label:
@@ -2598,26 +2715,10 @@ async def _run_blocks_and_collect_debug(
     # right moment to drop stale outputs. Full success at the end of this
     # function updates verified state in place (overwriting re-run labels).
 
-    # Common-case staging leaves the canonical row stale; prefer the staged copy.
-    workflow = ctx.staged_workflow
-    if workflow is None:
-        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=ctx.workflow_permanent_id,
-            organization_id=ctx.organization_id,
-        )
-    # Only an empty workflow borrows the uncommitted prior draft (ctx.prior_copilot_workflow_yaml);
-    # a populated workflow missing a requested label still reports not-found.
-    resolved_from_prior_draft = False
-    if not _workflow_has_blocks(workflow):
-        prior_draft_workflow = await _workflow_from_prior_draft(ctx, block_labels)
-        if prior_draft_workflow is not None:
-            workflow = prior_draft_workflow
-            resolved_from_prior_draft = True
-    # An in-memory definition the canonical rows never saw: nothing for the parameter-binding
-    # invariant to compare against, and the run needs a persisted snapshot of its own to bind.
-    executes_unpersisted_definition = resolved_from_prior_draft or definition_unpersisted
-    if not workflow:
+    snapshot = await _select_execution_snapshot(ctx, block_labels)
+    if snapshot is None:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
+    workflow = snapshot.workflow
 
     for label in block_labels:
         if not workflow.get_output_parameter(label):
@@ -2744,19 +2845,17 @@ async def _run_blocks_and_collect_debug(
     runtime_frontier_starter_url_seeded = False
 
     user_params: dict[str, Any] = params.get("parameters") or {}
-    persisted_workflow_params, persisted_output_params = await asyncio.gather(
-        app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id),
-        app.DATABASE.workflow_params.get_workflow_output_parameters(workflow_id=workflow.workflow_id),
-    )
 
     # Short-circuit before a wasted workflow execution when the definition
     # JSON has drifted from the persisted parameter rows that runtime reads.
-    # Skipped when the definition was never persisted: its in-memory params differ from the
-    # canonical rows by design, and the run binds against its own snapshot version instead.
     invariant_error = (
         None
-        if executes_unpersisted_definition
-        else _parameter_binding_invariant_error(workflow, persisted_workflow_params, persisted_output_params)
+        if snapshot.provenance == "staged"
+        else _parameter_binding_invariant_error(
+            workflow,
+            list(snapshot.workflow_parameters),
+            list(snapshot.output_parameters),
+        )
     )
     if invariant_error is not None:
         summary, missing_persisted, missing_from_definition = invariant_error
@@ -2873,7 +2972,7 @@ async def _run_blocks_and_collect_debug(
     # The persisted dispatch version (its own regenerated parameter ids) used for post-run output
     # mapping on the dispatch path; runtime_workflow / ctx.staged_workflow is left unmutated.
     dispatch_workflow: Workflow | None = None
-    if dispatch_to_worker or executes_unpersisted_definition:
+    if dispatch_to_worker or snapshot.provenance == "staged" or runtime_workflow != snapshot.workflow:
         # Persist the wrapped runtime workflow as a real new version (with its own parameter /
         # output-parameter rows) through the normal create machinery. The run is then created
         # against this version so the worker resolves it by run.workflow_id and registers block
@@ -2890,7 +2989,7 @@ async def _run_blocks_and_collect_debug(
                 organization_id=ctx.organization_id,
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 dispatch_to_worker=dispatch_to_worker,
-                executes_unpersisted_definition=executes_unpersisted_definition,
+                snapshot_provenance=snapshot.provenance,
                 exc_info=True,
             )
             if dispatch_to_worker:
@@ -2904,19 +3003,10 @@ async def _run_blocks_and_collect_debug(
             }
 
     if dispatch_workflow is not None:
-        all_workflow_params = [
-            parameter
-            for parameter in dispatch_workflow.workflow_definition.parameters
-            if isinstance(parameter, WorkflowParameter)
-        ]
-        all_output_params = [
-            parameter
-            for parameter in dispatch_workflow.workflow_definition.parameters
-            if isinstance(parameter, OutputParameter)
-        ]
-    else:
-        all_workflow_params = persisted_workflow_params
-        all_output_params = persisted_output_params
+        snapshot = _materialized_execution_snapshot(snapshot, dispatch_workflow)
+
+    all_workflow_params = list(snapshot.workflow_parameters)
+    all_output_params = list(snapshot.output_parameters)
 
     ephemeral_input_values = _ephemeral_input_values_by_parameter_key(
         ctx.code_artifact_metadata,
@@ -2952,10 +3042,9 @@ async def _run_blocks_and_collect_debug(
             organization=organization,
             workflow_request=workflow_request,
             template=False,
-            # Dispatched runs pin the exact persisted snapshot version by workflow_id because the
-            # (permanent_id, version) index is non-unique; inline runs use the latest version and
-            # pass the runtime workflow in-process via workflow_override.
-            resolved_workflow_id=dispatch_draft_workflow_id,
+            # Both execution paths pin the exact version. A permanent-id lookup could
+            # select a newer proposal while this run still carries the previous definition.
+            resolved_workflow_id=snapshot.workflow.workflow_id,
             max_steps=None,
             request_id=None,
             # The trigger type (and the -ui queue routing it implies) is a cloud contract; ask the
@@ -2965,6 +3054,8 @@ async def _run_blocks_and_collect_debug(
             copilot_session_id=ctx.workflow_copilot_chat_id,
         )
 
+        ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
+
         # The ordinary Track-A producer owns this registry at run creation. Keeping the run id and
         # serialized values in one immutable carrier prevents a later context from vouching for it.
         origin_registry = await _bind_origin_run_redaction_registry(
@@ -2972,13 +3063,15 @@ async def _run_blocks_and_collect_debug(
             workflow_run_id=workflow_run.workflow_run_id,
             parameter_values=data,
             credential_ids=approval_credential_ids,
-            sensitive_parameter_keys=_sensitive_parameter_keys_requiring_resolved_values(dispatch_workflow or workflow),
+            sensitive_parameter_keys=_sensitive_parameter_keys_requiring_resolved_values(snapshot.workflow),
         )
         if origin_registry.contains_sensitive_values and run_session_id:
             sensitive_run_custody_lock = browser_page_custody_lock(ctx, session_id=run_session_id)
             await sensitive_run_custody_lock.acquire()
             sensitive_run_session_id = run_session_id
-            ctx.sensitive_origin_browser_session_ids.add(run_session_id)
+            record_sensitive_origin_run_taint(
+                ctx, workflow_run_id=workflow_run.workflow_run_id, session_id=run_session_id
+            )
             register_sensitive_origin_run_lease(
                 ctx, workflow_run_id=workflow_run.workflow_run_id, session_id=run_session_id
             )
@@ -3063,7 +3156,7 @@ async def _run_blocks_and_collect_debug(
                     # definition: its blocks carry the persisted output-parameter rows. Executing
                     # the in-memory runtime copy instead registers block outputs against ids that
                     # were never persisted, and every consumer keyed on the definition drops them.
-                    workflow_override=dispatch_workflow or runtime_workflow,
+                    workflow_override=snapshot.workflow if dispatch_workflow is not None else runtime_workflow,
                     requested_completion_contract=requested_completion_contract,
                 )
             )
@@ -3237,6 +3330,12 @@ async def _run_blocks_and_collect_debug(
                         final_status = trusted
                         exit_reason = "success"
 
+            await _halt_turn_if_superseded(
+                ctx,
+                run,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
             if exit_reason != "success":
                 assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
                 error_msg = await _watchdog_error_message(
@@ -3339,9 +3438,18 @@ async def _run_blocks_and_collect_debug(
                 if run_paused:
                     # The inline executor coroutine is what observes the approval and resumes the
                     # run, so it has to outlive this tool call instead of being cancelled.
-                    _DETACHED_CLEANUP_TASKS.add(run_task)
-                    run_task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
-                    run_task.add_done_callback(_log_detached_cleanup_failure)
+                    detached_task = (
+                        asyncio.create_task(
+                            _retire_snapshot_after_execution(
+                                run_task, dispatch_draft_workflow_id, workflow_run.workflow_run_id, ctx.organization_id
+                            )
+                        )
+                        if dispatch_draft_workflow_id is not None
+                        else run_task
+                    )
+                    _DETACHED_CLEANUP_TASKS.add(detached_task)
+                    detached_task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+                    detached_task.add_done_callback(_log_detached_cleanup_failure)
                 else:
                     run_task.cancel()
             # Soft-delete the pinned draft so it never lingers as the latest version. Gated on a final
@@ -3404,7 +3512,7 @@ async def _run_blocks_and_collect_debug(
         if first_failed is not None:
             action_trace_summary = _failure_action_trace_summary(first_failed)
             failing_code_line = _failing_code_line(first_failed.get("action_trace"))
-        failed_block_code = _failed_block_code(workflow, first_failed)
+        failed_block_code = _failed_block_code(snapshot.workflow, first_failed)
 
         # Per-block action_trace is for derivation only — keep it out of the
         # compact packet. get_run_results remains the heavier inspection path.
@@ -3415,6 +3523,7 @@ async def _run_blocks_and_collect_debug(
 
         result_data: dict[str, Any] = {
             "workflow_run_id": workflow_run.workflow_run_id,
+            "workflow_id": snapshot.workflow.workflow_id,
             "browser_session_id": run_session_id,
             "overall_status": final_status,
             "requested_block_labels": list(block_labels),
@@ -3434,7 +3543,7 @@ async def _run_blocks_and_collect_debug(
         if not run_ok and run and getattr(run, "failure_category", None):
             result_data["failure_category"] = run.failure_category
 
-        output_identity_workflow = dispatch_workflow or runtime_workflow
+        output_identity_workflow = snapshot.workflow
         result_data["requested_output_parameter_definitions"] = _requested_output_parameter_definitions(
             workflow_run_id=workflow_run.workflow_run_id,
             workflow=output_identity_workflow,
@@ -3476,7 +3585,7 @@ async def _run_blocks_and_collect_debug(
         current_url, post_run_page_evidence = await _attach_post_run_browser_enrichment(
             ctx,
             result_data,
-            workflow=workflow,
+            workflow=snapshot.workflow,
             workflow_run_id=workflow_run.workflow_run_id,
             run_block_rows=run_block_rows,
             results=results,
@@ -3708,6 +3817,11 @@ async def _get_run_results(
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     if getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
+    await _halt_turn_if_superseded(
+        ctx,
+        run,
+        workflow_run_id=workflow_run_id,
+    )
 
     if run_workflow is None:
         result_data["requested_output_definitions_omission"] = "the run-pinned workflow snapshot was unavailable"
@@ -4136,6 +4250,7 @@ def _record_run_blocks_result(
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
     if isinstance(run_id, str) and run_id:
         copilot_ctx.block_run_calls_this_turn = _runs_this_turn(copilot_ctx) + 1
+        copilot_ctx.dispatched_run_ids_this_turn.add(run_id)
     # ADR-0025: interactive authoring has no post-run adjudicator. Keep the
     # argument temporarily for callers/tests while making it deliberately inert;
     # the unattended page-observation self-heal verifier remains a separate lane.
@@ -4725,10 +4840,18 @@ def _stamp_run_side_connect_failure(copilot_ctx: CopilotContext, result: dict[st
     return build_test_connect_failure_sentence(failure)
 
 
+def _is_budget_run_denial(result: Mapping[str, object]) -> bool:
+    data = result.get("data")
+    return isinstance(data, dict) and data.get("budget_expired") is True and data.get("run_dispatched") is False
+
+
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], _handler_start: float
 ) -> RecordedBuildTestOutcome | None:
     """Record and emit the run fact once; no authoring judge may rewrite it."""
+    if _is_budget_run_denial(result):
+        # A denied dispatch is not a new failed run; retain the last actual run's evidence.
+        return None
     if result.get(_INTERNAL_RUN_OUTCOME_RECORDED_KEY) is True:
         recorded = copilot_ctx.last_run_outcome
     else:
@@ -5230,7 +5353,14 @@ def build_test_evidence_packet(
                 omission_notices.append(
                     "failure.failed_operation.failing_line omitted: no failing code line was recorded for the operation."
                 )
+        failed_output = failed_block.get("output") if failed_block is not None else None
+        failure_page_state = failed_output.get("failure_page_state") if isinstance(failed_output, Mapping) else None
+        if not isinstance(failure_page_state, Mapping):
+            failure_page_state = {}
         failure = BuildTestPacketFailure(
+            final_url=_packet_string(failure_page_state.get("final_url")),
+            page_title=_packet_string(failure_page_state.get("page_title")),
+            covering_element=_packet_string(failure_page_state.get("covering_element")),
             workflow_run_block_id=(
                 _packet_string(failed_block.get("workflow_run_block_id")) if failed_block is not None else None
             ),
@@ -5342,6 +5472,8 @@ def finalize_build_test_result(
     recorded_outcome: RecordedBuildTestOutcome | None = None,
 ) -> dict[str, Any]:
     """Finalize diagnosis state and attach the one shared factual packet."""
+    if _is_budget_run_denial(result):
+        return result
     # Tool seams sometimes deliberately suppress collection and return no recorded outcome.
     # Treat any non-record as absent rather than allowing a test double or failed observer to
     # contaminate the model-facing packet.

@@ -17,6 +17,13 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
     derive_code_block_steps_in_yaml,
 )
+from skyvern.forge.sdk.copilot.workflow_block_traversal import (
+    WorkflowBlockLocation,
+    WorkflowBlockNodeLocation,
+    workflow_block_locations,
+    workflow_block_node_locations,
+    workflow_link_node_mappings,
+)
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
@@ -53,32 +60,17 @@ def runner_code_block_associations(
         parsed = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return {}
-    blocks = _workflow_blocks(parsed)
-    if blocks is None:
+    if not isinstance(parsed, dict):
         return {}
     associations: dict[str, str] = {}
     prior_associations = prior_associations or {}
-
-    def walk(value: object) -> None:
-        if not isinstance(value, list):
-            return
-        for block in value:
-            if not isinstance(block, dict):
-                continue
-            label = block.get("label")
-            if block.get("block_type") == "code" and isinstance(label, str) and label:
-                associations[label] = (
-                    prior_associations[label]
-                    if preserve_existing and label in prior_associations
-                    else f"cba_{uuid4().hex}"
-                )
-            walk(block.get("blocks"))
-            walk(block.get("loop_blocks"))
-            for branch in block.get("branch_conditions", []):
-                if isinstance(branch, dict):
-                    walk(branch.get("blocks"))
-
-    walk(blocks)
+    for location in workflow_block_locations(parsed):
+        block = location.block
+        label = block.get("label")
+        if block.get("block_type") == "code" and isinstance(label, str) and label:
+            associations[label] = (
+                prior_associations[label] if preserve_existing and label in prior_associations else f"cba_{uuid4().hex}"
+            )
     return associations
 
 
@@ -661,6 +653,28 @@ async def _process_workflow_yaml(
                 title = named
                 break
 
+    settings_source = settings_fallback_workflow or current_workflow
+    if settings_source is None and (
+        "cdp_connect_headers" not in workflow_yaml_request.model_fields_set
+        or "max_elapsed_time_minutes" not in workflow_yaml_request.model_fields_set
+    ):
+        try:
+            settings_source = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        except WorkflowNotFound:
+            settings_source = None
+    cdp_connect_headers = workflow_yaml_request.cdp_connect_headers
+    if "cdp_connect_headers" in workflow_yaml_request.model_fields_set:
+        # An empty mapping preserves an explicit clear across later edits and reloads.
+        cdp_connect_headers = cdp_connect_headers or {}
+    elif settings_source is not None:
+        cdp_connect_headers = settings_source.cdp_connect_headers
+    max_elapsed_time_minutes = workflow_yaml_request.max_elapsed_time_minutes
+    if "max_elapsed_time_minutes" not in workflow_yaml_request.model_fields_set and settings_source is not None:
+        max_elapsed_time_minutes = settings_source.max_elapsed_time_minutes
+
     now = datetime.now(timezone.utc)
     return Workflow(
         workflow_id=workflow_id,
@@ -683,8 +697,11 @@ async def _process_workflow_yaml(
         browser_profile_key=workflow_yaml_request.browser_profile_key,
         model=workflow_yaml_request.model,
         max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
+        max_elapsed_time_minutes=max_elapsed_time_minutes,
+        generate_script_on_terminal=workflow_yaml_request.generate_script_on_terminal,
+        status=workflow_yaml_request.status,
         extra_http_headers=workflow_yaml_request.extra_http_headers,
-        cdp_connect_headers=workflow_yaml_request.cdp_connect_headers,
+        cdp_connect_headers=cdp_connect_headers,
         run_with=workflow_yaml_request.run_with,
         ai_fallback=workflow_yaml_request.ai_fallback,
         cache_key=workflow_yaml_request.cache_key,
@@ -719,30 +736,63 @@ def _compose_workflow_yaml(stored_yaml: str) -> Node | None:
         loader.dispose()  # type: ignore[no-untyped-call]
 
 
-def _code_scalar_source(stored_yaml: str, label: str) -> tuple[ScalarNode, int]:
-    """Locate one existing block's code using PyYAML's parser-owned source marks."""
-    root = _compose_workflow_yaml(stored_yaml)
-    workflow_definition_pair = _mapping_node_value(root, "workflow_definition")
-    blocks_pair = _mapping_node_value(workflow_definition_pair[1], "blocks") if workflow_definition_pair else None
-    blocks_node = blocks_pair[1] if blocks_pair else None
-    if not isinstance(blocks_node, SequenceNode):
-        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
-
-    matches: list[MappingNode] = []
-    for block_node in blocks_node.value:
-        label_pair = _mapping_node_value(block_node, "label")
-        if label_pair and isinstance(label_pair[1], ScalarNode) and label_pair[1].value == label:
-            if isinstance(block_node, MappingNode):
-                matches.append(block_node)
+def _node_location_by_label(root: Node | None, label: str) -> WorkflowBlockNodeLocation:
+    locations = workflow_block_node_locations(root)
+    matches = [location for location in locations if _node_label(location.block) == label]
     if not matches:
         raise BlockEditError(f"No block labelled {label!r}.")
     if len(matches) > 1:
-        raise BlockEditError(f"{len(matches)} blocks share the label {label!r}; labels must be unique to edit one.")
+        paths = ", ".join(location.path for location in matches)
+        raise BlockEditError(
+            f"{len(matches)} blocks share the label {label!r}; labels must be unique to edit one. Paths: {paths}."
+        )
+    return matches[0]
 
-    code_pair = _mapping_node_value(matches[0], "code")
+
+def _node_label(block: MappingNode) -> str | None:
+    label_pair = _mapping_node_value(block, "label")
+    label_node = label_pair[1] if label_pair else None
+    return label_node.value if isinstance(label_node, ScalarNode) else None
+
+
+def _code_scalar_source(stored_yaml: str, label: str) -> tuple[Node, ScalarNode, int]:
+    """Locate one existing block's code using PyYAML's parser-owned source marks."""
+    root = _compose_workflow_yaml(stored_yaml)
+    if root is None or not workflow_block_node_locations(root):
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    location = _node_location_by_label(root, label)
+    _require_unaliased_value(root, location.block)
+    code_pair = _mapping_node_value(location.block, "code")
     if code_pair is None or not isinstance(code_pair[1], ScalarNode):
         raise BlockEditError(f"Block {label!r} has no code to edit.")
-    return code_pair[1], code_pair[0].start_mark.column + 2
+    return root, code_pair[1], int(code_pair[0].start_mark.column) + 2
+
+
+def _node_reference_count(root: Node, target: Node) -> int:
+    counts: dict[int, int] = {id(root): 1}
+    stack = [root]
+    expanded: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in expanded:
+            continue
+        expanded.add(id(node))
+        children = (
+            [child for pair in node.value for child in pair]
+            if isinstance(node, MappingNode)
+            else list(node.value)
+            if isinstance(node, SequenceNode)
+            else []
+        )
+        for child in children:
+            counts[id(child)] = counts.get(id(child), 0) + 1
+            stack.append(child)
+    return counts.get(id(target), 0)
+
+
+def _require_unaliased_value(root: Node, value_node: Node) -> None:
+    if _node_reference_count(root, value_node) > 1:
+        raise BlockEditError("This field is used by a YAML alias and cannot be edited without changing another field.")
 
 
 def _render_code_scalar(code: str, *, content_indent: int, source_style: str | None) -> str:
@@ -759,7 +809,7 @@ def _render_code_scalar(code: str, *, content_indent: int, source_style: str | N
     chomp = "+" if trailing_newlines > 1 else "" if trailing_newlines == 1 else "-"
     first_nonempty = next((line for line in code.splitlines() if line), "")
     indentation_indicator = "2" if first_nonempty[:1].isspace() else ""
-    indicator = f"|{indentation_indicator}{chomp}"
+    indicator = f"{source_style}{indentation_indicator}{chomp}"
     indentation = " " * content_indent
     body = "".join(f"{indentation}{line}" for line in code.splitlines(keepends=True))
     if not code.endswith("\n"):
@@ -768,12 +818,48 @@ def _render_code_scalar(code: str, *, content_indent: int, source_style: str | N
 
 
 def _replace_code_scalar_source(stored_yaml: str, label: str, code: str) -> str:
-    scalar, content_indent = _code_scalar_source(stored_yaml, label)
-    replacement = _render_code_scalar(code, content_indent=content_indent, source_style=scalar.style)
+    root, scalar, content_indent = _code_scalar_source(stored_yaml, label)
+    _require_unaliased_value(root, scalar)
+    replacement = _render_code_scalar_replacement(stored_yaml, scalar, code, content_indent)
     return stored_yaml[: scalar.start_mark.index] + replacement + stored_yaml[scalar.end_mark.index :]
 
 
-def _workflow_blocks(parsed: Any) -> list[Any] | None:
+def _render_code_scalar_replacement(stored_yaml: str, scalar: ScalarNode, code: str, content_indent: int) -> str:
+    source_style = "|" if scalar.style == ">" and "\n" in code.rstrip("\n") else scalar.style
+    replacement = _render_code_scalar(code, content_indent=content_indent, source_style=source_style)
+    header_preserved = False
+    if scalar.style in {"|", ">"} and source_style == scalar.style and code:
+        current_trailing_newlines = len(scalar.value) - len(scalar.value.rstrip("\n"))
+        replacement_trailing_newlines = len(code) - len(code.rstrip("\n"))
+        current_first_nonempty = next((line for line in scalar.value.splitlines() if line), "")
+        replacement_first_nonempty = next((line for line in code.splitlines() if line), "")
+        indentation_shape_unchanged = current_first_nonempty[:1].isspace() == replacement_first_nonempty[:1].isspace()
+        source = stored_yaml[scalar.start_mark.index : scalar.end_mark.index]
+        source_header_end = source.find("\n")
+        replacement_header_end = replacement.find("\n")
+        if (
+            current_trailing_newlines == replacement_trailing_newlines
+            and indentation_shape_unchanged
+            and min(source_header_end, replacement_header_end) >= 0
+        ):
+            replacement = source[: source_header_end + 1] + replacement[replacement_header_end + 1 :]
+            header_preserved = True
+    if scalar.style in {"|", ">"} and not header_preserved:
+        source = stored_yaml[scalar.start_mark.index : scalar.end_mark.index]
+        source_header_end = source.find("\n")
+        replacement_header_end = replacement.find("\n")
+        if min(source_header_end, replacement_header_end) >= 0:
+            source_header = source[:source_header_end]
+            replacement_header = replacement[:replacement_header_end]
+            style_index = source_header.find(scalar.style)
+            comment_index = source_header.find("#", style_index + 1)
+            metadata_prefix = source_header[:style_index] if style_index >= 0 else ""
+            comment_suffix = source_header[comment_index - 1 :] if comment_index > 0 else ""
+            replacement = metadata_prefix + replacement_header + comment_suffix + replacement[replacement_header_end:]
+    return replacement
+
+
+def _top_level_workflow_blocks(parsed: Any) -> list[Any] | None:
     if not isinstance(parsed, dict):
         return None
     definition = parsed.get("workflow_definition")
@@ -783,14 +869,179 @@ def _workflow_blocks(parsed: Any) -> list[Any] | None:
     return blocks if isinstance(blocks, list) else None
 
 
-def _block_by_label(blocks: list[Any], label: str) -> dict[str, Any]:
-    matches = [b for b in blocks if isinstance(b, dict) and str(b.get("label") or "") == label]
+def _block_by_label(parsed: dict[str, Any], label: str) -> WorkflowBlockLocation:
+    locations = workflow_block_locations(parsed)
+    matches = [location for location in locations if str(location.block.get("label") or "") == label]
     if not matches:
-        known = ", ".join(sorted(str(b.get("label") or "") for b in blocks if isinstance(b, dict)))
+        known = ", ".join(sorted(str(location.block.get("label") or "") for location in locations))
         raise BlockEditError(f"No block labelled {label!r}. The workflow has: {known or '(no labelled blocks)'}.")
     if len(matches) > 1:
-        raise BlockEditError(f"{len(matches)} blocks share the label {label!r}; labels must be unique to edit one.")
+        paths = ", ".join(location.path for location in matches)
+        raise BlockEditError(
+            f"{len(matches)} blocks share the label {label!r}; labels must be unique to edit one. Paths: {paths}."
+        )
     return matches[0]
+
+
+def _top_level_block_by_label(blocks: list[Any], label: str) -> dict[str, Any]:
+    matches = [block for block in blocks if isinstance(block, dict) and str(block.get("label") or "") == label]
+    if not matches:
+        known = ", ".join(sorted(str(block.get("label") or "") for block in blocks if isinstance(block, dict)))
+        raise BlockEditError(
+            f"No top-level block labelled {label!r}. The workflow has these top-level blocks: "
+            f"{known or '(no labelled blocks)'}."
+        )
+    if len(matches) > 1:
+        raise BlockEditError(f"{len(matches)} top-level blocks share the label {label!r}; labels must be unique.")
+    return matches[0]
+
+
+def _render_flow_yaml_value(value: Any) -> str:
+    rendered = yaml.safe_dump(
+        value,
+        allow_unicode=True,
+        default_flow_style=True,
+        sort_keys=False,
+        width=_YAML_NO_FOLD_WIDTH,
+    )
+    return rendered.removesuffix("\n...\n").removesuffix("\n")
+
+
+def _apply_source_edits(stored_yaml: str, edits: list[tuple[int, int, str]]) -> str:
+    result = stored_yaml
+    previous_start = len(stored_yaml) + 1
+    for start, end, replacement in sorted(edits, reverse=True):
+        if start < 0 or end < start or end > len(stored_yaml) or end > previous_start:
+            raise BlockEditError("The requested block mutations overlap in the stored YAML.")
+        result = result[:start] + replacement + result[end:]
+        previous_start = start
+    return result
+
+
+def _mapping_append_index(stored_yaml: str, block_node: MappingNode) -> int:
+    if not block_node.value:
+        return block_node.end_mark.index
+    block_end = block_node.end_mark.index
+    lower_bound = block_end if block_end == len(stored_yaml) else stored_yaml.rfind("\n", 0, block_end) + 1
+    return max(lower_bound, _node_content_line_end(stored_yaml, block_node.value[-1][1]))
+
+
+def _render_inserted_fields(fields: dict[str, Any], indent: int) -> str:
+    rendered = yaml.safe_dump(fields, allow_unicode=True, sort_keys=False, width=_YAML_NO_FOLD_WIDTH)
+    indentation = " " * indent
+    return "".join(f"{indentation}{line}" for line in rendered.splitlines(keepends=True))
+
+
+def _render_node_replacement(stored_yaml: str, value_node: Node, value: Any, minimum_indent: int) -> str:
+    replacement = " " * max(0, minimum_indent - value_node.start_mark.column) + _render_flow_yaml_value(value)
+    is_multiline_block_value = isinstance(value_node, (MappingNode, SequenceNode)) or (
+        isinstance(value_node, ScalarNode) and value_node.style in {"|", ">"}
+    )
+    if not is_multiline_block_value or value_node.end_mark.line == value_node.start_mark.line:
+        return replacement
+    if value_node.end_mark.column:
+        return f"{replacement}\n{' ' * value_node.end_mark.column}"
+    source = stored_yaml[value_node.start_mark.index : value_node.end_mark.index]
+    return replacement + ("\n" if source[-1:] == "\n" else "")
+
+
+def _replace_block_fields_source(stored_yaml: str, label: str, fields: dict[str, Any]) -> str:
+    root = _compose_workflow_yaml(stored_yaml)
+    if root is None:
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    location = _node_location_by_label(root, label)
+    _require_unaliased_value(root, location.block)
+    edits: list[tuple[int, int, str]] = []
+    inserted: dict[str, Any] = {}
+    for key, value in fields.items():
+        pair = _mapping_node_value(location.block, key)
+        if pair is None:
+            inserted[key] = value
+            continue
+        key_node, value_node = pair
+        _require_unaliased_value(root, value_node)
+        replacement = (
+            _render_code_scalar_replacement(stored_yaml, value_node, value, key_node.start_mark.column + 2)
+            if key == "code" and isinstance(value, str) and isinstance(value_node, ScalarNode)
+            else _render_node_replacement(stored_yaml, value_node, value, key_node.start_mark.column + 2)
+        )
+        edits.append((value_node.start_mark.index, value_node.end_mark.index, replacement))
+
+    if inserted:
+        if location.block.flow_style:
+            suffix = ", " if location.block.value else ""
+            rendered = _render_flow_yaml_value(inserted)
+            edits.append(
+                (location.block.end_mark.index - 1, location.block.end_mark.index - 1, suffix + rendered[1:-1])
+            )
+        else:
+            indent = location.block.value[0][0].start_mark.column
+            insertion = _mapping_append_index(stored_yaml, location.block)
+            prefix = "" if insertion == 0 or stored_yaml[insertion - 1 : insertion] == "\n" else "\n"
+            edits.append((insertion, insertion, prefix + _render_inserted_fields(inserted, indent)))
+    return _apply_source_edits(stored_yaml, edits)
+
+
+def _sequence_item_source_span(
+    stored_yaml: str, location: WorkflowBlockNodeLocation, value_indent: int
+) -> tuple[int, int, str]:
+    owner = location.owner
+    if owner.flow_style:
+        if len(owner.value) == 1:
+            return owner.start_mark.index, owner.end_mark.index, "[]"
+        if location.index < len(owner.value) - 1:
+            return location.block.start_mark.index, owner.value[location.index + 1].start_mark.index, ""
+        previous = owner.value[location.index - 1]
+        return previous.end_mark.index, location.block.end_mark.index, ""
+    if len(owner.value) == 1:
+        end = _node_content_line_end(stored_yaml, location.block)
+        trailing_newline = "\n" if end > owner.start_mark.index and stored_yaml[end - 1 : end] == "\n" else ""
+        return owner.start_mark.index, end, f"{' ' * (value_indent - owner.start_mark.column)}[]{trailing_newline}"
+    start = stored_yaml.rfind("\n", 0, location.block.start_mark.index) + 1
+    end = _node_content_line_end(stored_yaml, location.block)
+    return start, end, ""
+
+
+def _node_content_line_end(stored_yaml: str, node: Node) -> int:
+    if isinstance(node, MappingNode) and node.value:
+        return _node_content_line_end(stored_yaml, node.value[-1][1])
+    if isinstance(node, SequenceNode) and node.value:
+        return _node_content_line_end(stored_yaml, node.value[-1])
+    end = node.end_mark.index
+    if isinstance(node, ScalarNode) and node.style in {"|", ">"} and node.end_mark.column:
+        end = stored_yaml.rfind("\n", 0, end) + 1
+    if end > 0 and stored_yaml[end - 1 : end] == "\n":
+        return end
+    newline = stored_yaml.find("\n", end)
+    return newline + 1 if newline >= 0 else len(stored_yaml)
+
+
+def _unique_nodes(root: Node) -> list[Node]:
+    nodes: list[Node] = []
+    stack = [root]
+    visited: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        nodes.append(node)
+        if isinstance(node, MappingNode):
+            stack.extend(child for pair in node.value for child in pair)
+        elif isinstance(node, SequenceNode):
+            stack.extend(node.value)
+    return nodes
+
+
+def _sequence_value_indent(root: Node, sequence: SequenceNode) -> int:
+    nodes = _unique_nodes(root)
+    for node in nodes:
+        if not isinstance(node, MappingNode):
+            continue
+        for key_node, value_node in node.value:
+            if value_node is sequence:
+                return max(int(sequence.start_mark.column), int(key_node.start_mark.column) + 2)
+    return int(sequence.start_mark.column)
 
 
 def stored_workflow_yaml(copilot_ctx: Any) -> str:
@@ -814,11 +1065,10 @@ def stored_block_code(stored_yaml: str, label: str) -> str | None:
         parsed = safe_load_no_dates(stored_yaml)
     except Exception:
         return None
-    blocks = _workflow_blocks(parsed)
-    if blocks is None:
+    if not isinstance(parsed, dict):
         return None
     try:
-        block = _block_by_label(blocks, label)
+        block = _block_by_label(parsed, label).block
     except BlockEditError:
         return None
     code = block.get("code")
@@ -842,10 +1092,9 @@ def apply_block_edit(
         parsed = safe_load_no_dates(stored_yaml)
     except Exception as exc:
         raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
-    blocks = _workflow_blocks(parsed)
-    if blocks is None:
+    if not isinstance(parsed, dict) or _top_level_workflow_blocks(parsed) is None:
         raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
-    block = _block_by_label(blocks, label)
+    block = _block_by_label(parsed, label).block
 
     edited_code: str | None = None
     if expected_code is not None or replacement_code is not None:
@@ -867,14 +1116,13 @@ def apply_block_edit(
                 f"surrounding lines to identify one occurrence. Its code is now:\n{current}"
             )
         edited_code = current.replace(expected_code, replacement_code, 1)
-        block["code"] = edited_code
-
-    for key, value in (fields or {}).items():
-        block[key] = value
 
     if edited_code is not None and not fields:
         return _replace_code_scalar_source(stored_yaml, label, edited_code)
-    return yaml.safe_dump(parsed, sort_keys=False)
+    mutations = dict(fields or {})
+    if edited_code is not None and "code" not in mutations:
+        mutations["code"] = edited_code
+    return _replace_block_fields_source(stored_yaml, label, mutations)
 
 
 def _merge_new_workflow_parameters(parsed: dict[str, Any], parameters: list[Any]) -> None:
@@ -913,10 +1161,10 @@ def add_block_to_workflow(
         parsed = safe_load_no_dates(stored_yaml)
     except Exception as exc:
         raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
-    blocks = _workflow_blocks(parsed)
+    blocks = _top_level_workflow_blocks(parsed)
     if blocks is None:
         raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
-    predecessor = _block_by_label(blocks, after_label)
+    predecessor = _top_level_block_by_label(blocks, after_label)
 
     try:
         new_block = safe_load_no_dates(block_yaml)
@@ -927,7 +1175,7 @@ def add_block_to_workflow(
     new_label = str(new_block.get("label") or "")
     if not new_label:
         raise BlockEditError("The new block needs a label.")
-    known = sorted(str(b.get("label") or "") for b in blocks if isinstance(b, dict))
+    known = sorted(str(location.block.get("label") or "") for location in workflow_block_locations(parsed))
     if new_label in known:
         raise BlockEditError(
             f"A block labelled {new_label!r} already exists. The workflow has: {', '.join(known)}. "
@@ -953,13 +1201,36 @@ def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
         parsed = safe_load_no_dates(stored_yaml)
     except Exception as exc:
         raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
-    blocks = _workflow_blocks(parsed)
-    if blocks is None:
+    if not isinstance(parsed, dict) or _top_level_workflow_blocks(parsed) is None:
         raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
-    _block_by_label(blocks, label)
-    remaining = [b for b in blocks if not (isinstance(b, dict) and str(b.get("label") or "") == label)]
-    for other in remaining:
-        if isinstance(other, dict) and other.get("next_block_label") == label:
-            other["next_block_label"] = None
-    parsed["workflow_definition"]["blocks"] = remaining
-    return yaml.safe_dump(parsed, sort_keys=False)
+    _block_by_label(parsed, label)
+
+    root = _compose_workflow_yaml(stored_yaml)
+    if root is None:
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    target = _node_location_by_label(root, label)
+    _require_unaliased_value(root, target.block)
+    _require_unaliased_value(root, target.owner)
+    target_start, target_end, replacement = _sequence_item_source_span(
+        stored_yaml, target, _sequence_value_indent(root, target.owner)
+    )
+    for node in _unique_nodes(root):
+        if target_start <= node.start_mark.index and node.end_mark.index <= target_end:
+            _require_unaliased_value(root, node)
+    edits = [(target_start, target_end, replacement)]
+    seen_pointer_spans: set[tuple[int, int]] = set()
+    for mapping in workflow_link_node_mappings(root):
+        pointer_pair = _mapping_node_value(mapping, "next_block_label")
+        pointer = pointer_pair[1] if pointer_pair else None
+        if not isinstance(pointer, ScalarNode) or pointer.value != label:
+            continue
+        if target_start <= pointer.start_mark.index and pointer.end_mark.index <= target_end:
+            continue
+        span = (pointer.start_mark.index, pointer.end_mark.index)
+        if span in seen_pointer_spans:
+            continue
+        _require_unaliased_value(root, mapping)
+        _require_unaliased_value(root, pointer)
+        seen_pointer_spans.add(span)
+        edits.append((pointer.start_mark.index, pointer.end_mark.index, "null"))
+    return _apply_source_edits(stored_yaml, edits)

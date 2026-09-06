@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 
@@ -17,13 +17,17 @@ from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata, CopilotEvalMode
+from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
+from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url
 from skyvern.forge.sdk.copilot.google_connection_notice import (
     GoogleConnectionNotice,
     GoogleConnectionNoticePayload,
     GoogleSheetConnectionBinding,
 )
+from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
@@ -120,6 +124,14 @@ class NarrativeTurnFacts(TypedDict):
     ranCleanOnCurrentSource: bool
 
 
+class NarrativeBudgetExpiry(TypedDict):
+    budgetExpired: Literal[True]
+    source: Literal["deadline", "max_turns"]
+    reportProduced: bool | None
+    stagedDraftId: str | None
+    drainFingerprint: str | None
+
+
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
@@ -130,6 +142,7 @@ class TurnNarrativePayload(TypedDict):
     # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     terminalEnvelope: NotRequired[dict[str, Any]]
+    questionInteractions: NotRequired[list[dict[str, Any]]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
@@ -153,6 +166,7 @@ class TurnNarrativePayload(TypedDict):
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
     testedBlockFingerprints: NotRequired[dict[str, list[str]]]
+    budgetExpiry: NotRequired[NarrativeBudgetExpiry]
     turnFacts: NotRequired[NarrativeTurnFacts]
 
 
@@ -190,6 +204,21 @@ class CredentialCheck(BaseModel):
 
 class ApprovedCredential(BaseModel):
     credential_id: str
+    # Set only for an approval minted from a carried proposal, whose reach stays the page that
+    # vouched for it. Empty for a credential the user named, which never carried an origin.
+    admitted_url: str = ""
+
+
+ProposedCredentialOrigin = Literal["live_page_admitted", "executed_credential_fill"]
+
+
+class ProposedCredential(BaseModel):
+    credential_id: str
+    admitted_url: str = ""
+    origin_arm: ProposedCredentialOrigin | None = None
+    # How many later asks this proposal has already survived. The renewal cannot tell an ask about
+    # this credential from an ask about anything else, so the count is what bounds it.
+    carries: int = 0
 
 
 class ObservedPage(BaseModel):
@@ -324,6 +353,9 @@ class StructuredContext(BaseModel):
     # Google connections the user picked from the account card. Separate from approved_credentials
     # because connections never enter resolved_credentials, which is ADR 0002's password-fill plane.
     approved_connections: list[ApprovedCredential] = Field(default_factory=list)
+    # The credential the server itself resolved on a turn that ended by asking the user about it,
+    # rewritten unconditionally at every turn end so it never outlives the turn after the ask.
+    proposed_credential: ProposedCredential | None = None
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
     page_inspection_calls_made: int = 0
@@ -635,6 +667,10 @@ def finalize_observation_context(ctx: Any, raw_context: str | None) -> str | Non
 
 
 _MAX_APPROVED_CREDENTIALS = 20
+# Copilot re-asks about the same credential a handful of times before the user answers — the
+# production chat this carry was built for asked four. Past that the conversation has moved on,
+# whatever the turns are shaped like.
+_MAX_PROPOSAL_CARRIES = 5
 
 
 def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
@@ -661,16 +697,188 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     for credential in policy.resolved_credentials:
         # A credential the user picked from the card is durable approval even though the resume
         # stamped an origin for it; only page-vouched ids have to be re-earned.
+        # A stamp the carry restored is not page evidence the user has to re-earn: without this a
+        # user who answers by naming the credential gets no durable approval, which is the re-ask
+        # loop this amendment exists to end. A stamp a live page wrote this turn still counts.
+        settled_ids = policy.current_turn_named_credential_ids
+        # Read at turn end, when what the user settled is final: a card pick or a typed name landing
+        # after the citation is still them answering this ask by choosing a different credential.
+        carry_stamp_the_user_answered = (
+            credential.credential_id in policy.seeded_proposal_credential_ids
+            and credential.credential_id in policy.carry_cited_credential_ids
+            and not (settled_ids and credential.credential_id not in settled_ids)
+        )
         stamped_by_page = (
             credential.credential_id in policy.live_page_admitted_urls
             and credential.credential_id != ctx.credential_pause_connected_credential_id
+            and not carry_stamp_the_user_answered
         )
         if credential.credential_id in existing_ids or stamped_by_page:
             continue
-        sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
+        # An approval minted from a carry keeps the origin that vouched for the credential. Without
+        # it the id is resolved on every later turn with nothing pinning it, and the fill seam's
+        # user-provided-site route then reaches any site named anywhere in the conversation.
+        sc.approved_credentials.append(
+            ApprovedCredential(
+                credential_id=credential.credential_id,
+                admitted_url=(
+                    policy.live_page_admitted_urls.get(credential.credential_id, "")
+                    if carry_stamp_the_user_answered
+                    else ""
+                ),
+            )
+        )
         existing_ids.add(credential.credential_id)
     if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
         sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
+    return sc.to_json_str()
+
+
+def _live_page_admitted_proposal(policy: RequestPolicy) -> ProposedCredential | None:
+    """The credential a login page admitted on this turn, when it admitted exactly one.
+
+    An id the carry itself seeded is not evidence: hydration restores the same two fields a fresh
+    admission writes, so counting it here would re-mint the carry from its own state every turn.
+    """
+    # Count only what a page admitted this turn. Hydration appends the carry to the same list, so
+    # counting it would bail whenever a page freshly admits a second credential — dropping the new
+    # one and renewing the stale carry, on the turn copilot found a different login.
+    admitted_this_turn = [
+        credential
+        for credential in policy.auto_bound_credentials
+        if credential.credential_id not in policy.seeded_proposal_credential_ids
+    ]
+    if len(admitted_this_turn) != 1:
+        return None
+    credential_id = admitted_this_turn[0].credential_id
+    admitted_url = policy.live_page_admitted_urls.get(credential_id) or ""
+    if not admitted_url:
+        return None
+    return ProposedCredential(
+        credential_id=credential_id,
+        admitted_url=safe_admitted_url(admitted_url),
+        origin_arm="live_page_admitted",
+    )
+
+
+def _carried_proposal_still_unanswered(policy: RequestPolicy, sc: StructuredContext) -> ProposedCredential | None:
+    """The carry from an earlier turn, kept while the ask it was recorded for is still outstanding.
+
+    Copilot asks about the same credential across several turns before the user answers, so a carry
+    that died on the first re-ask would restore the loop this exists to end. The carry retires the
+    moment the answer lands: an answered proposal is durable approval, and a turn that settles a
+    different credential is the user declining this one. A turn that does not end by asking clears
+    it, since the recorder only reaches here on an ask.
+    """
+    seed = sc.proposed_credential
+    if seed is None or seed.credential_id not in policy.seeded_proposal_credential_ids:
+        return None
+    return seed
+
+
+def _executed_credential_fill_proposal(ctx: CopilotContext) -> ProposedCredential | None:
+    """The credential the server itself filled this turn, when the turn ran exactly one such fill.
+
+    Read from this turn's own trajectory, never the persisted record: ``_merge_carried_trajectory``
+    keeps earlier turns' entries verbatim and unmarked, so a filter over the merged list would match
+    every historical fill and re-derive the carry forever. ``credentials_checked`` is not a source
+    either — a vault lookup by name has no page behind it, so it leaves no origin to restore.
+    """
+    raw_trajectory = getattr(ctx, "scout_trajectory", None)
+    trajectory = raw_trajectory if isinstance(raw_trajectory, Sequence) else ()
+    fills = [
+        entry
+        for entry in trajectory
+        if isinstance(entry, Mapping)
+        and entry.get("carried") is not True
+        and entry.get("tool_name") == CREDENTIAL_FILL_TOOL_NAME
+        and isinstance(entry.get("credential_id"), str)
+        and entry.get("credential_id")
+        and isinstance(entry.get("executed_selector"), str)
+        and entry.get("executed_selector")
+        and isinstance(entry.get("source_url"), str)
+        and entry.get("source_url")
+    ]
+    if len({str(entry["credential_id"]) for entry in fills}) != 1:
+        return None
+    return ProposedCredential(
+        credential_id=str(fills[-1]["credential_id"]),
+        admitted_url=safe_admitted_url(str(fills[-1]["source_url"])),
+        origin_arm="executed_credential_fill",
+    )
+
+
+def _proposal_that_survives_this_turn(
+    proposed: ProposedCredential, policy: RequestPolicy, sc: StructuredContext
+) -> ProposedCredential | None:
+    """Apply the retirement rules to whichever arm produced the proposal.
+
+    Held here rather than in the arms because each arm otherwise enforces its own subset: a turn that
+    ran a fill would mint a fresh record every time, resetting the count and outliving both the
+    answer and a different credential the user settled — the login-retry loop the fill arm exists for
+    is exactly where that ran forever.
+    """
+    if proposed.credential_id in policy.carry_cited_credential_ids:
+        return None
+    settled_ids = policy.current_turn_named_credential_ids
+    if settled_ids and proposed.credential_id not in settled_ids:
+        return None
+    prior = sc.proposed_credential
+    # Fresh evidence for a credential the user still has not answered for is the same unanswered ask,
+    # so the count follows the credential rather than the arm that produced this turn's record.
+    carries = prior.carries + 1 if prior is not None and prior.credential_id == proposed.credential_id else 0
+    if carries >= _MAX_PROPOSAL_CARRIES:
+        return None
+    return proposed.model_copy(update={"carries": carries})
+
+
+def record_proposed_credential_in_global_llm_context(
+    ctx: CopilotContext, raw_context: str | None, response_type: str
+) -> str | None:
+    """Carry the credential the server itself bound or filled, when the turn ends by asking the user,
+    so the next turn can verify a model citation against it. The write is unconditional in both
+    directions, so any turn reaching here expires an older record.
+    """
+    policy = ctx.request_policy
+    sc = StructuredContext.from_json_str(raw_context)
+    proposed: ProposedCredential | None = None
+    if policy is not None and response_type == "ASK_QUESTION":
+        proposed = (
+            _live_page_admitted_proposal(policy)
+            or _executed_credential_fill_proposal(ctx)
+            or _carried_proposal_still_unanswered(policy, sc)
+        )
+        if proposed is not None:
+            proposed = _proposal_that_survives_this_turn(proposed, policy, sc)
+        # The card settles its own id within the turn, so a card answer never needs the carry — and
+        # a card answer naming a different credential retires the proposal it replaced.
+        if proposed is not None and ctx.credential_pause_connected_credential_id is not None:
+            proposed = None
+    if proposed is None:
+        return clear_proposed_credential(raw_context)
+    LOG.info(
+        "copilot_credential_proposal_recorded",
+        credential_id=proposed.credential_id,
+        origin_arm=proposed.origin_arm,
+        admitted_url=loggable_origin(proposed.admitted_url),
+    )
+    if sc.proposed_credential == proposed:
+        return raw_context
+    sc.proposed_credential = proposed
+    return sc.to_json_str()
+
+
+def clear_proposed_credential(raw_context: str | None) -> str | None:
+    """Drop the one-turn credential proposal from a context a turn is about to persist. Every path
+    that persists without running the recorder above must call this, or the proposal outlives its
+    turn and re-grants fill authority later.
+    """
+    if raw_context is None:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    if sc.proposed_credential is None:
+        return raw_context
+    sc.proposed_credential = None
     return sc.to_json_str()
 
 
@@ -700,6 +908,7 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
         structured = StructuredContext.from_json_str(model_raw)
     structured.approved_credentials = list(trusted.approved_credentials)
     structured.approved_connections = list(trusted.approved_connections)
+    structured.proposed_credential = trusted.proposed_credential
     structured.carried_trajectory = [dict(entry) for entry in trusted.carried_trajectory]
     return structured
 
@@ -731,6 +940,7 @@ class AgentResult:
     # AgentResult, never the context that recorded them. None when unknown.
     cancellation_iteration: int | None = None
     cancellation_last_recorded_phase: str | None = None
+    cancellation_workflow_run_id: str | None = None
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
@@ -746,8 +956,8 @@ class AgentResult:
     has_staged_proposal: bool = False
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
-    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
-    # settings changes); terminal handlers roll back on non-auto-accept.
+    # Legacy marker for turns that wrote canonical before snapshot isolation.
+    # Terminal handlers retain rollback support for those persisted turns.
     canonical_was_persisted_due_to_param_change: bool = False
     # Exact model-owned contract deletion must survive to the auto-accept write; ordinary saves
     # still preserve a stored contract when their rebuilt definition omits this Copilot field.
@@ -786,6 +996,9 @@ class CopilotContext(AgentContext):
     """
 
     workflow_copilot_chat_id: str | None = None
+    copilot_cancel_token: str | None = None
+    copilot_question_pause_seconds: float = 0.0
+    human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None
     eval_mode: CopilotEvalMode | None = None
     eval_prompt_sha256: str | None = None
@@ -803,7 +1016,10 @@ class CopilotContext(AgentContext):
     copilot_total_timeout_exceeded: bool = False
     copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
+    budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
+    check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0
+    tool_calls_this_turn: int = 0
     enforcement_pass_count: int = 0
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     user_message: str = ""
@@ -903,6 +1119,9 @@ class CopilotContext(AgentContext):
     # after a watchdog reconciliation read has cleared the retry guard.
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
+    # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
+    # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
+    dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None
@@ -989,8 +1208,8 @@ class CopilotContext(AgentContext):
     auto_accept: bool | None = None
     # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
     prior_copilot_workflow_yaml: str | None = None
-    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
-    # settings changes); terminal handlers roll back on non-auto-accept.
+    # Legacy marker for turns that wrote canonical before snapshot isolation.
+    # Terminal handlers retain rollback support for those persisted turns.
     canonical_was_persisted_due_to_param_change: bool = False
     clear_persisted_completion_contract: bool = False
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None

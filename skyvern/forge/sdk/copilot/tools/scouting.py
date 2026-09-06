@@ -68,6 +68,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     current_call_browser_session_override,
     effective_browser_session_id,
     resolve_browser_state_for_context,
+    sensitive_origin_page_facts_withheld,
     sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -76,6 +77,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     screenshot_result_facts,
     stage_screenshot_from_artifact,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -439,6 +441,9 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
             )
         except Exception:
             result = None
+    # Held raw in this turn's pending stash: the record-time scrub compares the raw identity to its
+    # scrubbed form to decide whether a locator was rewritten, and a packet scrubbed here would
+    # defeat that comparison.
     packet = (result.get("data") or {}).get("result") if isinstance(result, dict) and result.get("ok") else None
     if not isinstance(packet, dict):
         LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
@@ -733,6 +738,44 @@ def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: st
     return observed_hidden, observed_disabled
 
 
+# Every field the synthesizer can build a locator from: selectors, the role/name pair it falls
+# back to, and the element fingerprint that identifies the element across equivalent selectors.
+_RETAINED_LOCATOR_IDENTITY_FIELDS = (
+    "selector",
+    "executed_selector",
+    "selector_candidates",
+    "role",
+    "accessible_name",
+    "element_fingerprint_id",
+    "element_fingerprint_name",
+    "element_fingerprint_type",
+    "element_fingerprint_placeholder",
+    "element_fingerprint_label",
+    "element_fingerprint_test_id",
+    "element_fingerprint_tag",
+    "element_fingerprint_probed",
+)
+
+
+def _scrub_retained_interaction(ctx: AgentContext, artifact: Any) -> Any:
+    """Scrub a retained interaction with every registered value; if the scrub rewrote any locator
+    identity, drop the whole identity rather than keep it. A placeholder inside a selector, a
+    role/name, or a fingerprint is a dead locator that would fail a later run silently, and the
+    secret it replaced must not survive into the next turn. The identity is dropped as a set so the
+    synthesizer cannot rebuild the dead locator from a sibling field."""
+    scrubbed = scrub_secrets_from_structure(ctx, artifact)
+    if not isinstance(artifact, dict) or not isinstance(scrubbed, dict):
+        return scrubbed
+    rewritten = any(
+        field_name in scrubbed and scrubbed[field_name] != artifact.get(field_name)
+        for field_name in _RETAINED_LOCATOR_IDENTITY_FIELDS
+    )
+    if rewritten:
+        for field_name in _RETAINED_LOCATOR_IDENTITY_FIELDS:
+            scrubbed.pop(field_name, None)
+    return scrubbed
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -871,7 +914,7 @@ def _record_scouted_interaction(
         artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
-    redacted_artifact = _redact_codeblock_value(ctx, artifact)
+    redacted_artifact = _scrub_retained_interaction(ctx, _redact_codeblock_value(ctx, artifact))
     if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
         return
     artifact = cast(ScoutedInteraction, redacted_artifact)
@@ -1202,13 +1245,18 @@ async def _register_scout_interaction_observation(
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
-    if sensitive_origin_page_is_tainted(ctx):
+    origin_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    if sensitive_origin_page_facts_withheld(ctx, origin_run_id):
         return None, None
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
-    redacted_identity = _redact_codeblock_value(ctx, {"selector": selector, "source_url": source_url, "url": url})
+    identity = {"selector": selector, "source_url": source_url, "url": url}
+    redacted_identity = scrub_secrets_from_structure(ctx, _redact_codeblock_value(ctx, identity))
     if not isinstance(redacted_identity, dict):
+        return None, None
+    if redacted_identity.get("selector") != selector:
+        # A selector the scrub rewrote is a dead locator; nothing authored against it could run.
         return None, None
     safe_selector = _selector_text(redacted_identity.get("selector"))
     safe_source_url = _selector_text(redacted_identity.get("source_url"))
@@ -1236,10 +1284,14 @@ async def _register_scout_interaction_observation(
             observed_after_interaction=True,
             prior_page_evidence=prior_page_evidence,
         )
-        if sensitive_origin_page_is_tainted(ctx):
+        if sensitive_origin_page_facts_withheld(ctx, origin_run_id):
             ctx.last_scout_act_observe_outcome = None
             ctx.last_scout_act_observe_packet = None
             return None, None
+        if parsed is not None:
+            scrubbed_parsed = scrub_secrets_from_structure(ctx, parsed)
+            parsed = scrubbed_parsed if isinstance(scrubbed_parsed, dict) else None
+            ctx.last_scout_act_observe_packet = parsed
         # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
         # that rendered witnessed value content is bindable even when it exposes no actionable schema.
         if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):

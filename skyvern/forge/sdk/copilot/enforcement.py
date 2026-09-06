@@ -13,10 +13,16 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
+from agents.exceptions import MaxTurnsExceeded
+from agents.memory.session import Session
 from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
+from skyvern.forge.sdk.copilot.budget_expiry import (
+    BudgetExpirySource,
+    serialize_budget_expiry_observation,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     credential_scout_gap,
@@ -47,6 +53,7 @@ from skyvern.forge.sdk.copilot.config import (
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
@@ -113,6 +120,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
+BUDGET_DRAIN_HEADROOM = 4
+HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
 # constant so tests can shrink it instead of paying a full second per deadline.
@@ -285,6 +294,8 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
 def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: int) -> None:
     already_marked = ctx.copilot_total_timeout_exceeded is True
     ctx.copilot_total_timeout_exceeded = True
+    if ctx.budget_expiry_state.source is None:
+        ctx.budget_expiry_state.source = "deadline"
     if already_marked:
         return
     LOG.warning(
@@ -296,7 +307,7 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
-    """Wall-clock elapsed since ``start_time``, minus time spent in a credential pause.
+    """Wall-clock elapsed since ``start_time``, minus completed and active human-input waits.
 
     Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
     time, so a paused-and-resumed turn isn't penalized for pause time.
@@ -308,7 +319,15 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
     if not isinstance(pause_seconds, (int, float)):
         pause_seconds = 0.0
-    return time.monotonic() - start_time - pause_seconds
+    question_seconds = getattr(ctx, "copilot_question_pause_seconds", 0.0)
+    if not isinstance(question_seconds, (int, float)):
+        question_seconds = 0.0
+    now = time.monotonic()
+    wait = getattr(ctx, "human_input_wait", None)
+    # Overlapping waits credit their union only when the last waiter exits.
+    # Until then, exclude the active union at model/tool completion boundaries.
+    active_wait_seconds = now - wait.started_at if isinstance(wait, HumanInputWait) and wait.count > 0 else 0.0
+    return now - start_time - pause_seconds - question_seconds - active_wait_seconds
 
 
 def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
@@ -1154,20 +1173,18 @@ async def _run_streamed_with_deadline(
     agent: Agent,
     current_input: str | list,
     ctx: Any,
-    session: Any,
+    session: Session | None,
     tracked_stream: _SendTrackingStream,
     runner_kwargs: dict[str, Any],
     start_time: float,
     iteration: int,
 ) -> Any:
-    """Run ``Runner.run_streamed`` + ``stream_to_sse`` with a deadline
-    against ``TOTAL_TIMEOUT_SECONDS``.
+    """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
     The top-of-loop elapsed check only fires between iterations; a
-    long-running tool inside ``Runner.run_streamed`` needs this deadline
-    to raise ``CopilotTotalTimeoutError`` mid-tool so the caller's
-    ``_build_exit_result`` path emits a non-empty REPLY before the
-    client's own transport timeout closes the stream. The live timeout is
+    long-running tool inside ``Runner.run_streamed`` needs this watchdog
+    to raise ``CopilotTotalTimeoutError`` after the soft budget and drain
+    allowance are both spent. The live watchdog is
     published on the context so a tool that parks on a user decision (the
     credential card) can suspend it for the length of that wait.
 
@@ -1175,9 +1192,20 @@ async def _run_streamed_with_deadline(
     timeout never panics on an already-spent budget.
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
-    remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
+    remaining = max(
+        MIN_DEADLINE_REMAINING_SECONDS,
+        TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - elapsed,
+    )
     with pending_operation("turn.stream", span=True):
         result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
+
+        def check_model_work_deadline() -> None:
+            if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
+                # SDK after_turn finishes pending tools and persists their outputs before
+                # returning, so the drain can see them without another ordinary model call.
+                result.cancel(mode="after_turn")
+
+        ctx.check_model_work_deadline = None if ctx.budget_expiry_state.drain_active else check_model_work_deadline
         try:
             try:
                 async with asyncio.timeout(remaining) as deadline:
@@ -1185,6 +1213,7 @@ async def _run_streamed_with_deadline(
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
                 ctx.model_stream_deadline = None
+                ctx.check_model_work_deadline = None
                 # A request_credential call the SDK rejected before its handler ran leaves the gate
                 # armed with no releaser, and arm_credential_pause_gate skips a stranded Event, so
                 # every later response's run tools would park on it. A rejected call never sets the
@@ -1193,8 +1222,65 @@ async def _run_streamed_with_deadline(
                     release_credential_pause_gate(ctx)
                 _accumulate_usage(result, ctx)
         except TimeoutError:
+            ctx.budget_expiry_state.hard_backstop_reached = True
             _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
             raise CopilotTotalTimeoutError() from None
+    return result
+
+
+def _mark_budget_expiry(ctx: CopilotContext, source: BudgetExpirySource) -> None:
+    state = ctx.budget_expiry_state
+    if state.source is None:
+        state.source = source
+    if source == "deadline":
+        ctx.copilot_total_timeout_exceeded = True
+    else:
+        ctx.copilot_max_turns_exceeded = True
+    if state.staged_draft_id is None and ctx.staged_workflow is not None:
+        state.staged_draft_id = ctx.staged_workflow.workflow_id
+
+
+async def _run_budget_drain(
+    agent: Agent,
+    ctx: CopilotContext,
+    session: Session | None,
+    stream: EventSourceStream,
+    runner_kwargs: dict[str, Any],
+    start_time: float,
+    iteration: int,
+    source: BudgetExpirySource,
+) -> RunResultStreaming:
+    _mark_budget_expiry(ctx, source)
+    state = ctx.budget_expiry_state
+    if state.drain_attempted:
+        raise MaxTurnsExceeded("Budget drain already attempted")
+    drain_kwargs = dict(runner_kwargs)
+    drain_kwargs["max_turns"] = BUDGET_DRAIN_HEADROOM
+    observation = serialize_budget_expiry_observation(
+        source=state.source or source,
+        headroom=BUDGET_DRAIN_HEADROOM,
+        staged_draft=state.staged_draft_id,
+    )
+    state.begin_drain()
+    LOG.info(
+        "copilot_budget_drain_started",
+        source=state.source,
+        drain_fingerprint=state.drain_fingerprint,
+        staged_draft_id=state.staged_draft_id,
+    )
+    try:
+        result = await _run_streamed_with_deadline(
+            agent,
+            observation,
+            ctx,
+            session,
+            _SendTrackingStream(stream),
+            drain_kwargs,
+            start_time,
+            iteration,
+        )
+    finally:
+        state.drain_active = False
     return result
 
 
@@ -1726,9 +1812,18 @@ async def run_with_enforcement(
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        if elapsed > TOTAL_TIMEOUT_SECONDS:
+        if iteration > 0 and elapsed >= TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
-            raise CopilotTotalTimeoutError()
+            return await _run_budget_drain(
+                agent,
+                ctx,
+                session,
+                stream,
+                runner_kwargs,
+                start_time,
+                iteration,
+                "deadline",
+            )
 
         # When the current turn contains image payloads, the session-backed
         # input filter cannot protect us — the payload is in current_input,
@@ -1764,6 +1859,17 @@ async def run_with_enforcement(
             except asyncio.CancelledError:
                 _record_copilot_cancellation(ctx, start_time, iteration)
                 raise
+            except MaxTurnsExceeded:
+                return await _run_budget_drain(
+                    agent,
+                    ctx,
+                    session,
+                    stream,
+                    runner_kwargs,
+                    start_time,
+                    iteration,
+                    "max_turns",
+                )
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -1808,6 +1914,17 @@ async def run_with_enforcement(
                 except asyncio.CancelledError:
                     _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
+                except MaxTurnsExceeded:
+                    return await _run_budget_drain(
+                        agent,
+                        ctx,
+                        session,
+                        stream,
+                        runner_kwargs,
+                        start_time,
+                        iteration,
+                        "max_turns",
+                    )
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
@@ -1817,6 +1934,20 @@ async def run_with_enforcement(
                         has_session=session is not None,
                     )
                     raise
+
+        elapsed = _elapsed_run_seconds(ctx, start_time)
+        if elapsed >= TOTAL_TIMEOUT_SECONDS:
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
+            return await _run_budget_drain(
+                agent,
+                ctx,
+                session,
+                stream,
+                runner_kwargs,
+                start_time,
+                iteration,
+                "deadline",
+            )
 
         # The post-run screenshot drain must follow the enforcement check:
         # without a nudge, re-invoking with just the screenshot would replace

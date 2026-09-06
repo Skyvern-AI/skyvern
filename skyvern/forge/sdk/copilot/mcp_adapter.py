@@ -59,7 +59,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
     resolve_browser_state_for_context,
     retire_browser_session_id,
-    sensitive_origin_page_has_active_run,
+    sensitive_origin_page_facts_withheld,
     sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -69,7 +69,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     matching_origin_run_redaction_parameters,
-    register_matching_origin_run_redaction_values,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -346,10 +345,10 @@ def _record_browser_call_outcome(
 
 
 def _scrub_browser_call_outcome(ctx: AgentContext, outcome: _BrowserCallOutcome) -> _BrowserCallOutcome:
-    scrubbed = outcome.with_raw_result(_scrub_tool_result(ctx, outcome.raw_result()))
+    scrubbed = outcome.with_raw_result(scrub_model_facing_tool_result(ctx, outcome.raw_result()))
     if outcome.protocol_error_detail is None:
         return scrubbed
-    detail_result = _scrub_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
+    detail_result = scrub_model_facing_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
     detail = detail_result.get("error")
     return replace(scrubbed, protocol_error_detail=detail if isinstance(detail, str) else "")
 
@@ -635,7 +634,7 @@ def _mapping_keys_preserved(source: Any, scrubbed: Any) -> bool:
     return True
 
 
-def _scrub_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
+def scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
     scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
     if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
         return {}
@@ -665,7 +664,7 @@ def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseExce
         detail = ""
     error = f"{tool_name} failed: {detail}" if detail else f"{tool_name} failed"
     del exception, detail
-    return _scrub_tool_result(ctx, {"ok": False, "error": error})
+    return scrub_model_facing_tool_result(ctx, {"ok": False, "error": error})
 
 
 _MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "evidence_drain", "context_exit"]
@@ -1551,7 +1550,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
             else:
-                result = _scrub_tool_result(copilot_ctx, result)
+                result = scrub_model_facing_tool_result(copilot_ctx, result)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
@@ -1585,7 +1584,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                     hook_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
-                    hook_result = _scrub_tool_result(copilot_ctx, hook_result)
+                    hook_result = scrub_model_facing_tool_result(copilot_ctx, hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result, tool_name)
             return None
@@ -1644,7 +1643,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                     err = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
-                    err = _scrub_tool_result(copilot_ctx, err)
+                    err = scrub_model_facing_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err, tool_name)
             if continuity_result is not None:
@@ -1662,7 +1661,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                     continuity_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
-                    continuity_result = _scrub_tool_result(copilot_ctx, continuity_result)
+                    continuity_result = scrub_model_facing_tool_result(copilot_ctx, continuity_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
                 return _copilot_to_call_tool_result(continuity_result, tool_name)
             mcp_args["session_id"] = binding.session_id_for(copilot_ctx)
@@ -1701,7 +1700,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             phases.pause()
             # Scrub before the post hook so evidence the hooks record from raw_mcp
             # (flow evidence, scout observations) is scrubbed too.
-            raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
+            raw_mcp = scrub_model_facing_tool_result(copilot_ctx, raw_mcp)
             session_lost = False
             error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
             if (
@@ -1772,25 +1771,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                     ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
                     try:
                         copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
-                        # The adapter is the last disclosure boundary. Production custody changes share
-                        # this call's outer lock; this gate also fails closed if an unexpected producer
-                        # marks the exact session while an enrichment awaits.
-                        sensitive_result_is_scrubbable = (
-                            overlay.redacts_sensitive_origin_structured_result
-                            and not sensitive_origin_page_has_active_run(copilot_ctx)
-                            and register_matching_origin_run_redaction_values(copilot_ctx)
-                        )
-                        if (
-                            overlay.requires_browser
-                            and sensitive_origin_page_is_tainted(copilot_ctx)
-                            and not sensitive_result_is_scrubbable
-                        ):
-                            _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                            copilot_result = {
-                                "ok": False,
-                                "error": SENSITIVE_ORIGIN_PAGE_ERROR,
-                                **binding.provenance(),
-                            }
                     except asyncio.CancelledError:
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
                         raise
@@ -1799,8 +1779,27 @@ class SkyvernOverlayMCPServer(MCPServer):
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
                         LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
                         copilot_result = base_copilot_result
+                    # The last disclosure boundary, so it also runs after a crashed post-hook. It fails
+                    # closed when an unexpected producer marks the exact session while an enrichment awaits.
+                    sensitive_result_is_scrubbable = (
+                        overlay.redacts_sensitive_origin_structured_result
+                        and not sensitive_origin_page_facts_withheld(
+                            copilot_ctx, getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+                        )
+                    )
+                    if (
+                        overlay.requires_browser
+                        and sensitive_origin_page_is_tainted(copilot_ctx)
+                        and not sensitive_result_is_scrubbable
+                    ):
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        copilot_result = {
+                            "ok": False,
+                            "error": SENSITIVE_ORIGIN_PAGE_ERROR,
+                            **binding.provenance(),
+                        }
 
-            copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
+            copilot_result = scrub_model_facing_tool_result(copilot_ctx, copilot_result)
 
             def _commit_evidence() -> None:
                 if browser_outcome is not None:
@@ -1938,7 +1937,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     display_tool_name=tool_name,
                 )
             else:
-                err = _scrub_tool_result(copilot_ctx, err)
+                err = scrub_model_facing_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
@@ -1986,7 +1985,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     display_tool_name=tool_name,
                 )
             else:
-                err = _scrub_tool_result(
+                err = scrub_model_facing_tool_result(
                     copilot_ctx,
                     _browser_session_loss_result(
                         {},
@@ -2113,7 +2112,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
                     browser_outcome=outcome,
                 )
-            return _InternalToolCallResult(result=_scrub_tool_result(ctx, result))
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result))
         phases.enter("session_prepare")
         try:
             err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
@@ -2162,7 +2161,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
                     browser_outcome=outcome,
                 )
-            return _InternalToolCallResult(result=_scrub_tool_result(ctx, err))
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, err))
         if continuity_result is not None:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             if uses_shared_browser_outcome:
@@ -2180,7 +2179,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
                     browser_outcome=outcome,
                 )
-            return _InternalToolCallResult(result=_scrub_tool_result(ctx, continuity_result))
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, continuity_result))
         # An explicit session is a dispatch lease chosen before session preparation awaits. Do not
         # relabel that call with mutable ambient context if another concurrent tool replaces it.
         call_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
@@ -2308,7 +2307,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     browser_outcome=outcome,
                 )
             return _InternalToolCallResult(
-                result=_scrub_tool_result(
+                result=scrub_model_facing_tool_result(
                     ctx,
                     _browser_session_loss_result(
                         {},
@@ -2356,7 +2355,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             phases.settle()
         call_status = "error" if failed else post_dispatch_status
         _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", call_status)
-        scrubbed = _scrub_tool_result(ctx, raw_mcp)
+        scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp)
         error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)
         if (
             ctx.turn_origin != TurnOrigin.runtime_self_heal

@@ -40,6 +40,7 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
+    read_locator_is_content_editable,
     read_locator_tag_name,
     read_resolved_anchor_href,
     read_whether_link_or_button,
@@ -541,6 +542,19 @@ class SkyvernElement:
         except Exception:
             LOG.info(
                 "Failed to check element editable, considering it's not editable",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            return False
+
+    async def is_content_editable(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
+        # A block inside a contenteditable host inherits editability without carrying the attribute, so
+        # only the live DOM property can answer this.
+        try:
+            return await read_locator_is_content_editable(self.get_locator(), timeout=timeout) is True
+        except Exception:
+            LOG.info(
+                "Failed to check element contenteditable, considering it's not contenteditable",
                 exc_info=True,
                 element_id=self.get_id(),
             )

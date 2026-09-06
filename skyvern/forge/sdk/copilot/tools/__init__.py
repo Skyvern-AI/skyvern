@@ -13,6 +13,7 @@ from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
 
 from skyvern.forge import app as app
+from skyvern.forge.sdk.copilot.ask_user import AskUserArguments, QuestionInput
 from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
@@ -44,7 +45,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     bound_call_browser_session,
     resolve_browser_state_for_context,
-    sensitive_origin_page_is_tainted,
+    sensitive_origin_page_facts_withheld,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -829,6 +830,23 @@ async def request_credential_tool(ctx: RunContextWrapper, login_page_url: str, r
     return json.dumps(result)
 
 
+@function_tool(name_override="ask_user")
+async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionInput]) -> str:
+    """Ask the user questions in an inline card and receive their response before continuing.
+
+    Keep questions and choice labels concise. Aim for 200 characters or fewer per question or choice, and offer no more than eight choices.
+
+    Give each question a prompt and optional choices. The card always has a bottom free-text
+    field. Users can submit choices, free text, or both, answer some parts, or skip. The result
+    preserves the questions, chosen options, free text, and unanswered parts. Decide what to do
+    next from those facts, including explaining or asking again. Use request_credential for
+    credentials; an ordinary answer does not change existing action or credential permissions.
+    """
+    from skyvern.forge.sdk.copilot.ask_user import ask_user
+
+    return json.dumps(await ask_user(ctx.context, AskUserArguments(parts=parts), ctx.tool_call_id))
+
+
 @function_tool(name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
@@ -1463,8 +1481,10 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
     copilot_ctx = ctx.context
 
     def finish(result: dict[str, Any]) -> str:
-        # Scrub once, then record and return that same structure, so nothing downstream retains an
-        # unsanitized copy of page text.
+        # This tool reads Playwright directly and never crosses the MCP adapter; the exact-value
+        # scrubber carries each secret's encoded forms, so a credential echoed URL-encoded in the URL
+        # or HTML-escaped in outer HTML is caught here too. Scrub once, then record and return that
+        # same structure, so nothing downstream retains an unsanitized copy of page text.
         scrubbed = scrub_secrets_from_structure(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, LOCATOR_INSPECTION_TOOL_NAME, parsed, scrubbed)
         return json.dumps(scrubbed)
@@ -1493,7 +1513,8 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
         return finish({"ok": False, "error": "No selectors supplied.", **binding.provenance()})
 
     with bound_call_browser_session(binding.session_id_override):
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        run_id = copilot_ctx.last_run_blocks_workflow_run_id
+        if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR, **binding.provenance()})
         browser_state = await resolve_browser_state_for_context(copilot_ctx)
         if browser_state is None:
@@ -1516,7 +1537,7 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
                 }
             )
         facts = await inspect_locator_matches(page, selectors)
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR, **binding.provenance()})
         return finish({"ok": True, "current_url": page.url, **binding.provenance(), "data": facts})
 
@@ -1531,6 +1552,7 @@ inspect_locator_matches_tool = FunctionTool(
 
 
 NATIVE_TOOLS = [
+    ask_user_tool,
     update_workflow_tool,
     edit_block_tool,
     edit_block_and_run_tool,

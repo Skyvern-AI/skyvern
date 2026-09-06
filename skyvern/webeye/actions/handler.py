@@ -7939,6 +7939,10 @@ async def _handle_input_text_action(
             else:
                 contenteditable = await skyvern_element.get_attr("contenteditable", mode="static")
                 is_contenteditable = contenteditable is not None and str(contenteditable).lower() != "false"
+                if contenteditable is None and tag_name not in _NATIVE_FILL_TAGS:
+                    # The scraper offers blocks inside an editing host as targets; they inherit editability
+                    # without carrying the attribute, and the per-character seam below splits them.
+                    is_contenteditable = await skyvern_element.is_content_editable()
                 # SKY-13821: an ordinary native input is populated with one atomic fill instead of the
                 # input_sequentially fill(prefix)+type(tail) seam, so a caret-resetting field cannot reorder or
                 # truncate the value. A typed-widget (the is_typed_widget signal computed above -- search-bar or

@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
+import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, get_args, runtime_checkable
 
 from opentelemetry import trace as otel_trace
@@ -27,6 +30,7 @@ if TYPE_CHECKING:
 
 import structlog
 import yaml
+from agents.items import ToolCallItem
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
@@ -49,6 +53,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     config_for_eval_mode,
     resolve_copilot_tool_surface,
 )
+from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState, serialize_prior_budget_expiry
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _TEXT_MAX,
@@ -94,14 +99,17 @@ from skyvern.forge.sdk.copilot.context import (
     TurnNarrativePayload,
     adopt_model_authored_context,
     build_model_safe_global_llm_context,
+    clear_proposed_credential,
     coerce_ask_subject,
     finalize_observation_context,
     parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
+    record_proposed_credential_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotNonRetriableNavError,
     _elapsed_run_seconds,
     artifact_health_blocked,
     outcome_fully_verified,
@@ -112,7 +120,12 @@ from skyvern.forge.sdk.copilot.entrypoint import (
     resolve_turn_entrypoint_url,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
+from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
+from skyvern.forge.sdk.copilot.model_telemetry import (
+    CopilotModelStopMetadata,
+    model_attempt_telemetry_scope,
+)
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     record_criteria_lifecycle,
@@ -181,14 +194,13 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.terminal_envelope import (
+    INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
     MINIMAL_CANCEL_STOP,
     TESTED_DRAFT_PRESERVED,
     UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
-    QuestionPart,
     TerminalCause,
     TerminalOutcomeEnvelope,
-    admit_question_parts,
     assemble_terminal_envelope,
     is_interim_run_outcome,
     reason_in_reply_shadow,
@@ -206,11 +218,13 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     run_workflow_end_to_end,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import hydrate_prior_carried_trajectory
+from skyvern.forge.sdk.copilot.tools.workflow_update import restore_pending_workflow_proposal
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHalt,
+    TurnHaltKind,
     raise_if_turn_halt,
     turn_halt_to_trace_data,
 )
@@ -222,6 +236,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     connected_account_choice_context,
     selected_connected_account_id,
     stopped_exit_response_kind,
+    with_budget_expiry,
     with_copilot_code_mode_diagnostics,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
@@ -239,8 +254,9 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    TURN_OPENER_SENDERS,
     WorkflowCopilotChatHistoryMessage,
-    WorkflowCopilotChatSender,
+    chat_history_role,
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
@@ -287,7 +303,7 @@ def _derive_turn_index(
     # fallback can undercount long sessions; prefer the explicit count.
     if explicit is not None:
         return explicit
-    return sum(1 for m in chat_history if m.sender == WorkflowCopilotChatSender.USER)
+    return sum(1 for m in chat_history if m.sender in TURN_OPENER_SENDERS)
 
 
 @contextlib.contextmanager
@@ -451,7 +467,21 @@ async def _resolve_live_browser_session_id(
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
     if not chat_history:
         return ""
-    lines = [f"{msg.sender}: {msg.content}" for msg in chat_history]
+    from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
+
+    lines: list[str] = []
+    for msg in chat_history:
+        questions = msg.narrative_payload.get("questionInteractions", []) if msg.narrative_payload is not None else []
+        for raw in questions:
+            interaction = QuestionInteraction.model_validate(raw)
+            if interaction.status == "resolved":
+                lines.append(f"ask_user result: {json.dumps(interaction.tool_result())}")
+            else:
+                lines.append(f"ask_user request: {interaction.model_dump_json()}")
+        lines.append(f"{chat_history_role(msg.sender)}: {msg.content}")
+        expiry = serialize_prior_budget_expiry(msg.turn_outcome)
+        if expiry is not None:
+            lines.append(f"turn_outcome: {expiry}")
     return "\n".join(lines)
 
 
@@ -707,7 +737,10 @@ def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
 
 
 def _clean_authoring_repair_prompt_atom(value: str, *, max_chars: int = 160) -> str:
-    cleaned = redact_raw_secrets_for_prompt(value).replace("\r", " ").replace("\n", " ").strip()
+    """Atoms carry page-derived text (selectors, titles, value excerpts), so they are escaped
+    like every other untrusted prompt argument; a bare fence run would swallow the sections
+    rendered after it."""
+    cleaned = escape_code_fences(redact_raw_secrets_for_prompt(value)).replace("\r", " ").replace("\n", " ").strip()
     if contains_internal_machinery_leak(cleaned):
         return ""
     return cleaned[:max_chars]
@@ -1159,7 +1192,7 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         )
     elif (
         outcome.is_authoritative
-        and page_path_failure is None
+        and (page_path_failure is None or bool(outcome.missing_requested_output_facts))
         and outcome.phase == "persisted_block_run"
         and outcome.reason_code == "no_meaningful_output"
         and outcome.workflow_run_id
@@ -1658,11 +1691,15 @@ def _crash_exit_interruption(
         return None
     if turn_outcome is None or turn_outcome.terminal_reason != UNEXPECTED_ERROR_TERMINAL_REASON:
         return None
-    # Only the identity is known here. ``workflow_persisted`` is always False under staging, which
+    # Only the identities are known here. ``workflow_persisted`` is always False under staging, which
     # is the population this path serves, and ``last_workflow`` is stamped version=1 by the YAML
     # parse rather than carrying the workflow's real version, so both would state something about
     # the turn that this site cannot observe.
-    return InterruptedTurnFacts(workflow_permanent_id=ctx.workflow_permanent_id)
+    outcome = ctx.latest_recorded_build_test_outcome
+    return InterruptedTurnFacts(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        run_id=outcome.workflow_run_id if isinstance(outcome, RecordedBuildTestOutcome) else None,
+    )
 
 
 def _assemble_terminal_envelope_safe(
@@ -1684,7 +1721,6 @@ def _assemble_terminal_envelope_safe(
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
     interruption: InterruptedTurnFacts | None = None,
-    question_parts: Sequence[QuestionPart] = (),
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1704,7 +1740,6 @@ def _assemble_terminal_envelope_safe(
             connect_failure=connect_failure,
             proposal_present=proposal_present,
             interruption=interruption,
-            question_parts=question_parts,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1755,11 +1790,20 @@ def _concrete_narrative_response_kind(
     return ResponseKind.ANSWER
 
 
+def _budget_expiry_state_with_staged_draft(ctx: CopilotContext) -> BudgetExpiryState:
+    state = ctx.budget_expiry_state
+    if state.source is not None and state.staged_draft_id is None and ctx.staged_workflow is not None:
+        state.staged_draft_id = ctx.staged_workflow.workflow_id
+    return state
+
+
 def _make_agent_result(
     ctx: CopilotContext | None,
     *,
     global_llm_context: str | None = None,
     turn_outcome: TurnOutcome | None = None,
+    terminal_cause_override: TerminalCause | None = None,
+    terminal_verified_override: bool | None = None,
     **kwargs: Any,
 ) -> AgentResult:
     """Sole ``AgentResult`` constructor in this module.
@@ -1769,11 +1813,12 @@ def _make_agent_result(
     output-policy block, clarification helpers, non-retriable nav error,
     normal translate-result, missing-SDK fallback, unexpected-error fallback).
     """
-    final_context = (
-        record_approved_credentials_in_global_llm_context(ctx, finalize_observation_context(ctx, global_llm_context))
-        if ctx is not None
-        else global_llm_context
-    )
+    final_context = global_llm_context
+    if ctx is not None:
+        final_context = finalize_observation_context(ctx, global_llm_context)
+        final_context = record_approved_credentials_in_global_llm_context(ctx, final_context)
+    if ctx is not None and turn_outcome is not None:
+        turn_outcome = with_budget_expiry(turn_outcome, _budget_expiry_state_with_staged_draft(ctx))
     proposal_yaml = kwargs.get("workflow_yaml")
     if isinstance(proposal_yaml, str):
         proposal_yaml = derive_code_block_steps_in_yaml(proposal_yaml)
@@ -1793,10 +1838,14 @@ def _make_agent_result(
     review_projection: NarrativeReviewProjection | None = (
         narrative_payload.get("review") if isinstance(narrative_payload, dict) else None
     )
-    terminal_cause = _terminal_cause_for_context(ctx) if ctx is not None else None
+    terminal_cause = terminal_cause_override or (_terminal_cause_for_context(ctx) if ctx is not None else None)
     turn_facts = _turn_facts_for_context(ctx, review_projection, proposal_yaml) if ctx is not None else None
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
+    if ctx is not None:
+        final_context = record_proposed_credential_in_global_llm_context(ctx, final_context, response_type_value)
+    else:
+        final_context = clear_proposed_credential(final_context)
     raw_disposition = kwargs.get("proposal_disposition")
     proposal_disposition: ProposalDisposition | None = (
         raw_disposition if raw_disposition in get_args(ProposalDisposition) else None
@@ -1843,7 +1892,18 @@ def _make_agent_result(
             if reason:
                 payload_updates["credentialPrompt"] = {"reason": reason}
         if ctx is not None and "credentialAutoBound" not in narrative_payload:
-            auto_bound = ctx.request_policy.auto_bound_credentials if ctx.request_policy is not None else []
+            policy = ctx.request_policy
+            # A hydrated carry is not a bind that happened this turn; showing it again would repeat
+            # the receipt, with its Change affordance, on every turn the carry survives.
+            auto_bound = (
+                [
+                    item
+                    for item in policy.auto_bound_credentials
+                    if item.credential_id not in policy.seeded_proposal_credential_ids
+                ]
+                if policy is not None
+                else []
+            )
             if auto_bound:
                 bound = auto_bound[-1]
                 payload_updates["credentialAutoBound"] = {
@@ -1868,7 +1928,11 @@ def _make_agent_result(
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
     note_eligible = (
-        ctx is not None and turn_outcome is not None and response_type != "ASK_QUESTION" and result_has_workflow_attempt
+        ctx is not None
+        and turn_outcome is not None
+        and response_type != "ASK_QUESTION"
+        and result_has_workflow_attempt
+        and ctx.budget_expiry_state.source is None
     )
     unresolved_failure = None
     detector_disposition = "not_evaluated"
@@ -1922,7 +1986,11 @@ def _make_agent_result(
         workflow_mutated = bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None
         terminal_envelope = _assemble_terminal_envelope_safe(
             response_type=response_type_value,
-            verified=bool(outcome_fully_verified(ctx)),
+            verified=(
+                terminal_verified_override
+                if terminal_verified_override is not None
+                else bool(outcome_fully_verified(ctx))
+            ),
             workflow_applied=False,
             proposal_disposition=proposal_disposition,
             run_outcomes=_terminal_envelope_run_outcomes(ctx),
@@ -1938,7 +2006,6 @@ def _make_agent_result(
             connect_failure=connect_failure,
             proposal_present=result_carries_workflow,
             interruption=_crash_exit_interruption(ctx, turn_outcome, failed_operation),
-            question_parts=ctx.question_parts,
         )
     if terminal_envelope is not None and (
         terminal_envelope.get("failed_operation") is not None
@@ -2093,6 +2160,15 @@ def _build_narrative_payload(
         "startedAt": ctx.turn_started_at,
         "endedAt": ctx.turn_ended_at,
     }
+    budget_state = _budget_expiry_state_with_staged_draft(ctx)
+    if budget_state.source is not None:
+        payload["budgetExpiry"] = {
+            "budgetExpired": True,
+            "source": budget_state.source,
+            "reportProduced": budget_state.report_produced,
+            "stagedDraftId": budget_state.staged_draft_id,
+            "drainFingerprint": budget_state.drain_fingerprint,
+        }
     if ctx.google_connection_notices:
         payload["googleConnectionNotices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
     if ctx.staged_workflow_yaml is not None:
@@ -2434,7 +2510,9 @@ def _build_turn_halt_exit_result(
     halt: TurnHalt,
 ) -> AgentResult:
     signal = halt.blocker_signal
-    if isinstance(signal, CopilotToolBlockerSignal):
+    if halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED:
+        user_response = INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
+    elif isinstance(signal, CopilotToolBlockerSignal):
         user_response = signal.user_facing_reason
     else:
         user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
@@ -2446,38 +2524,6 @@ def _build_turn_halt_exit_result(
     )
 
 
-_TIMEOUT_REPLY_DEFAULT = (
-    "I ran out of time processing your request, and I don't have a draft workflow to hand over. "
-    "Tell me what to focus on and I'll try again."
-)
-_TIMEOUT_REPLY_UNVALIDATED = (
-    "I ran out of time. I have a draft workflow you can keep — "
-    "accept it to save (note: it hasn't been verified end-to-end), or discard."
-)
-_TIMEOUT_REPLY_TESTED = "I ran out of time, but I have a tested draft for you. Accept it to save, or discard."
-_BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT = "The browser task did not finish before this turn ran out of time."
-_BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY = (
-    f"{_BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT} I recorded browser activity before the timeout."
-)
-
-
-def _browser_ablation_timeout_reply(tool_activity_count: int) -> str:
-    if tool_activity_count:
-        return _BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
-    return _BROWSER_ABLATION_TIMEOUT_REPLY_DEFAULT
-
-
-_MAX_TURNS_REPLY_DEFAULT = (
-    "I've reached the maximum number of steps, and I don't have a draft workflow to hand over. "
-    "Tell me what to focus on and I'll try again."
-)
-_MAX_TURNS_REPLY_UNVALIDATED = (
-    "I've reached the maximum number of steps. I have a draft "
-    "workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard."
-)
-_MAX_TURNS_REPLY_TESTED = (
-    "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
-)
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
     "I hit an unexpected issue. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
@@ -2920,18 +2966,6 @@ def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
     return f"{tested_reply} The latest attempted change did not verify: {reason}.{status_sentence}"
 
 
-def _deadline_failure_reply(ctx: CopilotContext, deadline_reply: str, *, halted_mid_progress: bool) -> str:
-    # A guard-halted or budget-paced run was interrupted, not disproven, and the deadline copy
-    # already says the work is unverified -- appending a failure verdict would mis-attribute the
-    # stop a second time, which is the defect this precedence exists to remove.
-    if halted_mid_progress:
-        return deadline_reply
-    reason, status_sentence = _recorded_failure_summary(ctx)
-    if not reason:
-        return deadline_reply
-    return f"{deadline_reply} The last test did not verify: {reason}.{status_sentence}"
-
-
 def _recorded_failure_reply(
     ctx: CopilotContext, *, cancelled: bool = False, internal_tool_instruction_failure: bool | None = None
 ) -> str | None:
@@ -3002,24 +3036,10 @@ def _build_wip_exit_result(
 ) -> AgentResult:
     """Non-success exits surface the most recent successfully parsed workflow."""
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
-    halted_mid_progress = _halted_mid_progress(internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
     )
     effective_terminal = terminal_reason or (CANCEL_TERMINAL_REASON if cancelled else None)
-    # Deadline expiry and a recorded failure both want to author the reply. The
-    # deadline owns it -- the failed test is what spent the budget, so naming the
-    # test as the cause mis-attributes the stop. Same latch the envelope's
-    # terminal_cause reads, so the rendered text and the typed cause cannot diverge.
-    deadline_owns_reply = ctx.copilot_total_timeout_exceeded is True and not cancelled
-
-    # An interrupted run was not disproven, so a deadline-expired turn appends no failure verdict.
-    deadline_suppresses_failure_detail = deadline_owns_reply and halted_mid_progress
-
-    def _deadline_owned_or(base_reply: str, failure_reply: str | None) -> str | None:
-        if deadline_owns_reply and failure_reply:
-            return _deadline_failure_reply(ctx, base_reply, halted_mid_progress=halted_mid_progress)
-        return failure_reply
 
     def _guard(text: str) -> tuple[str, TurnOutcome]:
         if contains_internal_machinery_leak(text):
@@ -3083,7 +3103,7 @@ def _build_wip_exit_result(
         and ctx.last_workflow is not ctx.last_good_workflow
         and not ctx.last_test_suspicious_success
     ):
-        append_failure_detail = recorded_failure_reply and not deadline_suppresses_failure_detail
+        append_failure_detail = recorded_failure_reply
         held_reply = _tested_draft_reply(
             ctx,
             ctx.last_good_workflow_yaml,
@@ -3126,7 +3146,7 @@ def _build_wip_exit_result(
         )
         unvalidated = not full_test_ok
         if unvalidated and recorded_failure_reply:
-            reply = _deadline_owned_or(unvalidated_reply, recorded_failure_reply) or unvalidated_reply
+            reply = recorded_failure_reply
         else:
             reply = (
                 unvalidated_reply
@@ -3175,7 +3195,7 @@ def _build_wip_exit_result(
     # canonical on the same turn the user is told there is nothing to hand over.
     return _build_exit_result(
         ctx,
-        _deadline_owned_or(default_reply, recorded_failure_reply) or default_reply,
+        recorded_failure_reply or default_reply,
         global_llm_context,
         cancelled=cancelled,
         terminal_reason=effective_terminal,
@@ -3193,23 +3213,62 @@ def _merge_exit_context(
     return merge_failure_into_context(global_llm_context, failure)
 
 
-def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION:
-        return _build_exit_result(
-            ctx,
-            _browser_ablation_timeout_reply(len(ctx.eval_tool_activity)),
-            global_llm_context,
-            terminal_reason="timeout",
-            proposal_disposition="no_proposal",
-        )
-    return _build_wip_exit_result(
-        ctx,
-        global_llm_context,
-        default_reply=_TIMEOUT_REPLY_DEFAULT,
-        unvalidated_reply=_TIMEOUT_REPLY_UNVALIDATED,
-        tested_reply=_TIMEOUT_REPLY_TESTED,
-        terminal_reason="timeout",
+def _build_budget_expiry_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    state = ctx.budget_expiry_state
+    state.report_produced = False
+    terminal_reason = "timeout" if state.source == "deadline" else "max_turns"
+    proposal_disposition: ProposalDisposition = "review_untested" if ctx.has_staged_proposal else "no_proposal"
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text="",
+        attempted_kind=stopped_exit_response_kind(terminal_reason),
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason=terminal_reason,
     )
+    staged_workflow = ctx.staged_workflow if ctx.has_staged_proposal else None
+    staged_workflow_yaml = ctx.staged_workflow_yaml if staged_workflow is not None else None
+    _log_output_policy_parity(
+        ctx,
+        has_workflow_proposal=staged_workflow is not None,
+        workflow_attempted=ctx.has_genuine_workflow_attempt(),
+    )
+    # A zero-content drain is a typed terminal state, not prose to repair. Keep
+    # its accepted staged proposal attached without routing through generic
+    # empty-output or blocker renderers, both of which can fabricate copy.
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=staged_workflow,
+        global_llm_context=global_llm_context,
+        workflow_yaml=staged_workflow_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+        has_staged_proposal=ctx.has_staged_proposal,
+        staged_workflow_yaml=ctx.staged_workflow_yaml,
+        staged_workflow=ctx.staged_workflow,
+        canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+        total_tokens=ctx.total_tokens_used,
+        proposal_disposition=proposal_disposition,
+        turn_outcome=outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="error",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
+    )
+
+
+def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    ctx.budget_expiry_state.source = "deadline"
+    ctx.copilot_total_timeout_exceeded = True
+    return _build_budget_expiry_exit_result(ctx, global_llm_context)
+
+
+def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    ctx.budget_expiry_state.source = "max_turns"
+    ctx.copilot_max_turns_exceeded = True
+    return _build_budget_expiry_exit_result(ctx, global_llm_context)
 
 
 def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
@@ -3220,22 +3279,13 @@ def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | 
         result = _build_cancel_exit_result(ctx, global_llm_context)
     result.cancellation_iteration = ctx.copilot_turn_cancelled_iteration
     outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
-    result.cancellation_last_recorded_phase = outcome.phase if isinstance(outcome, RecordedBuildTestOutcome) else None
+    recorded = outcome if isinstance(outcome, RecordedBuildTestOutcome) else None
+    result.cancellation_last_recorded_phase = recorded.phase if recorded is not None else None
+    result.cancellation_workflow_run_id = recorded.workflow_run_id if recorded is not None else None
     return result
 
 
-def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_wip_exit_result(
-        ctx,
-        global_llm_context,
-        default_reply=_MAX_TURNS_REPLY_DEFAULT,
-        unvalidated_reply=_MAX_TURNS_REPLY_UNVALIDATED,
-        tested_reply=_MAX_TURNS_REPLY_TESTED,
-        terminal_reason="max_turns",
-    )
-
-
-def _handle_max_turns_exceeded(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+def _handle_budget_drain_exhausted(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
     ctx.copilot_max_turns_exceeded = True
     start_monotonic = ctx.copilot_run_start_monotonic
     LOG.warning(
@@ -3245,7 +3295,7 @@ def _handle_max_turns_exceeded(ctx: CopilotContext, global_llm_context: str | No
         elapsed_seconds=round(_elapsed_run_seconds(ctx, start_monotonic), 3) if start_monotonic is not None else 0.0,
         model_call_count=ctx.model_calls_this_turn,
     )
-    return _build_max_turns_exit_result(ctx, global_llm_context)
+    return _build_budget_expiry_exit_result(ctx, global_llm_context)
 
 
 def _build_unexpected_error_exit_result(
@@ -3301,6 +3351,66 @@ def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | Non
         unvalidated_reply=_CANCEL_REPLY_UNVALIDATED,
         tested_reply=_CANCEL_REPLY_TESTED,
         cancelled=True,
+    )
+
+
+_PROXY_TRANSPORT_NAV_ERROR_CODES = (
+    "net::ERR_TUNNEL_CONNECTION_FAILED",
+    "net::ERR_SOCKS_CONNECTION_FAILED",
+    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+)
+
+
+def _non_retriable_nav_reply(error_message: str) -> str:
+    _, separator, machine_error = error_message.rpartition(". Error message: ")
+    classification_source = machine_error if separator else error_message
+    if any(code in classification_source for code in _PROXY_TRANSPORT_NAV_ERROR_CODES):
+        return (
+            f"The site could not be reached through Skyvern's browser network. Error: {error_message}. "
+            "Please try again later, or contact Skyvern Support if the problem continues."
+        )
+    return f"The target URL could not be reached. Error: {error_message}. Please verify the URL and try again."
+
+
+def _build_non_retriable_nav_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    error: CopilotNonRetriableNavError,
+) -> AgentResult:
+    # Non-retriable nav errors prove the current workflow doesn't work; zero
+    # the proposal even if other tools succeeded.
+    nav_reply = _non_retriable_nav_reply(error.error_message)
+    final_nav_text, nav_outcome = apply_repeated_reply_guard(
+        final_text=nav_reply,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason="non_retriable_nav",
+    )
+    return _finalize_result_with_blocker_override(
+        ctx,
+        _make_agent_result(
+            ctx,
+            user_response=final_nav_text,
+            updated_workflow=None,
+            global_llm_context=global_llm_context,
+            workflow_yaml=None,
+            workflow_was_persisted=ctx.workflow_persisted,
+            has_staged_proposal=ctx.has_staged_proposal,
+            staged_workflow_yaml=ctx.staged_workflow_yaml,
+            staged_workflow=ctx.staged_workflow,
+            canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+            total_tokens=ctx.total_tokens_used,
+            turn_outcome=nav_outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_nav_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
+        ),
+        exit_site="non_retriable_nav",
     )
 
 
@@ -3458,12 +3568,16 @@ async def _translate_to_agent_result(
     # Deferred tools.py imports here and below: tools.py -> routes.workflow_copilot -> this module (circular at import time).
     from skyvern.forge.sdk.copilot.tools import _process_workflow_yaml
 
+    budget_drain = ctx.budget_expiry_state.drain_attempted
     text = extract_final_text(result)
-    if not text:
-        text = '{"type": "REPLY", "user_response": "I\'m not sure how to help with that. Could you rephrase?"}'
+    if not text and budget_drain:
+        return _build_budget_expiry_exit_result(ctx, global_llm_context)
 
     action_data = parse_final_response(text)
-    user_response = action_data.get("user_response") or "Done."
+    raw_user_response = action_data.get("user_response")
+    if budget_drain and (not isinstance(raw_user_response, str) or not raw_user_response.strip()):
+        return _build_budget_expiry_exit_result(ctx, global_llm_context)
+    user_response = raw_user_response or "Done."
 
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
@@ -3474,15 +3588,18 @@ async def _translate_to_agent_result(
             subject=coerce_ask_subject(action_data.get("ask_subject")),
             refs=parsed_ask_refs(action_data.get("refs")),
         )
-    normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
-    resp_type = normalized_scaffolding.response_type
-    user_response = normalized_scaffolding.user_response or "Done."
+    if not budget_drain:
+        normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
+        resp_type = normalized_scaffolding.response_type
+        user_response = normalized_scaffolding.user_response or "Done."
     model_authored_ask = resp_type == "ASK_QUESTION"
 
     # Bind the signal to a local so the proposal-cascade gating below can't
     # desync from the inline override if ctx mutates mid-translate.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    render_blocker_reply = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    render_blocker_reply = (
+        local_blocker_signal is not None and local_blocker_signal.renders_final_reply and not budget_drain
+    )
     blocker_active = render_blocker_reply
     if local_blocker_signal is not None and render_blocker_reply:
         # Override only user-visible text + resp_type so REPLACE_WORKFLOW and ASK_QUESTION gating skip the model's side-effect path; the shim is the sole renderer.
@@ -3689,7 +3806,13 @@ async def _translate_to_agent_result(
     # renderer owns the final reply, so reshaping the agent's prose first
     # would be wasted work the finalization shim discards.
     direct_test_handoff = chat_request.product_action == "test_end_to_end"
-    if not blocker_active and resp_type != "ASK_QUESTION" and not salvaged_reply and not direct_test_handoff:
+    if (
+        not budget_drain
+        and not blocker_active
+        and resp_type != "ASK_QUESTION"
+        and not salvaged_reply
+        and not direct_test_handoff
+    ):
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     last_workflow = None
@@ -3803,6 +3926,8 @@ async def _translate_to_agent_result(
             require_full_workflow_test=direct_test_handoff,
             evaluated_reason_codes=list(raw_output_policy_verdict.reason_codes),
         )
+    if budget_drain:
+        ctx.budget_expiry_state.report_produced = True
 
     final_user_response = str(user_response)
     connected_account_choices = await _verified_connected_account_choices(
@@ -3815,12 +3940,6 @@ async def _translate_to_agent_result(
         # copy owns the choice interaction. Do not let model prose invite an
         # account-name reply or mix password credentials into this OAuth path.
         final_user_response = _connected_google_account_choice_reply()
-    # Parts describe the model's own question, so every path that replaces the reply with
-    # server-authored copy leaves them describing text the user never sees.
-    server_authored_reply = blocker_active or unbacked_workflow_delivery_rewritten or bool(connected_account_choices)
-    ctx.question_parts = (
-        admit_question_parts(action_data.get("parts")) if model_authored_ask and not server_authored_reply else []
-    )
     attempted_kind = _concrete_narrative_response_kind(
         response_type=resp_type,
         has_workflow_attempt=ctx.has_genuine_workflow_attempt(),
@@ -3838,54 +3957,53 @@ async def _translate_to_agent_result(
     )
     if connected_account_choices:
         turn_outcome = turn_outcome.model_copy(update={"connected_account_choices": connected_account_choices})
-    return _finalize_result_with_blocker_override(
+    translated_result = _make_agent_result(
         ctx,
-        _make_agent_result(
-            ctx,
-            user_response=final_user_response,
-            updated_workflow=last_workflow,
-            global_llm_context=enriched_context or None,
-            response_type=resp_type,
-            workflow_yaml=last_workflow_yaml,
-            workflow_was_persisted=ctx.workflow_persisted,
-            has_staged_proposal=ctx.has_staged_proposal,
-            staged_workflow_yaml=ctx.staged_workflow_yaml,
-            staged_workflow=ctx.staged_workflow,
-            canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
-            total_tokens=ctx.total_tokens_used,
-            clear_proposed_workflow=resp_type == "ASK_QUESTION" and last_workflow is None,
-            proposal_disposition=(
-                "no_proposal"
-                if unbacked_workflow_delivery_rewritten and last_workflow is None
-                else "review_tested"
-                if chat_request.product_action == "test_end_to_end"
-                and last_workflow is not None
-                and ctx.last_full_workflow_test_ok is True
-                else "review_untested"
-                if chat_request.product_action == "test_end_to_end" and last_workflow is not None
-                else "no_proposal"
-                if chat_request.product_action == "test_end_to_end"
-                else "review_untested"
-                if unvalidated
-                else "review_tested"
-                if resp_type == "ASK_QUESTION" and last_workflow is not None
-                else "no_proposal"
-                if resp_type == "ASK_QUESTION"
-                else "auto_applicable"
-            ),
-            output_policy_diagnostics=output_policy_diagnostics,
-            turn_outcome=turn_outcome,
-            turn_id=ctx.turn_id,
-            narrative_summary=ctx.narrative_summary,
-            narrative_payload=_build_narrative_payload(
-                ctx,
-                terminal="response",
-                terminal_message=final_user_response,
-                narrative_summary=ctx.narrative_summary,
-            ),
+        user_response=final_user_response,
+        updated_workflow=last_workflow,
+        global_llm_context=enriched_context or None,
+        response_type=resp_type,
+        workflow_yaml=last_workflow_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+        has_staged_proposal=ctx.has_staged_proposal,
+        staged_workflow_yaml=ctx.staged_workflow_yaml,
+        staged_workflow=ctx.staged_workflow,
+        canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+        total_tokens=ctx.total_tokens_used,
+        clear_proposed_workflow=(resp_type == "ASK_QUESTION" and last_workflow is None),
+        proposal_disposition=(
+            "no_proposal"
+            if unbacked_workflow_delivery_rewritten and last_workflow is None
+            else "review_tested"
+            if chat_request.product_action == "test_end_to_end"
+            and last_workflow is not None
+            and ctx.last_full_workflow_test_ok is True
+            else "review_untested"
+            if chat_request.product_action == "test_end_to_end" and last_workflow is not None
+            else "no_proposal"
+            if chat_request.product_action == "test_end_to_end"
+            else "review_untested"
+            if unvalidated
+            else "review_tested"
+            if resp_type == "ASK_QUESTION" and last_workflow is not None
+            else "no_proposal"
+            if resp_type == "ASK_QUESTION"
+            else "auto_applicable"
         ),
-        exit_site="translate_to_agent_result",
+        output_policy_diagnostics=output_policy_diagnostics,
+        turn_outcome=turn_outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_user_response,
+            narrative_summary=ctx.narrative_summary,
+        ),
     )
+    if budget_drain:
+        return translated_result
+    return _finalize_result_with_blocker_override(ctx, translated_result, exit_site="translate_to_agent_result")
 
 
 def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None:
@@ -3893,6 +4011,156 @@ def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None
     if not fallback_key or fallback_key == current_llm_key:
         return None
     return fallback_key
+
+
+EMPTY_COMPLETION_TERMINAL_MESSAGE = "The model produced no response and nothing in the workflow was changed."
+EMPTY_COMPLETION_AFTER_WORKFLOW_CHANGE_MESSAGE = "The model produced no response after the workflow was changed."
+EMPTY_COMPLETION_AFTER_ACTION_MESSAGE = (
+    "The model produced no final response after taking actions in this turn. Nothing in the workflow was changed."
+)
+
+
+def _model_attempt_source_revision() -> str | None:
+    revision = os.environ.get("GIT_COMMIT") or os.environ.get("DD_VERSION") or os.environ.get("COMMIT_SHA")
+    if revision:
+        return revision
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[4],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _empty_completion_error(
+    result: RunResultStreaming,
+    *,
+    ctx: CopilotContext,
+    tool_call_count_start: int,
+    llm_key: str,
+    stop_metadata: CopilotModelStopMetadata,
+) -> CopilotEmptyCompletionError | None:
+    if ctx.budget_expiry_state.drain_attempted or isinstance(ctx.turn_halt, TurnHalt):
+        return None
+    if extract_final_text(result).strip():
+        return None
+    tool_calls_observed = ctx.tool_calls_this_turn > tool_call_count_start or any(
+        isinstance(item, ToolCallItem) for item in result.new_items
+    )
+    return CopilotEmptyCompletionError(
+        llm_key=llm_key,
+        stop_metadata=stop_metadata,
+        retry_allowed=not tool_calls_observed,
+    )
+
+
+def _dump_model_attempt_packet(
+    *,
+    result: RunResultStreaming,
+    ctx: CopilotContext,
+    model_name: str,
+    llm_key: str,
+    is_fallback: bool,
+    stop_metadata: CopilotModelStopMetadata,
+    outcome: str,
+    tool_call_count: int,
+    retry_allowed: bool | None,
+) -> None:
+    root_value = os.environ.get("COPILOT_DUMP_MODEL_ATTEMPTS")
+    if not root_value:
+        return
+    try:
+        root = Path(root_value).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        final_output_present = bool(extract_final_text(result).strip())
+        payload = {
+            "version": 1,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "source_revision": _model_attempt_source_revision(),
+            "turn_fingerprint": hashlib.sha256(ctx.turn_id.encode()).hexdigest(),
+            "model_name": model_name,
+            "llm_key": llm_key,
+            "is_fallback": is_fallback,
+            "outcome": outcome,
+            "final_output_present": final_output_present,
+            "tool_call_count": tool_call_count,
+            "retry_allowed": retry_allowed,
+            "new_item_types": [item.type for item in result.new_items],
+            "stop_metadata": stop_metadata.log_fields(),
+        }
+        label = "empty" if outcome == CopilotEmptyCompletionError.reason else "success"
+        target = root / f"attempt-{label}.json"
+        try:
+            with target.open("x", encoding="utf-8") as packet_file:
+                json.dump(payload, packet_file, indent=2, sort_keys=True)
+                packet_file.write("\n")
+        except FileExistsError:
+            target = root / f"attempt-{label}-{uuid.uuid4().hex}.json"
+            with target.open("x", encoding="utf-8") as packet_file:
+                json.dump(payload, packet_file, indent=2, sort_keys=True)
+                packet_file.write("\n")
+    except Exception:
+        LOG.warning("Copilot model attempt capture failed", exc_info=True)
+
+
+def _build_empty_completion_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+) -> AgentResult:
+    terminal_message = (
+        EMPTY_COMPLETION_AFTER_WORKFLOW_CHANGE_MESSAGE
+        if ctx.has_staged_proposal
+        else EMPTY_COMPLETION_AFTER_ACTION_MESSAGE
+        if ctx.tool_calls_this_turn
+        else EMPTY_COMPLETION_TERMINAL_MESSAGE
+    )
+    staged_workflow = ctx.staged_workflow if ctx.has_staged_proposal else None
+    staged_workflow_yaml = ctx.staged_workflow_yaml if staged_workflow is not None else None
+    proposal_disposition: ProposalDisposition = "review_untested" if staged_workflow is not None else "no_proposal"
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=terminal_message,
+        attempted_kind=ResponseKind.BUILD,
+        blocked_signatures=ctx.blocked_reply_signatures,
+        reason_code=CopilotEmptyCompletionError.reason,
+        terminal_reason=CopilotEmptyCompletionError.reason,
+    )
+    _log_output_policy_parity(
+        ctx,
+        has_workflow_proposal=staged_workflow is not None,
+        workflow_attempted=False,
+    )
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=staged_workflow,
+        global_llm_context=global_llm_context,
+        response_type="REPLY",
+        workflow_yaml=staged_workflow_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+        has_staged_proposal=ctx.has_staged_proposal,
+        staged_workflow_yaml=staged_workflow_yaml,
+        staged_workflow=staged_workflow,
+        canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+        total_tokens=ctx.total_tokens_used,
+        proposal_disposition=proposal_disposition,
+        turn_outcome=outcome,
+        terminal_cause_override="empty_completion",
+        terminal_verified_override=False,
+        turn_id=ctx.turn_id,
+        narrative_summary=terminal_message,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="error",
+            terminal_message=terminal_message,
+            narrative_summary=terminal_message,
+        ),
+    )
 
 
 async def _run_agent_loop_with_surface(
@@ -3911,15 +4179,17 @@ async def _run_agent_loop_with_surface(
     overlays: dict[str, Any],
     output_guardrails: list[Any],
     allow_untested_retry: bool = False,
+    is_fallback: bool = False,
 ) -> Any:
     # No model owns the attempt until setup completes and enforcement is ready to
     # enter the model loop. This also clears a prior model before fallback setup.
     ctx.resolved_model = None
     from agents import Agent
+    from agents.exceptions import InputGuardrailTripwireTriggered, MaxTurnsExceeded, OutputGuardrailTripwireTriggered
     from agents.mcp import MCPServerManager
 
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
-    from skyvern.forge.sdk.copilot.enforcement import run_with_enforcement
+    from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, run_with_enforcement
     from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
@@ -3931,7 +4201,7 @@ async def _run_agent_loop_with_surface(
         allowlist=frozenset(alias_map.values()),
         context_provider=lambda: ctx,
         ordered_allowlist=(tuple(alias_map.values()) if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION else None),
-        enforce_dispatch_allowlist=ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION,
+        enforce_dispatch_allowlist=(ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION),
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
@@ -3944,51 +4214,114 @@ async def _run_agent_loop_with_surface(
     )
     session = create_copilot_session(chat_id)
     model_token = _copilot_model_name.set(model_name)
+    tool_call_count_start = ctx.tool_calls_this_turn
     try:
-        async with MCPServerManager([mcp_server]) as manager:
-            agent.mcp_servers = list(manager.active_servers)
-            if ctx.eval_mode is not None:
-                advertised_mcp_tools = await mcp_server.list_tools()
-                ctx.eval_tool_surface_sha256 = CopilotToolSurface(
-                    native_tools=tuple(native_tools),
-                    alias_map=alias_map,
-                    overlays=overlays,
-                    ordered_native_names=tuple(tool.name for tool in native_tools),
-                    # Without the ablation's ordered allowlist the server publishes in its own
-                    # order, so record the order advertised rather than asserting one.
-                    ordered_mcp_names=tuple(tool.name for tool in advertised_mcp_tools),
-                ).advertised_sha256(advertised_mcp_tools)
-            attempts = 2 if allow_untested_retry else 1
-            for attempt in range(attempts):
-                try:
-                    ctx.resolved_model = model_name
-                    result = await run_with_enforcement(
-                        agent=agent,
-                        initial_input=initial_input,
-                        ctx=ctx,
-                        stream=stream,
-                        max_turns=copilot_config.max_turns,
-                        hooks=CopilotRunHooks(ctx),
-                        run_config=run_config,
-                        session=session,
-                        copilot_config=copilot_config,
+        with model_attempt_telemetry_scope() as attempt_telemetry:
+            try:
+                async with MCPServerManager([mcp_server]) as manager:
+                    agent.mcp_servers = list(manager.active_servers)
+                    if ctx.eval_mode is not None:
+                        advertised_mcp_tools = await mcp_server.list_tools()
+                        ctx.eval_tool_surface_sha256 = CopilotToolSurface(
+                            native_tools=tuple(native_tools),
+                            alias_map=alias_map,
+                            overlays=overlays,
+                            ordered_native_names=tuple(tool.name for tool in native_tools),
+                            # Without the ablation's ordered allowlist the server publishes in its own
+                            # order, so record the order advertised rather than asserting one.
+                            ordered_mcp_names=tuple(tool.name for tool in advertised_mcp_tools),
+                        ).advertised_sha256(advertised_mcp_tools)
+                    attempts = 2 if allow_untested_retry else 1
+                    for attempt in range(attempts):
+                        try:
+                            ctx.resolved_model = model_name
+                            result = await run_with_enforcement(
+                                agent=agent,
+                                initial_input=initial_input,
+                                ctx=ctx,
+                                stream=stream,
+                                max_turns=copilot_config.max_turns,
+                                hooks=CopilotRunHooks(ctx),
+                                run_config=run_config,
+                                session=session,
+                                copilot_config=copilot_config,
+                            )
+                            break
+                        except Exception as exc:
+                            if (
+                                attempt + 1 < attempts
+                                and getattr(ctx, "last_workflow", None) is None
+                                and isinstance(exc, LiteLLMNotFoundError)
+                            ):
+                                LOG.warning("Retrying untested draft agent loop after model lookup failure")
+                                continue
+                            raise
+                stop_metadata = attempt_telemetry.latest_stop_metadata
+                empty_error = _empty_completion_error(
+                    result,
+                    ctx=ctx,
+                    tool_call_count_start=tool_call_count_start,
+                    llm_key=llm_key,
+                    stop_metadata=stop_metadata,
+                )
+                attempt_outcome = empty_error.reason if empty_error is not None else "success"
+                attempt_tool_call_count = max(
+                    ctx.tool_calls_this_turn - tool_call_count_start,
+                    sum(isinstance(item, ToolCallItem) for item in result.new_items),
+                )
+                _dump_model_attempt_packet(
+                    result=result,
+                    ctx=ctx,
+                    model_name=model_name,
+                    llm_key=llm_key,
+                    is_fallback=is_fallback,
+                    stop_metadata=stop_metadata,
+                    outcome=attempt_outcome,
+                    tool_call_count=attempt_tool_call_count,
+                    retry_allowed=empty_error.retry_allowed if empty_error is not None else None,
+                )
+                if empty_error is not None:
+                    raise empty_error
+            except Exception as exc:
+                stop_metadata = (
+                    exc.stop_metadata
+                    if isinstance(exc, CopilotEmptyCompletionError)
+                    else attempt_telemetry.latest_stop_metadata
+                )
+                routine_terminal_exceptions = (
+                    CopilotTurnHalt,
+                    InputGuardrailTripwireTriggered,
+                    OutputGuardrailTripwireTriggered,
+                    CopilotTotalTimeoutError,
+                    MaxTurnsExceeded,
+                )
+                if isinstance(exc, routine_terminal_exceptions):
+                    LOG.info(
+                        "Copilot agent model attempt stopped",
+                        workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+                        llm_key=llm_key,
+                        attempt_outcome="terminal",
+                        error_type=type(exc).__name__,
+                        **stop_metadata.log_fields(),
                     )
-                    break
-                except Exception as exc:
-                    if (
-                        attempt + 1 < attempts
-                        and getattr(ctx, "last_workflow", None) is None
-                        and isinstance(exc, LiteLLMNotFoundError)
-                    ):
-                        LOG.warning("Retrying untested draft agent loop after model lookup failure")
-                        continue
-                    raise
-        LOG.info(
-            "Copilot agent model attempt succeeded",
-            workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
-            llm_key=llm_key,
-        )
-        return result
+                else:
+                    LOG.warning(
+                        "Copilot agent model attempt failed",
+                        workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+                        llm_key=llm_key,
+                        attempt_outcome=(exc.reason if isinstance(exc, CopilotEmptyCompletionError) else "failed"),
+                        error_type=type(exc).__name__,
+                        **stop_metadata.log_fields(),
+                    )
+                raise
+            LOG.info(
+                "Copilot agent model attempt succeeded",
+                workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+                llm_key=llm_key,
+                attempt_outcome="success",
+                **attempt_telemetry.latest_stop_metadata.log_fields(),
+            )
+            return result
     finally:
         _copilot_model_name.reset(model_token)
         session.close()
@@ -4023,7 +4356,8 @@ def _build_request_policy_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=not outcome_fully_verified(ctx),
+            clear_proposed_workflow=(not outcome_fully_verified(ctx)),
+            proposal_disposition="no_proposal",
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -4698,9 +5032,8 @@ async def _run_copilot_turn_impl(
     safe_prior_user_messages = redact_refused_secret_turns(list(prior_user_messages))
     chat_history_text = _format_chat_history(safe_chat_history_messages)
     safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
-    safe_workflow_yaml = redact_raw_secrets_for_prompt(chat_request.workflow_yaml or "")
     safe_global_llm_context = build_model_safe_global_llm_context(global_llm_context)
-    previous_user_messages = [msg.content for msg in safe_chat_history_messages if msg.sender == "user"]
+    previous_user_messages = [msg.content for msg in safe_chat_history_messages if msg.sender in TURN_OPENER_SENDERS]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
 
     try:
@@ -4752,6 +5085,7 @@ async def _run_copilot_turn_impl(
         api_key=api_key,
         user_message=chat_request.message,
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+        copilot_cancel_token=chat_request.cancel_token,
         auto_accept=auto_accept,
         eval_capture_case_id=eval_capture_case_id,
         eval_mode=eval_mode,
@@ -4769,6 +5103,9 @@ async def _run_copilot_turn_impl(
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
         },
     )
+    await restore_pending_workflow_proposal(ctx)
+    chat_request.workflow_yaml = ctx.workflow_yaml
+    safe_workflow_yaml = redact_raw_secrets_for_prompt(ctx.workflow_yaml or "")
     # Before the turn acts: a repair opened about a failed run inherits that run's identity and the
     # browser it used, so a tool asked to look at the run has something to look at from the first
     # call rather than only after this turn has run something itself.
@@ -4819,7 +5156,8 @@ async def _run_copilot_turn_impl(
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
         persisted_workflow_yaml=persisted_workflow_yaml,
-        selected_connected_account_id=selected_connected_account_id(prior_turn_outcome, chat_request.message),
+        selected_connected_account_id=chat_request.selected_connected_account_id
+        or selected_connected_account_id(prior_turn_outcome, chat_request.message),
         stored_completion_criteria=stored_completion_criteria,
     )
     request_policy_guardrails = _build_copilot_input_guardrails(
@@ -4939,7 +5277,6 @@ async def _run_copilot_turn_impl(
             safe_global_llm_context = seeded_context.to_json_str()
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
-        CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
         CopilotUnrecoverableToolError,
         gate_decision_trace_fields,
@@ -4954,12 +5291,9 @@ async def _run_copilot_turn_impl(
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
     ctx.browser_session_id = validated_browser_session_id
 
-    direct_test_handoff: list[dict[str, str]] | None = None
+    direct_test_handoff = None
     if chat_request.product_action == "test_end_to_end":
-        direct_test_handoff = await _run_end_to_end_test_turn(
-            ctx,
-            workflow_yaml=chat_request.workflow_yaml or "",
-        )
+        direct_test_handoff = await _run_end_to_end_test_turn(ctx, workflow_yaml=chat_request.workflow_yaml or "")
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
         llm_api_handler,
@@ -4975,7 +5309,7 @@ async def _run_copilot_turn_impl(
     )
     surface = resolve_copilot_tool_surface(
         mode=eval_mode,
-        native_tools=list(NATIVE_TOOLS),
+        native_tools=[tool for tool in NATIVE_TOOLS if tool.name != "ask_user" or chat_request.supports_question_tool],
         alias_map=alias_map,
         overlays=overlays,
         registered_mcp_tools=registered_mcp_tools,
@@ -5007,7 +5341,10 @@ async def _run_copilot_turn_impl(
             runnable_draft_summary = ctx.turn_context_packet.runnable_draft_context.rendered_summary
 
     scoped_global_llm_context = safe_global_llm_context
-    prior_choice_context = connected_account_choice_context(prior_turn_outcome, chat_request.message)
+    prior_choice_context = connected_account_choice_context(
+        prior_turn_outcome,
+        explicit_selected_connection_id=request_policy.selected_connected_account_id,
+    )
     if prior_choice_context:
         scoped_global_llm_context = (
             f"{scoped_global_llm_context}\n\nCONNECTED ACCOUNT CHOICE FACTS:\n{prior_choice_context}"
@@ -5073,6 +5410,8 @@ async def _run_copilot_turn_impl(
         attempt_model_name: str,
         attempt_run_config: Any,
         attempt_llm_key: str,
+        *,
+        is_fallback: bool,
     ) -> RunResultStreaming:
         attempt = await _run_agent_loop_with_surface(
             ctx=ctx,
@@ -5089,6 +5428,7 @@ async def _run_copilot_turn_impl(
             overlays=overlays,
             output_guardrails=output_guardrails,
             allow_untested_retry=ctx.allow_untested_workflow_draft,
+            is_fallback=is_fallback,
         )
         return attempt
 
@@ -5096,7 +5436,7 @@ async def _run_copilot_turn_impl(
         with trace_context:
             try:
                 try:
-                    result = await _run_attempt(model_name, run_config, llm_key)
+                    result = await _run_attempt(model_name, run_config, llm_key, is_fallback=False)
                 except Exception as primary_error:
                     fallback_llm_key = _fallback_llm_key(copilot_config, llm_key)
                     if fallback_llm_key is None or not _is_retriable_llm_error(primary_error):
@@ -5116,7 +5456,12 @@ async def _run_copilot_turn_impl(
                         )
                     )
                     ctx.supports_vision = fallback_supports_vision
-                    result = await _run_attempt(fallback_model_name, fallback_run_config, fallback_resolved_key)
+                    result = await _run_attempt(
+                        fallback_model_name,
+                        fallback_run_config,
+                        fallback_resolved_key,
+                        is_fallback=True,
+                    )
                 agent_result = await _translate_to_agent_result(
                     result,
                     ctx,
@@ -5171,9 +5516,11 @@ async def _run_copilot_turn_impl(
                 )
                 return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
-                return _handle_max_turns_exceeded(ctx, global_llm_context)
+                return _handle_budget_drain_exhausted(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
-                return _build_timeout_exit_result(ctx, global_llm_context)
+                return _build_budget_expiry_exit_result(ctx, global_llm_context)
+            except CopilotEmptyCompletionError:
+                return _build_empty_completion_exit_result(ctx, global_llm_context)
             except CopilotUnrecoverableToolError as exc:
                 LOG.warning(
                     "Copilot run halted on unrecoverable tool error",
@@ -5189,44 +5536,7 @@ async def _run_copilot_turn_impl(
                     error_message=exc.error_message,
                     organization_id=organization_id,
                 )
-                # Non-retriable nav errors prove the current workflow doesn't
-                # work; zero the proposal even if other tools succeeded.
-                nav_reply = (
-                    f"The target URL could not be reached. Error: {exc.error_message}. "
-                    "Please verify the URL and try again."
-                )
-                final_nav_text, nav_outcome = apply_repeated_reply_guard(
-                    final_text=nav_reply,
-                    attempted_kind=ResponseKind.CLARIFY,
-                    blocked_signatures=ctx.blocked_reply_signatures,
-                    terminal_reason="non_retriable_nav",
-                )
-                return _finalize_result_with_blocker_override(
-                    ctx,
-                    _make_agent_result(
-                        ctx,
-                        user_response=final_nav_text,
-                        updated_workflow=None,
-                        global_llm_context=global_llm_context,
-                        workflow_yaml=None,
-                        workflow_was_persisted=ctx.workflow_persisted,
-                        has_staged_proposal=ctx.has_staged_proposal,
-                        staged_workflow_yaml=ctx.staged_workflow_yaml,
-                        staged_workflow=ctx.staged_workflow,
-                        canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
-                        total_tokens=ctx.total_tokens_used,
-                        turn_outcome=nav_outcome,
-                        turn_id=ctx.turn_id,
-                        narrative_summary=ctx.narrative_summary,
-                        narrative_payload=_build_narrative_payload(
-                            ctx,
-                            terminal="response",
-                            terminal_message=final_nav_text,
-                            narrative_summary=ctx.narrative_summary,
-                        ),
-                    ),
-                    exit_site="non_retriable_nav",
-                )
+                return _build_non_retriable_nav_exit_result(ctx, global_llm_context, exc)
     except Exception as e:
         try:
             # Terminal-path gate-decision record; the per-tool hook records the

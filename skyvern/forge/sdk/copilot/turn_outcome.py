@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import structlog
 
+from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.signature import compute_signature
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 
@@ -23,7 +24,7 @@ IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
 # ROUTE_OWNED_TERMINAL_REASONS in dev_scripts/replay_turn_outcome_kind.py for the full split.
 CANCEL_TERMINAL_REASON = "cancel"
 UNEXPECTED_ERROR_TERMINAL_REASON = "unexpected_error"
-CopilotComposerMode = Literal["ask", "build", "code"]
+CopilotComposerMode = Literal["build", "code"]
 
 
 def selected_connected_account_id(outcome: TurnOutcome | None, current_user_message: str) -> str | None:
@@ -37,16 +38,21 @@ def selected_connected_account_id(outcome: TurnOutcome | None, current_user_mess
     )
 
 
-def connected_account_choice_context(outcome: TurnOutcome | None, current_user_message: str) -> str:
+def connected_account_choice_context(
+    outcome: TurnOutcome | None,
+    *,
+    explicit_selected_connection_id: str | None = None,
+) -> str:
+    """Expose the validated picker selection as context; authorization remains in request policy."""
     choices = outcome.connected_account_choices if outcome is not None else None
-    if not choices:
+    if not choices and explicit_selected_connection_id is None:
         return ""
-    payload: dict[str, Any] = {
-        "connected_account_choices": [choice.model_dump(mode="json") for choice in choices],
-    }
-    selected_connection_id = selected_connected_account_id(outcome, current_user_message)
-    if selected_connection_id is not None:
-        payload["selected_connection_id"] = selected_connection_id
+    payload: dict[str, Any] = {}
+    if choices:
+        payload["connected_account_choices"] = [choice.model_dump(mode="json") for choice in choices]
+    if explicit_selected_connection_id is not None:
+        payload["selection_source"] = "user_picker"
+        payload["selected_connection_id"] = explicit_selected_connection_id
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -107,6 +113,21 @@ def with_copilot_code_mode_diagnostics(outcome: TurnOutcome, ctx: Any) -> TurnOu
     return outcome.model_copy(update=derive_copilot_code_mode_diagnostics(ctx))
 
 
+def with_budget_expiry(outcome: TurnOutcome, state: BudgetExpiryState) -> TurnOutcome:
+    if state.source is None:
+        return outcome
+    return outcome.model_copy(
+        update={
+            "terminal_reason": "timeout" if state.source == "deadline" else "max_turns",
+            "budget_expired": True,
+            "budget_expiry_source": state.source,
+            "budget_expiry_report_produced": state.report_produced,
+            "budget_expiry_staged_draft_id": state.staged_draft_id,
+            "drain_fingerprint": state.drain_fingerprint,
+        }
+    )
+
+
 def with_copilot_code_mode_metadata(
     outcome: TurnOutcome,
     *,
@@ -116,6 +137,7 @@ def with_copilot_code_mode_metadata(
 ) -> TurnOutcome:
     return outcome.model_copy(
         update={
+            "copilot_runtime": "agent",
             "copilot_effective_mode": effective_mode,
             "copilot_code_available": code_available,
             "copilot_turn_id": turn_id,

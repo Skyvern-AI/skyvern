@@ -45,8 +45,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_evidence_commit_lock,
     browser_page_custody_lock,
     clear_sensitive_origin_page_taint,
+    sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -1350,7 +1350,7 @@ async def _inspect_page_for_composition_under_custody(
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
 
-    if sensitive_origin_page_is_tainted(copilot_ctx) and not sensitive_same_turn_run:
+    if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
         result = {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result

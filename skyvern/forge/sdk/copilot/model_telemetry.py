@@ -5,7 +5,7 @@ import contextvars
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Literal, cast, overload
 from urllib.parse import urlparse
@@ -51,6 +51,41 @@ LOG = structlog.get_logger()
 _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 
 
+@dataclass(frozen=True, slots=True)
+class CopilotModelStopMetadata:
+    model_call_index: int | None
+    finish_reason: str | None = None
+    incomplete_details: dict[str, str] | None = None
+    refusal: bool | None = None
+    content_filter: bool | None = None
+    usage_missing: bool = True
+
+    @classmethod
+    def unknown(cls) -> CopilotModelStopMetadata:
+        return cls(model_call_index=None)
+
+    def log_fields(self) -> dict[str, int | str | bool | dict[str, str] | None]:
+        return {
+            "model_call_index": self.model_call_index,
+            "finish_reason": self.finish_reason,
+            "incomplete_details": self.incomplete_details,
+            "refusal": self.refusal,
+            "content_filter": self.content_filter,
+            "usage_missing": self.usage_missing,
+        }
+
+
+@dataclass(slots=True)
+class CopilotModelAttemptTelemetry:
+    latest_stop_metadata: CopilotModelStopMetadata = field(default_factory=CopilotModelStopMetadata.unknown)
+
+    def record(self, metadata: CopilotModelStopMetadata) -> None:
+        current_index = self.latest_stop_metadata.model_call_index
+        next_index = metadata.model_call_index
+        if next_index is not None and (current_index is None or next_index >= current_index):
+            self.latest_stop_metadata = metadata
+
+
 def _usage_field(value: Any, *keys: str) -> Any:
     for key in keys:
         if isinstance(value, dict):
@@ -74,6 +109,10 @@ class CopilotModelCallTelemetry:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    finish_reason: str | None = None
+    incomplete_details: dict[str, str] | None = None
+    refusal: bool | None = None
+    content_filter: bool | None = None
 
     def capture(self, usage: Any | None) -> None:
         if usage is None:
@@ -96,15 +135,43 @@ class CopilotModelCallTelemetry:
             if isinstance(cache_write, int) and not isinstance(cache_write, bool):
                 self.cache_write_tokens = cache_write
 
+    def stop_metadata(self) -> CopilotModelStopMetadata:
+        return CopilotModelStopMetadata(
+            model_call_index=self.model_call_index,
+            finish_reason=self.finish_reason,
+            incomplete_details=self.incomplete_details,
+            refusal=self.refusal,
+            content_filter=self.content_filter,
+            usage_missing=self.input_tokens is None and self.output_tokens is None,
+        )
+
 
 _current_model_call_telemetry: contextvars.ContextVar[CopilotModelCallTelemetry | None] = contextvars.ContextVar(
     "_current_model_call_telemetry",
+    default=None,
+)
+_current_model_attempt_telemetry: contextvars.ContextVar[CopilotModelAttemptTelemetry | None] = contextvars.ContextVar(
+    "_current_model_attempt_telemetry",
     default=None,
 )
 
 
 def current_model_call_telemetry() -> CopilotModelCallTelemetry | None:
     return _current_model_call_telemetry.get()
+
+
+def current_model_attempt_telemetry() -> CopilotModelAttemptTelemetry | None:
+    return _current_model_attempt_telemetry.get()
+
+
+@contextlib.contextmanager
+def model_attempt_telemetry_scope() -> Iterator[CopilotModelAttemptTelemetry]:
+    telemetry = CopilotModelAttemptTelemetry()
+    token = _current_model_attempt_telemetry.set(telemetry)
+    try:
+        yield telemetry
+    finally:
+        _current_model_attempt_telemetry.reset(token)
 
 
 def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
@@ -192,7 +259,60 @@ def model_call_telemetry_scope(
         except Exception:
             pass
         finally:
+            attempt_telemetry = current_model_attempt_telemetry()
+            if attempt_telemetry is not None:
+                attempt_telemetry.record(telemetry.stop_metadata())
             _current_model_call_telemetry.reset(token)
+
+
+def _capture_chat_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+    """Capture only typed transport exit facts; no model text reaches logs."""
+
+    choices = _usage_field(response, "choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        finish_reason = _usage_field(choice, "finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            telemetry.finish_reason = finish_reason
+            telemetry.content_filter = finish_reason == "content_filter"
+        message = _usage_field(choice, "message", "delta")
+        if message is None:
+            continue
+        refusal = _usage_field(message, "refusal")
+        provider_fields = _usage_field(message, "provider_specific_fields")
+        if refusal is None and provider_fields is not None:
+            refusal = _usage_field(provider_fields, "refusal")
+        if isinstance(refusal, str):
+            telemetry.refusal = bool(refusal)
+        elif telemetry.refusal is None and finish_reason is not None:
+            telemetry.refusal = False
+
+
+def _capture_responses_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+    status = _usage_field(response, "status")
+    incomplete = _usage_field(response, "incomplete_details")
+    reason = _usage_field(incomplete, "reason") if incomplete is not None else None
+    if isinstance(reason, str) and reason:
+        telemetry.incomplete_details = {"reason": reason}
+        telemetry.content_filter = reason == "content_filter"
+
+    output = _usage_field(response, "output")
+    if isinstance(output, list):
+        refused = False
+        for item in output:
+            content = _usage_field(item, "content")
+            if not isinstance(content, list):
+                continue
+            if any(_usage_field(part, "type") == "refusal" for part in content):
+                refused = True
+        telemetry.refusal = refused
+    if (
+        isinstance(status, str)
+        and status in {"completed", "failed", "incomplete", "cancelled"}
+        and telemetry.content_filter is None
+    ):
+        telemetry.content_filter = False
 
 
 class _UsageCapturingStream:
@@ -217,6 +337,7 @@ class _UsageCapturingStream:
         usage = getattr(chunk, "usage", None)
         if isinstance(usage, (LiteLLMUsage, CompletionUsage)):
             _capture_usage(self._telemetry, usage)
+        _capture_chat_stop_metadata(self._telemetry, chunk)
         return chunk
 
 
@@ -239,6 +360,10 @@ class _ResponsesUsageCapturingStream:
         usage = getattr(response, "usage", None)
         if usage is not None:
             _capture_usage(self._telemetry, usage)
+        if response is not None:
+            _capture_responses_stop_metadata(self._telemetry, response)
+        if _usage_field(event, "type") in {"response.refusal.delta", "response.refusal.done"}:
+            self._telemetry.refusal = True
         return event
 
 
@@ -420,6 +545,7 @@ class CopilotLitellmModel(LitellmModel):
                 usage = result.get("usage")
                 if isinstance(usage, LiteLLMUsage):
                     _capture_usage(telemetry, usage)
+                _capture_chat_stop_metadata(telemetry, result)
             return result
 
         response, response_stream = result
@@ -543,6 +669,7 @@ class CopilotLitellmModel(LitellmModel):
             if isinstance(raw_response.model, str):
                 telemetry.response_model = raw_response.model
             _capture_usage(telemetry, raw_response.usage)
+            _capture_responses_stop_metadata(telemetry, raw_response)
         model_response = responses_api_bridge.transformation_handler.transform_response(
             model=self.model,
             raw_response=raw_response,

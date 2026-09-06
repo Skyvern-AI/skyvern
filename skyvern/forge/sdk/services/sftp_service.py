@@ -61,7 +61,9 @@ async def upload_file(
         known_hosts: bytes | None = f"{entry} {host_key}\n".encode()
     else:
         known_hosts = None
-        LOG.warning("SFTP host key verification disabled; no host_key provided", host=host, port=port)
+        # The host can be a value the workflow bound to a secret parameter, and `host` is
+        # not redacted by log_redaction. The run context already identifies the block.
+        LOG.warning("SFTP host key verification disabled; no host_key provided", port=port)
     connect_kwargs["known_hosts"] = known_hosts
 
     if private_key:

@@ -12,6 +12,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
     WorkflowDefinitionYamlBlocksItem_Code,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
+    WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
 
@@ -111,6 +112,7 @@ class Mouse(BaseModel):
 OutputBlock = t.Union[
     WorkflowDefinitionYamlBlocksItem_Action,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
+    WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
 ]
 
@@ -135,6 +137,7 @@ class RecordingDraftStep(BaseModel):
     timestamp_start: float | None = None
     timestamp_end: float | None = None
     credential_kind: CredentialKind | None = None
+    credential_id: str | None = None
 
 
 class RecordingInterpretationUpdate(BaseModel):

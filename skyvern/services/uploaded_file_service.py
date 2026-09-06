@@ -236,11 +236,12 @@ async def resolve_file_reference(*, file_id: str, organization_id: str) -> str |
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:
-    """Delete files whose caller-specified retention period has elapsed.
+    """Delete files whose retention period has elapsed.
 
-    Only rows that carry an ``expires_at`` are eligible: a file uploaded without a
-    retention period is never touched here, so this job can only ever remove data a
-    caller explicitly asked to have removed.
+    Only rows that carry an ``expires_at`` are eligible — an expiry the caller asked for at
+    upload, or one set by the organization's data-retention policy. Deleting an object that
+    is already gone is a no-op in every storage backend, so a row whose object went first
+    still converges.
     """
     now = datetime.now(timezone.utc)
     expired = await app.DATABASE.uploaded_files.get_expired_uploaded_files(before=now, limit=limit)

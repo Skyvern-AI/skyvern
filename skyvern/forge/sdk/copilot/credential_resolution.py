@@ -73,6 +73,26 @@ def url_parts(url: str) -> tuple[str, str, str] | None:
     return (f"{without_query}?{query}" if query else without_query), without_query, origin
 
 
+def safe_admitted_url(url: str) -> str:
+    """The part of an admitted login URL that the origin check reads, with nothing else.
+
+    A live sign-in URL carries `?state=`/`?code=`/reset tokens and can carry `user:pass@`. This value
+    is persisted into the chat context and enters the next model prompt, so it keeps only the scheme,
+    host, port and path the exact and path tiers match on.
+    """
+    parsed = _parse_url(url if "://" in url else f"https://{url}")
+    if parsed is None or not parsed.hostname:
+        return ""
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        port = ""
+    # urlparse strips the brackets an IPv6 literal needs; without them the port reads as part of
+    # the address and the next turn's origin check cannot canonicalize it.
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme.lower()}://{host}{port}{parsed.path.rstrip('/')}"
+
+
 def loggable_origin(url: str) -> str:
     """The origin with any `user:pass@` dropped, for logs.
 

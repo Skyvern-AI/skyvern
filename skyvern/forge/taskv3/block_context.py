@@ -174,7 +174,8 @@ def render_block_context(
         # criterion (the step engine's per-step goal check gives it this for free).
         pieces.append(
             "This task is one block of a larger workflow and starts mid-flow. First read "
-            "the full page text (get_html) and check whether the completion criterion is ALREADY "
+            "the page's visible text (get_html with format text) and check whether the completion "
+            "criterion is ALREADY "
             "satisfied by the page's settled, loaded content - a loading indicator, skeleton, or "
             "empty container does NOT satisfy a criterion about visible content."
             + (
@@ -203,9 +204,9 @@ def render_block_context(
         pieces.append(
             "This is an assessment task: do not modify page state. Evaluate the completion "
             "and termination criteria above and finish with the matching status. Ground the judgment "
-            "in the page's actual content: read the full page text (get_html) before concluding, and "
-            "never finish with status=terminated on element summaries alone — absence must be "
-            "confirmed against the full text."
+            "in the page's actual content: read the page's visible text (get_html with format text) "
+            "before concluding, and never finish with status=terminated on element summaries alone — "
+            "absence must be confirmed against that text."
         )
     elif task_block is not None and task.task_type == TaskType.action:
         pieces.append("This is a single, focused action: perform it and finish.")

@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+import secrets
 import time
 import unicodedata
 import weakref
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, o
 from skyvern.forge.taskv3.loop import (
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
+    SemanticCommitStats,
     ToolHandler,
     ToolResult,
     ToolSpec,
@@ -57,14 +59,51 @@ LOG = structlog.get_logger()
 # tab/popup is followed on the next call instead of leaving the loop stuck on a stale page.
 PageProvider = Callable[[], Awaitable[Any]]
 
+# Answers one question for the selector guard: did this action fail because its target is markup the
+# page never renders? None means "not that", so the original failure keeps its own reporting.
+InertTargetDiagnosis = Callable[[str, Exception], Awaitable["ToolResult | None"]]
+
 # Cap on the page URL observe() echoes. Callers that register a secret URL for exact-match redaction
 # must register this prefix too, or the truncated echo survives the scrub.
 OBSERVE_URL_MAX_CHARS = 300
 
+# Cap on what get_html returns, for markup and for rendered text alike.
+HTML_MAX_CHARS = 20000
+
+# Nothing in these may vary between two reads of an unchanged page: get_html's content is hashed
+# into the loop's perception digests, which decide whether the run has returned to known ground.
+# No quote character may appear in either notice: loop._TV3_MARKER_CUT_RE recognizes a marker the cut
+# left open only while no quote follows it, and the notice is what follows. Only the whole-page read
+# is steered toward text — a cut element read already has the element it asked about.
+_MARKUP_CUT = f"…[truncated at {HTML_MAX_CHARS} chars]"
+_PAGE_MARKUP_CUT = (
+    f"…[truncated at {HTML_MAX_CHARS} chars - for the visible text instead of markup, call get_html with format=text]"
+)
+# ponytail: text past the cap stays unreachable; add an offset argument if a real page needs it.
+# Component text is appended after the light DOM (_PAGE_TEXT_JS walks document first), so it is what
+# a cut drops first — hence naming the component read here rather than only a generic selector.
+_RENDERED_TEXT_CUT = (
+    f"…[rendered text truncated at {HTML_MAX_CHARS} chars - text inside components is appended last "
+    "and is cut first; read one region with get_html and a selector, or call observe]"
+)
+
+
+def _escape_tags_in_text(text: str) -> str:
+    """Neutralize start tags in a rendered-text result.
+
+    The alias layer's tag scanner runs over every page-content result and a page controls every byte
+    of its text, so a page printing `<input id="...">` as visible text would be handed the alias meant
+    for a real element. Only `<` is escaped: masking matches a selector by its literal spelling, so
+    escaping `"` or `&` would hide a quoted one from the pass that owns it.
+    """
+    return text.replace("<", "&lt;")
+
+
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
-# click menu probe, data-tv3-act by act-by-mark (written transiently on the look-resolved element
-# just before the action and cleared after). Each exists only where we set it, so one that matches
-# nothing now cannot reappear without a fresh observe / menu-opening click / look.
+# click menu probe, data-tv3-act by act-by-mark (written on the look-resolved element at act time and
+# kept for the life of the document, so the submit watch can still resolve it turns later). Each
+# exists only where we set it, so one that matches nothing now cannot reappear without a fresh
+# observe / menu-opening click / look.
 _TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act|-sugg)?="[^"\\]+"\]$')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe hands such a
@@ -612,8 +651,42 @@ _SELECTOR_GUARD_TOOL_NAMES = frozenset(
     }
 )
 
+# The tools whose driver timeout actually propagates to the guard AND whose action needs its target
+# rendered. Measured per ANCHOR SHAPE, not per tool -- one shape answering does not mean the tool
+# does. On a display:none template: select_option on a native <select> and a click on a native
+# checkbox are refused by a visibility pre-gate before anything raises (they reach the same diagnosis
+# through _unreachable_error); select_option on a custom listbox and select_combobox on a div anchor
+# return their own could-not-open error; but select_combobox on a TYPEABLE anchor (the searchable
+# autocomplete) takes the typeahead branch and raises the driver's call log verbatim, which is the
+# evidence chain this exists to break. press_key returns ok without failing on every shape tried.
+# file_upload is absent for a different reason: set_input_files drives a hidden <input type=file>,
+# which is how essentially every site ships one, so a hidden target is the normal case there.
+_INERT_DIAGNOSIS_TOOL_NAMES = frozenset({"click", "hover", "type", "select_combobox"})
 
-def _with_selector_guard(handler: ToolHandler) -> ToolHandler:
+
+def _inert_target_error(selector: str) -> ToolResult:
+    # Distinct from the unreachable error, which sends the model to whatever reveals a collapsed
+    # section: a template is not a section, has no opener of its own, and the live control (if there
+    # is one) is a different element with a different selector. Distinct from the covered error for
+    # the reason the run this exists for terminated — the model was handed a driver log saying its
+    # target resolved and was not visible, read that as a layer over the page, and gave up on a page
+    # that was ready to accept the action (SKY-15662).
+    # Scoped to the target, and to NOW. The probe establishes that THIS element has no box at this
+    # moment: not that the page is unobstructed (a real modal can be open at the same time, and a
+    # categorical "nothing is blocking you" would turn this into a way to dismiss a genuine blocker),
+    # and not that it will stay hidden -- a pending fetch can reveal it with no trigger at all, so the
+    # shapes are named as the usual ones rather than as an exhaustive pair.
+    return ToolResult.error(
+        f"{selector} is not rendered — it matched inside a display:none subtree. An element with no box "
+        "cannot be obstructed, so THIS failure is not evidence of a layer over it; whether something "
+        "else on the page is blocked is a separate question this does not answer. Hidden markup is "
+        "usually a template the page clones (the live control is then a DIFFERENT element) or a panel "
+        "some trigger opens (act on the trigger first), and something still loading may yet reveal "
+        "this one. Re-observe and act on what the page actually renders."
+    )
+
+
+def _with_selector_guard(handler: ToolHandler, diagnose_inert: InertTargetDiagnosis | None = None) -> ToolHandler:
     """Shared seam for selector tools: normalize a bare invalid `#id` before the handler resolves it, and
     convert a residual invalid-selector crash into an actionable error instead of a batch-aborting raise."""
 
@@ -627,6 +700,15 @@ def _with_selector_guard(handler: ToolHandler) -> ToolHandler:
             guarded = _invalid_selector_result(args.get("selector"), exc)
             if guarded is not None:
                 return guarded
+            # Diagnosed here rather than per tool because the act paths reach the driver the same
+            # way: each waits for a target that is display:none until the timeout, then re-raises the
+            # driver's own call log ("resolved to <button ...>", "element is not visible") for the
+            # loop to hand the model verbatim.
+            acted_on = args.get("selector")
+            if diagnose_inert is not None and isinstance(acted_on, str):
+                inert = await diagnose_inert(acted_on, exc)
+                if inert is not None:
+                    return inert
             raise
 
     return wrapped
@@ -2363,19 +2445,29 @@ async def pending_marker(page: Any, selector: str) -> str | None:
     text=/xpath forms all resolve here and none of them resolve through an in-page querySelector walk.
     Fails open: an unresolvable control reports nothing, and nothing is not evidence of pending."""
     try:
-        handle = await page.query_selector(selector)
+        handles = await page.query_selector_all(selector)
     except Exception:
         LOG.warning("taskv3 pending-marker probe could not resolve the control", selector=selector, exc_info=True)
         return None
-    if handle is None:
+    if not handles:
         # Not an error: the control being gone is the ordinary shape of a submission that landed.
         return None
-    try:
-        marker: str | None = await handle.evaluate(PENDING_MARKER_JS)
-    except Exception:
-        LOG.warning("taskv3 pending-marker probe failed on the control", selector=selector, exc_info=True)
-        return None
-    return marker
+    if len(handles) > 1:
+        # cloneNode copies attributes, so a page that duplicates a control the run acted on can leave
+        # two elements answering to one selector. Read them ALL and report the first that is still in
+        # flight: taking whichever came first in document order would answer "settled" off a twin the
+        # run never touched while the real control was still submitting -- a false completion, where
+        # an extra hold costs only a turn.
+        LOG.info("taskv3 pending-marker probe found more than one control", selector=selector, matches=len(handles))
+    for handle in handles:
+        try:
+            marker: str | None = await handle.evaluate(PENDING_MARKER_JS)
+        except Exception:
+            LOG.warning("taskv3 pending-marker probe failed on the control", selector=selector, exc_info=True)
+            continue
+        if marker:
+            return marker
+    return None
 
 
 # Cap on marks a single look draws: more than this yields an unreadable set-of-marks image and a legend
@@ -2462,10 +2554,23 @@ _LOOK_ENUM_JS = (
 })()"""
 )
 
-# Write the transient act-by-mark attribute on an element handle the caller already resolved
-# (Playwright's engine, which pierces open shadow). Returns whether the node is still connected; a
-# detached handle errors rather than re-resolving by a stale coordinate.
-_LOOK_TAG_HANDLE_JS = "(el, n) => { try { el.setAttribute('data-tv3-act', String(n)); } catch (e) { return false; } return el.isConnected; }"
+_ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
+_ACT_SELECTOR_PREFIX = '[data-tv3-act="'
+# Write the act-by-mark attribute on an element handle the caller already resolved (Playwright's
+# engine, which pierces open shadow). Returns whether the node is still connected; a detached handle
+# errors rather than re-resolving by a stale coordinate. The attribute outlives the call: the submit
+# watch re-resolves this selector turns later.
+# Keyed on the ELEMENT, which is the only identity that satisfies every consumer at once: the node
+# keeps whatever token it was first given, so re-acting one control mints the same tag however the
+# marks have been renumbered since, while a different control gets its own and never steals it.
+# Returns the token in force, or "" for a detached node or a clobbered accessor.
+# Writes only. The DECISION about whether a tag can be trusted as an identity is deliberately NOT
+# made here: this runs in the page's own realm, where RegExp, getAttribute and setAttribute are all
+# replaceable, so a page could answer "yes, that forged value is yours". The caller reads the result
+# back through Playwright's accessor and judges it there.
+_ACT_WRITE_HANDLE_JS = (
+    "(el, t) => { try { el.setAttribute('data-tv3-act', t); } catch (e) { return false; } return el.isConnected; }"
+)
 
 
 def _annotate_screenshot(png_bytes: bytes, elements: list[dict[str, Any]], vw: int, *, max_width: int = 1024) -> bytes:
@@ -2855,6 +2960,29 @@ _REACH_PROBE_NEEDED_JS = (
       if (arg.allowOwnLabel !== false && (nativeLabelsOf(el).length || (_isLabel(el) && nativeControlOf(el)))) return true;
     }
   } catch (e) { /* best-effort */ }
+  return false;
+}"""
+)
+
+# Whether the element an action just failed on sits under display:none. Asked only after a failure,
+# so it costs nothing on the normal path -- and asked of the LIVE page, because an element that was
+# hidden while the driver waited may since have been revealed. The climb crosses shadow boundaries
+# (`host`) and slots (`assignedSlot`), since a slotted child of a hidden host is hidden with it.
+_INERT_TARGET_PROBE_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return false;
+  try {
+    // Two hops per shadow boundary (the fragment, then its host), so the cap is well clear of any
+    // real component nesting; a climb that ran out returns false and leaves the original error alone.
+    for (let n = el, hops = 0; n && hops < 512; hops++) {
+      if (n.nodeType === 1 && getComputedStyle(n).display === 'none') return true;
+      n = n.assignedSlot || n.parentNode || n.host || null;
+    }
+  } catch (e) { /* a claim the climb could not establish is not made */ }
   return false;
 }"""
 )
@@ -6030,21 +6158,34 @@ class _UploadActivityProbe:
 # site's own file-handling code, which is the one thing a silent no-op (or ambient network noise) can
 # never produce.
 _PAGE_TEXT_JS = (
-    r"""() => {
+    r"""(start) => {
   const _shadowRoots = """
     + _SHADOW_ROOTS_JS
     + r""";
+  // Called on the page (start undefined) for the whole document, or on an element handle for that
+  // element's subtree: an element's own innerText is light DOM only, so its shadow roots are walked
+  // exactly as the document's are.
+  const from = start || document;
+  // _shadowRoots walks a root's DESCENDANTS for hosts, so an element start's own shadow root has to
+  // be seeded explicitly; from the document every host is a descendant.
+  const starts = [from];
+  if (from !== document && from.shadowRoot && from.shadowRoot.nodeType === 11) starts.push(from.shadowRoot);
   let out = '';
-  for (const root of _shadowRoots(document)) {
+  for (const root of starts.flatMap(_shadowRoots)) {
     try {
       // Rendered text only: textContent would count hidden nodes, <script> and <style>. A shadow
       // root has no innerText itself, so read each element child — but only rendered ones, since
       // innerText on an element that is not rendered (a <style>, a hidden chip) is its textContent.
-      const tops = root === document ? [document.body] : Array.from(root.children);
-      for (const el of tops) {
+      const tops = root === document ? [document.body] : root === from ? [from] : Array.from(root.children);
+      // A top with no box of its own (display:contents - the usual :host pattern - or a bare wrapper)
+      // is not unrendered; its children may be. Descend under the same filter instead of dropping it.
+      const stack = tops.slice().reverse();
+      while (stack.length) {
+        const el = stack.pop();
         if (!el || typeof el.innerText !== 'string') continue;
-        if (!(el.getClientRects && el.getClientRects().length > 0)) continue;
-        out += ' ' + el.innerText;
+        if (el.getClientRects && el.getClientRects().length > 0) { out += ' ' + el.innerText; continue; }
+        const style = el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView.getComputedStyle(el) : null;
+        if (style && style.display === 'contents') for (let i = el.children.length - 1; i >= 0; i--) stack.push(el.children[i]);
       }
     } catch (e) {}
   }
@@ -6065,12 +6206,12 @@ _UPLOAD_REJECTION_WORDS = re.compile(
 _FILENAME_MENTION_CHARS = 240
 
 
-async def _page_rendered_text(page: Any) -> str | None:
-    """The page's rendered text across the document and open shadow roots; None when it cannot be read."""
+async def _page_rendered_text(target: Any) -> str | None:
+    """Rendered text of a page, or of one element handle, across open shadow roots; None when unreadable."""
     try:
-        text = await page.evaluate(_PAGE_TEXT_JS)
+        text = await target.evaluate(_PAGE_TEXT_JS)
     except Exception:
-        LOG.info("taskv3 file_upload page-text readback failed", exc_info=True)
+        LOG.info("taskv3 page-text readback failed", exc_info=True)
         return None
     return text if isinstance(text, str) else None
 
@@ -6271,6 +6412,7 @@ def build_browser_tools(
     resolve_typed_text: Callable[[str], Any] | None = None,
     opaque_refs: OpaqueUrlRefs | None = None,
     vision_enabled: bool = True,
+    semantic_commit_stats: SemanticCommitStats | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
 
@@ -6311,6 +6453,10 @@ def build_browser_tools(
     # Per-run set-of-marks from the most recent look(): mark index -> {handle, tag, label}. A
     # fresh look replaces it (marks renumber), and act-by-mark resolves mark=N against it at act time.
     _look_manifest: dict[int, dict[str, Any]] = {}
+    _act_seq = [0]
+    # Unguessable by the page, so a planted data-tv3-act cannot be adopted as an element identity.
+    _act_prefix = f"a{secrets.token_hex(4)}"
+    _act_token_re = re.compile(re.escape(_act_prefix) + r"[0-9]+")
     # Opaque-id aliases, run-scoped and stable: the same emitted selector maps to the same alias for
     # the whole run, like opaque_url_ tokens, so the model never handles the raw identifier.
     _alias_for_selector: dict[str, str] = {}
@@ -6514,7 +6660,11 @@ def build_browser_tools(
                     raise _withheld_error(masked_text).with_traceback(exc.__traceback__) from None
                 raise masked_exc.with_traceback(exc.__traceback__) from None
             if _alias_for_selector and isinstance(result.content, str):
-                is_markup = markup and result.status == "ok"
+                page_content = markup and result.status == "ok"
+                # get_html's text format returns rendered text, which has no attribute a handle could
+                # go on: a selector printed there is prose the whole-token pass owns, not markup where
+                # the rewritten attribute would be the handle.
+                is_markup = page_content and not (result.data or {}).get("rendered_text")
                 if result.status != "ok":
                     # A failure result is prose, not page content, and reaches the model exactly as a
                     # raise does: it gets the same passes, including the ones a whole-token match
@@ -6536,10 +6686,11 @@ def build_browser_tools(
                         own_alias=own_alias if own_tag_returned else None,
                         absent_alias=absent_alias,
                     )
-                if not is_markup and _leaks_owned_raw(masked):
-                    # Markup is exempt: a raw id in an href, a script or prose is page content get_html
-                    # returns on purpose. Elsewhere only the text is dropped, never the status — an
-                    # outcome reported as its opposite sends the model to redo a committed side effect.
+                if not page_content and _leaks_owned_raw(masked):
+                    # get_html's page content is exempt, markup and rendered text alike: a raw id in an
+                    # href, a script, prose or visible text is content it returns on purpose. Elsewhere
+                    # only the text is dropped, never the status — an outcome reported as its opposite
+                    # sends the model to redo a committed side effect.
                     masked = _withheld_text(masked, "failed" if result.status != "ok" else "succeeded")
                 if masked != result.content:
                     result = ToolResult(result.status, masked, result.data, result.screenshots)
@@ -6557,12 +6708,31 @@ def build_browser_tools(
     # not fresh-page progress, for the budget-extension evidence.
     _recent_nav_canonicals: deque[str] = deque(maxlen=16)
 
+    # The page a handler actually acted on. A failure diagnosis must ask about THAT page, not about
+    # whatever must_get_working_page resolves afterwards: it can switch to the newest valid tab, so a
+    # tab that opened while the action was failing would be probed instead, and a hidden element with
+    # the same name there would replace the real failure with a false one. One slot, not one per call,
+    # because the loop dispatches one tool at a time; concurrent tool calls on a single build would
+    # need this to become per-call state.
+    _acted_page: list[Any] = []
+    # Original selector -> the one a handler actually acts on, recorded only where a handler rewrites
+    # it: a bare `#id` that names a shadow HOST resolves to the mirrored control inside the root, and
+    # the driver then waits on THAT element. The guard only sees the original, so without this the
+    # diagnosis asks about a visible host while the hidden inner control is what timed out. Cleared in
+    # _resolve_page, so it never outlives the call that recorded it.
+    _acted_selector: dict[str, str] = {}
+
     async def _resolve_page() -> tuple[Any, ToolResult | None]:
         # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
         # once, not twice (each resolution is a must_get_working_page with its recovery path).
         page = _prefetched_page.pop() if _prefetched_page else await page_provider()
         if page is None:
             return None, ToolResult.error(PAGE_UNAVAILABLE_ERROR)
+        _acted_page[:] = [page]
+        # Per call, not per rewrite: only some handlers rewrite their selector, so clearing this where
+        # a rewrite succeeds leaves the previous call's mapping in place for one that does not. A later
+        # hover on the same `#id` would then be diagnosed against an inner control it never touched.
+        _acted_selector.clear()
         return page, None
 
     async def _url(page: Any) -> str:
@@ -6832,11 +7002,34 @@ def build_browser_tools(
         # is untouched. url= is already masked before truncation above; re-masking a token is a no-op.
         return ToolResult.ok(_mask_refs("\n".join(lines)), data={"count": len(elements), "summary": summary})
 
+    async def _rendered_text_result(page: Any, selector: str | None) -> ToolResult:
+        # A text result carries no start tags of the page's own, so the one thing the alias layer
+        # must know is that this is prose: rendered_text routes it to the whole-token pass.
+        target = page
+        if selector:
+            target = await page.query_selector(selector)
+            if target is None:
+                return ToolResult.error(f"no element for selector {selector!r}")
+        text = await _page_rendered_text(target)
+        if text is None:
+            return ToolResult.error("the rendered text could not be read")
+        body = _escape_tags_in_text(_mask_refs(text))
+        if len(body) > HTML_MAX_CHARS:
+            body = body[:HTML_MAX_CHARS] + _RENDERED_TEXT_CUT
+        return ToolResult.ok(body, data={"rendered_text": True})
+
     async def get_html(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
             return error
         selector = args.get("selector")
+        fmt = str(args.get("format") or "html").strip().lower()
+        if fmt == "text":
+            return await _rendered_text_result(page, selector)
+        if fmt != "html":
+            # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
+            # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
+            return ToolResult.error(f'unknown format {args.get("format")!r}: use "html" or "text"')
         # Whether the requested element's OWN start tag is in the answer. The alias masking layer may
         # only stamp the caller's handle on a tag it knows is that element's, never on a descendant.
         markup_scope = "document"
@@ -6860,12 +7053,24 @@ def build_browser_tools(
         # The click/type reaction gate stamps data-tv3-pre on every visible element; internal bookkeeping
         # that, left in place, costs a third of the truncation budget below in noise.
         html = html.replace(' data-tv3-pre="1"', "")
+        # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
+        # still on the page when this runs. It is a stable handle rather than a dangerous one -- the
+        # token belongs to the element, not the number -- but it is ours, not the page's, and it
+        # costs truncation budget the model needs for real markup.
+        html = _ACT_ATTR_RE.sub("", html)
         html = _mask_refs(html)
-        if len(html) > 20000:
-            return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]", data={"markup_scope": markup_scope})
+        if len(html) > HTML_MAX_CHARS:
+            cut = _MARKUP_CUT if selector else _PAGE_MARKUP_CUT
+            return ToolResult.ok(html[:HTML_MAX_CHARS] + cut, data={"markup_scope": markup_scope})
         return ToolResult.ok(html, data={"markup_scope": markup_scope})
 
-    def _unreachable_error(selector: str) -> ToolResult:
+    async def _unreachable_error(selector: str) -> ToolResult:
+        # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
+        # pre-gate, before anything raises -- so it never reaches the guard's diagnosis and used to be
+        # told its section is collapsed and to go find the trigger, which a template does not have.
+        # Same question, same probe, asked one layer earlier.
+        if await _target_is_inert(selector):
+            return _inert_target_error(selector)
         return ToolResult.error(
             f"{selector} is not rendered and nothing visible stands in for it — its section is collapsed, "
             "closed or inactive, so a person could not reach this control either. Act on whatever reveals "
@@ -6953,6 +7158,30 @@ def build_browser_tools(
             element = None
         return {"sel": selector, "el": element}
 
+    async def _target_is_inert(selector: str) -> bool:
+        # _evaluate_isolated directly, NOT _probe_evaluate: that helper falls back to the page's own
+        # realm when no isolated world exists, and there a page replacing getComputedStyle could report
+        # a visible control as display:none -- turning this diagnosis into a way to dismiss a real
+        # blocker. No isolated answer is unknown, and unknown makes no claim.
+        if not _acted_page:
+            return False
+        try:
+            return await _evaluate_isolated(_acted_page[0], _INERT_TARGET_PROBE_JS, selector) is True
+        except Exception:
+            return False
+
+    async def _diagnose_inert_target(selector: str, exc: Exception) -> ToolResult | None:
+        # Only a driver wait that ran out, and the driver's call log is what proves it was one. A bare
+        # "Timeout" in the type name is not enough: file_upload fetches its source over the network
+        # first, and an asyncio timeout there would be blamed on a file input that is display:none by
+        # the convention every site follows. Matching the message rather than the type also survives
+        # the patchright/playwright fork boundary, as the invalid-selector markers above do.
+        if "Call log" not in str(exc):
+            return None
+        # The element the driver waited on, which is not always the one the caller named.
+        acted = _acted_selector.get(selector, selector)
+        return _inert_target_error(acted) if await _target_is_inert(acted) else None
+
     async def _resolve_mirrored_host_control(page: Any, selector: str) -> str:
         # Only a single compound selector can name a host by mistake; a composed (host-anchored) one
         # already points inside a root and a marker selector names exactly what observe marked.
@@ -6970,6 +7199,7 @@ def build_browser_tools(
         except Exception:
             return selector
         if isinstance(named, str) and named:
+            _acted_selector[selector] = named
             LOG.debug(
                 "taskv3 selector resolved to a shadow host; acting on its mirrored control",
                 selector=selector,
@@ -7346,13 +7576,13 @@ def build_browser_tools(
             # for one something visible stands in for, so an unreachable select is sent to reveal first
             # rather than to a tool that would refuse it a turn later.
             if not skin_probe.get("proxied"):
-                return _unreachable_error(selector)
+                return await _unreachable_error(selector)
             return ToolResult.error(
                 f"{selector} is a hidden native <select> — a click cannot open it; use select_option "
                 "with this selector instead"
             )
         if isinstance(skin_probe, dict) and skin_probe.get("unproxied"):
-            return _unreachable_error(selector)
+            return await _unreachable_error(selector)
         skinned = bool(isinstance(skin_probe, dict) and skin_probe.get("skinned"))
         if skinned and skin_probe.get("labelCovered"):
             return _covered_error(selector, None, verb="clicked")
@@ -7801,6 +8031,7 @@ def build_browser_tools(
         # surface that already showed this label BEFORE the click proves nothing and is never consulted.
         readable = False
         committed = ""
+        counted = False
         for attempt in range(4):
             if attempt:
                 await asyncio.sleep(0.7)
@@ -7827,6 +8058,12 @@ def build_browser_tools(
                     except Exception:
                         commit_evt = False
             if settings.TASK_V3_SEMANTIC_COMMIT_VERIFY:
+                # One opportunity per CALL, and only inside this block: the poll early-returns on an
+                # accept, so a per-attempt count would track widget latency, and a count taken
+                # outside the block would report a 0% accept rate for a tier that cannot fire at all.
+                if semantic_commit_stats is not None and not counted:
+                    semantic_commit_stats.opportunities += 1
+                    counted = True
                 semantic = await _semantic_commit_read(
                     page,
                     selector,
@@ -7835,6 +8072,8 @@ def build_browser_tools(
                     typed_trusted=verify_args.get("typedTrusted") is True,
                 )
                 if semantic is not None:
+                    if semantic_commit_stats is not None:
+                        semantic_commit_stats.accepts += 1
                     return semantic, True
             try:
                 read = await page.evaluate(
@@ -9279,7 +9518,7 @@ def build_browser_tools(
         # Playwright still sets the value and dispatches native input/change on the real element.
         force = bool(isinstance(probe, dict) and probe.get("exists") and not probe.get("visible"))
         if force and not probe.get("proxied"):
-            return _unreachable_error(selector)
+            return await _unreachable_error(selector)
         if label is not None:
             await page.select_option(selector, label=label, timeout=15000, force=force)
         else:
@@ -9568,15 +9807,6 @@ def build_browser_tools(
         except Exception:
             pass
 
-    async def _clear_act_tags(page: Any) -> None:
-        try:
-            await page.evaluate(
-                "() => { const _q = " + _ROOT_QUERY_JS + "; "
-                "_q.all('[data-tv3-act]').forEach((e) => e.removeAttribute('data-tv3-act')); }"
-            )
-        except Exception:
-            pass
-
     async def look(_args: dict[str, Any]) -> ToolResult:
         if _look_count[0] >= _LOOK_MAX_PER_RUN:
             return ToolResult.error(
@@ -9666,7 +9896,7 @@ def build_browser_tools(
     async def _resolve_mark(page: Any, mark: int) -> tuple[str | None, ToolResult | None]:
         # Turn mark=N into a selector the existing click/type handlers act through. Resolution is the
         # SAME live element handle look retained (Playwright's engine, which pierces open shadow), tagged
-        # data-tv3-act=N at act time so the marker branch uniqueness-checks and commit-verifies it like
+        # data-tv3-act at act time so the marker branch uniqueness-checks and commit-verifies it like
         # any other marker. A detached handle errors rather than re-guessing by coordinates: a stale
         # look-time point could hit whatever now occupies those pixels after a scroll, which is exactly
         # the wrong-element class this must not introduce.
@@ -9675,28 +9905,66 @@ def build_browser_tools(
             return None, ToolResult.error(
                 f"mark {mark} is not in the current set of marks. Call look() first, then act on a number it drew."
             )
-        await _clear_act_tags(page)
         handle = entry.get("handle")
-        connected = False
-        if handle is not None:
+        stale = ToolResult.error(
+            f"mark {mark} no longer points to an element on the page — it moved or the page "
+            "re-rendered since look(). Call look() again and act on a fresh number.",
+            data={"page_state_changed": True},
+        )
+        if handle is None:
+            return None, stale
+        # Every judgement below is made HERE, not in the page's realm. The read goes through
+        # Playwright's accessor, the format is matched against this run's own pattern, and the
+        # holder count comes from Playwright's engine -- so a page that patches its own RegExp,
+        # getAttribute or querySelectorAll cannot talk this into adopting a value it planted.
+        token = ""
+        try:
+            existing = await handle.get_attribute("data-tv3-act")
+        except Exception:
+            existing = None
+        if existing and _act_token_re.fullmatch(existing):
             try:
-                connected = bool(await handle.evaluate(_LOOK_TAG_HANDLE_JS, mark))
+                # An inherited token is not an identity: cloneNode copies the attribute, so a
+                # duplicated control arrives already wearing one. Keep it only while its holder is
+                # alone -- counted by the engine that pierces open shadow roots, which is the domain
+                # the click gate and the in-flight probe both resolve in.
+                if len(await page.query_selector_all(f'{_ACT_SELECTOR_PREFIX}{existing}"]')) == 1:
+                    token = existing
             except Exception:
-                connected = False
-        if not connected:
-            return None, ToolResult.error(
-                f"mark {mark} no longer points to an element on the page — it moved or the page "
-                "re-rendered since look(). Call look() again and act on a fresh number.",
-                data={"page_state_changed": True},
-            )
-        return f'[data-tv3-act="{mark}"]', None
+                token = ""
+        if not token:
+            # Never reissued, so no two elements can share one and no tag left on a page the run
+            # navigated away from can match a later selector.
+            _act_seq[0] += 1
+            minted = f"{_act_prefix}{_act_seq[0]}"
+            try:
+                if not bool(await handle.evaluate(_ACT_WRITE_HANDLE_JS, minted)):
+                    return None, stale
+                # Read back through Playwright: a page that hijacks setAttribute can put the token
+                # on an element of its choosing, and an unverified write would hand back a selector
+                # naming that one instead of this. Confirming this element carries it is necessary
+                # but not sufficient -- the same trap can write it to a decoy AS WELL -- so the
+                # engine also has to agree the token has exactly one holder. This resolver must
+                # never hand back an ambiguous selector, whatever the callers downstream check.
+                if await handle.get_attribute("data-tv3-act") != minted:
+                    return None, stale
+                if len(await page.query_selector_all(f'{_ACT_SELECTOR_PREFIX}{minted}"]')) != 1:
+                    return None, stale
+            except Exception:
+                return None, stale
+            token = minted
+        return f'{_ACT_SELECTOR_PREFIX}{token}"]', None
 
     def _with_act_by_mark(handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
             mark = args.get("mark")
             if mark is None:
                 return await handler(args)
-            if args.get("selector"):
+            existing = args.get("selector")
+            # A selector this wrapper minted is not the model passing both: since the resolved
+            # selector is now written back into the caller's dict, a re-dispatch of that same dict
+            # would otherwise fail a guard aimed at the model. The mark still wins and is re-resolved.
+            if existing and not str(existing).startswith(_ACT_SELECTOR_PREFIX):
                 return ToolResult.error("Pass either mark or selector to act on a control, not both.")
             try:
                 mark_int = int(mark)
@@ -9708,10 +9976,11 @@ def build_browser_tools(
             selector, mark_error = await _resolve_mark(page, mark_int)
             if mark_error is not None:
                 return mark_error
-            try:
-                return await handler({**args, "selector": selector})
-            finally:
-                await _clear_act_tags(page)
+            # In place rather than into a copy: everything downstream reads this dict AFTER dispatch
+            # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
+            # nudge's target -- and a copy leaves every one of them seeing only `mark`.
+            args["selector"] = selector
+            return await handler(args)
 
         return wrapped
 
@@ -9724,8 +9993,19 @@ def build_browser_tools(
         ),
         _spec(
             "get_html",
-            "Get raw outer/inner HTML of the page or a specific element (for detail beyond observe).",
-            _obj({"selector": {"type": "string", "description": "CSS selector; omit for whole page"}}),
+            "Get raw outer/inner HTML of the page or a specific element (for detail beyond observe), or "
+            'with format "text" its rendered visible text instead - what a user sees, no markup. Both '
+            f"are capped at {HTML_MAX_CHARS} chars and say when they were cut.",
+            _obj(
+                {
+                    "selector": {"type": "string", "description": "CSS selector; omit for whole page"},
+                    "format": {
+                        "type": "string",
+                        "enum": ["html", "text"],
+                        "description": 'Default "html". "text" returns the visible text instead of markup.',
+                    },
+                }
+            ),
             get_html,
         ),
         _spec(
@@ -9863,7 +10143,10 @@ def build_browser_tools(
         if _tool_spec.name in _SELECTOR_GUARD_TOOL_NAMES:
             # Outside preflight (it builds its action from the normalized selector), inside act_by_mark
             # (mark=N resolves to a selector first), so every selector tool inherits the guard.
-            _tool_spec.handler = _with_alias_resolution(_tool_spec.name, _with_selector_guard(_tool_spec.handler))
+            diagnose = _diagnose_inert_target if _tool_spec.name in _INERT_DIAGNOSIS_TOOL_NAMES else None
+            _tool_spec.handler = _with_alias_resolution(
+                _tool_spec.name, _with_selector_guard(_tool_spec.handler, diagnose)
+            )
         if _tool_spec.name in ("click", "type"):
             # OUTERMOST wrapper: resolve mark=N to a selector before preflight builds its action from
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)

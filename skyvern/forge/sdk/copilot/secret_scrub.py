@@ -7,8 +7,11 @@ stay scrubbed on readbacks in later turns whose per-turn context is empty.
 
 from __future__ import annotations
 
+import html
+import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, quote_plus
 
 import structlog
 
@@ -49,21 +52,48 @@ def _session_id(ctx: AgentContext) -> str | None:
     return session_id if isinstance(session_id, str) and session_id else None
 
 
+# encodeURIComponent leaves these literal where Python's quote does not.
+_ENCODE_URI_COMPONENT_SAFE = "-_.!~*'()"
+
+
+def encoded_secret_variants(value: str) -> list[str]:
+    """The forms a page can echo a value in: a URL query, escaped markup, a JSON or Python literal."""
+    try:
+        forms = [
+            value,
+            html.escape(value, quote=False),
+            html.escape(value, quote=True),
+            quote(value),
+            quote(value, safe=""),
+            quote(value, safe=_ENCODE_URI_COMPONENT_SAFE),
+            quote_plus(value, safe=""),
+            json.dumps(value, ensure_ascii=True)[1:-1],
+            repr(value)[1:-1],
+            value.encode("unicode_escape").decode("ascii"),
+        ]
+    except UnicodeError:
+        forms = [value]
+    return list(dict.fromkeys(form for form in forms if form))
+
+
 def register_secret_scrub_value(ctx: AgentContext, value: str | None) -> None:
+    """Register a value and every encoded form of it, so a page that echoes the value URL- or
+    HTML-encoded is scrubbed by the same exact-string pass."""
     if not isinstance(value, str) or not value:
         return
     values = getattr(ctx, "secret_scrub_values", None)
-    if isinstance(values, list) and value not in values:
-        values.append(value)
     session_id = _session_id(ctx)
-    if session_id is not None:
-        new_session = session_id not in _SESSION_SCRUB_VALUES
-        session_values = _SESSION_SCRUB_VALUES.setdefault(session_id, [])
-        if value not in session_values:
-            session_values.append(value)
-        if new_session:
-            while len(_SESSION_SCRUB_VALUES) > _MAX_SCRUB_SESSIONS:
-                _SESSION_SCRUB_VALUES.pop(next(iter(_SESSION_SCRUB_VALUES)))
+    new_session = session_id is not None and session_id not in _SESSION_SCRUB_VALUES
+    for variant in encoded_secret_variants(value):
+        if isinstance(values, list) and variant not in values:
+            values.append(variant)
+        if session_id is not None:
+            session_values = _SESSION_SCRUB_VALUES.setdefault(session_id, [])
+            if variant not in session_values:
+                session_values.append(variant)
+    if new_session:
+        while len(_SESSION_SCRUB_VALUES) > _MAX_SCRUB_SESSIONS:
+            _SESSION_SCRUB_VALUES.pop(next(iter(_SESSION_SCRUB_VALUES)))
 
 
 def register_secret_scrub_values_from_structure(ctx: AgentContext, obj: Any) -> None:
@@ -110,7 +140,20 @@ def register_matching_origin_run_redaction_values(ctx: AgentContext, run_id: str
     if parameters is None:
         return False
     register_secret_scrub_values_from_structure(ctx, parameters)
+    bound_run_id = run_id or getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    if isinstance(bound_run_id, str) and bound_run_id:
+        bound_run_ids = getattr(ctx, "origin_runs_bound_to_scrubber", None)
+        if not isinstance(bound_run_ids, set):
+            bound_run_ids = set()
+            ctx.origin_runs_bound_to_scrubber = bound_run_ids
+        bound_run_ids.add(bound_run_id)
     return True
+
+
+def origin_runs_bound_to_scrubber(ctx: AgentContext) -> set[str]:
+    """Runs whose complete registry has been registered with this context's scrubber."""
+    bound_run_ids = getattr(ctx, "origin_runs_bound_to_scrubber", None)
+    return bound_run_ids if isinstance(bound_run_ids, set) else set()
 
 
 def clear_session_scrub_values(session_id: str | None) -> None:
@@ -174,11 +217,14 @@ def scrub_all_registered_from_text(text: str) -> str:
 
 
 def scrub_secrets_from_structure(ctx: AgentContext, obj: Any) -> Any:
+    return _scrub_structure(_registered_scrub_values(ctx), obj)
+
+
+def _scrub_structure(values: list[str], obj: Any) -> Any:
     # Lazy: output_utils costs ~7.7s to import, and this module is on the logging and span
     # exception paths, where that would be paid by whichever request raises first.
     from skyvern.forge.sdk.copilot.output_utils import is_valid_image_base64  # noqa: PLC0415
 
-    values = _registered_scrub_values(ctx)
     if not values:
         return obj
     replacements = 0

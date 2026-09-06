@@ -73,6 +73,7 @@ class ConnectedAccountChoiceReference(BaseModel):
 
 
 CopilotCancelSource = Literal["escape_key", "stop_button", "api"]
+PersistedCopilotComposerMode = Literal["ask", "build", "code"]
 
 
 class TurnOutcome(BaseModel):
@@ -87,11 +88,20 @@ class TurnOutcome(BaseModel):
     normalized_reply_signature: str = ""
     tool_calls: list[str] = Field(default_factory=list)
     terminal_reason: str | None = None
+    budget_expired: bool = False
+    budget_expiry_source: Literal["deadline", "max_turns"] | None = None
+    budget_expiry_report_produced: bool | None = None
+    budget_expiry_staged_draft_id: str | None = None
+    drain_fingerprint: str | None = None
     # Sits beside terminal_reason so cancel volume groups by gesture in the same
     # query that finds the cancels. None when the request named no source.
     cancel_source: CopilotCancelSource | None = None
     blocked_signatures: list[str] = Field(default_factory=list)
-    copilot_effective_mode: Literal["ask", "build", "code"] | None = None
+    # Durable discriminator for the post-graduation runtime. Historical legacy
+    # turns may carry the same effective mode, so analytics must not infer the
+    # runtime from copilot_effective_mode alone.
+    copilot_runtime: Literal["agent"] | None = None
+    copilot_effective_mode: PersistedCopilotComposerMode | None = None
     copilot_code_available: bool = False
     copilot_last_code_build_failed: bool = False
     copilot_pending_capability: str | None = None

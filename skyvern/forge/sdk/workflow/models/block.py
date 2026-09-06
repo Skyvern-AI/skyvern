@@ -50,6 +50,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
@@ -255,7 +256,11 @@ from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
-from skyvern.utils.secret_redaction import MIN_NUMERIC_SECRET_LENGTH, MIN_SECRET_LENGTH
+from skyvern.utils.secret_redaction import (
+    MIN_NUMERIC_SECRET_LENGTH,
+    MIN_SECRET_LENGTH,
+    redact_secrets_from_text,
+)
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_available_keys, get_missing_variables
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
@@ -1044,6 +1049,26 @@ class Block(BaseModel, abc.ABC):
         error_codes: list[str] | None = None,
         is_synthetic_loop_failure: bool = False,
     ) -> BlockResult:
+        # Every arm that reports a block failure lands here -- the raise path and the ones that
+        # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
+        # to workflow_run_blocks.failure_reason and lifted onto the run, neither redacted downstream.
+        if failure_reason:
+            # Best-effort: this builder runs for every block result, including on paths that never
+            # start a ForgeApp, and a secret lookup must never be what turns a block result into a
+            # failure. Degrades to the unredacted reason, which is the pre-existing behaviour.
+            try:
+                context = skyvern_context.current()
+                block_run_id = context.workflow_run_id if context is not None else None
+                block_run_secrets = (
+                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(block_run_id)
+                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(block_run_id)
+                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+                )
+                if block_run_secrets:
+                    failure_reason = redact_secrets_from_text(failure_reason, block_run_secrets)
+            except Exception:
+                LOG.warning("failed to redact a block failure reason", exc_info=True)
+
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
             output_parameter_value = {"value": output_parameter_value}
@@ -1863,6 +1888,18 @@ class BaseTaskBlock(Block):
         This helper method consolidates the error detection logic that was previously
         duplicated across multiple exception handlers in the execute method.
         """
+        # Both fields below leave over the customer webhook, and neither downstream sanitizer covers
+        # runtime-minted values: the task path does not redact at all, and the workflow-run
+        # aggregation redacts against the static secrets dict only. Redact once here so the persist
+        # and the detector see the same scrubbed string.
+        run_secrets = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+        )
+        if failure_reason and run_secrets:
+            failure_reason = redact_secrets_from_text(failure_reason, run_secrets)
+
         await app.DATABASE.tasks.update_task(
             task.task_id,
             status=TaskStatus.failed,
@@ -1879,6 +1916,25 @@ class BaseTaskBlock(Block):
                     failure_reason=failure_reason,
                 )
                 if detected_errors:
+                    # The detector reads the page too, so redacting its input is not enough: a secret
+                    # entered into the form can come back in its reasoning.
+                    if run_secrets:
+                        # model_copy skips the field validator, and redaction can LENGTHEN the
+                        # string -- the placeholder is longer than a short code -- so re-apply the
+                        # model's own bound rather than trusting the value that went in. No rstrip
+                        # fallback: these reach bounded_reasoning, not the strict payload check that
+                        # drops a row whose reasoning is not strip()-clean. A call site that DOES hit
+                        # that check would need it.
+                        detected_errors = [
+                            error.model_copy(
+                                update={
+                                    "reasoning": redact_secrets_from_text(error.reasoning, run_secrets)[
+                                        :ERROR_CODE_REASONING_MAX_LENGTH
+                                    ]
+                                }
+                            )
+                            for error in detected_errors
+                        ]
                     # Only pass new errors — update_task() appends to existing errors
                     new_errors = [error.model_dump() for error in detected_errors]
                     await app.DATABASE.tasks.update_task(
@@ -4456,8 +4512,10 @@ async def _code_block_solve_captcha_builtin(
 
 
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
-    fresh_key = workflow_run_context.generate_random_secret_id()
-    workflow_run_context.secrets[fresh_key] = value
+    # Every caller registers a one-time code minted at runtime, so it goes through the runtime OTP
+    # path: that set is what the copilot's origin-run handoff publishes, and a code minted here
+    # would otherwise never reach the scrubber that guards the page this run leaves.
+    workflow_run_context.register_runtime_otp_value(value)
 
 
 def _code_block_safe_print(
@@ -6620,6 +6678,84 @@ async def wrapper({default_args}):
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
         return output if isinstance(output, dict) else None
 
+    async def _capture_inline_failure_page_state(
+        self,
+        *,
+        page: Page,
+        failure_locator: Any | None,
+        workflow_run_context: WorkflowRunContext,
+        redaction_parameters: dict[str, Any],
+    ) -> dict[str, str]:
+        """Read bounded, masked facts from the exact locator that raised inline."""
+        from skyvern.forge.sdk.workflow.models.code_block_recorder import COVERING_ELEMENT_SCRIPT
+
+        def mask_fact(value: Any) -> str | None:
+            if not isinstance(value, str):
+                return None
+            masked = workflow_run_context.mask_secrets_in_data(value)
+            redacted = app.AGENT_FUNCTION.redact_codeblock_parameter_values(masked, redaction_parameters)
+            if not isinstance(redacted, str) or not redacted:
+                return None
+            return "".join(char for char in redacted if unicodedata.category(char)[0] != "C").strip()[:1000] or None
+
+        state: dict[str, str] = {}
+        try:
+            async with asyncio.timeout(0.5):
+                try:
+                    final_url = mask_fact(page.url)
+                    if final_url:
+                        state["final_url"] = final_url
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - failure evidence is best effort.
+                    pass
+                try:
+                    page_title = mask_fact(await page.title())
+                    if page_title:
+                        state["page_title"] = page_title
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - failure evidence is best effort.
+                    pass
+                try:
+                    if failure_locator is not None:
+                        coverer = mask_fact(await failure_locator.evaluate(COVERING_ELEMENT_SCRIPT))
+                        if coverer:
+                            state["covering_element"] = coverer
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - failure evidence is best effort.
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            pass
+        return state
+
+    async def _persist_captured_failure_final_url(
+        self,
+        *,
+        final_url: str | None,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> None:
+        """Restore the terminal URL after screenshot and healing evidence reads the live page."""
+        if not final_url:
+            return
+        try:
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                final_url=final_url,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - failure evidence is best effort.
+            LOG.warning(
+                "Failed to persist the captured code-block failure URL",
+                workflow_run_block_id=workflow_run_block_id,
+            )
+
     async def _failed_result_with_evidence(
         self,
         *,
@@ -7444,14 +7580,54 @@ async def wrapper({default_args}):
                             else self._classify_secure_runner_failure(secure_failure)
                         )
 
+                        def scrub_secure_failure_fact(raw_value: str | None) -> str | None:
+                            if not isinstance(raw_value, str):
+                                return None
+                            masked_value = workflow_run_context.mask_secrets_in_data(raw_value)
+                            scrubbed_value = scrub_failure_reason(masked_value, fallback="")
+                            return (
+                                (
+                                    "".join(
+                                        char for char in scrubbed_value if unicodedata.category(char)[0] != "C"
+                                    ).strip()[:1000]
+                                    or None
+                                )
+                                if scrubbed_value
+                                else None
+                            )
+
+                        secure_failure_page_state = {
+                            field: value
+                            for field, raw_value in (
+                                ("final_url", secure_failure.final_url),
+                                ("page_title", secure_failure.page_title),
+                                ("covering_element", secure_failure.covering_element),
+                            )
+                            if (value := scrub_secure_failure_fact(raw_value)) is not None
+                        }
+
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
                             if engine_block_result is not None:
                                 engine_block_result = scrub_failed_block_result(engine_block_result)
+                                if secure_failure_page_state and isinstance(
+                                    engine_block_result.output_parameter_value, dict
+                                ):
+                                    failure_output = dict(engine_block_result.output_parameter_value)
+                                    failure_output["failure_page_state"] = secure_failure_page_state
+                                    engine_block_result = replace(
+                                        engine_block_result,
+                                        output_parameter_value=failure_output,
+                                    )
                                 await self.record_output_parameter_value(
                                     workflow_run_context,
                                     workflow_run_id,
                                     engine_block_result.output_parameter_value,
+                                )
+                                await self._persist_captured_failure_final_url(
+                                    final_url=secure_failure_page_state.get("final_url"),
+                                    workflow_run_block_id=workflow_run_block_id,
+                                    organization_id=organization_id,
                                 )
                                 return engine_block_result
                             # The runner already scrubbed this text against the same serialized
@@ -7462,10 +7638,17 @@ async def wrapper({default_args}):
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
+                            if secure_failure_page_state:
+                                failure_output["failure_page_state"] = secure_failure_page_state
                             if secure_failure.denied_exception_class is not None:
                                 failure_output["runner_exception_class"] = secure_failure.denied_exception_class
                             await self.record_output_parameter_value(
                                 workflow_run_context, workflow_run_id, failure_output
+                            )
+                            await self._persist_captured_failure_final_url(
+                                final_url=secure_failure_page_state.get("final_url"),
+                                workflow_run_block_id=workflow_run_block_id,
+                                organization_id=organization_id,
                             )
                             return await self.build_block_result(
                                 success=False,
@@ -7822,6 +8005,20 @@ async def wrapper({default_args}):
                     scrub_failure_reason(masked_message[:CODE_BLOCK_FAILURE_REASON_MAX_CHARS])
                     or CODE_BLOCK_GENERIC_FAILURE_REASON
                 )
+            inline_failure_page_state: dict[str, str] = {}
+            if isinstance(e, PlaywrightTimeoutError):
+                # Bind to the original exception before diagnostic proxy calls can alter recorder state.
+                failed_locator = recording_page.failure_locator(e)
+                inline_failure_page_state = await self._capture_inline_failure_page_state(
+                    page=page,
+                    failure_locator=failed_locator,
+                    workflow_run_context=workflow_run_context,
+                    redaction_parameters=serialized_parameter_values,
+                )
+            if inline_failure_page_state:
+                from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state
+
+                failure_reason = append_failure_page_state(failure_reason, **inline_failure_page_state)
             recorded = recorder.recorded_actions()
             if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
@@ -7857,20 +8054,35 @@ async def wrapper({default_args}):
             )
 
             async def build_legacy_failure_result() -> BlockResult:
+                failure_output = None
+                if inline_failure_page_state:
+                    failure_output = build_block_failure_output(failure_reason, [])
+                    failure_output["failure_page_state"] = inline_failure_page_state
+                download_aware_failure_output = await self._failure_output_with_downloads(
+                    engine="inline",
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    resolved_download_id=resolved_download_id,
+                    download_dir_before=download_dir_before,
+                    session_bound=session_download_lane_active(browser_state),
+                    download_binding_kind=download_binding_of(browser_state).value,
+                    result=failure_output,
+                )
+                if download_aware_failure_output is None and failure_output is not None:
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
+                # This deferred closure follows screenshot/heal evidence capture; restore the URL
+                # observed at the original timeout so later page activity cannot overwrite it.
+                await self._persist_captured_failure_final_url(
+                    final_url=inline_failure_page_state.get("final_url"),
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
                 return await self.build_block_result(
                     success=False,
                     failure_reason=failure_reason,
-                    output_parameter_value=await self._failure_output_with_downloads(
-                        engine="inline",
-                        workflow_run_context=workflow_run_context,
-                        workflow_run_id=workflow_run_id,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                        resolved_download_id=resolved_download_id,
-                        download_dir_before=download_dir_before,
-                        session_bound=session_download_lane_active(browser_state),
-                        download_binding_kind=download_binding_of(browser_state).value,
-                    ),
+                    output_parameter_value=download_aware_failure_output or failure_output,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
@@ -8733,6 +8945,18 @@ async def _resolve_sensitive_block_secret(
     return value
 
 
+def _resolve_block_secret_reference(workflow_run_context: WorkflowRunContext, value: str | None) -> str | None:
+    """Map a masked secret placeholder back to its original value; anything else passes through.
+
+    Destination blocks render templates with secrets excluded, so a field bound to a secret
+    parameter arrives here as a placeholder token rather than the value it stands for.
+    """
+    if not value:
+        return value
+    resolved_value = workflow_run_context.get_original_secret_value_or_none(value)
+    return value if resolved_value is None else resolved_value
+
+
 class FileDestinationBlock(Block):
     s3_bucket: str | None = None
     aws_access_key_id: str | None = None
@@ -9102,10 +9326,15 @@ class FileDestinationBlock(Block):
         private_key_passphrase: str | None,
         remote_path: str | None,
         host_key: str | None,
+        uri_host: str,
+        uri_remote_path: str | None,
     ) -> FileUploadDestination:
         filename = Path(file_path).name
-        remote_target = sftp_service.build_remote_target(remote_path, filename)
-        remote_uri = f"sftp://{host}:{port}/{remote_target.lstrip('/')}"
+        # The uri is recorded as the block's output and survives the run, so it is built
+        # from the configured values. When a field is bound to a secret those are still
+        # the placeholders, keeping the plaintext confined to the connection fields.
+        uri_target = sftp_service.build_remote_target(uri_remote_path, filename)
+        remote_uri = f"sftp://{uri_host}:{port}/{uri_target.lstrip('/')}"
         return FileUploadDestination(
             storage_type=FileStorageType.SFTP,
             customer_uri=remote_uri,
@@ -9259,21 +9488,28 @@ class FileDestinationBlock(Block):
                 self.sftp_private_key_passphrase,
                 "sftp_private_key_passphrase",
             )
-            actual_sftp_username = (
-                workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
-            )
+            actual_sftp_username = _resolve_block_secret_reference(workflow_run_context, self.sftp_username)
+            actual_sftp_host = _resolve_block_secret_reference(workflow_run_context, self.sftp_host)
+            actual_sftp_remote_path = _resolve_block_secret_reference(workflow_run_context, self.sftp_remote_path)
+            actual_sftp_host_key = _resolve_block_secret_reference(workflow_run_context, self.sftp_host_key)
+            if not actual_sftp_host or not actual_sftp_host.strip():
+                raise ValueError("SFTP is not configured: resolved host is empty")
+            if not actual_sftp_username or not actual_sftp_username.strip():
+                raise ValueError("SFTP is not configured: resolved username is empty")
             sftp_port = 22 if self.sftp_port is None else self.sftp_port
             for file_path in files_to_upload:
                 destination = self._build_sftp_destination(
                     file_path=file_path,
-                    host=self.sftp_host or "",
+                    host=actual_sftp_host,
                     port=sftp_port,
-                    username=actual_sftp_username or "",
+                    username=actual_sftp_username,
                     password=actual_sftp_password,
                     private_key=actual_sftp_private_key,
                     private_key_passphrase=actual_sftp_passphrase,
-                    remote_path=self.sftp_remote_path,
-                    host_key=self.sftp_host_key,
+                    remote_path=actual_sftp_remote_path,
+                    host_key=actual_sftp_host_key,
+                    uri_host=self.sftp_host or "",
+                    uri_remote_path=self.sftp_remote_path,
                 )
                 customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
                     file_path=file_path,

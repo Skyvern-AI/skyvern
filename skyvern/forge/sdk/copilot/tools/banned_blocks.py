@@ -276,6 +276,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
         _code_only_browser_unavailable_summary(),
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
+        "A saved run executes this block against a page it loads itself, without the interactions performed while scouting. Whatever the page requires before the target is reachable is part of what the block does, not a condition it inherits.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",

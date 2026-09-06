@@ -124,6 +124,10 @@ class LoopOutcome:
     # Perception snapshots are compacted in place during the run, so superseded observe/get_html
     # content is already elided here — treat as lossy if ever persisted for audit.
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # The progress signals for the caller's one terminal record, set on every path out of the loop.
+    # The None default only covers an outcome built by someone else; the caller still writes its
+    # record and simply carries no progress fields on it.
+    telemetry: TerminalTelemetry | None = None
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -231,20 +235,32 @@ ACTION_LOOP_REASON_PREFIX = "action_loop:"
 
 # Progress-gated action-step budget extension (SKY-15264): a run that hits its action-step cap while
 # the page is still demonstrably changing (a repeated probe returned fresh content, a navigation or
-# download landed) earns ONE extension of half the original cap — the observed failure population is
+# download landed) earns an extension of half the original cap — the observed failure population is
 # genuinely long multi-page forms dying mid-progress, while a stalled run must be refused exactly as
 # before. Evidence must be at most this many action rounds old: staler change evidence says nothing
 # about the run's current state.
 ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
+# A long form does not stop being long because one extension already fired: 41.4% of long-block
+# step-cap deaths die at the ALREADY-EXTENDED cap (SKY-15666). So the grant repeats under the same
+# evidence predicate, bounded two ways. Each grant is half the ORIGINAL cap, never half the current
+# one: a run that has already spent 1.5x its budget must not draw a proportionally larger handout,
+# and constant-size grants keep every extension priced the same and re-earned on fresh evidence.
+# Total growth stops at this multiple of the original cap. The wall clock — the one cap that is not
+# a function of the action-step budget — is the outer runaway stop and is never re-derived.
+ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # Facetable event names — both the grant and the refusal are queryable so the gate's decision
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+# A wrap-up turn granted by a guard that a later budget extension raised past its trip; facetable
+# so a released latch is distinguishable from one that never fired.
+FINAL_TURN_RELEASED_EVENT = "taskv3 loop final turn grant released by budget extension"
 
-# Single-shot final-turn grant (budget-exhaustion final turn): the first budget cap trip in a run
-# buys exactly one more unconstrained model turn instead of ending the run immediately, so a model
-# mid-extraction can still call finish with what it has. Facetable — change only with the dashboards
-# that read it.
+# Final-turn grant (budget-exhaustion final turn): a budget cap trip buys one more unconstrained
+# model turn instead of ending the run immediately, so a model mid-extraction can still call finish
+# with what it has. NOT once per run since SKY-15666: an extension that relieves the latching guard
+# releases the latch and re-arms it for a later trip, so this fires up to one more time than the run
+# had grants. Facetable — change only with the dashboards that read it.
 FINAL_TURN_GRANTED_EVENT = "taskv3 loop final turn granted"
 
 # Page-state stall policy (SKY-15265): rounds of billable batches that left the page fingerprint
@@ -454,6 +470,12 @@ class _PerceptionLedger:
         self.content_only: dict[tuple[str, str], deque[str]] = {}
         self.shadow_reported = False
         self.suppressed_reported = False
+        # Run-level, deliberately NOT cleared by reset(): the worst revisit streak the run ever
+        # reached, and how many reads could have produced one. A first look at a probe key cannot
+        # revisit anything, so it is not a chance — counting it would make a run of one-shot probes
+        # read as "looked and found no looping".
+        self.peak_probe_revisits = 0
+        self.revisit_chances = 0
 
     def reset(self) -> None:
         """Forget every streak: the document they described is gone (a reload)."""
@@ -474,6 +496,7 @@ class _PerceptionLedger:
         if probe is None:
             self._probes[key] = _ProbeStreak(deque([content_digest], maxlen=PERCEPTION_RING))
             return _Snapshot(tool_identical, 0, 0, False)
+        self.revisit_chances += 1
         progressed = content_digest != probe.history[-1]
         if progressed:
             probe.identical = 0
@@ -484,6 +507,7 @@ class _PerceptionLedger:
         else:
             probe.revisits = 0
         probe.history.append(content_digest)
+        self.peak_probe_revisits = max(self.peak_probe_revisits, probe.revisits)
         return _Snapshot(tool_identical, probe.identical, probe.revisits, progressed)
 
     def next_snapshot_can_trip(self, threshold: int) -> bool:
@@ -527,15 +551,6 @@ CANONICAL_LOOP_FIRE_COUNTS = (3, 4, 6, 8)
 CANONICAL_LOOP_TOUCHES = 4
 
 PROGRESS_LEDGER_SHADOW_EVENT = "taskv3 loop progress ledger would fail-fast"
-PROGRESS_LEDGER_FINAL_EVENT = "taskv3 loop progress ledger final"
-# The ledger's survival record is gated on ever_armed, so it describes ONLY runs that saw a
-# validation error. Search / filter / navigate / extract runs emitted nothing at all, which makes any
-# fire count taken off that population a floor and never a prevalence. This is the complement record,
-# keyed on the canonical tracker because its counters are the only progress signal defined without a
-# form. The two partition the population: exactly one is emitted per run, so their union is the
-# denominator. Additive — the ledger record's own population and fields are unchanged, so survival
-# data collected before this change stays comparable with data collected after it.
-CANONICAL_SURVIVAL_EVENT = "taskv3 canonical progress final"
 
 
 @dataclass
@@ -790,6 +805,39 @@ def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | No
     return True
 
 
+def _cap_trip_relieved(
+    cap_trip: str | None,
+    max_tokens: int | None,
+    total_tokens: int,
+    final_turn_token_reserve: int,
+    max_turns: int,
+    turns: int,
+    max_tool_calls: int,
+    total_tool_calls: int,
+) -> bool:
+    """Whether the guard that produced `cap_trip` has since been raised past its trip.
+
+    Only the three guards a budget extension re-derives can be relieved. Mirrors the top-of-turn
+    checks exactly, reserve included, so a released latch cannot re-trip on the very next turn.
+
+    The two exclusions differ in kind. The wall clock is never re-derived, and its branch is
+    unreachable in practice besides: the gate refuses every grant once the clock is blown
+    ("insufficient_deadline_headroom"), so a deadline latch and a grant cannot coexist in one run.
+    The action-step trip is excluded on purpose and IS reachable — a refusal can latch the wrap-up
+    turn and the next turn's refreshed evidence can then earn a grant, which the spent-grant exit
+    discards. That wastes an earned extension and is worth revisiting, but releasing on it is a
+    behaviour change beyond raising the guards and is deliberately not made here."""
+    if cap_trip is None:
+        return False
+    if cap_trip.startswith("max_tokens"):
+        return max_tokens is not None and total_tokens < max(0, max_tokens - final_turn_token_reserve)
+    if cap_trip.startswith("max_turns"):
+        return turns < max_turns
+    if cap_trip.startswith("max_tool_calls"):
+        return total_tool_calls < max_tool_calls
+    return False
+
+
 def _budget_extension_gate(
     action_steps: int,
     last_change_evidence_step: int | None,
@@ -799,19 +847,33 @@ def _budget_extension_gate(
     deadline_at: float | None,
     extension: int,
     seconds_per_step: float | None = None,
+    headroom_gain: tuple[int, int, int] = (0, 0, 0),
 ) -> tuple[bool, str]:
-    """Whether an exhausted action-step budget may be extended once, and the deciding reason.
+    """Whether an exhausted action-step budget may be extended, and the deciding reason.
 
     Progress is the property, not its absence-of-stall proxy: the gate requires POSITIVE recent
     evidence the page changed (a repeated probe returning fresh content, a navigation or download —
     the same events that clear the action-retry ledger), then vetoes on any live stall signal, and
     finally requires the turn/token/deadline headroom to actually fund the extension — granting
     budget the runaway guards would immediately revoke converts an honest exhaustion into a worse
-    one. The pre-computed turn/tool-call backstops are NOT re-derived from the extended cap: these
-    headroom checks are the margin the extension runs on, so tightening the per-step guard
-    multipliers also tightens what an extension can fund. They are a funding FLOOR sized off the
-    run's own observed burn (turns per step so far, last turn's tokens), not a guarantee the
-    extension completes — the facetable grant/refusal events measure that on the canary."""
+    one. `headroom_gain` is the extra (turns, tool calls, tokens) that granting would itself create
+    by re-deriving the runaway backstops from the extended cap, and is added to what the run has
+    left: the question is whether the extension is fundable AFTER the grant, so judging it on
+    pre-grant headroom would refuse extensions the grant pays for.
+
+    Which of the three checks stay live depends on that gain. Under the standard sizing policy the
+    turn and tool-call gains exceed anything one extension can consume, so those two become
+    satisfied by construction — correctly, since a guard re-derived from the new cap provably
+    cannot revoke it — and they still bind for a caller passing no `backstops_for_cap` (the
+    default) or its own guards. TOKENS are the live discriminator: the gain per step is that
+    guard's own per-step allowance, so a run burning more than that per turn — the re-read-the-page
+    spiral the backstop exists for — still fails, and so does one whose gain is zero because the
+    guard has clamped at its ceiling.
+
+    The checks are a funding FLOOR sized off the run's own observed burn (turns per step so far,
+    last turn's tokens), not a guarantee the extension completes — the facetable grant/refusal
+    events measure that on the canary."""
+    extra_turns, extra_tool_calls, extra_tokens = headroom_gain
     if (
         last_change_evidence_step is None
         or action_steps - last_change_evidence_step > ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW
@@ -822,22 +884,20 @@ def _budget_extension_gate(
     if progress_stalled:
         return False, "no_net_progress_window"
     if activity is not None and activity.turns_remaining is not None:
+        turns_remaining = activity.turns_remaining + extra_turns
         # Fractional comparison (cross-multiplied): floor division would read 1.9 observed
         # turns-per-step as 1 and fund an extension the remaining turns cannot run.
-        if (
-            activity.turns_remaining < extension
-            or activity.turns_remaining * max(action_steps, 1) < extension * activity.turn
-        ):
+        if turns_remaining < extension or turns_remaining * max(action_steps, 1) < extension * activity.turn:
             return False, "insufficient_turn_headroom"
     if activity is not None and activity.tool_calls_remaining is not None:
         # +1 reserves the terminal finish call: funding only the actions trades one budget
         # exhaustion for another at the very last call.
-        if activity.tool_calls_remaining < extension + 1:
+        if activity.tool_calls_remaining + extra_tool_calls < extension + 1:
             return False, "insufficient_tool_call_headroom"
     if (
         activity is not None
         and activity.tokens_remaining is not None
-        and activity.tokens_remaining < extension * max(activity.last_turn_tokens, 1)
+        and activity.tokens_remaining + extra_tokens < extension * max(activity.last_turn_tokens, 1)
     ):
         return False, "insufficient_token_headroom"
     if activity is not None and activity.perception_stall_imminent:
@@ -875,6 +935,66 @@ class SubmitWatch:
     def clear(self) -> None:
         self.selector = None
         self.deferred = False
+
+
+@dataclass
+class SemanticCommitStats:
+    """Tier-1 semantic commit reads and how many accepted. One instance per run, shared by every
+    tool call, so a per-run accept rate is a division and not a join."""
+
+    opportunities: int = 0
+    accepts: int = 0
+
+    def log_fields(self) -> dict[str, int]:
+        return {"semantic_commit_opportunities": self.opportunities, "semantic_commit_accepts": self.accepts}
+
+
+@dataclass
+class LedgerTerminalFields:
+    """The ledger's end-of-run numbers, present only for a run that ever armed a form."""
+
+    peak_actions_since_progress: int
+    actions_since_progress: int
+    # The CURRENT look, cleared by progress — not the partition. See `TerminalTelemetry.form_ever_armed`.
+    form_armed: bool
+    would_fire: bool
+
+    def log_fields(self) -> dict[str, int | bool]:
+        return {
+            "peak_actions_since_progress": self.peak_actions_since_progress,
+            "actions_since_progress": self.actions_since_progress,
+            "form_armed": self.form_armed,
+            "would_fire": self.would_fire,
+        }
+
+
+@dataclass
+class TerminalTelemetry:
+    """The run's progress signals, assembled where their state lives and emitted by the caller on the
+    one terminal record it already writes per run. Every optional member is OMITTED rather than zeroed
+    when its tier could not have fired, because a 0 would read as "fired nothing" instead of "never
+    ran" and would drag an offline rate's denominator."""
+
+    # Sticky, and the partition. `form_armed` on the same record is the current look and answers a
+    # different question, so filter populations on this one.
+    form_ever_armed: bool
+    survival: dict[str, int]
+    ledger: LedgerTerminalFields | None = None
+    peak_page_state_stall_rounds: int | None = None
+    peak_probe_revisits: int | None = None
+    semantic_commit: SemanticCommitStats | None = None
+
+    def log_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {"form_ever_armed": self.form_ever_armed, **self.survival}
+        if self.ledger is not None:
+            fields.update(self.ledger.log_fields())
+        if self.peak_page_state_stall_rounds is not None:
+            fields["peak_page_state_stall_rounds"] = self.peak_page_state_stall_rounds
+        if self.peak_probe_revisits is not None:
+            fields["peak_probe_revisits"] = self.peak_probe_revisits
+        if self.semantic_commit is not None:
+            fields.update(self.semantic_commit.log_fields())
+        return fields
 
 
 def _unblocker_options(available_tools: set[str]) -> list[str]:
@@ -944,6 +1064,28 @@ def _refresh_nudge_text() -> str:
         "The page was refreshed by a page-level handler after the last tool call. Its state may have "
         "changed: re-observe before acting, and do not re-submit a form until the fresh page shows it "
         "was not already submitted."
+    )
+
+
+def _budget_extended_observation(cap: str, recency: ActivityRecency | None) -> str:
+    """The retraction of a `_budget_exhausted_observation` whose cap has since been raised.
+
+    APPENDED, never popped: `snapshot_indices` stores absolute message indices, so deleting the
+    stale message would silently re-anchor compaction onto the wrong ones. Without this the model
+    keeps reading "this is the final turn" for the rest of the run and wraps up early — which spends
+    the extension the release exists to preserve, through the prompt instead of through a counter."""
+    payload = {
+        "budget_exhausted": False,
+        "cap": cap,
+        "headroom": {
+            "tool_calls": recency.tool_calls_remaining if recency is not None else None,
+            "tokens": recency.tokens_remaining if recency is not None else None,
+        },
+    }
+    json_line = json.dumps(payload, separators=(",", ":"))
+    return (
+        f"{json_line}\nThat budget was extended: the earlier final-turn notice no longer applies and "
+        "the run continues. Keep working toward the goal."
     )
 
 
@@ -1034,11 +1176,13 @@ class _CanonicalProgressTracker:
     # on a fire rung while churn evicts other keys — a rung is one threshold crossing, not one
     # event per touch spent at it.
     _fired: set[tuple[str, int]] = field(default_factory=set)
-    # Run-level high-water marks, deliberately NOT cleared by progress(): the survival record needs
-    # the worst churn the run ever reached, the same way the ledger keeps peak_actions_since_progress
-    # across its own clears. Clearing these with the ring would report the last streak, not the peak.
+    # Run-level high-water marks and per-evidence clear tallies, deliberately NOT cleared by
+    # progress(): the survival record needs the worst churn the run ever reached and every clear it
+    # ever made, the same way the ledger keeps peak_actions_since_progress across its own clears.
+    # Clearing these with the ring would report the last streak, not the peak.
     peak_same_touches: int = 0
     peak_same_errors: int = 0
+    _evidence_counts: dict[str, int] = field(default_factory=dict)
 
     def record_touch(self, target_key: str, is_error: bool) -> tuple[int, int]:
         """Record one billable touch; returns (same-target touches, same-target errors) in-window."""
@@ -1060,6 +1204,7 @@ class _CanonicalProgressTracker:
         self._touches.clear()
         self._fired.clear()
         self.gen += 1
+        self._evidence_counts[evidence.value] = self._evidence_counts.get(evidence.value, 0) + 1
         LOG.debug("taskv3 canonical progress clear", evidence=evidence.value)
 
     def claim_rung(self, target_key: str, count: int) -> bool:
@@ -1080,11 +1225,14 @@ class _CanonicalProgressTracker:
 
     def survival_fields(self) -> dict[str, int]:
         """The per-run survival numbers, read through the class for the same reason progress() is
-        the one write choke point: the ring's state has no references outside this body."""
+        the one write choke point: the ring's state has no references outside this body. Every
+        evidence class carries an explicit 0, so a class that never fired stays distinguishable
+        from one this record forgot to emit."""
         return {
             "peak_same_touches": self.peak_same_touches,
             "peak_same_errors": self.peak_same_errors,
             "looping_targets": self.looping_targets(),
+            **{f"clear_{member.value}": self._evidence_counts.get(member.value, 0) for member in _ProgressEvidence},
         }
 
     def looping_targets(self) -> int:
@@ -1496,18 +1644,30 @@ async def run_agent_tool_loop(
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
-    # One model call's worth of token headroom, reserved so the single-shot final turn (below) is
+    # One model call's worth of token headroom, reserved so the granted final turn (below) is
     # actually fundable rather than being immediately re-tripped by the same max_tokens check it
     # was granted under. 0 (the default) reproduces today's unreserved check.
     final_turn_token_reserve: int = 0,
+    # The caller's policy for sizing the runaway guards off an action-step budget — the same
+    # function that produced the max_turns/max_tool_calls/max_tokens above. Supplied so a granted
+    # budget extension can RE-DERIVE them from the extended cap instead of running on the leftover
+    # headroom of the pre-extension one; without it a bigger action budget merely converts a
+    # step-cap death into a token-cap death. None keeps the guards fixed for the whole run.
+    backstops_for_cap: Callable[[int], tuple[int, int, int]] | None = None,
+    semantic_commit_stats: SemanticCommitStats | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     outcome: LoopOutcome | None = None
     pending_nav_dead_end: int | None = None
     stall_nudges_due: list[tuple[str, int]] = []
+    budget_extended_notice: str | None = None
     # Page-state stall detector (SKY-15265): consecutive billable rounds on a byte-identical
     # fingerprint, whether the one re-plan nudge went out, and whether one is due this turn.
-    page_state_stall_rounds = 0
+    trailing_page_state_stall_rounds = 0
+    peak_page_state_stall_rounds = 0
+    # Whether the detector ever reached a verdict. A wired sampler is not a taken sample: it is only
+    # read behind a billable call, so a run that lands none never judges the page at all.
+    page_state_ever_judged = False
     page_state_nudge_delivered = False
     page_state_nudge_due = False
     # The last fingerprint sample from the PREVIOUS batch: a delayed render can land between one
@@ -1546,13 +1706,17 @@ async def run_agent_tool_loop(
     # the warning (and a chance to self-correct) at least one turn before the verdict.
     action_counts: dict[tuple[str, str], tuple[int, int]] = {}
     action_warned: set[tuple[str, str]] = set()
-    # Progress-gated budget extension (SKY-15264): the action round of the latest positive
-    # page-change evidence, and whether the single extension has been spent.
+    # Progress-gated budget extension (SKY-15264, SKY-15666): the action round of the latest
+    # positive page-change evidence, how many extensions have been granted, and the cap they are
+    # all sized and bounded against — captured before the first grant so growth stays linear.
     last_change_evidence_step: int | None = None
-    budget_extension_granted = False
-    # Single-shot final-turn grant (budget-exhaustion final turn): mirrors budget_extension_granted's
-    # shape. The first budget-cap trip anywhere in the loop sets this and buys exactly one more
-    # unconstrained model turn; cap_trip_pending remembers which cap granted it, so a finish() outcome
+    budget_extensions_granted = 0
+    original_action_steps = max_action_steps
+    token_clamp_reported = False
+    # Final-turn grant (budget-exhaustion final turn): mirrors budget_extension_granted's shape. A
+    # budget-cap trip anywhere in the loop sets this and buys one more unconstrained model turn. One
+    # grant per latch, but an extension that relieves the latching guard releases it and re-arms the
+    # latch for a later trip; cap_trip_pending remembers which cap granted it, so a finish() outcome
     # produced on that turn can carry the fact forward even though finish is a different code path.
     # final_turn_started distinguishes "granted, turn not run yet" from "granted turn already ran": a
     # mid-batch grant (max_tool_calls, the action-step gate) leaves the SAME counter tripped for the
@@ -1580,7 +1744,7 @@ async def run_agent_tool_loop(
         """Clear the page-refresh signal and, unless dropped or past the cap, reload and void `remaining`."""
         nonlocal refresh_cycles, refresh_nudge_due, reload_failed_nudge_due, pending_screenshots, outcome
         nonlocal pending_nav_dead_end, stall_nudges_due, last_change_evidence_step
-        nonlocal page_state_stall_rounds, page_state_nudge_delivered, page_state_prev_fp
+        nonlocal trailing_page_state_stall_rounds, page_state_nudge_delivered, page_state_prev_fp
         ctx.refresh_working_page = False
         refresh_cycles += 1
         if drop:
@@ -1619,7 +1783,7 @@ async def run_agent_tool_loop(
         # so the run must re-demonstrate progress before it can earn an extension.
         _clear_action_state()
         last_change_evidence_step = None
-        page_state_stall_rounds = 0
+        trailing_page_state_stall_rounds = 0
         page_state_nudge_delivered = False
         page_state_prev_fp = None
         perception.reset()
@@ -1903,8 +2067,8 @@ async def run_agent_tool_loop(
         if should_cancel is not None and await should_cancel():
             outcome = LoopOutcome("canceled", "run canceled")
             break
-        # The single-shot final-turn grant (see final_turn_granted above): the first budget trip
-        # here buys exactly one more turn instead of ending the run, so the checks below are elif'd
+        # The final-turn grant (see final_turn_granted above): a budget trip here buys one more
+        # turn instead of ending the run, so the checks below are elif'd
         # (only the first tripped cap matters this iteration). A spent grant ends the run BEFORE any
         # counter is consulted: the granted turn may have been granted at a gate no top-of-turn
         # check re-reads (the action-step gate), so waiting for a counter to re-trip would let a
@@ -2039,6 +2203,7 @@ async def run_agent_tool_loop(
         turn_did_action = False
         stall_nudges_due = []
         refresh_nudge_due = False
+        budget_extended_notice = None
         reload_failed_nudge_due = False
         action_nudges_due: list[tuple[str, dict[str, Any], int]] = []
         round_actions: list[tuple[str, dict[str, Any], bool]] = []
@@ -2161,20 +2326,52 @@ async def run_agent_tool_loop(
             # Once the action-step budget is spent, refuse a further page action — terminate, mirroring
             # the step engine's max-steps stop — but let perception/finish through, since the cap bounds
             # new action rounds, not the separate re-observe/finish turn the system prompt asks for.
-            # A run with recent positive page-change evidence earns ONE extension of half the original
+            # A run with recent positive page-change evidence earns an extension of half the original
             # cap first (SKY-15264): the observed exhaustion population splits into genuinely long
             # multi-page forms dying mid-progress (the extension's target) and stalled runs the gate
-            # refuses so they fail exactly as before.
+            # refuses so they fail exactly as before. The grant repeats under that same predicate
+            # while the evidence keeps arriving (SKY-15666) — a form that was long enough to need one
+            # extension is routinely long enough to need another — up to a hard multiple of the
+            # original cap.
             if spec is not None and spec.billable and max_action_steps is not None and action_steps >= max_action_steps:
-                raw_extension = max_action_steps // 2
-                extension = raw_extension
+                base_cap = original_action_steps if original_action_steps else max_action_steps
+                raw_extension = base_cap // 2
+                extension_limit = base_cap * ACTION_BUDGET_EXTENSION_MAX_FACTOR
+                extension = min(raw_extension, max(0, extension_limit - max_action_steps))
                 if max_action_steps_ceiling is not None:
                     # The org's workflow-run-wide step pool is a HARD ceiling the extension must
                     # never breach: truncate the grant to what the pool can fund.
                     extension = min(extension, max_action_steps_ceiling - max_action_steps)
+                # Re-derive the runaway guards from the cap this grant would produce, and never
+                # below their live values. This is the whole difference between converting a
+                # step-cap death into a completion and merely relocating it onto the token guard:
+                # the guards were sized as functions of the action-step budget, so moving that
+                # budget without moving them leaves the extension running on leftovers.
+                grant_max_turns, grant_max_tool_calls, grant_max_tokens = max_turns, max_tool_calls, max_tokens
+                headroom_gain = (0, 0, 0)
+                token_clamped = False
+                if backstops_for_cap is not None and extension > 0:
+                    next_turns, next_tool_calls, next_tokens = backstops_for_cap(max_action_steps + extension)
+                    grant_max_turns = max(max_turns, next_turns)
+                    grant_max_tool_calls = max(max_tool_calls, next_tool_calls)
+                    token_gain = 0
+                    if max_tokens is not None:
+                        grant_max_tokens = max(max_tokens, next_tokens)
+                        token_gain = grant_max_tokens - max_tokens
+                    headroom_gain = (
+                        grant_max_turns - max_turns,
+                        grant_max_tool_calls - max_tool_calls,
+                        token_gain,
+                    )
+                    # Turns still scale with the cap but tokens do not: the token guard is at its
+                    # ceiling, and a cap raised past that point silently stops buying tokens.
+                    # Reported from the grant branch below, never here — a refused extension leaves
+                    # the cap where it was, so reporting on it would name a cap never in effect and
+                    # would spend the once-per-run latch on a non-event.
+                    token_clamped = max_tokens is not None and token_gain == 0 and grant_max_turns > max_turns
                 refresh_ctx = skyvern_context.current()
-                if budget_extension_granted:
-                    allowed, gate_reason = False, "already_extended"
+                if max_action_steps >= extension_limit:
+                    allowed, gate_reason = False, "extension_limit_reached"
                 elif raw_extension <= 0:
                     allowed, gate_reason = False, "cap_too_small"
                 elif extension <= 0:
@@ -2199,6 +2396,7 @@ async def run_agent_tool_loop(
                         deadline_at,
                         extension,
                         seconds_per_step=(time.monotonic() - started_at) / max(action_steps, 1),
+                        headroom_gain=headroom_gain,
                     )
                 # This read cannot see unabsorbed in-batch movement: action_steps is frozen during
                 # a batch, so the cap check trips on the batch's FIRST billable call — before any
@@ -2214,12 +2412,68 @@ async def run_agent_tool_loop(
                 )
                 if allowed:
                     original_cap = max_action_steps
-                    budget_extension_granted = True
+                    budget_extensions_granted += 1
                     max_action_steps += extension
+                    max_turns, max_tool_calls, max_tokens = grant_max_turns, grant_max_tool_calls, grant_max_tokens
+                    if activity is not None:
+                        # The guards moved mid-turn; the failure-evidence gates read these same
+                        # fields later in this turn and would otherwise judge the run on the
+                        # headroom it had before the grant.
+                        activity.turns_remaining = max_turns - turns
+                        activity.tool_calls_remaining = max_tool_calls - total_tool_calls
+                        activity.tokens_remaining = None if max_tokens is None else max_tokens - total_tokens
+                    if token_clamped and not token_clamp_reported:
+                        token_clamp_reported = True
+                        LOG.info(
+                            "task_v3 token backstop clamped at its ceiling",
+                            log_code="taskv3_token_backstop_clamped",
+                            step_cap=max_action_steps,
+                            max_tokens=max_tokens,
+                            extensions_granted=budget_extensions_granted,
+                        )
+                    if final_turn_granted and _cap_trip_relieved(
+                        cap_trip_pending,
+                        max_tokens,
+                        total_tokens,
+                        final_turn_token_reserve,
+                        max_turns,
+                        turns,
+                        max_tool_calls,
+                        total_tool_calls,
+                    ):
+                        # This run was granted its single wrap-up turn by a guard the grant above just
+                        # raised past the trip. Before SKY-15666 no cap could be relieved mid-run, so
+                        # the latch was permanent and reporting the remembered cap was honest; now it
+                        # would end the run naming a budget it is nowhere near, with the extension it
+                        # just earned unspent. Release it and let the top-of-turn checks resume.
+                        LOG.info(
+                            FINAL_TURN_RELEASED_EVENT,
+                            cap=cap_trip_pending,
+                            turn=turns,
+                            extensions_granted=budget_extensions_granted,
+                        )
+                        released_cap = cap_trip_pending
+                        final_turn_granted = False
+                        final_turn_started = False
+                        cap_trip_pending = None
+                        # Staged under a latch that no longer holds: leaving it would stamp a stale
+                        # extraction onto a terminal produced by some LATER cap trip.
+                        final_turn_staged_output = None
+                        if activity is not None:
+                            activity.final_turn_active = False
+                        # Staged, not appended: a user message may not sit between an assistant
+                        # turn's tool calls and their results, and this fires mid-batch. It rides
+                        # out with the other end-of-batch notes.
+                        budget_extended_notice = _budget_extended_observation(released_cap or "budget", activity)
                     LOG.info(
                         ACTION_BUDGET_EXTENDED_EVENT,
                         original_cap=original_cap,
                         extension=extension,
+                        extensions_granted=budget_extensions_granted,
+                        base_cap=base_cap,
+                        max_turns=max_turns,
+                        max_tool_calls=max_tool_calls,
+                        max_tokens=max_tokens,
                         action_steps=action_steps,
                         turn=turns,
                         tool=tool_name,
@@ -2229,6 +2483,8 @@ async def run_agent_tool_loop(
                         ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
                         gate_reason=gate_reason,
                         max_action_steps=max_action_steps,
+                        extensions_granted=budget_extensions_granted,
+                        base_cap=base_cap,
                         action_steps=action_steps,
                         turn=turns,
                         tool=tool_name,
@@ -2649,7 +2905,7 @@ async def run_agent_tool_loop(
             if page_state_prev_fp is not None and batch_fp_before != page_state_prev_fp:
                 # The page moved BETWEEN batches (a delayed render landing after the prior
                 # after-sample): the streak the old samples described is stale.
-                page_state_stall_rounds = 0
+                trailing_page_state_stall_rounds = 0
                 page_state_nudge_delivered = False
             page_state_changed: bool | None
             if batch_page_change_reason is not None and batch_page_change_reason != "page_transitioned":
@@ -2659,20 +2915,24 @@ async def run_agent_tool_loop(
                     batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
                 page_state_changed = None if batch_fp_after is None else batch_fp_after != batch_fp_before
             page_state_prev_fp = batch_fp_after if batch_fp_after is not None else batch_fp_before
+            page_state_ever_judged = page_state_ever_judged or page_state_changed is not None
             if page_state_changed is True:
-                page_state_stall_rounds = 0
+                trailing_page_state_stall_rounds = 0
                 page_state_nudge_delivered = False
                 canonical.progress(_ProgressEvidence.PAGE_STATE_VERDICT)
             elif page_state_changed is False:
-                page_state_stall_rounds += 1
-                if page_state_stall_rounds == PAGE_STATE_STALL_TERMINATE_AFTER and page_state_nudge_delivered:
+                trailing_page_state_stall_rounds += 1
+                peak_page_state_stall_rounds = max(peak_page_state_stall_rounds, trailing_page_state_stall_rounds)
+                if trailing_page_state_stall_rounds == PAGE_STATE_STALL_TERMINATE_AFTER and page_state_nudge_delivered:
                     # Shadow-only verdict: measured, not enforced (see PAGE_STATE_STALL_SHADOW_EVENT).
                     LOG.info(
                         PAGE_STATE_STALL_SHADOW_EVENT,
-                        rounds=page_state_stall_rounds,
+                        rounds=trailing_page_state_stall_rounds,
                         turn=turns,
                     )
-                elif page_state_stall_rounds >= PAGE_STATE_STALL_NUDGE_AFTER and not page_state_nudge_delivered:
+                elif (
+                    trailing_page_state_stall_rounds >= PAGE_STATE_STALL_NUDGE_AFTER and not page_state_nudge_delivered
+                ):
                     page_state_nudge_due = True
 
         if (
@@ -2704,6 +2964,10 @@ async def run_agent_tool_loop(
         # turn's tool results, and the model reads it with the snapshot that tripped it. Every note
         # due this turn shares ONE user message so the transcript keeps alternating roles.
         nudge_parts: list[str] = []
+        if budget_extended_notice is not None:
+            # First: it retracts a standing claim that the run is ending, which every other note
+            # this turn is written as if untrue.
+            nudge_parts.append(budget_extended_notice)
         if outcome is None and refresh_nudge_due:
             nudge_parts.append(_refresh_nudge_text())
         elif outcome is None and reload_failed_nudge_due:
@@ -2713,8 +2977,8 @@ async def run_agent_tool_loop(
         if outcome is None and page_state_nudge_due:
             page_state_nudge_due = False
             page_state_nudge_delivered = True
-            LOG.info("taskv3 loop page state stall nudged", rounds=page_state_stall_rounds, turn=turns)
-            nudge_parts.append(_page_state_nudge_text(page_state_stall_rounds))
+            LOG.info("taskv3 loop page state stall nudged", rounds=trailing_page_state_stall_rounds, turn=turns)
+            nudge_parts.append(_page_state_nudge_text(trailing_page_state_stall_rounds))
         if outcome is None and action_nudges_due:
             # Deliver only warnings whose streak survived the batch AND spans turns: a later call in
             # the same batch (an observe showing the page changed, a download) may have cleared it,
@@ -2767,37 +3031,33 @@ async def run_agent_tool_loop(
         if outcome.extracted_output is None:
             outcome.extracted_output = final_turn_staged_output
 
+    ledger_fields: LedgerTerminalFields | None = None
     if progress is not None and progress.ever_armed:
-        # Per-run survival record, emitted only for runs that ever saw a form (the population the
-        # ledger applies to — this bounds the added log volume to formful runs, not every v3 run):
-        # the peak no-progress streak and whether the shadow verdict would have fired, tagged with the
-        # terminal outcome — joined offline (by task_id via log context) to grade the ledger's
-        # precision and to pick an enforce window from the streak distribution at completion vs
-        # budget-death, not by gut. Read fire-precision as trustworthy but recall as a FLOOR: the
-        # ledger is precision-biased (see _ProgressLedger), so FEW FIRES != FEW STUCK RUNS.
-        LOG.info(
-            PROGRESS_LEDGER_FINAL_EVENT,
+        # The ledger is precision-biased (see _ProgressLedger), so read its fire precision as
+        # trustworthy but its recall as a FLOOR: few fires is not few stuck runs.
+        ledger_fields = LedgerTerminalFields(
             peak_actions_since_progress=progress.peak_actions_since_progress,
             actions_since_progress=progress.actions_since_progress,
             form_armed=progress.form_armed,
             would_fire=progress.shadow_reported,
-            outcome_status=outcome.status,
-            turns=turns,
         )
-    else:
-        # The complement: a run that never armed a form. Same terminal join key and the same
-        # outcome/turns tagging as above, so the two read as one population split in two, not as two
-        # unrelated streams. `looping_targets` is the end-state count; the peaks are the run's worst.
-        # Deliberately NOT gated on `progress`: the canonical tracker is built and updated
-        # unconditionally, so this record does not need the ledger to exist. Gating it would drop
-        # BOTH records whenever progress_window is None and silently restore the very hole this
-        # record closes — the partition has to be total for the union to be a denominator.
-        LOG.info(
-            CANONICAL_SURVIVAL_EVENT,
-            **canonical.survival_fields(),
-            outcome_status=outcome.status,
-            turns=turns,
-        )
+    outcome.telemetry = TerminalTelemetry(
+        # The sticky flag, not `form_armed`: the latter is the CURRENT look and is cleared by
+        # progress, so a run that saw a form early and lost it by the end reads False on it. This is
+        # the partition the two collapsed records used to encode by which one of them fired.
+        form_ever_armed=progress is not None and progress.ever_armed,
+        survival=canonical.survival_fields(),
+        ledger=ledger_fields,
+        # Present only where the detector actually judged the page at least once, so the field means
+        # "this was the worst streak" and never "nothing ever looked".
+        peak_page_state_stall_rounds=peak_page_state_stall_rounds if page_state_ever_judged else None,
+        # Present for any run that RE-READ a probe, which is the population the counter is defined
+        # on. It ships unconditionally there because it is the calibration input for a pending
+        # threshold: the shadow line fires only above the current cutoff, so nothing below it is
+        # observable from logs today.
+        peak_probe_revisits=perception.peak_probe_revisits if perception.revisit_chances else None,
+        semantic_commit=semantic_commit_stats,
+    )
 
     outcome.turns = turns
     outcome.no_tool_call_turns = no_tool_call_turns

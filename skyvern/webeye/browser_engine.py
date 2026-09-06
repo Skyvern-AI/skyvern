@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import importlib.metadata
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeAlias, cast
 
 import structlog
 from playwright.async_api import Error as _PlaywrightError
@@ -42,8 +42,15 @@ from skyvern.webeye.browser_errors import (
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 
 if TYPE_CHECKING:
+    from playwright.async_api import Frame as _StockFrame
+
     from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.webeye.browser_manager import BrowserManager
+    from skyvern.webeye.skycdp.facade.page import Frame as _SkyCdpFrame
+
+    # Callers annotate against this rather than naming an engine's frame class, so engine identity
+    # stays behind the registry seam that test_experimental_engine_production_isolation pins.
+    EngineFrame: TypeAlias = "_StockFrame | _SkyCdpFrame"
 
 LOG = structlog.get_logger()
 

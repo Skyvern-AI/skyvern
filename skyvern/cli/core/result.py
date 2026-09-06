@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, ParamSpec, TypeVar
 
+from skyvern.cli.core.guards import STALE_FRAME_HINT, stale_frame_selection_in
+
 # Module-level flag: when True, make_result() strips fields that waste AI context
 # tokens (echoed inputs, sdk_equivalent, browser_context, timing, empty collections).
 # Set once at MCP server startup; CLI paths leave it False.
@@ -64,6 +66,7 @@ class ErrorCode:
     WORKFLOW_NOT_FOUND = "WORKFLOW_NOT_FOUND"
     RUN_NOT_FOUND = "RUN_NOT_FOUND"
     API_ERROR = "API_ERROR"
+    STALE_FRAME_SELECTION = "STALE_FRAME_SELECTION"
 
 
 @dataclass
@@ -146,7 +149,11 @@ def make_error(
     message: str,
     hint: str,
     details: dict[str, Any] | None = None,
+    exc: BaseException | None = None,
 ) -> dict[str, Any]:
+    if stale_frame_selection_in(exc):
+        code = ErrorCode.STALE_FRAME_SELECTION
+        hint = STALE_FRAME_HINT
     return {
         "code": code,
         "message": message,

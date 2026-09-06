@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -30,12 +31,18 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    origin_runs_bound_to_scrubber,
+    register_matching_origin_run_redaction_values,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import (
     HealAdoptionFailed,
@@ -66,7 +73,6 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-    from skyvern.forge.sdk.copilot.terminal_envelope import QuestionPart
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
@@ -114,6 +120,16 @@ _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 # a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
 _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
+# How long a superseded run's owner gets to drop the lease. The worker releases only after its own
+# cooperative cancel check, so a cleared runnable_id is the evidence its browser work stopped.
+_SUPERSEDE_RELEASE_WAIT_SECONDS = 15.0
+_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS = 0.5
+# Time the typed occupied report needs to reach the user once the release wait gives up. The turn's
+# own deadline must not fire inside that window, or outer cancellation replaces the typed report.
+_SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS = 5.0
+# WorkflowRunStatus cannot be imported here: block.py imports this module, so its own module is
+# still initializing. It is a StrEnum, so its members compare equal to their string values.
+_PAUSED_WORKFLOW_RUN_STATUS = "paused"
 
 
 @dataclass(frozen=True)
@@ -363,6 +379,9 @@ class AgentContext:
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
+    # Build-test dispatch calls in the model response now executing, armed before any of them runs.
+    # The SDK schedules them concurrently, so more than one means a sibling may hold this session.
+    build_test_tool_calls_in_model_response: int = 0
     # The streaming adapter narrates any context it is handed, so the design-phase latches live here
     # rather than on the copilot subclass it is annotated for.
     design_start_emitted: bool = False
@@ -431,7 +450,10 @@ class AgentContext:
     copilot_total_timeout_exceeded: bool = False
     copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
+    budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
+    check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0
+    tool_calls_this_turn: int = 0
     enforcement_pass_count: int = 0
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     last_test_ok: bool | None = None
@@ -624,6 +646,11 @@ class AgentContext:
     # This is mutable page custody, separate from the immutable run redaction registry: only a
     # successful fresh navigation of this exact session clears it.
     sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
+    # Which run tainted which session, and which runs have had their complete registry bound to
+    # the scrubber. A session's facts are disclosed only when every run that tainted it is bound,
+    # because the registry describes one run while a page can hold values from several.
+    sensitive_origin_run_sessions: dict[str, str] = field(default_factory=dict)
+    origin_runs_bound_to_scrubber: set[str] = field(default_factory=set)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
@@ -632,9 +659,6 @@ class AgentContext:
     blocker_signal: CopilotToolBlockerSignal | None = None
     # Presentation-only recovery rows; authority remains in RequestPolicy.
     connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
-    # Admitted parts of the model's own terminal question; set at final translation and read
-    # by the terminal-envelope assembler. Presentation-only, like the rows above.
-    question_parts: list[QuestionPart] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
     # Most recently emitted blocker signal for the current tool output. Unlike
     # blocker_signal, this is last-wins so the activity-log projection can
@@ -861,7 +885,50 @@ def release_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: st
 
 
 def sensitive_origin_page_has_active_run(ctx: AgentContext) -> bool:
-    return effective_browser_session_id(ctx) in active_sensitive_origin_page_sessions(ctx)
+    active_session_ids = active_sensitive_origin_page_sessions(ctx)
+    if not active_session_ids:
+        return False
+    return effective_browser_session_id(ctx) in active_session_ids
+
+
+def record_sensitive_origin_run_taint(ctx: AgentContext, *, workflow_run_id: str, session_id: str) -> None:
+    tainted_session_ids = getattr(ctx, "sensitive_origin_browser_session_ids", None)
+    if not isinstance(tainted_session_ids, set):
+        tainted_session_ids = set()
+        ctx.sensitive_origin_browser_session_ids = tainted_session_ids
+    tainted_session_ids.add(session_id)
+    run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
+    if not isinstance(run_sessions, dict):
+        run_sessions = {}
+        ctx.sensitive_origin_run_sessions = run_sessions
+    run_sessions[workflow_run_id] = session_id
+
+
+def sensitive_origin_runs_for_session(ctx: AgentContext, session_id: str | None) -> set[str]:
+    run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
+    if not isinstance(run_sessions, dict) or session_id is None:
+        return set()
+    return {run_id for run_id, tainted_session_id in run_sessions.items() if tainted_session_id == session_id}
+
+
+def sensitive_origin_page_facts_withheld(ctx: AgentContext, run_id: str | None) -> bool:
+    """Whether a tainted page's structured facts stay withheld.
+
+    Disclosure needs no run active on the page, the claimed run's complete registry bound to the
+    scrubber, and the same for every other run that tainted this page: a run that ended without
+    completing its registry may have left values the scrubber never saw.
+    Answering False binds the claimed run's values to the scrubber as a side effect, which is what
+    lets the caller scrub the facts it is about to return; do not skip or reorder the call.
+    Frames are never licensed by this: pixels cannot be exact-value scrubbed.
+    """
+    if sensitive_origin_page_has_active_run(ctx):
+        return True
+    if not sensitive_origin_page_is_tainted(ctx):
+        return False
+    if not run_id or not register_matching_origin_run_redaction_values(ctx, run_id):
+        return True
+    tainting_run_ids = sensitive_origin_runs_for_session(ctx, effective_browser_session_id(ctx))
+    return not tainting_run_ids <= origin_runs_bound_to_scrubber(ctx)
 
 
 def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
@@ -869,6 +936,10 @@ def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
     active_session_ids = active_sensitive_origin_page_sessions(ctx)
     if session_id is not None and session_id not in active_session_ids:
         ctx.sensitive_origin_browser_session_ids.discard(session_id)
+        run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
+        if isinstance(run_sessions, dict):
+            for run_id in sensitive_origin_runs_for_session(ctx, session_id):
+                run_sessions.pop(run_id, None)
 
 
 async def resolve_browser_state_for_context(
@@ -1416,7 +1487,134 @@ async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, An
         }
 
 
-async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
+def _supersede_release_budget_seconds(ctx: AgentContext) -> float:
+    """Seconds the release poll may spend before the turn's own deadline needs what is left to
+    terminalize. A deadline suspended for a user decision reports no ``when()`` and imposes no clamp."""
+    deadline = ctx.model_stream_deadline
+    when = deadline.when() if deadline is not None else None
+    if when is None:
+        return _SUPERSEDE_RELEASE_WAIT_SECONDS
+    remaining = when - asyncio.get_running_loop().time() - _SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS
+    return min(_SUPERSEDE_RELEASE_WAIT_SECONDS, remaining)
+
+
+async def _build_test_session_occupancy_stop(
+    ctx: AgentContext,
+    *,
+    session_id: str,
+    copilot_chat_id: str | None,
+    copilot_turn_id: str | None,
+) -> BuildTestConnectFailure | None:
+    """Whether a live lease on the attached session blocks dispatching a build test into it.
+
+    ``None`` means the session was free when read: nothing held it, or this chat's own older test
+    run was superseded and its owner dropped the lease. It is a read, not a reservation — the new
+    run takes the lease later, in the worker, so a third party can still win that gap and the run
+    dies on the shared lease exactly as it does today.
+    """
+    session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        session_id=session_id,
+        organization_id=ctx.organization_id,
+    )
+    if session is None or not session.runnable_id:
+        return None
+    holder_id = session.runnable_id
+
+    def _stop(reason: str) -> BuildTestConnectFailure:
+        LOG.info(
+            "copilot_build_test_session_occupied",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            occupier_runnable_id=holder_id,
+            occupier_runnable_type=session.runnable_type,
+            reason=reason,
+        )
+        return BuildTestConnectFailure(
+            state="occupied",
+            browser_session_id=session_id,
+            occupier_run_id=holder_id if session.runnable_type == "workflow_run" else None,
+        )
+
+    if session.runnable_type != "workflow_run":
+        return _stop("non_run_owner")
+    holder = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=holder_id,
+        organization_id=ctx.organization_id,
+    )
+    if holder is None:
+        return _stop("owner_run_missing")
+    if holder.status.is_final():
+        return _stop("owner_run_terminal")
+    if not copilot_chat_id or holder.copilot_session_id != copilot_chat_id:
+        return _stop("foreign_chat")
+    # Descendant runs inherit the chat id from their parent, so a child would otherwise pass every
+    # guard: cancelling it leaves the parent running and misreporting a failed child block.
+    if holder.parent_workflow_run_id is not None:
+        return _stop("owner_run_is_child")
+    # A run the user is answering is live work, and ``is_final`` does not cover ``paused``.
+    if holder.status == _PAUSED_WORKFLOW_RUN_STATUS:
+        return _stop("owner_run_paused")
+    if ctx.build_test_tool_calls_in_model_response > 1:
+        return _stop("sibling_dispatch_this_turn")
+
+    # Cancelling without time left to see the lease drop would destroy the older test and start
+    # nothing in its place, so a spent budget reports occupied and leaves the holder running.
+    release_budget = _supersede_release_budget_seconds(ctx)
+    if release_budget <= 0:
+        return _stop("supersede_release_budget_exhausted")
+    try:
+        canceled = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
+            holder_id,
+            failure_reason=SUPERSEDED_BY_NEWER_TEST_REASON,
+        )
+    except Exception:
+        LOG.warning(
+            "copilot_build_test_supersede_cancel_failed",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            superseded_workflow_run_id=holder_id,
+            exc_info=True,
+        )
+        return _stop("supersede_cancel_failed")
+    # A no-op cancel means the holder reached its own terminal state in the gap after the status
+    # read, so this turn superseded nothing and must not claim it did.
+    if canceled is not None and copilot_chat_id and copilot_turn_id:
+        # The reason on the run row is the fast path, but the superseded run's own finalizer can
+        # still overwrite it; this record is copilot's and nothing else writes it.
+        await app.DATABASE.workflow_params.record_superseded_build_test_run(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=copilot_chat_id,
+            turn_id=copilot_turn_id,
+            workflow_run_id=holder_id,
+        )
+    LOG.info(
+        "copilot_build_test_session_superseded",
+        session_id=session_id,
+        organization_id=ctx.organization_id,
+        superseded_workflow_run_id=holder_id,
+    )
+    deadline = time.monotonic() + release_budget
+    while time.monotonic() < deadline:
+        await asyncio.sleep(_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS)
+        current = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+        )
+        if current is None:
+            return _stop("session_row_gone_after_supersede")
+        if not current.runnable_id:
+            return None
+        if current.runnable_id != holder_id:
+            return _stop("relet_after_supersede")
+    return _stop("supersede_release_timed_out")
+
+
+async def verify_build_test_browser_session_by_attaching(
+    ctx: AgentContext,
+    *,
+    copilot_chat_id: str | None = None,
+    copilot_turn_id: str | None = None,
+) -> dict[str, Any] | None:
     """Attach once for a build test; report supported acquisition state without replacing it."""
     await _drop_browser_session_id_at_its_fixed_deadline(ctx)
     if not ctx.browser_session_id:
@@ -1424,7 +1622,6 @@ async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> d
     examined_session_id = ctx.browser_session_id
     try:
         await _attach_current_browser_generation(ctx)
-        return None
     except CopilotBrowserSessionUnavailable:
         retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
@@ -1456,3 +1653,11 @@ async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> d
             "error": "The build-test browser attach could not be classified.",
             "probe_error_type": type(exc).__name__,
         }
+
+    occupancy = await _build_test_session_occupancy_stop(
+        ctx,
+        session_id=examined_session_id,
+        copilot_chat_id=copilot_chat_id,
+        copilot_turn_id=copilot_turn_id,
+    )
+    return None if occupancy is None else _build_test_connect_failure_result(occupancy)

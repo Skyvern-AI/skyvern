@@ -955,6 +955,16 @@ class SkyvernActionFailed(SkyvernException):
         super().__init__(reason)
 
 
+class StaleFrameSelectionError(RuntimeError):
+    """The selected iframe belongs to a different page than the one now resolved."""
+
+    def __init__(self, name: str, url: str) -> None:
+        super().__init__(
+            f"Stale frame selection: the selected iframe (name={name[:80]!r}, url={url!r}) belongs to a "
+            "different page than the one now in focus."
+        )
+
+
 class ScrapingFailedBlankPage(ScrapingFailed):
     def __init__(self) -> None:
         super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")

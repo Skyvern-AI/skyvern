@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+    from skyvern.webeye.browser_engine import EngineFrame
 
 
 @dataclass
@@ -91,7 +92,7 @@ class SessionState:
     # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
     active_routes: dict[int, set[str]] = field(default_factory=dict)
     # -- Iframe frame context --
-    _working_frame: Frame | None = None
+    _working_frame: EngineFrame | None = None
     _observed_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
     _observed_refs_generation: int = 0
     # Local fallback when no cloud/CDP/extension browser-session identity is available.

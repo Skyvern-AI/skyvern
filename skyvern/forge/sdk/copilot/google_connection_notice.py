@@ -3,12 +3,13 @@ from __future__ import annotations
 import itertools
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NotRequired
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from skyvern.config import settings
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock
@@ -18,27 +19,32 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 class GoogleConnectionNoticePayload(TypedDict):
     provider: Literal["google"]
-    connectionId: str
+    connectionId: str | None
     displayName: str | None
-    condition: Literal["missing", "unusable"]
+    condition: Literal["missing", "unusable", "unbound"]
+    choices: NotRequired[list[dict[str, str | None]]]
 
 
 class GoogleConnectionNotice(BaseModel):
     provider: Literal["google"] = "google"
-    connectionId: str
+    connectionId: str | None
     displayName: str | None = None
-    condition: Literal["missing", "unusable"]
+    condition: Literal["missing", "unusable", "unbound"]
+    choices: list[ConnectedAccountChoice] = Field(default_factory=list)
 
     def to_payload(self) -> GoogleConnectionNoticePayload:
-        return {
+        payload: GoogleConnectionNoticePayload = {
             "provider": self.provider,
             "connectionId": self.connectionId,
             "displayName": self.displayName,
             "condition": self.condition,
         }
+        if self.condition == "unbound":
+            payload["choices"] = [choice.model_dump(mode="json") for choice in self.choices]
+        return payload
 
 
-GoogleSheetConnectionBinding = tuple[str, str]
+GoogleSheetConnectionBinding = tuple[str, str | None]
 
 _CAPTURE_SEQ = itertools.count(1)
 
@@ -52,8 +58,8 @@ def google_sheet_connection_bindings(workflow: Workflow | None) -> tuple[GoogleS
         for block in blocks:
             if isinstance(block, (GoogleSheetsReadBlock, GoogleSheetsWriteBlock)):
                 connection_id = block.credential_id
-                if connection_id and connection_id.startswith("goac_"):
-                    result.append((block.label, connection_id))
+                if not connection_id or connection_id.startswith("goac_"):
+                    result.append((block.label, connection_id or None))
             elif isinstance(block, (ForLoopBlock, WhileLoopBlock)):
                 collect(block.loop_blocks)
 
@@ -62,7 +68,9 @@ def google_sheet_connection_bindings(workflow: Workflow | None) -> tuple[GoogleS
 
 
 def google_sheet_connection_ids(workflow: Workflow | None) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(connection_id for _, connection_id in google_sheet_connection_bindings(workflow)))
+    return tuple(
+        dict.fromkeys(connection_id for _, connection_id in google_sheet_connection_bindings(workflow) if connection_id)
+    )
 
 
 def collect_google_connection_notices(
@@ -74,7 +82,7 @@ def collect_google_connection_notices(
     prior = set(turn_start_bindings)
     visible_by_id = {credential.id: credential for credential in visible_credentials}
     notices: list[GoogleConnectionNotice] = []
-    noticed_ids: set[str] = set()
+    noticed_ids: set[str | None] = set()
     for binding in current_bindings:
         if binding in prior:
             continue
@@ -82,6 +90,24 @@ def collect_google_connection_notices(
         if connection_id in noticed_ids:
             continue
         noticed_ids.add(connection_id)
+        if connection_id is None:
+            notices.append(
+                GoogleConnectionNotice(
+                    connectionId=None,
+                    condition="unbound",
+                    choices=[
+                        ConnectedAccountChoice(
+                            connection_id=credential.id,
+                            name=credential.credential_name,
+                            state=credential.state,
+                            email_address=credential.email_address,
+                        )
+                        for credential in visible_credentials
+                        if credential.state == STATE_ACTIVE and GOOGLE_SHEETS_DATA_SCOPE in credential.scopes_granted
+                    ],
+                )
+            )
+            continue
         credential = visible_by_id.get(connection_id)
         if credential is None:
             notices.append(GoogleConnectionNotice(connectionId=connection_id, condition="missing"))
@@ -98,7 +124,7 @@ def collect_google_connection_notices(
 
 def retain_notices_after_lookup_failure(
     *,
-    current_connection_ids: tuple[str, ...],
+    current_connection_ids: tuple[str | None, ...],
     notices: list[GoogleConnectionNotice],
 ) -> list[GoogleConnectionNotice]:
     current_ids = set(current_connection_ids)

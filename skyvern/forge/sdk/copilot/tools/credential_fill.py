@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_page_custody_lock,
     ensure_browser_session,
     mcp_browser_context,
-    sensitive_origin_page_is_tainted,
+    sensitive_origin_page_facts_withheld,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -829,9 +829,10 @@ async def _fill_credential_field_impl_serial(
         for field_name in _CREDENTIAL_FILL_ROLLBACK_FIELDS
         if field_name in context_values
     }
+    origin_run_id = copilot_ctx.last_run_blocks_workflow_run_id
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
             # The custody lock excludes every other model browser evidence commit while this call
             # runs, so restoring this transaction cannot remove facts owned by a parallel tool.
             for field_name, value in rollback_snapshot.items():
@@ -843,7 +844,7 @@ async def _fill_credential_field_impl_serial(
     authority_error = _authority_tool_error(copilot_ctx, "fill_credential_field")
     if authority_error:
         return finish({"ok": False, "error": authority_error})
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
 
     selector = (selector or "").strip()
@@ -867,10 +868,10 @@ async def _fill_credential_field_impl_serial(
     session_error = await ensure_browser_session(copilot_ctx)
     if session_error:
         return finish(session_error)
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     await _capture_scout_source_url(copilot_ctx)
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     # Capture each target's factual identity before the secret-bearing action; a fill can change
     # attributes, trigger framework replacement, or navigate, so a later read describes a different
@@ -879,12 +880,12 @@ async def _fill_credential_field_impl_serial(
     submit_probe = (
         await _probe_scout_target(copilot_ctx, submit_selector, fingerprint=False) if submit_selector else None
     )
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     fingerprint = fill_probe.fingerprint
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     # Started here rather than before the resolver, whose credential read and enterprise-secret
     # normalization precede the generation and would be counted as code age they are not. Nothing
@@ -939,7 +940,7 @@ async def _fill_credential_field_impl_serial(
         )
 
     assert fill_outcome is not None
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
@@ -956,7 +957,7 @@ async def _fill_credential_field_impl_serial(
         # one the fill acted on distinguishes the two, and it is read here rather than up front
         # because every other path reaches this point having already landed.
         landed_url = await _live_working_page_url(copilot_ctx) or ""
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
         # Compared at origin+path, not as raw strings: a rejected code re-renders the same page at
         # ?error=..., and reading that as a navigation would report a fill nobody saw land.
@@ -992,7 +993,7 @@ async def _fill_credential_field_impl_serial(
         }
         return finish(landing_failure)
     url = await _live_working_page_url(copilot_ctx) or ""
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     _record_scouted_interaction(
         copilot_ctx,
@@ -1060,7 +1061,7 @@ async def _fill_credential_field_impl_serial(
             mint_started=mint_started,
             secret_value=value,
         )
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
         if submit.clicked:
             data["submitted"] = True
@@ -1108,7 +1109,7 @@ async def _fill_credential_field_impl_serial(
             source_url=source_url,
             url=url,
         )
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     _mark_pending_browser_interaction_observation(copilot_ctx, tool_name=observed_tool, url=observed_url)
     # An act-observe that cannot reach the discovery server leaves the previous click's outcome in
@@ -1122,7 +1123,7 @@ async def _fill_credential_field_impl_serial(
         source_url=observed_source_url,
         url=observed_url,
     )
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     _attach_scout_observation_step(
         copilot_ctx,
@@ -1140,7 +1141,7 @@ async def _fill_credential_field_impl_serial(
             _attach_scout_page_summary(copilot_ctx, result, page_evidence)
     else:
         form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
-        if sensitive_origin_page_is_tainted(copilot_ctx):
+        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
             return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
         if form_submits:
             data["form_submit_controls"] = form_submits
@@ -1150,7 +1151,7 @@ async def _fill_credential_field_impl_serial(
         captured_url=observed_url,
         observation_step=observation_step,
     )
-    if sensitive_origin_page_is_tainted(copilot_ctx):
+    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
         return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     LOG.info(
         "copilot fill_credential_field filled a saved credential field",

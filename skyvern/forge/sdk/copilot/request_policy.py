@@ -19,7 +19,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     CredentialResolution,
     CredentialResolutionTier,
@@ -57,7 +57,9 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_origins,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
+from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    TURN_OPENER_SENDERS,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
@@ -899,6 +901,14 @@ class RequestPolicy:
     live_page_admitted_urls: dict[str, str] = field(default_factory=dict)
     live_page_resolution: LivePageResolutionRecord | None = None
     live_page_logged_urls: set[str] = field(default_factory=set)
+    # Ids that reached auto_bound_credentials from a carried proposal rather than from a page this
+    # turn admitted. Without it the recorder cannot tell its own hydration from fresh evidence and
+    # re-mints the carry every turn, so it never expires.
+    seeded_proposal_credential_ids: set[str] = field(default_factory=set)
+    # Ids whose citation passed on the carry this turn. Whether that stands as the user's answer is
+    # settled at turn end. Kept apart from current_turn_named_credential_ids, whose claim is that
+    # the user wrote the identifier out themselves.
+    carry_cited_credential_ids: set[str] = field(default_factory=set)
     # Approves persisting a bound credential, not running it: run authority stays
     # scoped to resolved_credentials (ADR 0002).
     discovered_credentials: list[Credential] = field(default_factory=list)
@@ -1276,7 +1286,7 @@ def build_transcript_context(
     current_stripped = (current_user_message or "").strip()
     if (
         filtered
-        and filtered[-1].sender == WorkflowCopilotChatSender.USER
+        and filtered[-1].sender in TURN_OPENER_SENDERS
         and (filtered[-1].content or "").strip() == current_stripped
         and current_stripped
     ):
@@ -1284,7 +1294,7 @@ def build_transcript_context(
 
     filtered = redact_refused_secret_turns(filtered)
 
-    user_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.USER]
+    user_indices = [i for i, m in enumerate(filtered) if m.sender in TURN_OPENER_SENDERS]
     ai_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.AI]
 
     earliest_idx = user_indices[0] if user_indices else None
@@ -1315,7 +1325,7 @@ def build_transcript_context(
     for i, message in enumerate(filtered):
         if i in anchor_indices:
             continue
-        role = "user" if message.sender == WorkflowCopilotChatSender.USER else "assistant"
+        role = "user" if message.sender in TURN_OPENER_SENDERS else "assistant"
         candidate_lines.append((i, f"[{i + 1}] {role}: {_safe_slot(message.content, anchor_char_cap)}"))
 
     keep: list[str] = []
@@ -4116,6 +4126,8 @@ def _ground_user_provided_sites(
     this function's: it reads the whole conversation. What is recorded here is only the deterministic
     part — the origins the user actually wrote.
     """
+    # USER only, never TURN_OPENER_SENDERS: this set releases credentials, so a site must have
+    # been written by the person, not by a row the product authored on their behalf.
     user_texts = [
         message.content
         for message in full_chat_history
@@ -4159,6 +4171,12 @@ async def _seed_prior_approved_credentials(
     global_llm_context: str,
 ) -> None:
     approved_ids = _prior_approved_credential_ids(global_llm_context)
+    # An approval minted from a carry recorded the page that vouched for the credential; restoring it
+    # keeps the fill pinned there instead of falling through to any site named in the conversation.
+    for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
+        if record.credential_id in approved_ids and record.admitted_url:
+            policy.live_page_admitted_urls.setdefault(record.credential_id, record.admitted_url)
+            policy.seeded_proposal_credential_ids.add(record.credential_id)
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
@@ -4171,6 +4189,47 @@ async def _seed_prior_approved_credentials(
             *policy.resolved_credentials,
             *(credential for credential in credentials if credential.credential_id in approved_ids),
         ]
+    )
+
+
+def _proposed_credential_seed(global_llm_context: str) -> ProposedCredential | None:
+    seed = StructuredContext.from_json_str(global_llm_context).proposed_credential
+    if seed is None or not seed.credential_id.startswith("cred_") or not seed.admitted_url:
+        return None
+    return seed
+
+
+async def _seed_proposed_credential(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    seed = _proposed_credential_seed(global_llm_context)
+    if seed is None:
+        return
+    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        [seed.credential_id],
+        organization_id=organization_id,
+    )
+    credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
+    if credential is None:
+        return
+    policy.resolved_credentials = _deduplicate_credentials([*policy.resolved_credentials, credential])
+    # Restoring the recorded origin keeps the hydrated id page-vouched, so the turn-end recorder
+    # still skips it rather than promoting a one-turn carry to durable approval.
+    policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
+    policy.seeded_proposal_credential_ids.add(seed.credential_id)
+    # The server bound this and the user did not name it, so it enters through the auto-bound record:
+    # a write to current_turn_named_credential_ids would refuse the user's own later answer.
+    if seed.credential_id not in {item.credential_id for item in policy.auto_bound_credentials}:
+        policy.auto_bound_credentials.append(credential)
+    LOG.info(
+        "copilot_credential_proposal_hydrated",
+        organization_id=organization_id,
+        credential_id=seed.credential_id,
+        origin_arm=seed.origin_arm,
+        admitted_url=loggable_origin(seed.admitted_url),
     )
 
 
@@ -4539,10 +4598,8 @@ async def _build_request_policy_bootstrap(
         credential_id for credential_id in policy.persisted_workflow_credential_ids if credential_id.startswith("goac_")
     }
     google_connection_candidates |= _prior_approved_connection_ids(global_llm_context)
-    if selected_connected_account_id is not None:
-        policy.selected_connected_account_id = selected_connected_account_id
-        google_connection_candidates.add(selected_connected_account_id)
-    if google_connection_candidates:
+    policy.selected_connected_account_id = None
+    if google_connection_candidates or selected_connected_account_id is not None:
         try:
             active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
         except Exception:
@@ -4553,6 +4610,22 @@ async def _build_request_policy_bootstrap(
             )
         else:
             active_ids = {connection.id for connection in active_connections}
+            # Picker metadata can refresh after OAuth, independently of the previous turn.
+            # Validate the explicit selection before it becomes durable run authority.
+            selected = next(
+                (
+                    connection
+                    for connection in active_connections
+                    if connection.id == selected_connected_account_id
+                    and connection.organization_id == organization_id
+                    and connection.state == STATE_ACTIVE
+                    and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
+                ),
+                None,
+            )
+            if selected is not None:
+                policy.selected_connected_account_id = selected.id
+                google_connection_candidates.add(selected.id)
             policy.run_approved_google_connection_ids = sorted(google_connection_candidates & active_ids)
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
     try:
@@ -4564,6 +4637,18 @@ async def _build_request_policy_bootstrap(
     except Exception:
         LOG.warning(
             "request-policy prior approved credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+    try:
+        await _seed_proposed_credential(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy proposed credential seeding failed",
             organization_id=organization_id,
             exc_info=True,
         )

@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
-from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
+from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
@@ -123,7 +123,7 @@ class ProcessBrowserSessionRecordingResponse(BaseModel):
         default=[],
         description="List of workflow blocks generated from the processed browser session recording.",
     )
-    parameters: list[WorkflowDefinitionYamlParametersItem_Workflow] = Field(
+    parameters: list[WorkflowDefinitionYamlParametersItem] = Field(
         default=[],
         description="List of workflow parameters generated from the processed browser session recording.",
     )

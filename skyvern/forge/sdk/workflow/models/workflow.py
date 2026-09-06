@@ -170,6 +170,9 @@ class WorkflowDefinition(BaseModel):
                     raise NonTerminalFinallyBlock(self.finally_block_label)
 
 
+COPILOT_TEST_WORKFLOW_CREATOR = "copilot_test"
+
+
 class Workflow(BaseModel):
     workflow_id: str
     organization_id: str

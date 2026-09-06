@@ -196,7 +196,12 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_page_html_for_summary
-from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes, redact_secrets_from_text
+from skyvern.utils.secret_redaction import (
+    clears_numeric_secret_floor,
+    redact_console_log_bytes,
+    redact_har_bytes,
+    redact_secrets_from_text,
+)
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
@@ -393,6 +398,25 @@ _RUN_TYPE_BY_ENGINE: dict[RunEngine, str] = {
     RunEngine.ui_tars: "ui_tars",
     RunEngine.yutori_navigator: "yutori_navigator",
 }
+
+
+_PAGE_FINGERPRINT_PROBE_JS = (
+    "() => { if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
+    " const mix = (str, seed) => { let x = seed;"
+    " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
+    # The act-by-mark tag is OUR writing and it now outlives the action, so a page that never
+    # moved still hashes differently the first time each control is acted on. That reads as a
+    # page change and resets the stall counter -- on a frozen page the model works through
+    # mark after mark, which is precisely the run the stall detector exists to catch.
+    ' const scrub = (s) => s.replace(/ data-tv3-act="[^"]*"/g, \'\');'
+    " const walk = (root) => { h = mix(scrub(root.innerHTML || ''), h);"
+    " const all = root.querySelectorAll('*'); elems += all.length;"
+    " for (const el of root.querySelectorAll('input, textarea, select'))"
+    " v = mix(String(el.value || '') + '|' + (el.checked === true ? '1' : '0'), v);"
+    " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
+    " walk(document.body);"
+    " return h + ':' + elems + ':' + v; }"
+)
 
 
 def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields: Any) -> Action:
@@ -1977,18 +2001,6 @@ class ForgeAgent:
         # serialization does not reflect, so a form being filled would otherwise read as frozen.
         # Open shadow roots are traversed for the same reason — the tools pierce them, so work
         # inside a shadow widget must move the fingerprint too (closed roots stay invisible).
-        _PAGE_FINGERPRINT_PROBE_JS = (
-            "() => { if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
-            " const mix = (str, seed) => { let x = seed;"
-            " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
-            " const walk = (root) => { h = mix(root.innerHTML || '', h);"
-            " const all = root.querySelectorAll('*'); elems += all.length;"
-            " for (const el of root.querySelectorAll('input, textarea, select'))"
-            " v = mix(String(el.value || '') + '|' + (el.checked === true ? '1' : '0'), v);"
-            " for (const el of all) { if (el.shadowRoot) walk(el.shadowRoot); } };"
-            " walk(document.body);"
-            " return h + ':' + elems + ':' + v; }"
-        )
 
         _DOCUMENT_NONCE_JS = (
             "() => { if (!window.__skyvern_doc_nonce) window.__skyvern_doc_nonce = String(Math.random());"
@@ -2054,7 +2066,7 @@ class ForgeAgent:
             # must see the pinned key, or a multi-credential context hides get_verification_code.
             # No page provider in page-free mode: the sign-in-link tool navigates, and a run that
             # structurally never touches the live DOM must not be offered it.
-            verification_state = VerificationState()
+            verification_state = VerificationState(task=task)
             auth_tools, auth_guidance = build_auth_tools(
                 task,
                 None if page_free_validation else _page_provider,
@@ -2290,12 +2302,14 @@ class ForgeAgent:
                 extracted_information = validate_and_fill_extraction_result(
                     extracted_information, task.extracted_information_schema
                 )
-        if extracted_information is not None and app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(
-            task.workflow_run_id
-        ):
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
-            if secret_values:
-                extracted_information = _redact_extracted_information(extracted_information, secret_values)
+        if extracted_information is not None and run_secrets:
+            # extracted_information is returned product data, not a diagnostic string, so it gets a
+            # stricter floor than the reasoning fields: runtime OTP values skip the numeric-length
+            # check that workflow secrets get, and a 4-digit code would scrub the "2024" out of a
+            # date the customer asked for.
+            extraction_secrets = {value for value in run_secrets if clears_numeric_secret_floor(value)}
+            if extraction_secrets:
+                extracted_information = _redact_extracted_information(extracted_information, extraction_secrets)
         # Emit one action-result per billable browser action so the per-step billing hook meters a
         # task_v3 run per action, exactly like the step engine — no billing-model change. (Reuses the
         # _TASKV3_TOOL_ACTION_TYPES map for per-action persistence.)
@@ -2341,6 +2355,13 @@ class ForgeAgent:
             failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
         else:
             failure_reason = outcome.reason or outcome.status
+        # failure_reason is a first-class field on the task webhook payload, so the model's finish
+        # text leaves the system here. Redacted where it is born rather than at the persist below
+        # because the redactor matches whole registered values: the error detector and the
+        # non-completed block handoff, which truncates, both pass this text onward, and either could
+        # otherwise hand on a fragment that no longer matches.
+        if failure_reason and run_secrets:
+            failure_reason = redact_secrets_from_text(failure_reason, run_secrets)
         if outcome.cap_trip is not None:
             # The typed fact a budget cap tripped this run, independent of whether the model went on
             # to finish on the granted final turn (a completed/failed/terminated verdict) or the loop
@@ -2432,6 +2453,22 @@ class ForgeAgent:
                     failure_reason=failure_reason,
                 )
                 if detected_errors:
+                    # The detector reads the page as well as the failure reason, so a redacted input
+                    # does not make its output safe: a secret typed into the form can come back in
+                    # its reasoning, and task.errors leaves over the customer webhook.
+                    scrubbed_errors = []
+                    for error in detected_errors:
+                        reasoning = error.reasoning
+                        if run_secrets:
+                            reasoning = redact_secrets_from_text(reasoning, run_secrets)
+                        # Truncate after redacting, like the sibling persists: cutting first can split
+                        # a secret into a fragment the redactor no longer matches. The cap is
+                        # unconditional because this column appends rather than replaces.
+                        reasoning = reasoning[:_TASKV3_REASONING_MAX_CHARS]
+                        scrubbed_errors.append(
+                            error if reasoning == error.reasoning else error.model_copy(update={"reasoning": reasoning})
+                        )
+                    detected_errors = scrubbed_errors
                     await app.DATABASE.tasks.update_task(
                         task_id=task.task_id,
                         organization_id=task.organization_id,
@@ -2493,6 +2530,17 @@ class ForgeAgent:
                         # Mask BEFORE truncating so a secret straddling the cap cannot survive as a
                         # partial, unmatchable prefix.
                         handoff_reason = task.failure_reason if task.status != TaskStatus.completed else outcome.reason
+                        # A completed run leaves failure_reason None, so this branch carries the raw
+                        # finish text, and mask_secrets_in_data below covers the static secrets dict
+                        # but not the runtime-minted values run_secrets holds.
+                        # LoopOutcome is a plain class, so `reason` is unvalidated and a model can
+                        # answer with an object. Flatten rather than skip: the mask below covers only
+                        # the static workflow secrets, so skipping would publish a runtime value
+                        # inside the repr this line is stringified into anyway.
+                        if handoff_reason is not None and not isinstance(handoff_reason, str):
+                            handoff_reason = str(handoff_reason)
+                        if handoff_reason and run_secrets:
+                            handoff_reason = redact_secrets_from_text(handoff_reason, run_secrets)
                         finish_reason = (
                             mask_signed_urls_in_text(str(workflow_run_context.mask_secrets_in_data(handoff_reason)))[
                                 :MAX_PERSISTED_FINISH_REASON_CHARS
@@ -3240,6 +3288,17 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
+            # This exit is reachable on v3 as well as v1 -- a run that dies by exception rather than
+            # by a model verdict lands here -- and it persists failure_reason and then webhooks
+            # itself, so redact once at the top and every consumer below sees the redacted string.
+            run_secrets = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+                else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            )
+            if reason and run_secrets:
+                reason = redact_secrets_from_text(reason, run_secrets)
+
             # Update task status first
             failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
             LOG.info(
@@ -3280,6 +3339,15 @@ class ForgeAgent:
                     # Update task errors if any were detected
                     # Only pass new errors — update_task() appends to existing errors
                     if detected_errors:
+                        # The detector reads the page too, so redacting its input is not enough: a
+                        # secret typed into the form can come back in its reasoning.
+                        if run_secrets:
+                            detected_errors = [
+                                error.model_copy(
+                                    update={"reasoning": redact_secrets_from_text(error.reasoning, run_secrets)}
+                                )
+                                for error in detected_errors
+                            ]
                         new_errors = [error.model_dump() for error in detected_errors]
                         await app.DATABASE.tasks.update_task(
                             task_id=task.task_id,

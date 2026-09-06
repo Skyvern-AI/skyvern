@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Literal
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation
@@ -31,19 +30,10 @@ def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringP
     return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
 
 
-def block_authoring_policy_for_request(
-    code_block_mode: bool | None,
-    composer_mode: Literal["ask", "build"] | None,
-    *,
-    fallback_code_block_mode: bool,
-) -> BlockAuthoringPolicy:
+def block_authoring_policy_for_request(code_block_mode: bool | None) -> BlockAuthoringPolicy:
     if code_block_mode is True:
         return BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    if composer_mode == "build":
-        return BlockAuthoringPolicy.TASK_V3_PURE
-    if code_block_mode is False:
-        return BlockAuthoringPolicy.STANDARD
-    return block_authoring_policy_from_code_only_mode(fallback_code_block_mode)
+    return BlockAuthoringPolicy.TASK_V3_PURE
 
 
 def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:
@@ -97,6 +87,8 @@ class CopilotConfig:
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    code_block_available: bool = False
+    effective_code_block_mode: bool = False
     requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
     requested_output_shape_expectations: dict[str, ShapeExpectation] = field(default_factory=dict)
     credential_pause_enabled: bool = field(default_factory=_default_credential_pause_enabled)

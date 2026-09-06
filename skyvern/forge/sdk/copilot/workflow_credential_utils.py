@@ -5,10 +5,9 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
+from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-_NESTED_BLOCK_LIST_KEYS = ("loop_blocks", "blocks")
-_BRANCH_LIST_KEYS = ("branch_conditions", "branches", "ordered_branches")
 URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
 
 
@@ -103,44 +102,7 @@ def workflow_blocks(parsed: dict[str, Any], selected_labels: set[str] | None = N
     """With `selected_labels`, collect only blocks whose label is in the set plus their
     descendants — a selected `for_loop` drags its `loop_blocks` in, since loop children are
     not themselves named in an executing label set."""
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return []
-
-    collected: list[dict[str, Any]] = []
-
-    def visit_branch(branch: dict[str, Any], inherited: bool) -> None:
-        for key in _NESTED_BLOCK_LIST_KEYS:
-            visit(branch.get(key), inherited)
-        for branch_key in _BRANCH_LIST_KEYS:
-            branches = branch.get(branch_key)
-            if not isinstance(branches, list):
-                continue
-            for nested_branch in branches:
-                if isinstance(nested_branch, dict):
-                    visit_branch(nested_branch, inherited)
-
-    def visit(blocks: Any, inherited: bool) -> None:
-        if not isinstance(blocks, list):
-            return
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            selected = inherited or selected_labels is None or block.get("label") in selected_labels
-            if selected:
-                collected.append(block)
-            for key in _NESTED_BLOCK_LIST_KEYS:
-                visit(block.get(key), selected)
-            for branch_key in _BRANCH_LIST_KEYS:
-                branches = block.get(branch_key)
-                if not isinstance(branches, list):
-                    continue
-                for branch in branches:
-                    if isinstance(branch, dict):
-                        visit_branch(branch, selected)
-
-    visit(workflow_definition.get("blocks"), False)
-    return collected
+    return [location.block for location in workflow_block_locations(parsed, selected_labels)]
 
 
 def block_credential_ids(block: dict[str, Any], credential_params_by_key: Mapping[str, str | set[str]]) -> set[str]:

@@ -16,11 +16,12 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator, Literal
+from typing import Any, Awaitable, Callable, Iterator, Literal, Sequence
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
@@ -34,6 +35,28 @@ LOG = structlog.get_logger(__name__)
 TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
 COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
 OBSERVE_V2_ENV = "SKYVERN_MCP_OBSERVE_V2"
+
+_SELECTOR_IS_PASSWORD_JS = (
+    "el => el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'"
+)
+
+
+async def selector_targets_password(scopes: Sequence[Any], selector: str, *, timeout: float) -> bool:
+    """Report whether ``selector`` reaches a password input in any document the paired write may
+    resolve it in; pass every such scope, since a probe narrower than the write fails open.
+
+    ``timeout`` must be the paired write's own timeout. A probe that gives up sooner answers "not a
+    password" for a field the write then waits for and types into, which is the one failure this
+    guard exists to prevent.
+    """
+    for scope in scopes:
+        try:
+            if await scope.locator(selector).first.evaluate(_SELECTOR_IS_PASSWORD_JS, timeout=timeout):
+                return True
+        except Exception:
+            LOG.debug("password probe failed", selector=selector, exc_info=True)
+    return False
+
 
 # Per-request rollout decision (set by the cloud MCP middleware from the org-keyed
 # PostHog flag). None means "no decision here" - fall back to the process env var,
@@ -972,7 +995,7 @@ class NativeOptionSelection:
 
 
 async def select_native_option_if_targeted(
-    page: Any,
+    page: SkyvernPage,
     selector: str,
     *,
     timeout: int = 30000,
@@ -983,13 +1006,12 @@ async def select_native_option_if_targeted(
     Playwright. This keeps selector/ref driven click flows deterministic by
     translating that specific target shape into a select_option call.
     """
-    raw_page = getattr(page, "page", page)
-    locator_factory = getattr(raw_page, "locator", None)
-    if locator_factory is None:
-        return None
+    # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+    _ = page.locator_scope
+    locator_factory = page.page.locator
 
     locator = locator_factory(selector)
-    first_locator = getattr(locator, "first", locator)
+    first_locator = locator.first
     # Bounded classification probe: only decides whether the target is a native <option>.
     # If the element is not readily present, defer to the caller's click (preserving
     # direct-mode fast-fail and resilient-mode waiting) instead of blocking the full
@@ -1210,10 +1232,10 @@ def _merge_dom_observe_elements(
 
 async def get_observe_document_id(page: Any) -> str | None:
     """Read the current document revision marker without taking an observe snapshot."""
-    working_frame = getattr(page, "_working_frame", None)
-    target = working_frame if working_frame is not None else page
+    scope = page.locator_scope if isinstance(page, SkyvernPage) else None
+    target = scope if scope is not None else page
     raw_page = getattr(page, "page", page)
-    session_target = working_frame if working_frame is not None else raw_page
+    session_target: Any = scope if scope is not None else raw_page
     cdp = getattr(session_target, "_skyvern_observe_cdp_session", None)
 
     # The session is cached on the page so the marker costs no attach per call; a cached one can be

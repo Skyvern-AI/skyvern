@@ -174,6 +174,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.models.run_limits import get_effective_workflow_run_max_elapsed_time_minutes
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
     WorkflowRequestBody,
@@ -10205,6 +10206,7 @@ class WorkflowService:
     async def mark_workflow_run_as_canceled_if_not_final(
         self,
         workflow_run_id: str,
+        failure_reason: str | None = None,
     ) -> WorkflowRun | None:
         """Conditional cancel that is a no-op when the run has already reached a
         terminal state. Safe to call from cancellation cleanup paths (e.g. the
@@ -10214,6 +10216,7 @@ class WorkflowService:
         updated = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.canceled,
+            failure_reason=failure_reason,
         )
         if updated is None:
             return None
@@ -12051,7 +12054,7 @@ class WorkflowService:
         regenerated per-version on a DEEP COPY of the definition (the source ids would collide on
         the global parameter PKs, and the shared ctx.staged_workflow / runtime_workflow object
         must not be mutated). The returned (reloaded) version carries the regenerated ids; the
-        caller maps post-run output values against it. The version is created as auto_generated
+        caller maps post-run output values against it. The version is marked with the copilot_test creator
         and is soft-deleted by the caller once the run reaches a terminal state.
         """
         # next_version is computed including soft-deleted rows: a soft-deleted version still
@@ -12064,6 +12067,15 @@ class WorkflowService:
         )
         next_version = (latest.version if latest else 0) + 1
         dispatch_definition = runtime_workflow.workflow_definition.model_copy(deep=True)
+        cdp_connect_headers = runtime_workflow.cdp_connect_headers
+        if cdp_connect_headers:
+            source = await app.DATABASE.workflows.get_workflow(
+                workflow_id=runtime_workflow.workflow_id,
+                organization_id=organization_id,
+            )
+            cdp_connect_headers = merge_masked_headers(
+                cdp_connect_headers, source.cdp_connect_headers if source is not None else None
+            )
         placeholder = await self.create_workflow(
             title=runtime_workflow.title,
             workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
@@ -12071,6 +12083,8 @@ class WorkflowService:
             workflow_permanent_id=runtime_workflow.workflow_permanent_id,
             version=next_version,
             status=WorkflowStatus.auto_generated,
+            created_by=COPILOT_TEST_WORKFLOW_CREATOR,
+            edited_by="copilot",
             description=runtime_workflow.description,
             proxy_location=runtime_workflow.proxy_location,
             webhook_callback_url=runtime_workflow.webhook_callback_url,
@@ -12086,9 +12100,10 @@ class WorkflowService:
             max_screenshot_scrolling_times=runtime_workflow.max_screenshot_scrolls,
             max_elapsed_time_minutes=runtime_workflow.max_elapsed_time_minutes,
             extra_http_headers=runtime_workflow.extra_http_headers,
-            cdp_connect_headers=runtime_workflow.cdp_connect_headers,
+            cdp_connect_headers=cdp_connect_headers,
             run_with=runtime_workflow.run_with,
             ai_fallback=runtime_workflow.ai_fallback,
+            cache_key=runtime_workflow.cache_key,
             code_version=runtime_workflow.code_version,
             run_sequentially=runtime_workflow.run_sequentially or False,
             sequential_key=runtime_workflow.sequential_key,
@@ -12321,6 +12336,13 @@ class WorkflowService:
                 organization_id=organization_id,
                 filter_deleted=False,
             )
+            existing_version = existing_latest_workflow.version
+            if existing_latest_workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR:
+                # Test versions reserve numbers but never supply settings for a normal save.
+                existing_latest_workflow = await self.get_workflow_by_permanent_id(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                )
         else:
             existing_latest_workflow = None
 
@@ -12332,8 +12354,6 @@ class WorkflowService:
 
         try:
             if existing_latest_workflow:
-                existing_version = existing_latest_workflow.version
-
                 # Missing field inherits the stored dict; an explicit dict (possibly
                 # with mask sentinels for unedited keys) is resolved entry-by-entry
                 # against the stored value so newly-added keys aren't dropped.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import hashlib
 import json
@@ -39,7 +38,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
 )
-from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
@@ -107,7 +105,9 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _normalize_copilot_yaml,
     _process_workflow_yaml,
+    dump_workflow_yaml,
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
     runner_code_block_associations,
@@ -144,7 +144,6 @@ from .credentials import (
 from .frontier import (
     _get_prior_workflow,
     _invalidate_verified_state_on_edit,
-    _workflow_requires_canonical_persist,
 )
 from .guardrails import _authority_tool_error
 
@@ -3857,29 +3856,73 @@ def _author_time_findings(
     return findings
 
 
-async def _record_canonical_write_ownership(ctx: CopilotContext, workflow: Workflow) -> None:
-    """Stamp the turn's marker with what it just left canonical as.
-
-    Best-effort: a missed stamp only costs this turn its rollback claim, while raising here
-    would fail a write that already succeeded. Canonical is re-read rather than fingerprinted
-    from the in-memory object so the value matches what reconcile computes.
-    """
-    with contextlib.suppress(Exception):
-        workflow_permanent_id = workflow.workflow_permanent_id
-        if not (ctx.workflow_copilot_chat_id and ctx.turn_id and workflow_permanent_id and ctx.organization_id):
+async def restore_pending_workflow_proposal(ctx: CopilotContext) -> None:
+    """Restore only the server's pending proposal, never a prior canonical YAML fallback."""
+    if ctx.staged_workflow is not None or not ctx.workflow_copilot_chat_id:
+        return
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+    )
+    if chat is None or chat.workflow_permanent_id != ctx.workflow_permanent_id:
+        return
+    proposal = chat.proposed_workflow
+    if not isinstance(proposal, dict):
+        return
+    workflow_yaml = proposal.get("_copilot_yaml")
+    if not isinstance(workflow_yaml, str) or not workflow_yaml:
+        return
+    if ctx.workflow_yaml:
+        # An explicit canvas edit remains the model's input to the normal update tool.
+        # Only restore over the persisted canvas or the same pending proposal.
+        try:
+            submitted = _normalize_copilot_yaml(ctx.workflow_yaml)
+            known_sources = [workflow_yaml]
+            if ctx.persisted_workflow_yaml:
+                known_sources.append(ctx.persisted_workflow_yaml)
+            if all(submitted != _normalize_copilot_yaml(source) for source in known_sources):
+                return
+        except (yaml.YAMLError, ValidationError):
             return
-        persisted = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=ctx.organization_id,
+    if "workflow_definition" in proposal:
+        workflow = Workflow.model_validate(proposal)
+        authored = _normalize_copilot_yaml(workflow_yaml)
+        if "cdp_connect_headers" in authored.model_fields_set:
+            # Workflow JSON masks these values for API disclosure; authored YAML retains
+            # the submitted header binding, including an explicit clear.
+            workflow.cdp_connect_headers = authored.cdp_connect_headers or {}
+        if "max_elapsed_time_minutes" in authored.model_fields_set:
+            workflow.max_elapsed_time_minutes = authored.max_elapsed_time_minutes
+        inherits_headers = (
+            "cdp_connect_headers" not in authored.model_fields_set and workflow.cdp_connect_headers is None
         )
-        if persisted is None:
-            return
-        await app.DATABASE.workflow_params.record_pending_copilot_turn_canonical_write(
-            organization_id=ctx.organization_id,
-            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
-            turn_id=ctx.turn_id,
-            fingerprint=workflow_content_fingerprint(persisted.model_dump(mode="json")),
+        inherits_limit = (
+            "max_elapsed_time_minutes" not in authored.model_fields_set and workflow.max_elapsed_time_minutes is None
         )
+        if inherits_headers or inherits_limit:
+            # Older proposal writers stored defaults rather than resolved omitted settings.
+            saved = await app.DATABASE.workflows.get_workflow(
+                workflow_id=ctx.workflow_id, organization_id=ctx.organization_id
+            )
+            if saved is not None:
+                if inherits_headers:
+                    workflow.cdp_connect_headers = saved.cdp_connect_headers
+                if inherits_limit:
+                    workflow.max_elapsed_time_minutes = saved.max_elapsed_time_minutes
+    else:
+        # Older proposals persisted only YAML.
+        workflow = await _process_workflow_yaml(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+            workflow_yaml=workflow_yaml,
+            settings_fallback_yaml=ctx.persisted_workflow_yaml,
+        )
+    ctx.staged_workflow = workflow
+    ctx.staged_workflow_yaml = workflow_yaml
+    ctx.workflow_yaml = workflow_yaml
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = workflow_yaml
 
 
 async def _update_workflow(
@@ -4100,6 +4143,20 @@ async def _update_workflow(
             if isinstance(ctx, CopilotContext):
                 ctx.clear_persisted_completion_contract = clear_persisted_completion_contract
             params["workflow_yaml"] = workflow_yaml
+        # Retain settings whose omission means inheritance in the durable YAML. Header
+        # values cannot be reconstructed from the masked Workflow JSON after reload.
+        submitted_definition = parse_workflow_yaml(workflow_yaml)
+        prior_definition = parse_workflow_yaml(prior_yaml) if prior_yaml else None
+        if isinstance(submitted_definition, dict) and isinstance(prior_definition, dict):
+            inherited_settings = {
+                key: prior_definition[key]
+                for key in ("cdp_connect_headers", "max_elapsed_time_minutes")
+                if key not in submitted_definition and key in prior_definition
+            }
+            if inherited_settings:
+                submitted_definition.update(inherited_settings)
+                workflow_yaml = dump_workflow_yaml(submitted_definition)
+                params["workflow_yaml"] = workflow_yaml
         prior_workflow = await _get_prior_workflow(ctx)
         workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
@@ -4116,47 +4173,8 @@ async def _update_workflow(
             workflow.webhook_callback_url = validate_webhook_url(webhook_callback_url)
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
-        # Param / top-level setting changes go through canonical because
-        # prepare_workflow and the runtime parameter-row read consume canonical
-        # values; terminal handlers roll back on non-auto-accept.
-        requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
-        if requires_canonical_persist:
-            await app.WORKFLOW_SERVICE.update_workflow_definition(
-                workflow_id=ctx.workflow_id,
-                organization_id=ctx.organization_id,
-                title=workflow.title,
-                description=workflow.description,
-                workflow_definition=workflow.workflow_definition,
-                proxy_location=workflow.proxy_location,
-                webhook_callback_url=workflow.webhook_callback_url,
-                totp_verification_url=workflow.totp_verification_url,
-                totp_identifier=workflow.totp_identifier,
-                persist_browser_session=workflow.persist_browser_session,
-                reuse_browser_session=workflow.reuse_browser_session,
-                mask_secrets=getattr(workflow, "mask_secrets", False),
-                pin_saved_session_ip=workflow.pin_saved_session_ip,
-                browser_profile_id=workflow.browser_profile_id,
-                browser_profile_key=workflow.browser_profile_key,
-                model=workflow.model,
-                max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
-                extra_http_headers=workflow.extra_http_headers,
-                cdp_connect_headers=workflow.cdp_connect_headers,
-                run_with=workflow.run_with,
-                ai_fallback=workflow.ai_fallback,
-                cache_key=workflow.cache_key,
-                adaptive_caching=workflow.adaptive_caching,
-                enable_self_healing=workflow.enable_self_healing,
-                code_version=workflow.code_version,
-                run_sequentially=workflow.run_sequentially,
-                sequential_key=workflow.sequential_key,
-                edited_by="copilot",
-                preserve_completion_contract=not getattr(ctx, "clear_persisted_completion_contract", False),
-            )
-            ctx.canonical_was_persisted_due_to_param_change = True
-            # isinstance narrows the declared ``AgentContext`` to the marker-aware
-            # ``CopilotContext`` for mypy, matching the narrative-emit seam below.
-            if isinstance(ctx, CopilotContext):
-                await _record_canonical_write_ownership(ctx, workflow)
+        # Runs materialize this proposal as their own version. The saved workflow
+        # remains unchanged until Accept, including parameter and setting edits.
         ctx.staged_workflow_yaml = workflow_yaml
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
@@ -4306,6 +4324,8 @@ async def _update_workflow(
             data["findings"] = findings
         if google_connection_resolution:
             data["google_connection_resolution"] = google_connection_resolution
+        if isinstance(ctx, CopilotContext) and ctx.google_connection_notices:
+            data["google_connection_notices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
         return {
             "ok": True,
             "data": data,

@@ -12,6 +12,7 @@ import structlog
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -910,7 +911,6 @@ class CodeBlockStepYAML(BaseModel):
 
 
 ERROR_CODE_MAX_LENGTH = 128
-ERROR_CODE_REASONING_MAX_LENGTH = 2000
 ERROR_CODE_MAPPING_MAX_ENTRIES = 64
 ERROR_CODE_MAPPING_MAX_UTF8_BYTES = 32768
 

@@ -38,6 +38,7 @@ from skyvern.forge.taskv3.loop import (
     CompletionBlocker,
     CompletionProbe,
     LoopOutcome,
+    SemanticCommitStats,
     SubmitWatch,
     ToolSpec,
     VerificationBlocker,
@@ -90,7 +91,7 @@ How to work:
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
 - Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys yourself. If `select_combobox` returns an error, the field is genuinely unfilled — try a fuller value or report it; never treat it as done.
-- `observe` already gives you everything you need to fill a field (selector, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` is a rare last resort for ONE specific element `observe` failed to describe: NEVER call it on a whole page/form/section, NEVER call it twice for the same element, and NEVER inspect more than once before acting.
+- `observe` already gives you everything you need to fill a field (selector, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER call it twice for the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
 - Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its selectors before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
@@ -292,6 +293,10 @@ async def run_task_v3_agent_loop(
     )
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
+    # The tier only ever increments under the verify flag, so the kill switch and the omit-vs-zero
+    # contract have to agree: with the switch off, a live object would report 0 opportunities for a
+    # tier that is turned off rather than saying it was not there.
+    semantic_commit_stats = None if page_free or not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY else SemanticCommitStats()
     browser_tools = (
         []
         if page_free
@@ -302,6 +307,7 @@ async def run_task_v3_agent_loop(
             resolve_typed_text=resolve_typed_text,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
+            semantic_commit_stats=semantic_commit_stats,
         )
     )
 
@@ -374,6 +380,8 @@ async def run_task_v3_agent_loop(
             page_fingerprint=None if page_free else page_fingerprint,
             reload_page=None if page_free else reload_page,
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
+            backstops_for_cap=taskv3_runaway_backstops,
+            semantic_commit_stats=semantic_commit_stats,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -396,5 +404,10 @@ async def run_task_v3_agent_loop(
         tool_choice_in_effect=outcome.tool_choice_in_effect,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
+        # The loop's progress signals ride here rather than on records of their own: this line
+        # already fires exactly once per run and already carries block_type, so collapsing removes a
+        # per-run indexed event and makes the join to block_type free instead of a second lookup.
+        # `status` and `turns` are deliberately not in log_fields() — they are already above.
+        **(outcome.telemetry.log_fields() if outcome.telemetry is not None else {}),
     )
     return outcome

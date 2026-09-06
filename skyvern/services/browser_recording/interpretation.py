@@ -193,12 +193,20 @@ def _draft_step_from_block(
 
 
 def _action_display_text(action: Action) -> str:
-    for text in action.target.texts or []:
+    target = action.target
+
+    # A <select>'s texts can be its option labels, so taken literally a country dropdown reads
+    # "Fill 'Germany'". Its accessible name is the field's own label whenever it has one.
+    if (target.tag_name or "").lower() == "select":
+        label = target.accessible_name or target.id
+        return label[:80] if label else (target.tag_name or "element").lower()
+
+    for text in target.texts or []:
         cleaned = " ".join(text.split())
         if cleaned:
             return cleaned[:80]
 
-    return (action.target.tag_name or "element").lower()
+    return (target.tag_name or "element").lower()
 
 
 _PLACEHOLDER_VERBS: dict[ActionKind, str] = {
@@ -295,6 +303,7 @@ class RecordingInterpretationSession:
             sm.Click(),
             sm.Hover(),
             sm.InputText(),
+            sm.Select(),
             sm.UrlChange(),
             sm.Wait(),
         ]

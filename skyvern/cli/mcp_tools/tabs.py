@@ -162,14 +162,14 @@ async def skyvern_tab_new(
                     "skyvern_tab_new",
                     ok=False,
                     browser_context=ctx,
-                    error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a public HTTP(S) URL"),
+                    error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a public HTTP(S) URL", exc=e),
                 )
         except SkyvernHTTPException as e:
             return make_result(
                 "skyvern_tab_new",
                 ok=False,
                 browser_context=ctx,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL"),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL", exc=e),
             )
 
     prev_active = state._active_page
@@ -205,7 +205,7 @@ async def skyvern_tab_new(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check URL or browser state"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check URL or browser state", exc=e),
             )
 
     pages = browser._browser_context.pages
@@ -258,7 +258,7 @@ async def skyvern_open_tabs(
         return make_result(
             "skyvern_open_tabs",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
 
     if len(urls) > _MAX_OPEN_TABS_PER_CALL:
@@ -505,7 +505,7 @@ async def skyvern_tab_close(
             "skyvern_tab_close",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Tab may already be closed"),
+            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Tab may already be closed", exc=e),
         )
 
     # Clear active page — get_working_page() will lazily pick the last remaining page

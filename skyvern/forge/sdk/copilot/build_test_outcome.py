@@ -272,6 +272,9 @@ class BuildTestPacketFailure(BaseModel):
     block_type: str | None = None
     block_status: str | None = None
     reason: str | None = None
+    final_url: str | None = None
+    page_title: str | None = None
+    covering_element: str | None = None
     error_codes: list[str] = Field(default_factory=list)
     failing_line: int | None = None
     failed_operation: BuildTestFailedOperation | None = None
@@ -1446,6 +1449,7 @@ def recorded_outcome_from_run_blocks_result(
         _declared_goal_path_omission_facts(
             declared_goal_path_omissions or [],
             authoritative_workflow_run_id,
+            blocks,
         ),
     )
     missing_output_facts = _merge_missing_requested_output_facts(
@@ -1606,6 +1610,7 @@ def recorded_outcome_from_run_blocks_result(
             failed_operation=failed_operation,
             executed_block_associations=executed_block_associations,
             completed_block_associations=completed_block_associations,
+            observed_page_value_excerpt=_observed_page_value_excerpt(graded_page_evidence),
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
                 "structural_failure_identity": (
@@ -1613,6 +1618,7 @@ def recorded_outcome_from_run_blocks_result(
                     if typed_output_omission_facts
                     else "CompletionVerificationResult verdict structure"
                 ),
+                "observed_page_value_excerpt": "bounded post-run page evidence",
                 "page_evidence_refs": "bounded post-run page evidence",
                 "evidence_refs": "run output structure",
                 "missing_requested_output_facts": (
@@ -2134,8 +2140,14 @@ def observed_value_extraction_scaffold_lines(observed_values: str, output_paths:
     if not paths:
         return [f"observed_page_values: {observed_values}"]
     lines = [
-        "OBSERVED PAGE VALUES CONTRACT: author a keyed extraction over the on-screen values below and bind "
-        "each required output_path to its observed value.",
+        (
+            "OBSERVED PAGE VALUES CONTRACT: author a keyed extraction over the on-screen values below and bind "
+            "each required output_path to the element that showed it."
+        ),
+        (
+            "These values were read after the last run and may already have changed. Locate each one on the page "
+            "at run time; never carry an observed value into the code as a literal."
+        ),
         f"observed_values: {observed_values}",
         "bind_output_paths:",
     ]
@@ -2557,9 +2569,38 @@ def _typed_requested_output_omission_facts(
     return sorted(facts, key=lambda item: str(item["output_path"]))
 
 
+def _declared_path_returned_empty_scalar(
+    blocks: Sequence[Mapping[str, object]],
+    output_path: str,
+    block_label: str,
+) -> bool:
+    """True when every value this path yielded is a blank string, which is the run reaching the page
+    and reading nothing, unlike a null (nothing produced) or an empty collection (a real value).
+    An unlabelled omission cannot be attributed to one block, so it stays the absent reading rather
+    than borrowing a sibling's blank value."""
+    if not block_label:
+        return False
+    returned: list[object] = []
+    for block in blocks:
+        if _bounded_ref(block.get("label")) != block_label:
+            continue
+        extracted = block.get("extracted_data")
+        if extracted is None:
+            continue
+        value, present = _value_at_output_path(extracted, output_path)
+        if not present or value is None:
+            continue
+        if "[]" in output_path and isinstance(value, list):
+            returned.extend(value)
+        else:
+            returned.append(value)
+    return bool(returned) and all(isinstance(value, str) and not value.strip() for value in returned)
+
+
 def _declared_goal_path_omission_facts(
     declared_goal_path_omissions: Sequence[Mapping[str, object]],
     workflow_run_id: str,
+    blocks: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
     """Same-run declared goal-value paths the completed run retained no value for."""
     if not workflow_run_id:
@@ -2572,17 +2613,18 @@ def _declared_goal_path_omission_facts(
         output_path = _bounded_text(omission.get("output_path"))
         if not output_path:
             continue
+        block_label = _bounded_ref(omission.get("block_label"))
+        empty = _declared_path_returned_empty_scalar(blocks, output_path, block_label)
         fact: dict[str, object] = {
             "output_path": output_path,
-            "reason_code": "declared_goal_path_absent",
-            "value_status": "no_typed_value",
+            "reason_code": "declared_goal_path_empty" if empty else "declared_goal_path_absent",
+            "value_status": "empty_typed_value" if empty else "no_typed_value",
         }
         # A top-level array path such as ``[].number`` has no root to group under. The root is
         # diagnostic grouping only, so its absence must not withhold the path itself.
         output_root = _output_path_root(output_path)
         if output_root:
             fact["output_root"] = output_root
-        block_label = _bounded_ref(omission.get("block_label"))
         if block_label:
             fact["block_label"] = block_label
         facts.append(fact)

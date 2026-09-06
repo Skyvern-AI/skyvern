@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
@@ -23,6 +23,8 @@ TerminalCause = Literal[
     "already_closed",
     "provisioning_unavailable",
     "cdp_connect_failed",
+    "occupied",
+    "empty_completion",
 ]
 _FINAL_RUN_VERDICTS = frozenset({"not_demonstrated", "not_evaluated"})
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
@@ -44,6 +46,7 @@ INTERRUPTED_TERMINAL_REASON = "interrupted"
 INTERRUPTED_TERMINAL_HEADLINE = "This turn was interrupted before it could finish."
 INTERRUPTED_TERMINAL_RETRY = "Send your message again to retry."
 INTERRUPTED_TERMINAL_MESSAGE = f"{INTERRUPTED_TERMINAL_HEADLINE} {INTERRUPTED_TERMINAL_RETRY}"
+INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE = "This test stopped because a newer test in this chat took over the browser."
 
 
 class InterruptedTurnFacts(BaseModel):
@@ -59,62 +62,8 @@ class InterruptedTurnFacts(BaseModel):
     workflow_version: int | None = None
     authored_edits_saved: bool | None = None
     last_recorded_build_test_phase: str | None = None
-
-
-# A part's prompt and each of its choices are model-authored text that reaches the chat
-# unrendered by any other surface, so both are admitted the way every other model-authored
-# envelope string is. The length bound is a render bound, not a budget: a choice label is the
-# answer the user sends, so an over-long one is dropped rather than truncated — a truncated
-# label answers a different question than the one it shows. How many things one question may
-# ask and how many options one of them may offer are independent, so they get their own names.
-QUESTION_PART_TEXT_LIMIT = 200
-QUESTION_PART_LIMIT = 8
-QUESTION_CHOICE_LIMIT = 8
-
-
-class QuestionPart(BaseModel):
-    """One thing a terminal question asks, with the options the model offered for it.
-
-    ``part_id`` is minted server-side in emission order rather than read from the model, so
-    the identity a later answer or event refers to is the one the user actually saw.
-    """
-
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    part_id: str
-    prompt: str
-    choices: list[str] = Field(default_factory=list)
-
-
-def admit_question_parts(raw: object) -> list[QuestionPart]:
-    """Typed admission for the ``parts`` array a model emits on an ASK_QUESTION.
-
-    Nothing here refuses the turn: the question's own prose always renders and the composer
-    always takes a free-form answer, so a part that cannot be vouched for is dropped and the
-    user still sees the whole question. A part with no admitted choices is kept — dropping it
-    would hide half of a compound ask behind an affordance for the other half.
-    """
-    if not isinstance(raw, list):
-        return []
-    parts: list[QuestionPart] = []
-    for entry in raw[:QUESTION_PART_LIMIT]:
-        if not isinstance(entry, dict):
-            continue
-        prompt = _safe_question_text(entry.get("prompt"))
-        if prompt is None:
-            continue
-        raw_choices = entry.get("choices")
-        candidates = raw_choices[:QUESTION_CHOICE_LIMIT] if isinstance(raw_choices, list) else []
-        admitted = [_safe_question_text(choice) for choice in candidates]
-        choices = list(dict.fromkeys(choice for choice in admitted if choice is not None))
-        parts.append(QuestionPart(part_id=f"p{len(parts) + 1}", prompt=prompt, choices=choices))
-    return parts
-
-
-def _safe_question_text(value: object) -> str | None:
-    if not isinstance(value, str) or len(value) > QUESTION_PART_TEXT_LIMIT:
-        return None
-    return _safe_output_report(value)
+    run_id: str | None = None
+    superseded_by_newer_test: bool = False
 
 
 class TerminalOutcomeEnvelope(BaseModel):
@@ -145,7 +94,6 @@ class TerminalOutcomeEnvelope(BaseModel):
     # None when the client named no gesture, so the report stays silent rather
     # than naming one the request never carried.
     cancel_source: CopilotCancelSource | None = None
-    question_parts: list[QuestionPart] = Field(default_factory=list)
     rendered_from_envelope: bool = False
     envelope_version: int = 1
 
@@ -192,7 +140,6 @@ def assemble_terminal_envelope(
     connect_failure: BuildTestConnectFailure | None = None,
     proposal_present: bool = False,
     interruption: InterruptedTurnFacts | None = None,
-    question_parts: Sequence[QuestionPart] = (),
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = select_run_outcome_anchor(run_outcomes)
     run_outcome_role = run_outcome.role if run_outcome is not None else None
@@ -257,8 +204,6 @@ def assemble_terminal_envelope(
         proposal_present=proposal_present,
         proposal_disposition=proposal_disposition,
         interruption=interruption,
-        # Parts describe a question, so they ride only a turn that actually ended on one.
-        question_parts=list(question_parts) if user_action_required else [],
     )
 
 
@@ -308,13 +253,15 @@ def interrupted_terminal_envelope(facts: InterruptedTurnFacts | None = None) -> 
         workflow_applied=facts is not None and facts.authored_edits_saved is True,
         response_kind="stopped",
         halt_kind=INTERRUPTED_TERMINAL_REASON,
+        run_id=facts.run_id if facts is not None else None,
         interruption=facts,
     )
 
 
 def render_interrupted_message(facts: InterruptedTurnFacts | None = None, *, proposal_present: bool = False) -> str:
     """User-facing copy for an interrupted turn: what is known, and never why it stopped."""
-    message = INTERRUPTED_TERMINAL_HEADLINE
+    superseded = facts is not None and facts.superseded_by_newer_test
+    message = INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE if superseded else INTERRUPTED_TERMINAL_HEADLINE
     if facts is not None:
         if facts.recorded_at:
             message = _append_sentence(message, f"Recorded at {facts.recorded_at}.")
@@ -336,10 +283,15 @@ def render_interrupted_message(facts: InterruptedTurnFacts | None = None, *, pro
         # The Accept/Discard card stays on screen for an untested draft, so a message that did not
         # mention it would contradict what the user is looking at.
         message = _append_sentence(message, "The untested draft is available for review.")
+    # The newer message is already sent on a superseded turn, so asking for it again is a lie.
+    if superseded:
+        return message
     return _append_sentence(message, INTERRUPTED_TERMINAL_RETRY)
 
 
 def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:
+    if envelope.terminal_cause in {"deadline_expired", "max_turns_exceeded"} and not cancelled:
+        return agent_message, False
     output_report = _safe_output_report(envelope.run_output_report)
     if (
         envelope.connect_failure is not None
@@ -397,24 +349,6 @@ def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: st
                 f"{pending_question_intro}: {agent_message}",
             )
         return message, True
-    # A deadline-expired turn already authored copy naming time and the draft's
-    # state; replaced=True is what syncs it to the surfaces hydration prefers.
-    # "completed" is excluded because replaced=True also overwrites a distinct
-    # narrativeSummary, and an applied turn's summary is not the terminal text.
-    # "awaiting_user_input" needs no exclusion: it requires ASK_QUESTION, and a deadline
-    # always exits through _build_wip_exit_result, which only ever builds REPLY results.
-    if envelope.terminal_cause == "deadline_expired" and not cancelled and envelope.next_state != "completed":
-        message = agent_message
-        facts = _recorded_run_facts(envelope)
-        # The agent's own deadline copy already names time, so the time-limit
-        # sentence rides along only with facts that copy does not carry.
-        if facts:
-            for sentence in [*facts, "The turn reached its time limit."]:
-                message = _append_sentence(message, sentence)
-        if output_report and not _text_contains(message, output_report):
-            return _append_sentence(message, output_report), True
-        return message, True
-
     # A stop reports what the turn recorded regardless of derived state: a cancel that
     # preserved a draft derives ``proposal_pending`` and never reaches the branch below.
     if cancelled:

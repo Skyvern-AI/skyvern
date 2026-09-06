@@ -24,8 +24,6 @@ import json
 import re
 import secrets
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -38,6 +36,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
+from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -415,33 +414,6 @@ async def _wait_for_credential_response(
     return None
 
 
-def _reschedule_stream_deadline(deadline: asyncio.Timeout, when: float | None) -> None:
-    try:
-        deadline.reschedule(when)
-    except RuntimeError:
-        # The owning ``asyncio.timeout`` block has already exited -- the turn was cancelled or torn
-        # down while the card was open -- so there is no deadline left to move.
-        LOG.info("copilot_credential_pause_deadline_reschedule_skipped")
-
-
-@contextmanager
-def _stream_deadline_suspended(ctx: Any) -> Iterator[None]:
-    """Hold off the turn's model-stream deadline while the user answers the card, then give it back
-    the time the answer took; the wait itself is bounded by the pause timeout."""
-    deadline = getattr(ctx, "model_stream_deadline", None)
-    when = deadline.when() if deadline is not None else None
-    if deadline is None or when is None:
-        yield
-        return
-    loop = asyncio.get_running_loop()
-    start = loop.time()
-    _reschedule_stream_deadline(deadline, None)
-    try:
-        yield
-    finally:
-        _reschedule_stream_deadline(deadline, when + (loop.time() - start))
-
-
 async def _run_credential_pause(
     ctx: Any,
     message: str,
@@ -545,9 +517,8 @@ async def _run_credential_pause(
         ctx.credential_pause_outcome = "declined"
         return None
 
-    start = time.monotonic()
     try:
-        with _stream_deadline_suspended(ctx):
+        with pause_human_input(ctx, "credential"):
             resolution = await _wait_for_credential_response(response_key, ctx, stream, timeout_seconds)
     except BaseException:
         # Covers CancelledError (a direct BaseException subclass, not Exception)
@@ -557,10 +528,6 @@ async def _run_credential_pause(
         # Can't act on a rescued resolution mid-unwind, only avoid corrupting state.
         await _invalidate_active_pause_record()
         raise
-    finally:
-        ctx.copilot_credential_pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0) + (
-            time.monotonic() - start
-        )
 
     if resolution is None:
         resolution = await _invalidate_active_pause_record()

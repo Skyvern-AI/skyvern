@@ -15,8 +15,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Sequence
 from urllib.parse import unquote_plus, urlsplit
 
@@ -37,7 +38,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
 from skyvern.forge.taskv3.tools import OBSERVE_URL_MAX_CHARS, PageProvider
 from skyvern.services.otp_service import OTPValue, has_otp_source, resolve_otp_value
-from skyvern.utils.url_validators import validate_fetch_url
+from skyvern.utils.url_validators import strip_query_params, validate_fetch_url
 from skyvern.webeye.navigation import revalidate_redirect_chain
 
 LOG = structlog.get_logger()
@@ -174,6 +175,17 @@ def _register_opaque_values(context: SkyvernContext, raw: str) -> None:
             context.register_secret_value(value, hide_from_model=True)
 
 
+def _loggable_url(url: str | None) -> str | None:
+    """The polling endpoint without its query, which carries the caller's own secret. `Task` holds this
+    as an unvalidated string, so a URL the parser rejects must cost the field, never the record."""
+    if not url:
+        return None
+    try:
+        return strip_query_params(url) or None
+    except Exception:
+        return None
+
+
 def _register_link_for_redaction(url: str) -> None:
     """Register the sign-in URL and its opaque query/fragment values as model-hidden secrets. Exact
     values only, so redaction can never match anything the URL did not literally contain."""
@@ -249,18 +261,86 @@ async def _cookie_jar(page: Any) -> list[tuple[str, str, str, str]] | None:
     return sorted((c.get("domain", ""), c.get("path", ""), c.get("name", ""), c.get("value", "")) for c in cookies)
 
 
+class VerificationFailure(StrEnum):
+    """Every condition that arms the completion refusal. This closes the VOCABULARY, which is what the
+    earlier hand-kept inventory could not do — it was missing six sites. Each member is written at
+    exactly one place today, so the covered set and the site set coincide; nothing here would stop a
+    future site from reusing a member, so that coincidence is a fact to re-check, not a guarantee."""
+
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    NO_CODE_TWICE = "no_code_twice"
+    NO_LINK_TWICE = "no_link_twice"
+    SOURCE_ERRORED_TWICE = "source_errored_twice"
+    LOOKUP_FAILED_TWICE = "lookup_failed_twice"
+    MAGIC_LINK_UNSUPPORTED = "magic_link_unsupported"
+    MAGIC_LINK_UNSUPPORTED_CACHED = "magic_link_unsupported_cached"
+    VALUE_NOT_A_CODE = "value_not_a_code"
+    VALUE_NOT_A_LINK = "value_not_a_link"
+    PAGE_UNAVAILABLE = "page_unavailable"
+    LINK_REFUSED = "link_refused"
+    LINK_URL_UNUSABLE = "link_url_unusable"
+    LINK_OPEN_FAILED = "link_open_failed"
+    LINK_REJECTED_BY_SITE = "link_rejected_by_site"
+
+
 @dataclass
 class VerificationState:
     """Lets the finish tool refuse a completed verdict once the source terminally failed to deliver.
 
-    `source_failed` is set by every terminal non-delivery answer (budget exhaustion, repeated lookup
+    The latch is armed by every terminal non-delivery answer (budget exhaustion, repeated lookup
     empty answers, refused or unopenable link), never by a retryable "not yet" or by a link failure
     that may have received a response (the URL moved, a cookie landed, or the jar could not be read).
     Only the tools count as delivery, so a code read off the page after the source failed still
-    blocks; a value delivered at any point wins."""
+    blocks; a value delivered at any point wins.
 
-    source_failed: bool = False
-    values_delivered: int = 0
+    `source_failed` is derived from the recorded reason rather than settable on its own, so arming is
+    only reachable through `arm`, which narrates. The step engine narrates the same failure with the
+    same fields (`skyvern/forge/agent.py`, "TOTP polling timed out — terminating task"); without this
+    the v3 side latched silently and the failure could not be found in production at all."""
+
+    # Excluded from the repr: the bound `block_completion` handed to the loop would otherwise carry
+    # the task's navigation payload into any message that formats the callback.
+    task: Task = field(repr=False)
+    values_delivered: int = field(default=0, init=False)
+    _armings: list[VerificationFailure] = field(default_factory=list, init=False, repr=False)
+
+    @property
+    def source_failed(self) -> bool:
+        return bool(self._armings)
+
+    def arm(self, reason: VerificationFailure, tool: str) -> None:
+        self._armings.append(reason)
+        try:
+            LOG.warning(
+                "task_v3 verification source failed",
+                task_id=self.task.task_id,
+                organization_id=self.task.organization_id,
+                workflow_run_id=self.task.workflow_run_id,
+                tool=tool,
+                # str(), not .value: the swallow below must not be able to hide a caller that passed
+                # something other than a member, which would otherwise stop narration silently.
+                reason=str(reason),
+                # The count at THIS arming, not a verdict: a value delivered later unblocks the run,
+                # and no record is written when that happens. Reads as a bound, not as an outcome.
+                values_delivered=self.values_delivered,
+                # Every arming reports, so this is the true running total. The record this replaces
+                # was gated to one per task and could not be counted at all.
+                arming_count=len(self._armings),
+                # Masked to **** by `log_redaction.SENSITIVE_FIELDS` before rendering, as v1's is.
+                # Carried for field parity with the step engine; the stripped URL is the triage handle.
+                totp_identifier=self.task.totp_identifier,
+                totp_verification_url=_loggable_url(self.task.totp_verification_url),
+                # `strip_query_params` answers "" for a scheme-less or host-less string, which is
+                # indistinguishable from an absent URL; this pair keeps the two apart.
+                # Separates a source with no URL configured from one whose URL cannot be parsed —
+                # a malformed polling URL is a plausible root cause of the source never delivering.
+                totp_verification_url_configured=bool(self.task.totp_verification_url),
+            )
+        except Exception:
+            # The latch is already set above. Narration must never cost the tool its answer: an
+            # escape here would reach the model as a bare tool_error, dropping both the "finish as
+            # failed" guidance and the page-state payload the link paths attach.
+            pass
 
     async def block_completion(self) -> str | None:
         if self.source_failed and self.values_delivered == 0:
@@ -280,7 +360,7 @@ def build_auth_tools(
     poll and deliver values; pass its `block_completion` to `make_finish_tool` to gate a completed
     verdict on it. A caller with no use for that gate can omit `state` entirely."""
     if state is None:
-        state = VerificationState()
+        state = VerificationState(task=task)
     offer_code_tool = has_otp_source(
         task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=allowed_credential_parameter_keys
     )
@@ -295,8 +375,6 @@ def build_auth_tools(
     # then the tools refuse with stop guidance. One budget for both tools: they drain one source.
     budget_seconds = settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS * 60.0
     polling_spent_seconds = 0.0
-    call_count = 0
-    budget_warned = False
     # A value one tool resolved that the other tool owns (the webhook source does not filter by type).
     cached_otp_value: OTPValue | None = None
     first_poll_started_at: datetime | None = None
@@ -306,23 +384,16 @@ def build_auth_tools(
     empty_answer_streak = 0
 
     def _budget_exhausted(expected_otp_type: OTPType) -> ToolResult:
-        nonlocal budget_warned
-        state.source_failed = True
-        if not budget_warned:
-            budget_warned = True
-            LOG.warning(
-                "task_v3 verification code polling budget exhausted",
-                task_id=task.task_id,
-                tool=_tool_name(expected_otp_type),
-                call_count=call_count,
-            )
+        state.arm(VerificationFailure.BUDGET_EXHAUSTED, _tool_name(expected_otp_type))
         if expected_otp_type == OTPType.MAGIC_LINK:
             return ToolResult.error(_LINK_BUDGET_EXHAUSTED)
         return ToolResult.error(_BUDGET_EXHAUSTED)
 
-    def _failed(message: str, data: dict[str, Any] | None = None) -> ToolResult:
+    def _failed(
+        message: str, *, reason: VerificationFailure, tool: str, data: dict[str, Any] | None = None
+    ) -> ToolResult:
         """A terminal non-delivery answer: the finish tool must refuse a completed verdict from here on."""
-        state.source_failed = True
+        state.arm(reason, tool)
         return ToolResult.error(message, data=data)
 
     def _not_yet(expected_otp_type: OTPType, detail: str) -> ToolResult:
@@ -336,11 +407,11 @@ def build_auth_tools(
             "first, then call get_verification_code again."
         )
 
-    def _empty_answer(once: str, terminal: str) -> ToolResult:
+    def _empty_answer(once: str, terminal: str, *, reason: VerificationFailure, tool: str) -> ToolResult:
         nonlocal empty_answer_streak
         empty_answer_streak += 1
         if empty_answer_streak > 1:
-            return _failed(terminal)
+            return _failed(terminal, reason=reason, tool=tool)
         return ToolResult.error(once)
 
     async def _poll(expected_otp_type: OTPType) -> ToolResult | OTPValue:
@@ -362,8 +433,18 @@ def build_auth_tools(
             )
             if otp_value is None:
                 if expected_otp_type == OTPType.MAGIC_LINK:
-                    return _empty_answer(_NO_LINK_ONCE, _NO_LINK_AVAILABLE)
-                return _empty_answer(_NO_CODE_ONCE, _NO_CODE_AVAILABLE)
+                    return _empty_answer(
+                        _NO_LINK_ONCE,
+                        _NO_LINK_AVAILABLE,
+                        reason=VerificationFailure.NO_LINK_TWICE,
+                        tool=_tool_name(expected_otp_type),
+                    )
+                return _empty_answer(
+                    _NO_CODE_ONCE,
+                    _NO_CODE_AVAILABLE,
+                    reason=VerificationFailure.NO_CODE_TWICE,
+                    tool=_tool_name(expected_otp_type),
+                )
             empty_answer_streak = 0
             return otp_value
         except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode) as exc:
@@ -380,6 +461,8 @@ def build_auth_tools(
                     "do not re-trigger the page.",
                     f"the verification source kept failing ({detail}). Finish the task as failed and say the "
                     "verification step never completed.",
+                    reason=VerificationFailure.SOURCE_ERRORED_TWICE,
+                    tool=_tool_name(expected_otp_type),
                 )
             empty_answer_streak = 0
             if exc.webhook_diagnostics:
@@ -401,19 +484,24 @@ def build_auth_tools(
             return _empty_answer(
                 f"{message}. {retry_hint}",
                 f"{message} repeatedly. Finish the task as failed and say the verification step never completed.",
+                reason=VerificationFailure.LOOKUP_FAILED_TWICE,
+                tool=_tool_name(expected_otp_type),
             )
         finally:
             polling_spent_seconds += time.monotonic() - started
 
     async def _get_verification_code(args: dict[str, Any]) -> ToolResult:
-        nonlocal call_count, cached_otp_value
-        call_count += 1
+        nonlocal cached_otp_value
         cached = cached_otp_value
         if cached is not None:
             if cached.get_otp_type() == OTPType.MAGIC_LINK:
                 if offer_link_tool:
                     return ToolResult.error(_MAGIC_LINK_REDIRECT)
-                return _failed(_MAGIC_LINK_UNSUPPORTED)
+                return _failed(
+                    _MAGIC_LINK_UNSUPPORTED,
+                    reason=VerificationFailure.MAGIC_LINK_UNSUPPORTED_CACHED,
+                    tool="get_verification_code",
+                )
             cached_otp_value = None
             return _deliver_code(cached.value)
 
@@ -439,9 +527,13 @@ def build_auth_tools(
                 tool="get_verification_code",
                 otp_type=OTPType.MAGIC_LINK.value,
             )
-            return _failed(_MAGIC_LINK_UNSUPPORTED)
+            return _failed(
+                _MAGIC_LINK_UNSUPPORTED, reason=VerificationFailure.MAGIC_LINK_UNSUPPORTED, tool="get_verification_code"
+            )
         if otp_value.get_otp_type() != OTPType.TOTP:
-            return _failed(_NO_CODE_AVAILABLE)
+            return _failed(
+                _NO_CODE_AVAILABLE, reason=VerificationFailure.VALUE_NOT_A_CODE, tool="get_verification_code"
+            )
         return _deliver_code(otp_value.value)
 
     def _deliver_code(code: str) -> ToolResult:
@@ -453,8 +545,7 @@ def build_auth_tools(
         return ToolResult.ok(f"verification_code: {code}")
 
     async def _open_verification_link(args: dict[str, Any]) -> ToolResult:
-        nonlocal call_count, cached_otp_value, first_poll_started_at
-        call_count += 1
+        nonlocal cached_otp_value, first_poll_started_at
         otp_value: OTPValue | None = cached_otp_value
         if otp_value is None:
             polled = await _poll(OTPType.MAGIC_LINK)
@@ -466,7 +557,9 @@ def build_auth_tools(
             cached_otp_value = otp_value
             return ToolResult.error(_CODE_INSTEAD_OF_LINK)
         if otp_value.get_otp_type() != OTPType.MAGIC_LINK:
-            return _failed(_NO_LINK_AVAILABLE)
+            return _failed(
+                _NO_LINK_AVAILABLE, reason=VerificationFailure.VALUE_NOT_A_LINK, tool="open_verification_link"
+            )
 
         url = otp_value.value
         # Held only while nothing has been attempted: once a link is handed to the browser or refused,
@@ -485,7 +578,9 @@ def build_auth_tools(
                 )
                 page = None
         if page is None:
-            return _failed(_PAGE_UNAVAILABLE)
+            return _failed(
+                _PAGE_UNAVAILABLE, reason=VerificationFailure.PAGE_UNAVAILABLE, tool="open_verification_link"
+            )
 
         cached_otp_value = None
         # The link is spent on any attempt, so a retry must poll for a newer one. Only affects bare
@@ -543,10 +638,17 @@ def build_auth_tools(
                     data=failure_data,
                 )
             if policy_refusal:
-                return _failed(_LINK_REFUSED, data=failure_data)
+                return _failed(
+                    _LINK_REFUSED,
+                    reason=VerificationFailure.LINK_REFUSED,
+                    tool="open_verification_link",
+                    data=failure_data,
+                )
             return _failed(
                 f"failed to open the sign-in link ({type(exc).__name__}); nothing was signed in. Finish the "
                 "task as failed and say the sign-in link could not be opened.",
+                reason=VerificationFailure.LINK_OPEN_FAILED if navigated else VerificationFailure.LINK_URL_UNUSABLE,
+                tool="open_verification_link",
                 data=failure_data,
             )
 
@@ -577,6 +679,8 @@ def build_auth_tools(
                 f"the site rejected the sign-in link (HTTP {status}); it may be expired or already used. "
                 "Do not claim to be signed in. If the page offers to send a new link you may request one "
                 "and call open_verification_link again; otherwise finish the task as failed.",
+                reason=VerificationFailure.LINK_REJECTED_BY_SITE,
+                tool="open_verification_link",
                 data={"page_state_changed": True},
             )
         state.values_delivered += 1

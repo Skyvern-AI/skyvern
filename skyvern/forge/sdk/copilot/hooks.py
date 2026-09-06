@@ -38,6 +38,11 @@ LOG = structlog.get_logger()
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
     {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks", "edit_block_and_run"}
 )
+# The tools that dispatch a build test. Counted per model response so the acquisition seam can tell
+# a stale run of an earlier turn from a sibling call the same response is running right now.
+_BUILD_TEST_DISPATCH_TOOLS: frozenset[str] = frozenset(
+    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}
+)
 _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
     {
         "last_test_ok",
@@ -96,12 +101,20 @@ class CopilotRunHooks(RunHooksBase):
             )
 
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
+        if self._ctx.check_model_work_deadline is not None:
+            self._ctx.check_model_work_deadline()
         try:
-            if any(getattr(item, "name", None) == "request_credential" for item in response.output):
+            called = [getattr(item, "name", None) for item in response.output]
+            # Counted before the credential gate: a gate that raises would otherwise leave the
+            # previous response's count standing, and the acquisition seam reads it as this one's.
+            self._ctx.build_test_tool_calls_in_model_response = sum(
+                1 for name in called if name in _BUILD_TEST_DISPATCH_TOOLS
+            )
+            if "request_credential" in called:
                 arm_credential_pause_gate(self._ctx)
         except Exception:
             LOG.warning(
-                "CopilotRunHooks.on_llm_end credential gate arming failed",
+                "CopilotRunHooks.on_llm_end response accounting failed",
                 **_copilot_log_fields(self._ctx),
             )
 
@@ -114,6 +127,16 @@ class CopilotRunHooks(RunHooksBase):
                 **_copilot_log_fields(self._ctx),
             )
 
+    async def on_tool_start(
+        self,
+        context: RunContextWrapper,
+        agent: AgentBase,
+        tool: Tool,
+    ) -> None:
+        # Retry safety depends on this monotonic fact, so record it before the
+        # tool executes and outside the best-effort activity-summary path.
+        self._ctx.tool_calls_this_turn += 1
+
     async def on_tool_end(
         self,
         context: RunContextWrapper,
@@ -121,6 +144,8 @@ class CopilotRunHooks(RunHooksBase):
         tool: Tool,
         result: Any,
     ) -> None:
+        if self._ctx.check_model_work_deadline is not None:
+            self._ctx.check_model_work_deadline()
         # Activity recording is observability -- a malformed tool result or an
         # unserializable block output must not propagate into the agent loop
         # and kill the whole run.

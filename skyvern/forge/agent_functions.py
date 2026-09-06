@@ -239,6 +239,9 @@ class CodeBlockEngineFailure:
     # exception_class narrowed to the runner's allowlist of denial guards; the only form of it
     # that may reach a user-facing payload.
     denied_exception_class: str | None = None
+    final_url: str | None = None
+    page_title: str | None = None
+    covering_element: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2082,12 +2085,14 @@ class AgentFunction:
         spreadsheet_id: str,
         range_: str,
         values: list[list[Any]],
+        insert_data_option: str = "INSERT_ROWS",
     ) -> dict[str, Any] | None:
         return await google_sheets_service.values_append(
             access_token=access_token,
             spreadsheet_id=spreadsheet_id,
             range_=range_,
             values=values,
+            insert_data_option=insert_data_option,
         )
 
     async def google_sheets_values_update(
@@ -2477,23 +2482,43 @@ class AgentFunction:
             block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
         )
 
+    async def _resolve_copilot_requested_code_block_mode(
+        self,
+        organization_id: str | None,
+        code_block_mode: bool | None,
+    ) -> bool:
+        del organization_id
+        # Code-first is an explicit per-request selection. Callers that omit
+        # the field get plain Build instead of inheriting deployment state.
+        return code_block_mode is True
+
     async def get_copilot_config_for_request(
         self,
         organization_id: str | None = None,
         code_block_mode: bool | None = None,
-        composer_mode: Literal["ask", "build"] | None = None,
     ) -> CopilotConfig | None:
         """Return a request-scoped workflow copilot config override."""
-        del organization_id
-        fallback_code_block_mode = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE
-        config = self.get_copilot_config(code_block_mode)
+        requested_code_block_mode = await self._resolve_copilot_requested_code_block_mode(
+            organization_id,
+            code_block_mode,
+        )
+        try:
+            has_code_block_access = await self.has_code_block_access(organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve Copilot code-block access; using non-code authoring",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            has_code_block_access = False
+        effective_code_block_mode = requested_code_block_mode and has_code_block_access
+        code_block_available = has_code_block_access if code_block_mode is not None else effective_code_block_mode
+        config = self.get_copilot_config(effective_code_block_mode)
         if config is None:
             return None
-        config.block_authoring_policy = block_authoring_policy_for_request(
-            code_block_mode,
-            composer_mode,
-            fallback_code_block_mode=fallback_code_block_mode,
-        )
+        config.block_authoring_policy = block_authoring_policy_for_request(effective_code_block_mode)
+        config.code_block_available = code_block_available
+        config.effective_code_block_mode = effective_code_block_mode
         return config
 
     async def should_render_copilot_terminal_from_envelope(self, organization_id: str | None = None) -> bool:

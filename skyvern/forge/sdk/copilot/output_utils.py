@@ -398,6 +398,12 @@ def _bounded_connect_failure(
                 max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                 notices=notices,
             ),
+            "occupier_run_id": _bounded_packet_string(
+                failure.occupier_run_id,
+                field_name="failure.connect_failure.occupier_run_id",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            ),
         }
     )
 
@@ -1321,6 +1327,17 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                 ]
             sanitized = {"data": data, **{key: value for key, value in sanitized.items() if key != "data"}}
         else:
+            # Without a packet the summary is the only action surface left, and nothing upstream
+            # bounds it; hold it to the same per-line budget the packet projection applies.
+            summary = data.get("action_trace_summary")
+            if isinstance(summary, list):
+                data["action_trace_summary"] = _bounded_packet_strings(
+                    [line for line in summary if isinstance(line, str)],
+                    field_name="action_trace_summary",
+                    max_items=_BUILD_TEST_ACTION_TRACE_MAX_ITEMS,
+                    max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
+                    notices=[],
+                )
             sanitized["data"] = data
     return sanitized
 

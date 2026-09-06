@@ -242,17 +242,12 @@ class Settings(BaseSettings):
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
-    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
-    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
-    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
-    # Per-environment canary; default off until we are confident.
-    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     # Internal eval-only selector for the least-privileged direct-browser Copilot surface.
     WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED: bool = False
     # Enabling the process-level kill switch is insufficient on a shared deployment: only API
     # credentials belonging to these explicitly configured eval organizations may select the mode.
     WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS: list[str] = []
-    # Experimental Workflow Copilot v2 branch mode.
+    # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
