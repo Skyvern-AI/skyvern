@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import skyvern.webeye.actions.handler as handler_module
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ClickAction
 from skyvern.webeye.actions.handler import (
@@ -32,6 +33,16 @@ from tests.unit.helpers import make_organization, make_step, make_task
 def _el(*, element_id: str, tag_name: str, attributes: dict | None = None) -> SkyvernElement:
     static = {"id": element_id, "tagName": tag_name, "attributes": attributes or {}}
     return SkyvernElement(MagicMock(), MagicMock(), static)
+
+
+@pytest.fixture(autouse=True)
+def _oss_neutral_submit_recognizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The stub app's AGENT_FUNCTION auto-mocks unset methods as truthy AsyncMocks, which would make
+    # the recognizer seam bypass everything. Pin the OSS-neutral default (recognizes nothing) here;
+    # tests needing recognition override this method afterwards.
+    monkeypatch.setattr(
+        handler_module.app.AGENT_FUNCTION, "is_recognized_submit_control", AsyncMock(return_value=False)
+    )
 
 
 class TestSkyvernElementIsExplicitSubmit:
@@ -197,6 +208,83 @@ class TestSequentialClickSubmitBypass:
         inner.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_agent_function_recognized_submit_bypasses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # When the AGENT_FUNCTION seam recognizes the control (cloud recognizes a JS-wired submit),
+        # the wrapper bypasses the rescrape exactly like an explicit type=submit. The anchor here is
+        # an ordinary type=button with no hooks — only the seam's verdict drives the bypass.
+        inner = AsyncMock(return_value=MagicMock(name="sequential_result"))
+        monkeypatch.setattr("skyvern.webeye.actions.handler.handle_sequential_click_for_dropdown", inner)
+        monkeypatch.setattr(
+            handler_module.app.AGENT_FUNCTION, "is_recognized_submit_control", AsyncMock(return_value=True)
+        )
+        el = _el(element_id="E1", tag_name="button", attributes={"type": "button"})
+
+        result = await handle_sequential_click_with_submit_bypass(**self._kwargs(el))
+
+        assert result is None
+        inner.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_oss_base_recognizes_no_submit_control_and_rescrapes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # OSS neutrality: bind the REAL base AgentFunction — it recognizes no submit control, so a
+        # click runs the normal rescrape. The hook-specific recognizer is a deployment-layer contract
+        # tested elsewhere; no submit fingerprint lives in skyvern/ or tests/unit.
+        sentinel = MagicMock(name="sequential_result")
+        inner = AsyncMock(return_value=sentinel)
+        monkeypatch.setattr("skyvern.webeye.actions.handler.handle_sequential_click_for_dropdown", inner)
+        monkeypatch.setattr(
+            handler_module.app.AGENT_FUNCTION,
+            "is_recognized_submit_control",
+            AgentFunction().is_recognized_submit_control,
+        )
+        el = _el(element_id="E1", tag_name="button", attributes={"type": "button"})
+
+        result = await handle_sequential_click_with_submit_bypass(**self._kwargs(el))
+
+        assert result is sentinel
+        inner.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_bypass_log_marks_recognizer_arm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Observability: the bypass log must carry recognized_submit_control=True when the deployment
+        # recognizer arm (not the legacy explicit type=submit) caused the bypass. Message unchanged.
+        monkeypatch.setattr("skyvern.webeye.actions.handler.handle_sequential_click_for_dropdown", AsyncMock())
+        monkeypatch.setattr(
+            handler_module.app.AGENT_FUNCTION, "is_recognized_submit_control", AsyncMock(return_value=True)
+        )
+        log_mock = MagicMock()
+        monkeypatch.setattr(handler_module, "LOG", log_mock)
+        el = _el(element_id="E1", tag_name="button", attributes={"type": "button"})
+
+        result = await handle_sequential_click_with_submit_bypass(**self._kwargs(el))
+
+        assert result is None
+        log_mock.info.assert_called_once()
+        args, kwargs = log_mock.info.call_args
+        assert args[0] == "Explicit submit click; bypassing the dropdown sequential-click rescrape"
+        assert kwargs["recognized_submit_control"] is True
+
+    @pytest.mark.asyncio
+    async def test_bypass_log_marks_legacy_explicit_submit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The legacy explicit type=submit arm logs recognized_submit_control=False, and the recognizer
+        # is never consulted (short-circuit preserved). Message unchanged.
+        monkeypatch.setattr("skyvern.webeye.actions.handler.handle_sequential_click_for_dropdown", AsyncMock())
+        recognizer = AsyncMock(side_effect=AssertionError("recognizer must not be called for explicit submit"))
+        monkeypatch.setattr(handler_module.app.AGENT_FUNCTION, "is_recognized_submit_control", recognizer)
+        log_mock = MagicMock()
+        monkeypatch.setattr(handler_module, "LOG", log_mock)
+        el = _el(element_id="E1", tag_name="button", attributes={"type": "submit"})
+
+        result = await handle_sequential_click_with_submit_bypass(**self._kwargs(el))
+
+        assert result is None
+        recognizer.assert_not_called()
+        log_mock.info.assert_called_once()
+        args, kwargs = log_mock.info.call_args
+        assert args[0] == "Explicit submit click; bypassing the dropdown sequential-click rescrape"
+        assert kwargs["recognized_submit_control"] is False
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("padded", [" submit ", "submit ", " submit"])
     async def test_whitespace_padded_type_invokes_sequential_handler(
         self, monkeypatch: pytest.MonkeyPatch, padded: str
@@ -273,6 +361,29 @@ class TestHandleClickActionIntegration:
         # Result is exactly chain_click's output — no synthesized business-success result appended.
         assert results == chain_click_mock.return_value
         assert len(results) == 1
+        assert isinstance(results[-1], ActionSuccess)
+
+    @pytest.mark.asyncio
+    async def test_seam_recognized_submit_clicks_and_bypasses_dropdown_rescrape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End-to-end at the handle_click_action entry: when the AGENT_FUNCTION seam recognizes the
+        # control (cloud recognizes a JS-wired submit), the click runs and the expensive rescrape is
+        # bypassed. The anchor is an ordinary type=button — only the seam verdict drives the bypass.
+        submit_el = self._clickable_element(tag_name="button", type_value="button")
+        chain_click_mock, sequential_mock, incremental = self._wire_handler(monkeypatch, submit_el)
+        monkeypatch.setattr(
+            handler_module.app.AGENT_FUNCTION, "is_recognized_submit_control", AsyncMock(return_value=True)
+        )
+
+        results = await handle_click_action(
+            ClickAction(element_id="E1"), self._page(), MagicMock(), MagicMock(), MagicMock()
+        )
+
+        chain_click_mock.assert_awaited_once()
+        sequential_mock.assert_not_called()
+        incremental.stop_listen_dom_increment.assert_awaited_once()
+        assert results == chain_click_mock.return_value
         assert isinstance(results[-1], ActionSuccess)
 
     @pytest.mark.asyncio
@@ -538,6 +649,7 @@ class TestHandleActionPublicPathFalseClickBypass:
         app_mock = MagicMock()
         app_mock.BROWSER_MANAGER.get_for_task.return_value = MagicMock()
         app_mock.AGENT_FUNCTION.wait_for_challenge_solver = AsyncMock()
+        app_mock.AGENT_FUNCTION.is_recognized_submit_control = AsyncMock(return_value=False)
         app_mock.DATABASE.workflow_params.create_action = AsyncMock(return_value=SimpleNamespace(action_id="a-1"))
         monkeypatch.setattr(handler_module, "app", app_mock)
         monkeypatch.setattr(handler_module, "preflight_action", MagicMock(return_value=None))
