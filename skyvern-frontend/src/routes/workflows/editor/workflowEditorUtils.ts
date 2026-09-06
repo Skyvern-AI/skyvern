@@ -4331,11 +4331,20 @@ const bareDriveFileId = /^[A-Za-z0-9_-]+$/;
 
 function urlMayBeGoogleDrive(url: string): boolean {
   const candidate = url.trim();
-  return (
-    candidate.toLowerCase().includes("drive.google.com") ||
-    candidate.includes("{{") ||
-    bareDriveFileId.test(candidate)
-  );
+  if (candidate.includes("{{") || bareDriveFileId.test(candidate)) {
+    return true;
+  }
+
+  try {
+    const parsed = new URL(candidate);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname === "drive.google.com" &&
+      parsed.pathname.startsWith("/file/d/")
+    );
+  } catch {
+    return false;
+  }
 }
 
 // Mirrors the blocks in block.py that actually reach BaseTaskBlock.execute and so leave
