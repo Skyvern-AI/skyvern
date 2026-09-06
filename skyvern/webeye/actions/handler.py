@@ -6418,12 +6418,18 @@ async def handle_sequential_click_with_submit_bypass(
     submit controls; every other click still runs ``handle_sequential_click_for_dropdown``.
 
     ``anchor_element`` is the final click target after any disabled-wrapper
-    retargeting, so the explicit-submit check is evaluated here and never stale.
+    retargeting, so the submit check is evaluated here and never stale.
     """
-    if await anchor_element.is_explicit_submit():
+    is_explicit_submit = await anchor_element.is_explicit_submit()
+    # Short-circuit: only consult the deployment recognizer when this is not already an explicit submit.
+    recognized_submit_control = not is_explicit_submit and await app.AGENT_FUNCTION.is_recognized_submit_control(
+        anchor_element
+    )
+    if is_explicit_submit or recognized_submit_control:
         LOG.info(
             "Explicit submit click; bypassing the dropdown sequential-click rescrape",
             element_id=anchor_element.get_id(),
+            recognized_submit_control=recognized_submit_control,
         )
         return None
 

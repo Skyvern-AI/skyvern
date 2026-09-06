@@ -908,6 +908,10 @@ class AgentFunction:
     async def resolve_task_v3_error_code_choice(self, *, task: Task, organization: Organization) -> bool:
         return False
 
+    # Recognition of submit controls whose submission is wired in JS (rendered type=button); base recognizes none.
+    async def is_recognized_submit_control(self, element: SkyvernElement) -> bool:
+        return False
+
     async def record_run_duration(
         self,
         run_type: str,
