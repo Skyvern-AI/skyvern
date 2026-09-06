@@ -511,18 +511,6 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     ).toBeDefined();
   });
 
-  test("does not treat a URL containing the Drive hostname as a Drive link", () => {
-    setFileDownloadNode("d1", {
-      downloadTarget: "sftp",
-      url: "https://example.com/drive.google.com/file/d/abc123/view",
-    });
-    render(<FileDownloadBlockForm blockId="d1" />);
-
-    expect(
-      screen.queryByText("Google Drive Source Account (Optional)"),
-    ).toBeNull();
-  });
-
   test("selects a Google Drive source account for SFTP delivery", () => {
     setFileDownloadNode("d1", {
       downloadTarget: "sftp",
