@@ -8734,3 +8734,175 @@ async def test_a_code_is_accepted_on_a_failed_finish_too() -> None:
     outcome, _ = await _run(script, [finish])
     assert outcome.status == "failed"
     assert outcome.error_code == "COVERAGE_NOT_ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_a_cycling_page_still_accumulates_the_action_repeat_count() -> None:
+    # SKY-14998, and the reason _perception_stall_check's two ring-membership reads are coupled.
+    # A page that CYCLES between two states moves on every probe, so `snap.progressed` holds every
+    # round; if a progressed snapshot cleared the action-repeat guard unconditionally, the action
+    # DRIVING the oscillation would reset its own counter forever and never trip the cap. What
+    # stops that is the ring: a return to content this probe has already seen is not new ground.
+    #
+    # This is the positive control for that coupling. Relaxing the ring test that gates the clear
+    # (making the clear unconditional) leaves this test's cycle looking like progress every round,
+    # the click count never reaches the threshold, and the run dies of budget instead -- so the two
+    # assertions below both flip.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    rounds = 40
+    # Two states, alternating: every probe differs from the one before it, and every probe after the
+    # first two is a return to a state already in this probe's ring.
+    cycle = ["<div>panel open</div>", "<div>panel shut</div>"] * rounds
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for _ in range(rounds):
+        script.append([("click", {"selector": "#toggle"})])
+        script.append([("get_html", {"selector": "#panel"})])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("get_html", cycle), make_finish_tool()]
+
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    assert outcome.reason is not None and outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert len(clicks) < rounds  # the cap landed rather than the run burning its whole budget
+
+
+@pytest.mark.asyncio
+async def test_one_batch_of_identical_clicks_is_never_an_action_loop() -> None:
+    # The action-loop verdict is guarded by TWO reads that have to hold together: the streak must
+    # span more than one turn, AND its warning must already have been delivered. This is the
+    # positive control for the first read. The system prompt commands batching identical clicks
+    # (steppers, arrows), so a single turn can legitimately emit the whole threshold in one batch --
+    # the model has had no feedback to act on yet, and cutting it off mid-batch would punish the
+    # batching the prompt asked for. With no nudge configured the second read is vacuously true, so
+    # only `first_turn < turns` stands between this run and a wrong verdict.
+    terminate_after, batched = 5, 8  # the batch deliberately overruns the threshold
+    script = [[("click", {"selector": "#next"})] * batched, [("finish", {"status": "completed"})]]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+
+    outcome, _ = await _run(
+        script, tools, max_turns=10, action_nudge_after=None, action_terminate_after=terminate_after
+    )
+
+    assert outcome.status == "completed"
+    # Both assertions have to move under the relaxation: a mid-batch verdict lands at the 5th click,
+    # so the count would read 5. A batch sized AT the threshold could not have shown that.
+    assert len(clicks) == batched
+
+
+@pytest.mark.asyncio
+async def test_the_action_loop_verdict_never_lands_before_its_warning_was_delivered() -> None:
+    # Positive control for the second of the two coupled reads. A nudge that is merely DUE is not a
+    # nudge the model has seen: it is delivered at the end of the turn, so a streak that crosses the
+    # nudge threshold and the terminate threshold inside the same batch has been warned zero times.
+    # Terminating there would deliver a verdict the model never had a chance to act on, which is the
+    # whole reason the verdict is gated on the delivered-warning set rather than on the counter.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    nudge_after, terminate_after = 4, 6
+    script = [
+        [("click", {"selector": "#next"})] * 3,  # turn 0: counter reaches 3, below the nudge
+        # turn 1 crosses BOTH thresholds inside one batch, and keeps going past the second, so a
+        # verdict landing at the 6th click is visible as a short count rather than hidden by a batch
+        # that happened to end there anyway.
+        [("click", {"selector": "#next"})] * 5,
+        [("finish", {"status": "completed"})],
+    ]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+
+    outcome, _ = await _run(
+        script, tools, max_turns=10, action_nudge_after=nudge_after, action_terminate_after=terminate_after
+    )
+
+    assert outcome.reason is None or not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert len(clicks) == 8
+
+
+@pytest.mark.asyncio
+async def test_a_form_less_page_extension_is_not_vetoed_by_a_bare_action_counter() -> None:
+    # The extension gate's progress-stall veto is `progress.form_armed AND actions_since_progress >=
+    # progress.window` -- never the counter alone (loop.py, the budget-extension gate call site: "and
+    # never a bare counter -- a form-less page increments the counter but must not be judged stuck by
+    # it"). A form-less page (no observe ever reports invalid_fields, so form_armed stays False)
+    # still ticks actions_since_progress on every billable dispatch; if the counter alone could veto,
+    # a multi-page wizard between forms would have its extension refused as "stalled" the moment its
+    # action count crossed the window, even with fresh page-change evidence on file. Fresh, distinct
+    # observe content keeps the evidence check satisfied so the veto under test is the only thing
+    # standing between grant and refusal.
+    observes = [f"confirmation banner, step {i}" for i in range(PROGRESS_LEDGER_WINDOW + 2)]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})]]
+    for i in range(PROGRESS_LEDGER_WINDOW):
+        script.append([("click", {"selector": f"#next-{i}"})])
+        script.append([("observe", {})])
+    script.append([("click", {"selector": "#next-last"})])
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", observes), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, tools, max_action_steps=PROGRESS_LEDGER_WINDOW, max_turns=100, max_tool_calls=200
+        )
+    grants = [e for e in logs if e.get("event") == ACTION_BUDGET_EXTENDED_EVENT]
+    refusals = [e for e in logs if e.get("event") == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert grants, "the form-less page must earn its extension"
+    assert not any(e["gate_reason"] == "no_net_progress_window" for e in refusals)
+
+
+@pytest.mark.asyncio
+async def test_canonical_loop_event_suppressed_by_same_batch_progress_after_the_rung_fires() -> None:
+    # The rung is a capture-then-compare: a fire captures `canonical.gen` when the rung crosses, and
+    # is only emitted if that generation is UNCHANGED at the end of the batch (loop.py,
+    # pending_canonical_fires / `pending_fire.pop("gen") == canonical.gen`). A rung claimed early in a
+    # batch, followed in the SAME batch by a call that progresses the run (bumping the generation),
+    # describes a progressing run and must stay silent -- the same-batch mirror of the cross-turn case
+    # already covered by test_canonical_loop_event_silent_when_progress_intervenes.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    advances: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("fill", {"selector": "#code", "value": "a"})],
+        [("fill", {"selector": "#code", "value": "b"})],
+        # Same batch: the third refused touch claims rung 3, then a later call in this very batch
+        # lands a real page transition.
+        [("fill", {"selector": "#code", "value": "c"}), ("advance", {"selector": "#next"})],
+        [("finish", {"status": "completed", "reason": "advanced"})],
+    ]
+    tools = [
+        _error_billable_tool("fill", touches),
+        _billable_tool("advance", advances, data={"page_transitioned": True}),
+        make_finish_tool(),
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "completed"
+    assert len(touches) == 3
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
+
+
+@pytest.mark.asyncio
+async def test_a_renumbered_mark_does_not_alias_with_its_pre_renumber_history() -> None:
+    # A look renumbers the manifest from 1 every time (loop.py, invalidate_marks): mark=N names a
+    # different control before and after. `marks_stale` alone only blocks queued mark= calls IN THE
+    # SAME BATCH as the renumbering look -- across turns, only invalidate_marks() purging the
+    # mark-keyed ring stops the pre- and post-renumber touches on mark=1 from aliasing into one false
+    # streak.
+    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
+
+    touches: list[tuple[str, dict[str, Any]]] = []
+    looks: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("poke", {"mark": 1})],
+        [("poke", {"mark": 1})],
+        [("look", {})],
+        [("poke", {"mark": 1})],
+        [("finish", {"status": "failed", "reason": "kept refusing"})],
+    ]
+    tools = [_error_billable_tool("poke", touches), _look_tool(looks), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, max_turns=50, max_tool_calls=100)
+    assert outcome.status == "failed"
+    assert len(touches) == 3
+    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
