@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 
 class _Request:
@@ -35,14 +37,38 @@ class _Route:
         self.outcome = reason
 
 
+class _FakePage:
+    def __init__(self, url: str = "about:blank") -> None:
+        self.url = url
+        self.handlers: dict[str, list] = {}
+        self.closed = False
+        self.video = None
+
+    def on(self, event: str, handler) -> None:
+        self.handlers.setdefault(event, []).append(handler)
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def crash(self) -> None:
+        for handler in self.handlers.get("crash", []):
+            handler(self)
+
+
 class _BrowserContext:
     def __init__(self, browser: _Browser | None = None) -> None:
         self.handler = None
         self.unrouted = False
-        self.pages = [SimpleNamespace(url="about:blank")]
+        self.pages = [_FakePage()]
         self.service_workers = []
         self.browser = browser or _Browser()
         self.closed = False
+
+    def on(self, _event: str, _handler) -> None:
+        return None
 
     async def route(self, _pattern: str, handler) -> None:
         self.handler = handler
@@ -54,8 +80,8 @@ class _BrowserContext:
     async def cookies(self) -> list[dict[str, str]]:
         return []
 
-    async def new_page(self) -> SimpleNamespace:
-        page = SimpleNamespace(url="about:blank")
+    async def new_page(self) -> _FakePage:
+        page = _FakePage()
         self.pages.append(page)
         return page
 
@@ -197,8 +223,8 @@ async def test_candidate_guard_isolates_non_pristine_attached_cdp_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     browser_context = _BrowserContext()
-    selected_page = SimpleNamespace(url="https://selected.test/")
-    newest_page = SimpleNamespace(url="https://newest.test/")
+    selected_page = _FakePage("https://selected.test/")
+    newest_page = _FakePage("https://newest.test/")
     browser_context.pages = [selected_page, newest_page]
     browser_state = _BrowserState(
         browser_context,
@@ -559,3 +585,39 @@ async def test_real_adapter_internal_call_drains_candidate_network_before_return
 
     assert result["ok"] is True
     assert agent_function.idle_waits == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_context_swap_arms_crash_reaping_on_the_candidate_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_adapter.app, "AGENT_FUNCTION", _AgentFunction())
+    original = _BrowserContext()
+    original_page = original.pages[0]
+    state = RealBrowserState(pw=SimpleNamespace(), browser_context=original, page=original_page)
+
+    async with mcp_adapter._service_worker_blocked_context(state, organization_id="org") as candidate:
+        candidate_page = candidate.pages[-1]
+        assert candidate_page in state._crash_listener_pages
+        candidate_page.crash()
+        await asyncio.gather(*list(state._detached_teardown_tasks))
+        assert candidate_page.closed is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_context_restore_keeps_crash_reaping_on_the_original_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_adapter.app, "AGENT_FUNCTION", _AgentFunction())
+    original = _BrowserContext()
+    original_page = original.pages[0]
+    state = RealBrowserState(pw=SimpleNamespace(), browser_context=original, page=original_page)
+
+    async with mcp_adapter._service_worker_blocked_context(state, organization_id="org"):
+        pass
+
+    assert state.browser_context is original
+    assert original_page in state._crash_listener_pages
+    original_page.crash()
+    await asyncio.gather(*list(state._detached_teardown_tasks))
+    assert original_page.closed is True

@@ -69,7 +69,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {"clear": 1, "click": 2, "move": 2, "scroll_into_view_if_needed": 1, "type": 3, "wheel": 1}
     ),
     "skyvern/forge/sdk/event/factory.py": Counter({"click": 1, "wheel": 1}),
-    "skyvern/webeye/real_browser_state.py": Counter({"close": 5, "evaluate": 1, "goto": 1, "new_page": 3, "reload": 2}),
+    "skyvern/webeye/real_browser_state.py": Counter({"close": 6, "evaluate": 1, "goto": 1, "new_page": 3, "reload": 2}),
 }
 
 _EVALUATE_CALLERS = {
@@ -219,14 +219,14 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 164
+    assert sum(sum(methods.values()) for methods in observed.values()) == 165
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 159
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 160
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:

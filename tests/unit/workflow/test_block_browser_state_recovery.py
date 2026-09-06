@@ -9,7 +9,7 @@ import subprocess
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from playwright.async_api import async_playwright
@@ -23,6 +23,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -445,8 +446,6 @@ async def test_reconnect_stops_fresh_driver_when_state_rebuild_fails(monkeypatch
 async def test_requested_close_logs_disconnect_at_info_not_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     # The end-of-run teardown closes the context on purpose; observing that close is diagnostic
     # context, not a warning. A close nobody requested still warns.
-    from skyvern.webeye import real_browser_state as real_browser_state_module
-
     log = MagicMock()
     monkeypatch.setattr(real_browser_state_module, "LOG", log)
     monkeypatch.setattr(real_browser_state_module, "disable_download_interceptor_for_context", AsyncMock())
@@ -479,8 +478,6 @@ async def test_requested_close_logs_disconnect_at_info_not_warning(monkeypatch: 
 async def test_keep_alive_close_does_not_downgrade_a_later_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     # close(close_browser_on_completion=False) keeps the browser for reuse, so a disconnect that
     # follows it is nobody's request and must still warn.
-    from skyvern.webeye import real_browser_state as real_browser_state_module
-
     log = MagicMock()
     monkeypatch.setattr(real_browser_state_module, "LOG", log)
 
@@ -493,3 +490,123 @@ async def test_keep_alive_close_does_not_downgrade_a_later_disconnect(monkeypatc
 
     log.warning.assert_called_once()
     assert log.warning.call_args.args[0] == "Browser state disconnected"
+
+
+def _crashable_page() -> MagicMock:
+    page = MagicMock()
+    page.close = AsyncMock()
+    return page
+
+
+async def _never_returns() -> None:
+    await asyncio.sleep(3600)
+
+
+def test_crash_listener_registers_once_for_pre_existing_and_later_pages() -> None:
+    existing = _crashable_page()
+    context = MagicMock(pages=[existing])
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+
+    assert existing.on.call_args_list == [call("crash", state._on_page_crashed)]
+    assert call("page", state._watch_page_for_crash) in context.on.call_args_list
+
+    later = _crashable_page()
+    state._watch_page_for_crash(later)
+    state._watch_page_for_crash(later)
+    state._register_disconnect_listeners(context)
+
+    assert existing.on.call_count == 1
+    assert later.on.call_count == 1
+
+
+def test_a_context_attached_from_outside_the_class_is_armed_for_crash_reaping() -> None:
+    existing = _crashable_page()
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(pages=[]))
+    replacement = MagicMock(pages=[existing])
+
+    state.browser_context = replacement
+
+    assert existing.on.call_args_list == [call("crash", state._on_page_crashed)]
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_page_is_excluded_before_its_close_lands() -> None:
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/crashed"
+    crashed.close = AsyncMock(side_effect=_never_returns)
+    survivor = _crashable_page()
+    survivor.url = "https://example.invalid/alive"
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(pages=[crashed, survivor]))
+
+    state._on_page_crashed(crashed)
+
+    try:
+        assert await state.list_valid_pages() == [survivor]
+        crashed.close.assert_not_awaited()
+    finally:
+        for task in list(state._detached_teardown_tasks):
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_close_that_swallows_cancellation_still_exhausts_its_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation-resistant close must not read as success: asyncio.timeout only cancels, so a
+    close that swallows the cancel would leave the dead target blocking every later attach."""
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_PAGE_CLOSE_TIMEOUT", 0.05)
+    page = _crashable_page()
+
+    async def _swallow_cancellation() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            return
+
+    page.close = AsyncMock(side_effect=_swallow_cancellation)
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(pages=[page]))
+
+    await state._close_crashed_page(page)
+
+    assert page.close.await_count == real_browser_state_module.CRASHED_PAGE_CLOSE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_crashed_page_close_is_retried_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_PAGE_CLOSE_TIMEOUT", 0.05)
+    page = _crashable_page()
+    attempts: list[int] = []
+
+    async def _hang_once_then_succeed() -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            await _never_returns()
+
+    page.close = AsyncMock(side_effect=_hang_once_then_succeed)
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(pages=[page]))
+
+    await state._close_crashed_page(page)
+
+    assert page.close.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_crashed_page_close_is_bounded_and_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(real_browser_state_module, "BROWSER_PAGE_CLOSE_TIMEOUT", 0.05)
+    crashed = _crashable_page()
+    stubborn = _crashable_page()
+    stubborn.close = AsyncMock(side_effect=RuntimeError("close refused"))
+    hanging = _crashable_page()
+    hanging.close = AsyncMock(side_effect=_never_returns)
+    context = MagicMock(pages=[crashed, stubborn, hanging])
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+
+    state._on_page_crashed(crashed)
+    state._on_page_crashed(stubborn)
+    state._on_page_crashed(hanging)
+    async with asyncio.timeout(10):
+        await asyncio.gather(*list(state._detached_teardown_tasks))
+
+    crashed.close.assert_awaited_once()
+    stubborn.close.assert_awaited_once()
+    assert state._detached_teardown_tasks == set()

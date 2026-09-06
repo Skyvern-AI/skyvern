@@ -548,8 +548,7 @@ class TestResetBrowserTabsBetweenIterations:
         research_old = MagicMock(url="https://r1", close=AsyncMock())
         research_cur = MagicMock(url="https://r2", close=AsyncMock())
 
-        bs = RealBrowserState.__new__(RealBrowserState)
-        bs.browser_context = MagicMock()
+        bs = RealBrowserState(pw=MagicMock(), browser_context=MagicMock())
         bs.browser_context.pages = [deliverable, pre_ref, research_old, research_cur]
         bs.get_working_page = AsyncMock(return_value=research_cur)
 

@@ -196,9 +196,7 @@ async def test_scrape_with_type_normal_no_reload_call() -> None:
 
 
 def _reconnect_state(binding: DownloadBinding) -> RealBrowserState:
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = MagicMock()
+    state = RealBrowserState(pw=AsyncMock(), browser_context=MagicMock())
     state.engine_selection = MagicMock()
     state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
     state.set_working_page = AsyncMock()
@@ -230,9 +228,7 @@ async def test_reconnect_keeps_run_dir_binding() -> None:
 
 
 def _reconnect_state_capturing_check(binding: DownloadBinding, captured: dict[str, object]) -> RealBrowserState:
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = MagicMock()
+    state = RealBrowserState(pw=AsyncMock(), browser_context=MagicMock())
     state.engine_selection = MagicMock()
     state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
     state.set_working_page = AsyncMock()
@@ -268,9 +264,8 @@ async def test_reconnect_threads_run_dir_binding_into_check_and_fix_state() -> N
 def _recreation_state(
     binding: DownloadBinding, captured: dict[str, object]
 ) -> tuple[RealBrowserState, Callable[..., Awaitable[tuple[object, BrowserArtifacts, object]]]]:
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = None  # force the check_and_fix_state recreation branch
+    # No browser context forces the check_and_fix_state recreation branch.
+    state = RealBrowserState(pw=AsyncMock(), browser_context=None)
     state.engine_selection = None
     state.browser_artifacts = BrowserArtifacts(download_binding=binding)
     state.set_working_page = AsyncMock()
@@ -346,9 +341,7 @@ async def test_check_and_fix_state_recreation_stamps_forwarded_binding_on_assign
     """Outer contract: on recreation, check_and_fix_state forwards the derived binding and the factory
     stamps it on the fresh artifacts, so the state ends up SESSION_DIR — with no later override that
     could mislabel a genuine provider change."""
-    state = RealBrowserState.__new__(RealBrowserState)
-    state.pw = AsyncMock()
-    state.browser_context = None
+    state = RealBrowserState(pw=AsyncMock(), browser_context=None)
     state.engine_selection = None
     state.browser_artifacts = BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR)
     state.set_working_page = AsyncMock()

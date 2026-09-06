@@ -166,3 +166,67 @@ async def test_discard_video_artifact_noop_when_page_has_no_video() -> None:
     await state._discard_video_artifact(page)
 
     assert [va.video_path for va in state.browser_artifacts.video_artifacts] == ["/tmp/real.webm"]
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_page_keeps_its_recording() -> None:
+    """The crashed tab is usually the run's own working page, so discarding its video here would
+    delete the recording of the very run that crashed. Closing it must not touch the artifact."""
+    crashed = _make_page("/tmp/crashed.webm")
+    survivor = _make_page("/tmp/real.webm")
+    state = _build_state(
+        pages=[crashed, survivor],
+        working_page=survivor,
+        video_artifacts=[VideoArtifact(video_path="/tmp/crashed.webm"), VideoArtifact(video_path="/tmp/real.webm")],
+    )
+
+    await state._close_crashed_page(crashed)
+
+    crashed.close.assert_awaited_once()
+    assert [va.video_path for va in state.browser_artifacts.video_artifacts] == [
+        "/tmp/crashed.webm",
+        "/tmp/real.webm",
+    ]
+    assert state.browser_artifacts.is_page_video_discarded(crashed) is False
+
+
+@pytest.mark.asyncio
+async def test_the_orphan_sweep_keeps_a_crashed_page_recording() -> None:
+    """The sibling path: a crashed page whose close is in flight or timed out is still in
+    context.pages, and _close_all_other_pages would otherwise discard the same run's recording."""
+    crashed = _make_page("/tmp/crashed.webm")
+    working = _make_page("/tmp/real.webm")
+    orphan = _make_page("/tmp/orphan.webm")
+    state = _build_state(
+        pages=[crashed, working, orphan],
+        working_page=working,
+        video_artifacts=[
+            VideoArtifact(video_path="/tmp/crashed.webm"),
+            VideoArtifact(video_path="/tmp/real.webm"),
+            VideoArtifact(video_path="/tmp/orphan.webm"),
+        ],
+    )
+    state._crashed_pages.add(crashed)
+
+    await state._close_all_other_pages(discard_orphaned_videos=True)
+
+    assert state.browser_artifacts.is_page_video_discarded(crashed) is False
+    assert state.browser_artifacts.is_page_video_discarded(orphan) is True
+    assert [va.video_path for va in state.browser_artifacts.video_artifacts] == [
+        "/tmp/crashed.webm",
+        "/tmp/real.webm",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_page_that_refuses_to_close_stays_watchable() -> None:
+    crashed = _make_page(None)
+    crashed.close = AsyncMock(side_effect=RuntimeError("close refused"))
+    state = _build_state(pages=[crashed], working_page=None, video_artifacts=[])
+    state._watch_page_for_crash(crashed)
+
+    await state._close_crashed_page(crashed)
+
+    assert crashed in state._crash_listener_pages
+    state._register_disconnect_listeners(state.browser_context)
+    assert crashed.on.call_count == 1
