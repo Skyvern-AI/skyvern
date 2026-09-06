@@ -2434,3 +2434,99 @@ async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: p
     assert result.success is False
     assert "belongs to https://example.com" in (result.failure_reason or "")
     assert not any(call.startswith("fill:") for call in page.inner.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["click", "wait_for"])
+async def test_failure_locator_tracks_exact_exception_without_reparsing_selector(operation: str) -> None:
+    page = FakePage()
+    failure = PlaywrightTimeoutError("locator timed out")
+    original = getattr(page.inner, operation)
+    setattr(page.inner, operation, AsyncMock(side_effect=failure))
+    recording = RecordingPage(page)
+    with pytest.raises(PlaywrightTimeoutError) as caught:
+        await getattr(recording.get_by_role("button", name="Continue"), operation)()
+    assert recording.failure_locator(caught.value) is page.inner
+    assert recording.failure_locator(PlaywrightTimeoutError("locator timed out")) is None
+    setattr(page.inner, operation, original)
+    await recording.get_by_role("button", name="Continue").click()
+    assert recording.failure_locator(caught.value) is None
+
+
+@pytest.mark.asyncio
+async def test_inline_timeout_snapshot_masks_before_bounding_and_uses_exact_locator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inline diagnostic reads the recorded locator, never a selector parsed from the error."""
+    from skyvern.forge.sdk.workflow.models import block as block_module
+
+    secret = "credential-secret"
+    exception = PlaywrightTimeoutError("locator timed out")
+
+    class TimedOutLocator:
+        async def evaluate(self, script: str) -> str:
+            assert "elementFromPoint" in script
+            return f'<div id="cover">{secret}</div>'
+
+    class SnapshotPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.url = f"https://fixture.test/checkout?token={secret}"
+
+        async def title(self) -> str:
+            return f"\x1b\u202e\nCheckout {secret}" + "x" * 1200
+
+    recording = RecordingPage(SnapshotPage())
+    locator = TimedOutLocator()
+    monkeypatch.setattr(RecordingPage, "failure_locator", lambda _self, exc: locator if exc is exception else None)
+    monkeypatch.setattr(
+        block_module.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(redact_codeblock_parameter_values=lambda value, _parameters: value),
+    )
+    context = SimpleNamespace(mask_secrets_in_data=lambda value: value.replace(secret, "*****"))
+    block = _make_code_block("pass")
+
+    state = await block._capture_inline_failure_page_state(
+        page=recording,
+        failure_locator=recording.failure_locator(exception),
+        workflow_run_context=context,
+        redaction_parameters={},
+    )
+
+    assert state["final_url"] == "https://fixture.test/checkout?token=*****"
+    assert state["page_title"].startswith("Checkout *****")
+    assert len(state["page_title"]) == 1000
+    assert state["covering_element"] == '<div id="cover">*****</div>'
+    assert secret not in str(state)
+    assert await block._capture_inline_failure_page_state(
+        page=recording,
+        failure_locator=recording.failure_locator(PlaywrightTimeoutError("same message")),
+        workflow_run_context=context,
+        redaction_parameters={},
+    ) == {"final_url": "https://fixture.test/checkout?token=*****", "page_title": state["page_title"]}
+
+
+@pytest.mark.asyncio
+async def test_later_page_operation_invalidates_an_inflight_failure_locator():
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    page = FakePage()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    failure = PlaywrightTimeoutError("covered target")
+
+    async def delayed_click(**kwargs):
+        started.set()
+        await release.wait()
+        raise failure
+
+    page.inner.click = delayed_click
+    recording = RecordingPage(page)
+    pending = asyncio.create_task(recording.locator("#target").click())
+    await started.wait()
+    await recording.wait_for_load_state()
+    release.set()
+    with pytest.raises(PlaywrightTimeoutError):
+        await pending
+    assert recording.failure_locator(failure) is None

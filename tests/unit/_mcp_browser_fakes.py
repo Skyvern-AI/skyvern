@@ -10,6 +10,25 @@ import pytest
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.exceptions import StaleFrameSelectionError
+
+
+class StaleScopePage:
+    """Page whose selected frame belongs to another tab, so reading the locator scope refuses.
+
+    Everything else forwards to the raw page, so a caller that skips the ownership read still
+    reaches a working page-space action and the test fails.
+    """
+
+    def __init__(self, raw: MagicMock) -> None:
+        self.page = raw
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.page, name)
+
+    @property
+    def locator_scope(self) -> Any:
+        raise StaleFrameSelectionError("payment", "https://frame.example.com/")
 
 
 def make_real_wait_for_timeout() -> AsyncMock:
@@ -65,10 +84,12 @@ def make_probe_locator(
     count: int = 1,
     visible: bool = True,
     enabled: bool = True,
+    is_password: bool = False,
     side_effect: Exception | None = None,
 ) -> MagicMock:
     locator = MagicMock()
     locator.first = locator
+    locator.evaluate = AsyncMock(side_effect=side_effect, return_value=is_password)
     locator.count = AsyncMock(side_effect=side_effect, return_value=count)
     locator.is_visible = AsyncMock(side_effect=side_effect, return_value=visible)
     locator.is_enabled = AsyncMock(side_effect=side_effect, return_value=enabled)
@@ -98,11 +119,11 @@ def make_select_option_page(*, locator_scope: Any | None = None) -> tuple[Simple
     probe.evaluate = AsyncMock(return_value=False)
     probe.select_option = AsyncMock(return_value="selected")
     raw_page.locator = MagicMock(return_value=probe)
-    page = SimpleNamespace(page=raw_page, select_option=native_select_option)
+    page = SimpleNamespace(page=raw_page, select_option=native_select_option, locator_scope=raw_page)
     if locator_scope is not None:
         if isinstance(locator_scope, MagicMock):
             locator_scope.locator = MagicMock(return_value=probe)
-        page._locator_scope = locator_scope
+        page.locator_scope = locator_scope
     return page, native_select_option
 
 

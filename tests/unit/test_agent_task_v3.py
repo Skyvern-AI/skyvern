@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
@@ -569,7 +570,9 @@ async def test_execute_task_v3_scrubs_registered_secret_from_persisted_action_re
 async def test_execute_task_v3_leaves_extraction_unscrubbed_when_redaction_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Secret values are available, but the gate itself is off — the scrub must not run at all.
+    # A workflow-registered secret is available but the gate is off, so it must not reach the
+    # scrub. Engine-minted runtime values still do -- that is the fallback the hoist provides --
+    # which is why this pins the gate rather than the scrub being skipped entirely.
     monkeypatch.setattr(
         "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
     )
@@ -2375,7 +2378,7 @@ async def test_execute_task_v3_page_free_validation_prompt_has_no_perception_ins
     # No perception INSTRUCTIONS: neither the verify-first preamble nor the grounding clause
     # (the page-free text itself may name the tools only to forbid them).
     assert "First read" not in goal
-    assert "read the full page text (get_html) before concluding" not in goal
+    assert "read the page's visible text (get_html with format text) before concluding" not in goal
     assert "Do not call observe or get_html" in goal
 
 
@@ -2451,7 +2454,9 @@ async def test_execute_task_v3_detects_user_defined_errors_on_failure(
 ) -> None:
     # error_code_mapping workflows consume configured codes on failure; v3 must run the same
     # detection the step engine does before finalizing failed/terminated outcomes.
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "payment_failed"}, error_code="payment_failed")]
+    detected = [
+        SimpleNamespace(model_dump=lambda: {"error_code": "payment_failed"}, error_code="payment_failed", reasoning="")
+    ]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -2622,7 +2627,9 @@ async def test_execute_task_v3_terminal_block_that_names_no_code_gets_none(
     # A model that was offered the codes and named none must end with NO business code at all. This
     # is the case the detector cannot get right on its own: it sees a page, not the question, so on a
     # block whose terminal reason none of the codes describes it can still match one from the page.
-    detect_mock = AsyncMock(return_value=[SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})])
+    detect_mock = AsyncMock(
+        return_value=[SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
+    )
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
@@ -2656,7 +2663,9 @@ async def test_execute_task_v3_declining_a_code_holds_on_the_failed_path_too(
     # detector's last resort substring-matches a description with no negation handling, so a model
     # explaining "this was NOT <description>" would persist that code at confidence 1.0: the very
     # defect this PR exists to fix.
-    detect_mock = AsyncMock(return_value=[SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})])
+    detect_mock = AsyncMock(
+        return_value=[SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
+    )
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
@@ -2719,7 +2728,7 @@ async def test_execute_task_v3_vetoed_completion_still_reaches_the_detector(
     # A completion the gate vetoes is demoted to failed, but the MODEL said "completed" -- it was
     # never asked which business outcome explains a failure, so its silence is not a deliberate
     # decline and must not suppress the detector. Gating on task_status alone would swallow it.
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})]
+    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -2829,6 +2838,202 @@ async def test_execute_task_v3_caps_the_chosen_codes_reasoning_after_redacting_i
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_scrubs_a_registered_secret_from_the_webhook_bound_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # failure_reason is a first-class field on the task webhook payload, so this string LEAVES the
+    # system. run_secrets is hoisted for "every model-authored string this method persists" and
+    # failure_reason is one of them, so a path that skipped it published a secret the sibling redacts.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="the portal rejected the key sk4829137765 I was given",
+        billable_actions=[],
+    )
+    _, out_task, loop_mock, _ = await _run_execute_task_v3(monkeypatch, outcome)
+
+    persisted = loop_mock.update_task_kwargs["failure_reason"]
+    assert "sk4829137765" not in persisted
+    assert REDACTED_SECRET_PLACEHOLDER in persisted
+    # Asserted at the egress boundary rather than only at the local: this is the field the webhook
+    # payload is built from, which is what makes the leak customer-visible.
+    assert "sk4829137765" not in (out_task.to_task_response().failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_redacts_failure_reason_before_any_consumer_reads_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pins WHERE the redaction runs, not just that it runs. The redactor matches whole registered
+    # values, so it has to happen at the point the string is born -- before the classifier and the
+    # error detector read it. Moving it down to just before the terminal update would still pass the
+    # test above while handing raw secrets to a detector whose own output also leaves over the webhook.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    detector = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detector)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    outcome = LoopOutcome(
+        status="terminated",
+        reason="the portal rejected the key sk4829137765 I was given",
+        billable_actions=[],
+    )
+    await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+
+    seen_by_detector = detector.await_args.kwargs["failure_reason"]
+    assert "sk4829137765" not in seen_by_detector
+    assert REDACTED_SECRET_PLACEHOLDER in seen_by_detector
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_scrubs_a_registered_secret_from_detector_written_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fourth reasoning persist in this method. The detector also reads the page, so redacting
+    # its input is not enough -- a secret typed into the form can come back in its reasoning, and
+    # task.errors leaves over the customer's webhook exactly like the chosen-code branch does.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.detect_user_defined_errors_for_task",
+        AsyncMock(
+            return_value=[
+                UserDefinedError(
+                    error_code="COVERAGE_NOT_ACTIVE",
+                    reasoning="the page showed sk4829137765 after submit",
+                    confidence_float=1.0,
+                )
+            ]
+        ),
+    )
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="terminated", reason="could not continue", billable_actions=[])
+    await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert "sk4829137765" not in persisted["reasoning"]
+    assert REDACTED_SECRET_PLACEHOLDER in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_caps_detector_written_reasoning_after_redacting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # task.errors APPENDS rather than replaces (tasks.py `task.errors = (task.errors or []) + errors`),
+    # so an uncapped detector reasoning accumulates in a webhook-shipped column.
+    # The secret straddles the cap boundary, so this also pins the ORDER: redact, then truncate.
+    # Truncating first would cut the secret in half and publish a fragment the redactor cannot match.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    straddling = "a" * (agent_mod._TASKV3_REASONING_MAX_CHARS - 5) + "sk4829137765" + "b" * 4000
+    monkeypatch.setattr(
+        "skyvern.forge.agent.detect_user_defined_errors_for_task",
+        AsyncMock(
+            return_value=[
+                UserDefinedError(error_code="COVERAGE_NOT_ACTIVE", reasoning=straddling, confidence_float=1.0)
+            ]
+        ),
+    )
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="terminated", reason="could not continue", billable_actions=[])
+    await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert len(persisted["reasoning"]) == agent_mod._TASKV3_REASONING_MAX_CHARS
+    assert "sk48" not in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_caps_detector_written_reasoning_with_no_secrets_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cap is not gated on the Mask Secrets opt-in: a long reasoning accumulates in an
+    # append-only, webhook-shipped column whether or not the run registered any secret.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+        lambda *_a, **_k: set(),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.detect_user_defined_errors_for_task",
+        AsyncMock(
+            return_value=[
+                UserDefinedError(
+                    error_code="COVERAGE_NOT_ACTIVE",
+                    reasoning="z" * (agent_mod._TASKV3_REASONING_MAX_CHARS + 2500),
+                    confidence_float=1.0,
+                )
+            ]
+        ),
+    )
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="terminated", reason="could not continue", billable_actions=[])
+    await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+
+    (persisted,) = errors_update.await_args.kwargs["errors"]
+    assert len(persisted["reasoning"]) == agent_mod._TASKV3_REASONING_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_leaves_failure_reason_byte_identical_when_redaction_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Secret values are available, but the gate itself is off -- the scrub must not run at all.
+    # Redaction is opt-in per workflow, so a run that never enabled it must get the model's text back
+    # unchanged rather than a quiet rewrite of a field customers read and alert on.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+        lambda *_a, **_k: set(),
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    raw = "the portal rejected the key sk4829137765 I was given"
+    outcome = LoopOutcome(status="terminated", reason=raw, billable_actions=[])
+    _, _, loop_mock, _ = await _run_execute_task_v3(monkeypatch, outcome)
+
+    assert loop_mock.update_task_kwargs["failure_reason"] == raw
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_records_the_models_own_account_not_the_gate_veto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2869,7 +3074,7 @@ async def test_execute_task_v3_leaves_unasked_failures_to_the_detector(
 ) -> None:
     # The scope guard: every v1 caller and every v3 task without a mapping has error_codes_offered
     # False, and those runs must keep exactly today's behavior -- the detector still runs.
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"})]
+    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -2927,13 +3132,15 @@ async def test_execute_task_v3_router_selected_data_only_validation_goes_page_fr
     )
     goal = loop_mock.await_args.kwargs["goal"]
     assert "page-free assessment" not in goal
-    assert "read the full page text (get_html) before concluding" in goal
+    assert "read the page's visible text (get_html with format text) before concluding" in goal
 
 
 @pytest.mark.asyncio
 async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     # The finish gate the loop receives must be the same VerificationState the auth tools mutate;
     # a fresh or detached state would let a refused source false-complete despite the blocker.
+    from skyvern.forge.taskv3.auth_tools import VerificationFailure
+
     seen_states: list[Any] = []
 
     def capturing_build(
@@ -2951,7 +3158,7 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     assert blocker is not None
     assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
     assert await blocker() is None
-    seen_states[0].source_failed = True
+    seen_states[0].arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
     assert await blocker() is not None
 
 
@@ -3703,6 +3910,174 @@ async def test_execute_task_v3_persists_finish_reason_and_final_url_with_run_con
     assert update_block_mock.await_args.kwargs["workflow_run_block_id"] == "wrb_current"
     assert update_block_mock.await_args.kwargs["finish_reason"] == "done here"
     assert update_block_mock.await_args.kwargs["final_url"] == "https://example.test/confirmation"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_redacts_a_runtime_secret_from_a_completed_runs_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A completed run leaves failure_reason None, so the handoff falls to raw outcome.reason and is
+    # sanitized only by mask_secrets_in_data -- which covers the static workflow secrets dict but
+    # NOT the runtime-minted values (a resolved verification code) that run_secrets carries.
+    # finish_reason is persisted and API-visible, so that value leaves the system.
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    # The masker only knows the static secrets dict, so it is a no-op on a runtime OTP.
+    workflow_run_context.mask_secrets_in_data = lambda v, **_k: v
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+
+    outcome = LoopOutcome(
+        status="completed", reason="entered the code sk4829137765 and submitted", billable_actions=["click"]
+    )
+    block = _make_block(TaskBlock, label="shipping")
+    final_page = MagicMock()
+    final_page.url = "https://example.test/confirmation"
+    final_page.is_closed = MagicMock(return_value=False)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_row=_make_own_block_row(),
+        workflow_run_id="wr_handoff",
+        get_working_page_side_effect=[final_page, final_page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    persisted = update_block_mock.await_args.kwargs["finish_reason"]
+    assert "sk4829137765" not in persisted
+    assert REDACTED_SECRET_PLACEHOLDER in persisted
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_redacts_runtime_secrets_from_extraction_with_the_gate_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The extraction scrub did its own lookup gated on the Mask Secrets opt-in, with no fallback to
+    # runtime_secret_values_for_artifacts(). That toggle is on for 0.6% of workflows, so an
+    # engine-minted value echoed into extracted_information shipped raw almost always -- while the
+    # same value in failure_reason is redacted through the hoisted run_secrets.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+        lambda *_a, **_k: {"482913"},
+    )
+    outcome = LoopOutcome(
+        status="completed",
+        reason="done",
+        billable_actions=["type"],
+        extracted_output={"confirmation": "verification code 482913 accepted"},
+    )
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        data_extraction_goal="Extract the confirmation number",
+        extracted_information_schema=None,
+    )
+    assert "482913" not in task.extracted_information["confirmation"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_redacts_a_secret_inside_a_non_string_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # LoopOutcome is a plain class, so `reason` is unvalidated and a model answering with an object
+    # lands here as a dict. The redactor would raise on it, and the enclosing contained_effect would
+    # swallow that -- dropping finish_reason AND final_url for the block rather than crashing, which
+    # is the kind of silent loss that reads as "the handoff just never ran".
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks", AsyncMock(return_value=[]))
+    update_block_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", update_block_mock)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    workflow_run_context = MagicMock()
+    workflow_run_context.mask_secrets_in_data = lambda v, **_k: v
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        lambda *_a, **_k: workflow_run_context,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+
+    outcome = LoopOutcome(
+        status="completed", reason={"summary": "entered code sk4829137765"}, billable_actions=["click"]
+    )
+    block = _make_block(TaskBlock, label="shipping")
+    final_page = MagicMock()
+    final_page.url = "https://example.test/confirmation"
+    final_page.is_closed = MagicMock(return_value=False)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        own_block_row=_make_own_block_row(),
+        workflow_run_id="wr_handoff",
+        get_working_page_side_effect=[final_page, final_page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    # The persist still happens AND the secret inside the object is redacted. Skipping redaction for
+    # a non-string reason would publish it through the repr, which is the leak this PR exists to close.
+    update_block_mock.assert_awaited_once()
+    assert update_block_mock.await_args.kwargs["final_url"] == "https://example.test/confirmation"
+    persisted = update_block_mock.await_args.kwargs["finish_reason"]
+    assert "sk4829137765" not in persisted
+    assert REDACTED_SECRET_PLACEHOLDER in persisted
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_short_numeric_otp_does_not_scrub_returned_extraction_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Runtime OTP values skip the numeric-length floor that workflow secrets get, and the extraction
+    # scrub matches on all-length boundaries -- so a 4-digit code would rewrite the "2024" inside a
+    # date the customer actually asked for. Diagnostics can afford that; returned data cannot.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+        lambda *_a, **_k: {"2024"},
+    )
+    outcome = LoopOutcome(
+        status="completed",
+        reason="done",
+        billable_actions=["type"],
+        extracted_output={"invoice_date": "2024-05-01"},
+    )
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        data_extraction_goal="Extract the invoice date",
+        extracted_information_schema=None,
+    )
+    assert task.extracted_information["invoice_date"] == "2024-05-01"
 
 
 @pytest.mark.asyncio

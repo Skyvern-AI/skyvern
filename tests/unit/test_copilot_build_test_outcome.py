@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot import runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _build_dynamic_system_prompt,
@@ -74,13 +78,18 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
+    HANDBACK_WORKFLOW_YAML,
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    install_run_blocks_harness,
     make_copilot_ctx,
     make_stub_html_artifact,
     page_only_failed_block,
@@ -5804,3 +5813,103 @@ def test_a_selector_argument_built_at_runtime_cannot_prove_removal() -> None:
 
     assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
     assert disposition == "no_reported_candidate"
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_created(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    now = datetime.now(UTC)
+    sessions_manager = MagicMock()
+    sessions_manager.get_session = AsyncMock(
+        return_value=PersistentBrowserSession(
+            persistent_browser_session_id="pbs_chat",
+            organization_id="org-1",
+            runnable_id="wr_foreign",
+            runnable_type="workflow_run",
+            status="running",
+            created_at=now,
+            modified_at=now,
+        )
+    )
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", sessions_manager)
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
+    forge_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(
+            workflow_run_id="wr_foreign",
+            copilot_session_id="wcc_someone_else",
+            status=WorkflowRunStatus.running,
+            parent_workflow_run_id=None,
+        )
+    )
+
+    @asynccontextmanager
+    async def _attach(_ctx: CopilotContext) -> AsyncIterator[None]:
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.workflow_copilot_chat_id = "wcc_mine"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    workflow_service_module.prepare_workflow.assert_not_awaited()
+    harness["worker_execute"].assert_not_awaited()
+    forge_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+    assert result["ok"] is False, result
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    assert result["data"]["build_test_connect_failure"]["occupier_run_id"] == "wr_foreign"
+    assert result["data"]["executed_block_labels"] == []
+
+
+@pytest.mark.asyncio
+async def test_budget_denied_dispatch_preserves_prior_run_through_public_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx()
+    ctx.budget_expiry_state.source = "deadline"
+    ctx.budget_expiry_state.drain_active = True
+    ctx.last_run_blocks_workflow_run_id = "wr_prior"
+    ctx.last_successful_run_blocks_workflow_run_id = "wr_prior"
+    ctx.last_run_blocks_browser_session_id = "pbs_prior"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    ctx.last_run_outcome = RecordedRunOutcome(
+        verdict="verified", reason_code="execution_completed", workflow_run_id="wr_prior", run_completed=True
+    )
+    previous_outcome = ctx.last_run_outcome
+    previous_history = list(ctx.terminal_envelope_run_outcomes)
+    previous_diagnosis = ctx.latest_diagnosis_repair_contract
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(tools_module, "_plan_frontier", lambda *_args: (["step"], {}, "step", "initial"))
+    dispatch = AsyncMock(side_effect=AssertionError("denied dispatch must not reach the database"))
+    monkeypatch.setattr(run_execution_module.app.DATABASE.workflows, "get_workflow_by_permanent_id", dispatch)
+
+    result = json.loads(
+        await tools_module.run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug"),
+            json.dumps({"block_labels": ["step"], "parameters": {}}),
+        )
+    )
+
+    assert ctx.last_run_blocks_workflow_run_id == "wr_prior"
+    assert ctx.last_successful_run_blocks_workflow_run_id == "wr_prior"
+    assert ctx.last_run_blocks_browser_session_id == "pbs_prior"
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_run_outcome is previous_outcome
+    assert ctx.terminal_envelope_run_outcomes == previous_history
+    assert ctx.latest_diagnosis_repair_contract is previous_diagnosis
+    assert result == {"ok": False, "data": {"budget_expired": True, "run_dispatched": False, "source": "deadline"}}
+    dispatch.assert_not_awaited()

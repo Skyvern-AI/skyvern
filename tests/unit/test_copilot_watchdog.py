@@ -71,6 +71,7 @@ def _fake_run(status: str = "running", modified_at: datetime | None = None) -> A
         status=status,
         modified_at=modified_at or datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
         browser_session_id=None,
+        failure_reason=None,
     )
 
 

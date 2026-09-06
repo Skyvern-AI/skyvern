@@ -25,15 +25,17 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
+from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
+    ACTION_BUDGET_EXTENSION_MAX_FACTOR,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_REASON_PREFIX,
     ACTION_LOOP_TERMINATE_AFTER,
-    CANONICAL_SURVIVAL_EVENT,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
+    FINAL_TURN_RELEASED_EVENT,
     NAV_DEAD_END_REASON_PREFIX,
     NAVIGATION_DEAD_END_STATUSES,
     NO_TOOL_CALL_NUDGE,
@@ -48,18 +50,20 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_SHADOW_EVENT,
     PERCEPTION_STALL_SUPPRESSED_EVENT,
     PERCEPTION_STALL_TERMINATE_AFTER,
-    PROGRESS_LEDGER_FINAL_EVENT,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
     ActivityRecency,
     LoopOutcome,
+    SemanticCommitStats,
     SubmitWatch,
     ToolHandler,
     ToolResult,
     ToolSpec,
     _budget_extension_gate,
     _canonical_perception_content,
+    _cap_trip_relieved,
     _PerceptionLedger,
+    _ProgressEvidence,
     _ProgressLedger,
     _RevisitMemory,
     make_finish_tool,
@@ -1882,30 +1886,123 @@ async def test_action_step_budget_no_extension_without_page_change_evidence() ->
 
 
 @pytest.mark.asyncio
-async def test_action_step_budget_extension_is_granted_at_most_once() -> None:
-    # The grant is single: a run that exhausts cap + extension is refused for good, and the
-    # exhaustion reason names the in-effect (extended) cap.
+async def test_action_step_budget_extension_repeats_but_is_bounded_at_a_multiple_of_the_original_cap() -> None:
+    # A long form does not stop being long after one extension, so the grant repeats under the same
+    # evidence predicate — but it is not unbounded. Each grant is half the ORIGINAL cap (linear, so
+    # a run that has already spent 1.5x its budget draws the same size handout as one at first
+    # exhaustion, never a compounding one), and growth stops dead at the limit multiple.
     clicks: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", clicks, billable=True)
-    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 6)])
-    script = [
-        [("observe", {})],
-        [("click", {"selector": "#a"})],
-        [("observe", {})],
-        [("click", {"selector": "#b"})],  # cap
-        [("observe", {})],
-        [("click", {"selector": "#c"})],  # extension: cap 2 -> 3
-        [("observe", {})],
-        [("click", {"selector": "#d"})],  # beyond the extended cap: refused for good
-        # Deliberate contract change: the #d block above grants one final observed turn; retrying
-        # the same beyond-cap click on it hits the gate again ("already_extended") and ends the run.
-        [("click", {"selector": "#d"})],
-    ]
-    outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=2, max_turns=30)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 20)])
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(14):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            max_action_steps=4,
+            max_turns=80,
+            max_tool_calls=200,
+        )
     assert outcome.status == "budget_exhausted"
-    assert "maximum steps (3)" not in outcome.reason
-    assert outcome.cap_trip == "Reached the maximum steps (3)"
-    assert len(clicks) == 3
+    # 4 -> 6 -> 8 -> 10 -> 12, then the limit (4 * ACTION_BUDGET_EXTENSION_MAX_FACTOR) stops it.
+    granted = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+    assert [entry["original_cap"] for entry in granted] == [4, 6, 8, 10]
+    assert {entry["extension"] for entry in granted} == {2}, "every grant is half the ORIGINAL cap"
+    assert [entry["extensions_granted"] for entry in granted] == [1, 2, 3, 4]
+    assert len(clicks) == 4 * ACTION_BUDGET_EXTENSION_MAX_FACTOR
+    assert outcome.cap_trip == "Reached the maximum steps (12)"
+    refused = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENSION_REFUSED_EVENT]
+    assert refused and all(entry["gate_reason"] == "extension_limit_reached" for entry in refused)
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_final_grant_truncates_to_the_limit_instead_of_overshooting() -> None:
+    # The limit is enforced by clamping each grant to the headroom left under it, and on an EVEN base
+    # cap that clamp never binds: half the cap divides the 2x headroom evenly, so the last full grant
+    # lands exactly on the limit and a bare `extension = raw_extension` behaves identically. An odd
+    # base cap is what separates them -- 25 leaves 2 steps under the limit after four 12s, and only
+    # the clamp turns the fifth grant into that runt instead of overshooting the cap to 85.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 120)])
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(90):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            max_action_steps=25,
+            max_turns=400,
+            max_tool_calls=800,
+        )
+    assert outcome.status == "budget_exhausted"
+    granted = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+    assert [entry["original_cap"] for entry in granted] == [25, 37, 49, 61, 73]
+    assert [entry["extension"] for entry in granted] == [12, 12, 12, 12, 2], (
+        "the final grant must truncate to the limit, not overshoot it by a full half-cap"
+    )
+    assert len(clicks) == 25 * ACTION_BUDGET_EXTENSION_MAX_FACTOR
+    assert outcome.cap_trip == "Reached the maximum steps (75)"
+
+
+@pytest.mark.asyncio
+async def test_extension_publishes_the_moved_guards_to_the_live_activity_record() -> None:
+    # The failure-evidence gates read ActivityRecency, and a grant moves the guards MID-BATCH. Two
+    # writes on that path have no reader anywhere else in the suite because `_run` leaves
+    # `activity=None`: the `*_remaining` refresh (gates later in this same batch would otherwise
+    # judge the run on pre-grant headroom) and clearing `final_turn_active` on release (left stuck
+    # True it refuses every finish hold for the rest of the run). Probes bracket the billable call
+    # so one reads the record before the grant and one after, within a single batch.
+    activity = ActivityRecency()
+    snapshots: list[tuple[int, bool, int | None]] = []
+
+    async def probe_handler(args: dict[str, Any]) -> ToolResult:
+        snapshots.append((activity.turn, activity.final_turn_active, activity.tokens_remaining))
+        return ToolResult.ok("probe")
+
+    probe = ToolSpec(
+        name="probe", description="probe", parameters={"type": "object", "properties": {}}, handler=probe_handler
+    )
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 40)])
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(10):
+        script.append([("observe", {})])
+        script.append([("probe", {}), ("click", {"selector": f"#a{i}"}), ("probe", {})])
+
+    with capture_logs() as logs:
+        await _run(
+            script,
+            [observe, click, probe, make_finish_tool()],
+            max_action_steps=4,
+            max_turns=200,
+            max_tool_calls=500,
+            # Trips at the top of a turn well before the action cap, latching the wrap-up turn; the
+            # grant during that turn re-derives the token guard to 1.5M and releases the latch.
+            max_tokens=135,
+            backstops_for_cap=taskv3_runaway_backstops,
+            activity=activity,
+        )
+    released = [entry for entry in logs if entry["event"] == FINAL_TURN_RELEASED_EVENT]
+    assert released, "the run never reached the release path this test exists to cover"
+    release_turn = released[0]["turn"]
+    # Only the mid-batch refresh makes the raised token guard visible to the rest of THIS turn;
+    # without it the first roomy reading arrives at the top of the next one.
+    roomy = [snapshot for snapshot in snapshots if snapshot[2] is not None and snapshot[2] > 135]
+    assert roomy and roomy[0][0] == release_turn, (
+        "the grant's raised guards were not published to the live record until the following turn"
+    )
+    assert any(snapshot[1] for snapshot in snapshots), "the wrap-up latch never engaged, so the reset is untested"
+    latched_at = next(index for index, snapshot in enumerate(snapshots) if snapshot[1])
+    assert any(not snapshot[1] for snapshot in snapshots[latched_at:]), (
+        "final_turn_active stayed True after the release, which refuses every later finish hold"
+    )
 
 
 @pytest.mark.asyncio
@@ -2704,6 +2801,160 @@ def test_budget_extension_gate_vetoes_fire_independently() -> None:
     )
     stalling = ActivityRecency(perception_stall_imminent=True)
     assert _budget_extension_gate(10, 9, set(), False, stalling, None, 5) == (False, "perception_stall_imminent")
+
+
+@pytest.mark.asyncio
+async def test_extension_releases_a_final_turn_granted_by_a_guard_it_just_raised() -> None:
+    # The single wrap-up turn is latched by the FIRST cap trip and deliberately never re-evaluated:
+    # before the budget could be extended repeatedly no cap could be relieved mid-run, so reporting
+    # the remembered cap was always honest. A grant that raises that same guard past its trip breaks
+    # that premise -- without the release the run ends naming a token budget it is nowhere near,
+    # with the extension it just earned unspent.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, 40)])
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(10):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+
+    with capture_logs() as logs:
+        outcome, caller = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            max_action_steps=4,
+            max_turns=200,
+            max_tool_calls=500,
+            # Trips at the top of a turn well before the action cap, latching the wrap-up turn; the
+            # grant during that turn re-derives it to 1.5M, so the latched cap stops binding.
+            max_tokens=135,
+            backstops_for_cap=taskv3_runaway_backstops,
+        )
+    released = [entry for entry in logs if entry["event"] == FINAL_TURN_RELEASED_EVENT]
+    assert [entry["cap"] for entry in released] == ["max_tokens (135) reached"]
+    assert outcome.cap_trip != "max_tokens (135) reached", "died on a budget the grant had relieved"
+    # Releasing the counter is only half of it: the model was TOLD it was on its final turn, and that
+    # message rides the transcript forever. Left standing it steers the model to wrap up early, which
+    # spends the extension through the prompt instead of the counter.
+    transcript = "".join(
+        str(message.get("content", "")) for message in caller.message_history if message.get("role") == "user"
+    )
+    assert "this is the final turn before the run ends." in transcript
+    assert '"budget_exhausted":false' in transcript, "the final-turn notice was never retracted"
+    # The release fires MID-BATCH. A user message between an assistant turn's tool_calls and their
+    # results is a transcript the provider rejects outright, which would turn every later turn into
+    # a call failure and end the run as loop_error -- strictly worse than the budget_exhausted it
+    # replaces. The retraction must ride out with the other end-of-batch notes.
+    history = caller.message_history
+    for index, message in enumerate(history):
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        expected = len(message["tool_calls"])
+        answers = history[index + 1 : index + 1 + expected]
+        assert all(answer.get("role") == "tool" for answer in answers), (
+            f"a non-tool message interrupts the tool results of turn {index}: {answers}"
+        )
+    # The relieved run goes on to spend the budget it earned instead of stopping one step in.
+    assert len(clicks) > 4
+    assert len([entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]) > 1
+
+
+def test_cap_trip_relieved_only_for_the_guards_an_extension_actually_raises() -> None:
+    # A release resurrects a run past a cap it was stopped at, so the set of relievable caps must be
+    # exactly the three an extension re-derives. The wall clock is never re-derived, and the
+    # action-step trip is not a top-of-turn cap. An integration test cannot reach the deadline case:
+    # the gate's own deadline-headroom check (loop.py, "insufficient_deadline_headroom") refuses
+    # every grant once the clock is blown, so a deadline latch and a grant cannot coexist in one run
+    # -- that branch is defensive. This pins the predicate; the wiring above it is pinned by
+    # test_extension_releases_a_final_turn_granted_by_a_guard_it_just_raised.
+    kwargs = dict(
+        max_tokens=1000,
+        total_tokens=50,
+        final_turn_token_reserve=0,
+        max_turns=200,
+        turns=10,
+        max_tool_calls=500,
+        total_tool_calls=20,
+    )
+    assert _cap_trip_relieved("max_tokens (100) reached", **kwargs)
+    assert _cap_trip_relieved("max_turns (12) reached", **kwargs)
+    assert _cap_trip_relieved("max_tool_calls (25) reached", **kwargs)
+    assert not _cap_trip_relieved("deadline (1800s) reached", **kwargs)
+    assert not _cap_trip_relieved("Reached the maximum steps (24)", **kwargs)
+    assert not _cap_trip_relieved(None, **kwargs)
+    # Still tripped is still tripped: releasing here would resurrect the run into an immediate
+    # re-trip. The reserve is part of the trip, so it is part of the relief.
+    assert not _cap_trip_relieved("max_tokens (100) reached", **{**kwargs, "total_tokens": 1000})
+    assert not _cap_trip_relieved(
+        "max_tokens (100) reached", **{**kwargs, "total_tokens": 950, "final_turn_token_reserve": 50}
+    )
+    assert not _cap_trip_relieved("max_turns (12) reached", **{**kwargs, "turns": 200})
+    assert not _cap_trip_relieved("max_tool_calls (25) reached", **{**kwargs, "total_tool_calls": 500})
+
+
+@pytest.mark.asyncio
+async def test_extension_past_the_token_ceiling_reports_the_clamp() -> None:
+    # The start-of-run clamp check only sees the INITIAL cap. Now that extensions can push the cap
+    # past the point where the token guard stops scaling, a run can reach that ceiling mid-flight and
+    # that detector would never fire -- so the grant site raises the same log_code. Driven by the
+    # REAL sizing policy at a cap whose token guard is already clamped, not by a stand-in.
+    base_cap = MAX_TOKENS_CEILING // MAX_TOKENS_PER_ACTION_STEP
+    max_turns, max_tool_calls, max_tokens = taskv3_runaway_backstops(base_cap)
+    assert max_tokens == MAX_TOKENS_CEILING, "the base cap must already sit at the token ceiling"
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    observe = _perception_tool("observe", [f"page {i}" for i in range(1, base_cap + 40)])
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(base_cap + 4):
+        script.append([("observe", {})])
+        script.append([("click", {"selector": f"#a{i}"})])
+
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [observe, click, make_finish_tool()],
+            max_action_steps=base_cap,
+            max_turns=max_turns,
+            max_tool_calls=max_tool_calls,
+            max_tokens=max_tokens,
+            backstops_for_cap=taskv3_runaway_backstops,
+        )
+    assert outcome.status == "budget_exhausted", "the run must end on a budget, not an early error"
+    granted = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
+    assert granted, "the run must actually reach a grant, or the probe cannot fire"
+    assert granted[0]["max_tokens"] == MAX_TOKENS_CEILING, "tokens stop rising; turns do not"
+    assert granted[0]["max_turns"] > max_turns
+    clamped = [entry for entry in logs if entry.get("log_code") == "taskv3_token_backstop_clamped"]
+    assert len(clamped) == 1, "reported once per run, not once per grant"
+    assert clamped[0]["step_cap"] == base_cap + base_cap // 2
+
+
+def test_budget_extension_gate_credits_the_headroom_the_grant_itself_creates() -> None:
+    # The runaway guards are functions of the action-step budget, so granting an extension also
+    # raises them. Judging the grant on PRE-grant headroom refuses extensions the grant itself pays
+    # for, which is how a step-cap death gets relocated onto the token guard instead of converted.
+    # The check stays a real discriminator: the gain is the guards' own per-step allowance, so a run
+    # burning more than that per turn -- the re-read-the-page spiral the backstops exist for -- still
+    # fails, and so does one whose gain is zero because a guard has clamped at its ceiling.
+    # Scope: this pins the predicate only. Deleting the call site's `headroom_gain=` argument leaves
+    # it green -- that link is covered above the seam, by tests/browser_e2e/test_taskv3_budget_extension_e2e.py.
+    starved = ActivityRecency(tokens_remaining=100, last_turn_tokens=50)
+    assert _budget_extension_gate(10, 9, set(), False, starved, None, 5) == (False, "insufficient_token_headroom")
+    assert _budget_extension_gate(10, 9, set(), False, starved, None, 5, headroom_gain=(0, 0, 150))[0]
+    assert _budget_extension_gate(10, 9, set(), False, starved, None, 5, headroom_gain=(0, 0, 149)) == (
+        False,
+        "insufficient_token_headroom",
+    )
+    turn_starved = ActivityRecency(turns_remaining=3, turn=10)
+    assert _budget_extension_gate(10, 9, set(), False, turn_starved, None, 5) == (False, "insufficient_turn_headroom")
+    assert _budget_extension_gate(10, 9, set(), False, turn_starved, None, 5, headroom_gain=(30, 0, 0))[0]
+    call_starved = ActivityRecency(tool_calls_remaining=4)
+    assert _budget_extension_gate(10, 9, set(), False, call_starved, None, 5) == (
+        False,
+        "insufficient_tool_call_headroom",
+    )
+    assert _budget_extension_gate(10, 9, set(), False, call_starved, None, 5, headroom_gain=(0, 2, 0))[0]
 
 
 @pytest.mark.asyncio
@@ -6494,7 +6745,7 @@ async def test_progress_ledger_documented_fn_oscillating_same_page_stays_silent(
 
 
 @pytest.mark.asyncio
-async def test_progress_ledger_emits_terminal_survival_record() -> None:
+async def test_ledger_fields_ride_the_terminal_telemetry_for_a_form_run() -> None:
     # Per-run terminal instrumentation: the ledger's peak no-progress streak and whether it would
     # have fired, tagged with the run's outcome — the survival-distribution data for choosing an
     # enforce threshold from data rather than gut.
@@ -6503,13 +6754,12 @@ async def test_progress_ledger_emits_terminal_survival_record() -> None:
     tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
     script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
     script.append([("finish", {"status": "completed", "reason": "done"})])
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
-    final = [e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]
-    assert len(final) == 1
-    assert final[0]["outcome_status"] == "completed"
-    assert final[0]["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
-    assert final[0]["would_fire"] is True
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    fields = outcome.telemetry.log_fields()
+    assert fields["form_ever_armed"] is True
+    assert fields["peak_actions_since_progress"] >= PROGRESS_LEDGER_WINDOW
+    assert fields["would_fire"] is True
 
 
 @pytest.mark.asyncio
@@ -6605,7 +6855,7 @@ async def test_revisit_memory_silent_when_every_perception_state_is_new() -> Non
 
 
 @pytest.mark.asyncio
-async def test_non_form_run_emits_its_own_survival_record_keyed_on_canonical_touches() -> None:
+async def test_non_form_run_reads_false_on_the_partition_and_still_carries_canonical_touches() -> None:
     # The ledger's survival record is gated on ever_armed, so it covers only runs that saw a
     # validation error. Every search / filter / navigate / extract run — the whole non-form half of
     # the product — emitted NOTHING, which is why a fire count off that population is a floor and
@@ -6619,22 +6869,24 @@ async def test_non_form_run_emits_its_own_survival_record_keyed_on_canonical_tou
     # on whether a later observe clears the ring.
     script.append([("click", {"selector": "#stuck"}) for _ in range(4)])
     script.append([("finish", {"status": "completed", "reason": "done"})])
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
 
     assert outcome.status == "completed"
-    survival = [e for e in logs if e.get("event") == CANONICAL_SURVIVAL_EVENT]
-    assert len(survival) == 1, survival
-    assert survival[0]["outcome_status"] == "completed"
+    fields = outcome.telemetry.log_fields()
+    # The two branches partition the population — a non-form run must read False here, or the
+    # union double-counts and the denominator is wrong in the other direction.
+    assert fields["form_ever_armed"] is False
+    # A ledger that exists but never armed must contribute no ledger fields either. Without this the
+    # `and progress.ever_armed` conjunct can be deleted with the suite still green, and every
+    # formless run would carry would_fire=False plus two zeroed counters into the denominator.
+    for key in ("would_fire", "peak_actions_since_progress", "actions_since_progress", "form_armed"):
+        assert key not in fields, (key, fields)
     # Load-bearing: the record has to carry the same-target churn, or it is an empty denominator.
-    assert survival[0]["peak_same_touches"] >= 4, survival[0]
-    # The two records partition the population — a non-form run must not also emit the form one, or
-    # the union double-counts and the denominator is wrong in the other direction.
-    assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]
+    assert fields["peak_same_touches"] >= 4, fields
 
 
 @pytest.mark.asyncio
-async def test_a_run_still_gets_exactly_one_survival_record_with_the_ledger_disabled() -> None:
+async def test_telemetry_omits_the_ledger_fields_when_the_ledger_is_disabled() -> None:
     # The partition must be TOTAL, not conditional on an unrelated flag. The canonical tracker is
     # built and updated unconditionally, so its record does not depend on the ledger existing —
     # gating it on `progress` would drop BOTH records whenever progress_window is None and silently
@@ -6644,31 +6896,283 @@ async def test_a_run_still_gets_exactly_one_survival_record_with_the_ledger_disa
     tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
     script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
     script.append([("finish", {"status": "completed", "reason": "done"})])
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500, progress_window=None)
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500, progress_window=None)
 
     assert outcome.status == "completed"
-    records = [e for e in logs if e.get("event") in (PROGRESS_LEDGER_FINAL_EVENT, CANONICAL_SURVIVAL_EVENT)]
-    assert len(records) == 1, records
-    assert records[0]["event"] == CANONICAL_SURVIVAL_EVENT
+    assert outcome.telemetry is not None
+    fields = outcome.telemetry.log_fields()
+    assert fields["form_ever_armed"] is False
+    assert "would_fire" not in fields, fields
 
 
 @pytest.mark.asyncio
-async def test_form_run_still_emits_only_the_ledger_record_and_not_the_non_form_one() -> None:
+async def test_telemetry_carries_the_ledger_fields_when_the_ledger_is_enabled() -> None:
     # The other half of the partition, and the compatibility guarantee: the existing record's
-    # population and shape are untouched, so the survival data already collected stays comparable
-    # with everything collected after this change.
+    # population is untouched, so run-level survival rates stay comparable across this change. Its
+    # field set is not — both records gained keys.
     rounds = 10
     clicks: list[tuple[str, dict[str, Any]]] = []
     tools = [_form_observe("observe", [3] * rounds), _billable_tool("click", clicks), make_finish_tool()]
     script = [[("observe", {}), ("click", {"selector": f"#f{i}"})] for i in range(rounds)]
     script.append([("finish", {"status": "completed", "reason": "done"})])
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
 
     assert outcome.status == "completed"
-    assert len([e for e in logs if e.get("event") == PROGRESS_LEDGER_FINAL_EVENT]) == 1
-    assert not [e for e in logs if e.get("event") == CANONICAL_SURVIVAL_EVENT]
+    fields = outcome.telemetry.log_fields()
+    assert fields["form_ever_armed"] is True
+    assert "would_fire" in fields, fields
+
+
+@pytest.mark.asyncio
+async def test_telemetry_carries_a_count_for_every_clear_evidence_class_including_silent_ones() -> None:
+    # The clear reason was LOG.debug-only, which production INFO workers never emit, so the ring's
+    # clear behaviour was unmeasurable. Every class rides the terminal record with an explicit 0, so
+    # "never fired" cannot be read as "field missing", and a count survives every later clear.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _form_observe("observe", [3, 3, 3]),
+        _billable_tool("click", clicks, data={"page_transitioned": True}),
+        make_finish_tool(),
+    ]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        [("observe", {})],
+        [("observe", {})],
+        [("click", {"selector": "#next"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(
+        script, tools, max_turns=200, max_tool_calls=500, semantic_commit_stats=SemanticCommitStats()
+    )
+
+    assert outcome.status == "completed"
+    record = outcome.telemetry.log_fields()
+    assert record["form_ever_armed"] is True
+    # Two observes landed distinct content digests, then a URL-moving click cleared on the
+    # transition: the earlier count must still be there after the later clear.
+    assert record["clear_perception_digest"] == 2, record
+    assert record["clear_page_transitioned"] == 1, record
+    fired = {_ProgressEvidence.PERCEPTION_DIGEST, _ProgressEvidence.PAGE_TRANSITIONED}
+    silent = {f"clear_{member.value}": 0 for member in _ProgressEvidence if member not in fired}
+    assert len(silent) == 7, silent
+    assert {key: record.get(key, "MISSING") for key in silent} == silent, record
+    # Both groups ride the same telemetry object, so moving either off it cannot stay green.
+    assert record["semantic_commit_opportunities"] == 0, record
+    assert record["semantic_commit_accepts"] == 0, record
+
+
+@pytest.mark.asyncio
+async def test_telemetry_reports_the_peak_page_state_stall_and_not_the_streak_recovery_erased() -> None:
+    # A run that stalls, recovers, then finishes leaves the live counter at 0, so a trailing read
+    # reports a frozen page as never having frozen. PAGE_STATE_STALL_TERMINATE_AFTER is tuned off
+    # this distribution, and a recovery-erased value biases it low, toward over-termination.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, billable=True)
+    fp_state = {"n": 0}
+
+    async def thawing_fingerprint() -> str:
+        fp_state["n"] += 1
+        # Two samples per round: frozen through round 4's after-sample (8 calls), moving after.
+        return "FROZEN" if fp_state["n"] <= 8 else f"dom-{fp_state['n']}"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("click", {"selector": f"#try-{i}"})] for i in range(7)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        page_fingerprint=thawing_fingerprint,
+        max_action_steps=24,
+        max_turns=60,
+        max_tool_calls=200,
+    )
+
+    assert outcome.status == "completed"
+    fields = outcome.telemetry.log_fields()
+    assert fields["form_ever_armed"] is False
+    assert fields["peak_page_state_stall_rounds"] == 4, fields
+
+
+@pytest.mark.asyncio
+async def test_peak_page_state_stall_is_omitted_when_a_wired_sampler_never_reached_a_verdict() -> None:
+    # A wired sampler is not a taken sample. The detector only samples behind a billable call, so a
+    # run that lands none never reaches a verdict, and emitting 0 puts it in the stall-rate
+    # denominator as "watched, never froze" — the same absent-vs-zero confusion one step in.
+    # The sampler records instead of raising: _sample_probe swallows every exception, so a raising
+    # tripwire here could never fail and the test would pass whether or not the detector sampled.
+    samples: list[str] = []
+
+    async def sampler() -> str:
+        samples.append("read")
+        return "dom"
+
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(script, [make_finish_tool()], page_fingerprint=sampler)
+    assert samples == [], samples
+    fields = outcome.telemetry.log_fields()
+    assert "peak_page_state_stall_rounds" not in fields, fields
+
+
+@pytest.mark.asyncio
+async def test_peak_page_state_stall_is_omitted_with_no_sampler_and_an_explicit_zero_once_judged() -> None:
+    # The two readings the field has to keep apart. Without a sampler nothing can ever tick the
+    # counter, and a 0 there says "the page never froze" when it means "nothing watched it" — the
+    # population an offline stall rate must drop. Once a run has actually been judged, the 0 is a
+    # real measurement and must ship; that half is the only pin on the emit side of the predicate.
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(script, [make_finish_tool()])
+    unwatched = outcome.telemetry.log_fields()
+    assert "peak_page_state_stall_rounds" not in unwatched, unwatched
+
+    fp_state = {"n": 0}
+    judged_samples: list[str] = []
+
+    async def moving_fingerprint() -> str:
+        fp_state["n"] += 1
+        judged_samples.append("read")
+        return f"dom-{fp_state['n']}"
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    judged: list[list[tuple[str, dict[str, Any]]]] = [
+        [("click", {"selector": "#go"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(
+        judged,
+        [_recording_tool("click", clicks, billable=True), make_finish_tool()],
+        page_fingerprint=moving_fingerprint,
+    )
+    # Positive control for the sibling test's `samples == []`: the same recording sampler DOES get
+    # read on a judged run, so an empty list there is a measured absence and not a dead probe.
+    assert judged_samples, judged_samples
+    watched = outcome.telemetry.log_fields()
+    assert watched["peak_page_state_stall_rounds"] == 0, watched
+
+
+@pytest.mark.asyncio
+async def test_telemetry_carries_the_run_peak_probe_revisits_not_just_the_shadow_crossing() -> None:
+    # probe_revisits is computed every snapshot but only ever logged once a probe crosses
+    # stall_terminate_after, so production carries a firing indicator at that one threshold and no
+    # distribution below it. Nothing can pick a different threshold from that. The run peak is the
+    # instrument: it is defined for every run that took a snapshot, whatever the probe reached.
+    contents = ["state-A", "state-B"] * 10
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_perception_tool("observe", contents), make_finish_tool()],
+            stall_terminate_after=4,
+            max_turns=200,
+            max_tool_calls=500,
+        )
+
+    fields = outcome.telemetry.log_fields()
+    shadow = [e for e in logs if e["event"] == PERCEPTION_STALL_SHADOW_EVENT]
+    assert shadow, "the toggling probe must cross the shadow threshold, or this pins nothing"
+    # The peak has to be at least what the shadow saw: the shadow reports its FIRST crossing and
+    # then latches, so a peak that trailed it would be reporting less than we already log today.
+    assert fields["peak_probe_revisits"] >= max(e["snapshots"] for e in shadow), (fields, shadow)
+
+
+@pytest.mark.asyncio
+async def test_peak_probe_revisits_is_omitted_with_no_snapshot_and_an_explicit_zero_with_one() -> None:
+    # Absent and 0 are different readings, and 0 is the answer a threshold sweep would most like to
+    # trust. A run that never took a perception snapshot never gave the probe a chance; a run that
+    # took snapshots and never revisited a state is a real measurement of no looping.
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(script, [make_finish_tool()])
+    assert "peak_probe_revisits" not in outcome.telemetry.log_fields(), outcome.telemetry.log_fields()
+
+    # Positive control for the absence above: the same assertion on a run that DID re-read a probe
+    # finds the key, so its absence is a measured absence and not a field that never ships.
+    moving = [f"state-{i}" for i in range(6)]
+    script = [[("observe", {})] for _ in range(6)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    outcome, _ = await _run(
+        script, [_perception_tool("observe", moving), make_finish_tool()], max_turns=200, max_tool_calls=500
+    )
+    fields = outcome.telemetry.log_fields()
+    assert fields["peak_probe_revisits"] == 0, fields
+
+    # A first look at a probe key has nothing to return to, so a run of one-shot probes never gave
+    # the counter a chance and must read absent, not 0 — otherwise a "% of runs below any threshold"
+    # statistic silently counts runs the metric was never defined on.
+    script = [[("observe", {"q": i})] for i in range(5)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    outcome, _ = await _run(
+        script,
+        [_perception_tool("observe", [f"one-shot-{i}" for i in range(5)]), make_finish_tool()],
+        max_turns=200,
+        max_tool_calls=500,
+    )
+    assert "peak_probe_revisits" not in outcome.telemetry.log_fields(), outcome.telemetry.log_fields()
+
+
+@pytest.mark.asyncio
+async def test_peak_probe_revisits_survives_the_ledger_reset_a_navigation_performs() -> None:
+    # reset() runs on every reload and revisit-navigation, and it clears the streaks by design. The
+    # run-level counters must NOT go with them: adding them to reset() is a tidy-up someone will
+    # reach for, and it would silently turn this into a peak-since-last-navigation.
+    async def nav_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("navigated", data={"page_state_changed": True, "nav_revisit": True})
+
+    navigate = ToolSpec(
+        name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=nav_handler
+    )
+    # Toggle to build a peak, hop back onto known territory (which resets the ledger), then look at
+    # a fresh page that never repeats. Only the pre-navigation peak can satisfy the assertion.
+    contents = ["state-A", "state-B"] * 6 + [f"after-nav-{i}" for i in range(4)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(12)]
+    script.append([("navigate", {"url": "https://example.test/apply"})])
+    script.extend([[("observe", {})] for _ in range(4)])
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    outcome, _ = await _run(
+        script,
+        [_perception_tool("observe", contents), navigate, make_finish_tool()],
+        max_turns=200,
+        max_tool_calls=500,
+    )
+
+    assert outcome.status == "completed"
+    fields = outcome.telemetry.log_fields()
+    assert fields["peak_probe_revisits"] >= 4, fields
+
+
+@pytest.mark.asyncio
+async def test_peak_probe_revisits_survives_a_probe_that_recovers_before_the_run_ends() -> None:
+    # The load-bearing case for any peak: revisits climb while a control toggles, then reset to 0 the
+    # moment the probe returns genuinely new content. A field that reported the LAST read would say
+    # this run never looped, and a threshold picked off that would be tuned on recovered runs.
+    contents = ["state-A", "state-B"] * 6 + [f"fresh-{i}" for i in range(8)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("observe", {})] for _ in range(len(contents))]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    outcome, _ = await _run(
+        script, [_perception_tool("observe", contents), make_finish_tool()], max_turns=200, max_tool_calls=500
+    )
+
+    assert outcome.status == "completed"
+    fields = outcome.telemetry.log_fields()
+    # The toggle phase alone reaches well past 4; the eight fresh states then drive the live counter
+    # back to 0, so anything reporting the end state reads 0 here.
+    assert fields["peak_probe_revisits"] >= 4, fields
+
+
+@pytest.mark.asyncio
+async def test_semantic_commit_counters_are_omitted_not_zeroed_when_the_run_has_no_browser_tools() -> None:
+    # Absent and zero are different readings: a page-free run never builds the tools that could
+    # accept, so a 0 would read as "the tier never fired" instead of "the tier did not exist".
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(script, [make_finish_tool()])
+    page_free = outcome.telemetry.log_fields()
+    assert "semantic_commit_opportunities" not in page_free, page_free
+    assert "semantic_commit_accepts" not in page_free, page_free
+
+    outcome, _ = await _run(script, [make_finish_tool()], semantic_commit_stats=SemanticCommitStats())
+    with_tools = outcome.telemetry.log_fields()
+    assert with_tools["semantic_commit_opportunities"] == 0, with_tools
+    assert with_tools["semantic_commit_accepts"] == 0, with_tools
+    clear_keys = {f"clear_{member.value}": 0 for member in _ProgressEvidence}
+    assert {key: with_tools.get(key, "MISSING") for key in clear_keys} == clear_keys, with_tools
 
 
 @pytest.mark.asyncio

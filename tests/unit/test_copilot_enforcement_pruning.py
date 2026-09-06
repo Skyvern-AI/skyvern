@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.config import (
     SCREENSHOT_DROPPED_NUDGE,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     KEEP_RECENT_TOOL_OUTPUTS,
@@ -50,6 +51,7 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS as shared_total_timeout_seconds
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 class _Ctx:
@@ -375,6 +377,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         code_artifact_metadata={},
         composition_page_evidence=None,
         block_run_calls_this_turn=0,
+        dispatched_run_ids_this_turn=set(),
         unbound_required_parameter_keys=[],
         last_test_ok=True,
         last_test_failure_reason=None,
@@ -1039,11 +1042,8 @@ def test_advisory_run_force_lane_is_deleted() -> None:
     assert not hasattr(enforcement_module, "_should_force_advisory_run_dispatch")
 
 
-def _deadline_ctx() -> SimpleNamespace:
-    return SimpleNamespace(
-        copilot_total_timeout_exceeded=False,
-        copilot_credential_pause_seconds=0.0,
-    )
+def _deadline_ctx() -> CopilotContext:
+    return make_copilot_ctx()
 
 
 def _deadline_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:

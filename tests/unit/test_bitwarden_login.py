@@ -13,6 +13,7 @@ from skyvern.forge.sdk.services.bitwarden import (
     RunCommandResult,
     get_list_response_item_from_bitwarden_item,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 # The vault server omits `totp` entirely for a login saved without a two-factor secret,
 # and returns it as JSON null for some hand-made items.
@@ -269,7 +270,7 @@ async def test_secret_fetch_retries_after_a_jittered_backoff_with_a_constant_ste
 
     monkeypatch.setattr(BitwardenService, "_get_secret_value_from_url", fake_inner)
     monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda attempt: 7.5)
-    monkeypatch.setattr(bitwarden_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     result = await BitwardenService.get_secret_value_from_url(**_secret_fetch_kwargs(), max_retries=3, timeout=60)
 
@@ -292,7 +293,7 @@ async def test_secret_fetch_gives_up_after_max_retries_with_every_reason(monkeyp
 
     monkeypatch.setattr(BitwardenService, "_get_secret_value_from_url", always_times_out)
     monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda attempt: float(attempt))
-    monkeypatch.setattr(bitwarden_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     with pytest.raises(bitwarden_module.BitwardenListItemsError) as excinfo:
         await BitwardenService.get_secret_value_from_url(**_secret_fetch_kwargs(), max_retries=3, timeout=60)
@@ -337,7 +338,7 @@ async def test_identity_fetch_backs_off_before_its_recursive_retry(monkeypatch: 
 
     monkeypatch.setattr(BitwardenService, "_get_sensitive_information_from_identity", fake_inner)
     monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda attempt: 3.0 + attempt)
-    monkeypatch.setattr(bitwarden_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     result = await BitwardenService.get_sensitive_information_from_identity(
         client_id="cid",

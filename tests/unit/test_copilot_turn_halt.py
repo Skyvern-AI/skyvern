@@ -62,5 +62,6 @@ def test_only_a_lost_browser_session_ends_the_turn(reason_code: str) -> None:
     raise_if_turn_halt(ctx)
 
 
-def test_the_only_remaining_halt_kind_is_a_lost_browser_session() -> None:
-    assert [kind.value for kind in TurnHaltKind] == ["browser_session_lost"]
+def test_a_turn_halts_only_on_a_lost_browser_session_or_a_superseded_build_test() -> None:
+    """Both are outcomes the harness observes out of process and the model cannot read off the page."""
+    assert [kind.value for kind in TurnHaltKind] == ["browser_session_lost", "build_test_superseded"]

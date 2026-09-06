@@ -26,7 +26,7 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.google_connection_notice import GoogleConnectionNotice
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
@@ -111,6 +111,24 @@ def test_backfill_omits_empty_google_connection_notices() -> None:
     result = _result(_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert "googleConnectionNotices" not in result.narrative_payload
+
+
+@pytest.mark.parametrize("has_model_choices", [False, True])
+def test_unbound_notice_does_not_replace_the_turns_account_question(has_model_choices: bool) -> None:
+    ctx = _ctx()
+    choice = ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active")
+    ctx.google_connection_notices = [GoogleConnectionNotice(connectionId=None, condition="unbound", choices=[choice])]
+    model_choices = (
+        [ConnectedAccountChoice(connection_id="goac_other", name="Named account", state="active")]
+        if has_model_choices
+        else []
+    )
+    outcome = TurnOutcome(response_kind=ResponseKind.CLARIFY, connected_account_choices=model_choices)
+    result = _result(ctx, turn_outcome=outcome, narrative_payload=_payload())
+
+    assert result.narrative_payload["googleConnectionNotices"][0]["choices"] == [choice.model_dump(mode="json")]
+    restored = TurnOutcome.model_validate_json(result.turn_outcome.model_dump_json())
+    assert restored.connected_account_choices == model_choices
 
 
 @pytest.mark.parametrize(

@@ -718,6 +718,24 @@ async def test_non_contenteditable_custom_sink_url_keeps_sequential_fill() -> No
 
 
 @pytest.mark.asyncio
+async def test_editing_host_child_without_attribute_uses_atomic_fill() -> None:
+    # Only the editing host carries the contenteditable attribute; a block inside it inherits editability and
+    # must take the same atomic path, or the per-character seam re-resolves its selector onto split blocks.
+    el = _mock_input({"type": None, "autocomplete": None, "name": None})
+    el.get_tag_name.return_value = "p"
+    el.is_content_editable = AsyncMock(return_value=True)
+    text = "first line\nsecond line\nthird line"
+
+    results, _, _, _, _, secret_readback = await _run_input_text(el, text, tag_name="p")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with(text)
+    el.refresh_locator_if_stale.assert_awaited_once()
+    el.input_sequentially.assert_not_awaited()
+    secret_readback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("input_type", ["password", "text", "email", "search", "url", None])
 async def test_secret_in_exact_value_input_uses_readback(input_type: str | None) -> None:
     # Every native exact-value input type (password/text/email/search/url and an untyped input) round-trips

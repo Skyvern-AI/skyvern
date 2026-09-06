@@ -8,6 +8,7 @@ import pytest
 
 from skyvern.services import email
 from skyvern.services.email import gmail_client
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 @pytest.mark.asyncio
@@ -223,7 +224,7 @@ async def test_gmail_get_json_retries_429_then_succeeds(monkeypatch: pytest.Monk
             return httpx.Response(429, json={"error": {"message": "rate limited"}}, headers={"Retry-After": "0"})
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr(gmail_client.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(gmail_client, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         payload = await gmail_client.get_json(client, "https://gmail.example/messages", access_token="AT")
@@ -245,7 +246,7 @@ async def test_gmail_get_json_raises_after_retryable_errors(monkeypatch: pytest.
         calls += 1
         return httpx.Response(500, json={"error": {"message": "server error"}})
 
-    monkeypatch.setattr(gmail_client.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(gmail_client, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(email.GmailAPIError) as exc_info:
@@ -270,7 +271,7 @@ async def test_outlook_get_json_retries_429_then_succeeds(monkeypatch: pytest.Mo
             return httpx.Response(429, json={"error": {"code": "TooManyRequests"}}, headers={"Retry-After": "0"})
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr(email.outlook.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(email.outlook, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         payload = await email.outlook._get_json(client, "https://graph.example/messages", access_token="AT")
@@ -292,7 +293,7 @@ async def test_outlook_get_json_raises_after_retryable_errors(monkeypatch: pytes
         calls += 1
         return httpx.Response(500, json={"error": {"code": "ServiceUnavailable", "message": "server error"}})
 
-    monkeypatch.setattr(email.outlook.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(email.outlook, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(email.OutlookAPIError) as exc_info:
@@ -1521,7 +1522,7 @@ async def test_outlook_list_folder_messages_keeps_message_when_attachment_fetch_
             },
         )
 
-    monkeypatch.setattr(email.outlook.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(email.outlook, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         messages = await email.outlook.list_folder_messages(access_token="AT", include_body=True, client=client)

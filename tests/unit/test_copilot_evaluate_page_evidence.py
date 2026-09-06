@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     release_sensitive_origin_run_lease,
     sensitive_origin_page_has_active_run,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
     _inspect_page_for_composition_impl,
@@ -25,6 +26,11 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from tests.unit.copilot_test_helpers import (
+    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    remove_sensitive_disclosure_prerequisite,
+    taint_by_terminal_run,
+)
 
 
 def _ctx() -> CopilotContext:
@@ -179,6 +185,81 @@ async def test_target_url_inspection_does_not_navigate_away_from_interaction_evi
         "observation_step": 4,
     }
     assert 'target_url="current_page"' in result["error"]
+
+
+def _current_page_after_credential_run(monkeypatch: pytest.MonkeyPatch) -> CopilotContext:
+    """The composition read on the page a credential run left, with the run terminal and bound."""
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-run"
+    clear_session_scrub_values("pbs-run")
+    ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
+    ctx.last_run_blocks_browser_session_id = "pbs-run"
+    taint_by_terminal_run(ctx, workflow_run_id="wr-sensitive", session_id="pbs-run")
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr-sensitive",
+        {"password": "origin-secret-2026"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    capture = AsyncMock(
+        return_value=(
+            {
+                "inspected_url": "https://private.example.test/otp",
+                "current_url": "https://private.example.test/otp",
+                "source_tool": "inspect_page_for_composition",
+                "page_title": "Sign in origin-secret-2026",
+                "forms": [
+                    {
+                        "fields": [{"name": "token", "label": "Token", "type": "text", "selector": "#token"}],
+                        "submit_controls": [{"text": "Login", "type": "submit", "selector": "button.btn--login"}],
+                    }
+                ],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error", lambda *_a: None)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._fallback_page_info",
+        AsyncMock(return_value=("https://private.example.test/otp", "Sign in")),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence", capture)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url", AsyncMock()
+    )
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspection_discloses_scrubbed_facts_after_a_terminal_credential_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _current_page_after_credential_run(monkeypatch)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["reached_via"] == "post_run"
+    dumped = json.dumps(result)
+    assert '"name": "token"' in dumped
+    assert "origin-secret-2026" not in dumped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+async def test_current_page_inspection_withholds_when_a_disclosure_prerequisite_is_absent(
+    monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    ctx = _current_page_after_credential_run(monkeypatch)
+    remove_sensitive_disclosure_prerequisite(ctx, arm)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is False
+    assert "origin-secret-2026" not in json.dumps(result)
 
 
 @pytest.mark.asyncio

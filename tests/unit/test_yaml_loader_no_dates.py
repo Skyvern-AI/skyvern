@@ -20,6 +20,8 @@ import yaml
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 
+pytestmark = pytest.mark.usefixtures("no_saved_workflow")
+
 ISO_BLOB = """
 parameters:
   - parameter_type: workflow

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 
 
 def install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -62,6 +63,8 @@ def setup_new_copilot_mocks(
         agent_result.cancellation_iteration = None
     if not hasattr(agent_result, "cancellation_last_recorded_phase"):
         agent_result.cancellation_last_recorded_phase = None
+    if not hasattr(agent_result, "cancellation_workflow_run_id"):
+        agent_result.cancellation_workflow_run_id = None
     if not hasattr(original_workflow, "modified_at"):
         original_workflow.modified_at = datetime(2026, 4, 14, tzinfo=timezone.utc)
     if not hasattr(original_workflow, "model_dump"):
@@ -113,6 +116,8 @@ def setup_new_copilot_mocks(
     )
     app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
-    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(
+        return_value=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
+    )
 
     return restore_mock, workflow_params

@@ -7,6 +7,7 @@ import json
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,13 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from skyvern.cli.commands import browser as cli_browser
 from skyvern.cli.commands import cli_app
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
+from skyvern.cli.core.guards import STALE_FRAME_HINT
 from skyvern.cli.status import _status_data
+from skyvern.exceptions import StaleFrameSelectionError
+from tests.unit._mcp_browser_fakes import StaleScopePage
 
 # ---------------------------------------------------------------------------
 # _state.py
@@ -220,6 +225,50 @@ class TestBrowserCommandGuards:
 
         with pytest.raises(GuardError, match="Invalid state"):
             _validate_wait_state("bad-state")
+
+    @pytest.mark.parametrize("clear", [True, False], ids=["fill", "append"])
+    def test_type_with_intent_refuses_top_document_password_match(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, clear: bool
+    ) -> None:
+        top_match = MagicMock()
+        top_match.first = top_match
+        top_match.evaluate = AsyncMock(return_value=True)
+        top_match.type = AsyncMock()
+        raw_page = MagicMock()
+        raw_page.locator = MagicMock(return_value=top_match)
+        frame_match = MagicMock()
+        frame_match.first = frame_match
+        frame_match.evaluate = AsyncMock(return_value=False)
+        active_frame = MagicMock()
+        active_frame.locator = MagicMock(return_value=frame_match)
+        page = MagicMock()
+        page.page = raw_page
+        page.locator_scope = active_frame
+        page.locator = MagicMock(return_value=top_match)
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+        monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+        monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+        monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+        with pytest.raises(SystemExit):
+            cli_browser.type_text(
+                text="opaque-value",
+                intent="the promo code box",
+                selector=".shared-field",
+                session=None,
+                cdp=None,
+                timeout=1000,
+                clear=clear,
+                delay=None,
+                json_output=True,
+            )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert "password" in parsed["error"]["message"].lower()
+        top_match.type.assert_not_awaited()
+        page.fill.assert_not_called()
 
 
 class TestBrowserCommands:
@@ -1380,3 +1429,107 @@ class TestStopCommands:
         assert parsed["ok"] is False
         assert parsed["action"] == "stop.all"
         assert parsed["error"]["message"] == "No Skyvern services found running on ports 8000, 8080, or 9090."
+
+
+class TestCLIStaleFrameSurface:
+    @staticmethod
+    def _patch_page(monkeypatch: pytest.MonkeyPatch, page: object) -> None:
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+        monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+        monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+        monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+    @pytest.mark.parametrize(
+        "invoke",
+        [
+            lambda: cli_browser.evaluate(expression="1 + 1", session=None, cdp=None, json_output=True),
+            lambda: cli_browser.scroll(
+                direction="down", session=None, cdp=None, amount=None, intent=None, selector=None, json_output=True
+            ),
+            lambda: cli_browser.press_key(
+                key="Enter", session=None, cdp=None, intent=None, selector=None, json_output=True
+            ),
+            lambda: cli_browser.select(
+                value="Ground",
+                intent=None,
+                selector="#ship",
+                session=None,
+                cdp=None,
+                timeout=30000,
+                by_label=True,
+                json_output=True,
+            ),
+        ],
+        ids=["evaluate", "scroll", "press_key", "select_by_label"],
+    )
+    def test_page_space_commands_refuse_an_unowned_frame_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        invoke: Callable[[], None],
+    ) -> None:
+        raw = MagicMock()
+        raw.evaluate = AsyncMock(return_value=2)
+        raw.keyboard = SimpleNamespace(press=AsyncMock())
+        self._patch_page(monkeypatch, StaleScopePage(raw))
+
+        with pytest.raises(SystemExit):
+            invoke()
+
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert "Stale frame selection" in error["message"]
+        assert error["hint"] == STALE_FRAME_HINT
+        raw.locator.assert_not_called()
+
+    def test_select_by_label_resolves_in_page_space_not_the_selected_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = MagicMock()
+        raw.locator = MagicMock(return_value=SimpleNamespace(select_option=AsyncMock()))
+        frame = MagicMock()
+        self._patch_page(monkeypatch, SimpleNamespace(page=raw, locator_scope=frame))
+
+        cli_browser.select(
+            value="Ground",
+            intent=None,
+            selector="#ship",
+            session=None,
+            cdp=None,
+            timeout=30000,
+            by_label=True,
+            json_output=True,
+        )
+
+        raw.locator.assert_called_once_with("#ship")
+        frame.locator.assert_not_called()
+
+    def test_wait_intent_envelope_keeps_the_stale_selection_hint(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        page = SimpleNamespace(
+            wait_for_timeout=AsyncMock(),
+            validate=AsyncMock(side_effect=StaleFrameSelectionError("pay", "https://pay.example.com/")),
+        )
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+        monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+        monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+        monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+        with pytest.raises(SystemExit):
+            cli_browser.wait(
+                session=None,
+                cdp=None,
+                time_ms=None,
+                intent="the card form is ready",
+                selector=None,
+                state="visible",
+                timeout=0,
+                poll_interval=0,
+                json_output=True,
+            )
+
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert "Stale frame selection" in error["message"]
+        assert error["hint"] == STALE_FRAME_HINT

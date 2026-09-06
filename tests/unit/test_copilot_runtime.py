@@ -13,6 +13,7 @@ import ast
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,9 +27,12 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
+from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
@@ -970,6 +974,7 @@ async def test_attach_verification_follows_one_concurrent_generation_replacement
 
     monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
     monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+    _install_occupancy_app(monkeypatch, sessions=[_session_row(runnable_id=None)])
     ctx = _make_ctx()
     ctx.browser_session_id = "bs_live"
 
@@ -1081,3 +1086,307 @@ async def test_build_test_provisioning_failure_retains_created_session_identity(
         "retry_action": "test_end_to_end",
     }
     manager.create_session.assert_awaited_once()
+
+
+def _session_row(*, runnable_id: str | None, runnable_type: str | None = "workflow_run") -> PersistentBrowserSession:
+    now = datetime.now(UTC)
+    return PersistentBrowserSession(
+        persistent_browser_session_id="bs_live",
+        organization_id="org_1",
+        runnable_id=runnable_id,
+        runnable_type=runnable_type,
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _owner_run(
+    *,
+    copilot_session_id: str | None,
+    status: WorkflowRunStatus = WorkflowRunStatus.running,
+    parent_workflow_run_id: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_run_id="wr_prior",
+        copilot_session_id=copilot_session_id,
+        status=status,
+        parent_workflow_run_id=parent_workflow_run_id,
+    )
+
+
+def _install_occupancy_app(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sessions: list[PersistentBrowserSession],
+    owner: SimpleNamespace | None = None,
+) -> MagicMock:
+    remaining = list(sessions)
+
+    async def _get_session(**_kwargs: Any) -> PersistentBrowserSession:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    manager = MagicMock()
+    manager.get_session = AsyncMock(side_effect=_get_session)
+    manager.release_browser_session = AsyncMock()
+    manager.create_session = AsyncMock(side_effect=AssertionError("must not replace automatically"))
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=owner)
+    # A row back means the conditional cancel actually claimed the transition; ``None`` is the
+    # no-op the holder's own terminal write already won.
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(
+        return_value=SimpleNamespace(workflow_run_id="wr_prior")
+    )
+    mock_app.DATABASE.workflow_params.record_superseded_build_test_run = AsyncMock()
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS", 0.0)
+    return mock_app
+
+
+@pytest.fixture
+def attached_build_test_ctx(monkeypatch: pytest.MonkeyPatch) -> AgentContext:
+    @asynccontextmanager
+    async def _attach(_ctx: AgentContext) -> AsyncIterator[None]:
+        yield
+
+    monkeypatch.setattr(runtime, "mcp_browser_context", _attach)
+    monkeypatch.setattr(runtime, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+    return ctx
+
+
+async def _acquire(ctx: AgentContext, *, chat_id: str | None = "wcc_1") -> dict[str, Any] | None:
+    return await runtime.verify_build_test_browser_session_by_attaching(ctx, copilot_chat_id=chat_id)
+
+
+@pytest.mark.asyncio
+async def test_an_unheld_session_dispatches_without_resolving_any_run(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(monkeypatch, sessions=[_session_row(runnable_id=None)])
+
+    assert await _acquire(attached_build_test_ctx) is None
+    assert attached_build_test_ctx.browser_session_id == "bs_live"
+    mock_app.DATABASE.workflow_runs.get_workflow_run.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_this_chats_older_test_run_is_superseded_and_the_same_session_is_reused(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior"), _session_row(runnable_id=None)],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+
+    assert await _acquire(attached_build_test_ctx) is None
+    assert attached_build_test_ctx.browser_session_id == "bs_live"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_awaited_once_with(
+        "wr_prior", failure_reason=SUPERSEDED_BY_NEWER_TEST_REASON
+    )
+    mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_supersede_whose_owner_never_releases_the_lease_reports_occupied(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session", "owner", "build_test_calls_in_response", "expected_occupier_run_id"),
+    [
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_other"),
+            1,
+            "wr_prior",
+            id="foreign-chat",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id=None),
+            1,
+            "wr_prior",
+            id="no-chat-identity",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_1", status=WorkflowRunStatus.completed),
+            1,
+            "wr_prior",
+            id="terminal-owner",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_1", status=WorkflowRunStatus.paused),
+            1,
+            "wr_prior",
+            id="paused-owner",
+        ),
+        pytest.param(
+            _session_row(runnable_id="wr_prior"),
+            _owner_run(copilot_session_id="wcc_1"),
+            2,
+            "wr_prior",
+            id="sibling-dispatched-this-response",
+        ),
+        pytest.param(_session_row(runnable_id="tsk_1", runnable_type="task"), None, 1, None, id="task-owner"),
+    ],
+)
+async def test_an_occupier_this_turn_may_not_supersede_is_reported_without_a_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    attached_build_test_ctx: AgentContext,
+    session: PersistentBrowserSession,
+    owner: SimpleNamespace | None,
+    build_test_calls_in_response: int,
+    expected_occupier_run_id: str | None,
+) -> None:
+    attached_build_test_ctx.build_test_tool_calls_in_model_response = build_test_calls_in_response
+    mock_app = _install_occupancy_app(monkeypatch, sessions=[session], owner=owner)
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    expected_failure = {
+        "state": "occupied",
+        "browser_session_id": "bs_live",
+        "retry_action": "test_end_to_end",
+    }
+    if expected_occupier_run_id is not None:
+        expected_failure["occupier_run_id"] = expected_occupier_run_id
+    assert result["data"]["build_test_connect_failure"] == expected_failure
+    if expected_occupier_run_id is None:
+        assert "tsk_1" not in result["error"]
+    else:
+        assert expected_occupier_run_id in result["error"]
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+    mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_supersede_cancel_write_reports_occupied_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(
+        side_effect=SQLATimeoutError("cancel write failed")
+    )
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+
+
+@pytest.mark.asyncio
+async def test_the_release_wait_reports_occupied_before_the_turn_deadline_fires(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_WAIT_SECONDS", 30.0)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS", 1.0)
+    monkeypatch.setattr(runtime, "_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS", 0.05)
+
+    async with asyncio.timeout(1.5) as deadline:
+        attached_build_test_ctx.model_stream_deadline = deadline
+        result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_holder_that_ended_on_its_own_is_not_recorded_as_superseded(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    """The conditional cancel returns nothing when the holder already reached terminal, so this turn
+    superseded nothing and must not leave a record saying it did."""
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior"), _session_row(runnable_id=None)],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(return_value=None)
+
+    assert await _acquire(attached_build_test_ctx) is None
+    mock_app.DATABASE.workflow_params.record_superseded_build_test_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_child_run_of_a_live_parent_is_never_superseded(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    """Descendant runs inherit the parent's chat id, so a child clears every other guard. Ending it
+    would leave the parent running and reporting a failed child block it did not cause."""
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1", parent_workflow_run_id="wr_parent"),
+    )
+
+    result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_spent_release_budget_leaves_the_older_test_running(
+    monkeypatch: pytest.MonkeyPatch, attached_build_test_ctx: AgentContext
+) -> None:
+    """Cancelling with no time left to watch the lease drop would end the older test and start
+    nothing in its place, so the older test keeps the browser and this dispatch reports occupied."""
+    mock_app = _install_occupancy_app(
+        monkeypatch,
+        sessions=[_session_row(runnable_id="wr_prior")],
+        owner=_owner_run(copilot_session_id="wcc_1"),
+    )
+    monkeypatch.setattr(runtime, "_SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS", 30.0)
+
+    async with asyncio.timeout(0.5) as deadline:
+        attached_build_test_ctx.model_stream_deadline = deadline
+        result = await _acquire(attached_build_test_ctx)
+
+    assert result is not None
+    assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_suspended_turn_deadline_leaves_the_release_wait_unclamped(
+    attached_build_test_ctx: AgentContext,
+) -> None:
+    async with asyncio.timeout(5.0) as deadline:
+        deadline.reschedule(None)
+        attached_build_test_ctx.model_stream_deadline = deadline
+        budget = runtime._supersede_release_budget_seconds(attached_build_test_ctx)
+
+    assert budget == runtime._SUPERSEDE_RELEASE_WAIT_SECONDS

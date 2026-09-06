@@ -379,7 +379,7 @@ def _ctx() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_update_workflow_persists_credential_id_misbinding_without_authoring_a_finding() -> None:
+async def test_update_workflow_stages_credential_id_misbinding_without_authoring_a_finding() -> None:
     submitted = _yaml(
         """
         title: Sign in
@@ -443,7 +443,8 @@ async def test_update_workflow_persists_credential_id_misbinding_without_authori
 
     assert result["ok"] is True, result
     assert "findings" not in result["data"]
-    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_awaited_once()
+    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_not_awaited()
+    assert ctx.staged_workflow is result["_workflow"]
 
 
 @pytest.mark.asyncio

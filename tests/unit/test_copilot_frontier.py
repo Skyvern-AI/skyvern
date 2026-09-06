@@ -2844,10 +2844,9 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
         block_outputs_to_seed: dict[str, Any] | None = None,
         frontier_start_label: str | None = None,
         force_fresh_session: bool = False,
-        definition_unpersisted: bool = False,
     ) -> dict[str, Any]:
         captured["requested"] = list(params["block_labels"])
-        captured["definition_unpersisted"] = definition_unpersisted
+        captured["has_staged_proposal"] = ctx.has_staged_proposal
         captured["executed"] = list(labels_to_execute or [])
         captured["frontier_start_label"] = frontier_start_label
         captured["force_fresh_session"] = force_fresh_session
@@ -2871,7 +2870,7 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
     assert captured["executed"] == ["open", "add_to_cart"]
     assert captured["frontier_start_label"] == "open"
     assert captured["force_fresh_session"] is True
-    assert captured["definition_unpersisted"] is True
+    assert captured["has_staged_proposal"] is True
     assert captured["provenance"] == "initial"
 
 

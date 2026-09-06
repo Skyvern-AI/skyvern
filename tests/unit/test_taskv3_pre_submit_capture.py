@@ -12,10 +12,12 @@ import time
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
-from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
+from skyvern.forge.agent import _taskv3_action_for_tool_call
+from skyvern.forge.taskv3.loop import SubmitWatch, make_finish_tool, run_agent_tool_loop
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, PreSubmitFrame, is_run_sampled
-from skyvern.forge.taskv3.tools import build_browser_tools
+from skyvern.forge.taskv3.tools import build_browser_tools, pending_marker
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _skip_no_browser
 
@@ -648,3 +650,149 @@ async def test_a_dom_failure_is_named_in_the_frame_header_instead_of_reading_as_
     assert frame.html is None and frame.screenshot is not None
     header = frame.html_document().decode()
     assert "reparse mismatch: 3 live vs 2" in header and "filled=0" in header
+
+
+_MARK_SUBMIT_FIXTURE = """<html><body>
+<button id="submit" type="button">Submit application</button>
+<label><input type="checkbox" id="agree"> Agree to terms</label>
+<script>
+document.getElementById('submit').addEventListener('click', (e) => {
+  // The submission stays in flight: the control remains in the DOM and renames itself, which is the
+  // only state the STOP-before-submit deferral has anything to say about.
+  e.target.textContent = 'Submitting...';
+});
+</script></body></html>"""
+
+
+def _mark_for(look_content: str, needle: str) -> int:
+    line = next(ln for ln in look_content.splitlines() if needle in ln and ln.startswith("["))
+    return int(line.split("]")[0].lstrip("["))
+
+
+async def _run_with_submit_watch(page: Any, script: list[list[tuple[str, dict[str, Any]]]], watch: Any) -> Any:
+    async def _provider() -> Any:
+        return page
+
+    async def _probe(selector: str) -> str | None:
+        return await pending_marker(page, selector)
+
+    tools = build_browser_tools(_provider) + [make_finish_tool(pending_marker=_probe, submit_watch=watch)]
+    return await run_agent_tool_loop(
+        llm_caller=_ScriptedCaller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=50,
+        submit_watch=watch,
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_mark_click_on_a_submit_still_in_flight_holds_the_completed_verdict() -> None:
+    # STOP-before-submit was blind to act-by-mark: the wrapper resolved the mark into a private copy,
+    # so the loop's _names_submit_control saw no selector, recorded no watch, and a run that submitted
+    # via a mark could call the job done while the page was still submitting. Real page, real probe,
+    # real loop -- the deferral has to fire on the mark path exactly as it does on the selector path.
+    pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
+    try:
+        watch = SubmitWatch()
+
+        async def _provider() -> Any:
+            return page
+
+        looked = await next(t for t in build_browser_tools(_provider) if t.name == "look").handler({})
+        submit_mark = _mark_for(looked.content, "Submit application")
+
+        script = [
+            [("look", {})],
+            [("click", {"mark": submit_mark})],
+            [("finish", {"status": "completed", "reason": "submitted"})],
+            [("finish", {"status": "completed", "reason": "submitted"})],
+        ]
+        with capture_logs() as logs:
+            outcome = await _run_with_submit_watch(page, script, watch)
+    finally:
+        await browser.close()
+        await pw.stop()
+
+    held = [e for e in logs if e["event"] == "taskv3 completed verdict held: submission still in flight"]
+    assert len(held) == 1, [e["event"] for e in logs]
+    assert held[0]["marker"].startswith("Submitting")
+    assert outcome.status == "completed"  # the hold is one deferral, not a trap
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_mark_click_on_a_non_submit_control_does_not_hold_the_verdict() -> None:
+    # The other half of the discrimination: carrying the resolved selector must not make EVERY mark
+    # click arm the deferral. A checkbox is clicked through the same wrapper and records the same
+    # kind of watch; it is the probe, not the carrier, that decides, and it must stay silent here.
+    pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
+    try:
+        watch = SubmitWatch()
+
+        async def _provider() -> Any:
+            return page
+
+        looked = await next(t for t in build_browser_tools(_provider) if t.name == "look").handler({})
+        agree_mark = _mark_for(looked.content, "Agree to terms")
+
+        script = [
+            [("look", {})],
+            [("click", {"mark": agree_mark})],
+            [("finish", {"status": "completed", "reason": "done"})],
+        ]
+        with capture_logs() as logs:
+            outcome = await _run_with_submit_watch(page, script, watch)
+    finally:
+        await browser.close()
+        await pw.stop()
+
+    assert [e for e in logs if e["event"].startswith("taskv3 completed verdict held")] == []
+    assert outcome.status == "completed"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
+    # The measured bug this ticket was opened on: 2.4% of production v3 clicks persist element_id="".
+    # They are the mark-based ones -- the loop appends the dispatched args to round_actions and the
+    # action builder reads args["selector"] off it, so a wrapper that resolved into a copy left the
+    # persisted row naming no element at all. Asserted through to the Action the row is built from.
+    pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
+    rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+
+    async def _capture(actions: list[tuple[str, dict[str, Any], bool]], _text: str | None) -> None:
+        rounds.append(actions)
+
+    try:
+
+        async def _provider() -> Any:
+            return page
+
+        looked = await next(t for t in build_browser_tools(_provider) if t.name == "look").handler({})
+        submit_mark = _mark_for(looked.content, "Submit application")
+        script = [
+            [("look", {})],
+            [("click", {"mark": submit_mark})],
+            [("finish", {"status": "completed", "reason": "done"})],
+        ]
+        await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=build_browser_tools(_provider) + [make_finish_tool()],
+            max_turns=20,
+            max_tool_calls=50,
+            on_action_round=_capture,
+        )
+    finally:
+        await browser.close()
+        await pw.stop()
+
+    clicked = [(name, args) for round_ in rounds for name, args, ok in round_ if name == "click" and ok]
+    assert len(clicked) == 1, rounds
+    action = _taskv3_action_for_tool_call("click", clicked[0][1], reasoning="r")
+    assert action.element_id, 'a mark-based click persisted element_id="" before the args carried it'

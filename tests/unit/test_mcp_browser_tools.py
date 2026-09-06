@@ -30,8 +30,10 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
 from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
+from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
 from tests.unit._mcp_browser_fakes import (
+    StaleScopePage,
     make_mock_page,
     make_probe_locator,
     make_real_wait_for_timeout,
@@ -283,7 +285,7 @@ def _direct_click_page(
     raw_page = MagicMock()
     raw_page.locator = MagicMock(return_value=locator)
     click = AsyncMock(side_effect=click_error, return_value="#target")
-    page = SimpleNamespace(page=raw_page, click=click)
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, click=click)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return click, locator
@@ -301,7 +303,7 @@ def _direct_type_page(
     raw_page = MagicMock()
     raw_page.locator = MagicMock(return_value=locator)
     fill = AsyncMock(side_effect=fill_error, return_value="typed")
-    page = SimpleNamespace(page=raw_page, evaluate=AsyncMock(return_value=False), fill=fill)
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, evaluate=AsyncMock(return_value=False), fill=fill)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return fill, locator
@@ -530,7 +532,8 @@ async def test_skyvern_click_selector_is_resilient_by_default(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_skyvern_click_page_adapter_never_receives_private_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
     click = AsyncMock(return_value="#resolved")
-    page = SimpleNamespace(page=MagicMock(), click=click)
+    raw_page = MagicMock()
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, click=click)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -775,7 +778,7 @@ async def test_skyvern_click_direct_failure_probes_working_frame(monkeypatch: py
     raw_page = MagicMock()
     raw_page.locator = MagicMock(return_value=main_locator)
     click = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
-    page = SimpleNamespace(page=raw_page, click=click, _locator_scope=frame)
+    page = SimpleNamespace(page=raw_page, click=click, locator_scope=frame)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -784,7 +787,7 @@ async def test_skyvern_click_direct_failure_probes_working_frame(monkeypatch: py
     assert result["ok"] is False
     # Main frame has count=0: a main-frame probe would say not_found; hidden proves the frame was probed.
     assert result["error"]["details"]["element_state"] == "hidden"
-    frame.locator.assert_called_once_with("#in-iframe")
+    frame.locator.assert_called_with("#in-iframe")
 
 
 @pytest.mark.asyncio
@@ -898,7 +901,7 @@ async def test_skyvern_press_key_direct_failure_reports_element_state(monkeypatc
     raw_page.locator = MagicMock(return_value=probe_locator)
     press_locator = MagicMock()
     press_locator.press = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
-    page = SimpleNamespace(page=raw_page, locator=MagicMock(return_value=press_locator))
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, locator=MagicMock(return_value=press_locator))
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -975,10 +978,11 @@ async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.M
 
 
 def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> object:
+    raw_page = MagicMock()
     page = (
-        make_skyvern_page(MagicMock())
+        make_skyvern_page(raw_page)
         if skyvern_page
-        else SimpleNamespace(page=MagicMock(), url="https://example.test/two-factor")
+        else SimpleNamespace(page=raw_page, locator_scope=raw_page, url="https://example.test/two-factor")
     )
     if skyvern_page:
         page.evaluate = AsyncMock(return_value=False)
@@ -1010,7 +1014,7 @@ def _native_option_page(
             side_effect=lambda selector: option_locator if selector == option_selector else select_locator
         )
     )
-    page = SimpleNamespace(page=raw_page, click=AsyncMock(return_value="#unexpected-click"))
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, click=AsyncMock(return_value="#unexpected-click"))
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return page, select_option
@@ -1264,7 +1268,7 @@ async def test_skyvern_type_direct_uses_event_strategy_deterministically(monkeyp
     )
 
     assert result["ok"] is True, result.get("error")
-    raw_page.locator.assert_called_once_with("#first_name")
+    assert raw_page.locator.call_args_list == [call("#first_name"), call("#first_name")]
     clear_field.assert_awaited_once_with(
         raw_page,
         locator,
@@ -1337,7 +1341,7 @@ async def test_skyvern_type_missing_selector_preflight_uses_aggregate_direct_tim
     first_match.evaluate = AsyncMock(side_effect=wait_for_missing_selector)
     matches.first = first_match
     active_frame.locator.return_value = matches
-    page = SimpleNamespace(page=raw_page, locator_scope=active_frame, _locator_scope=active_frame)
+    page = SimpleNamespace(page=raw_page, locator_scope=active_frame)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     strategy_aware_input = AsyncMock()
@@ -1475,7 +1479,7 @@ async def test_skyvern_type_direct_event_strategy_uses_active_iframe_and_first_m
     )
 
     assert result["ok"] is True, result
-    active_frame.locator.assert_called_once_with(".shared-name")
+    active_frame.locator.assert_called_with(".shared-name")
     raw_page.locator.assert_not_called()
     clear_field.assert_awaited_once_with(
         raw_page,
@@ -1527,6 +1531,74 @@ async def test_skyvern_type_direct_event_strategy_refuses_active_iframe_password
     first_match.evaluate.assert_awaited_once()
     raw_page.evaluate.assert_not_awaited()
     strategy_aware_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear", [True, False], ids=["fill", "append"])
+async def test_skyvern_type_with_intent_refuses_top_document_password_match(
+    monkeypatch: pytest.MonkeyPatch,
+    clear: bool,
+) -> None:
+    top_match = MagicMock()
+    top_match.first = top_match
+    top_match.evaluate = AsyncMock(return_value=True)
+    top_match.type = AsyncMock()
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    raw_page.locator = MagicMock(return_value=top_match)
+    frame_match = MagicMock()
+    frame_match.first = frame_match
+    frame_match.evaluate = AsyncMock(return_value=False)
+    active_frame = MagicMock()
+    active_frame.locator = MagicMock(return_value=frame_match)
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = active_frame
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_type(
+        selector=".shared-field",
+        intent="the promo code box",
+        text="opaque-value",
+        clear=clear,
+    )
+
+    assert result["ok"] is False
+    assert "password" in result["error"]["message"].lower()
+    top_match.type.assert_not_awaited()
+    page.fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_append_with_intent_builds_the_ai_locator_on_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = MagicMock()
+    probe.first = probe
+    probe.evaluate = AsyncMock(return_value=False)
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    raw_page.locator = MagicMock(return_value=probe)
+    active_frame = MagicMock()
+    active_frame.locator = MagicMock(return_value=probe)
+    ai_locator = MagicMock()
+    ai_locator.type = AsyncMock()
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = active_frame
+    page.locator = MagicMock(return_value=ai_locator)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_type(
+        selector=".promo-field",
+        intent="the promo code box",
+        text="opaque-value",
+        clear=False,
+    )
+
+    assert result["ok"] is True, result.get("error")
+    page.locator.assert_called_once_with(selector=".promo-field", prompt="the promo code box", ai="fallback")
+    ai_locator.type.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3170,6 +3242,7 @@ def _write_grid_page(*, focused_is_password: bool) -> tuple[SimpleNamespace, Sim
         click=AsyncMock(),
         evaluate=AsyncMock(return_value=focused_is_password),
     )
+    page.locator_scope = raw_page
     return page, cdp
 
 
@@ -3793,3 +3866,46 @@ def test_either_state_output_schema_accepts_both_envelope_modes(concise: bool) -
             jsonschema.validate(envelope, mcp_browser.EITHER_STATE_OUTPUT_SCHEMA)
     finally:
         set_concise_responses(False)
+
+
+@pytest.mark.asyncio
+async def test_password_probe_waits_as_long_as_the_write_it_guards() -> None:
+    """A probe bounded tighter than the write answers 'not a password' for a field the write
+    then waits for and types into, so the bound must be the write's own timeout."""
+    probe = make_probe_locator(is_password=True)
+    scope = MagicMock()
+    scope.locator = MagicMock(return_value=probe)
+
+    assert await browser_ops.selector_targets_password([scope], "#pw", timeout=30_000) is True
+    assert probe.evaluate.await_args.kwargs["timeout"] == 30_000
+
+
+@pytest.mark.asyncio
+async def test_native_option_probe_refuses_a_frame_owned_by_another_page() -> None:
+    """Pins the ownership read inside the probe itself.
+
+    skyvern_click refuses a stale selection further down as well, so deleting this probe's read
+    leaves every tool-level row green; only a direct call proves the probe still carries it.
+    """
+    raw = make_mock_page()
+    page = StaleScopePage(raw)
+
+    with pytest.raises(StaleFrameSelectionError):
+        await browser_ops.select_native_option_if_targeted(page, "#ship option[value='ground']", timeout=1000)
+
+    raw.locator.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_grid_refuses_a_frame_owned_by_another_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """focus_xy dispatches page-space CDP input, so it must refuse an unowned selection too."""
+    raw, _cdp = _write_grid_page(focused_is_password=False)
+    page = StaleScopePage(raw)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_cdp_input, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["hello"]], focus_xy=[10.0, 20.0], screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.STALE_FRAME_SELECTION
+    raw.page.context.new_cdp_session.assert_not_called()

@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 
 import pytest
@@ -44,6 +44,28 @@ def _raise_through_wrapper() -> None:
     async_wrapper()
 
 
+def _sole_line(stream: io.StringIO, predicate: Callable[[dict], bool]) -> str:
+    """Return the one raw line whose record this test produced. See _sole_record."""
+    lines = [line for line in stream.getvalue().strip().splitlines() if line]
+    mine = [line for line in lines if predicate(json.loads(line))]
+    assert len(mine) == 1, f"expected one matching record, got {len(mine)} of {len(lines)}"
+    return mine[0]
+
+
+def _sole_record(stream: io.StringIO, predicate: Callable[[dict], bool]) -> dict:
+    """Return the one record this test produced, ignoring anything else in the stream.
+
+    The interpreter hooks are process-wide, so a `gc` pass -- explicit, or triggered by any
+    allocation -- finalizes objects other tests left pending and logs their unraisable exceptions
+    into whatever stream is currently installed. Counting the whole stream therefore asserts that
+    the rest of the process is quiet, which is not the property under test and is not something a
+    test can control: CI shards by file, so which tests share a process changes whenever a file is
+    added. Match on the record's own fields instead; "one exception collapses to one record" is
+    still exactly what gets asserted.
+    """
+    return json.loads(_sole_line(stream, predicate))
+
+
 def test_foreign_stdlib_exception_renders_single_structured_line(json_stream: io.StringIO) -> None:
     """temporalio/asyncio emit stdlib records; their exc_info must collapse to one JSON entry."""
     logger = logging.getLogger("temporalio.activity")
@@ -52,9 +74,7 @@ def test_foreign_stdlib_exception_renders_single_structured_line(json_stream: io
     except ValueError:
         logger.warning("Completing activity as failed", exc_info=True)
 
-    lines = json_stream.getvalue().strip().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
+    record = _sole_record(json_stream, lambda r: r.get("logger") == "temporalio.activity")
 
     assert record["logger"] == "temporalio.activity"
     assert "exc_info" not in record  # the raw (traceback, ...) tuple is never dumped
@@ -85,9 +105,10 @@ def test_unraisable_traceback_becomes_one_structured_event(json_stream: io.Strin
     del doomed
     gc.collect()
 
-    lines = json_stream.getvalue().strip().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
+    record = _sole_record(
+        json_stream,
+        lambda r: "_FinalizerRaises" in f"{r.get('unraisable_err_msg', '')}{r.get('unraisable_object', '')}",
+    )
 
     assert record["msg"].startswith("Exception ignored in interpreter callback")
     assert record["error_type"] == "builtins.ValueError"
@@ -106,9 +127,7 @@ def test_uncaught_thread_exception_becomes_one_structured_event(json_stream: io.
     thread.start()
     thread.join()
 
-    lines = json_stream.getvalue().strip().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
+    record = _sole_record(json_stream, lambda r: r.get("thread_name") == "background-poller")
 
     assert record["thread_name"] == "background-poller"
     assert record["error_type"] == "builtins.ValueError"
@@ -122,9 +141,10 @@ def test_uncaught_main_thread_exception_becomes_one_structured_event(json_stream
     except ValueError:
         sys.excepthook(*sys.exc_info())
 
-    lines = json_stream.getvalue().strip().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
+    # "Uncaught exception" is emitted only by the main-thread excepthook -- the thread hook says
+    # "...in thread" and the unraisable hook says "Exception ignored in interpreter callback". A
+    # traceback-text match would not do: every raise in this file goes through async_wrapper.
+    record = _sole_record(json_stream, lambda r: r.get("msg") == "Uncaught exception")
 
     assert record["error_type"] == "builtins.ValueError"
     assert record["exception_hash"]
@@ -149,11 +169,10 @@ def test_oversized_structured_payload_is_bounded_to_one_log_record(json_stream: 
         "oversized_payload", payload="x" * 100_000, status="failed", error="payload rejected"
     )
 
-    lines = json_stream.getvalue().strip().splitlines()
-    assert len(lines) == 1
-    assert len(lines[0].encode()) <= _MAX_EMITTED_JSON_BYTES
+    line = _sole_line(json_stream, lambda r: r.get("msg") == "oversized_payload")
+    assert len(line.encode()) <= _MAX_EMITTED_JSON_BYTES
 
-    record = json.loads(lines[0])
+    record = json.loads(line)
     assert record["msg"] == "oversized_payload"
     assert record["event_status"] == "failed"
     assert record["error"] == "payload rejected"
@@ -306,9 +325,7 @@ def test_native_structlog_exception_not_double_processed(json_stream: io.StringI
     except ValueError:
         logger.exception("native boom")
 
-    lines = json_stream.getvalue().strip().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
+    record = _sole_record(json_stream, lambda r: r.get("msg") == "native boom")
 
     assert "exc_info" not in record
     assert "Traceback (most recent call last)" in record["exception"]

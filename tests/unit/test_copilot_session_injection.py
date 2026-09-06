@@ -723,7 +723,8 @@ class TestUpdateWorkflowDirect:
         assert result["data"]["block_count"] == 2
         assert result["_workflow"] is mock_workflow
         assert ctx.workflow_yaml == yaml_str
-        mock_wf_service.update_workflow_definition.assert_awaited_once()
+        mock_wf_service.update_workflow_definition.assert_not_awaited()
+        assert ctx.staged_workflow is mock_workflow
 
     @pytest.mark.asyncio
     async def test_calls_internal_without_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -754,7 +755,8 @@ class TestUpdateWorkflowDirect:
         result = await _update_workflow({"workflow_yaml": "title: Test"}, ctx)
 
         assert result["ok"] is True
-        mock_wf_service.update_workflow_definition.assert_awaited_once()
+        mock_wf_service.update_workflow_definition.assert_not_awaited()
+        assert ctx.staged_workflow is mock_workflow
 
     @pytest.mark.asyncio
     async def test_yaml_parse_error_returns_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:

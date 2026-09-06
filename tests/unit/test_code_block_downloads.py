@@ -58,6 +58,7 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _BLOCK_CREATED_AT = datetime(2026, 6, 14, 11, 0, tzinfo=UTC)
 
@@ -2386,7 +2387,7 @@ async def test_secure_runner_without_typed_download_does_not_settle_an_empty_ses
     skyvern_context.set(_session_context())
 
     sleep = AsyncMock()
-    monkeypatch.setattr(block_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=sleep))
     claim = AsyncMock(return_value=0)
     _fake_storage_app(
         monkeypatch,
@@ -2419,7 +2420,7 @@ async def test_secure_runner_typed_download_with_no_final_row_is_bounded_and_inv
     skyvern_context.set(_session_context())
 
     sleep = AsyncMock()
-    monkeypatch.setattr(block_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=sleep))
     claim = AsyncMock(return_value=0)
     _fake_storage_app(
         monkeypatch,
@@ -2576,7 +2577,7 @@ async def test_download_that_never_lands_falls_through_to_finalization(
     in_flight = AsyncMock(return_value=["s3://bucket/session.pdf.crdownload"])
     wait = AsyncMock(side_effect=DownloadFileMaxWaitingTime(downloading_files=["session.pdf.crdownload"]))
     monkeypatch.setattr(block_module, "wait_for_download_finished", wait)
-    monkeypatch.setattr(block_module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
     _fake_storage_app(
         monkeypatch,
         save=AsyncMock(),

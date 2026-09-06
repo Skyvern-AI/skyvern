@@ -91,7 +91,7 @@ def test_reports_missing_and_unusable_new_bindings_but_not_active_or_preexisting
         ],
     )
 
-    assert [notice.model_dump() for notice in notices] == [
+    assert [notice.to_payload() for notice in notices] == [
         {
             "provider": "google",
             "connectionId": "goac_missing",
@@ -128,6 +128,57 @@ def test_unresolved_connection_name_left_in_the_slot_is_not_a_connection_binding
     workflow = _workflow(_write("named", "Shared Sheets Account"), _write("bound", "goac_active"))
 
     assert google_sheet_connection_bindings(workflow) == (("bound", "goac_active"),)
+
+
+@pytest.mark.parametrize("with_usable_connection", [False, True])
+def test_unbound_nested_sheets_offer_only_usable_connections(with_usable_connection: bool) -> None:
+    nested = GoogleSheetsReadBlock(
+        label="read",
+        spreadsheet_url="https://docs.google.com/spreadsheets/d/test",
+        credential_id=None,
+        output_parameter=_output("read"),
+    )
+    loop = ForLoopBlock(
+        label="loop",
+        loop_over_parameter_key="items",
+        loop_blocks=[nested, _write("write", "")],
+        output_parameter=_output("loop"),
+    )
+    credentials = [_credential("goac_error", "error"), _credential("goac_mail", "active", scopes_granted=[])]
+    if with_usable_connection:
+        credentials.append(_credential("goac_active", "active"))
+
+    notices = collect_google_connection_notices(
+        turn_start_bindings=(),
+        current_bindings=google_sheet_connection_bindings(_workflow(loop)),
+        visible_credentials=credentials,
+    )
+
+    assert len(notices) == 1
+    assert notices[0].condition == "unbound"
+    assert notices[0].connectionId is None
+    assert [choice.connection_id for choice in notices[0].choices] == (
+        ["goac_active"] if with_usable_connection else []
+    )
+
+
+def test_unbound_notice_tracks_draft_binding_changes() -> None:
+    assert (
+        collect_google_connection_notices(
+            turn_start_bindings=(("write", None),),
+            current_bindings=(("write", None),),
+            visible_credentials=[],
+        )
+        == []
+    )
+    notices = collect_google_connection_notices(
+        turn_start_bindings=(("write", "goac_old"),),
+        current_bindings=(("write", None),),
+        visible_credentials=[],
+    )
+    assert len(notices) == 1
+    assert retain_notices_after_lookup_failure(current_connection_ids=(None,), notices=notices) == notices
+    assert retain_notices_after_lookup_failure(current_connection_ids=("goac_active",), notices=notices) == []
 
 
 def test_new_block_using_a_preexisting_connection_is_still_a_new_binding() -> None:
@@ -172,7 +223,7 @@ def test_active_connection_without_sheets_scope_is_unusable() -> None:
         ],
     )
 
-    assert [notice.model_dump() for notice in notices] == [
+    assert [notice.to_payload() for notice in notices] == [
         {
             "provider": "google",
             "connectionId": "goac_gmail",

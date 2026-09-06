@@ -12,14 +12,14 @@ import pytest
 from fastmcp import Client
 
 from skyvern.cli.core import session_manager
-from skyvern.cli.core.result import BrowserContext
+from skyvern.cli.core.result import BrowserContext, ErrorCode
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.browser import _wrap_async_iife
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from tests.unit._mcp_browser_fakes import make_probe_locator
+from tests.unit._mcp_browser_fakes import StaleScopePage, make_probe_locator
 
 RUN_ID = "wr_mcp_upload_test"
 
@@ -40,7 +40,7 @@ def _fake_page(raw: MagicMock | None = None) -> SimpleNamespace:
     if raw is None:
         raw = MagicMock()
     page = SimpleNamespace(page=raw, click=AsyncMock(), evaluate=AsyncMock())
-    page.locator_scope = page
+    page.locator_scope = raw
     return page
 
 
@@ -118,18 +118,18 @@ class TestEvaluateAsyncWrapping:
     @pytest.mark.asyncio
     async def test_plain_expression_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page, _ = _patch_get_page(monkeypatch)
-        page.evaluate = AsyncMock(return_value="hello")
+        page.locator_scope.evaluate = AsyncMock(return_value="hello")
         result = await mcp_browser.skyvern_evaluate(expression="document.title")
         assert result["ok"] is True
-        page.evaluate.assert_awaited_once_with("document.title")
+        page.locator_scope.evaluate.assert_awaited_once_with("document.title")
 
     @pytest.mark.asyncio
     async def test_await_expression_wrapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page, _ = _patch_get_page(monkeypatch)
-        page.evaluate = AsyncMock(return_value={"ok": True})
+        page.locator_scope.evaluate = AsyncMock(return_value={"ok": True})
         result = await mcp_browser.skyvern_evaluate(expression="await fetch('/api')")
         assert result["ok"] is True
-        page.evaluate.assert_awaited_once_with("(async () => { return await fetch('/api') })()")
+        page.locator_scope.evaluate.assert_awaited_once_with("(async () => { return await fetch('/api') })()")
 
 
 # -- skyvern_drag --
@@ -291,6 +291,49 @@ class TestFileUpload:
             [{"name": "test.txt", "mimeType": "text/plain", "buffer": b"safe upload"}],
             timeout=5000,
         )
+
+    @pytest.mark.asyncio
+    async def test_local_upload_resolves_in_page_space_not_the_selected_frame(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_file = run_upload_dir / "test.txt"
+        upload_file.write_bytes(b"safe upload")
+        raw, _ = _patch_file_input(monkeypatch)
+        frame = MagicMock()
+        _patch_get_page(monkeypatch, page=SimpleNamespace(page=raw, locator_scope=frame))
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_file)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is True, result.get("error")
+        raw.locator.assert_called_once_with("input[type=file]")
+        frame.locator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_local_upload_refuses_an_unowned_frame_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        run_upload_dir: Path,
+    ) -> None:
+        upload_file = run_upload_dir / "test.txt"
+        upload_file.write_bytes(b"safe upload")
+        raw, mock_locator = _patch_file_input(monkeypatch)
+        _patch_get_page(monkeypatch, page=StaleScopePage(raw))
+
+        with skyvern_context.scoped(SkyvernContext(run_id=RUN_ID)):
+            result = await mcp_browser.skyvern_file_upload(
+                file_paths=[str(upload_file)],
+                selector="input[type=file]",
+            )
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == ErrorCode.STALE_FRAME_SELECTION
+        mock_locator.set_input_files.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_rejects_path_traversal_outside_run_upload_directory(

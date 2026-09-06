@@ -1,0 +1,118 @@
+{
+  "schema": "generated-code-exception-packet-v1",
+  "provenance": "recorded actions and runner response produced by tests/browser_e2e/test_workflow_copilot_code_first_failure_attribution.py against a live Chromium page; run and session identifiers are fixture-local",
+  "absent_locally": [
+    "workflow_run_id",
+    "workflow_run_block_id",
+    "browser_session_id",
+    "driver_request_reply",
+    "terminal_envelope"
+  ],
+  "workflow_yaml": "title: Order documents\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: extract_order_documents\n    code: |\n      await page.goto(\"https://documents.fixture.test/orders\")\n      rows = page.locator(\"#order-documents tbody tr\")\n      await rows.first.wait_for(state=\"visible\", timeout=5000)\n      return {\"documents\": await rows.all_text_contents()}\n",
+  "goal": "Return every order-document row from the order documents table on this page, with its visible text.",
+  "target_url": "https://documents.fixture.test/orders",
+  "authoring_page_evidence": {
+    "workflow_run_id": "wr_consent_cover_fixture",
+    "source_browser_session_id": "pbs_consent_cover_fixture",
+    "source_tool": "inspect_page_for_composition",
+    "observed_after_workflow_run": true,
+    "current_url": "https://documents.fixture.test/orders",
+    "page_title": "Order Documents Portal",
+    "visible_text_excerpt": "Order Documents Portal\n\u2713\nSuccess! Browser check passed.\nYour order documents\nDocument ID\tTitle\tOrder date\tStatus\nDOC-58231\tPurchase confirmation\t2026-06-02\tAvailable\nDOC-58232\tShipping manifest\t2026-06-05\tAvailable\nDOC-58233\tWarranty certificate\t2026-06-11\tProcessing",
+    "clickable_controls": [
+      {
+        "text": "Continue",
+        "selector": "#btn-continue",
+        "disabled": false
+      }
+    ],
+    "result_containers": []
+  },
+  "scouted_interactions": [
+    {
+      "tool_name": "click",
+      "executed_selector": "#accept-terms",
+      "source_url": "https://documents.fixture.test/orders"
+    },
+    {
+      "tool_name": "click",
+      "executed_selector": "#btn-continue",
+      "source_url": "https://documents.fixture.test/orders"
+    }
+  ],
+  "page_evidence": {
+    "workflow_run_id": "wr_consent_cover_fixture",
+    "source_browser_session_id": "pbs_consent_cover_fixture",
+    "source_tool": "inspect_page_for_composition",
+    "observed_after_workflow_run": true,
+    "current_url": "https://documents.fixture.test/orders",
+    "page_title": "Order Documents Portal",
+    "visible_text_excerpt": "Order Documents Portal\n\u2713\nSuccess! Browser check passed.\nTerms of Service & Privacy\n\nBefore viewing your order documents, please review and accept our Terms of Service and Privacy Policy. We process personal data in accordance with GDPR; see the privacy policy for details on cookies and data retention.\n\nI have read and agree to the Terms of Service and the Privacy Policy.\nContinue",
+    "clickable_controls": [
+      {
+        "text": "Continue",
+        "selector": "#btn-continue",
+        "disabled": true
+      }
+    ],
+    "result_containers": []
+  },
+  "result": {
+    "ok": false,
+    "data": {
+      "workflow_run_id": "wr_consent_cover_fixture",
+      "browser_session_id": "pbs_consent_cover_fixture",
+      "overall_status": "failed",
+      "requested_block_labels": [
+        "extract_order_documents"
+      ],
+      "executed_block_labels": [
+        "extract_order_documents"
+      ],
+      "post_run_page_evidence": {
+        "workflow_run_id": "wr_consent_cover_fixture",
+        "source_browser_session_id": "pbs_consent_cover_fixture",
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": true,
+        "current_url": "https://documents.fixture.test/orders",
+        "page_title": "Order Documents Portal",
+        "visible_text_excerpt": "Order Documents Portal\n\u2713\nSuccess! Browser check passed.\nTerms of Service & Privacy\n\nBefore viewing your order documents, please review and accept our Terms of Service and Privacy Policy. We process personal data in accordance with GDPR; see the privacy policy for details on cookies and data retention.\n\nI have read and agree to the Terms of Service and the Privacy Policy.\nContinue",
+        "clickable_controls": [
+          {
+            "text": "Continue",
+            "selector": "#btn-continue",
+            "disabled": true
+          }
+        ],
+        "result_containers": []
+      },
+      "blocks": [
+        {
+          "workflow_run_block_id": "wrb_wr_consent_cover_fixture",
+          "label": "extract_order_documents",
+          "block_type": "CODE",
+          "status": "failed",
+          "task_id": "tsk_consent_cover_fixture",
+          "failure_reason": "Failed to execute code block. Reason: TimeoutError: Locator.wait_for: Timeout 5000ms exceeded.Call log:  - waiting for locator(\"#order-documents tbody tr\").first to be visible    15 \u00d7 locator resolved to hidden <tr>\u2026</tr>",
+          "error_codes": [
+            "user_code_error"
+          ],
+          "action_trace": [
+            {
+              "action": "goto_url",
+              "status": "completed",
+              "reasoning": null,
+              "element": null
+            }
+          ]
+        }
+      ],
+      "action_trace_summary": [
+        "goto_url completed"
+      ],
+      "recorder_code_line_stamps": [
+        null
+      ]
+    }
+  }
+}

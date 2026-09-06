@@ -28,12 +28,14 @@ from skyvern.exceptions import (
     ScriptTerminationException,
     SkyvernActionFailed,
     SkyvernHTTPException,
+    StaleFrameSelectionError,
 )
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
+from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
 
 
 class _KeyboardStub:
@@ -2514,24 +2516,28 @@ class _RecordingLocator:
 
 
 class _RecordingLocatorScope:
-    def __init__(self, locator: _RecordingLocator) -> None:
+    def __init__(self, locator: _RecordingLocator, page: object) -> None:
         self._locator = locator
+        self.page = page
+        self.name = "checkout"
+        self.url = "https://pay.example.com/checkout"
 
     def locator(self, _selector: str, **_kwargs: object) -> _RecordingLocator:
         return self._locator
 
 
 def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) -> ScriptSkyvernPage:
+    raw_page = create_mock_page()
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
-            page=create_mock_page(),
+            page=raw_page,
             ai=mock_ai,
         )
-    script_page._working_frame = _RecordingLocatorScope(locator)
+    script_page._working_frame = _RecordingLocatorScope(locator, raw_page)
     return script_page
 
 
@@ -2550,7 +2556,7 @@ def _skyvern_page_with_locator(
             ai=mock_ai,
             engine_selection=engine_selection,
         )
-    skyvern_page._working_frame = _RecordingLocatorScope(locator)
+    skyvern_page._working_frame = _RecordingLocatorScope(locator, raw_page)
     return skyvern_page
 
 
@@ -3706,3 +3712,133 @@ class TestCachedClickDesiredState:
         assert self._clicks(locator) == [("click", None)]
         assert ("evaluate", None) not in locator.calls
         assert locator.click_kwargs == [{"timeout": settings.BROWSER_ACTION_TIMEOUT_MS}]
+
+
+def test_locator_scope_refuses_a_skycdp_frame_owned_by_another_page(mock_ai):
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    skyvern_page._working_frame = CdpFrame(MagicMock(), "frame-1", url="https://pay.example.com/checkout")
+
+    with pytest.raises(StaleFrameSelectionError):
+        skyvern_page.locator_scope.locator("#card")
+
+
+def test_locator_scope_accepts_a_skycdp_frame_owned_by_this_page(mock_ai):
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    frame = CdpFrame(skyvern_page.page, "frame-1", url="https://pay.example.com/checkout")
+    skyvern_page._working_frame = frame
+
+    assert skyvern_page.locator_scope is frame
+
+
+class _UnownedFrame:
+    def __init__(self) -> None:
+        self.page = MagicMock()
+        self.name = "checkout"
+        self.url = "https://pay.example.com/checkout"
+
+
+def _page_with_unowned_frame(mock_ai) -> SkyvernPage:
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    skyvern_page._working_frame = _UnownedFrame()
+    return skyvern_page
+
+
+_TEXT_FIELD = {"selector": "#name", "type": "text", "tag": "input", "label": "Name"}
+_RADIO_GROUP_FIELD = {
+    "selector": "#q",
+    "type": "radio_group",
+    "tag": "input",
+    "label": "Q",
+    "options": [{"label": "Yes", "selector": "#yes"}],
+}
+_FILE_FIELD = {"selector": "#cv", "type": "file", "tag": "input", "name": "resume"}
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda page: page.fill_autocomplete(selector="#city", value="Paris"),
+        lambda page: page.fill(selector="#name", value="Ada"),
+        lambda page: page.upload_file(selector="#cv", files="https://example.com/cv.pdf"),
+        lambda page: page.select_option(selector="#country", value="FR"),
+        lambda page: page.fill_from_mapping([_TEXT_FIELD], {0: "Ada"}),
+        lambda page: page._fill_with_planned_value(_TEXT_FIELD, "Ada", None),
+        lambda page: page.fill_from_mapping([_RADIO_GROUP_FIELD], {0: "Maybe"}),
+        lambda page: page.fill_from_mapping([_FILE_FIELD], {}, {"resume": "https://example.com/cv.pdf"}),
+        lambda page: page._fill_matched_field(_TEXT_FIELD, {"action": "fill"}, None),
+        lambda page: page._fill_unknown_field(_TEXT_FIELD, "Fill out the form"),
+        lambda page: page._find_autocomplete_options(),
+    ],
+    ids=[
+        "fill_autocomplete",
+        "fill",
+        "upload_file",
+        "select_option",
+        "fill_from_mapping_text",
+        "fill_with_planned_value",
+        "fill_from_mapping_group_ai_fallback",
+        "fill_from_mapping_file_pass",
+        "fill_matched_field",
+        "fill_unknown_field",
+        "find_autocomplete_options",
+    ],
+)
+@pytest.mark.asyncio
+async def test_frame_scoped_write_propagates_the_stale_frame_refusal(mock_ai, action):
+    page = _page_with_unowned_frame(mock_ai)
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+        AsyncMock(return_value="/tmp/cv.pdf"),
+    ):
+        with pytest.raises(StaleFrameSelectionError):
+            await action(page)
+
+
+@pytest.mark.asyncio
+async def test_structural_validate_propagates_the_stale_frame_refusal(mock_ai):
+    page = _page_with_unowned_frame(mock_ai)
+    page.page.evaluate = AsyncMock(return_value=[])
+
+    with pytest.raises(StaleFrameSelectionError):
+        await page.structural_validate()
+
+
+class _StealFocusOnSelectLocator(_RecordingLocator):
+    def __init__(self, scope: _RecordingLocatorScope) -> None:
+        super().__init__()
+        self._scope = scope
+
+    async def select_option(self, *_args: object, **_kwargs: object) -> None:
+        self._scope.page = MagicMock()
+        raise RuntimeError("no option matched")
+
+
+@pytest.mark.asyncio
+async def test_post_fill_validation_propagates_a_mid_action_stale_frame_refusal(mock_ai):
+    page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    field = {
+        "selector": "#name",
+        "type": "text",
+        "tag": "input",
+        "label": "Name",
+        "_format_hint": "short text",
+    }
+
+    async def _steal_focus_after_filling(*_args: object, **_kwargs: object) -> None:
+        page.working_frame.page = MagicMock()
+
+    with patch.object(SkyvernPage, "fill", AsyncMock(side_effect=_steal_focus_after_filling)):
+        with pytest.raises(StaleFrameSelectionError):
+            await page._fill_with_planned_value(field, "Ada", None)
+
+
+@pytest.mark.asyncio
+async def test_select_ai_fallback_propagates_a_mid_action_stale_frame_refusal(mock_ai):
+    page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    scope = page.working_frame
+    scope._locator = _StealFocusOnSelectLocator(scope)
+    field = {"selector": "#country", "type": "select-one", "tag": "select", "label": "Country"}
+
+    with pytest.raises(StaleFrameSelectionError):
+        await page.fill_from_mapping([field], {0: "France"})

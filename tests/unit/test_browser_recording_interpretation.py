@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import typing as t
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,7 +16,7 @@ from skyvern.services.browser_recording.interpretation import (
     RecordingInterpretationSession,
     streaming_events_to_recording_events,
 )
-from skyvern.services.browser_recording.service import Processor
+from skyvern.services.browser_recording.service import Processor, bound_credential_ids
 from skyvern.services.browser_recording.types import (
     ActionKind,
     ActionTarget,
@@ -868,3 +869,338 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     assert len(blocks) == len(session_two.steps)
 
     registry.discard_session(PBS_ID)
+
+
+def test_drafts_to_blocks_collapses_credentialed_login_form_into_one_login_block() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    login_url = "https://example.com/login"
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-goto",
+            action_kind=ActionKind.URL_CHANGE,
+            block_type="goto_url",
+            label="goto",
+            url=login_url,
+        ),
+        RecordingDraftStep(
+            step_id="step-email",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_email",
+            url=login_url,
+            parameters=[{"key": "email"}],
+            parameter_keys=["email"],
+        ),
+        RecordingDraftStep(
+            step_id="step-password",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_password",
+            title="Log into example",
+            url=login_url,
+            credential_kind="password",
+            credential_id="cred_abc",
+        ),
+        RecordingDraftStep(
+            step_id="step-submit",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_sign_in",
+            url=login_url,
+        ),
+        RecordingDraftStep(
+            step_id="step-after",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_dashboard",
+            url="https://example.com/dashboard",
+        ),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
+
+    assert [block.block_type for block in blocks] == ["goto_url", "login", "action"]
+    login_block = blocks[1]
+    assert login_block.url == login_url
+    assert login_block.title == "Log into example"
+    # Keyed by the credential id: a token the editor swaps for a real key when it applies the blocks.
+    assert login_block.parameter_keys == ["cred_abc"]
+    assert login_block.parameters == [{"key": "cred_abc"}]
+    # The email typing and the submit click are the login block's job now.
+    assert blocks[2].label == "click_dashboard"
+
+    credential_parameters = [p for p in parameters if p.parameter_type == "credential"]
+    assert [(p.key, p.credential_id) for p in credential_parameters] == [("cred_abc", "cred_abc")]
+    # The absorbed email step's placeholder parameter goes with it.
+    assert [p.key for p in parameters if p.parameter_type == "workflow"] == []
+
+
+def test_drafts_to_blocks_points_a_secret_fill_at_the_credential_field() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-secret",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_api_token",
+            url="https://example.com/settings",
+            navigation_goal="Type 'API token' with {{ api_token }}.",
+            parameters=[{"key": "api_token"}],
+            parameter_keys=["api_token"],
+            credential_kind="secret",
+            credential_id="cred_secret",
+        ),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
+
+    assert [block.block_type for block in blocks] == ["action"]
+    # The instruction reads the credential field, not the empty placeholder it replaced.
+    assert blocks[0].navigation_goal == "Type 'API token' with {{ cred_secret.secret_value }}."
+    assert blocks[0].parameter_keys == ["cred_secret"]
+    assert blocks[0].parameters == [{"key": "cred_secret"}]
+    assert [(p.parameter_type, p.key) for p in parameters] == [("credential", "cred_secret")]
+
+
+def test_drafts_to_blocks_leaves_a_card_fill_unbound() -> None:
+    """A card credential spans several fields and the recorder does not say which one was typed.
+
+    Attaching it anyway would emit a credential parameter nothing references while the
+    instruction still rendered the empty placeholder.
+    """
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-card",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_card_number",
+            url="https://example.com/checkout",
+            navigation_goal="Type 'Card number' with {{ cardnumber }}.",
+            parameters=[{"key": "cardnumber"}],
+            parameter_keys=["cardnumber"],
+            credential_kind="credit_card",
+            credential_id="cred_card",
+        ),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
+
+    assert [block.block_type for block in blocks] == ["action"]
+    assert blocks[0].navigation_goal == "Type 'Card number' with {{ cardnumber }}."
+    assert blocks[0].parameter_keys == ["cardnumber"]
+    assert [(p.parameter_type, p.key) for p in parameters] == [("workflow", "cardnumber")]
+
+
+def test_drafts_to_blocks_keeps_post_login_steps_when_the_url_never_changes() -> None:
+    """A modal/SPA login must not swallow the rest of the session.
+
+    The whole recording sits on one URL, so a same-URL span reaches to the last step.
+    """
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    app_url = "https://example.com/app"
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-goto",
+            action_kind=ActionKind.URL_CHANGE,
+            block_type="goto_url",
+            label="goto",
+            url=app_url,
+        ),
+        RecordingDraftStep(
+            step_id="step-open-modal",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_sign_in_link",
+            url=app_url,
+        ),
+        RecordingDraftStep(
+            step_id="step-email",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_email",
+            url=app_url,
+            parameters=[{"key": "email"}],
+            parameter_keys=["email"],
+        ),
+        RecordingDraftStep(
+            step_id="step-password",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_password",
+            url=app_url,
+            credential_kind="password",
+            credential_id="cred_abc",
+        ),
+        RecordingDraftStep(
+            step_id="step-submit",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+            url=app_url,
+        ),
+        RecordingDraftStep(
+            step_id="step-after-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_new_invoice",
+            url=app_url,
+        ),
+        RecordingDraftStep(
+            step_id="step-after-2",
+            action_kind=ActionKind.INPUT_TEXT,
+            block_type="action",
+            label="type_amount",
+            url=app_url,
+            parameters=[{"key": "amount"}],
+            parameter_keys=["amount"],
+        ),
+        RecordingDraftStep(
+            step_id="step-after-3",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_save",
+            url=app_url,
+        ),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
+
+    assert [block.label for block in blocks] == [
+        "goto",
+        "click_sign_in_link",
+        "type_password",
+        "click_new_invoice",
+        "type_amount",
+        "click_save",
+    ]
+    assert [block.block_type for block in blocks] == [
+        "goto_url",
+        "action",
+        "login",
+        "action",
+        "action",
+        "action",
+    ]
+    # The post-login work keeps its own parameters.
+    assert sorted(p.key for p in parameters if p.parameter_type == "workflow") == ["amount"]
+
+
+def _step(step_id: str, kind: ActionKind, label: str, **kwargs: t.Any) -> RecordingDraftStep:
+    return RecordingDraftStep(
+        step_id=step_id,
+        action_kind=kind,
+        block_type=kwargs.pop("block_type", "action"),
+        label=label,
+        **kwargs,
+    )
+
+
+def test_drafts_to_blocks_keeps_the_work_between_a_login_and_a_later_reauth() -> None:
+    """The same credential used twice is two logins, not one span over everything between."""
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        _step("s1", ActionKind.INPUT_TEXT, "type_password_1", credential_kind="password", credential_id="cred_abc"),
+        _step("s2", ActionKind.CLICK, "click_submit_1"),
+        _step("s3", ActionKind.URL_CHANGE, "goto_dashboard", block_type="goto_url", url="https://example.com/app"),
+        _step("s4", ActionKind.CLICK, "click_billing"),
+        _step("s5", ActionKind.INPUT_TEXT, "type_amount", parameters=[{"key": "amount"}], parameter_keys=["amount"]),
+        _step("s6", ActionKind.URL_CHANGE, "goto_reauth", block_type="goto_url", url="https://example.com/reauth"),
+        _step("s7", ActionKind.INPUT_TEXT, "type_password_2", credential_kind="password", credential_id="cred_abc"),
+        _step("s8", ActionKind.CLICK, "click_submit_2"),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+
+    assert [block.label for block in blocks] == [
+        "type_password_1",
+        "goto_dashboard",
+        "click_billing",
+        "type_amount",
+        "goto_reauth",
+        "type_password_2",
+    ]
+    assert [block.block_type for block in blocks] == [
+        "login",
+        "goto_url",
+        "action",
+        "action",
+        "goto_url",
+        "login",
+    ]
+
+
+def test_drafts_to_blocks_absorbs_only_the_field_next_to_the_credential() -> None:
+    """A signup-style form's earlier fields are not the login block's to type."""
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        _step("s1", ActionKind.INPUT_TEXT, "type_first_name", parameters=[{"key": "first"}], parameter_keys=["first"]),
+        _step("s2", ActionKind.INPUT_TEXT, "type_last_name", parameters=[{"key": "last"}], parameter_keys=["last"]),
+        _step("s3", ActionKind.INPUT_TEXT, "type_email", parameters=[{"key": "email"}], parameter_keys=["email"]),
+        _step("s4", ActionKind.INPUT_TEXT, "type_password", credential_kind="password", credential_id="cred_abc"),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
+
+    # Only the email field next to the password is absorbed; the name fields survive.
+    assert [block.label for block in blocks] == ["type_first_name", "type_last_name", "type_password"]
+    assert [block.block_type for block in blocks] == ["action", "action", "login"]
+    assert sorted(p.key for p in parameters if p.parameter_type == "workflow") == ["first", "last"]
+
+
+def test_drafts_to_blocks_keeps_in_app_work_between_two_uses_of_one_credential() -> None:
+    """A re-auth on a single-page app is a second login, not one span over the work between.
+
+    Nothing navigates and every step in between is a click or a text entry, which is exactly
+    what ordinary app work looks like - so adjacency, not step kind, has to bound the group.
+    """
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        _step("s1", ActionKind.INPUT_TEXT, "type_password_1", credential_kind="password", credential_id="cred_abc"),
+        _step("s2", ActionKind.CLICK, "click_submit_1"),
+        _step("s3", ActionKind.CLICK, "click_invoices"),
+        _step("s4", ActionKind.INPUT_TEXT, "type_amount", parameters=[{"key": "amount"}], parameter_keys=["amount"]),
+        _step("s5", ActionKind.CLICK, "click_save"),
+        _step("s6", ActionKind.CLICK, "click_reauth_prompt"),
+        _step("s7", ActionKind.INPUT_TEXT, "type_password_2", credential_kind="password", credential_id="cred_abc"),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+
+    assert [block.label for block in blocks] == [
+        "type_password_1",
+        "click_invoices",
+        "type_amount",
+        "click_save",
+        "click_reauth_prompt",
+        "type_password_2",
+    ]
+    assert [block.block_type for block in blocks] == [
+        "login",
+        "action",
+        "action",
+        "action",
+        "action",
+        "login",
+    ]
+
+
+def test_drafts_to_blocks_merges_a_totp_fill_across_the_submit_click() -> None:
+    """One step may separate two fills of a credential: the submit between password and code."""
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        _step("s1", ActionKind.INPUT_TEXT, "type_password", credential_kind="password", credential_id="cred_abc"),
+        _step("s2", ActionKind.CLICK, "click_next"),
+        _step("s3", ActionKind.INPUT_TEXT, "type_code", credential_kind="totp", credential_id="cred_abc"),
+        _step("s4", ActionKind.CLICK, "click_verify"),
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+
+    assert [block.block_type for block in blocks] == ["login"]
+    assert blocks[0].parameter_keys == ["cred_abc"]

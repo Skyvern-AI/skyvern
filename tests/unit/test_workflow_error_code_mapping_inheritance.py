@@ -1,12 +1,20 @@
-"""Tests for workflow-level error_code_mapping inheritance into blocks at execution time."""
+"""Tests for block-level error_code_mapping: workflow inheritance, and redaction on the block's own
+task-failure handler (SKY-15643).
+"""
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
+from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import TaskBlock
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.schemas.workflows import BlockStatus
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 
 
 def _make_output_parameter() -> OutputParameter:
@@ -298,3 +306,223 @@ class TestWorkflowLevelErrorCodeMappingInheritance:
         block = block_yaml_to_block(block_yaml, parameters)
         assert isinstance(block, TaskBlock)
         assert block.error_code_mapping == {"BLOCK_ERROR": "only block"}
+
+
+class TestBlockTaskFailureRedaction:
+    """The block's own failure handler persists failure_reason and the detector's reasoning to the
+    task, and both leave over the customer webhook. It is a third caller of the same detector, and
+    it wraps execute_step for every engine (SKY-15643)."""
+
+    @staticmethod
+    def _patch_secrets(
+        monkeypatch: pytest.MonkeyPatch, secrets: set[str], gate: bool = True, seen: list | None = None
+    ) -> None:
+        # `seen` captures the identifier the lookups are keyed on. Without it a regression that
+        # passed task_id, or a typo'd attribute, would look up the wrong run's secrets, redact
+        # nothing in production, and leave every assertion below green.
+        def _record(value: object) -> None:
+            if seen is not None:
+                seen.append(value)
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled",
+            lambda run_id, *_a, **_k: (_record(run_id), gate)[1],
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+            lambda run_id, *_a, **_k: (_record(run_id), secrets)[1],
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
+            lambda *_a, **_k: set(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_failure_reason_is_redacted_before_it_is_persisted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block = _make_task_block(error_code_mapping={"payment_failed": "Payment was declined"})
+        seen: list = []
+        self._patch_secrets(monkeypatch, {"sk4829137765"}, seen=seen)
+        update_task = AsyncMock()
+        monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.DATABASE.tasks.update_task", update_task)
+        detector = AsyncMock(return_value=[])
+        monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.detect_user_defined_errors_for_task", detector)
+        task = MagicMock(task_id="t_1", workflow_run_id="wr_test")
+
+        await block._handle_task_failure_with_error_detection(
+            task=task,
+            step=MagicMock(step_id="s_1"),
+            browser_state=None,
+            failure_reason="the portal rejected the key sk4829137765",
+            organization_id="o_test",
+        )
+
+        persisted = update_task.await_args_list[0].kwargs["failure_reason"]
+        assert "sk4829137765" not in persisted
+        assert REDACTED_SECRET_PLACEHOLDER in persisted
+        # Redacted at the top, so the detector is handed the scrubbed string too.
+        assert "sk4829137765" not in detector.await_args.kwargs["failure_reason"]
+        # ...and the secrets were looked up for the RUN, not some other identifier on the task.
+        assert set(seen) == {"wr_test"}
+
+    @pytest.mark.asyncio
+    async def test_detector_written_reasoning_is_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The detector reads the page as well as the failure reason, so scrubbing its input is not
+        # enough: a secret typed into the form can come back in its reasoning.
+        block = _make_task_block(error_code_mapping={"payment_failed": "Payment was declined"})
+        self._patch_secrets(monkeypatch, {"sk4829137765"})
+        update_task = AsyncMock()
+        monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.DATABASE.tasks.update_task", update_task)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.detect_user_defined_errors_for_task",
+            AsyncMock(
+                return_value=[
+                    UserDefinedError(
+                        error_code="payment_failed",
+                        reasoning="the page showed sk4829137765 after submit",
+                        confidence_float=1.0,
+                    )
+                ]
+            ),
+        )
+        task = MagicMock(task_id="t_1", workflow_run_id="wr_test")
+
+        await block._handle_task_failure_with_error_detection(
+            task=task,
+            step=MagicMock(step_id="s_1"),
+            browser_state=None,
+            failure_reason="could not continue",
+            organization_id="o_test",
+        )
+
+        (persisted,) = update_task.await_args_list[-1].kwargs["errors"]
+        assert "sk4829137765" not in persisted["reasoning"]
+        assert REDACTED_SECRET_PLACEHOLDER in persisted["reasoning"]
+
+    @pytest.mark.asyncio
+    async def test_gate_off_leaves_a_workflow_secret_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A workflow-registered secret is available but the per-workflow opt-in is off, so it must
+        # not reach the scrub. Engine-minted runtime values still would, via the fallback.
+        block = _make_task_block(error_code_mapping=None)
+        self._patch_secrets(monkeypatch, {"sk4829137765"}, gate=False)
+        update_task = AsyncMock()
+        monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.DATABASE.tasks.update_task", update_task)
+        task = MagicMock(task_id="t_1", workflow_run_id="wr_test")
+        raw = "the portal rejected the key sk4829137765"
+
+        await block._handle_task_failure_with_error_detection(
+            task=task,
+            step=MagicMock(step_id="s_1"),
+            browser_state=None,
+            failure_reason=raw,
+            organization_id="o_test",
+        )
+
+        assert update_task.await_args_list[0].kwargs["failure_reason"] == raw
+
+    @pytest.mark.asyncio
+    async def test_redacting_reasoning_cannot_push_it_past_the_model_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Redaction LENGTHENS: the placeholder is longer than a short code. model_copy skips the
+        # field validator, so a reasoning already at the bound would land over it, and nothing
+        # re-validates tasks.errors on the way out.
+        block = _make_task_block(error_code_mapping={"payment_failed": "Payment was declined"})
+        self._patch_secrets(monkeypatch, {"482913"})
+        update_task = AsyncMock()
+        monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app.DATABASE.tasks.update_task", update_task)
+        # Short numeric secrets are boundary-anchored, so the code needs a non-alphanumeric neighbour.
+        at_the_bound = "482913 " + "z" * (ERROR_CODE_REASONING_MAX_LENGTH - 7)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.detect_user_defined_errors_for_task",
+            AsyncMock(
+                return_value=[
+                    UserDefinedError(error_code="payment_failed", reasoning=at_the_bound, confidence_float=1.0)
+                ]
+            ),
+        )
+
+        await block._handle_task_failure_with_error_detection(
+            task=MagicMock(task_id="t_1", workflow_run_id="wr_test"),
+            step=MagicMock(step_id="s_1"),
+            browser_state=None,
+            failure_reason="could not continue",
+            organization_id="o_test",
+        )
+
+        (persisted,) = update_task.await_args_list[-1].kwargs["errors"]
+        assert "482913" not in persisted["reasoning"]
+        assert len(persisted["reasoning"]) == ERROR_CODE_REASONING_MAX_LENGTH
+
+    @pytest.mark.asyncio
+    async def test_block_level_failure_reason_is_redacted_too(self) -> None:
+        # The helper above scrubs the TASK row, but the block's own failure_reason is a separate
+        # string that is persisted to workflow_run_blocks and lifted onto the run, neither redacted
+        # downstream. The scrub lives in build_block_result rather than the except arm, because a
+        # block that reports failure by RETURNING an unsuccessful result never raises -- so the
+        # except arm is not the convergence point, and asserting on the returned BlockResult is what
+        # covers both arms.
+        block = _make_task_block(error_code_mapping=None)
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch.object(
+                BaseTaskBlock, "execute", new_callable=AsyncMock, side_effect=RuntimeError("token sk4829137765 bad")
+            ),
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        ):
+            mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(return_value=MagicMock())
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
+            mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = lambda *_a, **_k: True
+            mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = lambda *_a, **_k: {"sk4829137765"}
+
+            result = await block.execute_safe(workflow_run_id="wr_test", current_index=None)
+
+        assert "sk4829137765" not in (result.failure_reason or "")
+        assert REDACTED_SECRET_PLACEHOLDER in (result.failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_secret_lookup_does_not_break_the_block_result(self) -> None:
+        # build_block_result runs for EVERY block result, including on paths that never start a
+        # ForgeApp. A redaction lookup must never be what turns a block result into a failure, so it
+        # degrades to the unredacted reason -- which is exactly the pre-existing behaviour.
+        block = _make_task_block(error_code_mapping=None)
+
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+            mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.side_effect = RuntimeError(
+                "ForgeApp is not initialized"
+            )
+
+            result = await block.build_block_result(
+                success=False,
+                failure_reason="the vendor rejected the request",
+                status=BlockStatus.failed,
+                workflow_run_block_id="wrb_1",
+                organization_id="o_test",
+            )
+
+        assert result.failure_reason == "the vendor rejected the request"
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_a_returned_failure_reason_is_redacted_not_only_a_raised_one(self) -> None:
+        # The arm the except branch never sees: a block that reports failure by RETURNING an
+        # unsuccessful result. Scrubbing only the raise path would leave this one raw.
+        block = _make_task_block(error_code_mapping=None)
+
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+            mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = lambda *_a, **_k: True
+            mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = lambda *_a, **_k: {"sk4829137765"}
+
+            result = await block.build_block_result(
+                success=False,
+                failure_reason="the vendor rejected token sk4829137765",
+                status=BlockStatus.failed,
+                workflow_run_block_id="wrb_1",
+                organization_id="o_test",
+            )
+
+        assert "sk4829137765" not in (result.failure_reason or "")
+        assert REDACTED_SECRET_PLACEHOLDER in (result.failure_reason or "")

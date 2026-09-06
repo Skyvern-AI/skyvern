@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -25,11 +26,13 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint, register_sensitive_origin_run_lease
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml as process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 
@@ -122,9 +125,10 @@ def stub_artifact_app(
 
 def _fake_workflow_run(status: str) -> SimpleNamespace:
     return SimpleNamespace(
-        status=status,
+        status=WorkflowRunStatus(status),
         modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
         browser_session_id=None,
+        failure_reason=None,
     )
 
 
@@ -138,6 +142,7 @@ async def install_run_blocks_harness(
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
     workflow = await process_workflow_yaml(
         settings_fallback_yaml="enable_self_healing: false",
         workflow_id="w_source",
@@ -156,6 +161,7 @@ async def install_run_blocks_harness(
 
     database = MagicMock()
     database.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
+    database.workflows.get_workflow = AsyncMock(return_value=workflow)
     database.organizations.get_organization = AsyncMock(return_value=organization)
     persisted_output_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, OutputParameter)]
     persisted_workflow_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, WorkflowParameter)]
@@ -515,3 +521,51 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
+
+
+SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS = [
+    "registry_missing",
+    "registry_incomplete",
+    "registry_other_run",
+    "run_still_active",
+    "run_id_unclaimed",
+    "second_browser_run_replaced_registry",
+    "same_session_earlier_run_unbound",
+]
+
+
+def taint_by_terminal_run(ctx: Any, *, workflow_run_id: str, session_id: str) -> None:
+    """Mark ``session_id`` as the page a finished credential run left, attributed to that run."""
+    record_sensitive_origin_run_taint(ctx, workflow_run_id=workflow_run_id, session_id=session_id)
+
+
+def remove_sensitive_disclosure_prerequisite(ctx: Any, arm: str) -> None:
+    """Drop exactly one prerequisite of the terminal-matching-registry disclosure route."""
+    registry = ctx.origin_run_redaction_registry
+    if arm == "registry_missing":
+        ctx.origin_run_redaction_registry = None
+    elif arm == "registry_incomplete":
+        ctx.origin_run_redaction_registry = replace(registry, contains_all_sensitive_values=False)
+    elif arm == "registry_other_run":
+        ctx.origin_run_redaction_registry = replace(registry, workflow_run_id="wr_unrelated")
+    elif arm == "run_still_active":
+        register_sensitive_origin_run_lease(
+            ctx, workflow_run_id=registry.workflow_run_id, session_id=ctx.browser_session_id
+        )
+    elif arm == "run_id_unclaimed":
+        ctx.last_run_blocks_workflow_run_id = None
+    elif arm == "second_browser_run_replaced_registry":
+        # A later run on another browser finished with a complete registry and is the run the
+        # model now claims; the page under inspection was tainted by the earlier run, whose
+        # values were never bound. The complete registry must not unlock that page.
+        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_second", session_id="pbs_second_browser")
+        ctx.last_run_blocks_workflow_run_id = "wr_second"
+        ctx.origin_run_redaction_registry = replace(
+            registry, workflow_run_id="wr_second", contains_all_sensitive_values=True
+        )
+    elif arm == "same_session_earlier_run_unbound":
+        # An earlier run on this same page ended without completing its registry, so a value
+        # it entered may be on the page while the claimed run's complete registry knows nothing of it.
+        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_earlier", session_id=ctx.browser_session_id)
+    else:
+        raise AssertionError(f"unknown arm {arm}")

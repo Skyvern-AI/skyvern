@@ -65,6 +65,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _scout_act_observe_page_evidence,
 )
 from tests.unit.copilot_test_helpers import carried_interaction, make_copilot_ctx
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _SOURCE_URL = "https://example.com/product"
 _LANDING_URL = "https://example.com/results"
@@ -166,6 +167,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         scout_trajectory=[],
         organization_id="o_test",
         browser_session_id="bs_test",
+        last_run_blocks_workflow_run_id=None,
         prior_carried_trajectory=[],
         carried_trajectory_rebound_done=False,
         pending_scout_source_url=source_url,
@@ -1419,7 +1421,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(seconds: float) -> None:
             sleeps.append(seconds)
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
 
         result = await _run_click(ctx)
 
@@ -1570,7 +1572,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(seconds: float) -> None:
             sleeps.append(seconds)
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         ctx = _ctx(
             server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
         )
@@ -1589,7 +1591,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(seconds: float) -> None:
             sleeps.append(seconds)
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         ctx = _ctx(
             server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
         )
@@ -1607,7 +1609,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(seconds: float) -> None:
             sleeps.append(seconds)
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
 
         await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
@@ -1625,7 +1627,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(seconds: float) -> None:
             sleeps.append(seconds)
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         ctx = _ctx(
             server=_server_returning_sequence(
                 [
@@ -1651,7 +1653,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         ctx = _ctx(
             server=_server_returning_sequence(
                 [
@@ -1675,7 +1677,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         unsignalled = _bounded_extractor_payload()
         ctx = _ctx(server=_server_returning_sequence([_bounded_challenge_signalled_payload(), unsignalled]))
 
@@ -1692,7 +1694,7 @@ class TestActObserveRecaptureSettle:
         async def record_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=record_sleep))
         ctx = _ctx(
             server=_server_returning_sequence(
                 [

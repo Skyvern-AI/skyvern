@@ -1152,7 +1152,12 @@ class TestAttachFailedBlockScreenshots:
             run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None)
         )
 
-        ctx = SimpleNamespace(organization_id="org-1", workflow_permanent_id="wpid-1")
+        ctx = SimpleNamespace(
+            organization_id="org-1",
+            workflow_permanent_id="wpid-1",
+            last_run_blocks_workflow_run_id=None,
+            dispatched_run_ids_this_turn=set(),
+        )
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
 
         assert result["data"]["current_url"] == "https://example.com/step-2"
@@ -1210,6 +1215,8 @@ class TestAttachFailedBlockScreenshots:
             organization_id="org-1",
             workflow_permanent_id="wpid-1",
             copilot_total_timeout_exceeded=False,
+            last_run_blocks_workflow_run_id=None,
+            dispatched_run_ids_this_turn=set(),
         )
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
 
@@ -1267,6 +1274,8 @@ class TestAttachFailedBlockScreenshots:
             organization_id="org-1",
             workflow_permanent_id="wpid-1",
             copilot_total_timeout_exceeded=False,
+            last_run_blocks_workflow_run_id=None,
+            dispatched_run_ids_this_turn=set(),
         )
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
 

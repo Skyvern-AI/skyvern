@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,14 +14,22 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import yaml
 from agents import GuardrailFunctionOutput, InputGuardrail
+from agents.exceptions import (
+    InputGuardrailTripwireTriggered,
+    MaxTurnsExceeded,
+    OutputGuardrailTripwireTriggered,
+)
+from agents.items import ToolCallItem
 from agents.run_context import RunContextWrapper
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _build_goal_satisfied_exit_result,
+    _format_chat_history,
     _resolve_wrapped_exception_exit_result,
     _rewrite_failed_test_response,
     _verified_workflow_or_none,
@@ -85,7 +94,11 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-from skyvern.forge.sdk.copilot.terminal_envelope import interim_run_start_outcome
+from skyvern.forge.sdk.copilot.terminal_envelope import (
+    INTERRUPTED_TERMINAL_RETRY,
+    INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
+    interim_run_start_outcome,
+)
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -113,12 +126,16 @@ from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSA
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
+from skyvern.services import workflow_service as workflow_service_module
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
@@ -167,6 +184,20 @@ def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]
             created_at=_HISTORY_SENTINEL_TS,
         )
         for sender, content in pairs
+    ]
+
+
+def test_a_product_row_speaks_as_the_user_in_the_formatted_history() -> None:
+    formatted = _format_chat_history(
+        _history(
+            ("product", "Diagnose run wr_42 and repair the workflow."),
+            ("ai", "Looking at it."),
+        )
+    )
+
+    assert formatted.splitlines() == [
+        "user: Diagnose run wr_42 and repair the workflow.",
+        "ai: Looking at it.",
     ]
 
 
@@ -1720,7 +1751,7 @@ workflow_definition:
 
     @pytest.mark.asyncio
     async def test_update_and_run_blocks_persists_clean_yaml(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+        from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 
         clean_yaml = """
 title: Test workflow
@@ -1761,6 +1792,9 @@ workflow_definition:
                 },
             }
 
+        monkeypatch.setattr(
+            "skyvern.forge.app.WORKFLOW_SERVICE.get_workflow_by_permanent_id", AsyncMock(return_value=None)
+        )
         monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
@@ -2049,6 +2083,12 @@ workflow_definition:
         source_obstructions = [dom_obstructions[0], screenshot_obstruction, *dom_obstructions, *dom_obstructions]
         failed_run = json.loads(json.dumps(self._FAILED_RUN))
         failed_run["data"]["authoring_repair_context"]["page_obstructions"] = source_obstructions
+        failure_page_state = {
+            "final_url": "https://example.test/at-timeout",
+            "page_title": "Checkout at failure",
+            "covering_element": '<div id="cover" class="notice">',
+        }
+        failed_run["data"]["blocks"][0]["output"]["failure_page_state"] = failure_page_state
 
         async def fake_update_workflow(payload, ctx, **_kwargs):
             assert payload["workflow_yaml"] == self._SAVED_WORKFLOW
@@ -2134,6 +2174,8 @@ workflow_definition:
         assert packet["executed_block_labels"] == ["read_total"]
         assert packet["run"] == {"workflow_run_id": "wr_packet_1", "status": "failed"}
         assert packet["failure"]["block_label"] == "read_total"
+        for key, value in failure_page_state.items():
+            assert packet["failure"][key] == value
         assert packet["failure"]["action_trace"] == ["NULL_ACTION failed response=missing total code_line=3"]
         assert packet["action_observations"] == ["NULL_ACTION failed response=missing total code_line=3"]
         assert packet["failure"]["page_state"]["result_summaries"] == [
@@ -2188,7 +2230,7 @@ workflow_definition:
         assert packet["registered_outputs"][0] == {
             "label": "read_total",
             "status": "failed",
-            "output": {"total": None},
+            "output": {"total": None, "failure_page_state": failure_page_state},
             "value_complete": True,
         }
         assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
@@ -2540,50 +2582,6 @@ class TestTranslateToAgentResultGating:
 
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
-
-    def test_model_authored_ask_carries_its_parts_onto_the_terminal_envelope(self) -> None:
-        ctx = _ctx()
-        result = _fake_run_result(
-            {
-                "type": "ASK_QUESTION",
-                "user_response": "Which store, and how should I pick the items?",
-                "parts": [
-                    {"prompt": "Which store?", "choices": ["Acme Supply", "Borough Goods"]},
-                    {"prompt": "Which email should get the receipt?", "choices": []},
-                ],
-            }
-        )
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.terminal_envelope is not None
-        assert agent_result.terminal_envelope["question_parts"] == [
-            {"part_id": "p1", "prompt": "Which store?", "choices": ["Acme Supply", "Borough Goods"]},
-            {"part_id": "p2", "prompt": "Which email should get the receipt?", "choices": []},
-        ]
-
-    def test_a_reply_never_carries_question_parts(self) -> None:
-        ctx = _ctx()
-        result = _fake_run_result(
-            {
-                "type": "REPLY",
-                "user_response": "Done.",
-                "parts": [{"prompt": "Which store?", "choices": ["Acme Supply"]}],
-            }
-        )
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.terminal_envelope is not None
-        assert agent_result.terminal_envelope["question_parts"] == []
 
     def test_request_policy_actuation_claim_does_not_rewrite_model_reply(self) -> None:
         ctx = _ctx(
@@ -3862,8 +3860,11 @@ class TestCredentialRefusalReachesAgent:
         assert "SKYVERN WORKFLOW YAML KNOWLEDGE BASE" not in prompt
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "restored_yaml", ["", "title: Restored proposal\nworkflow_definition: {parameters: [], blocks: []}"]
+    )
     async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, restored_yaml: str
     ) -> None:
         class FakeMCPServerManager:
             def __init__(self, servers):
@@ -3895,11 +3896,18 @@ class TestCredentialRefusalReachesAgent:
             run_with_enforcement,
         )
 
+        async def restore_proposal(ctx):
+            ctx.workflow_yaml = restored_yaml
+
+        monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", restore_proposal)
+        build_context = MagicMock(wraps=agent_module._build_user_context)
+        monkeypatch.setattr(agent_module, "_build_user_context", build_context)
+
         with capture_logs() as logs:
             result = await agent_module.run_copilot_agent(
                 stream=MagicMock(),
                 organization_id="org-1",
-                chat_request=SimpleNamespace(
+                chat_request=WorkflowCopilotChatRequest(
                     message="build it",
                     workflow_id="wf-1",
                     workflow_permanent_id="wfp-1",
@@ -3908,6 +3916,7 @@ class TestCredentialRefusalReachesAgent:
                     workflow_yaml="",
                     browser_session_id=None,
                     product_action=None,
+                    selected_connected_account_id=None,
                 ),
                 chat_history=[],
                 global_llm_context=None,
@@ -3922,6 +3931,7 @@ class TestCredentialRefusalReachesAgent:
 
         policy_event = next(log for log in logs if log["event"] == "copilot_block_authoring_policy_resolved")
 
+        assert build_context.call_args.kwargs["workflow_yaml"] == restored_yaml
         assert result.user_response == "ok"
         assert policy_event["block_authoring_policy"] == "CODE_ONLY_BROWSER"
         assert policy_event["block_authoring_policy_value"] == BlockAuthoringPolicy.CODE_ONLY_BROWSER.value
@@ -4442,7 +4452,11 @@ class TestRunBlocksCredentialApproval:
         else:
             get_organization = AsyncMock(return_value=organization_lookup)
         return SimpleNamespace(
-            workflows=SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=workflow)),
+            workflows=SimpleNamespace(
+                get_workflow=AsyncMock(return_value=workflow),
+                get_workflow_by_permanent_id=AsyncMock(return_value=workflow),
+            ),
+            workflow_params=SimpleNamespace(get_workflow_output_parameters=AsyncMock(return_value=[])),
             credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=credentials or [])),
             organizations=SimpleNamespace(get_organization=get_organization),
         )
@@ -4554,7 +4568,11 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(
             run_execution_module.app,
             "WORKFLOW_SERVICE",
-            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=prepare_workflow,
+                execute_workflow=execute_workflow,
+            ),
         )
 
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
@@ -4583,7 +4601,11 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(
             run_execution_module.app,
             "WORKFLOW_SERVICE",
-            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=prepare_workflow,
+                execute_workflow=execute_workflow,
+            ),
         )
 
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[SimpleNamespace(credential_id="cred_resolved")]))
@@ -4629,7 +4651,11 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(
             run_execution_module.app,
             "WORKFLOW_SERVICE",
-            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=prepare_workflow,
+                execute_workflow=execute_workflow,
+            ),
         )
 
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
@@ -4664,7 +4690,11 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(
             run_execution_module.app,
             "WORKFLOW_SERVICE",
-            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=prepare_workflow,
+                execute_workflow=execute_workflow,
+            ),
         )
 
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
@@ -4720,7 +4750,11 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(
             run_execution_module.app,
             "WORKFLOW_SERVICE",
-            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=prepare_workflow,
+                execute_workflow=execute_workflow,
+            ),
         )
 
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
@@ -4959,6 +4993,65 @@ class TestRunBlocksCredentialApproval:
         assert "Credentials UI" not in error
 
 
+@pytest.mark.asyncio
+async def test_a_foreign_holder_stops_the_dispatch_before_any_workflow_run_is_prepared(monkeypatch) -> None:
+    workflow = TestRunBlocksCredentialApproval._workflow()
+    organization = Organization(
+        organization_id="org-1",
+        organization_name="org",
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    database = TestRunBlocksCredentialApproval._db(workflow=workflow, organization_lookup=organization)
+    database.workflow_params = SimpleNamespace(get_workflow_output_parameters=AsyncMock(return_value=[]))
+
+    async def never_prepare(**_kwargs: object) -> object:
+        raise AssertionError("a workflow run was prepared for a session another chat holds")
+
+    now = datetime.now(timezone.utc)
+    held_session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_chat",
+        organization_id="org-1",
+        runnable_id="wr_foreign",
+        runnable_type="workflow_run",
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+    runtime_app = MagicMock()
+    runtime_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=held_session)
+    runtime_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(
+            workflow_run_id="wr_foreign",
+            copilot_session_id="wcc_someone_else",
+            status=WorkflowRunStatus.running,
+        )
+    )
+    runtime_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock(
+        side_effect=AssertionError("a foreign chat's run was cancelled")
+    )
+    monkeypatch.setattr(runtime_module, "app", runtime_app)
+    monkeypatch.setattr(runtime_module, "_drop_browser_session_id_at_its_fixed_deadline", AsyncMock())
+    monkeypatch.setattr(runtime_module, "_attach_current_browser_generation", AsyncMock())
+    monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+    monkeypatch.setattr(
+        run_execution_module.app,
+        "WORKFLOW_SERVICE",
+        SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
+    )
+    monkeypatch.setattr(workflow_service_module, "prepare_workflow", never_prepare)
+
+    ctx = _ctx(browser_session_id="pbs_chat")
+    ctx.workflow_copilot_chat_id = "wcc_mine"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+    assert result["ok"] is False
+    failure = result["data"]["build_test_connect_failure"]
+    assert failure["state"] == "occupied"
+    assert failure["occupier_run_id"] == "wr_foreign"
+
+
 class TestRunBlocksCredentialApprovalFrontierScope:
     CREDENTIAL_ID = "cred_frontier_login"
 
@@ -5015,6 +5108,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
             run_execution_module.app,
             "WORKFLOW_SERVICE",
             SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
                 prepare_workflow=AsyncMock(side_effect=AssertionError("prepare_workflow called")),
                 execute_workflow=AsyncMock(side_effect=AssertionError("execute_workflow called")),
             ),
@@ -5233,25 +5327,6 @@ class TestWorkflowBlocksSelectedLabels:
         assert labels == ["deep"]
 
 
-class TestResponseTypeClassificationRuleReachesAgent:
-    """Pin the classifier rule that selects ASK_QUESTION when `user_response` asks the user for required input — the agent.py null-out gate keys on `resp_type == "ASK_QUESTION"` and depends on this prompt text."""
-
-    def test_build_system_prompt_carries_classification_rule(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
-
-        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
-
-        assert "RESPONSE-TYPE CLASSIFICATION" in prompt
-        assert "required before you can continue" in prompt
-        assert "this turn built or tested a partial workflow" in prompt
-        assert "Classify by intent, not punctuation" in prompt
-        assert "goal_reached" not in prompt
-        assert "does NOT imply REPLY" in prompt
-        assert "explicitly asks for an untested draft" in prompt
-        assert "workflow was drafted without testing as requested" in prompt
-        assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
-
-
 class TestCopilotConfig:
     def test_system_prompt_uses_custom_security_rules(self) -> None:
         prompt = agent_module._build_system_prompt(
@@ -5276,10 +5351,304 @@ class TestCopilotConfig:
 
         assert agent_module._is_retriable_llm_error(FakeRateLimitError("rate limit"))
 
+    def test_empty_completion_is_typed_retriable_and_tool_calls_are_attempt_local(self) -> None:
+        ctx = _ctx()
+        error = agent_module._empty_completion_error(
+            SimpleNamespace(final_output="", new_items=[]),
+            ctx=ctx,
+            tool_call_count_start=0,
+            llm_key="PRIMARY",
+            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+        )
+        tool_bearing = agent_module._empty_completion_error(
+            SimpleNamespace(final_output="", new_items=[MagicMock(spec=ToolCallItem)]),
+            ctx=ctx,
+            tool_call_count_start=0,
+            llm_key="PRIMARY",
+            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+        )
+
+        assert error is not None
+        assert error.reason == "empty_completion"
+        assert agent_module._is_retriable_llm_error(error)
+        assert tool_bearing is not None
+        assert not agent_module._is_retriable_llm_error(tool_bearing)
+
+    def test_empty_completion_after_earlier_enforcement_tool_is_not_retriable(self) -> None:
+        ctx = _ctx()
+        ctx.tool_calls_this_turn = 8
+        error = agent_module._empty_completion_error(
+            SimpleNamespace(final_output="", new_items=[]),
+            ctx=ctx,
+            tool_call_count_start=7,
+            llm_key="PRIMARY",
+            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+        )
+
+        assert error is not None
+        assert not agent_module._is_retriable_llm_error(error)
+
+    def test_preexisting_tool_count_does_not_make_current_empty_attempt_non_retriable(self) -> None:
+        ctx = _ctx()
+        ctx.tool_calls_this_turn = 7
+
+        error = agent_module._empty_completion_error(
+            SimpleNamespace(final_output="", new_items=[]),
+            ctx=ctx,
+            tool_call_count_start=7,
+            llm_key="PRIMARY",
+            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+        )
+
+        assert error is not None
+        assert agent_module._is_retriable_llm_error(error)
+
+    @pytest.mark.parametrize("terminal_state", ["budget_drain", "turn_halt"])
+    def test_terminal_turn_state_is_not_relabelled_as_empty_completion(self, terminal_state: str) -> None:
+        ctx = _ctx()
+        if terminal_state == "budget_drain":
+            ctx.budget_expiry_state.drain_attempted = True
+        else:
+            ctx.turn_halt = TurnHalt(kind=TurnHaltKind.BUILD_TEST_SUPERSEDED)
+
+        error = agent_module._empty_completion_error(
+            SimpleNamespace(final_output="", new_items=[]),
+            ctx=ctx,
+            tool_call_count_start=0,
+            llm_key="PRIMARY",
+            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+        )
+
+        assert error is None
+
+    @pytest.mark.parametrize("field", ["refusal", "content_filter"])
+    def test_empty_completion_with_explicit_safety_stop_is_not_retriable(self, field: str) -> None:
+        stop_metadata = agent_module.CopilotModelStopMetadata(
+            model_call_index=1,
+            **{field: True},
+        )
+        error = agent_module._empty_completion_error(
+            SimpleNamespace(final_output="", new_items=[]),
+            ctx=_ctx(),
+            tool_call_count_start=0,
+            llm_key="PRIMARY",
+            stop_metadata=stop_metadata,
+        )
+
+        assert error is not None
+        assert not agent_module._is_retriable_llm_error(error)
+
     def test_fallback_key_skips_missing_or_same_key(self) -> None:
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key=None), "PRIMARY") is None
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="PRIMARY"), "PRIMARY") is None
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="SECONDARY"), "PRIMARY") == "SECONDARY"
+
+    @pytest.mark.asyncio
+    async def test_tool_started_during_attempt_prevents_empty_completion_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        async def run_after_tool_start(**kwargs):
+            assert kwargs["ctx"].tool_calls_this_turn == 7
+            tool = MagicMock()
+            tool.name = "navigate_browser"
+            await kwargs["hooks"].on_tool_start(MagicMock(), MagicMock(), tool)
+            return SimpleNamespace(final_output="", new_items=[])
+
+        async def seed_prior_tool_activity(ctx):
+            ctx.tool_calls_this_turn = 7
+
+        run_with_enforcement = AsyncMock(side_effect=run_after_tool_start)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent.restore_pending_workflow_proposal",
+            seed_prior_tool_activity,
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            lambda _handler, **_kwargs: ("model-PRIMARY", object(), "PRIMARY", True),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                message="hello",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_run_id=None,
+                workflow_yaml="",
+                browser_session_id=None,
+                product_action=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        )
+
+        assert run_with_enforcement.await_count == 1
+        assert result.user_response == (
+            "The model produced no final response after taking actions in this turn. "
+            "Nothing in the workflow was changed."
+        )
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.terminal_reason == "empty_completion"
+
+    @pytest.mark.asyncio
+    async def test_preexisting_tool_count_allows_current_empty_attempt_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        async def seed_prior_tool_activity(ctx):
+            ctx.tool_calls_this_turn = 7
+
+        run_with_enforcement = AsyncMock(
+            side_effect=[
+                SimpleNamespace(final_output="", new_items=[]),
+                _fake_run_result({"type": "REPLY", "user_response": "fallback reply"}),
+            ]
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent.restore_pending_workflow_proposal",
+            seed_prior_tool_activity,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            lambda _handler, **kwargs: (
+                f"model-{kwargs.get('llm_key_override') or 'PRIMARY'}",
+                object(),
+                kwargs.get("llm_key_override") or "PRIMARY",
+                True,
+            ),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                message="hello",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_run_id=None,
+                workflow_yaml="",
+                browser_session_id=None,
+                product_action=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        )
+
+        assert run_with_enforcement.await_count == 2
+        assert result.user_response == "fallback reply"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exception_factory",
+        [
+            pytest.param(
+                lambda: CopilotTurnHalt(TurnHalt(kind=TurnHaltKind.BUILD_TEST_SUPERSEDED)),
+                id="turn_halt",
+            ),
+            pytest.param(lambda: InputGuardrailTripwireTriggered(MagicMock()), id="input_guardrail"),
+            pytest.param(lambda: OutputGuardrailTripwireTriggered(MagicMock()), id="output_guardrail"),
+            pytest.param(CopilotTotalTimeoutError, id="total_timeout"),
+            pytest.param(lambda: MaxTurnsExceeded("max turns"), id="max_turns"),
+        ],
+    )
+    async def test_routine_terminal_exception_is_logged_as_stopped_not_failed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        exception_factory: Callable[[], Exception],
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        terminal_error = exception_factory()
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            AsyncMock(side_effect=terminal_error),
+        )
+
+        with capture_logs() as logs:
+            with pytest.raises(type(terminal_error)):
+                await agent_module._run_agent_loop_with_surface(
+                    ctx=_ctx(),
+                    stream=MagicMock(),
+                    chat_id="chat-1",
+                    initial_input="hello",
+                    system_prompt="system prompt",
+                    model_name="model-PRIMARY",
+                    run_config=MagicMock(),
+                    llm_key="PRIMARY",
+                    copilot_config=CopilotConfig(),
+                    native_tools=[],
+                    alias_map={},
+                    overlays={},
+                    output_guardrails=[],
+                )
+
+        assert not any(entry.get("event") == "Copilot agent model attempt failed" for entry in logs)
+        stopped = [entry for entry in logs if entry.get("event") == "Copilot agent model attempt stopped"]
+        assert len(stopped) == 1
+        assert stopped[0]["attempt_outcome"] == "terminal"
+        assert stopped[0]["error_type"] == type(terminal_error).__name__
+        assert stopped[0]["log_level"] == "info"
 
     @pytest.mark.asyncio
     async def test_run_copilot_agent_retries_retriable_failure_with_fallback(
@@ -5332,7 +5701,7 @@ class TestCopilotConfig:
         result = await agent_module.run_copilot_agent(
             stream=MagicMock(),
             organization_id="org-1",
-            chat_request=SimpleNamespace(
+            chat_request=WorkflowCopilotChatRequest(
                 message="build it",
                 workflow_id="wf-1",
                 workflow_permanent_id="wfp-1",
@@ -5341,6 +5710,7 @@ class TestCopilotConfig:
                 workflow_yaml="",
                 browser_session_id=None,
                 product_action=None,
+                selected_connected_account_id=None,
             ),
             chat_history=[],
             global_llm_context=None,
@@ -5357,6 +5727,242 @@ class TestCopilotConfig:
         assert run_with_enforcement.await_count == 2
         for call in run_with_enforcement.await_args_list:
             assert not getattr(call.kwargs["agent"], "input_guardrails", None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fallback_enabled", [True, False])
+    async def test_empty_completion_fallback_and_truthful_exhaustion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fallback_enabled: bool,
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        def fake_resolve_model_config(_handler, *, copilot_config=None, llm_key_override=None):
+            del copilot_config
+            key = llm_key_override or "PRIMARY"
+            return f"model-{key}", object(), key, True
+
+        fallback_result = (
+            _fake_run_result({"type": "REPLY", "user_response": "fallback reply"})
+            if fallback_enabled
+            else SimpleNamespace(final_output="", new_items=[])
+        )
+        run_with_enforcement = AsyncMock(side_effect=[SimpleNamespace(final_output="", new_items=[]), fallback_result])
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        with capture_logs() as logs:
+            result = await agent_module.run_copilot_agent(
+                stream=MagicMock(),
+                organization_id="org-1",
+                chat_request=WorkflowCopilotChatRequest(
+                    message="hello",
+                    workflow_id="wf-1",
+                    workflow_permanent_id="wfp-1",
+                    workflow_copilot_chat_id="chat-1",
+                    workflow_run_id=None,
+                    workflow_yaml="",
+                    browser_session_id=None,
+                    product_action=None,
+                ),
+                chat_history=[],
+                global_llm_context=None,
+                llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+                raw_secret_safety_handler=AsyncMock(
+                    return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+                ),
+                api_key="sk-test",
+                config=CopilotConfig(fallback_llm_key="SECONDARY"),
+            )
+
+        assert run_with_enforcement.await_count == 2
+        attempt_logs = [
+            entry
+            for entry in logs
+            if entry.get("event") in {"Copilot agent model attempt failed", "Copilot agent model attempt succeeded"}
+        ]
+        assert [entry["attempt_outcome"] for entry in attempt_logs] == [
+            "empty_completion",
+            "success" if fallback_enabled else "empty_completion",
+        ]
+        for entry in attempt_logs:
+            assert {"finish_reason", "incomplete_details", "refusal", "content_filter", "usage_missing"} <= entry.keys()
+        if fallback_enabled:
+            assert result.user_response == "fallback reply"
+            return
+        assert result.user_response == "The model produced no response and nothing in the workflow was changed."
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.reason_code == "empty_completion"
+        assert result.turn_outcome.terminal_reason == "empty_completion"
+        assert result.terminal_envelope is not None
+        assert result.terminal_envelope["terminal_cause"] == "empty_completion"
+        assert result.terminal_envelope["next_state"] == "stopped"
+        assert result.terminal_envelope["response_kind"] == "stopped"
+        assert result.terminal_envelope["verified"] is False
+        assert result.terminal_envelope["workflow_applied"] is False
+        assert result.terminal_envelope["proposal_present"] is False
+
+    @pytest.mark.asyncio
+    async def test_empty_completion_without_distinct_fallback_terminates_immediately(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            lambda _handler, **_kwargs: ("model-PRIMARY", object(), "PRIMARY", True),
+        )
+        run_with_enforcement = AsyncMock(return_value=SimpleNamespace(final_output="", new_items=[]))
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                message="hello",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_run_id=None,
+                workflow_yaml="",
+                browser_session_id=None,
+                product_action=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key=None),
+        )
+
+        assert run_with_enforcement.await_count == 1
+        assert result.user_response == "The model produced no response and nothing in the workflow was changed."
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.terminal_reason == "empty_completion"
+
+    def test_empty_completion_terminal_acknowledges_new_staged_workflow(self) -> None:
+        ctx = _ctx()
+        ctx.has_staged_proposal = True
+        ctx.staged_workflow = MagicMock()
+        ctx.staged_workflow_yaml = "workflow_definition:\n  parameters: []\n  blocks: []"
+
+        result = agent_module._build_empty_completion_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response == "The model produced no response after the workflow was changed."
+        assert result.updated_workflow is ctx.staged_workflow
+
+    @pytest.mark.asyncio
+    async def test_empty_completion_terminal_preserves_preexisting_staged_proposal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        staged_workflow = MagicMock()
+        staged_yaml = "workflow_definition:\n  parameters: []\n  blocks: []"
+
+        async def restore_proposal(ctx):
+            ctx.staged_workflow = staged_workflow
+            ctx.staged_workflow_yaml = staged_yaml
+            ctx.last_workflow = staged_workflow
+            ctx.last_workflow_yaml = staged_yaml
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent.restore_pending_workflow_proposal",
+            restore_proposal,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            lambda _handler, **_kwargs: ("model-PRIMARY", object(), "PRIMARY", True),
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            AsyncMock(return_value=SimpleNamespace(final_output="", new_items=[])),
+        )
+
+        result = await agent_module.run_copilot_agent(
+            stream=MagicMock(),
+            organization_id="org-1",
+            chat_request=WorkflowCopilotChatRequest(
+                message="hello",
+                workflow_id="wf-1",
+                workflow_permanent_id="wfp-1",
+                workflow_copilot_chat_id="chat-1",
+                workflow_run_id=None,
+                workflow_yaml="",
+                browser_session_id=None,
+                product_action=None,
+            ),
+            chat_history=[],
+            global_llm_context=None,
+            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
+            api_key="sk-test",
+            config=CopilotConfig(fallback_llm_key=None),
+        )
+
+        assert result.user_response == "The model produced no response and nothing in the workflow was changed."
+        assert result.updated_workflow is None
+        assert result.has_staged_proposal is False
+        assert result.staged_workflow is None
+        assert result.staged_workflow_yaml is None
+        assert result.proposal_disposition == "no_proposal"
+        assert result.terminal_envelope is not None
+        assert result.terminal_envelope["proposal_present"] is False
 
 
 class TestRequestPolicyTranscriptContext:
@@ -5378,6 +5984,27 @@ class TestRequestPolicyTranscriptContext:
         assert transcript.earliest_user_turn == "log into example.com"
         assert transcript.latest_prior_user_turn == "log into example.com"
         assert transcript.latest_assistant_turn == "(none)"
+
+    def test_a_product_opened_chat_anchors_the_receipt_as_a_user_turn(self) -> None:
+        transcript = build_transcript_context(
+            _history(
+                ("product", "Diagnose run wr_1 and repair the workflow."),
+                ("ai", "The login block timed out."),
+            ),
+            current_user_message="fix it then",
+        )
+
+        assert transcript.earliest_user_turn == "Diagnose run wr_1 and repair the workflow."
+        assert transcript.latest_prior_user_turn == "Diagnose run wr_1 and repair the workflow."
+        assert "assistant: Diagnose run" not in transcript.retained_history
+
+    def test_a_product_receipt_already_in_history_is_not_replayed_as_the_current_turn(self) -> None:
+        """The opener row and the turn being served are the same bytes, so one of them has to go."""
+        receipt = "Diagnose run wr_1 and repair the workflow."
+        transcript = build_transcript_context(_history(("product", receipt)), current_user_message=receipt)
+
+        assert transcript.earliest_user_turn == "(none)"
+        assert receipt not in transcript.retained_history
 
     def test_multi_turn_history_populates_all_anchors_without_duplicating_in_retained(self) -> None:
         transcript = build_transcript_context(
@@ -6713,8 +7340,6 @@ workflow_definition:
     @pytest.mark.parametrize(
         ("tested_reply", "unvalidated_reply"),
         [
-            (agent_module._TIMEOUT_REPLY_TESTED, agent_module._TIMEOUT_REPLY_UNVALIDATED),
-            (agent_module._MAX_TURNS_REPLY_TESTED, agent_module._MAX_TURNS_REPLY_UNVALIDATED),
             (agent_module._UNEXPECTED_ERROR_REPLY_TESTED, agent_module._UNEXPECTED_ERROR_REPLY_UNVALIDATED),
             (agent_module._CANCEL_REPLY_TESTED, agent_module._CANCEL_REPLY_UNVALIDATED),
         ],
@@ -6765,12 +7390,12 @@ workflow_definition:
             ctx,
             None,
             default_reply="No draft.",
-            unvalidated_reply=agent_module._TIMEOUT_REPLY_UNVALIDATED,
-            tested_reply=agent_module._TIMEOUT_REPLY_TESTED,
+            unvalidated_reply="Draft available for review.",
+            tested_reply="Tested draft available for review.",
             terminal_reason="max_turns",
         )
 
-        assert result.user_response == agent_module._TIMEOUT_REPLY_TESTED
+        assert result.user_response == "Tested draft available for review."
         assert result.proposal_disposition == "review_tested"
 
     def test_a_renamed_block_reports_unknown_coverage_and_drops_the_tested_claim(self) -> None:
@@ -6816,8 +7441,8 @@ workflow_definition:
             ctx,
             None,
             default_reply="No draft.",
-            unvalidated_reply=agent_module._TIMEOUT_REPLY_UNVALIDATED,
-            tested_reply=agent_module._TIMEOUT_REPLY_TESTED,
+            unvalidated_reply="Draft available for review.",
+            tested_reply="Tested draft available for review.",
             terminal_reason="max_turns",
         )
 
@@ -6842,11 +7467,23 @@ workflow_definition:
             ctx,
             None,
             default_reply="No draft.",
-            unvalidated_reply=agent_module._TIMEOUT_REPLY_UNVALIDATED,
-            tested_reply=agent_module._TIMEOUT_REPLY_TESTED,
+            unvalidated_reply="Draft available for review.",
+            tested_reply="Tested draft available for review.",
             terminal_reason="max_turns",
         )
 
         assert result.updated_workflow is good
         assert "tested draft" not in result.user_response
         assert result.proposal_disposition == "review_untested"
+
+
+def test_a_superseded_turns_report_reads_as_superseded_rather_than_a_failed_or_cancelled_test() -> None:
+    ctx = _ctx()
+    halt = TurnHalt(kind=TurnHaltKind.BUILD_TEST_SUPERSEDED, run_refs={"workflow_run_id": "wr_prior"})
+
+    message = agent_module._build_turn_halt_exit_result(ctx, None, halt).user_response
+
+    assert INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE in message
+    assert "fail" not in message.lower()
+    assert "cancelled by user" not in message.lower()
+    assert INTERRUPTED_TERMINAL_RETRY not in message

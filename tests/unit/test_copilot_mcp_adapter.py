@@ -39,6 +39,9 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_page_custody_lock,
     mcp_to_copilot,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    clear_session_scrub_values,
+)
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -47,8 +50,13 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserRetirement,
     BrowserRetirementReason,
 )
-from tests.unit.copilot_test_helpers import make_copilot_ctx
-from tests.unit.test_copilot_secret_scrub import _make_server
+from tests.unit.copilot_test_helpers import (
+    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    make_copilot_ctx,
+    remove_sensitive_disclosure_prerequisite,
+    taint_by_terminal_run,
+)
+from tests.unit.test_copilot_secret_scrub import _FakeClient, _make_server
 
 
 def _schema() -> dict:
@@ -93,7 +101,7 @@ def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: p
         SimpleNamespace(redact_codeblock_parameter_values=redact),
     )
 
-    scrubbed = mcp_adapter._scrub_tool_result(
+    scrubbed = mcp_adapter.scrub_model_facing_tool_result(
         ctx,
         {"ok": True, "data": {"url": f"https://example.test/callback?payload={encoded}"}},
     )
@@ -2392,3 +2400,77 @@ async def test_a_call_aimed_at_an_unavailable_browser_never_dispatches() -> None
     # The refusal names the target it could not honour; a later failure would not.
     assert payload.get("browser_target") == "last_run"
     assert "recorded a browser" in payload["error"]
+
+
+def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> SkyvernOverlayMCPServer:
+    aliases = get_skyvern_mcp_alias_map()
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={"click": _build_skyvern_mcp_overlays()["click"]},
+        alias_map={"click": aliases["click"]},
+        allowlist=frozenset({aliases["click"]}),
+        context_provider=lambda: ctx,
+    )
+    server._client = _FakeClient(payload)
+    return server
+
+
+def _sensitive_click_ctx(*, registry_complete: bool) -> AgentContext:
+    ctx = make_copilot_ctx(browser_session_id="pbs_1")
+    clear_session_scrub_values("pbs_1")
+    ctx.last_run_blocks_workflow_run_id = "wr_sensitive"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr_sensitive",
+        {"copilot_run_runtime_secret_values": ("654321",)},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=registry_complete,
+    )
+    taint_by_terminal_run(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
+    return ctx
+
+
+class TestSensitiveOriginActionContinuation:
+    @pytest.mark.asyncio
+    async def test_click_discloses_a_scrubbed_result_after_a_terminal_matching_run(
+        self, _stub_browser_session: None
+    ) -> None:
+        ctx = _sensitive_click_ctx(registry_complete=True)
+        server = _click_overlay_server(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "selector": "a.nav--analytics",
+                    "text_content": "Web analytics 654321",
+                    "url": "https://example.test/app",
+                },
+            },
+        )
+
+        result = await server.call_tool("click", {"selector": "a.nav--analytics"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is True
+        assert "654321" not in result.content[0].text
+        assert "[REDACTED_SECRET]" in result.content[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+    async def test_click_stays_withheld_when_a_disclosure_prerequisite_is_absent(
+        self, _stub_browser_session: None, arm: str
+    ) -> None:
+        # The adapter composes the predicate differently from the hooks (it also reads bare taint
+        # and the overlay flag), so every arm is pinned here too, the active-run arm included.
+        ctx = _sensitive_click_ctx(registry_complete=True)
+        remove_sensitive_disclosure_prerequisite(ctx, arm)
+        server = _click_overlay_server(
+            ctx,
+            {"ok": True, "data": {"selector": "a.nav--analytics", "text_content": "Web analytics 654321"}},
+        )
+
+        result = await server.call_tool("click", {"selector": "a.nav--analytics"})
+
+        surfaced = json.loads(result.content[0].text)
+        assert surfaced["ok"] is False
+        assert "specific named URL" in surfaced["error"]
+        assert "654321" not in result.content[0].text

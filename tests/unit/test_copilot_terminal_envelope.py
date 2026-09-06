@@ -14,9 +14,6 @@ import structlog.testing
 from skyvern.exceptions import get_user_facing_exception_message
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import _CANCEL_REPLY_UNVALIDATED
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    CopilotToolBlockerSignal,
-)
 from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestConnectFailure,
@@ -30,19 +27,21 @@ from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, r
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     CANCEL_STOP_AT_USER_REQUEST,
     INTERRUPTED_TERMINAL_HEADLINE,
+    INTERRUPTED_TERMINAL_RETRY,
+    INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
     MINIMAL_CANCEL_STOP,
     MINIMAL_HONEST_STOP,
-    QUESTION_PART_TEXT_LIMIT,
     UNTESTED_DRAFT_PRESERVED,
     InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
-    admit_question_parts,
     assemble_terminal_envelope,
     chat_awaits_user_input,
     finalize_applied_state,
     interim_run_start_outcome,
+    interrupted_terminal_envelope,
     is_interim_run_outcome,
     reason_in_reply_shadow,
+    render_interrupted_message,
     render_terminal_message,
     run_start_unresolved,
     select_run_outcome_anchor,
@@ -352,6 +351,63 @@ def test_unexpected_error_exit_renders_interrupted_and_keeps_its_terminal_reason
     # Neither fact is observable at a crash site, so the copy must not state either one.
     assert "version 1" not in result.user_response
     assert "were not saved" not in result.user_response
+
+
+def test_empty_completion_is_a_supported_failed_terminal_cause() -> None:
+    envelope = TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        workflow_applied=False,
+        response_kind="stopped",
+        terminal_cause="empty_completion",
+        proposal_present=False,
+        proposal_disposition="no_proposal",
+    )
+
+    assert envelope.terminal_cause == "empty_completion"
+    assert envelope.verified is False
+    assert envelope.workflow_applied is False
+    assert envelope.proposal_present is False
+
+
+def test_interrupted_envelope_names_the_run_the_turn_was_testing() -> None:
+    envelope = interrupted_terminal_envelope(InterruptedTurnFacts(workflow_permanent_id="wpid_1", run_id="wr_prior"))
+
+    assert envelope.run_id == "wr_prior"
+    assert envelope.interruption is not None
+    assert envelope.interruption.run_id == "wr_prior"
+
+
+def test_superseded_interruption_never_asks_for_the_message_again() -> None:
+    facts = InterruptedTurnFacts(workflow_permanent_id="wpid_1", run_id="wr_prior")
+
+    assert render_interrupted_message(facts).endswith(INTERRUPTED_TERMINAL_RETRY)
+
+    superseded = render_interrupted_message(facts.model_copy(update={"superseded_by_newer_test": True}))
+
+    assert superseded.startswith(INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE)
+    assert INTERRUPTED_TERMINAL_RETRY not in superseded
+    assert INTERRUPTED_TERMINAL_HEADLINE not in superseded
+    assert "Cancelled by user." not in superseded
+
+
+def test_crash_exit_interruption_names_the_run_it_was_testing() -> None:
+    ctx = make_copilot_ctx(
+        latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_crash",
+            failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
+        ),
+        last_workflow=SimpleNamespace(version=1),
+    )
+
+    result = agent_module._build_unexpected_error_exit_result(ctx, None, error=RuntimeError("boom"))
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["interruption"]["run_id"] == "wr_crash"
 
 
 def test_connect_failure_still_outranks_a_crash_exit() -> None:
@@ -1260,21 +1316,28 @@ def test_render_terminal_message_keeps_answer_kind_replies_on_stopped_state() ->
     assert replaced is False
 
 
-def test_render_terminal_message_keeps_deadline_copy_on_stopped_fallthrough() -> None:
+@pytest.mark.parametrize("terminal_cause", ["deadline_expired", "max_turns_exceeded"])
+@pytest.mark.parametrize("message", ["I saved the draft after the browser failed.", ""])
+def test_budget_report_preserved_after_browser_failure(terminal_cause: str, message: str) -> None:
     envelope = _assemble(
-        proposal_disposition="auto_applicable",
-        run_outcomes=[],
-        terminal_cause="deadline_expired",
+        terminal_cause=terminal_cause,
+        failed_operation=BuildTestFailedOperation(kind="browser_operation_failed"),
     )
-    message = agent_module._TIMEOUT_REPLY_DEFAULT
 
     rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
 
-    assert envelope.next_state == "stopped"
-    assert envelope.response_kind == "stopped"
-    assert rendered.startswith(message)
-    assert rendered != "I stopped without confirming the goal was met."
-    assert replaced is True
+    assert rendered == message
+    assert replaced is False
+
+
+def test_render_terminal_message_keeps_model_budget_report_unchanged() -> None:
+    envelope = _assemble(terminal_cause="deadline_expired")
+    message = "I saved the useful draft and stopped before another run."
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert rendered == message
+    assert replaced is False
 
 
 def test_render_terminal_message_under_budget_stop_keeps_the_reply_and_names_the_unevaluated_outcome() -> None:
@@ -1296,27 +1359,6 @@ def test_render_terminal_message_under_budget_stop_keeps_the_reply_and_names_the
     assert "The latest recorded run completed." not in rendered
 
 
-def test_render_terminal_message_held_draft_text_survives_with_deadline_cause() -> None:
-    envelope = _assemble(proposal_disposition="review_untested", terminal_cause="deadline_expired")
-    message = agent_module._TIMEOUT_REPLY_UNVALIDATED
-
-    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
-
-    assert envelope.next_state == "proposal_pending"
-    assert rendered.startswith(message)
-    assert replaced is True
-
-
-def test_render_terminal_message_held_draft_unreplaced_without_deadline_cause() -> None:
-    envelope = _assemble(proposal_disposition="review_untested")
-    message = agent_module._TIMEOUT_REPLY_UNVALIDATED
-
-    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
-
-    assert rendered == message
-    assert replaced is False
-
-
 def test_render_terminal_message_cancelled_turn_ignores_deadline_cause() -> None:
     envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
 
@@ -1324,51 +1366,6 @@ def test_render_terminal_message_cancelled_turn_ignores_deadline_cause() -> None
 
     assert rendered.startswith("cancelled-text")
     assert "time limit" not in rendered
-
-
-def test_render_terminal_message_completed_turn_is_not_stamped_by_deadline_cause() -> None:
-    # replaced=True overwrites a distinct narrativeSummary downstream, so an
-    # applied turn that happens to expire must not be stamped with its own text.
-    envelope = _assemble(
-        verified=True,
-        workflow_applied=True,
-        proposal_disposition="auto_applicable",
-        terminal_cause="deadline_expired",
-    )
-    message = agent_module._TIMEOUT_REPLY_TESTED
-
-    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
-
-    assert envelope.next_state == "completed"
-    assert rendered == message
-    assert replaced is False
-
-
-def test_run_without_output_projects_unverified_blocker_never_success() -> None:
-    blocker = "The run stayed queued and produced no terminal result before the deadline."
-    envelope = _assemble(
-        proposal_disposition="auto_applicable",
-        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", output_report=None)],
-        blocker_reason=blocker,
-        halt_kind="deadline_expired",
-        terminal_cause="deadline_expired",
-    )
-    finalized = finalize_applied_state(envelope, applied=False)
-
-    rendered, replaced = render_terminal_message(finalized, agent_module._TIMEOUT_REPLY_DEFAULT, cancelled=False)
-
-    assert finalized.verified is False
-    assert finalized.workflow_applied is False
-    assert finalized.next_state == "stopped"
-    assert finalized.response_kind == "stopped"
-    assert finalized.run_output_report is None
-    assert finalized.blocker_reason == blocker
-    assert rendered.startswith(agent_module._TIMEOUT_REPLY_DEFAULT)
-    assert "The recorded run's outcome was not evaluated." in rendered
-    assert "The turn reached its time limit." in rendered
-    assert replaced is True
-    assert "completed" not in rendered.lower()
-    assert "success" not in rendered.lower()
 
 
 def test_deadline_cause_survives_envelope_round_trip() -> None:
@@ -1381,37 +1378,7 @@ def test_deadline_cause_survives_envelope_round_trip() -> None:
     assert finalized.model_dump(mode="json")["terminal_cause"] == "deadline_expired"
 
 
-def test_envelope_carries_deadline_cause_when_blocker_override_rewrote_the_reason() -> None:
-    ctx = make_copilot_ctx()
-    ctx.copilot_total_timeout_exceeded = True
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="authority_denied",
-        agent_steering_text="Reply without updating the workflow.",
-        user_facing_reason="I can't update or run this workflow on this turn.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code="no_mutation_run_blocked",
-        blocked_tool="update_workflow",
-    )
-
-    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.terminal_reason != "timeout"
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
-
-
-def test_envelope_has_no_cause_when_deadline_did_not_expire() -> None:
-    ctx = make_copilot_ctx()
-    ctx.copilot_total_timeout_exceeded = False
-
-    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
-
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] is None
-
-
-def test_max_turns_exit_types_the_cause_and_logs_the_backstop_fields() -> None:
+def test_max_turns_drain_exhaustion_types_the_cause_and_logs_the_backstop_fields() -> None:
     ctx = make_copilot_ctx()
     ctx.copilot_config = CopilotConfig()
     ctx.copilot_run_start_monotonic = time.monotonic() - 12.0
@@ -1419,7 +1386,8 @@ def test_max_turns_exit_types_the_cause_and_logs_the_backstop_fields() -> None:
     ctx.model_calls_this_turn = 12
 
     with structlog.testing.capture_logs() as logs:
-        result = agent_module._handle_max_turns_exceeded(ctx, global_llm_context=None)
+        ctx.budget_expiry_state.source = "max_turns"
+        result = agent_module._handle_budget_drain_exhausted(ctx, global_llm_context=None)
 
     assert ctx.copilot_max_turns_exceeded is True
     assert result.terminal_envelope is not None
@@ -1433,7 +1401,7 @@ def test_max_turns_exit_types_the_cause_and_logs_the_backstop_fields() -> None:
     assert backstop_logs[0]["elapsed_seconds"] == pytest.approx(12.0, abs=1.0)
 
 
-def test_max_turns_exit_without_deadline_is_not_an_untyped_stop() -> None:
+def test_max_turns_exit_is_typed_no_report() -> None:
     ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     ctx.copilot_max_turns_exceeded = True
@@ -1441,101 +1409,10 @@ def test_max_turns_exit_without_deadline_is_not_an_untyped_stop() -> None:
     result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
 
     assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] is not None
     assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
-
-
-def test_deadline_wins_when_both_capacity_latches_are_set() -> None:
-    ctx = make_copilot_ctx()
-    ctx.copilot_total_timeout_exceeded = True
-    ctx.copilot_max_turns_exceeded = True
-
-    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
-
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
-
-
-def test_max_turns_exit_has_no_cause_when_neither_latch_is_set() -> None:
-    ctx = make_copilot_ctx()
-    ctx.copilot_total_timeout_exceeded = False
-    ctx.copilot_max_turns_exceeded = False
-
-    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
-
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] is None
-
-
-def test_a_deadline_turn_states_blocks_run_evaluation_and_the_time_limit() -> None:
-    envelope = _assemble(
-        proposal_disposition="review_tested",
-        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", run_completed=True)],
-        terminal_cause="deadline_expired",
-        blocks_run_this_turn=1,
-    )
-
-    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
-
-    assert "1 block ran this turn." in rendered
-    assert "The recorded run completed, and its outcome was not evaluated." in rendered
-    assert "reached its time limit" in rendered
-    assert "failed" not in rendered.lower()
-    assert replaced is True
-
-
-def test_an_unevaluated_outcome_alone_never_claims_the_run_finished() -> None:
-    envelope = _assemble(
-        proposal_disposition="review_tested",
-        run_outcomes=[_run_outcome("not_evaluated")],
-        terminal_cause="deadline_expired",
-        blocks_run_this_turn=1,
-    )
-
-    rendered, _ = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
-
-    assert "The recorded run's outcome was not evaluated." in rendered
-    assert "run completed" not in rendered
-
-
-@pytest.mark.parametrize("run_outcomes", [[], [_run_outcome("evaluating")]])
-def test_a_deadline_turn_without_a_settled_verdict_states_only_what_it_knows(
-    run_outcomes: list[RecordedRunOutcome],
-) -> None:
-    envelope = _assemble(
-        proposal_disposition="review_tested",
-        run_outcomes=run_outcomes,
-        terminal_cause="deadline_expired",
-        blocks_run_this_turn=2,
-    )
-
-    rendered, _ = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
-
-    assert "2 blocks ran this turn." in rendered
-    assert "reached its time limit" in rendered
-    assert "not evaluated" not in rendered
-
-
-def test_a_deadline_turn_with_no_run_facts_leaves_the_agent_copy_alone() -> None:
-    envelope = _assemble(proposal_disposition="review_tested", terminal_cause="deadline_expired")
-
-    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_UNVALIDATED, cancelled=False)
-
-    assert rendered == agent_module._TIMEOUT_REPLY_UNVALIDATED
-    assert replaced is True
-
-
-def test_a_deadline_turn_omits_the_block_count_it_was_never_given() -> None:
-    envelope = _assemble(
-        proposal_disposition="review_tested",
-        run_outcomes=[_run_outcome("not_evaluated")],
-        terminal_cause="deadline_expired",
-    )
-
-    rendered, _ = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_TESTED, cancelled=False)
-
-    assert "ran this turn" not in rendered
-    assert "reached its time limit" in rendered
+    assert result.user_response == ""
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.budget_expiry_report_produced is False
 
 
 def test_the_envelope_carries_the_recorded_run_id() -> None:
@@ -1744,25 +1621,6 @@ def test_only_a_stop_click_is_reported_as_the_user_asking() -> None:
     drafted = render_terminal_message(with_draft, _CANCEL_REPLY_UNVALIDATED, cancelled=True)[0]
     assert drafted.startswith(CANCEL_STOP_AT_USER_REQUEST)
     assert UNTESTED_DRAFT_PRESERVED in drafted
-
-
-def test_admission_keeps_only_parts_the_server_can_vouch_for() -> None:
-    parts = admit_question_parts(
-        [
-            {"prompt": "Which store?", "choices": ["Acme", "Borough", "Acme", 7]},
-            "not a part",
-            {"prompt": "Which email?", "choices": []},
-            {"choices": ["no prompt"]},
-            {"prompt": "x" * (QUESTION_PART_TEXT_LIMIT + 1), "choices": ["kept out with its part"]},
-            {"prompt": "Which day?", "choices": ["Monday", "y" * (QUESTION_PART_TEXT_LIMIT + 1)]},
-        ]
-    )
-
-    assert [(part.part_id, part.prompt, part.choices) for part in parts] == [
-        ("p1", "Which store?", ["Acme", "Borough"]),
-        ("p2", "Which email?", []),
-        ("p3", "Which day?", ["Monday"]),
-    ]
 
 
 def _asking_row(**overrides: Any) -> dict[str, Any]:

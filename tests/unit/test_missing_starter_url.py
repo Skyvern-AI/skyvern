@@ -93,7 +93,8 @@ def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
     database.organizations = organizations_db
     database.observer = observer_db
 
-    task = SimpleNamespace(task_id="tsk_test", status=TaskStatus.failed)
+    # workflow_run_id is on the real Task; the block failure handler keys its secret lookup on it.
+    task = SimpleNamespace(task_id="tsk_test", status=TaskStatus.failed, workflow_run_id="wr_test")
     step = SimpleNamespace(step_id="stp_test")
 
     agent = MagicMock()

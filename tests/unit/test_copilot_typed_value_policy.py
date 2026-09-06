@@ -13,6 +13,7 @@ async def test_type_text_uses_exact_registered_secret_fact_and_stashes_ordinary_
     ctx = SimpleNamespace(
         organization_id="o",
         browser_session_id=None,
+        last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
         pending_scout_input_value=None,
         discovery_mcp_server=None,
@@ -39,6 +40,7 @@ async def test_type_text_pre_hook_does_not_infer_secret_status_from_text_selecto
     ctx = SimpleNamespace(
         organization_id="o",
         browser_session_id=None,
+        last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
         pending_scout_input_value=None,
         discovery_mcp_server=None,

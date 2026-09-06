@@ -29,20 +29,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException, status
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _build_exit_result
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, StructuredContext
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.terminal_envelope import INTERRUPTED_TERMINAL_REASON, MINIMAL_CANCEL_STOP
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_CANCEL_TTL,
     USER_CANCELLED_TERMINAL_REASON,
     _assistant_row_exists_for_turn,
+    _build_recoverable_route_agent_result,
     _coerce_cancel_source,
     _copilot_cancel_key,
     _make_error_narrative_payload,
     _persist_cancel_turn,
     _persist_proposed_workflow_state,
+    _prior_global_llm_context,
     _watch_for_cancel,
     workflow_copilot_cancel,
     workflow_copilot_chat_post,
@@ -50,6 +51,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCancelRequest,
+    WorkflowCopilotChat,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
@@ -243,7 +245,6 @@ async def _drive_cancel_route(
     user_cancel: bool = True,
 ) -> tuple[AsyncMock, SimpleNamespace, list[Any]]:
     """Run a single chat-post + handler turn and return (restore_mock, workflow_params, sent_payloads)."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
     restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     if user_cancel:
@@ -690,7 +691,6 @@ async def test_route_cancel_clears_stale_proposal_when_rollback_itself_fails(
 ) -> None:
     """A failed rollback leaves canonical's state unverified — keep_pending_proposal
     must not be honored against an assumption ("nothing changed") that didn't hold."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
     chat = _make_chat(
         proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
@@ -762,10 +762,79 @@ async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
         original_workflow=None,
         user_message="please update",
         agent_result=None,
+        effective_mode="build",
+        code_available=True,
     )
 
     workflow_params.update_workflow_copilot_chat.assert_awaited_once()
     assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+    outcome = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["turn_outcome"]
+    assert outcome.copilot_effective_mode == "build"
+    assert outcome.copilot_code_available is True
+
+
+def _context_holding_a_credential_proposal() -> str:
+    return StructuredContext(
+        user_goal="log in and download the bill",
+        proposed_credential=ProposedCredential(
+            credential_id="cred_saved_login",
+            admitted_url="https://portal.example.test/login",
+        ),
+    ).to_json_str()
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_drops_the_one_turn_credential_proposal() -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="stop",
+        agent_result=None,
+        prior_global_llm_context=_context_holding_a_credential_proposal(),
+    )
+
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["global_llm_context"]
+    assert StructuredContext.from_json_str(persisted).proposed_credential is None
+    assert StructuredContext.from_json_str(persisted).user_goal == "log in and download the bill"
+
+
+def test_a_turn_carries_the_prior_credential_proposal_into_its_policy() -> None:
+    messages = [SimpleNamespace(global_llm_context=_context_holding_a_credential_proposal(), turn_outcome=object())]
+
+    carried = _prior_global_llm_context(messages)
+
+    proposal = StructuredContext.from_json_str(carried).proposed_credential
+    assert proposal is not None
+    assert proposal.credential_id == "cred_saved_login"
+
+
+def test_a_recoverable_failure_drops_the_one_turn_credential_proposal() -> None:
+    agent_result, _ = _build_recoverable_route_agent_result(
+        RuntimeError("boom"),
+        workflow_modified=False,
+        clear_proposed_workflow=False,
+        global_llm_context=_context_holding_a_credential_proposal(),
+    )
+
+    assert StructuredContext.from_json_str(agent_result.global_llm_context).proposed_credential is None
 
 
 @pytest.mark.asyncio
@@ -888,7 +957,6 @@ async def test_timeout_wip_result_streams_normal_response_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Timeout WIP rescue must use normal finalisation, not the cancel ERROR path."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -1019,7 +1087,6 @@ async def test_timeout_wip_review_tested_propagates_to_response_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-cancel WIP rescue propagates ``review_tested`` so the frontend skips auto-apply."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -1198,7 +1265,6 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """task.cancel() without user_cancel_observed[0] -> an interrupted row, never a user-cancel row."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
@@ -1291,11 +1357,14 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
 @pytest.mark.asyncio
 async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -> None:
     """Without a turn-stamped outcome, reconcile would append an interrupted row beside the cancel."""
-    chat = SimpleNamespace(
+    chat = WorkflowCopilotChat(
         organization_id="org-1",
+        workflow_permanent_id="wpid-1",
         workflow_copilot_chat_id="chat-1",
         proposed_workflow=None,
         auto_accept=False,
+        created_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
+        modified_at=datetime(2026, 4, 27, tzinfo=timezone.utc),
     )
     persisted: list[SimpleNamespace] = []
 
@@ -1310,6 +1379,7 @@ async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -
         return row
 
     workflow_params = SimpleNamespace(
+        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
         update_workflow_copilot_chat=AsyncMock(),
         create_workflow_copilot_chat_message=capture_message,
         clear_pending_copilot_turn=AsyncMock(),
@@ -1335,6 +1405,7 @@ async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -
     assert len(assistant_rows) == 1
     outcome = assistant_rows[0].turn_outcome
     assert outcome is not None
+    assert outcome.copilot_runtime == "agent"
     assert outcome.copilot_turn_id == "turn-a"
     assert outcome.terminal_reason == USER_CANCELLED_TERMINAL_REASON
     assert outcome.terminal_reason != "interrupted"
@@ -1352,7 +1423,6 @@ async def test_cancel_during_shielded_finalisation_does_not_write_a_second_row(
     The finalise keeps running when the cancel raises at its await, so both writers would
     otherwise reach the read-then-create idempotency check, see no existing row, and insert.
     """
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
     chat = _make_chat(auto_accept=False)
     original_workflow = _make_original_workflow()

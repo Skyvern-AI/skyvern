@@ -27,7 +27,9 @@ from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
+    current_model_attempt_telemetry,
     current_model_call_telemetry,
+    model_attempt_telemetry_scope,
     model_call_telemetry_scope,
 )
 from skyvern.forge.sdk.copilot.pending_operation import (
@@ -36,6 +38,7 @@ from skyvern.forge.sdk.copilot.pending_operation import (
     pending_operation,
     pending_operation_fields,
 )
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
 @pytest.fixture(autouse=True)
@@ -467,6 +470,95 @@ async def test_missing_usage_is_nonfatal_and_context_resets(monkeypatch: pytest.
 
     assert result.output
     assert current_model_call_telemetry() is None
+
+
+@pytest.mark.asyncio
+async def test_attempt_telemetry_captures_stop_metadata_and_missing_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _completion()
+    response.usage = None
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse:
+        return response
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    with model_attempt_telemetry_scope() as attempt:
+        await _get_response(CopilotLitellmModel(model="openai/gpt-5.6", next_model_call_index=lambda: 7))
+
+    assert attempt.latest_stop_metadata.model_call_index == 7
+    assert attempt.latest_stop_metadata.finish_reason == "stop"
+    assert attempt.latest_stop_metadata.incomplete_details is None
+    assert attempt.latest_stop_metadata.refusal is False
+    assert attempt.latest_stop_metadata.content_filter is False
+    assert attempt.latest_stop_metadata.usage_missing is True
+    assert current_model_attempt_telemetry() is None
+
+
+def test_responses_stop_metadata_captures_incomplete_filter_and_refusal() -> None:
+    response = _responses_completion()
+    response.status = "incomplete"
+    response.incomplete_details = {"reason": "content_filter"}
+    response.output = [
+        {
+            "id": "msg-refusal",
+            "type": "message",
+            "role": "assistant",
+            "status": "incomplete",
+            "content": [{"type": "refusal", "refusal": "not available"}],
+        }
+    ]
+    telemetry = model_telemetry_module.CopilotModelCallTelemetry(model_call_index=8)
+
+    model_telemetry_module._capture_responses_stop_metadata(telemetry, response)
+
+    assert telemetry.incomplete_details == {"reason": "content_filter"}
+    assert telemetry.content_filter is True
+    assert telemetry.refusal is True
+
+
+def test_chat_stop_metadata_captures_direct_refusal() -> None:
+    telemetry = model_telemetry_module.CopilotModelCallTelemetry(model_call_index=9)
+
+    model_telemetry_module._capture_chat_stop_metadata(
+        telemetry,
+        {"choices": [{"finish_reason": "stop", "message": {"refusal": "not available"}}]},
+    )
+
+    assert telemetry.finish_reason == "stop"
+    assert telemetry.content_filter is False
+    assert telemetry.refusal is True
+
+
+def test_attempt_telemetry_keeps_only_the_latest_model_call() -> None:
+    with model_attempt_telemetry_scope() as attempt:
+        with model_call_telemetry_scope(1) as first:
+            first.finish_reason = "length"
+        with model_call_telemetry_scope(2) as second:
+            second.finish_reason = "content_filter"
+            second.content_filter = True
+
+    assert attempt.latest_stop_metadata.model_call_index == 2
+    assert attempt.latest_stop_metadata.finish_reason == "content_filter"
+    assert attempt.latest_stop_metadata.content_filter is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_attempt_stop_metadata_is_isolated() -> None:
+    release = asyncio.Event()
+
+    async def observe(index: int, reason: str) -> tuple[int, str | None]:
+        with model_attempt_telemetry_scope() as attempt, model_call_telemetry_scope(index) as call:
+            call.finish_reason = reason
+            await release.wait()
+        return attempt.latest_stop_metadata.model_call_index, attempt.latest_stop_metadata.finish_reason
+
+    first = asyncio.create_task(observe(11, "stop"))
+    second = asyncio.create_task(observe(22, "length"))
+    release.set()
+
+    assert sorted(await asyncio.gather(first, second)) == [(11, "stop"), (22, "length")]
 
 
 @pytest.mark.asyncio
@@ -1032,7 +1124,7 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
     result = await copilot_agent_module.run_copilot_agent(
         stream=MagicMock(),
         organization_id="org-1",
-        chat_request=SimpleNamespace(
+        chat_request=WorkflowCopilotChatRequest(
             message="build it",
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
@@ -1041,6 +1133,7 @@ async def test_the_result_names_the_fallback_model_that_actually_returned(
             workflow_yaml="",
             browser_session_id=None,
             product_action=None,
+            selected_connected_account_id=None,
         ),
         chat_history=[],
         global_llm_context=None,
@@ -1087,7 +1180,7 @@ async def test_model_setup_failure_does_not_claim_the_unstarted_model(
     result = await copilot_agent_module.run_copilot_agent(
         stream=MagicMock(send=AsyncMock(return_value=True)),
         organization_id="org-1",
-        chat_request=SimpleNamespace(
+        chat_request=WorkflowCopilotChatRequest(
             message="build it",
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
@@ -1096,6 +1189,7 @@ async def test_model_setup_failure_does_not_claim_the_unstarted_model(
             workflow_yaml="",
             browser_session_id=None,
             product_action=None,
+            selected_connected_account_id=None,
         ),
         chat_history=[],
         global_llm_context=None,
@@ -1175,7 +1269,7 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     result = await copilot_agent_module.run_copilot_agent(
         stream=MagicMock(send=AsyncMock(return_value=True)),
         organization_id="org-1",
-        chat_request=SimpleNamespace(
+        chat_request=WorkflowCopilotChatRequest(
             message="research it",
             workflow_id="wf-1",
             workflow_permanent_id="wfp-1",
@@ -1184,6 +1278,7 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
             workflow_yaml="",
             browser_session_id=None,
             product_action=None,
+            selected_connected_account_id=None,
         ),
         chat_history=[],
         global_llm_context=None,
@@ -1197,9 +1292,10 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     )
 
     assert result.resolved_model == expected_model
-    assert result.user_response == copilot_agent_module._BROWSER_ABLATION_TIMEOUT_REPLY_WITH_ACTIVITY
-    assert "workflow" not in result.user_response.lower()
-    assert "draft" not in result.user_response.lower()
+    assert result.user_response == ""
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.budget_expired is True
+    assert result.turn_outcome.budget_expiry_report_produced is False
     assert result.terminal_envelope is not None
     assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
     assert result.browser_ablation_metadata is not None

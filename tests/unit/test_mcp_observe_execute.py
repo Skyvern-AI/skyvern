@@ -6,7 +6,7 @@ import asyncio
 import gc
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call
 
 import pytest
 
@@ -29,9 +29,10 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.client.errors import InternalServerError
+from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS
-from tests.unit._mcp_browser_fakes import make_real_wait_for_timeout, make_session_state
+from tests.unit._mcp_browser_fakes import make_real_wait_for_timeout, make_session_state, make_skyvern_page
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -325,6 +326,7 @@ class TestDoObserve:
         frame = SimpleNamespace(
             name="payment",
             url="https://example.com/payment-frame",
+            page=page.page,
             title=AsyncMock(return_value="Payment Frame"),
             evaluate=_mock_dom_evaluate(
                 [
@@ -1210,6 +1212,26 @@ class TestSkyvernExecuteMCP:
         assert result["ok"] is False
 
     @pytest.mark.asyncio
+    async def test_execute_refuses_a_frame_owned_by_another_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pins the stale-frame arm on skyvern_execute's observe-v2 document reads.
+
+        Both reads sit in a try whose other handler is CancelledError, so without this arm the
+        refusal escapes the tool instead of becoming a structured error.
+        """
+        page = make_skyvern_page(_make_page())
+        type(page).locator_scope = PropertyMock(
+            side_effect=StaleFrameSelectionError("payment", "https://frame.example.com/")
+        )
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr(mcp_browser, "observe_v2_enabled", lambda: True)
+
+        result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"selector": "#btn"}}])
+
+        assert result["ok"] is False, result
+        assert result["error"]["code"] == mcp_browser.ErrorCode.STALE_FRAME_SELECTION, result
+
+    @pytest.mark.asyncio
     async def test_execute_dispatch_calls_tool(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="local")
@@ -1397,6 +1419,7 @@ class TestSkyvernExecuteMCP:
         frame = SimpleNamespace(
             name="payment",
             url="https://example.com/payment-frame",
+            page=page.page,
             title=AsyncMock(return_value="Payment"),
             evaluate=_mock_dom_evaluate(
                 [
@@ -1969,6 +1992,7 @@ class TestSkyvernExecuteMCP:
             click=AsyncMock(return_value="#unexpected-click"),
         )
         page.page = page
+        page.locator_scope = page
         page._working_frame = None
         ctx = BrowserContext(mode="local")
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))

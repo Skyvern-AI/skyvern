@@ -13,6 +13,7 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -394,3 +395,98 @@ async def test_fail_task_with_task_already_timed_out(agent, mock_browser_state):
             result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
 
             assert result is False
+
+
+@pytest.mark.asyncio
+async def test_fail_task_redacts_a_registered_secret_from_the_failure_reason(agent, mock_browser_state):
+    """fail_task persists failure_reason and then webhooks the task itself, and this exit is
+    reachable on v3 as well as v1 -- a run that dies by exception rather than by a model verdict
+    lands here. Redaction happens once at the top, so the detector sees the redacted string too."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Payment was declined"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.return_value = task
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = []
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = True
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    await agent.fail_task(task, step, "the portal rejected the key sk4829137765", mock_browser_state)
+
+    persisted = mock_update_task.await_args.kwargs["failure_reason"]
+    assert "sk4829137765" not in persisted
+    assert REDACTED_SECRET_PLACEHOLDER in persisted
+    # Redacted at the top, so the detector is handed the scrubbed string rather than the raw one.
+    assert "sk4829137765" not in mock_detect.await_args.kwargs["failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_fail_task_redacts_a_registered_secret_from_detector_written_errors(agent, mock_browser_state):
+    """The detector reads the page as well as the failure reason, so redacting its input is not
+    enough -- a secret typed into the form can come back in its reasoning, and task.errors ships
+    over the same webhook."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Payment was declined"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.return_value = task
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = [
+                    UserDefinedError(
+                        error_code="payment_failed",
+                        reasoning="the page showed sk4829137765 after submit",
+                        confidence_float=1.0,
+                    )
+                ]
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = True
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    await agent.fail_task(task, step, "could not continue", mock_browser_state)
+
+                    (persisted,) = mock_app.DATABASE.tasks.update_task.call_args[1]["errors"]
+
+    assert "sk4829137765" not in persisted["reasoning"]
+    assert REDACTED_SECRET_PLACEHOLDER in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_fail_task_leaves_the_failure_reason_alone_when_no_secrets_are_registered(agent, mock_browser_state):
+    """Secret values are available only through the gate; with the gate off the scrub must not run
+    at all, so a run that never opted in gets its text back unchanged."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Payment was declined"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+    raw = "the portal rejected the key sk4829137765"
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.return_value = task
+            with patch(
+                "skyvern.forge.agent.detect_user_defined_errors_for_task", new_callable=AsyncMock
+            ) as mock_detect:
+                mock_detect.return_value = []
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+                    mock_app.DATABASE.tasks.update_task = AsyncMock()
+
+                    await agent.fail_task(task, step, raw, mock_browser_state)
+
+    assert mock_update_task.await_args.kwargs["failure_reason"] == raw

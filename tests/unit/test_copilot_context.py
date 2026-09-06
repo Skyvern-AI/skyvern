@@ -317,6 +317,9 @@ def _policy_ctx(
             resolved_credentials=resolved,
             credential_input_kind=credential_input_kind,
             live_page_admitted_urls={},
+            seeded_proposal_credential_ids=set(),
+            carry_cited_credential_ids=set(),
+            current_turn_named_credential_ids=set(),
             selected_connected_account_id=selected_connected_account_id,
         ),
     )

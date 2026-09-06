@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     CopilotNonRetriableNavError,
     _extract_url_from_nav_error,
@@ -37,7 +38,24 @@ _TUNNEL_FAILURE_REASON = (
 _SOCKS_FAILURE_REASON = (
     "Failed to navigate to url https://www.example.test/. Error message: net::ERR_SOCKS_CONNECTION_FAILED"
 )
+_SOCKS_HOST_UNREACHABLE_REASON = (
+    "Failed to navigate to url https://host.example. Error message: net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE"
+)
+_DNS_FAILURE_WITH_PROXY_TOKEN_IN_URL = (
+    "Failed to navigate to url https://example.test/net::ERR_TUNNEL_CONNECTION_FAILED. "
+    "Error message: net::ERR_NAME_NOT_RESOLVED"
+)
+_CERT_FAILURE_WITH_PROXY_TOKEN_IN_URL = (
+    "Failed to navigate to url https://example.test/net::ERR_SOCKS_CONNECTION_FAILED. "
+    "Error message: net::ERR_CERT_DATE_INVALID"
+)
 _GENERIC_FAILURE_REASON = "Timeout waiting for element #submit"
+
+_PROXY_FAILURE_REPLY = (
+    "The site could not be reached through Skyvern's browser network. Error: {reason}. "
+    "Please try again later, or contact Skyvern Support if the problem continues."
+)
+_NON_PROXY_FAILURE_REPLY = "The target URL could not be reached. Error: {reason}. Please verify the URL and try again."
 
 
 def _fresh_context() -> CopilotContext:
@@ -49,6 +67,31 @@ def _fresh_context() -> CopilotContext:
         browser_session_id=None,
         stream=SimpleNamespace(),  # type: ignore[arg-type]
     )
+
+
+def _record_and_render_terminal_reply(reason: str, *, block_type: str) -> tuple[CopilotContext, AgentResult]:
+    ctx = _fresh_context()
+    ctx.test_after_update_done = True
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "blocks": [
+                    {
+                        "label": "failed_navigation",
+                        "block_type": block_type,
+                        "status": "failed",
+                        "failure_reason": reason,
+                    }
+                ]
+            },
+        },
+    )
+    with pytest.raises(CopilotNonRetriableNavError) as excinfo:
+        _maybe_raise_non_retriable_nav(ctx)
+    result = agent_module._build_non_retriable_nav_exit_result(ctx, None, excinfo.value)
+    return ctx, result
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +409,49 @@ def test_full_flow_cleared_after_successful_run() -> None:
     )
     # Last-test fields now reflect success; the exit-path guard does nothing.
     _maybe_raise_non_retriable_nav(ctx)  # must not raise
+
+
+@pytest.mark.parametrize(
+    ("reason", "block_type"),
+    [
+        pytest.param(_SOCKS_FAILURE_REASON, "navigation", id="navigation_tool_socks"),
+        pytest.param(_TUNNEL_FAILURE_REASON, "code", id="secure_runner_goto_tunnel"),
+        pytest.param(_SOCKS_HOST_UNREACHABLE_REASON, "code", id="secure_runner_goto_host_unreachable"),
+    ],
+)
+def test_proxy_transport_full_flow_uses_browser_network_reply(reason: str, block_type: str) -> None:
+    ctx, result = _record_and_render_terminal_reply(reason, block_type=block_type)
+
+    assert result.user_response == _PROXY_FAILURE_REPLY.format(reason=reason)
+    assert "verify the URL" not in result.user_response
+    assert result.updated_workflow is None
+    assert result.workflow_yaml is None
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "non_retriable_nav"
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["next_state"] == "stopped"
+    assert result.terminal_envelope["response_kind"] == "stopped"
+    assert result.terminal_envelope["proposal_present"] is False
+    assert ctx.last_test_non_retriable_nav_error == reason
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(_DNS_FAILURE_REASON, id="dns"),
+        pytest.param(_CERT_FAILURE_REASON, id="certificate"),
+        pytest.param(_DNS_FAILURE_WITH_PROXY_TOKEN_IN_URL, id="dns_with_proxy_token_in_url"),
+        pytest.param(_CERT_FAILURE_WITH_PROXY_TOKEN_IN_URL, id="certificate_with_proxy_token_in_url"),
+    ],
+)
+def test_non_proxy_full_flow_preserves_existing_reply(reason: str) -> None:
+    _, result = _record_and_render_terminal_reply(reason, block_type="navigation")
+
+    assert result.user_response == _NON_PROXY_FAILURE_REPLY.format(reason=reason)
+    assert result.updated_workflow is None
+    assert result.workflow_yaml is None
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "non_retriable_nav"
 
 
 # ---------------------------------------------------------------------------

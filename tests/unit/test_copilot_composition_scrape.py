@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools._shared import (
 )
 from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _AsyncioSleepProxy:
@@ -198,7 +199,7 @@ async def test_late_structured_error_retains_valid_hollow_packet(monkeypatch: py
     assert first is not None
     capture = AsyncMock(side_effect=[(first, None), (None, "structured extraction timed out")])
     monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", capture)
-    monkeypatch.setattr(tools.composition_capture.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(tools.composition_capture, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
 
     evidence, error = await tools._capture_composition_evidence(
         SimpleNamespace(),

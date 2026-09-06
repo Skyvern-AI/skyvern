@@ -565,7 +565,15 @@ async def test_live_interpretation_enrichment_failure_keeps_placeholder(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_live_interpretation_nav_then_click_emits_two_steps() -> None:
+async def test_live_interpretation_nav_then_click_emits_two_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A real coroutine function, not the ambient AsyncMock: cancel() below drops the in-flight
+    # enrichment task, and an orphaned AsyncMock coroutine surfaces at GC time as an asyncio
+    # error event inside whatever unrelated test happens to be running then.
+    async def stub_llm(*args: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:
+        return {"block_label": "act", "title": "Browser Action", "prompt": ""}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", stub_llm)
+
     updates: list[RecordingInterpretationUpdate] = []
     session = RecordingInterpretationSession(
         browser_session_id=PBS_ID,
@@ -1358,3 +1366,192 @@ async def test_magic_link_click_stamps_kind(
 
     assert len(steps) == 1
     assert steps[0].credential_kind == "magic_link"
+
+
+def make_change_event(target: dict[str, t.Any], timestamp: float) -> ExfiltratedConsoleEvent:
+    return make_console_event(
+        params={"type": "change", "target": target, "timestamp": timestamp},
+        timestamp=timestamp,
+    )
+
+
+SELECT_TARGET = {
+    "id": "country",
+    "skyId": "sky-select",
+    "tagName": "SELECT",
+    "text": ["Germany", "France"],
+    "selector": "#country",
+    "value": "DE",
+}
+
+
+def test_select_chosen_with_the_mouse_records_its_value() -> None:
+    """A native select driven by mouse never reaches the input-text machine.
+
+    That machine needs a keydown to leave its focus state, so before this the chosen option
+    was dropped and the recording kept only the click that opened the dropdown.
+    """
+    events = [
+        make_click_event(target=SELECT_TARGET, timestamp=1000.0),
+        make_focus_event(target=SELECT_TARGET, timestamp=1010.0),
+        make_change_event(target=SELECT_TARGET, timestamp=1100.0),
+        make_blur_event(target=SELECT_TARGET, timestamp=1200.0),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert [a.kind for a in actions] == [ActionKind.CLICK, ActionKind.INPUT_TEXT]
+    assert actions[1].input_value == "DE"
+    assert actions[1].target.tag_name == "SELECT"
+
+
+def test_select_chosen_with_the_keyboard_records_once() -> None:
+    """The keyboard path reached the input-text machine already; it must not now double-emit."""
+    events = [
+        make_focus_event(target=SELECT_TARGET, timestamp=1000.0),
+        make_keydown_event(target=SELECT_TARGET, timestamp=1100.0, key="ArrowDown"),
+        make_change_event(target=SELECT_TARGET, timestamp=1150.0),
+        make_blur_event(target=SELECT_TARGET, timestamp=1900.0),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert [a.kind for a in actions] == [ActionKind.INPUT_TEXT]
+    assert actions[0].input_value == "DE"
+
+
+def test_change_on_a_checkbox_records_only_the_click() -> None:
+    """change fires for checkboxes and radios too, where the click already carries the gesture.
+
+    Without the SELECT-only guard a ticked checkbox also mints a bogus fill step with the
+    value "on".
+    """
+    target = {
+        "id": "terms",
+        "skyId": "sky-terms",
+        "tagName": "INPUT",
+        "inputType": "checkbox",
+        "text": ["Accept terms"],
+        "value": "on",
+    }
+
+    events = [
+        make_click_event(target=target, timestamp=1000.0),
+        make_change_event(target=target, timestamp=1010.0),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert [a.kind for a in actions] == [ActionKind.CLICK]
+
+
+def test_select_placeholder_row_records_nothing() -> None:
+    target = {**SELECT_TARGET, "value": ""}
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1100.0)])
+
+    assert actions == []
+
+
+def test_secret_select_keeps_its_step_with_a_blank_value() -> None:
+    """A card-expiry month is usually a <select autocomplete="cc-exp-month">.
+
+    Ingest redaction nulls its value, so returning None on a missing value would drop the whole
+    step and leave the user nothing to bind. StateMachineInputText keeps the step for the same
+    reason; this asserts the select machine matches.
+    """
+    target = {
+        "id": "cc-exp-month",
+        "skyId": "sky-cc",
+        "tagName": "SELECT",
+        "text": ["01", "02"],
+        "autocomplete": "cc-exp-month",
+        "value": "03",
+    }
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    # Through reify(), so ingest redaction runs exactly as it does in production.
+    events = processor.reify(
+        [
+            make_click_event(target=target, timestamp=1000.0).model_dump(),
+            make_change_event(target=target, timestamp=1100.0).model_dump(),
+        ]
+    )
+    actions = processor.events_to_actions(events)
+
+    assert [a.kind for a in actions] == [ActionKind.CLICK, ActionKind.INPUT_TEXT]
+    assert actions[1].input_value == ""
+
+
+def test_select_parameter_key_ignores_option_labels() -> None:
+    """A select's texts are its option labels, not a label for the field.
+
+    Without the guard a select with no id is named after whichever option is listed first, so
+    the draft reads "Enter {{ germany }} into the country field".
+    """
+    target = {"skyId": "sky-country", "tagName": "SELECT", "text": ["Germany", "France"], "value": "DE"}
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)])
+
+    assert deterministic_input_text_parameter_key(actions[0]) == "sky_country"
+
+
+def test_select_draft_step_is_named_after_the_field_not_an_option() -> None:
+    """A select's texts are its option labels, so a country dropdown would read "Fill 'Germany'".
+
+    The placeholder is what the user sees while enrichment runs, and what survives if it fails.
+    """
+    from skyvern.services.browser_recording.interpretation import _placeholder_step_from_action
+
+    target = {"id": "country", "skyId": "sky-s", "tagName": "SELECT", "text": ["Germany", "France"], "value": "DE"}
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)])
+    step = _placeholder_step_from_action(browser_session_id=PBS_ID, action_index=0, action=actions[0])
+
+    assert step.title == "Fill 'country'"
+    assert "Germany" not in (step.label or "")
+
+
+def test_select_type_ahead_records_the_option_the_user_landed_on() -> None:
+    """Keyboard type-ahead fires change per keystroke as the selection walks the option list.
+
+    Duplicate suppression keys on the target, so without the value in that key the second
+    change is swallowed and the recording keeps an option the user only passed through.
+    """
+    target = {"id": "country", "skyId": "sky-c", "tagName": "SELECT", "text": ["Country"]}
+
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1050.0, key="G"),
+        make_change_event(target={**target, "value": "GE"}, timestamp=1060.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="e"),
+        make_change_event(target={**target, "value": "DE"}, timestamp=1110.0),
+        make_blur_event(target={**target, "value": "DE"}, timestamp=1400.0),
+    ]
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions(events)
+
+    assert actions[-1].input_value == "DE"
+
+
+def test_labelled_select_keeps_its_field_label() -> None:
+    """A labelled select's texts lead with the field label, not an option.
+
+    getElementText pushes aria-label / aria-labelledby / placeholder / title ahead of option
+    text, and accessible_name carries the same label, so neither should fall back to the tag.
+    """
+    from skyvern.services.browser_recording.interpretation import _placeholder_step_from_action
+
+    target = {
+        "skyId": "sky-c",
+        "tagName": "SELECT",
+        "text": ["Country", "Germany"],
+        "accessibleName": "Country",
+        "value": "DE",
+    }
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)])
+    step = _placeholder_step_from_action(browser_session_id=PBS_ID, action_index=0, action=actions[0])
+
+    assert step.title == "Fill 'Country'"
+    assert deterministic_input_text_parameter_key(actions[0]) == "country"

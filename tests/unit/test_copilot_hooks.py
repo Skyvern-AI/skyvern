@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,12 +16,23 @@ import yaml
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
-from skyvern.forge.sdk.copilot.runtime import AgentContext, bound_call_browser_session
+from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_PAGE_ERROR,
+    AgentContext,
+    OriginRunRedactionRegistry,
+    bound_call_browser_session,
+)
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    clear_session_scrub_values,
+    register_secret_scrub_value,
+)
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_pre_action,
     _click_post_hook,
@@ -37,14 +48,21 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _scout_readback_outcome,
     _scout_type_landing_failure,
 )
+from skyvern.forge.sdk.copilot.tools.run_execution import _halt_turn_if_superseded
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _build_scout_page_summary,
     _page_evidence_names_obstruction,
     _summary_disclosure_control,
     _summary_entry,
 )
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    make_copilot_ctx,
+    remove_sensitive_disclosure_prerequisite,
+    taint_by_terminal_run,
+)
 
 READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_readback_outcome_cases.yaml").read_text())[
     "cases"
@@ -53,7 +71,9 @@ READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_rea
 
 @dataclass
 class _FakeContext:
+    check_model_work_deadline: Callable[[], None] | None = None
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls_this_turn: int = 0
     workflow_permanent_id: str = "wpid_example"
     turn_id: str = "turn_example"
     workflow_copilot_chat_id: str = "chat_example"
@@ -301,12 +321,14 @@ async def test_on_tool_end_swallows_unserializable_output() -> None:
 
     payload = {"ok": True, "data": {"blocks": [{"label": "bad", "output": _Unserializable()}]}}
     with capture_logs() as logs:
+        await hooks.on_tool_start(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"))
         await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"), payload)
 
     # The recording path raised inside json.dumps before append. The guard
     # swallowed it, so the invariant is "the run did not crash" -- and the
     # activity entry was dropped. That is the acceptable trade for observability.
     assert ctx.tool_activity == []
+    assert ctx.tool_calls_this_turn == 1
     warning = next(
         log for log in logs if log["event"] == "CopilotRunHooks.on_tool_end recording failed, skipping entry"
     )
@@ -823,6 +845,7 @@ class TestMCPToolOverlayCompleteness:
         # Both states are required by the tool itself, so a single-selector call — the shape that
         # spends the whole ceiling on a wrong guess — is not expressible here at all.
         assert not overlay.hide_params & {"selector_a", "selector_b"}
+        assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_action_pre_hook
 
     def test_intent_hidden_on_element_action_tools(self) -> None:
         """An `intent` runs a second LLM agent to pick the element, duplicating reasoning the
@@ -1109,6 +1132,8 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            last_run_blocks_workflow_run_id=None,
+            browser_session_id=None,
             request_policy=None,
             org_credentials_for_turn=None,
             organization_id="o_1",
@@ -1154,6 +1179,8 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            last_run_blocks_workflow_run_id=None,
+            browser_session_id=None,
         )
 
         result = await _click_post_hook(
@@ -1183,6 +1210,8 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            last_run_blocks_workflow_run_id=None,
+            browser_session_id=None,
         )
 
         result = await tools_module._type_text_post_hook(
@@ -1248,6 +1277,7 @@ class TestScoutedInteractionCapture:
             pending_scout_popup_content_type=None,
             discovery_mcp_server=None,
             browser_session_id=None,
+            last_run_blocks_workflow_run_id=None,
             scouted_interactions=[],
             scout_trajectory=[],
             scout_observed_terminal_criterion_ids=set(),
@@ -2934,3 +2964,264 @@ async def test_lifecycle_hooks_count_on_a_bare_agent_context() -> None:
 
     assert ctx.enforcement_pass_count == 1
     assert ctx.model_calls_this_turn == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("called_tools", "expected_count"),
+    [
+        pytest.param(["edit_block"], 0, id="no-build-test-call"),
+        pytest.param(["run_blocks_and_collect_debug"], 1, id="one-build-test-call"),
+        pytest.param(["edit_block_and_run", "update_and_run_blocks"], 2, id="two-build-test-calls"),
+        pytest.param(["run_blocks_and_collect_debug", "request_credential"], 1, id="build-test-beside-a-card"),
+    ],
+)
+async def test_on_llm_end_counts_the_responses_build_test_calls_before_any_of_them_runs(
+    called_tools: list[str], expected_count: int
+) -> None:
+    ctx = make_copilot_ctx()
+    ctx.build_test_tool_calls_in_model_response = 99
+    response = SimpleNamespace(output=[SimpleNamespace(name=name) for name in called_tools])
+
+    await CopilotRunHooks(ctx).on_llm_end(MagicMock(), MagicMock(), response)
+
+    assert ctx.build_test_tool_calls_in_model_response == expected_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_reason", "dispatched_this_turn", "expected_halt"),
+    [
+        pytest.param(SUPERSEDED_BY_NEWER_TEST_REASON, True, True, id="superseded-this-turn"),
+        pytest.param("The extraction block found no matching element.", True, False, id="ordinary-failure"),
+        pytest.param(SUPERSEDED_BY_NEWER_TEST_REASON, False, False, id="superseded-in-an-earlier-turn"),
+        pytest.param(SUPERSEDED_BY_NEWER_TEST_REASON, False, False, id="inherited-by-a-repair-turn"),
+    ],
+)
+async def test_a_superseded_build_test_run_stops_the_turn_before_it_can_dispatch_another(
+    failure_reason: str, dispatched_this_turn: bool, expected_halt: bool
+) -> None:
+    ctx = make_copilot_ctx()
+    if dispatched_this_turn:
+        ctx.dispatched_run_ids_this_turn.add("wr_this_turn")
+    else:
+        # What a repair turn inherits: seeded as the turn's last run, but never dispatched here.
+        ctx.last_run_blocks_workflow_run_id = "wr_this_turn"
+    await _halt_turn_if_superseded(
+        ctx,
+        SimpleNamespace(failure_reason=failure_reason),
+        workflow_run_id="wr_this_turn",
+    )
+    output = _mcp_text_output({"ok": False, "data": {"workflow_run_id": "wr_this_turn"}})
+    tool = _fake_tool("run_blocks_and_collect_debug")
+
+    if not expected_halt:
+        await CopilotRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, tool, output)
+        assert ctx.turn_halt is None
+        return
+
+    with pytest.raises(CopilotTurnHalt) as raised:
+        await CopilotRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, tool, output)
+    assert raised.value.halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED
+    assert raised.value.halt.run_refs == {"workflow_run_id": "wr_this_turn"}
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_run_still_drains_after_its_reason_is_overwritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The superseded run's own finalizer can overwrite the reason on the run row, so the drain
+    falls back to copilot's record of what it ended."""
+    import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+    was_superseded = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        run_execution_module,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(workflow_params=SimpleNamespace(build_test_run_was_superseded=was_superseded))
+        ),
+    )
+    ctx = make_copilot_ctx(workflow_copilot_chat_id="wcc_1")
+    ctx.dispatched_run_ids_this_turn.add("wr_this_turn")
+
+    await _halt_turn_if_superseded(
+        ctx,
+        SimpleNamespace(failure_reason="code_block block failed. failure reason: Target page closed"),
+        workflow_run_id="wr_this_turn",
+    )
+
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED
+    was_superseded.assert_awaited_once()
+
+
+ACTION_SEAM_PRE_HOOKS = [
+    "_click_pre_hook",
+    "_type_text_pre_hook",
+    "_select_option_pre_hook",
+    "_press_key_pre_hook",
+    "_scroll_pre_hook",
+    "_sensitive_origin_page_action_pre_hook",
+]
+ACTION_SEAM_POST_HOOKS = [
+    "_click_post_hook",
+    "_type_text_post_hook",
+    "_select_option_post_hook",
+    "_press_key_post_hook",
+    "_scroll_post_hook",
+    "_wait_for_either_state_post_hook",
+]
+CONTINUATION_RUN_OTP = "424242"
+CONTINUATION_RUN_PASSWORD = "Sp1r!t-Level-2026"
+
+
+def _terminal_credential_run_ctx() -> AgentContext:
+    ctx = make_copilot_ctx(browser_session_id="pbs_run")
+    clear_session_scrub_values("pbs_run")
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    taint_by_terminal_run(ctx, workflow_run_id="wr_credential", session_id="pbs_run")
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_credential",
+        parameters={"password": CONTINUATION_RUN_PASSWORD, "totp": CONTINUATION_RUN_OTP},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    return ctx
+
+
+class TestSensitiveOriginActionContinuation:
+    @pytest.mark.asyncio
+    async def test_click_continues_on_the_page_a_terminal_credential_run_left(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = _terminal_credential_run_ctx()
+        landed_page = {
+            "page_title": f"Web analytics {CONTINUATION_RUN_PASSWORD}",
+            "forms": [
+                {
+                    "fields": [{"name": "range", "label": "Date range", "type": "select", "selector": "#range"}],
+                    "submit_controls": [{"text": "Apply", "type": "submit", "selector": "#apply"}],
+                }
+            ],
+            "navigation_targets": [],
+            "result_containers": [{"tag": "table", "id": "trends", "selector": "#trends"}],
+        }
+        ctx.discovery_mcp_server = SimpleNamespace(
+            call_internal_tool=AsyncMock(return_value={"ok": True, "data": {"result": landed_page}})
+        )
+        ctx.supports_vision = False
+
+        assert await mcp_hooks._click_pre_hook({"selector": "a.nav--analytics"}, ctx) is None
+        result = await mcp_hooks._click_post_hook(
+            {
+                "ok": True,
+                "data": {"selector": "a.nav--analytics", "text_content": f"Web analytics {CONTINUATION_RUN_OTP}"},
+            },
+            {"browser_context": {"url": f"http://pathfold.test/app?code={CONTINUATION_RUN_OTP}", "title": "Pathfold"}},
+            ctx,
+        )
+
+        assert result["ok"] is True
+        assert ctx.scouted_interactions, "the continuation click was not recorded"
+        # The page the click reached is observed and retained, not just the click itself: a
+        # click-reached block can be authored against it without a separate inspection.
+        assert ctx.last_scout_act_observe_packet is not None
+        assert result["observation_step"] is not None
+        assert result["data"]["observation_step"] == result["observation_step"]
+        # Every retained store, the interaction-reached URLs included, is free of both run secrets.
+        retained = json.dumps(
+            {
+                "scouted_interactions": ctx.scouted_interactions,
+                "scout_trajectory": ctx.scout_trajectory,
+                "flow_evidence": ctx.flow_evidence,
+                "composition_page_evidence": ctx.composition_page_evidence,
+                "act_observe_packet": ctx.last_scout_act_observe_packet,
+            },
+            default=str,
+        )
+        assert CONTINUATION_RUN_PASSWORD not in retained
+        assert CONTINUATION_RUN_OTP not in retained
+        assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_a_retained_selector_a_secret_rewrote_is_dropped_not_kept_dead(self) -> None:
+        """A six-digit code can occur inside an id by chance; a placeholder there is a dead locator
+        that would fail a later run silently, so the whole locator identity is dropped: the synthesizer
+        must not fall back from the dropped selector to a role/name pair that carries the placeholder."""
+        ctx = _terminal_credential_run_ctx()
+        register_secret_scrub_value(ctx, CONTINUATION_RUN_OTP)
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector=f"#row-{CONTINUATION_RUN_OTP} button",
+            source_url=f"http://pathfold.test/app?code={CONTINUATION_RUN_OTP}",
+            accessible_name=f"Verify {CONTINUATION_RUN_OTP}",
+            role="button",
+        )
+
+        recorded = ctx.scouted_interactions[-1]
+        assert not set(recorded) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
+        assert recorded["source_url"] == f"http://pathfold.test/app?code={REDACTED_SECRET_PLACEHOLDER}"
+        assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+    async def test_evaluate_post_hook_stays_withheld_when_a_disclosure_prerequisite_is_absent(self, arm: str) -> None:
+        ctx = _terminal_credential_run_ctx()
+        remove_sensitive_disclosure_prerequisite(ctx, arm)
+
+        result = await mcp_hooks._evaluate_post_hook(
+            {"ok": True, "data": {"result": f"code {CONTINUATION_RUN_OTP}", "url": "http://pathfold.test/app"}},
+            {},
+            ctx,
+        )
+
+        assert result == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+    async def test_click_stays_withheld_when_a_disclosure_prerequisite_is_absent(self, arm: str) -> None:
+        ctx = _terminal_credential_run_ctx()
+        remove_sensitive_disclosure_prerequisite(ctx, arm)
+
+        refusal = await mcp_hooks._click_pre_hook({"selector": "a.nav--analytics"}, ctx)
+
+        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+    async def test_type_text_stays_withheld_when_a_disclosure_prerequisite_is_absent(self, arm: str) -> None:
+        ctx = _terminal_credential_run_ctx()
+        remove_sensitive_disclosure_prerequisite(ctx, arm)
+
+        refusal = await mcp_hooks._type_text_pre_hook({"selector": "#token", "text": "hello"}, ctx)
+
+        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hook_name", ACTION_SEAM_PRE_HOOKS)
+    async def test_every_action_pre_hook_stays_withheld_without_a_matching_registry(self, hook_name: str) -> None:
+        ctx = _terminal_credential_run_ctx()
+        remove_sensitive_disclosure_prerequisite(ctx, "registry_missing")
+
+        refusal = await getattr(mcp_hooks, hook_name)({"selector": "#token", "text": "hello", "key": "Enter"}, ctx)
+
+        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hook_name", ACTION_SEAM_POST_HOOKS)
+    async def test_every_action_post_hook_stays_withheld_without_a_matching_registry(self, hook_name: str) -> None:
+        ctx = _terminal_credential_run_ctx()
+        remove_sensitive_disclosure_prerequisite(ctx, "registry_missing")
+
+        refusal = await getattr(mcp_hooks, hook_name)(
+            {"ok": True, "data": {"selector": "#token", "text_content": CONTINUATION_RUN_OTP}},
+            {"browser_context": {"url": "http://pathfold.test/app"}},
+            ctx,
+        )
+
+        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}

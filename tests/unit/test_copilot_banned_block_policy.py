@@ -19,6 +19,7 @@ cross-layer sync-guard test at the end asserts neither symbol is ripped out.
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -566,6 +567,18 @@ def test_code_only_schema_guidance_exposes_credential_runtime_without_otp_proced
     assert "Do not read `email_inbox`" not in guidance
     assert "authenticated-page anchor" not in guidance
     assert "Transient disappearance of the OTP field" not in guidance
+
+
+def test_code_only_schema_guidance_states_the_cold_run_starting_condition() -> None:
+    guidance = "\n".join(_code_only_browser_schema_guidance())
+    entry = next(line for line in _code_only_browser_schema_guidance() if line.startswith("A saved run executes"))
+
+    assert "without the interactions performed while scouting" in guidance
+    for prescription in ("modal", "dialog", "consent", "cookie", "banner", "overlay", "dismiss", "wait", "click", "if"):
+        # Inflections included: a bare-stem match passes "the block waits", the prescriptive mood
+        # this guard exists to reject.
+        assert re.search(rf"\b{prescription}(s|es|ed|ing)?\b", entry.lower()) is None
+    assert "#" not in entry
 
 
 @pytest.mark.parametrize("block_type", ["task", "task_v2"])

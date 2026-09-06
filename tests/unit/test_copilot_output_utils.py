@@ -9,6 +9,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
@@ -642,6 +643,16 @@ class TestSanitization:
         sanitized = sanitize_tool_result_for_llm("get_block_schema", result)
 
         assert sanitized["data"]["schema"] == big_schema
+
+    def test_run_blocks_sanitizer_bounds_the_summary_when_no_packet_is_attached(self) -> None:
+        overlong = "click #add-to-cart failed response=" + "page detail " * 200 + "overlong-tail"
+        result = {"ok": False, "data": {"workflow_run_id": "wr_1", "action_trace_summary": [overlong]}}
+
+        sanitized = sanitize_tool_result_for_llm("get_run_results", result)
+
+        lines = sanitized["data"]["action_trace_summary"]
+        assert all(len(line) <= _BUILD_TEST_PAGE_SUMMARY_MAX_CHARS for line in lines)
+        assert "overlong-tail" not in json.dumps(sanitized)
 
     def test_run_blocks_sanitizer_preserves_compact_packet_fields(self) -> None:
         from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm

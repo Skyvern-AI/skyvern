@@ -49,6 +49,7 @@ def test_dom_inspection_interface_accepts_no_caller_supplied_code() -> None:
     }
     assert set(public_operations) == {
         "read_current_url",
+        "read_locator_is_content_editable",
         "read_locator_selected_state",
         "read_locator_tag_name",
         "read_resolved_anchor_href",
@@ -140,6 +141,20 @@ async def test_read_locator_selected_state_rejects_any_non_boolean_read(raw: obj
     locator.evaluate.return_value = raw
 
     assert await dom_inspection.read_locator_selected_state(locator) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("raw", "expected"), [(True, True), (False, False), ("true", None)])
+async def test_read_locator_is_content_editable_uses_only_the_approved_expression(
+    raw: object, expected: bool | None
+) -> None:
+    from skyvern.webeye import dom_inspection
+
+    locator = AsyncMock()
+    locator.evaluate.return_value = raw
+
+    assert await dom_inspection.read_locator_is_content_editable(locator, timeout=123) is expected
+    locator.evaluate.assert_awaited_once_with(dom_inspection._READ_LOCATOR_IS_CONTENT_EDITABLE, timeout=123)
 
 
 @pytest.mark.parametrize(

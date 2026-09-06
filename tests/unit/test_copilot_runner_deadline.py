@@ -32,6 +32,7 @@ from tests.unit.copilot_test_helpers import (
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    make_copilot_ctx,
 )
 
 
@@ -49,6 +50,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -67,7 +69,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
         hanging_stream,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with pytest.raises(CopilotTotalTimeoutError):
         await run_with_enforcement(
@@ -77,6 +79,9 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
             stream=stream,
         )
     assert ctx.copilot_total_timeout_exceeded is True
+    assert ctx.budget_expiry_state.hard_backstop_reached is True
+    assert ctx.budget_expiry_state.source == "deadline"
+    assert ctx.budget_expiry_state.drain_attempted is False
 
 
 @pytest.mark.asyncio
@@ -84,6 +89,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -118,7 +124,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
         fake_recover,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with pytest.raises(CopilotTotalTimeoutError):
         await run_with_enforcement(
@@ -155,7 +161,7 @@ async def test_runner_deadline_does_not_fire_when_tool_completes_in_time(
         quick_stream,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     returned = await run_with_enforcement(
         agent=MagicMock(),
@@ -167,8 +173,8 @@ async def test_runner_deadline_does_not_fire_when_tool_completes_in_time(
     assert ctx.copilot_total_timeout_exceeded is False
 
 
-def _cancellation_ctx() -> MagicMock:
-    ctx = MagicMock()
+def _cancellation_ctx() -> CopilotContext:
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     ctx.copilot_credential_pause_seconds = 0.0
     ctx.copilot_turn_cancelled_iteration = None
@@ -309,6 +315,7 @@ async def test_deadline_event_names_the_operation_still_open_when_the_budget_exp
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -325,7 +332,7 @@ async def test_deadline_event_names_the_operation_still_open_when_the_budget_exp
 
     monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", hanging_stream)
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -364,6 +371,7 @@ async def test_the_deadline_names_the_inner_operation_that_returned_over_the_out
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -384,7 +392,7 @@ async def test_the_deadline_names_the_inner_operation_that_returned_over_the_out
         stream_stalling_after_a_tool_returned,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -402,6 +410,7 @@ async def test_the_deadline_names_an_operation_that_exited_by_exception_and_neve
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -423,7 +432,7 @@ async def test_the_deadline_names_an_operation_that_exited_by_exception_and_neve
         stream_stalling_after_a_tool_failed,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -449,6 +458,7 @@ async def test_the_deadline_path_is_unchanged_when_the_fingerprint_contributes_n
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.pending_operation_fields", dict)
 
@@ -465,7 +475,7 @@ async def test_the_deadline_path_is_unchanged_when_the_fingerprint_contributes_n
 
     monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", hanging_stream)
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):

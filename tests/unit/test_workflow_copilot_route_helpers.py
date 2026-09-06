@@ -1,8 +1,7 @@
 """Tests for the small pure helpers on workflow_copilot.py.
 
 Covers the rollback/auto-accept safety net (``_should_restore_persisted_workflow``,
-``_effective_auto_accept``, ``_proposal_disposition``) for the
-``ENABLE_WORKFLOW_COPILOT_V2`` path, YAML normalization
+``_effective_auto_accept``, ``_proposal_disposition``), YAML normalization
 (``_normalize_copilot_yaml``), prior-YAML resolution
 (``_blockless_submission_fallback``, ``_prior_copilot_workflow_yaml``), and the
 SSE terminal-frame invariant (``_ensure_terminal_frame``, SKY-9232).
@@ -20,7 +19,7 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.copilot.agent import _build_timeout_exit_result
-from skyvern.forge.sdk.copilot.context import AgentResult
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _assistant_execution_receipts,
@@ -30,6 +29,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _ensure_terminal_frame,
     _normalize_copilot_yaml,
     _prior_copilot_workflow_yaml,
+    _prior_global_llm_context,
     _proposal_disposition,
     _run_grant_workflow_yaml,
     _should_commit_staged_workflow,
@@ -48,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
@@ -89,6 +90,21 @@ def test_assistant_history_retains_execution_receipts_after_proposal_clear() -> 
         "step": {"version_a", "version_b"},
         "other": {"version_c"},
     }
+
+
+def test_interrupted_assistant_turn_expires_older_credential_proposal() -> None:
+    context = StructuredContext(
+        proposed_credential=ProposedCredential(
+            credential_id="cred_previous",
+            admitted_url="https://example.invalid",
+        )
+    ).to_json_str()
+    prior = MagicMock(global_llm_context=context, turn_outcome=MagicMock())
+    interrupted = MagicMock(global_llm_context=None, turn_outcome=MagicMock())
+
+    carried = _prior_global_llm_context([prior, interrupted])
+
+    assert StructuredContext.from_json_str(carried).proposed_credential is None
 
 
 def _agent_result(
@@ -651,26 +667,33 @@ def test_run_grant_yaml_is_none_when_the_row_has_no_blocks() -> None:
     assert _run_grant_workflow_yaml(None) is None
 
 
-def _timed_out_ctx(*, workflow_yaml: str | None, last_test_ok: bool | None) -> MagicMock:
-    ctx = MagicMock()
-    ctx.last_workflow = MagicMock(name="wf")
-    ctx.last_workflow_yaml = workflow_yaml
-    ctx.last_test_ok = last_test_ok
-    ctx.last_full_workflow_test_ok = False
-    ctx.last_test_suspicious_success = False
-    ctx.copilot_total_timeout_exceeded = True
-    ctx.last_failure_category_top = None
-    ctx.workflow_persisted = False
-    ctx.total_tokens_used = None
-    ctx.last_good_workflow = None
-    ctx.last_good_workflow_yaml = None
-    ctx.tool_activity = []
-    ctx.latest_diagnosis_repair_contract = None
-    ctx.test_after_update_done = last_test_ok is not None
-    ctx.last_update_block_count = None
-    ctx.has_staged_proposal = True
-    ctx.request_policy.selected_connected_account_id = None
-    return ctx
+def _timed_out_ctx(*, workflow_yaml: str | None, last_test_ok: bool | None) -> CopilotContext:
+    workflow = (
+        Workflow(
+            workflow_id="wf_staged",
+            organization_id="org-1",
+            title="Staged draft",
+            workflow_permanent_id="wfp-1",
+            version=1,
+            proxy_location=ProxyLocation.NONE,
+            is_saved_task=False,
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+        if workflow_yaml is not None
+        else None
+    )
+    return make_copilot_ctx(
+        last_workflow=workflow,
+        last_workflow_yaml=workflow_yaml,
+        staged_workflow=workflow,
+        staged_workflow_yaml=workflow_yaml,
+        has_staged_proposal=workflow is not None,
+        last_test_ok=last_test_ok,
+        copilot_total_timeout_exceeded=True,
+        test_after_update_done=last_test_ok is not None,
+    )
 
 
 class TestTimedOutFailedTestDraftIsNotAutoApplied:

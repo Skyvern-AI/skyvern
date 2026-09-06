@@ -1660,6 +1660,43 @@ async def test_sftp_unwraps_secrets_and_defaults_port_to_22(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_sftp_identity_fields_bound_to_secret_parameters_reach_the_real_server(tmp_path: Path) -> None:
+    """A file_download block renders templates with secrets masked, so the host, remote directory
+    and host key arrive as placeholders and must be mapped back before connecting."""
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.SFTP,
+        sftp_host="{{sftp_host}}",
+        sftp_username="skyvern",
+        sftp_password="password",
+        sftp_remote_path="{{sftp_remote_path}}",
+        sftp_host_key="{{sftp_host_key}}",
+    )
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        download_dir,
+        secret_values={
+            "{{sftp_host}}": "sftp.example.com",
+            "{{sftp_remote_path}}": "/inbound/claims",
+            "{{sftp_host_key}}": "ssh-ed25519 AAAAC3Nz",
+        },
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.sftp_host == "sftp.example.com"
+    assert destination.sftp_remote_path == "/inbound/claims"
+    assert destination.sftp_host_key == "ssh-ed25519 AAAAC3Nz"
+    # The uri is recorded as the block output, so a secret-bound host and remote path
+    # stay masked there even though the connection above uses the real values.
+    assert destination.customer_uri == "sftp://{{sftp_host}}:22/{{sftp_remote_path}}/statement.pdf"
+    assert destination.sdk_uri == destination.customer_uri
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("download_target", "destination_fields", "sensitive_field", "literal_secret"),
     [

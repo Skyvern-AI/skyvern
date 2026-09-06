@@ -14,7 +14,9 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 import yarl
+from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -28,7 +30,7 @@ from skyvern.forge.taskv3.engine import (
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
+from skyvern.forge.taskv3.loop import LoopOutcome, SemanticCommitStats, ToolResult, ToolSpec, _ProgressEvidence
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
@@ -663,7 +665,7 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
     # object, or arm them for a page-free run (which has no page to ask) and disarm them for an
     # ordinary one, and nothing else in the suite would notice.
     from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome, SubmitWatch
+    from skyvern.forge.taskv3.loop import SubmitWatch
 
     finish_args: list[tuple[Any, Any]] = []
     loop_watches: list[Any] = []
@@ -711,6 +713,67 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
     assert watches[1] is None, watches
     assert loop_watches[0] is watches[0], (loop_watches, watches)
     assert loop_watches[1] is None, loop_watches
+
+
+@pytest.mark.asyncio
+async def test_engine_shares_one_semantic_commit_stats_between_the_browser_tools_and_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The counter needs BOTH halves on ONE record: the browser tools increment it, the loop's
+    # terminal record reads it. Wire either half to a different object and every production run
+    # reports 0 opportunities / 0 accepts forever, and nothing else in the suite would notice.
+    tool_stats: list[Any] = []
+    loop_stats: list[Any] = []
+    real_build = engine_mod.build_browser_tools
+    real_loop = engine_mod.run_agent_tool_loop
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        tool_stats.append(kwargs.get("semantic_commit_stats"))
+        return real_build(*args, **kwargs)
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_stats.append(kwargs.get("semantic_commit_stats"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="apply",
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert isinstance(tool_stats[0], SemanticCommitStats), tool_stats
+    assert loop_stats[0] is tool_stats[0], (loop_stats, tool_stats)
+
+
+@pytest.mark.asyncio
+async def test_engine_omits_semantic_commit_stats_when_the_verify_kill_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tier only ever increments under TASK_V3_SEMANTIC_COMMIT_VERIFY, so with the kill switch
+    # off a live object makes every page-ful run emit 0 opportunities for a tier that is turned
+    # off — the denominator drag omission exists to prevent. The switch and the omission contract
+    # have to agree, or flipping the switch silently corrupts the accept rate instead of ending it.
+    monkeypatch.setattr(settings, "TASK_V3_SEMANTIC_COMMIT_VERIFY", False)
+    loop_stats: list[Any] = []
+    real_loop = engine_mod.run_agent_tool_loop
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_stats.append(kwargs.get("semantic_commit_stats"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="apply",
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert loop_stats == [None], loop_stats
 
 
 @pytest.mark.asyncio
@@ -1271,8 +1334,6 @@ def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base()
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).
-    from structlog.testing import capture_logs
-
     script = [[("finish", {"status": "completed", "reason": "ok"})]]
     with capture_logs() as logs:
         await run_task_v3_agent_loop(
@@ -1295,6 +1356,87 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
         )
     terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
     assert terminal[0]["block_type"] is None  # bare task: no block context
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_carries_loop_telemetry_and_the_two_terminal_records_stay_dead() -> None:
+    # The only test that can catch the loop telemetry silently dropping off this line, or either
+    # per-run record it replaced coming back — everything else asserts the payload, not the join.
+    script = [[("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+        )
+
+    assert not [e for e in logs if e.get("event") == "taskv3 loop progress ledger final"]
+    assert not [e for e in logs if e.get("event") == "taskv3 canonical progress final"]
+
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1, terminal
+    record = terminal[0]
+    assert record["form_ever_armed"] is False
+    for member in _ProgressEvidence:
+        assert f"clear_{member.value}" in record, record
+    assert record["status"] == "completed"
+    assert isinstance(record["turns"], int)
+    assert "outcome_status" not in record, record
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_merges_a_fully_populated_telemetry_without_colliding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sibling test above drives a bare run, so it merges an almost-empty payload — it would stay
+    # green if a ledger or semantic-commit key ever collided with one of this line's fixed kwargs,
+    # and that collision is a TypeError inside LOG.info that would take the whole run's record with
+    # it. This one hands the engine the maximal payload every optional branch can produce.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LedgerTerminalFields, TerminalTelemetry
+
+    stats = SemanticCommitStats(opportunities=3, accepts=2)
+    telemetry = TerminalTelemetry(
+        form_ever_armed=True,
+        survival={
+            "peak_same_touches": 5,
+            "peak_same_errors": 2,
+            "looping_targets": 1,
+            **{f"clear_{member.value}": 1 for member in _ProgressEvidence},
+        },
+        ledger=LedgerTerminalFields(
+            peak_actions_since_progress=9,
+            actions_since_progress=4,
+            form_armed=False,
+            would_fire=True,
+        ),
+        peak_page_state_stall_rounds=6,
+        peak_probe_revisits=7,
+        semantic_commit=stats,
+    )
+
+    async def _loaded(**kwargs: object) -> LoopOutcome:
+        outcome = LoopOutcome(status="completed", reason="ok")
+        outcome.telemetry = telemetry
+        return outcome
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _loaded)
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
+        )
+
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1, terminal
+    record = terminal[0]
+    # Every key the payload can carry survives the merge, and the line's own kwargs are untouched.
+    for key, value in telemetry.log_fields().items():
+        assert record[key] == value, (key, record)
+    assert record["status"] == "completed"
+    assert record["block_type"] is None
+    # form_armed and form_ever_armed now ride the same record and mean different things.
+    assert record["form_armed"] is False
+    assert record["form_ever_armed"] is True
 
 
 @pytest.mark.asyncio

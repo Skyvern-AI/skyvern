@@ -323,6 +323,7 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.input_sequentially = AsyncMock()
     el.input_clear = AsyncMock()
     el.input_fill = AsyncMock()
+    el.is_content_editable = AsyncMock(return_value=False)
     el.refresh_locator_if_stale = AsyncMock()
     el.apply_secret_visual_mask = AsyncMock()
     el.scroll_into_view = AsyncMock()

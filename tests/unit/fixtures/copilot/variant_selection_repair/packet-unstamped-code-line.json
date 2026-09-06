@@ -1,0 +1,203 @@
+{
+  "schema": "generated-code-exception-packet-v1",
+  "provenance": "derived from packet.json with the failed entry's code_line stamp removed, reproducing the shape of retained traces whose recorded rows carry no code_line stamp",
+  "workflow_yaml": "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: select_variant\n    code: |\n      await page.wait_for_selector(\"body\", state=\"visible\")\n      choice = page.locator(\".choice\").first\n      await choice.wait_for(state=\"visible\")\n      identifier = await choice.get_attribute(\"id\")\n      await page.locator(\"#\" + identifier).click()\n      await page.locator(\"#add-to-cart\").click(timeout=3000)\n      return {\"added\": await page.locator(\"#cart-line\").inner_text()}\n",
+  "page_evidence": {
+    "workflow_run_id": "wr_variant_selection_fixture",
+    "source_browser_session_id": "pbs_variant_selection_fixture",
+    "source_tool": "inspect_page_for_composition",
+    "observed_after_workflow_run": true,
+    "current_url": "https://variant.fixture.test/item",
+    "page_title": "",
+    "visible_text_excerpt": "Item\nOption AOption B\nAdd to cart\nWe will let you know when this option is available again.Close",
+    "clickable_controls": [
+      {
+        "text": "Option A",
+        "selector": "#choice-a",
+        "disabled": false
+      },
+      {
+        "text": "Option B",
+        "selector": "#choice-b",
+        "disabled": false
+      },
+      {
+        "text": "Add to cart",
+        "selector": "#add-to-cart",
+        "disabled": false
+      },
+      {
+        "text": "Close",
+        "selector": "#notice-close",
+        "disabled": false
+      }
+    ],
+    "result_containers": []
+  },
+  "recorded_run_outcome": {
+    "verdict": "not_demonstrated",
+    "reason_code": "blocker_reported",
+    "display_reason": "CodeBlock failed while running user code.",
+    "workflow_run_id": "wr_variant_selection_fixture",
+    "run_completed": false
+  },
+  "result": {
+    "ok": false,
+    "data": {
+      "workflow_run_id": "wr_variant_selection_fixture",
+      "browser_session_id": "pbs_variant_selection_fixture",
+      "overall_status": "failed",
+      "requested_block_labels": [
+        "select_variant"
+      ],
+      "executed_block_labels": [
+        "select_variant"
+      ],
+      "post_run_page_evidence": {
+        "workflow_run_id": "wr_variant_selection_fixture",
+        "source_browser_session_id": "pbs_variant_selection_fixture",
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": true,
+        "current_url": "https://variant.fixture.test/item",
+        "page_title": "",
+        "visible_text_excerpt": "Item\nOption AOption B\nAdd to cart\nWe will let you know when this option is available again.Close",
+        "clickable_controls": [
+          {
+            "text": "Option A",
+            "selector": "#choice-a",
+            "disabled": false
+          },
+          {
+            "text": "Option B",
+            "selector": "#choice-b",
+            "disabled": false
+          },
+          {
+            "text": "Add to cart",
+            "selector": "#add-to-cart",
+            "disabled": false
+          },
+          {
+            "text": "Close",
+            "selector": "#notice-close",
+            "disabled": false
+          }
+        ],
+        "result_containers": []
+      },
+      "blocks": [
+        {
+          "workflow_run_block_id": "wrb_variant_selection_fixture",
+          "label": "select_variant",
+          "block_type": "CODE",
+          "status": "failed",
+          "task_id": "tsk_variant_selection_fixture",
+          "failure_reason": "CodeBlock failed while running user code.",
+          "error_codes": [
+            "user_code_error"
+          ],
+          "action_trace": [
+            {
+              "action": "click",
+              "status": "failed",
+              "reasoning": null,
+              "element": "#add-to-cart",
+              "response": "Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"#add-to-cart\")\n    - locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n    - waiting 20ms\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n      - waiting 100ms\n    6 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  "
+            },
+            {
+              "action": "click",
+              "status": "completed",
+              "reasoning": null,
+              "element": "#choice-a"
+            }
+          ]
+        }
+      ],
+      "action_trace_summary": [
+        "click completed",
+        "click failed"
+      ],
+      "recorder_code_line_stamps": [
+        null,
+        null
+      ],
+      "build_test_packet": {
+        "contract_version": "build_test_evidence_packet_v1",
+        "workflow_permanent_id": "wpid-variant-selection",
+        "canonical_workflow_yaml": "workflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: select_variant\n    code: |\n      await page.wait_for_selector(\"body\", state=\"visible\")\n      choice = page.locator(\".choice\").first\n      await choice.wait_for(state=\"visible\")\n      identifier = await choice.get_attribute(\"id\")\n      await page.locator(\"#\" + identifier).click()\n      await page.locator(\"#add-to-cart\").click(timeout=3000)\n      return {\"added\": await page.locator(\"#cart-line\").inner_text()}\n",
+        "canonical_workflow_source": "turn_start_persisted_readback",
+        "canonical_workflow_yaml_complete": true,
+        "attempted_block_labels": [
+          "select_variant"
+        ],
+        "executed_block_labels": [
+          "select_variant"
+        ],
+        "run": {
+          "workflow_run_id": "wr_variant_selection_fixture",
+          "browser_session_id": "pbs_variant_selection_fixture",
+          "status": "failed"
+        },
+        "action_observations": [],
+        "failure": {
+          "workflow_run_block_id": "wrb_variant_selection_fixture",
+          "task_id": "tsk_variant_selection_fixture",
+          "block_label": "select_variant",
+          "block_type": "CODE",
+          "block_status": "failed",
+          "reason": "CodeBlock failed while running user code.",
+          "error_codes": [
+            "user_code_error"
+          ],
+          "action_trace": [
+            "click completed",
+            "click failed"
+          ],
+          "page_state": {
+            "current_origin": "https://variant.fixture.test",
+            "current_url": "https://variant.fixture.test/item",
+            "evidence_source": "inspect_page_for_composition",
+            "observed_after_workflow_run": true,
+            "rendered_value_excerpt": "Item Option AOption B Add to cart We will let you know when this option is available again.Close",
+            "form_summaries": [],
+            "result_summaries": [],
+            "action_summaries": [
+              "Option A enabled",
+              "Option B enabled",
+              "Add to cart enabled",
+              "Close enabled"
+            ],
+            "challenge_summaries": [],
+            "obstruction_summaries": [],
+            "obstructions": []
+          },
+          "locator_observations": []
+        },
+        "page_capture": {
+          "status": "captured"
+        },
+        "requested_outputs": [],
+        "registered_outputs": [],
+        "downloads": [],
+        "screenshot": {
+          "present": false
+        },
+        "unfinished_items": [],
+        "omission_notices": [
+          "action_observations empty: no same-run action observation was recorded.",
+          "failure.locator_observations omitted: no post-action locator observation was attempted for this run.",
+          "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded.",
+          "downloads empty: no registered download artifact was recorded.",
+          "screenshot omitted: no final or failed-block screenshot was recorded.",
+          "unfinished_items empty: recorded outcome and workflow evidence identify none."
+        ]
+      },
+      "findings": [
+        {
+          "reason_code": "code_block_readiness_wait_advisory",
+          "summary": "Code blocks `select_variant`: Code block waits on a root container (`body`, `html`, `:root`, `*`) for page readiness. Every document already has one, so the wait encodes no precondition: it either passes immediately or burns its whole timeout with the container already resolved. Wait on the element whose content the block goes on to read, so a failed wait names what was actually missing."
+        }
+      ]
+    }
+  }
+}

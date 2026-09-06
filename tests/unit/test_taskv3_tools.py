@@ -26,6 +26,8 @@ from playwright.async_api import Error as _PlaywrightError
 from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.tools as taskv3_tools
+from skyvern.config import settings
+from skyvern.forge.taskv3.loop import SemanticCommitStats
 from skyvern.forge.taskv3.tools import (
     _ALIAS_SELECTOR_RE,
     _OPAQUE_ID_RUN_RE,
@@ -43,7 +45,9 @@ from skyvern.forge.taskv3.tools import (
 from skyvern.forge.taskv3.tools import _upload_submit_delay as _REAL_UPLOAD_SUBMIT_DELAY
 from skyvern.forge.taskv3.tools import (
     build_browser_tools,
+    pending_marker,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
 
@@ -2685,7 +2689,105 @@ async def test_get_html_marks_truncation_explicitly() -> None:
     r = await _tool(tools, "get_html").handler({"selector": "#big"})
     assert r.status == "ok"
     assert len(r.content) < 30000
-    assert r.content.endswith("…[truncated at 20000 chars]")
+    assert r.content.endswith(taskv3_tools._MARKUP_CUT)
+
+
+# A branch-local witness, not captured production DOM: a stylesheet larger than get_html's whole
+# markup budget standing in front of the one record a mid-flow block has to read.
+_STYLE_PREFIX_DOC = (
+    "<html><head><style>" + "/* pad */ .a{color:#000}\n" * 900 + "</style></head>"
+    "<body><main>Statement STMT-4471 issued 2026-02-14</main></body></html>"
+)
+_STYLE_PREFIX_RECORD = "Statement STMT-4471 issued 2026-02-14"
+
+
+class _FakeTextPage(_FakePage):
+    """A page whose markup and rendered text are both scripted."""
+
+    def __init__(self, html: str, text: str) -> None:
+        super().__init__()
+        self._html, self._text = html, text
+
+    async def content(self) -> str:
+        return self._html
+
+    async def evaluate(self, js: str) -> str:
+        if js == taskv3_tools._PAGE_TEXT_JS:
+            return self._text
+        return await super().evaluate(js)
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_returns_the_record_a_style_prefix_hides_from_markup() -> None:
+    # The record is genuinely past the markup cut, so the markup read provably cannot contain it —
+    # and its cut notice names the read that can.
+    assert len(_STYLE_PREFIX_DOC) > taskv3_tools.HTML_MAX_CHARS
+    assert _STYLE_PREFIX_RECORD not in _STYLE_PREFIX_DOC[: taskv3_tools.HTML_MAX_CHARS]
+    tools = build_browser_tools(_fixed_page_provider(_FakeTextPage(_STYLE_PREFIX_DOC, _STYLE_PREFIX_RECORD)))
+
+    markup = await _tool(tools, "get_html").handler({})
+    assert markup.status == "ok" and _STYLE_PREFIX_RECORD not in markup.content
+    assert markup.content.endswith(taskv3_tools._PAGE_MARKUP_CUT), markup.content[-200:]
+    assert "format=text" in taskv3_tools._PAGE_MARKUP_CUT and '"' not in taskv3_tools._PAGE_MARKUP_CUT
+
+    text = await _tool(tools, "get_html").handler({"format": "text"})
+    assert text.status == "ok", text.content
+    assert text.content == _STYLE_PREFIX_RECORD
+    assert text.data == {"rendered_text": True}
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_names_a_real_continuation_when_over_bound() -> None:
+    tools = build_browser_tools(_fixed_page_provider(_FakeTextPage(_STYLE_PREFIX_DOC, "Statement line\n" * 3000)))
+    r = await _tool(tools, "get_html").handler({"format": "text"})
+    assert r.status == "ok"
+    assert r.content.endswith(taskv3_tools._RENDERED_TEXT_CUT), r.content[-300:]
+    assert {"get_html", "observe"} <= {spec.name for spec in tools}
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_reads_one_element() -> None:
+    class _TextElement(_FakeElement):
+        async def evaluate(self, js: str, _arg: Any = None) -> Any:
+            assert js == taskv3_tools._PAGE_TEXT_JS
+            return "Statement STMT-4471 issued 2026-02-14"
+
+    page = _FakePage()
+    page.element = _TextElement()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "get_html").handler({"selector": "#records", "format": " Text "})
+    assert r.status == "ok" and r.content == "Statement STMT-4471 issued 2026-02-14"
+    assert r.data == {"rendered_text": True}
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_returns_an_empty_page_as_an_ordinary_result() -> None:
+    tools = build_browser_tools(_fixed_page_provider(_FakeTextPage("<html><body><main></main></body></html>", "")))
+    r = await _tool(tools, "get_html").handler({"format": "text"})
+    assert r.status == "ok" and r.content == "", r
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_reports_a_failed_read_instead_of_pretending_emptiness() -> None:
+    class _RaisingPage(_FakeTextPage):
+        async def evaluate(self, js: str) -> str:
+            if js == taskv3_tools._PAGE_TEXT_JS:
+                raise _PlaywrightError("Execution context was destroyed")
+            return await super().evaluate(js)
+
+    tools = build_browser_tools(_fixed_page_provider(_RaisingPage(_STYLE_PREFIX_DOC, "")))
+    r = await _tool(tools, "get_html").handler({"format": "text"})
+    assert r.status == "error", r
+
+
+@pytest.mark.asyncio
+async def test_get_html_rejects_an_unknown_format_instead_of_dumping_markup() -> None:
+    # The spec's enum is advisory. A typo that fell through to markup would return the whole-page
+    # dump the prompt forbids, on the very page whose markup is unreadable.
+    tools = build_browser_tools(_fixed_page_provider(_FakeTextPage(_STYLE_PREFIX_DOC, _STYLE_PREFIX_RECORD)))
+    r = await _tool(tools, "get_html").handler({"format": "txt"})
+    assert r.status == "error" and "txt" in r.content, r
+    assert (await _tool(tools, "get_html").handler({"format": " HTML "})).status == "ok"
 
 
 @pytest.mark.asyncio
@@ -7003,6 +7105,62 @@ def _observed_alias(observed: Any) -> str:
     return alias_match.group(1)
 
 
+class _FakeAliasTextPage(_FakeAliasPage):
+    """An alias fixture whose rendered text is scripted."""
+
+    def __init__(self, outer_html: str, selector: str, text: str) -> None:
+        super().__init__(outer_html, selector)
+        self._text = text
+
+    async def evaluate(self, js: str) -> str:
+        if js == taskv3_tools._PAGE_TEXT_JS:
+            return self._text
+        return await super().evaluate(js)
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_aliases_a_printed_selector_without_withholding_the_page() -> None:
+    # Prose: the whole-token pass owns a selector spelling; the page stays exempt from the withhold
+    # gate because a value it prints for the user to read is content get_html returns on purpose.
+    raw = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
+    page = _FakeAliasTextPage(f'<input id="{raw}" type="text">', f"#{raw}", f"Reference #{raw} - quote it")
+    tools = build_browser_tools(_fixed_page_provider(page))
+    alias = _observed_alias(await _tool(tools, "observe").handler({}))
+
+    r = await _tool(tools, "get_html").handler({"format": "text"})
+    assert r.status == "ok", r.content
+    assert r.content == f"Reference {alias} - quote it", r.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_masks_a_quoted_selector_the_page_prints() -> None:
+    # A quoted spelling is matched literally by the pass that masks it, which is why text is never
+    # quote-escaped: doing so would hide this one and leave the raw it names standing.
+    raw = "3f2e1d0c-9b8a-4756-8c4d-2e1f0a9b8c7d"
+    page = _FakeAliasTextPage(
+        f'<input data-testid="{raw}" type="text">', f'[data-testid="{raw}"]', f'Use [data-testid="{raw}"] here'
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    alias = _observed_alias(await _tool(tools, "observe").handler({}))
+
+    r = await _tool(tools, "get_html").handler({"format": "text"})
+    assert r.content == f"Use {alias} here", r.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_text_format_does_not_stamp_a_handle_on_a_start_tag_the_page_prints() -> None:
+    # A tag in rendered text is text the page displayed, not an element. Unescaped it reaches the tag
+    # scanner, which would hand it a real element's handle.
+    raw = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
+    page = _FakeAliasTextPage(f'<input id="{raw}" type="text">', f"#{raw}", f'Copy: <input id="{raw}">')
+    tools = build_browser_tools(_fixed_page_provider(page))
+    await _tool(tools, "observe").handler({})
+
+    r = await _tool(tools, "get_html").handler({"format": "text"})
+    assert "data-tv3-ref=" not in r.content, r.content
+    assert r.content.startswith("Copy: &lt;input"), r.content
+
+
 @pytest.mark.asyncio
 async def test_get_html_masks_an_id_in_a_start_tag_the_truncation_cut_open() -> None:
     # get_html truncates before the wrapper masks: a tag the cut leaves without a `>` is still a start
@@ -7153,7 +7311,7 @@ async def test_get_html_rejects_a_punctuation_divergent_truncation_cut() -> None
     html_result = await _tool(tools, "get_html").handler({})
     tail = html_result.content[-200:]
     assert html_result.status == "ok", tail
-    assert tail.endswith('<input id="question_.other-…[truncated at 20000 chars]'), tail
+    assert tail.endswith('<input id="question_.other-' + taskv3_tools._PAGE_MARKUP_CUT), tail
     assert f'<input {alias[1:-1]} type="text">' in html_result.content, html_result.content
     assert 'data-tv3-ref="?"' not in html_result.content, html_result.content
 
@@ -7180,7 +7338,7 @@ async def test_get_html_leaves_a_prefix_only_cut_bare_when_its_owner_is_outside_
     assert html_result.status == "ok", tail
     assert owner_raw not in html_result.content, html_result.content
     assert 'data-tv3-ref="?' not in html_result.content, html_result.content
-    assert tail.endswith('<input id="question_…[truncated at 20000 chars]'), tail
+    assert tail.endswith('<input id="question_' + taskv3_tools._PAGE_MARKUP_CUT), tail
 
 
 @pytest.mark.parametrize(
@@ -14846,7 +15004,7 @@ async def test_upload_submit_delay_mirrors_v1_inter_action_default(monkeypatch: 
         slept.append(s)
 
     monkeypatch.setattr(tools_module.random, "uniform", rec_uniform)
-    monkeypatch.setattr(tools_module.asyncio, "sleep", rec_sleep)
+    monkeypatch.setattr(tools_module, "asyncio", ScopedAsyncio(sleep=rec_sleep))
 
     # Real function (autouse no-ops the module attr for speed); exercise the actual arithmetic.
     await _REAL_UPLOAD_SUBMIT_DELAY()
@@ -15377,6 +15535,442 @@ async def test_look_legend_does_not_name_a_control_by_an_opaque_name_attribute()
     assert raw not in looked.content, looked.content
     # A name that is not opaque is still a usable last-resort label.
     assert "City" in looked.content, looked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_act_by_mark_carries_its_resolved_selector_back_to_the_caller() -> None:
+    # The loop keys the repeat guard, names the repeat nudge's target, and records the submit watch
+    # from the SAME dict it dispatched -- it reads `args` after `spec.handler(args)` returns -- so a
+    # mark act that resolves into a private copy leaves all three blind to what it acted on. The tag
+    # has to outlive the call for the same reason: the submit watch re-resolves that selector against
+    # the page turns later, and a mark act that cleared its own tag would hand it a dead one.
+    # A button that does NOT navigate: an in-flight submit is the only state the submit watch has
+    # anything to say about, and a click that navigates takes the whole DOM (tag included) with it.
+    async with _content_page('<button id="go" type="button">Submit</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        args: dict[str, Any] = {"mark": 1}
+        result = await _tool(tools, "click").handler(args)
+
+        assert result.status == "ok", result.content
+        # The property, not the tag's spelling: whatever the wrapper resolved is in the caller's own
+        # dict, and it still names the control that was clicked.
+        selector = args.get("selector")
+        assert selector, "dispatching a copy leaves the caller holding only `mark`"
+        element = await page.query_selector(selector)
+        assert element is not None
+        assert await element.get_attribute("id") == "go"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_mark_tag_left_on_another_page_cannot_be_matched_by_a_later_acts_selector() -> None:
+    # The submit watch re-resolves its selector against whatever page the run is on at probe time
+    # (agent.py's _pending_marker refetches the page), not the page the click happened on, and it
+    # runs no uniqueness check. _resolve_mark clears tags only on the page it resolves, so a tag
+    # outlives a page switch -- and while the tag value is just the mark, the next act on another
+    # page mints the SAME selector string and the probe can match the earlier page's element.
+    async with _content_page('<button id="a" type="button">A</button>') as page_a:
+        page_b = await page_a.context.new_page()
+        await page_b.set_content('<button id="b" type="button">B</button>')
+        current = [page_a]
+
+        async def _provider() -> Any:
+            return current[0]
+
+        tools = build_browser_tools(_provider)
+        await _tool(tools, "look").handler({})
+        args_a: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(args_a)).status == "ok"
+
+        current[0] = page_b
+        await _tool(tools, "look").handler({})
+        args_b: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(args_b)).status == "ok"
+
+        assert await page_a.query_selector(args_b["selector"]) is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_not_both_guard_still_rejects_a_model_selector_but_not_a_re_dispatch() -> None:
+    # Writing the selector back into the caller's dict leaves it carrying mark AND selector, which is
+    # the exact shape the "not both" guard rejects. The loop dispatches each dict once so no path
+    # re-dispatches today, but the guard is aimed at the model and must not fire on this wrapper's
+    # own output -- while still firing on a selector the model actually supplied alongside a mark.
+    async with _content_page('<button id="go" type="button">Go</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+
+        model_supplied = await _tool(tools, "click").handler({"mark": 1, "selector": "#go"})
+        assert model_supplied.status == "error"
+        assert "not both" in model_supplied.content
+
+        args: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(args)).status == "ok"
+        assert (await _tool(tools, "click").handler(args)).status == "ok"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_repeating_a_mark_act_leaves_the_page_fingerprint_untouched() -> None:
+    # The act tag now outlives the call, and the loop's page fingerprint hashes innerHTML, which
+    # carries attributes (agent.py's _PAGE_FINGERPRINT_PROBE_JS). It is sampled before a batch and
+    # again after it, so a tag whose VALUE moved on every act would make a motionless page read as
+    # changed on every turn and silently disarm the page-state stall detector -- on exactly the
+    # repeated-identical-action case that detector exists to terminate. The token is per look
+    # generation for this reason: the same mark keeps the same tag until look renumbers.
+    async with _content_page('<button id="go" type="button">Go</button><input id="x">') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+
+        assert (await _tool(tools, "click").handler({"mark": 1})).status == "ok"
+        before = await page.evaluate("() => document.body.innerHTML")
+        assert (await _tool(tools, "click").handler({"mark": 1})).status == "ok"
+        after = await page.evaluate("() => document.body.innerHTML")
+
+        assert before == after
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_acting_on_a_second_mark_does_not_strip_the_first_marks_tag() -> None:
+    # The submit watch holds the selector of the control a click acted on and re-resolves it turns
+    # later. Clearing every tag on the page at the top of each resolve meant any later mark act --
+    # a type into one more field, a select_option, a click that arms nothing -- silently stripped
+    # the tracked submit's tag, so the in-flight probe resolved nothing and the hold never fired.
+    async with _content_page('<button id="go" type="button">Go</button><input id="x">') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+
+        clicked: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(clicked)).status == "ok"
+        typed: dict[str, Any] = {"mark": 2, "text": "hello"}
+        assert (await _tool(tools, "type").handler(typed)).status == "ok"
+
+        assert await page.query_selector(clicked["selector"]) is not None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_same_control_keeps_its_selector_across_a_fresh_look() -> None:
+    # action_key is computed from the dispatched args AFTER the selector is written into them, so a
+    # token that turned over on every look() made look -> click(mark=N) -> look -> click(mark=N) on
+    # ONE element mint a different key each time and never accumulate a repeat streak -- defeating
+    # the repeat-action guard on exactly the act-by-mark stuck loop it exists to terminate.
+    async with _content_page('<button id="go" type="button">Go</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+
+        await _tool(tools, "look").handler({})
+        first: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(first)).status == "ok"
+
+        await _tool(tools, "look").handler({})
+        second: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(second)).status == "ok"
+
+        assert first["selector"] == second["selector"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_get_html_does_not_hand_back_the_act_tag() -> None:
+    # Every other data-tv3-* attribute is gone by the time get_html runs; this one now outlives its
+    # call, so it is the first that can reach the model. It must not: copied into an explicit
+    # selector it skips the mark path's freshness check and can name whatever still carries the
+    # attribute after the marks have been renumbered to mean something else.
+    async with _content_page('<button id="go" type="button">Go</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        assert (await _tool(tools, "click").handler({"mark": 1})).status == "ok"
+
+        assert await page.query_selector("[data-tv3-act]") is not None  # still tagged, as intended
+        html = await _tool(tools, "get_html").handler({})
+        assert "data-tv3-act" not in html.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_renumbered_mark_does_not_steal_the_tag_of_the_control_already_acted_on() -> None:
+    # look() renumbers, so the same number means a different element after it. The submit watch holds
+    # the selector of the control a click acted on and re-resolves it later, so a token that follows
+    # the NUMBER rather than the ELEMENT would migrate to whatever the number now names -- and the
+    # in-flight probe would answer about the wrong control, which is worse than not answering.
+    async with _content_page(
+        '<button id="b1" type="button">One</button><button id="b2" type="button">Two</button>'
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        acted: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(acted)).status == "ok"
+        first = await page.query_selector(acted["selector"])
+        assert first is not None and await first.get_attribute("id") == "b1"
+
+        # A control appears ahead of it, so mark 1 now names a different button.
+        await page.evaluate(
+            "() => document.body.insertAdjacentHTML('afterbegin', '<button id=\"b0\" type=\"button\">Zero</button>')"
+        )
+        await _tool(tools, "look").handler({})
+        renumbered: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(renumbered)).status == "ok"
+        assert await (await page.query_selector(renumbered["selector"])).get_attribute("id") == "b0"
+
+        still = await page.query_selector(acted["selector"])
+        assert still is not None and await still.get_attribute("id") == "b1"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("planted", ["a1", "A7", "a1x", "hijack", ""])
+async def test_a_data_tv3_act_the_page_already_carries_is_never_adopted_as_identity(planted: str) -> None:
+    # The element is trusted to remember its own token, so the read has to be able to tell OUR token
+    # from one the page wrote. Nothing guarantees a site's value is unique -- adopting `a1` from two
+    # different elements would point one selector at both -- so only a freshly minted token counts,
+    # and the planted value must be overwritten rather than reused.
+    html = f'<button id="go" type="button" data-tv3-act="{planted}">Go</button><button id="other" type="button">Other</button>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        args: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(args)).status == "ok"
+
+        minted = await (await page.query_selector("#go")).get_attribute("data-tv3-act")
+        assert minted != planted, "a value the page wrote was adopted as this element's identity"
+        # The property that matters: the selector handed back names exactly one element, the one
+        # clicked -- not a twin the page could have planted under the same token.
+        assert len(await page.query_selector_all(args["selector"])) == 1
+        assert await (await page.query_selector(args["selector"])).get_attribute("id") == "go"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_in_flight_probe_reads_every_control_a_selector_answers_to() -> None:
+    # cloneNode COPIES attributes, and pages duplicate controls the run has already acted on -- an
+    # "add another" repeatable row is the ordinary case -- so one selector can name two elements.
+    # Reading only the first in document order lets a settled twin answer for a control that is
+    # still submitting, and that verdict passes as complete. An extra hold costs a turn; this costs
+    # the submission. The probe reports the first match still in flight, whichever one it is.
+    async with _content_page('<button id="go" type="button">Submitting...</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        args: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(args)).status == "ok"
+
+        # A settled duplicate of the acted control lands AHEAD of it in document order.
+        await page.evaluate(
+            "() => { const o = document.getElementById('go'); const c = o.cloneNode(true);"
+            " c.id = 'clone'; c.textContent = 'Done';"
+            " document.body.insertBefore(c, document.body.firstChild); }"
+        )
+        assert len(await page.query_selector_all(args["selector"])) == 2  # the collision is real
+
+        assert await pending_marker(page, args["selector"]) == "Submitting..."
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_acting_on_a_clone_mints_it_a_token_instead_of_inheriting_one() -> None:
+    # Written because reverting the mint's uniqueness check reddened nothing. Refusing an ambiguous
+    # token at the probe keeps the run safe but leaves it permanently silent for that token; the
+    # clone has to take an identity of its own so BOTH controls stay individually addressable, and
+    # the original stays the sole holder of the token the submit watch is already carrying.
+    async with _content_page('<button id="go" type="button">Go</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        original: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(original)).status == "ok"
+
+        await page.evaluate(
+            "() => { const o = document.getElementById('go'); const c = o.cloneNode(true);"
+            " c.id = 'clone'; document.body.appendChild(c); }"
+        )
+        looked = await _tool(tools, "look").handler({})
+        clone_mark = max(
+            int(ln.split("]")[0].lstrip("[")) for ln in looked.content.splitlines() if ln.startswith("[") and "]" in ln
+        )
+        cloned: dict[str, Any] = {"mark": clone_mark}
+        assert (await _tool(tools, "click").handler(cloned)).status == "ok"
+
+        assert cloned["selector"] != original["selector"]
+        assert len(await page.query_selector_all(original["selector"])) == 1
+        assert len(await page.query_selector_all(cloned["selector"])) == 1
+        assert await (await page.query_selector(original["selector"])).get_attribute("id") == "go"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_clone_in_another_shadow_root_still_does_not_inherit_the_token() -> None:
+    # The uniqueness recheck has to count in the domain the CONSUMERS resolve in. Playwright's engine
+    # pierces open shadow roots, so the click-ambiguity gate and the in-flight probe both see across
+    # them; a same-root count calls a cross-root clone unique, keeps the inherited token, and the
+    # click gate then refuses the very control the recheck exists to keep actionable.
+    html = """<div id="h1"></div><div id="h2"></div><script>
+    document.getElementById('h1').attachShadow({mode:'open'}).innerHTML =
+      '<button id="a" type="button">Alpha</button>';
+    document.getElementById('h2').attachShadow({mode:'open'}).innerHTML = '<span>x</span>';
+    </script>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        original: dict[str, Any] = {"mark": 1}
+        assert (await _tool(tools, "click").handler(original)).status == "ok"
+
+        # The component duplicates the acted control into a DIFFERENT open shadow root.
+        await page.evaluate(
+            "() => { const a = document.getElementById('h1').shadowRoot.querySelector('button');"
+            " document.getElementById('h2').shadowRoot.appendChild(a.cloneNode(true)); }"
+        )
+        assert len(await page.query_selector_all(original["selector"])) == 2  # the collision is real
+
+        looked = await _tool(tools, "look").handler({})
+        marks = [int(ln.split("]")[0].lstrip("[")) for ln in looked.content.splitlines() if ln.startswith("[")]
+        cloned: dict[str, Any] = {"mark": max(marks)}
+        assert (await _tool(tools, "click").handler(cloned)).status == "ok", cloned
+
+        assert cloned["selector"] != original["selector"]
+        assert len(await page.query_selector_all(original["selector"])) == 1
+        assert len(await page.query_selector_all(cloned["selector"])) == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_cannot_forge_a_token_by_reading_the_prefix_and_adding_a_quote() -> None:
+    # The tag outlives its call, so the page can READ this run's prefix straight off the DOM after
+    # the first act. Accepting anything that merely BEGINS with it would adopt a value carrying a
+    # double quote, which closes the attribute early and turns the selector built from it into a
+    # selector LIST. That selector is what click() acts through, and a value with a quote does not
+    # match the marker regex, so it would skip the uniqueness check and land where the page said.
+    html = '<button id="b1" type="button">One</button><button id="b2" type="button">Two</button>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        assert (await _tool(tools, "click").handler({"mark": 1})).status == "ok"
+
+        # The prefix is "a" plus secrets.token_hex(4) -- nine characters. Stripping trailing digits
+        # would eat the hex tail too, and a truncated prefix is rejected by the very check under test.
+        observed = await page.evaluate("() => document.querySelector('[data-tv3-act]').getAttribute('data-tv3-act')")
+        prefix = observed[:9]
+        assert len(observed) > 9 and prefix.startswith("a"), observed
+        # Crafted so the selector built from it stays VALID and matches exactly ONE element -- the
+        # attacker's choice, b1 -- so it survives the sole-holder recheck and is adopted as identity.
+        await page.evaluate(
+            """(p) => document.getElementById('b2').setAttribute(
+                 'data-tv3-act', p + '999" i],[id="b1')""",
+            prefix,
+        )
+
+        await _tool(tools, "look").handler({})
+        acted: dict[str, Any] = {"mark": 2}
+        assert (await _tool(tools, "click").handler(acted)).status == "ok", acted
+
+        minted = await (await page.query_selector("#b2")).get_attribute("data-tv3-act")
+        assert '"' not in (minted or ""), minted
+        # The selector handed back must name the control that was acted on, not the one the page
+        # nominated: adopting the forged value points a mark act on b2 straight at b1.
+        assert len(await page.query_selector_all(acted["selector"])) == 1
+        assert await (await page.query_selector(acted["selector"])).get_attribute("id") == "b2"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_that_patches_its_own_regexp_cannot_have_a_forged_tag_accepted() -> None:
+    # Whether a tag counts as an identity is decided in Python, deliberately, because the page owns
+    # every primitive in its own realm -- RegExp included. A page that makes every test() return true
+    # can still not talk the engine into adopting a value it planted.
+    html = '<button id="b1" type="button">One</button><button id="b2" type="button">Two</button>'
+    async with _content_page(html) as page:
+        await page.evaluate(
+            "() => { const O = window.RegExp;"
+            " window.RegExp = function (...a) { const r = new O(...a); r.test = () => true; return r; }; }"
+        )
+        await page.evaluate("() => document.getElementById('b2').setAttribute('data-tv3-act', 'forged-by-page')")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        acted: dict[str, Any] = {"mark": 2}
+        assert (await _tool(tools, "click").handler(acted)).status == "ok", acted
+
+        assert "forged-by-page" not in acted["selector"]
+        assert await (await page.query_selector(acted["selector"])).get_attribute("id") == "b2"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_hijacked_setattribute_cannot_hand_back_a_selector_naming_another_element() -> None:
+    # A page that traps setAttribute receives the freshly minted token directly -- no guessing -- and
+    # can put it on an element of its choosing. Without reading the write back through Playwright,
+    # the engine would return a selector naming the decoy and act there. Refusing is the only safe
+    # answer: the mark genuinely cannot be resolved.
+    html = '<button id="real" type="button">Real</button><button id="decoy" type="button">Decoy</button>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        await page.evaluate(
+            "() => { const set = Element.prototype.setAttribute;"
+            " Element.prototype.setAttribute = function (n, v) {"
+            "   if (n === 'data-tv3-act') { return set.call(document.getElementById('decoy'), n, v); }"
+            "   return set.call(this, n, v); }; }"
+        )
+        result = await _tool(tools, "click").handler({"mark": 1})
+
+        assert result.status == "error", result.content
+        assert "no longer points to an element" in result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_setattribute_trap_cannot_hand_back_a_token_two_elements_carry() -> None:
+    # The subtler half of the same trap: rather than diverting the write, it lets the write land AND
+    # copies the token onto a decoy. The element then genuinely carries what was minted, so reading
+    # it back proves nothing on its own -- and the selector handed out would name two controls.
+    #
+    # The page ALSO hides the decoy from its own querySelectorAll, which is what the downstream
+    # marker-ambiguity gate counts through. That gate therefore sees one holder and waves it past;
+    # only a count taken through Playwright's engine, in a realm the page has no handle on, still
+    # sees two. Without that count this resolver hands out a selector naming two controls.
+    html = '<button id="real" type="button">Real</button><button id="decoy" type="button">Decoy</button>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        await page.evaluate(
+            "() => { const set = Element.prototype.setAttribute;"
+            " Element.prototype.setAttribute = function (n, v) {"
+            "   set.call(this, n, v);"
+            "   if (n === 'data-tv3-act') { set.call(document.getElementById('decoy'), n, v); } };"
+            " const qsa = Document.prototype.querySelectorAll;"
+            " Document.prototype.querySelectorAll = function (sel) {"
+            "   const out = Array.from(qsa.call(this, sel));"
+            "   return out.filter((e) => e.id !== 'decoy'); }; }"
+        )
+        result = await _tool(tools, "click").handler({"mark": 1})
+
+        assert result.status == "error", result.content
+        assert "no longer points to an element" in result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_acting_on_a_new_mark_does_not_read_as_a_page_change() -> None:
+    # The act tag outlives the action now, so the FIRST act on each control adds an attribute the
+    # page fingerprint would otherwise hash. On a frozen page the model works through mark after
+    # mark, and each new one would read as a page change and reset the stall counter -- disarming
+    # the detector on exactly the stuck run it exists to catch. The probe scrubs its own writing.
+    from skyvern.forge.agent import _PAGE_FINGERPRINT_PROBE_JS
+
+    async with _content_page('<button id="a" type="button">A</button><button id="b" type="button">B</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+
+        # Sampled AFTER the first act: the click gate's own data-tv3-pre stamping moves the hash once
+        # on any page and predates this work. What must not move it is the SECOND control gaining a
+        # tag, because that is the step a frozen page repeats.
+        assert (await _tool(tools, "click").handler({"mark": 1})).status == "ok"
+        before = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+        assert (await _tool(tools, "click").handler({"mark": 2})).status == "ok"
+        after = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
+
+        assert len(await page.query_selector_all("[data-tv3-act]")) == 2  # both really are tagged
+        assert before == after
 
 
 # A payload URL long enough to hit observe's per-field display caps (label 140, value 100,
@@ -21127,16 +21721,85 @@ async def test_semantic_commit_probe_contract(shape: str) -> None:
 @pytest.mark.asyncio
 async def test_semantic_verify_kill_switch_keeps_commits_working(monkeypatch: pytest.MonkeyPatch) -> None:
     # The flag is a kill switch, not a dependency: with it OFF the heuristics still accept a
-    # legitimate declared-list commit end to end.
-    from skyvern.config import settings as _settings
-
-    monkeypatch.setattr(_settings, "TASK_V3_SEMANTIC_COMMIT_VERIFY", False)
+    # legitimate declared-list commit end to end. Nothing is counted while it is off either — an
+    # opportunity counted outside the flag block would report a 0% accept rate for a tier that is
+    # structurally unable to fire.
+    monkeypatch.setattr(settings, "TASK_V3_SEMANTIC_COMMIT_VERIFY", False)
+    stats = SemanticCommitStats()
     async with _content_page(_declared_list_lingers_html(revert_on_escape=False)) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), semantic_commit_stats=stats)
         picked = await _tool(tools, "select_combobox").handler(
             {"selector": "#city", "value": "Springfield, Sangamon, IL"}
         )
         assert picked.status == "ok", picked.content
+    assert stats.opportunities == 0, stats
+    assert stats.accepts == 0, stats
+
+
+# A comma-hostile server-search widget: the requested label never matches as typed, so the tool has
+# to reduce to the leading clause, and the row click then writes back the fuller label the tool never
+# authored -- the value-transform shape tier-1 accepts on.
+_TIER1_VALUE_TRANSFORM_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="city">City</label>
+<input id="city" role="combobox" aria-autocomplete="list" aria-controls="dd" aria-expanded="false"
+       type="text" autocomplete="off" style="position:absolute;top:0;left:0;width:300px;height:26px">
+<div id="dd" role="listbox" style="position:absolute;top:40px;left:0;width:300px;background:#fff"></div>
+<script>
+var DATA = ['Springfield, Sangamon, IL'];
+var input = document.getElementById('city');
+var dd = document.getElementById('dd');
+function render() {
+  var q = input.value.trim().toLowerCase();
+  dd.innerHTML = '';
+  var rows = (!q || q.indexOf(',') >= 0)
+    ? []
+    : DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; });
+  rows.forEach(function (d) {
+    var row = document.createElement('div');
+    row.setAttribute('role', 'option');
+    row.style.cssText = 'height:24px;background:#eee';
+    row.textContent = d;
+    row.addEventListener('click', function () {
+      input.value = d;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    dd.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
+}
+input.addEventListener('input', render);
+input.addEventListener('focus', render);
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_semantic_commit_counts_one_opportunity_per_call_and_an_accept_when_the_tier_reads_a_commit() -> None:
+    # The poll early-returns on a tier-1 accept, so an accepting call spends one attempt and a
+    # refusing call spends four. Counting per attempt would make the accept rate track widget
+    # latency instead of the tier's decisiveness.
+    accepting = SemanticCommitStats()
+    async with _content_page(_TIER1_VALUE_TRANSFORM_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), semantic_commit_stats=accepting)
+        picked = await _tool(tools, "select_combobox").handler(
+            {"selector": "#city", "value": "Springfield, Sangamon, IL"}
+        )
+        assert picked.status == "ok", picked.content
+    assert accepting.opportunities == 1, accepting
+    assert accepting.accepts == 1, accepting
+
+    refusing = SemanticCommitStats()
+    async with _content_page(_PRE_SELECTED_DECOR_DEAD_CLICK_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), semantic_commit_stats=refusing)
+        dead = await _tool(tools, "select_combobox").handler(
+            {"selector": "#cityp", "value": "Springfield, Sangamon, IL"}
+        )
+        assert dead.status == "error", dead.content
+    assert refusing.opportunities == 1, refusing
+    assert refusing.accepts == 0, refusing
 
 
 @_skip_no_browser
@@ -21192,3 +21855,319 @@ async def test_observe_stays_silent_about_hidden_chrome_when_it_can_still_see_th
     assert "(1 interactive elements)" in r.content, r.content
     assert "present but not visible" not in r.content, r.content
     assert r.data is not None and r.data["summary"]["hidden_dropped"] == 1
+
+
+# The shape SKY-15662 was diagnosed on: many live, visible per-row controls whose accessible name is
+# exactly the string carried by one button inside a display:none subtree the page ships on every
+# load. That subtree is a template the app clones to open its dialog, so the hidden button is the one
+# element answering to that name that can never be clicked -- and the only one observe drops.
+_INERT_TEMPLATE_FIXTURE_HTML = """<!doctype html><html><body>
+  <ul id="rows">
+    <li>Row one <i title="Remove Item" role="button" tabindex="0" class="row-remove"
+        style="display:inline-block;width:24px;height:24px">x</i></li>
+    <li>Row two <i title="Remove Item" role="button" tabindex="0" class="row-remove"
+        style="display:inline-block;width:24px;height:24px">x</i></li>
+    <li>Row three <i title="Remove Item" role="button" tabindex="0" class="row-remove"
+        style="display:inline-block;width:24px;height:24px">x</i></li>
+  </ul>
+  <div style="display: none">
+    <div id="confirmationTemplate">
+      <p>Remove this row?</p>
+      <input class="tpl-note" placeholder="Note">
+      <button class="btn js-remove-confirm">Remove Item</button>
+    </div>
+  </div>
+</body></html>
+"""
+
+
+class _TimesOutWithoutADriverLog:
+    """A real page whose click raises a Timeout that did not come from the driver — what a network
+    fetch inside an action raises before the browser is ever touched."""
+
+    def __init__(self, page: Any) -> None:
+        self._page = page
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._page, name)
+
+    async def click(self, *args: Any, **kwargs: Any) -> None:
+        raise TimeoutError("fetching the source timed out")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_timeout_that_did_not_come_from_the_driver_is_not_blamed_on_a_hidden_element() -> None:
+    # The target really is display:none and the probe really runs against it, so every ingredient of
+    # the diagnosis is present except the one that matters: the driver never waited for anything. An
+    # action that fetches over the network before touching the browser (file_upload does) would
+    # otherwise have its fetch failure reported as "this element is not rendered" -- pointing at the
+    # element, which is fine, instead of at the fetch, which is not.
+    async with _content_page(_INERT_TEMPLATE_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(_TimesOutWithoutADriverLog(page)))
+        with pytest.raises(TimeoutError) as raised:
+            await _tool(tools, "click").handler({"selector": ".js-remove-confirm"})
+
+    assert "fetching the source timed out" in str(raised.value)
+
+
+_INERT_PREGATE_FIXTURE_HTML = """<!doctype html><html><body>
+  <div style="display:none">
+    <div id="confirmDialog">
+      <select class="tpl-reason"><option value="dup">Duplicate</option></select>
+      <input class="tpl-ack" type="checkbox">
+    </div>
+  </div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("select_option", {"selector": ".tpl-reason", "value": "dup"}),
+        ("click", {"selector": ".tpl-ack"}),
+    ],
+)
+async def test_a_hidden_widget_refused_before_dispatch_is_not_sent_looking_for_a_trigger(
+    tool_name: str, args: dict[str, object]
+) -> None:
+    # A native <select> and a native checkbox are refused by a visibility pre-gate BEFORE anything
+    # raises, so they never reach the guard's diagnosis. They were told their section is collapsed and
+    # to act on whatever reveals it -- but a template has no trigger to find, and sending the model
+    # hunting for one is the same wrong turn, in gentler words, that this whole change exists to stop.
+    async with _content_page(_INERT_PREGATE_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, tool_name).handler(args)
+
+    assert r.status == "error", r.content
+    assert "display:none" in r.content, r.content
+    assert "collapsed" not in r.content, r.content
+    assert "reveals it" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("click", {"selector": ".js-remove-confirm"}),
+        ("type", {"selector": ".tpl-note", "text": "why"}),
+        ("hover", {"selector": ".js-remove-confirm"}),
+    ],
+)
+async def test_acting_on_an_inert_template_control_is_not_reported_as_a_blocked_page(
+    tool_name: str, args: dict[str, object]
+) -> None:
+    # The defect's terminal step. The action times out because the target is display:none, and the
+    # raw driver log the model then received says the locator "resolved to" a real element that "is
+    # not visible" -- locally true, globally false. The model read that as a dialog covering the
+    # control and terminated a task the page was ready to accept. Every act tool reaches the driver
+    # the same way, so every one of them must name what actually happened rather than re-raise that
+    # log: nothing is covering it, it is markup the page does not render.
+    async with _content_page(_INERT_TEMPLATE_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, tool_name).handler(args)
+
+    assert r.status == "error", r.content
+    assert "not rendered" in r.content and "display:none" in r.content, r.content
+    # The two inferences that produced the termination must be absent: nothing covers it, and the
+    # driver's "resolved to <button ...> / element is not visible" log must not be what the model sees.
+    assert "covered" not in r.content, r.content
+    assert "resolved to" not in r.content and "Call log" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_live_control_that_fails_keeps_its_own_diagnosis() -> None:
+    # The guard must not answer "not rendered" for every failure that happens to time out. A visible
+    # control under a real overlay is the case the inert error would be actively wrong about -- it IS
+    # blocked, and telling the model to go find a different element would send it away from the
+    # dismissal that unblocks the page.
+    html = """<!doctype html><html><body>
+      <button class="live" style="position:fixed;top:40px;left:0;width:120px;height:30px">Go</button>
+      <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)">blocking overlay</div>
+    </body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": ".live"})
+
+    assert r.status == "error", r.content
+    assert "covered" in r.content, r.content
+    assert "not rendered" not in r.content, r.content
+
+
+async def _no_isolated_world(*_args: Any, **_kwargs: Any) -> None:
+    """Simulates a page/browser where no isolated world can be created — the state in which
+    `_probe_evaluate` falls back to the realm the page owns."""
+    return None
+
+
+class _TimesOutWithADriverLog:
+    """A real page whose click fails the way the driver does: a timeout carrying a call log."""
+
+    def __init__(self, page: Any) -> None:
+        self._page = page
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._page, name)
+
+    async def click(self, *args: Any, **kwargs: Any) -> None:
+        raise TimeoutError("Page.click: Timeout 15000ms exceeded.\nCall log:\n  - element is not visible")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_inert_diagnosis_makes_no_claim_about_the_rest_of_the_page() -> None:
+    # The probe establishes that THIS element has no box. A real modal or cookie banner can be open
+    # at the same time, and a categorical "nothing is blocking you" would turn a fix against inferring
+    # a blocker that is not there into a way to dismiss one that is.
+    async with _content_page(_INERT_TEMPLATE_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": ".js-remove-confirm"})
+
+    assert r.status == "error", r.content
+    assert "not rendered" in r.content, r.content
+    # Pinned as the PROPERTY the message must have, not as the phrasings it once used: it has to
+    # HEDGE both scopes it over-claimed -- the rest of the page, and the future. A list of forbidden
+    # spellings gives no signal, because the same claim reworded ("hidden markup is only ever ...;
+    # no wait will reveal it") passes it; a reworded over-claim cannot carry these hedges.
+    assert "separate question this does not answer" in r.content, r.content
+    assert "usually" in r.content, r.content
+    assert "may yet reveal" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_that_patches_computed_style_cannot_win_the_inert_question(monkeypatch: Any) -> None:
+    # The diagnosis must be decided in a realm the page cannot reach. _probe_evaluate falls back to
+    # the page's own realm when no isolated world exists, and there a page replacing getComputedStyle
+    # answers this question itself -- so a VISIBLE control reads as display:none and its failure is
+    # replaced by "not rendered", which is this fix inverted into a way to dismiss a real blocker.
+    # With no isolated world available the answer is unknown, and unknown must make no claim.
+    monkeypatch.setattr(taskv3_tools, "_isolated_world", _no_isolated_world)
+    html = """<!doctype html><html><body>
+      <button class="live" style="width:120px;height:30px">Go</button>
+      <script>
+        const real = window.getComputedStyle;
+        window.getComputedStyle = function (el, ps) {
+          const s = real.call(window, el, ps);
+          return new Proxy(s, {get: (t, k) => (k === 'display' ? 'none' : Reflect.get(t, k))});
+        };
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(_TimesOutWithADriverLog(page)))
+        with pytest.raises(Exception) as raised:
+            await _tool(tools, "click").handler({"selector": ".live"})
+
+    assert "Call log" in str(raised.value), "the original driver failure must survive untouched"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_typeable_combobox_anchor_in_hidden_markup_does_not_leak_the_driver_log() -> None:
+    # select_combobox has two anchor shapes and only one of them was measured. A div anchor returns
+    # its own could-not-open error, but a TYPEABLE anchor -- the searchable autocomplete every design
+    # system ships -- takes the typeahead branch and raises the driver's call log verbatim: "locator
+    # resolved to <input ...>", "element is not visible". That is the exact evidence the run this
+    # exists for read as a modal over the page.
+    html = """<!doctype html><html><body>
+      <div style="display:none">
+        <input class="combo-input" role="combobox" aria-expanded="false" aria-autocomplete="list">
+      </div>
+    </body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": ".combo-input", "value": "X"})
+
+    assert r.status == "error", r.content
+    assert "not rendered" in r.content and "display:none" in r.content, r.content
+    assert "resolved to" not in r.content and "Call log" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_diagnosis_probes_the_page_the_action_failed_on_not_a_newer_tab() -> None:
+    # page_provider resolves the working page, which in workflow-block runs can switch to the newest
+    # valid tab. A tab opening while an action fails would otherwise be probed instead of the page the
+    # action ran on -- and a hidden element answering to the same selector there would replace a real
+    # failure with a false "not rendered". The diagnosis asks the page the handler acted on.
+    acted_html = (
+        '<!doctype html><html><body><button class="target" style="width:90px;height:28px">Go</button></body></html>'
+    )
+    newer_html = (
+        '<!doctype html><html><body><div style="display:none"><button class="target">Go</button></div></body></html>'
+    )
+    async with _content_page(acted_html) as acted, _content_page(newer_html) as newer:
+        pages = [_TimesOutWithADriverLog(acted), newer]
+
+        async def _switching_provider() -> Any:
+            # First call (the handler's) hands over the page that fails; any later call hands over the
+            # newer tab, which is exactly what must_get_working_page would do.
+            return pages.pop(0) if len(pages) > 1 else pages[0]
+
+        tools = build_browser_tools(_switching_provider)
+        with pytest.raises(Exception) as raised:
+            await _tool(tools, "click").handler({"selector": ".target"})
+
+    assert "Call log" in str(raised.value), "the failure from the acted-on page must survive untouched"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_rewritten_selector_is_diagnosed_as_the_element_the_driver_waited_on() -> None:
+    # A bare `#id` can name a shadow HOST whose id is mirrored onto the control inside its root, and
+    # the handler rewrites the selector to that control before acting. The guard only ever sees the
+    # ORIGINAL, so a diagnosis that asks about it probes the visible host, finds it rendered, and
+    # hands back the driver's raw call log for the hidden inner control -- the exact evidence chain
+    # this change exists to replace, reached through a selector the model never wrote.
+    html = """<!doctype html><html><body>
+      <div id="cv" style="display:inline-block;width:160px;height:32px"></div>
+      <script>
+        const host = document.getElementById('cv');
+        host.attachShadow({mode: 'open'}).innerHTML =
+          '<input id="cv" type="text" style="display:none">';
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#cv", "text": "hello"})
+
+    assert r.status == "error", r.content
+    assert "not rendered" in r.content and "display:none" in r.content, r.content
+    assert "resolved to" not in r.content and "Call log" not in r.content, r.content
+    # Named as the element the driver actually waited on, not as the host the caller typed.
+    assert 'input[id="cv"]' in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_selector_rewrite_does_not_outlive_the_call_that_made_it() -> None:
+    # Only some handlers rewrite their selector. `type` on a shadow host resolves `#cv` to the
+    # mirrored control inside the root; a later `hover("#cv")` acts on the HOST and rewrites nothing.
+    # If the mapping survived, that hover -- failing because something genuinely covers the host --
+    # would be diagnosed against the hidden inner control and answered "not rendered", suppressing a
+    # real overlay. The dangerous direction: a fix against inventing a blocker, dismissing a real one.
+    html = """<!doctype html><html><body>
+      <div id="cv" style="position:fixed;top:40px;left:0;width:160px;height:32px"></div>
+      <div style="position:fixed;inset:0;background:rgba(0,0,0,.4)">blocking overlay</div>
+      <script>
+        const host = document.getElementById('cv');
+        host.attachShadow({mode: 'open'}).innerHTML =
+          '<input id="cv" type="text" style="display:none">';
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        typed = await _tool(tools, "type").handler({"selector": "#cv", "text": "hello"})
+        assert typed.status == "error" and "not rendered" in typed.content, typed.content
+        with pytest.raises(Exception) as raised:
+            await _tool(tools, "hover").handler({"selector": "#cv"})
+
+    # The overlay failure survives as itself. With the mapping still live it came back as
+    # "not rendered", which would have sent the model away from the layer it has to dismiss.
+    assert "Call log" in str(raised.value), str(raised.value)[:400]
+    assert "not rendered" not in str(raised.value), str(raised.value)[:400]

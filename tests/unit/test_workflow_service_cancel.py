@@ -46,6 +46,7 @@ async def test_mark_canceled_if_not_final_returns_conditional_result(
     delegate.assert_awaited_once_with(
         workflow_run_id="wr_1",
         status=WorkflowRunStatus.canceled,
+        failure_reason=None,
     )
 
 
@@ -351,6 +352,7 @@ async def test_mark_canceled_rejects_transition_on_terminal_row(
     conditional_update.assert_awaited_once_with(
         workflow_run_id="wr_final",
         status=WorkflowRunStatus.canceled,
+        failure_reason=None,
     )
     unconditional_update.assert_not_called()
 
@@ -379,6 +381,7 @@ async def test_mark_canceled_writes_when_row_is_non_terminal(
     conditional_update.assert_awaited_once_with(
         workflow_run_id="wr_running",
         status=WorkflowRunStatus.canceled,
+        failure_reason=None,
     )
     get_workflow_run.assert_not_called()
 

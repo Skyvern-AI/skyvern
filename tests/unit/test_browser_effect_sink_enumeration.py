@@ -49,7 +49,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
     "skyvern/webeye/dialog_handler.py": Counter({"accept": 3, "dismiss": 1}),
-    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 5}),
+    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 6}),
     "skyvern/webeye/utils/dom.py": Counter(
         {
             "check": 2,
@@ -99,6 +99,8 @@ _EVALUATE_CALLERS = {
             "read_current_url": 1,
             # locator-scoped live selected/checked read for the cached click guard (SKY-14051)
             "read_locator_selected_state": 1,
+            # locator-scoped live isContentEditable read; routes blocks nested in an editing host to the atomic fill
+            "read_locator_is_content_editable": 1,
             "read_locator_tag_name": 1,
             "read_resolved_anchor_href": 1,
             "read_whether_link_or_button": 1,
@@ -217,21 +219,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 163
+    assert sum(sum(methods.values()) for methods in observed.values()) == 164
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 158
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 159
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 27
+    assert sum(sum(callers.values()) for callers in observed.values()) == 28
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

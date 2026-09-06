@@ -14,6 +14,8 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.webeye.actions.action_types import ActionType
 
+pytestmark = pytest.mark.usefixtures("no_saved_workflow")
+
 
 def test_analyze_maps_playwright_calls_to_action_types_with_line_ranges():
     code = (

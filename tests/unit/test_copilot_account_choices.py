@@ -41,7 +41,11 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     TurnOutcome,
 )
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
+    WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
+)
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -276,8 +280,8 @@ def test_prior_choices_enter_context_and_only_exact_id_is_structurally_selected(
         ],
     )
 
-    selected = connected_account_choice_context(outcome, "goac_first")
-    free_text = connected_account_choice_context(outcome, "use the first account")
+    selected = connected_account_choice_context(outcome, explicit_selected_connection_id="goac_first")
+    free_text = connected_account_choice_context(outcome)
 
     assert '"selected_connection_id":"goac_first"' in selected
     assert '"connection_id":"goac_second"' in selected
@@ -285,6 +289,14 @@ def test_prior_choices_enter_context_and_only_exact_id_is_structurally_selected(
     assert '"connection_id":"goac_first"' in free_text
     assert selected_connected_account_id(outcome, "goac_first") == "goac_first"
     assert selected_connected_account_id(outcome, "use the first account") is None
+
+
+@pytest.mark.parametrize("prior_outcome", [None, TurnOutcome(response_kind=ResponseKind.CLARIFY)])
+def test_fresh_picker_selection_enters_model_context_without_prior_choices(prior_outcome) -> None:
+    context = connected_account_choice_context(prior_outcome, explicit_selected_connection_id="goac_new")
+    assert '"selected_connection_id":"goac_new"' in context
+    assert '"selection_source":"user_picker"' in context
+    assert connected_account_choice_context(prior_outcome) == ""
 
 
 def test_server_owned_google_choice_copy_never_invites_prose_or_password_entry() -> None:
@@ -450,15 +462,24 @@ async def test_picked_account_still_grants_run_authority_on_the_next_turn(
     )
     draft = "workflow_definition:\n  blocks:\n    - label: write\n      block_type: google_sheets_write\n      credential_id: goac_picked\n"
 
+    request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="goac_picked",
+        workflow_yaml=draft,
+        selected_connected_account_id="goac_picked",
+    )
+    assert selected_connected_account_id(None, request.message) is None
     picked = await request_policy_module._build_request_policy_bootstrap(
         user_message="goac_picked",
         workflow_yaml=draft,
         chat_history=[],
         global_llm_context="",
         organization_id="org-1",
-        selected_connected_account_id="goac_picked",
+        selected_connected_account_id=request.selected_connected_account_id,
     )
     assert picked.run_approved_google_connection_ids == ["goac_picked"]
+    assert picked.selected_connected_account_id == "goac_picked"
 
     carried = record_approved_credentials_in_global_llm_context(
         SimpleNamespace(request_policy=picked, credential_pause_connected_credential_id=None),
@@ -602,7 +623,7 @@ async def test_named_account_with_no_server_owned_choice_selects_nothing_and_sta
     )
 
     assert selected_connected_account_id(offered, named_message) is None
-    assert f'"connection_id":"{NAMED_PICK_ACCOUNT_ID}"' in connected_account_choice_context(offered, named_message)
+    assert f'"connection_id":"{NAMED_PICK_ACCOUNT_ID}"' in connected_account_choice_context(offered)
 
 
 @pytest.mark.asyncio
@@ -1156,3 +1177,41 @@ async def test_name_contained_in_a_longer_sibling_name_admits_nothing_at_dispatc
     )
 
     assert approved == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state,scopes,organization_id",
+    [
+        ("revoked", ["https://www.googleapis.com/auth/spreadsheets"], "org-1"),
+        ("active", ["openid"], "org-1"),
+        ("active", ["https://www.googleapis.com/auth/spreadsheets"], "org-other"),
+    ],
+)
+async def test_picker_selection_rejects_unusable_account_before_persisting_approval(
+    monkeypatch, state, scopes, organization_id
+):
+    account = _google("goac_new", "New account", state=state, scopes_granted=scopes)
+    account.organization_id = organization_id
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[account])
+    )
+    policy = await request_policy_module._build_request_policy_bootstrap(
+        user_message="goac_new",
+        workflow_yaml="workflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        selected_connected_account_id="goac_new",
+    )
+    assert policy.selected_connected_account_id is None
+    assert '"selected_connection_id"' not in connected_account_choice_context(
+        TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            connected_account_choices=[
+                ConnectedAccountChoice(connection_id="goac_new", name="New account", state="active")
+            ],
+        ),
+        explicit_selected_connection_id=policy.selected_connected_account_id,
+    )
+    assert policy.run_approved_google_connection_ids == []

@@ -485,6 +485,24 @@ class TestSanitizeBody:
     @pytest.mark.parametrize(
         "path",
         [
+            "/v1/workflow/copilot/chat-post",
+            "/v1/workflow/copilot/question-response",
+            "/v1/workflow/copilot/credential-response",
+            "/v1/workflow/copilot/convert-yaml-to-blocks",
+        ],
+    )
+    def test_workflow_copilot_request_is_fully_redacted_before_semantic_screening(self, path: str) -> None:
+        request = _make_request("POST", path)
+        literal = b'{"mode":"ask","message":"password InlineSecret123!"}'
+
+        result = _sanitize_body(request, literal, "application/json")
+
+        assert result == REDACTED
+        assert "InlineSecret123" not in result
+
+    @pytest.mark.parametrize(
+        "path",
+        [
             "/api/v1/google/oauth/config",
             "/v1/google/oauth/config",
         ],

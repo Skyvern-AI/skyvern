@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -18,13 +19,19 @@ from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
+import structlog
 from mcp.types import Tool as MCPTool
-from playwright.async_api import async_playwright
+from playwright.async_api import BrowserContext as PlaywrightBrowserContext
+from playwright.async_api import Frame, Page, Route, async_playwright
 
-from skyvern.cli.core.result import BrowserContext
-from skyvern.cli.core.session_manager import SessionState, get_current_session, set_current_session
+from skyvern.cli.core.browser_ops import get_observe_document_id
+from skyvern.cli.core.guards import STALE_FRAME_HINT
+from skyvern.cli.core.result import BrowserContext, ErrorCode
+from skyvern.cli.core.session_manager import SessionState, get_current_session, get_page, set_current_session
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.browser import (
+    skyvern_click,
+    skyvern_drag,
     skyvern_evaluate,
     skyvern_evaluate_and_screenshot,
     skyvern_execute,
@@ -32,15 +39,22 @@ from skyvern.cli.mcp_tools.browser import (
     skyvern_frame_main,
     skyvern_frame_switch,
     skyvern_observe,
+    skyvern_press_key,
+    skyvern_scroll,
+    skyvern_select_option,
     skyvern_type,
 )
+from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurface
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+
+LOG = structlog.get_logger()
 
 
 def _has_playwright_browser() -> bool:
@@ -69,6 +83,7 @@ MAIN_HTML = """\
   <div id="main-only-sentinel">main-page</div>
   <input id="main-input" type="text" value="" />
   <button id="parent-action" type="button">Parent action</button>
+  <select id="ship"><option value="">Pick</option><option value="ground">Ground</option></select>
   <iframe id="pay-frame" name="payment" srcdoc='
     <!DOCTYPE html>
     <html><body>
@@ -93,26 +108,45 @@ MAIN_HTML = """\
 """
 
 
+POPUP_URL = "https://popup.example.com/"
+
+POPUP_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+  <div id="main-only-sentinel">popup-page</div>
+  <input id="card" type="text" value="" />
+</body>
+</html>
+"""
+
+
 class _FakeBrowserContext:
     """Minimal browser context to satisfy get_page() hooks from tab management."""
 
-    def __init__(self, page: Any) -> None:
-        self.pages = [page]
+    def __init__(self, context: PlaywrightBrowserContext) -> None:
+        self._context = context
+
+    @property
+    def pages(self) -> list[Page]:
+        return list(self._context.pages)
 
     def on(self, event: str, handler: Any) -> None:
         pass  # No-op for tests
 
 
 class _FakeBrowser:
-    """Minimal SkyvernBrowser substitute that wraps a real Playwright page."""
+    """Minimal SkyvernBrowser substitute over a real Playwright context, selecting pages[-1] like
+    SkyvernBrowser.get_working_page. real_browser_state.py:362-380 pins an explicitly selected page
+    only while every open page is known and otherwise returns the newest, which is the same page
+    here because no tab is ever selected."""
 
-    def __init__(self, page: Any) -> None:
-        self._page = page
-        self._browser_context = _FakeBrowserContext(page)
+    def __init__(self, context: PlaywrightBrowserContext) -> None:
+        self._context = context
+        self._browser_context = _FakeBrowserContext(context)
 
-    async def get_working_page(self) -> Any:
-        # The real page wrapper, so frame routing (_locator_scope) matches production.
-        return SkyvernBrowserPage(MagicMock(), self._page)
+    async def get_working_page(self) -> SkyvernBrowserPage:
+        return SkyvernBrowserPage(MagicMock(), self._context.pages[-1])
 
 
 class _LocalToolResult:
@@ -160,7 +194,7 @@ async def mcp_session():
         await pw_page.set_content(MAIN_HTML)
         await asyncio.sleep(0.3)
 
-        fake_browser = _FakeBrowser(pw_page)
+        fake_browser = _FakeBrowser(context)
         ctx = BrowserContext(mode="local")
         state = SessionState(browser=fake_browser, context=ctx)  # type: ignore[arg-type]
         set_current_session(state)
@@ -458,3 +492,236 @@ async def test_iframe_navigation_invalidates_observed_ref(mcp_session: SessionSt
 
     assert execute_result["ok"] is False
     assert "Unknown ref" in execute_result["data"]["results"][0]["error"]
+
+
+async def _select_frame_then_steal_focus(state: SessionState) -> tuple[Frame, Page]:
+    """Select the payment iframe, then let the page open a popup that takes focus on its own."""
+    switched = await skyvern_frame_switch(selector="#pay-frame")
+    assert switched["ok"] is True
+    leftover_frame = state._working_frame
+    assert leftover_frame is not None
+
+    context = leftover_frame.page.context
+    origin = context.pages[0]
+
+    async def _serve(route: Route) -> None:
+        await route.fulfill(status=200, content_type="text/html", body=POPUP_HTML)
+
+    await context.route("**/*", _serve)
+    async with context.expect_page() as popup_info:
+        await origin.evaluate(f"window.open({POPUP_URL!r}, '_blank')")
+    popup = await popup_info.value
+    await popup.wait_for_load_state()
+
+    assert len(context.pages) == 2
+    assert context.pages[-1] is popup
+    assert leftover_frame.is_detached() is False
+    LOG.info(
+        "POPUP_GATE",
+        open_pages=len(context.pages),
+        newest_is_popup=context.pages[-1] is popup,
+        leftover_is_detached=leftover_frame.is_detached(),
+    )
+    return leftover_frame, popup
+
+
+@pytest.mark.asyncio
+async def test_popup_focus_refuses_stale_frame_read(mcp_session: SessionState) -> None:
+    leftover_frame, popup = await _select_frame_then_steal_focus(mcp_session)
+
+    result = await skyvern_evaluate(expression="document.querySelector('#frame-only-sentinel')?.textContent ?? null")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == ErrorCode.STALE_FRAME_SELECTION
+    assert result["error"]["hint"] == STALE_FRAME_HINT
+    assert "Stale frame selection" in result["error"]["message"]
+    assert "payment-frame" not in json.dumps(result)
+    assert await leftover_frame.evaluate("document.querySelector('#frame-only-sentinel').textContent") == (
+        "payment-frame"
+    )
+    assert await popup.evaluate("document.querySelector('#main-only-sentinel').textContent") == "popup-page"
+
+
+@pytest.mark.asyncio
+async def test_popup_focus_refuses_stale_frame_write(mcp_session: SessionState) -> None:
+    leftover_frame, popup = await _select_frame_then_steal_focus(mcp_session)
+
+    result = await skyvern_type(selector="#card", text="4242", selector_mode="direct")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == ErrorCode.STALE_FRAME_SELECTION
+    assert result["error"]["hint"] == STALE_FRAME_HINT
+    assert "Stale frame selection" in result["error"]["message"]
+    assert await leftover_frame.locator("#card").input_value() == ""
+    assert await popup.locator("#card").input_value() == ""
+
+
+@pytest.mark.parametrize(
+    "page_space_action",
+    [
+        lambda x, y: skyvern_click(x=x, y=y),
+        lambda x, y: skyvern_type(x=x, y=y, text="4242"),
+        lambda x, y: skyvern_press_key(key="4"),
+    ],
+    ids=["click_at", "type_at", "press_key"],
+)
+@pytest.mark.asyncio
+async def test_popup_focus_refuses_stale_frame_page_space_action(
+    mcp_session: SessionState,
+    page_space_action: Callable[[float, float], Awaitable[dict[str, Any]]],
+) -> None:
+    leftover_frame, popup = await _select_frame_then_steal_focus(mcp_session)
+    box = await popup.locator("#card").bounding_box()
+    assert box is not None
+
+    result = await page_space_action(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == ErrorCode.STALE_FRAME_SELECTION
+    assert result["error"]["hint"] == STALE_FRAME_HINT
+    assert "Stale frame selection" in result["error"]["message"]
+    assert await popup.locator("#card").input_value() == ""
+    assert await leftover_frame.locator("#card").input_value() == ""
+
+
+@pytest.mark.parametrize(
+    "page_space_action",
+    [
+        lambda x, y: skyvern_click(x=x, y=y),
+        lambda x, y: skyvern_type(x=x, y=y, text="4242"),
+        lambda x, y: skyvern_press_key(key="4"),
+    ],
+    ids=["click_at", "type_at", "press_key"],
+)
+@pytest.mark.asyncio
+async def test_owned_frame_keeps_page_space_actions_working(
+    mcp_session: SessionState,
+    page_space_action: Callable[[float, float], Awaitable[dict[str, Any]]],
+) -> None:
+    switched = await skyvern_frame_switch(selector="#pay-frame")
+    assert switched["ok"] is True
+    frame = mcp_session._working_frame
+    assert frame is not None
+    box = await frame.locator("#card").bounding_box()
+    assert box is not None
+
+    result = await page_space_action(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+    assert result["ok"] is True, result.get("error")
+
+
+_SELECTOR_PAGE_SPACE_ACTIONS = [
+    lambda: skyvern_drag(source_selector="#main-input", target_selector="#parent-action"),
+    lambda: skyvern_scroll(direction="down"),
+    lambda: skyvern_select_option(selector="#ship", value="Ground", by_label=True, selector_mode="direct"),
+    lambda: skyvern_click(selector="#ship option[value='ground']", selector_mode="direct"),
+]
+_SELECTOR_PAGE_SPACE_IDS = ["drag", "scroll", "select_by_label", "native_option"]
+
+
+@pytest.mark.parametrize("action", _SELECTOR_PAGE_SPACE_ACTIONS, ids=_SELECTOR_PAGE_SPACE_IDS)
+@pytest.mark.asyncio
+async def test_popup_focus_refuses_stale_frame_selector_page_space_action(
+    mcp_session: SessionState,
+    action: Callable[[], Awaitable[dict[str, Any]]],
+) -> None:
+    await _select_frame_then_steal_focus(mcp_session)
+
+    result = await action()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == ErrorCode.STALE_FRAME_SELECTION
+    assert result["error"]["hint"] == STALE_FRAME_HINT
+
+
+@pytest.mark.parametrize("action", _SELECTOR_PAGE_SPACE_ACTIONS, ids=_SELECTOR_PAGE_SPACE_IDS)
+@pytest.mark.asyncio
+async def test_owned_frame_keeps_selector_page_space_actions_in_the_top_document(
+    mcp_session: SessionState,
+    action: Callable[[], Awaitable[dict[str, Any]]],
+) -> None:
+    switched = await skyvern_frame_switch(selector="#pay-frame")
+    assert switched["ok"] is True
+    frame = mcp_session._working_frame
+    assert frame is not None
+    assert await frame.locator("#main-input").count() == 0
+    assert await frame.locator("#ship").count() == 0
+
+    result = await action()
+
+    assert result["ok"] is True, result.get("error")
+
+
+@pytest.mark.parametrize(
+    "retarget",
+    [
+        lambda: skyvern_type(selector="#card", text="4242", intent="the card number field"),
+        lambda: skyvern_press_key(key="4", selector="#card", intent="the card number field"),
+    ],
+    ids=["fill_ai_fallback", "ai_locator"],
+)
+@pytest.mark.asyncio
+async def test_popup_focus_refusal_is_not_retargeted_to_ai(
+    mcp_session: SessionState,
+    monkeypatch: pytest.MonkeyPatch,
+    retarget: Callable[[], Awaitable[dict[str, Any]]],
+) -> None:
+    leftover_frame, popup = await _select_frame_then_steal_focus(mcp_session)
+    ai_calls: list[str] = []
+
+    async def _record_ai_input_text(self: SdkSkyvernPageAi, *args: Any, **kwargs: Any) -> str:
+        ai_calls.append("ai_input_text")
+        return "4242"
+
+    async def _record_ai_locate_element(self: SdkSkyvernPageAi, *args: Any, **kwargs: Any) -> str:
+        ai_calls.append("ai_locate_element")
+        return "//input[@id='card']"
+
+    monkeypatch.setattr(SdkSkyvernPageAi, "ai_input_text", _record_ai_input_text)
+    monkeypatch.setattr(SdkSkyvernPageAi, "ai_locate_element", _record_ai_locate_element)
+
+    result = await retarget()
+
+    assert ai_calls == []
+    assert result["ok"] is False
+    assert "Stale frame selection" in result["error"]["message"]
+    assert await leftover_frame.locator("#card").input_value() == ""
+    assert await popup.locator("#card").input_value() == ""
+
+
+@pytest.mark.asyncio
+async def test_popup_focus_refuses_stale_observe_document_id(mcp_session: SessionState) -> None:
+    switched = await skyvern_frame_switch(selector="#pay-frame")
+    assert switched["ok"] is True
+    owned_page, _ = await get_page()
+    selected_document_id = await get_observe_document_id(owned_page)
+    assert selected_document_id is not None
+
+    await _select_frame_then_steal_focus(mcp_session)
+
+    stale_page, _ = await get_page()
+    with pytest.raises(StaleFrameSelectionError):
+        await get_observe_document_id(stale_page)
+
+    await skyvern_frame_main()
+    live_page, _ = await get_page()
+    assert await get_observe_document_id(live_page) != selected_document_id
+
+
+@pytest.mark.asyncio
+async def test_owner_closed_frame_names_the_stale_selection(mcp_session: SessionState) -> None:
+    leftover_frame, popup = await _select_frame_then_steal_focus(mcp_session)
+    context = popup.context
+    owner = context.pages[0]
+    await owner.close()
+    assert owner.is_closed() is True
+    assert len(context.pages) == 1
+
+    result = await skyvern_evaluate(expression="1 + 1")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == ErrorCode.STALE_FRAME_SELECTION
+    assert result["error"]["hint"] == STALE_FRAME_HINT
+    assert "Stale frame selection" in result["error"]["message"]
+    assert "TargetClosedError" not in json.dumps(result)
+    assert leftover_frame is mcp_session._working_frame

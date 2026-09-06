@@ -25,13 +25,28 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
-from skyvern.forge.sdk.copilot.runtime import browser_page_custody_lock
-from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_PAGE_ERROR,
+    OriginRunRedactionRegistry,
+    browser_page_custody_lock,
+)
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    clear_session_scrub_values,
+    register_secret_scrub_value,
+    scrub_secrets_from_structure,
+)
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType, PasswordCredential, TotpType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from tests.unit.copilot_test_helpers import (
+    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    remove_sensitive_disclosure_prerequisite,
+    taint_by_terminal_run,
+)
 
 _FAKE_PASSWORD = "fake-test-password-7x9"
 _FAKE_USERNAME = "qa.user@example.test"
@@ -55,9 +70,11 @@ def _policy(**overrides: Any) -> RequestPolicy:
 def _ctx(**overrides: Any) -> SimpleNamespace:
     ns = SimpleNamespace(
         organization_id="o_1",
+        turn_origin=TurnOrigin.interactive,
         request_policy=_policy(),
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         browser_session_id="pbs_1",
+        last_run_blocks_workflow_run_id=None,
         scouted_interactions=[],
         scout_trajectory=[],
         prior_carried_trajectory=[],
@@ -2371,3 +2388,98 @@ class TestVaultNamedSiteGrant:
 
         assert not credential_fill_module._within_grant("https://other.example.com/login", page_grant)
         assert credential_fill_module._within_grant("https://eu.example.com/step2", page_grant)
+
+
+_RUN_OTP = "424242"
+_RUN_PASSWORD = "Sp1r!t-Level-2026"
+_LANDED_URL_WITH_OTP = f"{_FIXTURE_LOGIN_URL}?code={_RUN_OTP}"
+
+
+def _terminal_credential_run_ctx(**overrides: Any) -> SimpleNamespace:
+    ctx = _ctx(**overrides)
+    ctx.flow_evidence = []
+    ctx.composition_page_evidence = None
+    clear_session_scrub_values(ctx.browser_session_id)
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    ctx.last_run_blocks_browser_session_id = ctx.browser_session_id
+    taint_by_terminal_run(ctx, workflow_run_id="wr_credential", session_id=ctx.browser_session_id)
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_credential",
+        parameters={"password": _RUN_PASSWORD, "totp": _RUN_OTP},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    return ctx
+
+
+def _echo_run_secret_in_probe_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_role_name(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
+        return "textbox", f"One-time code {_RUN_OTP} for {_RUN_PASSWORD}"
+
+    async def fake_url(_ctx: Any) -> str:
+        return _LANDED_URL_WITH_OTP
+
+    monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", fake_role_name)
+    monkeypatch.setattr(credential_fill_module, "_live_working_page_url", fake_url)
+    monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
+
+
+@pytest.mark.asyncio
+async def test_the_authorized_fill_and_submit_run_on_the_page_a_terminal_credential_run_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page, secret_value=_RUN_OTP)
+    _echo_run_secret_in_probe_facts(monkeypatch)
+    ctx = _terminal_credential_run_ctx()
+
+    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_123", "totp", "#verifyButton")
+
+    assert result["ok"] is True
+    assert result["data"]["readback_outcome"] == "exact_match"
+    assert page.read_calls == ["#token"]
+    assert page.click_calls == [("#verifyButton",)]
+    assert result["data"]["submitted"] is True
+    assert [entry["tool_name"] for entry in ctx.scout_trajectory] == ["fill_credential_field", "click"]
+    retained = json.dumps(
+        [ctx.scout_trajectory, ctx.scouted_interactions, ctx.flow_evidence, ctx.composition_page_evidence]
+    )
+    assert _RUN_OTP not in retained
+    assert _RUN_PASSWORD not in retained
+    assert REDACTED_SECRET_PLACEHOLDER in retained
+    model_facing = json.dumps(scrub_secrets_from_structure(ctx, result))
+    assert _RUN_OTP not in model_facing
+    assert _RUN_PASSWORD not in model_facing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
+async def test_the_fill_is_refused_on_the_same_page_when_a_prerequisite_is_absent(
+    monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page, secret_value=_RUN_OTP)
+    ctx = _terminal_credential_run_ctx()
+    remove_sensitive_disclosure_prerequisite(ctx, arm)
+
+    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_123", "totp", "#verifyButton")
+
+    assert result["ok"] is False
+    assert result["error"] == SENSITIVE_ORIGIN_PAGE_ERROR
+    assert page.fill_calls == []
+    assert page.click_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_credential_run_does_not_authorize_a_credential_without_an_origin_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _FakePage()
+    _wire_impl(monkeypatch, page, secret_value=_RUN_OTP)
+    ctx = _terminal_credential_run_ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_unbound", "totp", "#verifyButton")
+
+    assert result["ok"] is False
+    assert result["error"] != SENSITIVE_ORIGIN_PAGE_ERROR
+    assert page.fill_calls == []
