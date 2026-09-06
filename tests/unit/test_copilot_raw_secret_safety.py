@@ -755,7 +755,7 @@ async def _uncited_redaction_ctx(message: str = _RAW_SECRET_MESSAGE):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tool_name",
-    ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "inspect_page_for_composition"],
+    ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "inspect_page_for_composition", "search_web"],
 )
 async def test_uncited_deterministic_redaction_does_not_block_browser_tools(tool_name: str) -> None:
     ctx, policy = await _uncited_redaction_ctx()
@@ -779,7 +779,7 @@ async def test_uncited_deterministic_redaction_preserves_run_authority() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "discover_workflow_entrypoint"])
+@pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "search_web"])
 async def test_verified_cited_raw_secret_blocks_browser_acting_tools(tool_name: str) -> None:
     literal = "Hunter2Portal!"
     policy, _ = await _build(

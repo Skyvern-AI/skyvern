@@ -497,3 +497,44 @@ def fake_api_request_context() -> Callable[[], object]:
         return _FakeAPIRequestContext()
 
     return _build
+
+
+class FakeSearchPage:
+    """Temporary tab a `search_web` call opens on the run's browser context."""
+
+    def __init__(self, html: str, page_title: str, goto_error: Exception | None, http_status: int = 200) -> None:
+        self._html = html
+        self._page_title = page_title
+        self._goto_error = goto_error
+        self.http_status = http_status
+        self.closed = False
+        self.requested_url: str | None = None
+
+    async def goto(self, url: str, timeout: float | None = None) -> SimpleNamespace:
+        self.requested_url = url
+        if self._goto_error is not None:
+            raise self._goto_error
+        return SimpleNamespace(status=self.http_status)
+
+    async def title(self) -> str:
+        return self._page_title
+
+    async def content(self) -> str:
+        return self._html
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeSearchBrowserContext:
+    def __init__(
+        self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
+    ) -> None:
+        self.page = FakeSearchPage(html, page_title, goto_error, http_status)
+
+    async def new_page(self) -> FakeSearchPage:
+        return self.page
+
+
+def read_unit_data_fixture(name: str) -> str:
+    return (Path(__file__).parent / "data" / name).read_text()

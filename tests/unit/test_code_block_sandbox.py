@@ -33,6 +33,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from tests.unit.conftest import FakeSearchBrowserContext
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
@@ -2594,3 +2595,48 @@ class TestFailedReadinessWaitPropagates:
         assert result.status == BlockStatus.failed
         assert "24 results found" not in json.dumps(persisted)
         assert all(value in (None, {}) for value in persisted)
+
+
+class TestSearchWebHelperBinding:
+    @staticmethod
+    def _block() -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="search_block",
+            code="",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="search_output",
+                description="test output",
+                output_parameter_id="op_search",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    def test_search_web_is_reserved_in_safe_vars(self) -> None:
+        assert "search_web" in CodeBlock.build_safe_vars()
+
+    @pytest.mark.asyncio
+    async def test_authored_code_reaches_the_search_helper_through_the_run_browser_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OSS configures no search provider, so the observation says exactly that rather than
+        reporting a search that found nothing."""
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.web_search_provider",
+            lambda: None,
+        )
+        context = FakeSearchBrowserContext(html="<html>page</html>", page_title="Search results")
+        page = SimpleNamespace(context=context)
+        block = self._block()
+
+        user_function = block.generate_async_user_function(
+            'found = await search_web("construction company", max_results=2)\nreturn found\n',
+            page,  # type: ignore[arg-type]
+        )
+        result = await user_function()
+
+        assert result["error_kind"] == "not_configured"
+        assert result["results"] == []
