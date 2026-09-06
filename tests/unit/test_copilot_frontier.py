@@ -2199,7 +2199,7 @@ def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> N
     assert ctx.block_state_map == {}
     assert ctx.block_started_at_map == {}
     assert ctx.block_ended_at_map == {}
-    assert ctx.terminal_envelope_run_outcomes == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
+    assert ctx.run_outcome_trace == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
 
 
 def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2593,26 +2593,192 @@ def test_a_workflow_with_no_resolvable_labels_is_not_vacuously_tested() -> None:
     assert (
         terminal_ready_for_latch(
             current_workflow_labels=[],
-            has_executed_blocks=True,
+            planned_block_labels=[],
+            completed_block_labels=[],
+            all_run_blocks_completed=True,
             unverified=[],
             composition_unverified=[],
             artifact_reason=None,
             structured_blocker=None,
-            empty_data_blocks=None,
+            empty_data_blocks=False,
         )
         is False
     )
     assert (
         terminal_ready_for_latch(
             current_workflow_labels=["open"],
-            has_executed_blocks=True,
+            planned_block_labels=["open"],
+            completed_block_labels=["open"],
+            all_run_blocks_completed=True,
             unverified=[],
             composition_unverified=[],
             artifact_reason=None,
             structured_blocker=None,
-            empty_data_blocks=None,
+            empty_data_blocks=False,
         )
         is True
+    )
+
+
+def test_a_partial_or_failed_current_run_is_not_tested() -> None:
+    common = {
+        "current_workflow_labels": ["open", "collect"],
+        "planned_block_labels": ["open", "collect"],
+        "artifact_reason": None,
+        "structured_blocker": None,
+        "composition_unverified": [],
+        "empty_data_blocks": False,
+    }
+
+    assert (
+        terminal_ready_for_latch(
+            **common,
+            completed_block_labels=["open"],
+            all_run_blocks_completed=True,
+            unverified=["collect"],
+        )
+        is False
+    )
+    assert (
+        terminal_ready_for_latch(
+            **common,
+            completed_block_labels=["open", "collect"],
+            all_run_blocks_completed=False,
+            unverified=[],
+        )
+        is False
+    )
+
+
+def test_completed_rows_from_other_blocks_do_not_mark_the_current_workflow_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "collect"],
+            planned_block_labels=["open", "unrelated"],
+            completed_block_labels=["open", "unrelated"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=False,
+        )
+        is False
+    )
+
+
+def test_completed_nested_rows_do_not_disqualify_a_clean_container_run() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "conditional"],
+            planned_block_labels=["open", "conditional"],
+            completed_block_labels=["open", "conditional", "taken_branch_child"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=False,
+        )
+        is True
+    )
+
+
+def test_recording_nested_rows_uses_the_planned_container_labels() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("conditional", "conditional", {}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.last_requested_block_labels = ["open", "conditional"]
+    ctx.last_executed_block_labels = ["open", "conditional"]
+    ctx.verified_prefix_labels = ["open", "conditional"]
+    ctx.composition_verified_labels = ["open", "conditional"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_nested_rows",
+                # An observer readback may enumerate the nested rows even though the tool
+                # requested the two top-level workflow blocks recorded on the context.
+                "requested_block_labels": ["open", "conditional", "taken_branch_child"],
+                "executed_block_labels": ["open", "conditional", "taken_branch_child"],
+                "blocks": [
+                    {"label": "open", "status": "completed"},
+                    {"label": "conditional", "status": "completed"},
+                    {"label": "taken_branch_child", "status": "completed"},
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.verified_terminal_proposal_ready is True
+
+
+def test_missing_completed_row_for_an_executed_label_does_not_mark_the_run_tested() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("collect", "extraction", {"prompt": "collect the total"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open", "collect"]
+    ctx.composition_verified_labels = ["open", "collect"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_missing_row",
+                "requested_block_labels": ["open", "collect"],
+                "executed_block_labels": ["open", "collect"],
+                "blocks": [{"label": "open", "status": "completed"}],
+            },
+        },
+    )
+
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.verified_terminal_proposal_ready is False
+
+
+def test_missing_completion_for_a_planned_label_does_not_mark_the_run_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "collect"],
+            planned_block_labels=["open", "collect"],
+            completed_block_labels=["open"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=False,
+        )
+        is False
+    )
+
+
+def test_a_run_whose_data_blocks_are_all_empty_is_not_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open", "collect"],
+            planned_block_labels=["open", "collect"],
+            completed_block_labels=["open", "collect"],
+            all_run_blocks_completed=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=True,
+        )
+        is False
     )
 
 
@@ -2735,6 +2901,8 @@ def test_editing_a_composed_block_truncates_composition_credit_at_that_block() -
     ctx.last_workflow_yaml = "workflow: yaml"
     _credit_composition_verified_labels(ctx, labels, provenance)
     ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.last_requested_block_labels = ["open", "extract"]
+    ctx.last_executed_block_labels = ["extract"]
 
     _record_run_blocks_result(
         ctx,

@@ -3119,7 +3119,10 @@ def _run_ctx() -> CopilotContext:
 
 def _ctx_with_blocks(*block_types: str) -> CopilotContext:
     ctx = _run_ctx()
-    blocks = [SimpleNamespace(block_type=bt, label=f"b{i}") for i, bt in enumerate(block_types)]
+    blocks = [
+        SimpleNamespace(block_type=bt, label="confirm" if index == 0 else f"b{index}")
+        for index, bt in enumerate(block_types)
+    ]
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks))
     ctx.verified_prefix_labels = [b.label for b in blocks]
     ctx.composition_verified_labels = [b.label for b in blocks]

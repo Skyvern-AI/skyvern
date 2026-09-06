@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from skyvern.forge.sdk.copilot.agent import (
-    _CANCEL_REPLY_DEFAULT,
     _UNEXPECTED_ERROR_REPLY_UNVALIDATED,
     _build_cancel_exit_result,
     _build_max_turns_exit_result,
@@ -28,11 +27,11 @@ def test_budget_exit_builders_persist_typed_no_report() -> None:
         assert result.turn_outcome.terminal_reason == terminal_reason
 
 
-def test_regular_cancel_copy_is_unchanged() -> None:
+def test_cancel_exit_writes_no_copy_of_its_own() -> None:
     ctx = make_copilot_ctx()
     result = _build_cancel_exit_result(ctx, global_llm_context=None)
 
-    assert result.user_response == _CANCEL_REPLY_DEFAULT
+    assert result.user_response == ""
     assert result.turn_outcome is not None
     assert result.turn_outcome.terminal_reason == "cancel"
 

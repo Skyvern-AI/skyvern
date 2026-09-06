@@ -887,7 +887,7 @@ async def test_registered_output_adapter_retains_rows_without_workflow_definitio
     assert data["blocks"] == []
 
 
-def test_satisfied_interactive_completion_does_not_make_empty_output_terminal_ready() -> None:
+def test_clean_empty_output_run_does_not_latch_a_tested_receipt() -> None:
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -920,24 +920,24 @@ def test_challenge_observation_does_not_leave_authoritative_prompt_outcome() -> 
     assert outcome.is_authoritative is False
 
 
-def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
+def test_all_null_metadata_goal_fields_are_observations_not_empty_run_grades() -> None:
     result = _all_null_goal_fields_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
     assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
-    assert empty_data_blocks is True
-    # Empty output remains a factual test-readiness floor. It does not invoke an
-    # interactive outcome judge or convert the completed platform run to failure.
+    assert empty_data_blocks is False
+    # The nulls remain in the run facts for the acting model; they do not grade
+    # whether the platform run itself completed cleanly.
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is False
-    assert getattr(ctx, "last_good_workflow", None) is None
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_good_workflow is ctx.last_workflow
 
 
 def test_metadata_goal_fields_with_values_keep_clean_path() -> None:
@@ -976,13 +976,13 @@ def test_path_summary_goal_paths_with_boolean_flags_keep_clean_path() -> None:
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
-def test_goal_path_alias_without_exact_declared_path_is_flagged_as_no_goal_content() -> None:
+def test_goal_path_alias_without_exact_declared_path_does_not_grade_the_run() -> None:
     result = _domain_path_alias_summary_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
 
     _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
-    assert empty_data_blocks is True
+    assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
@@ -992,17 +992,17 @@ def test_null_goal_path_value_does_not_fall_back_to_alias_field() -> None:
     ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
 
     _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
-    assert empty_data_blocks is True
+    assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
-def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
+def test_partial_metadata_goal_fields_do_not_grade_the_run() -> None:
     result = _partial_goal_field_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
     _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
-    assert empty_data_blocks is True
+    assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
@@ -1060,7 +1060,7 @@ def test_array_goal_value_path_does_not_match_scalar_root() -> None:
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_top_level_goal_fields()}
 
     _, empty_data_blocks, _, _ = _analyze_run_blocks(result, ctx)
-    assert empty_data_blocks is True
+    assert empty_data_blocks is False
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
 

@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from skyvern.forge.sdk.copilot.agent import _build_timeout_exit_result
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
+from skyvern.forge.sdk.copilot.interruption import UNTESTED_DRAFT_PRESERVED, cancel_notice
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _assistant_execution_receipts,
@@ -28,6 +29,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _effective_auto_accept,
     _ensure_terminal_frame,
     _normalize_copilot_yaml,
+    _preserved_draft_disposition,
     _prior_copilot_workflow_yaml,
     _prior_global_llm_context,
     _proposal_disposition,
@@ -206,11 +208,11 @@ class TestEffectiveAutoAccept:
         assert _effective_auto_accept(True, result) is False
         assert _effective_auto_accept(False, result) is False
 
-    def test_missing_proposal_disposition_is_no_proposal_without_updated_workflow(self) -> None:
-        result = MagicMock(spec=["updated_workflow"])
-        result.updated_workflow = None
+    def test_default_disposition_without_a_proposal_never_auto_applies(self) -> None:
+        result = AgentResult(user_response="hi", updated_workflow=None, global_llm_context=None)
 
-        assert _proposal_disposition(result) == "no_proposal"
+        assert result.proposal_disposition == "auto_applicable"
+        assert _effective_auto_accept(True, result) is False
 
     def test_validated_proposal_respects_auto_accept_setting(self) -> None:
         validated = MagicMock()
@@ -237,6 +239,36 @@ class TestEffectiveAutoAccept:
         assert _proposal_disposition(None) == "no_proposal"
         assert _effective_auto_accept(True, None) is False
         assert _effective_auto_accept(False, None) is False
+
+
+class TestPreservedDraftDisposition:
+    def test_a_draft_this_turn_authored_is_named_by_this_turns_disposition(self) -> None:
+        result = MagicMock(proposal_disposition="review_tested", updated_workflow=MagicMock())
+
+        assert _preserved_draft_disposition(result, draft_present=True) == "review_tested"
+
+    def test_a_draft_from_an_earlier_turn_is_never_named_by_this_turns_disposition(self) -> None:
+        result = MagicMock(proposal_disposition="auto_applicable", updated_workflow=None)
+
+        assert _preserved_draft_disposition(result, draft_present=True) == "no_proposal"
+
+    def test_a_turn_with_no_draft_on_screen_names_none(self) -> None:
+        result = MagicMock(proposal_disposition="auto_applicable", updated_workflow=MagicMock())
+
+        assert _preserved_draft_disposition(result, draft_present=False) is None
+        assert _preserved_draft_disposition(draft_present=True) == "no_proposal"
+
+    def test_an_out_of_vocabulary_disposition_stays_out_of_the_copy_maps(self) -> None:
+        result = MagicMock(proposal_disposition="not-a-disposition", updated_workflow=MagicMock(), cancelled=False)
+
+        assert _proposal_disposition(result) == "review_untested"
+        assert _effective_auto_accept(True, result) is False
+        assert UNTESTED_DRAFT_PRESERVED in cancel_notice(
+            base="",
+            stop_button=True,
+            preserved_draft=_preserved_draft_disposition(result, draft_present=True),
+            canonical_rolled_back=False,
+        )
 
 
 def test_response_update_schema_omits_legacy_review_flags() -> None:

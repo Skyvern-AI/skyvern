@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
+from skyvern.forge.sdk.copilot.interruption import MINIMAL_CANCEL_STOP
 from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
     OutputPolicyReason,
@@ -33,7 +34,6 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-from skyvern.forge.sdk.copilot.terminal_envelope import MINIMAL_CANCEL_STOP
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
@@ -466,6 +466,28 @@ def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> 
     result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
 
     assert result.user_response == terminal.user_facing_reason
+
+
+def test_turn_halt_exit_never_makes_an_interactive_tested_draft_auto_applicable() -> None:
+    ctx = _ctx()
+    workflow = object()
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = "title: tested\nworkflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = True
+    terminal = _signal(
+        kind="tool_error",
+        user_facing="The browser session was lost after the test.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="tool_error_browser_session_lost",
+        blocked_tool="update_and_run_blocks",
+    )
+    halt = TurnHalt(kind=TurnHaltKind.BROWSER_SESSION_LOST, blocker_signal=terminal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.updated_workflow is workflow
+    assert result.proposal_disposition == "review_untested"
 
 
 def _seed_verified_outcome(ctx: CopilotContext) -> None:

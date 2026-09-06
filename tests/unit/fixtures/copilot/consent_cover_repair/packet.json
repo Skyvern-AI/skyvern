@@ -5,8 +5,7 @@
     "workflow_run_id",
     "workflow_run_block_id",
     "browser_session_id",
-    "driver_request_reply",
-    "terminal_envelope"
+    "driver_request_reply"
   ],
   "workflow_yaml": "title: Order documents\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: extract_order_documents\n    code: |\n      await page.goto(\"https://documents.fixture.test/orders\")\n      rows = page.locator(\"#order-documents tbody tr\")\n      await rows.first.wait_for(state=\"visible\", timeout=5000)\n      return {\"documents\": await rows.all_text_contents()}\n",
   "goal": "Return every order-document row from the order documents table on this page, with its visible text.",

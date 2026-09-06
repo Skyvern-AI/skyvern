@@ -15,12 +15,6 @@ from skyvern.forge.sdk.copilot.context import (
     adopt_model_authored_context,
     record_approved_credentials_in_global_llm_context,
 )
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-from skyvern.forge.sdk.copilot.terminal_envelope import (
-    TerminalOutcomeEnvelope,
-    assemble_terminal_envelope,
-    render_terminal_message,
-)
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _approve_server_verified_google_sheet_bindings,
     _approved_run_credential_ids,
@@ -533,23 +527,6 @@ def _dispatch_credential_ids(workflow_yaml: str) -> list[str]:
     return _extract_credential_ids_for_labels(_parsed_workflow_definition(workflow_yaml), [SHEETS_BLOCK_LABEL])
 
 
-def _terminal_envelope(run_outcomes: list[RecordedRunOutcome]) -> TerminalOutcomeEnvelope:
-    envelope = assemble_terminal_envelope(
-        response_type="REPLY",
-        verified=True,
-        workflow_applied=False,
-        proposal_disposition="no_proposal",
-        run_outcomes=run_outcomes,
-        blocker_reason=None,
-        halt_kind=None,
-        attempted=None,
-        workflow_mutated=True,
-        workflow_attempted=True,
-    )
-    assert envelope is not None
-    return envelope
-
-
 @pytest.mark.asyncio
 async def test_editor_bound_account_keeps_run_authority_from_resolution_through_the_dispatch_gate(
     monkeypatch: pytest.MonkeyPatch,
@@ -821,14 +798,6 @@ async def test_editor_bound_account_that_is_no_longer_active_is_refused_at_the_d
     assert blocker is not None
     assert blocker.blocker_kind == "authority_denied"
     assert blocker.internal_reason_code == "unapproved_google_connection_reference"
-
-
-def test_terminal_without_a_run_receipt_reports_no_run() -> None:
-    envelope = _terminal_envelope([])
-    message, replaced = render_terminal_message(envelope, "ok", False)
-
-    assert replaced
-    assert "I ran the workflow" not in message
 
 
 CITED_ACCOUNT_ID = "goac_cited"

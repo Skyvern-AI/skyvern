@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
-    recorded_output_report,
     run_outcome_display_reason,
     trusted_terminal_challenge_category_name,
 )
@@ -555,7 +554,7 @@ def test_recorded_run_outcome_carries_producing_workflow_run_id() -> None:
     assert ctx.last_run_outcome.workflow_run_id == "wr_test"
 
 
-def test_completion_reperception_cannot_grade_a_completed_run() -> None:
+def test_completion_reperception_does_not_override_the_empty_output_gate() -> None:
     ctx = _ctx([_code_block("search_registry_person", {"records": []})])
 
     outcome = _record_run_blocks_result(
@@ -603,7 +602,7 @@ def test_run_outcome_trace_is_append_only_across_pointer_updates() -> None:
 
     assert stashed.verdict == "not_demonstrated"
     assert ctx.last_run_outcome == stashed
-    assert ctx.terminal_envelope_run_outcomes == [committed, stashed]
+    assert ctx.run_outcome_trace == [committed, stashed]
 
 
 def test_recorded_outcome_for_new_run_uses_current_run_id() -> None:
@@ -843,36 +842,8 @@ async def test_registered_output_remains_a_fact_without_a_verdict_or_instruction
         "document_name": "Resale Demand Package (Required Statement of Fees - Demand)"
     }
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.output_report == (
-        'Recorded output from the latest completed run: {"extract_document_output":'
-        '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
-    )
+    assert ctx.last_run_outcome.verdict == "not_evaluated"
     assert "next_step" not in result["data"]
-
-
-def test_recorded_output_report_redacts_secret_key_values_before_json_serialization() -> None:
-    report = recorded_output_report(
-        [
-            {"output_parameter_key": "password", "value": "synthetic-password"},
-            {
-                "output_parameter_key": "result",
-                "value": {
-                    "token": "synthetic-token",
-                    "next_token": "page-2",
-                    "nested": {"api_key": "synthetic-api-key"},
-                },
-            },
-        ]
-    )
-
-    assert report == (
-        'Recorded output from the latest completed run: {"password":"[REDACTED_SECRET]",'
-        '"result":{"nested":{"api_key":"[REDACTED_SECRET]"},"next_token":"page-2",'
-        '"token":"[REDACTED_SECRET]"}}'
-    )
-    assert "synthetic-password" not in report
-    assert "synthetic-token" not in report
-    assert "synthetic-api-key" not in report
 
 
 @pytest.mark.asyncio

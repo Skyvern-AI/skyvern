@@ -145,8 +145,6 @@ def test_classifier_response_kind_does_not_terminalize_identical_plain_reply(
         narrative_payload=_payload(),
     )
 
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["response_kind"] == "answer"
     assert result.narrative_payload is not None
     assert result.narrative_payload["responseKind"] == "answer"
 
@@ -168,8 +166,6 @@ def test_concrete_workflow_attempt_terminalizes_independently_of_classifier_kind
         narrative_payload=_payload(),
     )
 
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["response_kind"] == "stopped"
     assert result.narrative_payload is not None
     assert result.narrative_payload["responseKind"] == "build"
 
@@ -221,14 +217,10 @@ def test_recorded_browser_operation_failure_overrides_success_prose_but_keeps_dr
 
     assert result.updated_workflow == draft
     assert result.proposal_disposition == "review_untested"
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["failed_operation"] == failed_operation.model_dump()
-    assert result.terminal_envelope["next_state"] == "stopped"
-    assert "browser operation failed" in result.user_response.lower()
-    assert "write completed" not in result.user_response.lower()
+    assert _terminal_failed_operation(ctx) == failed_operation
+    # The model's own report is delivered unchanged; the failure rides its own record.
+    assert result.user_response == "Destination write completed successfully."
     assert result.narrative_payload is not None
-    assert result.narrative_payload["terminalMessage"] == result.user_response
-    assert result.narrative_payload["narrativeSummary"] == result.user_response
     assert result.narrative_payload["turnFacts"]["terminalCause"] == "browser_operation_failed"
     assert result.narrative_payload["turnFacts"]["ranCleanOnCurrentSource"] is False
 
@@ -271,10 +263,7 @@ def test_later_connect_failure_owns_terminal_copy_over_failed_operation() -> Non
         narrative_payload=_payload(),
     )
 
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] == "cdp_connect_failed"
-    assert "cdp_connect_failed" in result.user_response
-    assert "fresh browser session" in result.user_response
+    assert result.user_response == "The code run failed."
     assert result.narrative_payload is not None
     assert result.narrative_payload["turnFacts"]["terminalCause"] == "cdp_connect_failed"
 
@@ -344,18 +333,10 @@ def test_recorded_browser_operation_failure_survives_auto_applicable_question_pr
         narrative_payload=_payload(),
     )
 
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["failed_operation"] == failed_operation.model_dump()
-    assert result.terminal_envelope["verified"] is False
-    assert result.terminal_envelope["workflow_applied"] is False
-    assert result.terminal_envelope["next_state"] == "awaiting_user_input"
-    assert result.terminal_envelope["response_kind"] == "question"
+    assert _terminal_failed_operation(ctx) == failed_operation
+    # A failure record forces review even on a question turn, and never rewrites the ask.
     assert result.proposal_disposition == "no_proposal"
-    assert "browser operation failed" in result.user_response.lower()
-    assert "which account should i use?" in result.user_response.lower()
-    assert result.narrative_payload is not None
-    assert result.narrative_payload["terminalMessage"] == result.user_response
-    assert result.narrative_payload["narrativeSummary"] == result.user_response
+    assert result.user_response == "The destination write completed. Which account should I use?"
 
 
 def test_result_carries_exact_model_contract_deletion_to_auto_accept() -> None:

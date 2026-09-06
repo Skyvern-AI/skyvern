@@ -56,12 +56,12 @@ from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_fa
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     project_build_test_packet_for_llm,
+    project_direct_test_handoff_packet_for_llm,
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import inject_runtime_authoring_repair_context
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
-from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, render_terminal_message
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -3461,29 +3461,8 @@ def test_failure_in_the_latest_run_keeps_the_stop_and_names_its_block() -> None:
     assert latest.failed_operation == failed_operation
     assert latest.completed_block_associations == ()
 
-    envelope = assemble_terminal_envelope(
-        response_type="REPLY",
-        verified=False,
-        workflow_applied=False,
-        proposal_disposition="review_untested",
-        run_outcomes=[],
-        blocker_reason=None,
-        halt_kind=None,
-        attempted=None,
-        workflow_mutated=True,
-        workflow_attempted=True,
-        failed_operation=latest.failed_operation,
-        proposal_present=True,
-        interruption=None,
-    )
-    assert envelope is not None
-    assert envelope.terminal_cause == "browser_operation_failed"
-    message, replaced = render_terminal_message(envelope, "End-to-end test did not complete.", cancelled=False)
-
-    assert replaced is True
-    assert message.startswith(
-        "I stopped after a browser operation failed in `continue_to_payment` while testing the workflow."
-    )
+    assert latest.failed_operation.kind == "browser_operation_failed"
+    assert latest.failed_operation.block_label == "continue_to_payment"
 
 
 def test_stop_clears_when_the_failed_block_completed_even_though_a_later_block_failed() -> None:
@@ -4415,24 +4394,22 @@ def _completed_output_run_result(retained_value: object, *, register_row: bool =
 
 
 @pytest.mark.parametrize(
-    ("case", "retained_value", "register_row", "expected_reason_code"),
+    ("case", "retained_value", "register_row"),
     [
-        ("no_row", {"payment_options": ["Visa"]}, False, "registered_output_missing"),
-        ("null_value", None, True, "registered_output_null"),
+        ("no_row", {"payment_options": ["Visa"]}, False),
+        ("null_value", None, True),
         # An empty collection is a value the code returned. Whether "no options were offered" is
         # the right answer is the model's call; reporting it absent would invite invented data.
-        ("empty_object", {}, True, None),
-        ("empty_list", [], True, None),
-        ("run_owned_value", {"payment_options": ["Visa", "PayPal"]}, True, None),
+        ("empty_object", {}, True),
+        ("empty_list", [], True),
+        ("run_owned_value", {"payment_options": ["Visa", "PayPal"]}, True),
     ],
 )
-def test_a_completed_run_that_retained_no_requested_output_value_returns_to_ordinary_repair(
+def test_a_completed_run_keeps_registered_output_facts_model_owned(
     case: str,
     retained_value: object,
     register_row: bool,
-    expected_reason_code: str | None,
 ) -> None:
-    """A retained row proves the block ran; it is not proof the requested output was produced."""
     result = _completed_output_run_result(retained_value, register_row=register_row)
     data = result["data"]
     assert isinstance(data, dict)
@@ -4458,27 +4435,13 @@ def test_a_completed_run_that_retained_no_requested_output_value_returns_to_ordi
         user_message="Repair the recorded run.",
     )
 
-    if expected_reason_code is None:
-        assert outcome.missing_requested_output_facts == []
-        assert outcome.verdict == "not_authoritative"
-        assert packet["unfinished_items"] == []
-        if case == "run_owned_value":
-            assert '"payment_options"' in ordinary_input, "the run-owned value is not handed back"
-        return
-
-    assert outcome.verdict == "repairable_failure"
-    assert outcome.reason_code == "no_meaningful_output"
-    assert outcome.is_authoritative is True
-    assert [fact["reason_code"] for fact in outcome.missing_requested_output_facts] == [expected_reason_code]
-    assert [fact["output_path"] for fact in outcome.missing_requested_output_facts] == ["output.collect_options_output"]
-    assert {
-        "kind": "missing_requested_output",
-        "label": "collect_options",
-        "output_path": "output.collect_options_output",
-        "reason_code": expected_reason_code,
-    } in packet["unfinished_items"]
-    assert '"output_path": "output.collect_options_output"' in ordinary_input
-    assert f'"reason_code": "{expected_reason_code}"' in ordinary_input
+    assert outcome.missing_requested_output_facts == []
+    assert outcome.verdict == "not_authoritative"
+    assert packet["unfinished_items"] == []
+    if register_row:
+        assert "collect_options" in ordinary_input
+    if case == "run_owned_value":
+        assert '"payment_options"' in ordinary_input
 
 
 def test_snapshot_registered_row_with_regenerated_id_satisfies_requested_output_by_key() -> None:
@@ -4574,8 +4537,7 @@ def test_explicit_null_block_output_rejects_stale_registered_row_fallback() -> N
     assert any("explicit null workflow run block output" in notice for notice in packet["omission_notices"])
 
 
-def test_a_declared_goal_path_the_run_left_empty_reaches_repair_and_the_latch_from_one_source() -> None:
-    """The terminal latch and ordinary repair read the same unmet declared goal paths."""
+def test_a_declared_goal_path_the_run_left_empty_remains_a_fact_not_an_automatic_grade() -> None:
     run_id = "wr_goal_paths"
     ctx = _locator_packet_ctx()
     ctx.code_artifact_metadata = {
@@ -4607,36 +4569,33 @@ def test_a_declared_goal_path_the_run_left_empty_reaches_repair_and_the_latch_fr
     _anti_bot, empty_data_blocks, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(
         result, ctx
     )
-    outcome = recorded_outcome_from_run_blocks_result(
+    run_execution_module._record_build_test_outcome(
+        ctx,
         result,
-        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
-        declared_goal_path_omissions=goal_path_omissions,
+        RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        goal_path_omissions,
     )
+    outcome = ctx.latest_recorded_build_test_outcome
     assert outcome is not None
     packet = project_build_test_packet_for_llm(
         build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
     ).model_dump(mode="json", exclude_none=True)
 
-    # The latch already refused this run; the same unmet paths now reach repair by name.
-    assert empty_data_blocks is True
+    assert empty_data_blocks is False
     assert goal_path_omissions == [{"block_label": "collect_options", "output_path": "cart_line_item"}]
-    assert outcome.verdict == "repairable_failure"
-    assert outcome.reason_code == "no_meaningful_output"
-    assert outcome.missing_requested_output_facts == [
-        {
-            "output_path": "cart_line_item",
-            "output_root": "cart_line_item",
-            "reason_code": "declared_goal_path_absent",
-            "value_status": "no_typed_value",
-            "block_label": "collect_options",
-        }
-    ]
-    assert {
-        "kind": "missing_requested_output",
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.reason_code == "run_completed_unevaluated"
+    assert outcome.missing_requested_output_facts == []
+    expected_observation = {
+        "kind": "requested_output_observation",
         "label": "collect_options",
         "output_path": "cart_line_item",
-        "reason_code": "declared_goal_path_absent",
-    } in packet["unfinished_items"]
+    }
+    assert expected_observation in packet["unfinished_items"]
+    direct_packet = project_direct_test_handoff_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert expected_observation in direct_packet["unfinished_items"]
 
     satisfied_result = json.loads(json.dumps(result))
     satisfied_result["data"]["blocks"][0]["extracted_data"]["cart_line_item"] = {"qty": 1}
@@ -4682,20 +4641,13 @@ def test_a_top_level_array_goal_path_is_not_dropped_for_having_no_root() -> None
     )
     assert outcome is not None
 
-    assert empty_data_blocks is True
-    assert outcome.verdict == "repairable_failure"
-    assert outcome.missing_requested_output_facts == [
-        {
-            "output_path": "[].number",
-            "reason_code": "declared_goal_path_absent",
-            "value_status": "no_typed_value",
-            "block_label": "collect_rows",
-        }
-    ]
+    assert empty_data_blocks is False
+    assert outcome.verdict == "not_authoritative"
+    assert goal_path_omissions == [{"block_label": "collect_rows", "output_path": "[].number"}]
+    assert outcome.missing_requested_output_facts == []
 
 
-def test_two_blocks_omitting_the_same_declared_path_both_reach_repair() -> None:
-    """Deduping on the path alone would repair one block and leave the other silently broken."""
+def test_declared_path_omissions_do_not_create_repair_instructions() -> None:
     run_id = "wr_shared_goal_path"
     ctx = _locator_packet_ctx()
     ctx.code_artifact_metadata = {
@@ -4729,30 +4681,16 @@ def test_two_blocks_omitting_the_same_declared_path_both_reach_repair() -> None:
     )
     assert outcome is not None
 
-    assert [(fact["output_path"], fact["block_label"]) for fact in outcome.missing_requested_output_facts] == [
-        ("status", "collect_first"),
-        ("status", "collect_second"),
-    ]
-
-    # Retaining both facts is only half the fix: repair must be able to tell them apart.
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.missing_requested_output_facts == []
     packet = project_build_test_packet_for_llm(
         build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
     ).model_dump(mode="json", exclude_none=True)
-    assert [
-        (item["output_path"], item["label"])
-        for item in packet["unfinished_items"]
-        if item["kind"] == "missing_requested_output"
-    ] == [("status", "collect_first"), ("status", "collect_second")]
-
-    ctx.latest_recorded_build_test_outcome = outcome
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    rendered = _recorded_build_test_outcome_prompt(ctx)
-    assert "block_label=collect_first" in rendered
-    assert "block_label=collect_second" in rendered
+    assert packet["unfinished_items"] == []
 
 
-def test_a_long_declared_goal_path_reaches_repair_uncut() -> None:
-    """The prompt tells the model to copy output_path verbatim; a clipped path names nothing."""
+def test_a_long_declared_goal_path_reaches_the_factual_packet_uncut() -> None:
+    """A clipped observation path names nothing for the acting model to interpret."""
     run_id = "wr_long_goal_path"
     long_path = "$.checkout.summary." + ".".join(f"level_{index:02d}" for index in range(15)) + ".amount_due"
     normalized = long_path.removeprefix("$.")
@@ -4783,25 +4721,31 @@ def test_a_long_declared_goal_path_reaches_repair_uncut() -> None:
     }
 
     _anti_bot, _empty, _categories, goal_path_omissions = run_execution_module._analyze_run_blocks(result, ctx)
-    outcome = recorded_outcome_from_run_blocks_result(
+    run_execution_module._record_build_test_outcome(
+        ctx,
         result,
-        recorded_run_outcome=RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
-        declared_goal_path_omissions=goal_path_omissions,
+        RecordedRunOutcome(verdict="not_evaluated", workflow_run_id=run_id, run_completed=True),
+        goal_path_omissions,
     )
+    outcome = ctx.latest_recorded_build_test_outcome
     assert outcome is not None
 
-    assert [fact["output_path"] for fact in outcome.missing_requested_output_facts] == [normalized]
+    assert goal_path_omissions == [{"block_label": "collect_total", "output_path": normalized}]
+    assert outcome.missing_requested_output_facts == []
 
     packet = project_build_test_packet_for_llm(
         build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
     ).model_dump(mode="json", exclude_none=True)
-    assert [
-        item["output_path"] for item in packet["unfinished_items"] if item["kind"] == "missing_requested_output"
-    ] == [normalized]
-
-    ctx.latest_recorded_build_test_outcome = outcome
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    assert f"output_path={normalized}" in _recorded_build_test_outcome_prompt(ctx)
+    expected_observation = {
+        "kind": "requested_output_observation",
+        "label": "collect_total",
+        "output_path": normalized,
+    }
+    assert expected_observation in packet["unfinished_items"]
+    direct_packet = project_direct_test_handoff_packet_for_llm(
+        build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
+    ).model_dump(mode="json", exclude_none=True)
+    assert expected_observation in direct_packet["unfinished_items"]
 
 
 def _goal_path_run_result(run_id: str, blocks: list[dict[str, object]]) -> dict[str, object]:
@@ -4868,14 +4812,8 @@ def test_a_sibling_blocks_complete_record_does_not_clear_another_blocks_omission
     assert outcome is not None
 
     assert goal_path_omissions == [{"block_label": "collect_options", "output_path": "cart_line_item"}]
-    assert empty_data_blocks is True
-    assert outcome.verdict == "repairable_failure"
-
-    ctx.latest_recorded_build_test_outcome = outcome
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    rendered = _recorded_build_test_outcome_prompt(ctx)
-    assert "output_path=cart_line_item" in rendered
-    assert "block_label=collect_options" in rendered
+    assert empty_data_blocks is False
+    assert outcome.verdict == "not_authoritative"
 
 
 def test_a_completed_block_that_retained_nothing_at_all_reports_every_declared_path() -> None:
@@ -4904,14 +4842,12 @@ def test_a_completed_block_that_retained_nothing_at_all_reports_every_declared_p
 
     assert empty_data_blocks is True
     assert [omission["output_path"] for omission in goal_path_omissions] == ["payment_options", "cart_line_item"]
-    assert outcome.verdict == "repairable_failure"
+    assert outcome.verdict == "not_authoritative"
 
     packet = project_build_test_packet_for_llm(
         build_test_evidence_packet(ctx, result, recorded_outcome=outcome)
     ).model_dump(mode="json", exclude_none=True)
-    assert sorted(
-        item["output_path"] for item in packet["unfinished_items"] if item["kind"] == "missing_requested_output"
-    ) == ["cart_line_item", "payment_options"]
+    assert packet["unfinished_items"] == []
 
 
 class _CheckoutPage:
@@ -5080,15 +5016,8 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
 
     before_outcome = before_ctx.latest_recorded_build_test_outcome
     assert before_outcome is not None
-    assert before_outcome.verdict == "repairable_failure"
-    assert sorted(fact["output_path"] for fact in before_outcome.missing_requested_output_facts) == [
-        "cart_line_item",
-        "payment_options",
-        "selection_output",
-    ]
-    rendered = _recorded_build_test_outcome_prompt(before_ctx)
-    for path in ("cart_line_item", "payment_options", "selection_output"):
-        assert f"output_path={path}" in rendered
+    assert before_outcome.verdict == "not_authoritative"
+    assert before_outcome.missing_requested_output_facts == []
 
     after_outcome = after_ctx.latest_recorded_build_test_outcome
     assert after_outcome is not None
@@ -5746,16 +5675,27 @@ def test_a_selector_the_text_scan_cannot_read_whole_cannot_prove_removal() -> No
     assert evidence["removal_provable"] is False
 
 
-def test_a_later_failed_block_is_captured_so_it_cannot_witness_its_own_repair() -> None:
-    """Capturing only the first failed block let a second one mint evidence and clear its own failure."""
+def test_not_evaluated_run_outcome_does_not_hide_failed_blocks() -> None:
     outcome = recorded_outcome_from_run_blocks_result(
         {
             "ok": True,
             "data": {
                 "workflow_run_id": "wr_2",
                 "blocks": [
-                    {"label": "open_page", "status": "failed", "failure_type": "runtime_error"},
-                    {"label": "sign_in_and_read", "status": "failed", "failure_type": "runtime_error"},
+                    {
+                        "label": "open_page",
+                        "block_type": "CODE",
+                        "status": "failed",
+                        "failure_reason": "CodeBlock failed while running user code.",
+                        "error_codes": ["user_code_error"],
+                    },
+                    {
+                        "label": "sign_in_and_read",
+                        "block_type": "CODE",
+                        "status": "failed",
+                        "failure_reason": "CodeBlock failed while running user code.",
+                        "error_codes": ["user_code_error"],
+                    },
                 ],
             },
         },
@@ -5763,20 +5703,9 @@ def test_a_later_failed_block_is_captured_so_it_cannot_witness_its_own_repair() 
     )
 
     assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"
     assert outcome.failed_block_labels == ["open_page", "sign_in_and_read"]
-
-    ctx = _run_history_ctx(two_page_login_yaml())
-    ctx.persisted_workflow_yaml = None
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    ctx.workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-    record_build_test_outcome(ctx, outcome)
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
 
 
 def _runtime_built_role_name_yaml() -> str:
@@ -5888,7 +5817,7 @@ async def test_budget_denied_dispatch_preserves_prior_run_through_public_tool(
         verdict="verified", reason_code="execution_completed", workflow_run_id="wr_prior", run_completed=True
     )
     previous_outcome = ctx.last_run_outcome
-    previous_history = list(ctx.terminal_envelope_run_outcomes)
+    previous_history = list(ctx.run_outcome_trace)
     previous_diagnosis = ctx.latest_diagnosis_repair_contract
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
@@ -5909,7 +5838,7 @@ async def test_budget_denied_dispatch_preserves_prior_run_through_public_tool(
     assert ctx.last_test_ok is True
     assert ctx.last_full_workflow_test_ok is True
     assert ctx.last_run_outcome is previous_outcome
-    assert ctx.terminal_envelope_run_outcomes == previous_history
+    assert ctx.run_outcome_trace == previous_history
     assert ctx.latest_diagnosis_repair_contract is previous_diagnosis
     assert result == {"ok": False, "data": {"budget_expired": True, "run_dispatched": False, "source": "deadline"}}
     dispatch.assert_not_awaited()

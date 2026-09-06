@@ -428,10 +428,8 @@ def test_proxy_transport_full_flow_uses_browser_network_reply(reason: str, block
     assert result.workflow_yaml is None
     assert result.turn_outcome is not None
     assert result.turn_outcome.terminal_reason == "non_retriable_nav"
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["next_state"] == "stopped"
-    assert result.terminal_envelope["response_kind"] == "stopped"
-    assert result.terminal_envelope["proposal_present"] is False
+    assert result.proposal_disposition == "no_proposal"
+    assert result.updated_workflow is None
     assert ctx.last_test_non_retriable_nav_error == reason
 
 

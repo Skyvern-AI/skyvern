@@ -1296,8 +1296,8 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     assert result.turn_outcome is not None
     assert result.turn_outcome.budget_expired is True
     assert result.turn_outcome.budget_expiry_report_produced is False
-    assert result.terminal_envelope is not None
-    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["turnFacts"]["terminalCause"] == "deadline_expired"
     assert result.browser_ablation_metadata is not None
     assert result.browser_ablation_metadata["eval_mode"] == "browser_ablation"
     assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]
