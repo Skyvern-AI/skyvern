@@ -7,10 +7,11 @@ not another ad-hoc sentence patched onto the goal string in ``ForgeAgent._execut
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
 
 from skyvern.forge.sdk.schemas.tasks import TaskType
@@ -42,6 +43,82 @@ class PreviousBlockHandoff:
 
 
 _TRAILING_PUNCT = ")]}>.,;:!?'\""
+
+
+@dataclass(frozen=True)
+class GoalDirectives:
+    """Everything that shapes a Task V3 block's goal beyond the navigation goal itself.
+
+    A field here is already the DECISION, not the raw task attribute: the caller resolves whether a
+    criterion is trusted and whether error codes are on offer, and passes ``None`` when the sentence
+    is not to be rendered. That keeps the policy at the caller and the wording here.
+    """
+
+    data_extraction_goal: str | None = None
+    extracted_information_schema: Any = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    framing: str = ""
+    block_context_section: str = ""
+
+
+def compose_goal(navigation_goal: str, directives: GoalDirectives) -> str:
+    """Build the goal the model is given, appending each directive in a fixed order.
+
+    Order is part of the contract: the model reads the extraction instruction before the schema it
+    must conform to, and the framing and block-context sections land last so run-shaped context
+    never separates a criterion from the goal it qualifies.
+    """
+    goal = navigation_goal
+    if directives.data_extraction_goal:
+        goal = (
+            f"{goal}\n\nWhen the page goal is met, extract the requested data and return it as the "
+            f"`extracted_output` argument to finish. Data to extract: {directives.data_extraction_goal}"
+        ).strip()
+    if directives.extracted_information_schema:
+        goal = (
+            f"{goal}\n\nThe extracted_output MUST be valid JSON conforming to this schema:\n"
+            f"{json.dumps(directives.extracted_information_schema, default=str)}"
+        ).strip()
+    if directives.complete_criterion:
+        goal = (
+            f"{goal}\n\nConsider the goal complete, and finish with status=completed, only when: "
+            f"{directives.complete_criterion}"
+        ).strip()
+    if directives.terminate_criterion:
+        goal = (
+            f"{goal}\n\nIf this becomes true, stop and finish with status=terminated: {directives.terminate_criterion}"
+        ).strip()
+    if directives.error_code_mapping:
+        # v1 shows the model these codes in-loop (see the error_code_mapping_str prompt sites), so
+        # a v1 terminal verdict names its own code. v3 did not, and the codes were instead matched
+        # on afterwards by the detector — which let a block with no adjudication criteria acquire a
+        # business code it never reasoned about (SKY-15586).
+        #
+        # The exclusion is drawn on OUR side of the line, not around the customer's taxonomy: a
+        # code must not stand in for a failure of this agent or the browser, because those are
+        # ours and have to surface uncoded. A site or portal problem MAY carry a code when the
+        # customer defined one for it -- several such codes exist precisely to trigger a retry,
+        # and a rule of ours that made them unreachable would break the workflow it was meant to
+        # protect. The description match is what does the real work.
+        goal = (
+            f"{goal}\n\nThe user defined these business outcomes and their descriptions:\n"
+            f"```\n{json.dumps(directives.error_code_mapping, indent=2)}\n```\n"
+            "If one of these descriptions is what actually happened, set error_code to exactly "
+            "that code, on whatever finish status is honest -- choose the status on its own "
+            "merits, never to make a code fit. Do not return a code the user did not define, and "
+            "do not stretch a description to cover something it does not say. Never use a code to "
+            "describe a failure of YOU or the browser -- being stuck, losing track of which page "
+            "you are on, running out of steps, or simply not managing the task are ours to "
+            "report, so finish those WITHOUT an error_code. A problem with the SITE may take a "
+            "code when the user defined one whose description names that problem."
+        ).strip()
+    if directives.framing:
+        goal = f"{goal}\n\n{directives.framing}".strip()
+    if directives.block_context_section:
+        goal = f"{goal}\n\n{directives.block_context_section}".strip()
+    return goal
 
 
 def mask_signed_urls_in_text(text: str) -> str:

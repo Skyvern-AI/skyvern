@@ -10,6 +10,7 @@ import string
 import time
 import uuid
 from asyncio.exceptions import CancelledError
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,6 +166,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     _task_block_supports_v3,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
@@ -979,6 +981,92 @@ def _redact_extracted_information(value: Any, secret_values: set[str]) -> Any:
     return root
 
 
+def _v3_task_status(
+    outcome: LoopOutcome, *, completion_vetoed: bool, extraction_requested: bool
+) -> tuple[TaskStatus, bool]:
+    """Map a Task V3 loop verdict onto the task's terminal status.
+
+    Returns the status and whether a promised extraction went missing, because the caller needs the
+    second fact again when it builds the failure reason -- recomputing it there would be a second
+    definition of the same rule.
+    """
+    status_map = {
+        "completed": TaskStatus.completed,
+        "terminated": TaskStatus.terminated,
+        "canceled": TaskStatus.canceled,
+    }
+    task_status = status_map.get(outcome.status, TaskStatus.failed)
+    if completion_vetoed:
+        task_status = TaskStatus.failed
+    # A completed run with a data-extraction goal must actually carry data. The model declaring
+    # completion with no extracted_output is a failed extraction, not an empty success — report it
+    # as failed rather than fabricate an empty object that reads as a successful-but-empty result.
+    # An explicit empty structure ({}/[]) is a real answer and is left as completed.
+    missing_extraction = (
+        task_status == TaskStatus.completed and extraction_requested and outcome.extracted_output is None
+    )
+    if missing_extraction:
+        task_status = TaskStatus.failed
+    return task_status, missing_extraction
+
+
+def _v3_failure_reason(
+    outcome: LoopOutcome,
+    *,
+    task_status: TaskStatus,
+    completion_vetoed: bool,
+    missing_extraction: bool,
+    run_secrets: Collection[str],
+) -> str | None:
+    if task_status in (TaskStatus.completed, TaskStatus.canceled):
+        failure_reason = None
+    elif completion_vetoed:
+        failure_reason = "task_v3 reported completion but the deployment completion gate rejected it"
+    elif missing_extraction:
+        failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
+    else:
+        failure_reason = outcome.reason or outcome.status
+    # failure_reason is a first-class field on the task webhook payload, so the model's finish
+    # text leaves the system here. Redacted where it is born rather than at the persist below
+    # because the redactor matches whole registered values: the error detector and the
+    # non-completed block handoff, which truncates, both pass this text onward, and either could
+    # otherwise hand on a fragment that no longer matches.
+    if failure_reason and run_secrets:
+        failure_reason = redact_secrets_from_text(failure_reason, run_secrets)
+    return failure_reason
+
+
+def _v3_failure_category(
+    outcome: LoopOutcome,
+    *,
+    task_status: TaskStatus,
+    failure_reason: str | None,
+    completion_vetoed: bool,
+    missing_extraction: bool,
+) -> list[dict[str, Any]] | None:
+    # failure_category must agree with failure_reason: a vetoed or extraction-less completion,
+    # a loop_error, and any finish verdict the model delivered on the granted turn all failed
+    # for THEIR reason, not the budget's. BUDGET_EXHAUSTED is reserved for the exits where the
+    # cap genuinely is the cause: the loop gave up without a verdict, or the granted-turn
+    # verdict's reason classifies to nothing (usually the model narrating the truncation).
+    cap_is_the_cause = (
+        outcome.cap_trip is not None
+        and not completion_vetoed
+        and not missing_extraction
+        and outcome.status != "loop_error"
+    )
+    if task_status == TaskStatus.failed and outcome.status == "budget_exhausted" and cap_is_the_cause:
+        return [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}]
+    if task_status == TaskStatus.failed:
+        # Same code-level failure classification fail_task records, so v3 failures carry a
+        # failure_category like step-engine failures.
+        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
+        if failure_category is None and cap_is_the_cause:
+            return [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}]
+        return failure_category
+    return None
+
+
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
@@ -1496,7 +1584,9 @@ class ForgeAgent:
         from skyvern.forge.taskv3.auth_tools import VerificationState, build_auth_tools
         from skyvern.forge.taskv3.block_context import (
             MAX_PERSISTED_FINISH_REASON_CHARS,
+            GoalDirectives,
             PreviousBlockHandoff,
+            compose_goal,
             mask_signed_urls_in_text,
             render_block_context,
             sanitize_handoff_url,
@@ -1550,30 +1640,6 @@ class ForgeAgent:
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         parameters = coerce_v3_parameters(task.navigation_payload)
         context = skyvern_context.current()
-        goal = task.navigation_goal or ""
-        if task.data_extraction_goal:
-            goal = (
-                f"{goal}\n\nWhen the page goal is met, extract the requested data and return it as the "
-                f"`extracted_output` argument to finish. Data to extract: {task.data_extraction_goal}"
-            ).strip()
-        if task.extracted_information_schema:
-            goal = (
-                f"{goal}\n\nThe extracted_output MUST be valid JSON conforming to this schema:\n"
-                f"{json.dumps(task.extracted_information_schema, default=str)}"
-            ).strip()
-        # Surface the customer's completion/termination criteria (trusted task config, like the
-        # navigation goal). Skip a complete_criterion flagged untrusted (LLM-derived from page content)
-        # so it can't be injected into the goal raw — unreachable on v3 today, but keeps the boundary
-        # if a future change ever routes such tasks here.
-        if task.complete_criterion and not (context and context.complete_criterion_is_untrusted):
-            goal = (
-                f"{goal}\n\nConsider the goal complete, and finish with status=completed, only when: "
-                f"{task.complete_criterion}"
-            ).strip()
-        if task.terminate_criterion:
-            goal = (
-                f"{goal}\n\nIf this becomes true, stop and finish with status=terminated: {task.terminate_criterion}"
-            ).strip()
         offer_error_codes = False
         if task.error_code_mapping:
             try:
@@ -1586,30 +1652,6 @@ class ForgeAgent:
                     task_id=task.task_id,
                     exc_info=True,
                 )
-        if offer_error_codes and task.error_code_mapping:
-            # v1 shows the model these codes in-loop (see the error_code_mapping_str prompt sites), so
-            # a v1 terminal verdict names its own code. v3 did not, and the codes were instead matched
-            # on afterwards by the detector — which let a block with no adjudication criteria acquire a
-            # business code it never reasoned about (SKY-15586).
-            #
-            # The exclusion is drawn on OUR side of the line, not around the customer's taxonomy: a
-            # code must not stand in for a failure of this agent or the browser, because those are
-            # ours and have to surface uncoded. A site or portal problem MAY carry a code when the
-            # customer defined one for it -- several such codes exist precisely to trigger a retry,
-            # and a rule of ours that made them unreachable would break the workflow it was meant to
-            # protect. The description match is what does the real work.
-            goal = (
-                f"{goal}\n\nThe user defined these business outcomes and their descriptions:\n"
-                f"```\n{json.dumps(task.error_code_mapping, indent=2)}\n```\n"
-                "If one of these descriptions is what actually happened, set error_code to exactly "
-                "that code, on whatever finish status is honest -- choose the status on its own "
-                "merits, never to make a code fit. Do not return a code the user did not define, and "
-                "do not stretch a description to cover something it does not say. Never use a code to "
-                "describe a failure of YOU or the browser -- being stuck, losing track of which page "
-                "you are on, running out of steps, or simply not managing the task are ours to "
-                "report, so finish those WITHOUT an error_code. A problem with the SITE may take a "
-                "code when the user defined one whose description names that problem."
-            ).strip()
         page_free_validation = bool(
             task_block is not None
             and task.task_type == TaskType.validation
@@ -1660,10 +1702,24 @@ class ForgeAgent:
             previous_block=previous_block,
             selected_block_labels=context.run_block_labels if context else None,
         )
-        if framing:
-            goal = f"{goal}\n\n{framing}".strip()
-        if block_context_section:
-            goal = f"{goal}\n\n{block_context_section}".strip()
+        goal = compose_goal(
+            task.navigation_goal or "",
+            GoalDirectives(
+                data_extraction_goal=task.data_extraction_goal,
+                extracted_information_schema=task.extracted_information_schema,
+                # Surface the customer's completion/termination criteria (trusted task config, like
+                # the navigation goal). Withhold a complete_criterion flagged untrusted (LLM-derived
+                # from page content) so it can't be injected into the goal raw — unreachable on v3
+                # today, but keeps the boundary if a future change ever routes such tasks here.
+                complete_criterion=(
+                    None if context and context.complete_criterion_is_untrusted else task.complete_criterion
+                ),
+                terminate_criterion=task.terminate_criterion,
+                error_code_mapping=task.error_code_mapping if offer_error_codes else None,
+                framing=framing,
+                block_context_section=block_context_section,
+            ),
+        )
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
@@ -2187,24 +2243,10 @@ class ForgeAgent:
                 )
             if completion_vetoed:
                 LOG.info("task_v3 completion vetoed by completion gate", task_id=task.task_id)
-        status_map = {
-            "completed": TaskStatus.completed,
-            "terminated": TaskStatus.terminated,
-            "canceled": TaskStatus.canceled,
-        }
-        task_status = status_map.get(outcome.status, TaskStatus.failed)
-        if completion_vetoed:
-            task_status = TaskStatus.failed
-        # A completed run with a data-extraction goal must actually carry data. The model declaring
-        # completion with no extracted_output is a failed extraction, not an empty success — report it
-        # as failed rather than fabricate an empty object that reads as a successful-but-empty result.
-        # An explicit empty structure ({}/[]) is a real answer and is left as completed.
         extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
-        missing_extraction = (
-            task_status == TaskStatus.completed and extraction_requested and outcome.extracted_output is None
+        task_status, missing_extraction = _v3_task_status(
+            outcome, completion_vetoed=completion_vetoed, extraction_requested=extraction_requested
         )
-        if missing_extraction:
-            task_status = TaskStatus.failed
         # Persist the terminal decision as the run's last action row — v1's step engine always writes
         # its complete/terminate decision, and this row is the only step detail a click-free
         # validation/extraction block has to show. Written HERE, after the verdict is
@@ -2346,22 +2388,13 @@ class ForgeAgent:
                 step_id=step.step_id,
                 exc_info=True,
             )
-        failure_category = None
-        if task_status in (TaskStatus.completed, TaskStatus.canceled):
-            failure_reason = None
-        elif completion_vetoed:
-            failure_reason = "task_v3 reported completion but the deployment completion gate rejected it"
-        elif missing_extraction:
-            failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
-        else:
-            failure_reason = outcome.reason or outcome.status
-        # failure_reason is a first-class field on the task webhook payload, so the model's finish
-        # text leaves the system here. Redacted where it is born rather than at the persist below
-        # because the redactor matches whole registered values: the error detector and the
-        # non-completed block handoff, which truncates, both pass this text onward, and either could
-        # otherwise hand on a fragment that no longer matches.
-        if failure_reason and run_secrets:
-            failure_reason = redact_secrets_from_text(failure_reason, run_secrets)
+        failure_reason = _v3_failure_reason(
+            outcome,
+            task_status=task_status,
+            completion_vetoed=completion_vetoed,
+            missing_extraction=missing_extraction,
+            run_secrets=run_secrets,
+        )
         if outcome.cap_trip is not None:
             # The typed fact a budget cap tripped this run, independent of whether the model went on
             # to finish on the granted final turn (a completed/failed/terminated verdict) or the loop
@@ -2372,29 +2405,13 @@ class ForgeAgent:
                 cap_trip=outcome.cap_trip,
                 final_turn_finished=outcome.status != "budget_exhausted",
             )
-        # failure_category must agree with failure_reason: a vetoed or extraction-less completion,
-        # a loop_error, and any finish verdict the model delivered on the granted turn all failed
-        # for THEIR reason, not the budget's. BUDGET_EXHAUSTED is reserved for the exits where the
-        # cap genuinely is the cause: the loop gave up without a verdict, or the granted-turn
-        # verdict's reason classifies to nothing (usually the model narrating the truncation).
-        cap_is_the_cause = (
-            outcome.cap_trip is not None
-            and not completion_vetoed
-            and not missing_extraction
-            and outcome.status != "loop_error"
+        failure_category = _v3_failure_category(
+            outcome,
+            task_status=task_status,
+            failure_reason=failure_reason,
+            completion_vetoed=completion_vetoed,
+            missing_extraction=missing_extraction,
         )
-        if task_status == TaskStatus.failed and outcome.status == "budget_exhausted" and cap_is_the_cause:
-            failure_category = [
-                {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
-            ]
-        elif task_status == TaskStatus.failed:
-            # Same code-level failure classification fail_task records, so v3 failures carry a
-            # failure_category like step-engine failures.
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
-            if failure_category is None and cap_is_the_cause:
-                failure_category = [
-                    {"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}
-                ]
         # Three cases, and the first is status-INDEPENDENT on purpose. A model that named a code has
         # answered the question; discarding that answer because the run also finished `completed`
         # would throw away exactly the business-outcome verdict this change exists to capture, and
