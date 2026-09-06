@@ -508,9 +508,9 @@ def block_yaml_to_block(
             loop_over_parameter = parameters.get(block_yaml.loop_over_parameter_key)
 
         if block_yaml.loop_variable_reference:
-            # it's backaward compatible with jinja style parameter and context paramter
-            # we trim the format like {{ loop_key }} into loop_key to initialize the context parater,
-            # otherwise it might break the context parameter initialization chain, blow up the worklofw parameters
+            # it's backward compatible with jinja style parameter and context parameter
+            # we trim the format like {{ loop_key }} into loop_key to initialize the context parameter,
+            # otherwise it might break the context parameter initialization chain, blow up the workflow parameters
             # TODO: consider remove this if we totally give up context parameter
             trimmed_key = block_yaml.loop_variable_reference.strip(" {}")
             if trimmed_key in parameters:
