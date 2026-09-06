@@ -175,7 +175,7 @@ class TestScrapeWebsiteTargetClosed:
 
 
 class TestScrapeRetryLoopTargetClosed:
-    """The terminal scrape attempt re-raises, and its own ERROR is what Error Tracking would file."""
+    """The terminal scrape attempt re-raises and logs at warning; its callers own the error record."""
 
     def _rig(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> tuple[ForgeAgent, MagicMock, dict]:
         now = datetime.now(UTC)
@@ -208,13 +208,14 @@ class TestScrapeRetryLoopTargetClosed:
         assert any("browser target closed" in str(call.args[0]).lower() for call in log.warning.call_args_list)
 
     @pytest.mark.asyncio
-    async def test_final_attempt_still_errors_on_other_failures(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_final_attempt_warns_on_other_failures(self, monkeypatch: pytest.MonkeyPatch) -> None:
         agent, log, kwargs = self._rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
 
         with pytest.raises(FailedToTakeScreenshot):
             await agent.build_and_record_step_prompt(**kwargs)
 
-        assert any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
+        assert any("All scrape attempts failed" in str(call.args[0]) for call in log.warning.call_args_list)
+        assert not any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
 
 
 def _browser_gone() -> MissingBrowserStatePage:
