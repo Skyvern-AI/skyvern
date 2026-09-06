@@ -3,6 +3,7 @@
 import inspect
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -58,3 +59,11 @@ def failing_sink(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
         monkeypatch.setattr(target, attribute, sync_sink)
 
     return install
+
+
+@pytest.fixture
+def no_saved_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give standalone YAML conversion tests an explicit empty saved-workflow lookup."""
+    from skyvern.forge import app
+
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
