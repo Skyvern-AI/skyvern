@@ -450,6 +450,7 @@ class AgentContext:
     copilot_total_timeout_exceeded: bool = False
     copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
+    empty_completion: bool = False
     budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
     check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0

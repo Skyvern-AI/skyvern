@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.ask_user import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
 from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
-from skyvern.forge.sdk.copilot.terminal_envelope import chat_awaits_user_input
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -1301,30 +1300,6 @@ class WorkflowParametersRepository(BaseRepository):
             )
             rows = (await session.execute(query)).all()
 
-            # The chats-list indexes are (organization_id, workflow_copilot_chat_id) with no
-            # created_at, so the tail lookup is scoped to this page's chats rather than joined
-            # as a DISTINCT ON over the org's whole message history.
-            chat_ids = [chat.workflow_copilot_chat_id for chat, _, _ in rows]
-            awaiting: dict[str, bool] = {}
-            if chat_ids:
-                latest_message = (
-                    select(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
-                        WorkflowCopilotChatMessageModel.sender,
-                        WorkflowCopilotChatMessageModel.narrative_payload,
-                    )
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.in_(chat_ids))
-                    .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
-                    .order_by(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
-                        WorkflowCopilotChatMessageModel.created_at.desc(),
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.desc(),
-                    )
-                )
-                for chat_id, sender, narrative_payload in (await session.execute(latest_message)).all():
-                    awaiting[chat_id] = chat_awaits_user_input(sender=sender, narrative_payload=narrative_payload)
-
             workflow_titles: dict[str, str] = {}
             permanent_ids = {chat.workflow_permanent_id for chat, _, _ in rows}
             if permanent_ids:
@@ -1348,8 +1323,7 @@ class WorkflowParametersRepository(BaseRepository):
                     title=summarize_copilot_chat_title(content),
                     created_at=chat.created_at,
                     modified_at=chat.modified_at,
-                    awaiting_user_input=awaiting.get(chat.workflow_copilot_chat_id, False)
-                    or any(
+                    awaiting_user_input=any(
                         question_wait_is_live(_parse_pending_turn_timestamp(heartbeat), datetime.now(timezone.utc))
                         for heartbeat in (question_heartbeats or [])
                     ),

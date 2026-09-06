@@ -78,10 +78,26 @@ _TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozen
 PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
 BuildTestPacketWorkflowSource = Literal["accepted_write_readback", "turn_start_persisted_readback", "unavailable"]
-BuildTestPacketUnfinishedKind = Literal["unverified_block", "missing_requested_output"]
+BuildTestPacketUnfinishedKind = Literal[
+    "unverified_block",
+    "missing_requested_output",
+    "requested_output_observation",
+]
 BuildTestPacketPageCaptureStatus = Literal["captured", "unavailable"]
 BuildTestPacketPageCaptureOmission = Literal["screenshot_capture_failed", "page_capture_unavailable"]
 BuildTestFailedOperationKind = Literal["browser_operation_failed"]
+# Why a turn stopped: an empty model completion, a capacity limit, the failed
+# operation's own kind, or the browser connection state the run could not get past.
+TerminalCause = Literal[
+    "empty_completion",
+    "deadline_expired",
+    "max_turns_exceeded",
+    "browser_operation_failed",
+    "already_closed",
+    "provisioning_unavailable",
+    "cdp_connect_failed",
+    "occupied",
+]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
     "run_browser_unavailable",
@@ -1464,9 +1480,7 @@ def recorded_outcome_from_run_blocks_result(
         authoritative_workflow_run_id,
     )
     if recorded_run_outcome is not None and (
-        failed_block is None
-        or _run_outcome_reason_code(recorded_run_outcome) in _TERMINAL_CHALLENGE_REASON_CODES
-        or recorded_run_outcome.verdict == "not_evaluated"
+        failed_block is None or _run_outcome_reason_code(recorded_run_outcome) in _TERMINAL_CHALLENGE_REASON_CODES
     ):
         reason_code = _run_outcome_reason_code(recorded_run_outcome)
         if reason_code in _TERMINAL_CHALLENGE_REASON_CODES:
@@ -1512,7 +1526,7 @@ def recorded_outcome_from_run_blocks_result(
                     "evidence_refs": "run output structure",
                 },
             )
-        if recorded_run_outcome.verdict == "not_evaluated" and not typed_output_omission_facts:
+        if recorded_run_outcome.verdict == "not_evaluated":
             return RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1727,6 +1741,9 @@ def recorded_outcome_from_run_blocks_result(
         block_labels=block_labels,
         requested_block_labels=requested_block_labels,
         executed_block_labels=executed_block_labels,
+        failed_block_labels=_clean_list(
+            [redacted for label in _failed_block_labels(blocks) if (redacted := _redacted_terminal_text(label))]
+        ),
         block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,

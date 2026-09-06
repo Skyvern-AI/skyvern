@@ -141,7 +141,6 @@ class TurnNarrativePayload(TypedDict):
     proposalDisposition: NotRequired[ProposalDisposition]
     # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
-    terminalEnvelope: NotRequired[dict[str, Any]]
     questionInteractions: NotRequired[list[dict[str, Any]]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
@@ -949,8 +948,6 @@ class AgentResult:
     narrative_summary: str | None = None
     # Persisted on the assistant chat message so the bubble survives a reload.
     narrative_payload: TurnNarrativePayload | None = None
-    # Shadow-only typed terminal-state envelope persisted and streamed on terminal frames.
-    terminal_envelope: dict[str, Any] | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
@@ -1016,6 +1013,7 @@ class CopilotContext(AgentContext):
     copilot_total_timeout_exceeded: bool = False
     copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
+    empty_completion: bool = False
     budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
     check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0
@@ -1128,7 +1126,7 @@ class CopilotContext(AgentContext):
     # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
     # (the same source that powers run_outcome SSE frames). Append-only across
     # per-run pointer resets (``last_run_outcome = None``) and workflow edits.
-    terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
+    run_outcome_trace: list[RecordedRunOutcome] = field(default_factory=list)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
@@ -1232,7 +1230,7 @@ class CopilotContext(AgentContext):
         self.google_connection_turn_start_workflow_yaml = self.workflow_yaml
 
         if isinstance(self.last_run_outcome, RecordedRunOutcome):
-            super().__setattr__("terminal_envelope_run_outcomes", [self.last_run_outcome])
+            super().__setattr__("run_outcome_trace", [self.last_run_outcome])
 
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
@@ -1245,11 +1243,11 @@ class CopilotContext(AgentContext):
             # archive reset. The trace retains the full in-order run record;
             # terminal projection deliberately anchors to its latest run.
             return
-        outcomes = getattr(self, "terminal_envelope_run_outcomes", None)
+        outcomes = getattr(self, "run_outcome_trace", None)
         if isinstance(outcomes, list):
             outcomes.append(value)
         else:
-            super().__setattr__("terminal_envelope_run_outcomes", [value])
+            super().__setattr__("run_outcome_trace", [value])
 
     def has_genuine_workflow_attempt(self) -> bool:
         """This turn persisted a workflow proposal or executed a real build-test run; excludes

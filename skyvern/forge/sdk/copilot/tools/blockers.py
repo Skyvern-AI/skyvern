@@ -12,9 +12,6 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     artifact_challenge_flag_key,
 )
-from skyvern.forge.sdk.copilot.completion_verification import (
-    structured_record_has_goal_content as _structured_record_candidate_has_goal_content,
-)
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import AgentContext
@@ -530,10 +527,6 @@ def _registered_download_output_values(value: Any) -> list[Any]:
     return [value[key] for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS if key in value]
 
 
-def _code_output_has_registered_download_content(value: Any) -> bool:
-    return any(_code_output_has_goal_content(item) for item in _registered_download_output_values(value))
-
-
 def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:
     if not use_current_page:
         return False
@@ -609,23 +602,14 @@ def _analyze_run_blocks(
                 if goal_value_paths:
                     has_data_blocks = True
                     unmet_paths = _unmet_code_output_goal_paths(extracted, goal_value_paths)
-                    if (
-                        _code_output_has_registered_download_content(extracted)
-                        or not unmet_paths
-                        or _structured_record_has_goal_content(extracted)
-                    ):
+                    if _is_meaningful_extracted_data(extracted):
                         any_data_output = True
-                    else:
-                        # Terminal goal paths are conjunctive: one missing
-                        # declared field means the block did not prove the
-                        # requested outcome, even if another path had data.
+                    if unmet_paths:
                         label = block.get("label")
                         unmet_goal_path_omissions.extend(
                             {"block_label": label if isinstance(label, str) else "", "output_path": path}
                             for path in unmet_paths
                         )
-                    # Goal-path contracts supersede the generic collection-shape
-                    # fallback below; they are the stronger outcome evidence check.
                     continue
                 # A code output joins the emptiness denominator only when it declares a
                 # collection shape; action-only outputs are exempt.
@@ -646,17 +630,7 @@ def _analyze_run_blocks(
         for registered in registered_payloads:
             if _is_meaningful_extracted_data(registered.get("value")):
                 any_data_output = True
-    empty_data_blocks = (has_data_blocks and not any_data_output) or bool(unmet_goal_path_omissions)
+    # Declared-path omissions are observations for the acting model, not a
+    # deterministic judgment that an otherwise completed run needs repair.
+    empty_data_blocks = has_data_blocks and not any_data_output
     return anti_bot_match, empty_data_blocks, None, unmet_goal_path_omissions
-
-
-def _structured_record_has_goal_content(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    candidates = [value]
-    candidates.extend(
-        nested
-        for key, nested in value.items()
-        if isinstance(key, str) and key.endswith("_output") and isinstance(nested, dict)
-    )
-    return any(_structured_record_candidate_has_goal_content(candidate) for candidate in candidates)

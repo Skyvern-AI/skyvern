@@ -2525,10 +2525,6 @@ class AgentFunction:
         config.effective_code_block_mode = effective_code_block_mode
         return config
 
-    async def should_render_copilot_terminal_from_envelope(self, organization_id: str | None = None) -> bool:
-        del organization_id
-        return settings.WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER
-
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.
 

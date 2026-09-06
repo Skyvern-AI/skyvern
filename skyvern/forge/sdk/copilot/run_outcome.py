@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -29,10 +28,9 @@ TERMINAL_CHALLENGE_FAILURE_CATEGORIES = ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES
 TERMINAL_CHALLENGE_FAILURE_CATEGORY_MIN_CONFIDENCE = 0.7
 
 
+_INTERIM_RUN_OUTCOME_ROLE: RunOutcomeRole = "interim_build_test"
+
 _DISPLAY_REASON_MAX_CHARS = 160
-_OUTPUT_REPORT_MAX_CHARS = 1200
-_OUTPUT_REPORT_LABEL = "Recorded output from the latest completed run:"
-_REDACTED_SECRET = "[REDACTED_SECRET]"
 
 
 @dataclass(frozen=True)
@@ -41,7 +39,6 @@ class RecordedRunOutcome:
     reason_code: RunOutcomeReasonCode | None = None
     display_reason: str | None = None
     workflow_run_id: str | None = None
-    output_report: str | None = None
     # Recorded lifecycle, kept apart from ``verdict``: reaching a completed status says
     # nothing about whether the outcome was evaluated. ``None`` on frames predating the field.
     run_completed: bool | None = None
@@ -56,53 +53,6 @@ def run_outcome_display_reason(text: str | None) -> str | None:
     reason = redact_raw_secrets_for_prompt(" ".join(text.split()))
     reason = URL_CANDIDATE_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", reason)
     return reason[:_DISPLAY_REASON_MAX_CHARS]
-
-
-def _registered_output_key_is_secret(key: object) -> bool:
-    if not isinstance(key, str) or not key:
-        return False
-    probe = f"{key}=value"
-    return redact_raw_secrets_for_prompt(probe) != probe
-
-
-def _redact_registered_output(value: Any, *, key: object = None) -> Any:
-    if _registered_output_key_is_secret(key):
-        return _REDACTED_SECRET
-    if isinstance(value, Mapping):
-        return {item_key: _redact_registered_output(item, key=item_key) for item_key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_registered_output(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_registered_output(item) for item in value)
-    if isinstance(value, str):
-        return redact_raw_secrets_for_prompt(value)
-    return value
-
-
-def recorded_output_report(payloads: object) -> str | None:
-    """Render the current run's already-sanitized registered outputs as a factual terminal line."""
-    if not isinstance(payloads, list):
-        return None
-    outputs: dict[str, Any] = {}
-    for payload in payloads:
-        if not isinstance(payload, Mapping):
-            continue
-        key = payload.get("output_parameter_key")
-        if not isinstance(key, str) or not key.strip() or "value" not in payload:
-            continue
-        normalized_key = key.strip()
-        outputs[normalized_key] = _redact_registered_output(payload.get("value"), key=normalized_key)
-    if not outputs:
-        return None
-    try:
-        serialized = json.dumps(outputs, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    except (TypeError, ValueError):
-        return None
-    serialized = URL_CANDIDATE_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", serialized)
-    report = f"{_OUTPUT_REPORT_LABEL} {redact_raw_secrets_for_prompt(serialized)}"
-    if len(report) > _OUTPUT_REPORT_MAX_CHARS:
-        report = report[: _OUTPUT_REPORT_MAX_CHARS - 3].rstrip() + "..."
-    return report
 
 
 def trusted_terminal_challenge_category_name(entry: Mapping[str, Any]) -> str | None:
@@ -120,3 +70,38 @@ def trusted_terminal_challenge_category_name(entry: Mapping[str, Any]) -> str | 
         ):
             return None
     return category
+
+
+def is_interim_run_outcome(outcome: RecordedRunOutcome | None) -> bool:
+    """A run start with no result behind it, which no surface may read as a resolved outcome."""
+    return outcome is not None and outcome.role == _INTERIM_RUN_OUTCOME_ROLE
+
+
+def interim_run_start_outcome(workflow_run_id: str) -> RecordedRunOutcome:
+    """The run-start record a mid-run stop reads: a run exists, its lifecycle and blocks are unresolved."""
+    return RecordedRunOutcome(
+        verdict="not_evaluated",
+        workflow_run_id=workflow_run_id,
+        run_completed=None,
+        role=_INTERIM_RUN_OUTCOME_ROLE,
+    )
+
+
+def select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> RecordedRunOutcome | None:
+    """The latest run the turn touched; a result supersedes that run's own start, whatever its verdict."""
+    resolved_run_ids = {
+        outcome.workflow_run_id
+        for outcome in run_outcomes
+        if outcome.workflow_run_id is not None and not is_interim_run_outcome(outcome)
+    }
+    live_outcomes = [
+        outcome
+        for outcome in run_outcomes
+        if not (is_interim_run_outcome(outcome) and outcome.workflow_run_id in resolved_run_ids)
+    ]
+    return live_outcomes[-1] if live_outcomes else None
+
+
+def run_start_unresolved(run_outcomes: Sequence[RecordedRunOutcome]) -> bool:
+    """True when the outcome the turn anchors on is a run start with no result behind it."""
+    return is_interim_run_outcome(select_run_outcome_anchor(run_outcomes))

@@ -121,7 +121,8 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RunOutcomeReasonCode,
     RunOutcomeRole,
     RunOutcomeVerdict,
-    recorded_output_report,
+    interim_run_start_outcome,
+    is_interim_run_outcome,
     run_outcome_display_reason,
     trusted_terminal_challenge_category_name,
 )
@@ -159,7 +160,6 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
 )
-from skyvern.forge.sdk.copilot.terminal_envelope import interim_run_start_outcome, is_interim_run_outcome
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     stash_build_test_superseded_halt,
@@ -680,7 +680,7 @@ def _forget_browser_position(ctx: CopilotContext) -> None:
 
 def _forget_interim_run_start(ctx: CopilotContext, workflow_run_id: str) -> None:
     """Drop the run-start record when submission unwound, so no terminal reports a run that never ran."""
-    outcomes = ctx.terminal_envelope_run_outcomes
+    outcomes = ctx.run_outcome_trace
     outcomes[:] = [
         outcome
         for outcome in outcomes
@@ -2365,24 +2365,31 @@ async def _complete_origin_run_redaction_registry_from_runtime(
 def terminal_ready_for_latch(
     *,
     current_workflow_labels: list[str],
-    has_executed_blocks: bool,
+    planned_block_labels: list[str],
+    completed_block_labels: list[str],
+    all_run_blocks_completed: bool,
     unverified: list[str],
     composition_unverified: list[str],
     artifact_reason: object | None,
     structured_blocker: object | None,
-    empty_data_blocks: object,
+    empty_data_blocks: bool,
 ) -> bool:
-    """The single definition of "tested". Offline replay calls this, so the rule cannot drift from its grader."""
+    """A current-workflow run is tested when its anchored execution completed cleanly."""
+    current_labels = set(current_workflow_labels)
+    planned_labels = set(planned_block_labels)
+    completed_labels = set(completed_block_labels)
     return (
-        # "Every label is credited" says nothing when there are no labels, so an unresolvable
-        # workflow must not satisfy it by emptiness.
-        bool(current_workflow_labels)
-        and has_executed_blocks
+        bool(current_labels)
+        and bool(completed_labels)
+        and bool(planned_labels)
+        and planned_labels.issubset(current_labels)
+        and planned_labels.issubset(completed_labels)
+        and all_run_blocks_completed
         and not unverified
         and not composition_unverified
+        and not empty_data_blocks
         and artifact_reason is None
         and structured_blocker is None
-        and not empty_data_blocks
     )
 
 
@@ -3084,7 +3091,7 @@ async def _run_blocks_and_collect_debug(
         # A run that never returns a result must not read as zero blocks at the terminal;
         # the tool-return record supersedes this one.
         interim_run_id = workflow_run.workflow_run_id
-        ctx.terminal_envelope_run_outcomes.append(interim_run_start_outcome(interim_run_id))
+        ctx.run_outcome_trace.append(interim_run_start_outcome(interim_run_id))
         await _send_run_started_update(ctx, workflow_run.workflow_run_id)
 
         if dispatch_to_worker:
@@ -3527,6 +3534,7 @@ async def _run_blocks_and_collect_debug(
             "browser_session_id": run_session_id,
             "overall_status": final_status,
             "requested_block_labels": list(block_labels),
+            "planned_block_labels": list(labels_to_execute),
             "executed_block_labels": list(labels_to_execute),
             "frontier_start_label": frontier_start_label,
             "blocks": results,
@@ -3568,7 +3576,18 @@ async def _run_blocks_and_collect_debug(
 
         # The record below derives "fully tested" from these credits and prefers its own
         # extracted_data for terminal replies, so both have to land before it, not after.
-        run_fully_completed = run_ok and all(r.get("status") == "completed" for r in results)
+        completed_result_labels = {
+            label
+            for result_row in results
+            if result_row.get("status") == "completed"
+            if isinstance((label := result_row.get("label")), str)
+        }
+        run_fully_completed = (
+            run_ok
+            and bool(labels_to_execute)
+            and set(labels_to_execute).issubset(completed_result_labels)
+            and all(result_row.get("status") == "completed" for result_row in results)
+        )
         if run_fully_completed:
             existing_prefix = list(ctx.verified_prefix_labels or [])
             existing_set = set(existing_prefix)
@@ -4380,30 +4399,52 @@ def _record_run_blocks_result(
         run_ok = False
 
     if run_ok:
-        output_report = recorded_output_report(
-            data.get("registered_output_parameter_values") if isinstance(data, dict) else None
-        )
         recorded_outcome = _recorded_run_outcome(
             workflow_run_id=run_id if isinstance(run_id, str) else None,
-            output_report=output_report,
             run_completed=run_ok,
         )
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         composition_unverified = _composition_unverified_current_workflow_labels(copilot_ctx)
         result_blocks = data.get("blocks") if isinstance(data, dict) else None
-        executed_labels = data.get("executed_block_labels") if isinstance(data, dict) else None
-        has_executed_blocks = bool(
-            getattr(copilot_ctx, "last_run_blocks_block_labels", None)
-            or (executed_labels if isinstance(executed_labels, list) else None)
-            or (result_blocks if isinstance(result_blocks, list) else None)
+        completed_block_labels = _completed_run_block_labels(data if isinstance(data, dict) else {})
+        executed_block_labels = data.get("executed_block_labels") if isinstance(data, dict) else None
+        recorded_planned_labels = data.get("planned_block_labels") if isinstance(data, dict) else None
+        current_workflow_labels = _current_workflow_block_labels(copilot_ctx)
+        current_label_set = set(current_workflow_labels)
+        planned_labels = (
+            [label for label in recorded_planned_labels if isinstance(label, str)]
+            if isinstance(recorded_planned_labels, list)
+            else list(copilot_ctx.last_executed_block_labels)
+        )
+        planned_labels_are_recorded = isinstance(recorded_planned_labels, list) or bool(
+            copilot_ctx.last_executed_block_labels
+        )
+        if not planned_labels and not planned_labels_are_recorded and isinstance(executed_block_labels, list):
+            planned_labels = [
+                label for label in executed_block_labels if isinstance(label, str) and label in current_label_set
+            ]
+        if not planned_labels and not planned_labels_are_recorded and not isinstance(executed_block_labels, list):
+            planned_labels = [label for label in completed_block_labels if label in current_label_set]
+        executed_label_set = (
+            {label for label in executed_block_labels if isinstance(label, str)}
+            if isinstance(executed_block_labels, list)
+            else set()
+        )
+        all_run_blocks_completed = (
+            isinstance(result_blocks, list)
+            and bool(result_blocks)
+            and all(isinstance(block, dict) and block.get("status") == "completed" for block in result_blocks)
+            and executed_label_set.issubset(completed_block_labels)
         )
         copilot_ctx.last_unverified_block_labels = unverified
         copilot_ctx.last_failed_workflow_yaml = None
         copilot_ctx.last_test_failure_reason = None
         copilot_ctx.last_test_suspicious_success = False
         terminal_ready = terminal_ready_for_latch(
-            current_workflow_labels=_current_workflow_block_labels(copilot_ctx),
-            has_executed_blocks=has_executed_blocks,
+            current_workflow_labels=current_workflow_labels,
+            planned_block_labels=planned_labels,
+            completed_block_labels=completed_block_labels,
+            all_run_blocks_completed=all_run_blocks_completed,
             unverified=unverified,
             composition_unverified=composition_unverified,
             artifact_reason=artifact_reason,
@@ -4416,10 +4457,12 @@ def _record_run_blocks_result(
                 "latch",
                 {
                     "trust": trust_snapshot(copilot_ctx),
-                    "current_workflow_labels": _current_workflow_block_labels(copilot_ctx),
+                    "current_workflow_labels": current_workflow_labels,
                     "unverified": unverified,
                     "composition_unverified": composition_unverified,
-                    "has_executed_blocks": has_executed_blocks,
+                    "planned_block_labels": planned_labels,
+                    "completed_block_labels": completed_block_labels,
+                    "all_run_blocks_completed": all_run_blocks_completed,
                     "artifact_reason": artifact_reason,
                     "structured_blocker": structured_blocker,
                     "empty_data_blocks": empty_data_blocks,
@@ -4590,20 +4633,27 @@ def _stash_recorded_run_outcome(copilot_ctx: Any, outcome: RecordedRunOutcome) -
         outcome = replace(outcome, workflow_run_id=getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
     copilot_ctx.last_run_outcome = outcome
     copilot_ctx.last_run_outcome_block_labels = list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or [])
+    LOG.info(
+        "copilot_run_outcome_recorded",
+        workflow_run_id=outcome.workflow_run_id,
+        verdict=outcome.verdict,
+        reason_code=outcome.reason_code,
+        display_reason=outcome.display_reason,
+        role=outcome.role,
+        run_completed=outcome.run_completed,
+    )
     return outcome
 
 
 def _recorded_run_outcome(
     *,
     workflow_run_id: str | None = None,
-    output_report: str | None = None,
     run_completed: bool | None = None,
 ) -> RecordedRunOutcome:
     """Record the completed run status without interpreting whether it met the request."""
     return RecordedRunOutcome(
         verdict="not_evaluated",
         workflow_run_id=workflow_run_id,
-        output_report=output_report,
         run_completed=run_completed,
     )
 
@@ -5238,6 +5288,7 @@ def _packet_unfinished_items(
     copilot_ctx: CopilotContext,
     run_id: str | None,
     recorded_outcome: RecordedBuildTestOutcome | None,
+    declared_goal_path_omissions: object,
     omission_notices: list[str],
 ) -> list[BuildTestPacketUnfinishedItem]:
     latest_outcome = getattr(copilot_ctx, "latest_recorded_build_test_outcome", None)
@@ -5276,6 +5327,23 @@ def _packet_unfinished_items(
         )
         for (path, block_label), reason_code in missing_by_path.items()
     )
+    if run_id is not None and isinstance(declared_goal_path_omissions, list):
+        observed_paths: set[tuple[str, str | None]] = set()
+        for omission in declared_goal_path_omissions:
+            if not isinstance(omission, Mapping):
+                continue
+            output_path = _packet_string(omission.get("output_path"))
+            if output_path is None:
+                continue
+            observed_paths.add((output_path, _packet_string(omission.get("block_label"))))
+        unfinished.extend(
+            BuildTestPacketUnfinishedItem(
+                kind="requested_output_observation",
+                label=block_label,
+                output_path=output_path,
+            )
+            for output_path, block_label in sorted(observed_paths, key=lambda item: (item[0], item[1] or ""))
+        )
     return unfinished
 
 
@@ -5288,6 +5356,7 @@ def build_test_evidence_packet(
     raw_data = result.get("data")
     data = raw_data if isinstance(raw_data, Mapping) else {}
     omission_notices: list[str] = []
+    raw_goal_path_omissions = result.get(_INTERNAL_GOAL_PATH_OMISSIONS_KEY)
     workflow_yaml, workflow_source = _packet_workflow_readback(copilot_ctx)
     if workflow_yaml is None:
         omission_notices.append(
@@ -5431,6 +5500,7 @@ def build_test_evidence_packet(
         copilot_ctx,
         run_id,
         recorded_outcome,
+        raw_goal_path_omissions,
         omission_notices,
     )
     if not unfinished_items:

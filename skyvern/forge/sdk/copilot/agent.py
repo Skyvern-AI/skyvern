@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +61,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
     RecordedBuildTestOutcome,
+    TerminalCause,
     history_has_runtime_block_failure,
     observed_value_extraction_scaffold_lines,
     unresolved_runtime_block_failure,
@@ -120,6 +121,7 @@ from skyvern.forge.sdk.copilot.entrypoint import (
     resolve_turn_entrypoint_url,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
+from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.model_telemetry import (
@@ -177,7 +179,12 @@ from skyvern.forge.sdk.copilot.review_gate import (
     build_review_projection,
     serialize_execution_receipts,
 )
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import (
+    RecordedRunOutcome,
+    is_interim_run_outcome,
+    run_start_unresolved,
+    select_run_outcome_anchor,
+)
 from skyvern.forge.sdk.copilot.runtime import (
     BrowserProbeOutcome,
     _browser_context_attachability,
@@ -192,21 +199,6 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_workflow_draft,
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
-)
-from skyvern.forge.sdk.copilot.terminal_envelope import (
-    INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
-    MINIMAL_CANCEL_STOP,
-    TESTED_DRAFT_PRESERVED,
-    UNTESTED_DRAFT_PRESERVED,
-    InterruptedTurnFacts,
-    TerminalCause,
-    TerminalOutcomeEnvelope,
-    assemble_terminal_envelope,
-    is_interim_run_outcome,
-    reason_in_reply_shadow,
-    render_terminal_message,
-    run_start_unresolved,
-    select_run_outcome_anchor,
 )
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
@@ -729,7 +721,8 @@ def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
         return ""
     return (
         "\n\nRUNTIME VERIFICATION EVIDENCE:\n```yaml\n" + escape_code_fences(rendered) + "\n```\n"
-        "Use this structured state before choosing the next action. If "
+        "Use these structured run facts before choosing the next action. "
+        "A clean completed run is factual evidence for your judgment, not an automatic grade. If "
         "`full_workflow_verified` is false, choose an evidence-grounded next step: split an oversized block, "
         "continue from observed current browser state, run only missing block labels, or report partial verification. "
         "Do not claim end-to-end verification unless `full_workflow_verified` is true."
@@ -1510,8 +1503,8 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     return None, None
 
 
-def _terminal_envelope_run_outcomes(ctx: CopilotContext) -> list[RecordedRunOutcome]:
-    raw = ctx.terminal_envelope_run_outcomes
+def _run_outcome_trace(ctx: CopilotContext) -> list[RecordedRunOutcome]:
+    raw = ctx.run_outcome_trace
     if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
         outcomes = [outcome for outcome in raw if isinstance(outcome, RecordedRunOutcome)]
         if outcomes:
@@ -1522,34 +1515,16 @@ def _terminal_envelope_run_outcomes(ctx: CopilotContext) -> list[RecordedRunOutc
 
 def _blocks_run_this_turn(ctx: CopilotContext) -> int | None:
     """None while a started run has no recorded result: an unresolved run's block count is unknown, not zero."""
-    if run_start_unresolved(_terminal_envelope_run_outcomes(ctx)):
+    if run_start_unresolved(_run_outcome_trace(ctx)):
         return None
     return len(ctx.executed_block_labels)
 
 
-def _terminal_halt_fields(ctx: CopilotContext) -> tuple[str | None, str | None]:
-    halt = getattr(ctx, "turn_halt", None)
-    if not isinstance(halt, TurnHalt):
-        return None, None
-    blocker_reason: str | None = None
-    signal = halt.blocker_signal
-    if isinstance(signal, CopilotToolBlockerSignal):
-        blocker_reason = signal.user_facing_reason
-    return blocker_reason, halt.kind.value
-
-
-def _attempted_summary(narrative_summary: object, narrative_payload: object) -> str | None:
-    if isinstance(narrative_summary, str) and narrative_summary.strip():
-        return narrative_summary.strip()
-    if isinstance(narrative_payload, Mapping):
-        payload_summary = narrative_payload.get("narrativeSummary")
-        if isinstance(payload_summary, str) and payload_summary.strip():
-            return payload_summary.strip()
-    return None
-
-
 def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
-    # The deadline owns capacity, so it wins if both capacity latches are set.
+    # An empty completion ends the turn before any other latch can describe the reply that ships,
+    # so it outranks them all. The deadline owns capacity, so it wins if both capacity latches are set.
+    if ctx.empty_completion is True:
+        return "empty_completion"
     if ctx.copilot_total_timeout_exceeded is True:
         return "deadline_expired"
     if ctx.copilot_max_turns_exceeded is True:
@@ -1650,7 +1625,7 @@ def _turn_facts_for_context(
 ) -> NarrativeTurnFacts:
     return _turn_fact_bundle(
         review,
-        select_run_outcome_anchor(_terminal_envelope_run_outcomes(ctx)),
+        select_run_outcome_anchor(_run_outcome_trace(ctx)),
         _terminal_cause_for_context(ctx),
         _blocks_run_this_turn(ctx),
         # The proposal these facts describe, not the turn-start persisted workflow. The terminal
@@ -1673,91 +1648,6 @@ def _terminal_failed_operation(
 def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | None:
     outcome = ctx.latest_recorded_build_test_outcome
     return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
-
-
-def _crash_exit_interruption(
-    ctx: CopilotContext,
-    turn_outcome: TurnOutcome | None,
-    failed_operation: BuildTestFailedOperation | None,
-) -> InterruptedTurnFacts | None:
-    """A turn that died in the error handler stopped; it never reported a test result.
-
-    Scoped to a crash that inherited a `failed_operation` from an earlier build test in the same
-    turn, because that latch is the only thing that would otherwise author the reply. A crash with
-    no latch already renders the recoverable-failure text, which names an error reference this
-    would drop. The latch itself is kept: it still drives the unverified/unapplied terminal state.
-    """
-    if failed_operation is None:
-        return None
-    if turn_outcome is None or turn_outcome.terminal_reason != UNEXPECTED_ERROR_TERMINAL_REASON:
-        return None
-    # Only the identities are known here. ``workflow_persisted`` is always False under staging, which
-    # is the population this path serves, and ``last_workflow`` is stamped version=1 by the YAML
-    # parse rather than carrying the workflow's real version, so both would state something about
-    # the turn that this site cannot observe.
-    outcome = ctx.latest_recorded_build_test_outcome
-    return InterruptedTurnFacts(
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        run_id=outcome.workflow_run_id if isinstance(outcome, RecordedBuildTestOutcome) else None,
-    )
-
-
-def _assemble_terminal_envelope_safe(
-    *,
-    response_type: str,
-    verified: bool,
-    workflow_applied: bool,
-    proposal_disposition: ProposalDisposition | None,
-    run_outcomes: Sequence[RecordedRunOutcome],
-    blocker_reason: str | None,
-    halt_kind: str | None,
-    attempted: str | None,
-    workflow_mutated: bool,
-    workflow_attempted: bool,
-    final_message: str,
-    terminal_cause: TerminalCause | None = None,
-    blocks_run_this_turn: int | None = None,
-    failed_operation: BuildTestFailedOperation | None = None,
-    connect_failure: BuildTestConnectFailure | None = None,
-    proposal_present: bool = False,
-    interruption: InterruptedTurnFacts | None = None,
-) -> dict[str, Any] | None:
-    try:
-        envelope = assemble_terminal_envelope(
-            response_type=response_type,
-            verified=verified,
-            workflow_applied=workflow_applied,
-            proposal_disposition=proposal_disposition,
-            run_outcomes=run_outcomes,
-            blocker_reason=blocker_reason,
-            halt_kind=halt_kind,
-            attempted=attempted,
-            workflow_mutated=workflow_mutated,
-            workflow_attempted=workflow_attempted,
-            terminal_cause=terminal_cause,
-            blocks_run_this_turn=blocks_run_this_turn,
-            failed_operation=failed_operation,
-            connect_failure=connect_failure,
-            proposal_present=proposal_present,
-            interruption=interruption,
-        )
-    except Exception:
-        LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
-        return None
-    if envelope is None:
-        return None
-    reason_in_reply = reason_in_reply_shadow(envelope.run_display_reason, final_message)
-    payload = envelope.model_dump(mode="json")
-    telemetry_payload = envelope.model_dump(mode="json", exclude={"run_output_report"})
-    LOG.info(
-        "copilot_terminal_envelope",
-        **telemetry_payload,
-        response_type=response_type,
-        envelope_response_kind=envelope.response_kind,
-        reason_in_reply=reason_in_reply,
-        finalized=False,
-    )
-    return payload
 
 
 def _with_unresolved_runtime_failure_note(user_response: str, failure: UnresolvedRuntimeFailure) -> str:
@@ -1802,8 +1692,6 @@ def _make_agent_result(
     *,
     global_llm_context: str | None = None,
     turn_outcome: TurnOutcome | None = None,
-    terminal_cause_override: TerminalCause | None = None,
-    terminal_verified_override: bool | None = None,
     **kwargs: Any,
 ) -> AgentResult:
     """Sole ``AgentResult`` constructor in this module.
@@ -1838,7 +1726,6 @@ def _make_agent_result(
     review_projection: NarrativeReviewProjection | None = (
         narrative_payload.get("review") if isinstance(narrative_payload, dict) else None
     )
-    terminal_cause = terminal_cause_override or (_terminal_cause_for_context(ctx) if ctx is not None else None)
     turn_facts = _turn_facts_for_context(ctx, review_projection, proposal_yaml) if ctx is not None else None
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
@@ -1858,13 +1745,31 @@ def _make_agent_result(
         or kwargs.get("staged_workflow") is not None
         or bool(kwargs.get("workflow_was_persisted"))
     )
+    if proposal_disposition is None:
+        proposal_present = kwargs.get("updated_workflow") is not None or kwargs.get("staged_workflow") is not None
+        proposal_disposition = (
+            "review_tested"
+            if proposal_present and ctx is not None and ctx.last_full_workflow_test_ok is True
+            else "review_untested"
+            if proposal_present
+            else "no_proposal"
+        )
+        kwargs["proposal_disposition"] = proposal_disposition
     result_has_workflow_attempt = bool(
         ctx is not None and (result_carries_workflow or ctx.has_genuine_workflow_attempt())
     )
     failed_operation = _terminal_failed_operation(ctx) if ctx is not None else None
     connect_failure = _terminal_connect_failure(ctx) if ctx is not None else None
-    if (failed_operation is not None or connect_failure is not None) and proposal_disposition == "auto_applicable":
+    if (failed_operation is not None or connect_failure is not None) and proposal_disposition in (
+        None,
+        "auto_applicable",
+    ):
         proposal_disposition = "review_untested" if result_carries_workflow else "no_proposal"
+        kwargs["proposal_disposition"] = proposal_disposition
+    # The route gate already refuses to apply a result that carries no proposal; without this the
+    # persisted disposition would still read auto_applicable and disagree with what it did.
+    if not result_carries_workflow and proposal_disposition in (None, "auto_applicable"):
+        proposal_disposition = "no_proposal"
         kwargs["proposal_disposition"] = proposal_disposition
     if isinstance(narrative_payload, dict):
         payload_base = {
@@ -1980,54 +1885,6 @@ def _make_agent_result(
                         if isinstance(narrative.get(key), str) and narrative[key].strip()
                     },
                 }
-    terminal_envelope: dict[str, Any] | None = None
-    if ctx is not None:
-        blocker_reason, halt_kind = _terminal_halt_fields(ctx)
-        workflow_mutated = bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None
-        terminal_envelope = _assemble_terminal_envelope_safe(
-            response_type=response_type_value,
-            verified=(
-                terminal_verified_override
-                if terminal_verified_override is not None
-                else bool(outcome_fully_verified(ctx))
-            ),
-            workflow_applied=False,
-            proposal_disposition=proposal_disposition,
-            run_outcomes=_terminal_envelope_run_outcomes(ctx),
-            blocker_reason=blocker_reason,
-            halt_kind=halt_kind,
-            attempted=_attempted_summary(kwargs.get("narrative_summary"), kwargs.get("narrative_payload")),
-            workflow_mutated=workflow_mutated,
-            workflow_attempted=ctx.has_genuine_workflow_attempt(),
-            final_message=str(kwargs.get("user_response") or ""),
-            terminal_cause=terminal_cause,
-            blocks_run_this_turn=_blocks_run_this_turn(ctx),
-            failed_operation=failed_operation,
-            connect_failure=connect_failure,
-            proposal_present=result_carries_workflow,
-            interruption=_crash_exit_interruption(ctx, turn_outcome, failed_operation),
-        )
-    if terminal_envelope is not None and (
-        terminal_envelope.get("failed_operation") is not None
-        or terminal_envelope.get("connect_failure") is not None
-        or terminal_envelope.get("interruption") is not None
-    ):
-        envelope = TerminalOutcomeEnvelope.model_validate(terminal_envelope)
-        terminal_message, replaced = render_terminal_message(
-            envelope,
-            str(kwargs.get("user_response") or ""),
-            bool(kwargs.get("cancelled")),
-        )
-        if replaced:
-            kwargs["user_response"] = terminal_message
-            narrative = kwargs.get("narrative_payload")
-            if isinstance(narrative, dict):
-                kwargs["narrative_payload"] = {
-                    **narrative,
-                    "terminalMessage": terminal_message,
-                    "narrativeSummary": terminal_message,
-                }
-    kwargs["terminal_envelope"] = terminal_envelope
     if turn_facts is not None:
         payload = kwargs.get("narrative_payload")
         if isinstance(payload, dict):
@@ -2199,7 +2056,7 @@ def _build_exit_result(
     global_llm_context: str | None,
     cancelled: bool = False,
     terminal_reason: str | None = None,
-    proposal_disposition: ProposalDisposition = "auto_applicable",
+    proposal_disposition: ProposalDisposition | None = None,
 ) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
@@ -2211,6 +2068,8 @@ def _build_exit_result(
         terminal_reason=effective_terminal,
     )
     workflow_attempted = ctx.has_genuine_workflow_attempt()
+    if proposal_disposition is None:
+        proposal_disposition = "review_tested" if verified_workflow is not None else "no_proposal"
     _log_output_policy_parity(
         ctx, has_workflow_proposal=verified_workflow is not None, workflow_attempted=workflow_attempted
     )
@@ -2538,10 +2397,6 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
-_CANCEL_REPLY_DEFAULT = MINIMAL_CANCEL_STOP
-_CANCEL_REPLY_ACCEPT_OR_DISCARD = "Accept it to save, or discard."
-_CANCEL_REPLY_UNVALIDATED = f"{MINIMAL_CANCEL_STOP} {UNTESTED_DRAFT_PRESERVED} {_CANCEL_REPLY_ACCEPT_OR_DISCARD}"
-_CANCEL_REPLY_TESTED = f"{MINIMAL_CANCEL_STOP} {TESTED_DRAFT_PRESERVED} {_CANCEL_REPLY_ACCEPT_OR_DISCARD}"
 _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
     "I wasn't able to produce a workflow proposal in this turn, and I couldn't identify which details were missing "
     "from this turn. Please retry with the target site, page, or workflow requirement."
@@ -3028,13 +2883,15 @@ def _build_wip_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
     *,
-    default_reply: str,
-    unvalidated_reply: str,
-    tested_reply: str,
+    default_reply: str = "",
+    unvalidated_reply: str = "",
+    tested_reply: str = "",
     cancelled: bool = False,
     terminal_reason: str | None = None,
 ) -> AgentResult:
-    """Non-success exits surface the most recent successfully parsed workflow."""
+    """Non-success exits surface the most recent successfully parsed workflow, replying with the
+    exit's own copy for a turn that wrote none. A cancel passes none, because the stop notice is
+    composed at the route beside whatever reply the turn already produced."""
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     recorded_failure_reply = _recorded_failure_reply(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
@@ -3344,14 +3201,7 @@ def _build_unexpected_error_exit_result(
 
 
 def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_wip_exit_result(
-        ctx,
-        global_llm_context,
-        default_reply=_CANCEL_REPLY_DEFAULT,
-        unvalidated_reply=_CANCEL_REPLY_UNVALIDATED,
-        tested_reply=_CANCEL_REPLY_TESTED,
-        cancelled=True,
-    )
+    return _build_wip_exit_result(ctx, global_llm_context, cancelled=True)
 
 
 _PROXY_TRANSPORT_NAV_ERROR_CODES = (
@@ -3988,7 +3838,11 @@ async def _translate_to_agent_result(
             if resp_type == "ASK_QUESTION" and last_workflow is not None
             else "no_proposal"
             if resp_type == "ASK_QUESTION"
-            else "auto_applicable"
+            else "review_tested"
+            if last_workflow is not None and ctx.last_full_workflow_test_ok is True
+            else "review_untested"
+            if last_workflow is not None
+            else "no_proposal"
         ),
         output_policy_diagnostics=output_policy_diagnostics,
         turn_outcome=turn_outcome,
@@ -4113,6 +3967,7 @@ def _build_empty_completion_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
 ) -> AgentResult:
+    ctx.empty_completion = True
     terminal_message = (
         EMPTY_COMPLETION_AFTER_WORKFLOW_CHANGE_MESSAGE
         if ctx.has_staged_proposal
@@ -4150,8 +4005,6 @@ def _build_empty_completion_exit_result(
         total_tokens=ctx.total_tokens_used,
         proposal_disposition=proposal_disposition,
         turn_outcome=outcome,
-        terminal_cause_override="empty_completion",
-        terminal_verified_override=False,
         turn_id=ctx.turn_id,
         narrative_summary=terminal_message,
         narrative_payload=_build_narrative_payload(

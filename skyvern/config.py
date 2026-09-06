@@ -250,7 +250,6 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Process-global override of the per-turn copilot deadline, read once at import;
     # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.

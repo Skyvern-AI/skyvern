@@ -293,7 +293,7 @@ class WorkflowCopilotChatSummary(BaseModel):
     modified_at: datetime = Field(..., description="When the chat was last modified")
     awaiting_user_input: bool = Field(
         False,
-        description="Whether the chat's most recent message is a copilot turn that asked the user a question",
+        description="Whether the chat has a pending question record still waiting on the user",
     )
 
 
@@ -377,10 +377,6 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     narrative_payload: TurnNarrativePayload | None = Field(
         None,
         description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
-    )
-    terminal_envelope: dict[str, Any] | None = Field(
-        None,
-        description="Shadow-only terminal outcome envelope for end-of-turn typed-state validation.",
     )
 
 

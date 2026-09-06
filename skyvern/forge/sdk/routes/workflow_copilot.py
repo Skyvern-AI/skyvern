@@ -42,6 +42,12 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     resolve_credential_pause,
 )
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.interruption import (
+    INTERRUPTED_TERMINAL_REASON,
+    InterruptedTurnFacts,
+    cancel_notice,
+    render_interrupted_message,
+)
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
@@ -53,17 +59,6 @@ from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, res
 from skyvern.forge.sdk.copilot.request_policy import _screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
-from skyvern.forge.sdk.copilot.terminal_envelope import (
-    INTERRUPTED_TERMINAL_REASON,
-    MINIMAL_CANCEL_STOP,
-    InterruptedTurnFacts,
-    TerminalOutcomeEnvelope,
-    finalize_applied_state,
-    interrupted_terminal_envelope,
-    reason_in_reply_shadow,
-    render_interrupted_message,
-    render_terminal_message,
-)
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CopilotComposerMode,
     build_minimal_turn_outcome,
@@ -485,55 +480,63 @@ async def _ensure_terminal_frame(
         pass
 
 
-def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
+_KNOWN_PROPOSAL_DISPOSITIONS: frozenset[str] = frozenset(get_args(ProposalDisposition))
+
+
+def _proposal_disposition(agent_result: AgentResult | None) -> ProposalDisposition:
     if agent_result is None:
         return "no_proposal"
-    disposition = getattr(agent_result, "proposal_disposition", None)
-    if disposition in ("no_proposal", "auto_applicable", "review_untested", "review_tested"):
+    disposition = agent_result.proposal_disposition
+    # ``_make_agent_result`` forwards untyped kwargs, so an out-of-vocabulary value can reach here;
+    # downstream copy indexes this hard, and the review-gated fallback never grants an auto-apply.
+    if disposition in _KNOWN_PROPOSAL_DISPOSITIONS:
         return disposition
-    if getattr(agent_result, "updated_workflow", None) is None:
-        return "no_proposal"
-    return "auto_applicable"
+    return "no_proposal" if agent_result.updated_workflow is None else "review_untested"
 
 
-def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """Only auto-applicable proposals may honor ``auto_accept=True``.
+def _preserved_draft_disposition(
+    agent_result: AgentResult | None = None, *, draft_present: bool
+) -> ProposalDisposition | None:
+    """The disposition naming the draft awaiting the user, or None when none is. Only a draft this
+    turn authored may borrow this turn's disposition; one carried over from an earlier turn is named
+    without it, since this turn's disposition says nothing about how that draft was reached."""
+    if not draft_present:
+        return None
+    turn_authored_the_draft = agent_result is not None and agent_result.updated_workflow is not None
+    return _proposal_disposition(agent_result) if turn_authored_the_draft else "no_proposal"
 
-    Auto-apply requires the chat's explicit ``auto_accept`` opt-in — a verified
-    build never commits on the user's behalf; it lands as a pending proposal for
-    the review gate.
-    """
-    terminal_envelope = getattr(agent_result, "terminal_envelope", None)
-    unresolved_failed_operation = isinstance(terminal_envelope, dict) and (
-        terminal_envelope.get("failed_operation") is not None or terminal_envelope.get("connect_failure") is not None
-    )
-    if (
-        getattr(agent_result, "cancelled", False) is True
-        or unresolved_failed_operation
-        or _proposal_disposition(agent_result) != "auto_applicable"
-    ):
+
+def _effective_auto_accept(auto_accept: bool | None, agent_result: AgentResult | None) -> bool:
+    """Only auto-applicable proposals may honor an explicit ``auto_accept=True``; a verified build
+    never commits on the user's behalf, it lands as a pending proposal for the review gate. A
+    recorded build-test failure downgrades the disposition before the result reaches this gate."""
+    if agent_result is None or agent_result.cancelled is True:
+        return False
+    if agent_result.updated_workflow is None and not agent_result.has_staged_proposal:
+        return False
+    if _proposal_disposition(agent_result) != "auto_applicable":
         return False
     return auto_accept is True
 
 
-def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
+def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: AgentResult | None) -> bool:
     """Restore when a mid-turn canonical write isn't covered by an accepted proposal."""
-    legacy_persisted = bool(getattr(agent_result, "workflow_was_persisted", False))
-    degraded_persisted = bool(getattr(agent_result, "canonical_was_persisted_due_to_param_change", False))
-    if not (legacy_persisted or degraded_persisted):
+    if agent_result is None:
         return False
-    if getattr(agent_result, "updated_workflow", None) is None:
+    if not (agent_result.workflow_was_persisted or agent_result.canonical_was_persisted_due_to_param_change):
+        return False
+    if agent_result.updated_workflow is None:
         return True
     return not _effective_auto_accept(auto_accept, agent_result)
 
 
-def _should_commit_staged_workflow(auto_accept: bool | None, agent_result: object | None) -> bool:
+def _should_commit_staged_workflow(auto_accept: bool | None, agent_result: AgentResult | None) -> bool:
     """Auto-accept commits the final staged workflow even after a mid-turn degraded
     write: a later blocks-only edit stages without persisting, so only this terminal
     commit reconciles canonical with the proposal the user sees."""
-    if not _effective_auto_accept(auto_accept, agent_result):
+    if agent_result is None or not _effective_auto_accept(auto_accept, agent_result):
         return False
-    return bool(getattr(agent_result, "has_staged_proposal", False))
+    return agent_result.has_staged_proposal
 
 
 def _record_recoverable_failure_span_attrs(
@@ -580,122 +583,14 @@ def _with_terminal_narrative_metadata(
     *,
     cancelled: bool,
     proposal_disposition: ProposalDisposition,
-    terminal_envelope: dict[str, Any] | None = None,
 ) -> TurnNarrativePayload | None:
     if narrative_payload is None:
         return None
-    payload: TurnNarrativePayload = {
+    return {
         **narrative_payload,
         "cancelled": cancelled,
         "proposalDisposition": proposal_disposition,
     }
-    if terminal_envelope is not None:
-        payload["terminalEnvelope"] = terminal_envelope
-    return payload
-
-
-def _agent_terminal_envelope(agent_result: AgentResult | None) -> dict[str, Any] | None:
-    if agent_result is None:
-        return None
-    try:
-        payload = agent_result.terminal_envelope
-    except AttributeError:
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _finalized_terminal_envelope(
-    agent_result: AgentResult | None,
-    *,
-    workflow_applied: bool,
-    final_message: str,
-    response_type: str,
-    proposal_disposition: ProposalDisposition | None = None,
-) -> tuple[TerminalOutcomeEnvelope, dict[str, Any]] | None:
-    payload = _agent_terminal_envelope(agent_result)
-    if payload is None:
-        return None
-    # workflow_applied mirrors the legacy auto-accept SSE field, which reads
-    # true on no-proposal turns because AgentResult defaults its disposition
-    # to auto_applicable. The envelope must only claim applied when a
-    # proposal actually existed to commit.
-    proposal_present = getattr(agent_result, "updated_workflow", None) is not None or bool(
-        getattr(agent_result, "has_staged_proposal", False)
-    )
-    try:
-        envelope = TerminalOutcomeEnvelope.model_validate(payload)
-        envelope_updates: dict[str, Any] = {
-            "proposal_present": proposal_present,
-            "proposal_disposition": proposal_disposition or envelope.proposal_disposition,
-        }
-        # Do not let an agent-authored pending state survive when the finalized
-        # result carries no workflow proposal.
-        if proposal_present is False and envelope.next_state == "proposal_pending":
-            envelope_updates.update(next_state="stopped", response_kind="stopped")
-        envelope = envelope.model_copy(update=envelope_updates)
-        finalized = finalize_applied_state(
-            envelope,
-            applied=workflow_applied and proposal_present,
-            proposal_present=proposal_present,
-        )
-        payload = finalized.model_dump(mode="json")
-        telemetry_payload = finalized.model_dump(mode="json", exclude={"run_output_report"})
-    except Exception:
-        LOG.warning("copilot terminal envelope finalization failed", exc_info=True)
-        return None
-    reason_in_reply = reason_in_reply_shadow(
-        payload.get("run_display_reason") if isinstance(payload.get("run_display_reason"), str) else None,
-        final_message,
-    )
-    LOG.info(
-        "copilot_terminal_envelope",
-        **telemetry_payload,
-        response_type=response_type,
-        envelope_response_kind=payload.get("response_kind"),
-        reason_in_reply=reason_in_reply,
-        finalized=True,
-    )
-    return finalized, payload
-
-
-def _with_rendered_terminal_text(
-    narrative_payload: TurnNarrativePayload | None,
-    *,
-    rendered_message: str,
-) -> TurnNarrativePayload | None:
-    if narrative_payload is None:
-        return None
-    payload: TurnNarrativePayload = narrative_payload.copy()
-    if isinstance(payload.get("terminalMessage"), str):
-        payload["terminalMessage"] = rendered_message
-    # The FE renders narrativeSummary ahead of terminalMessage, so a distinct
-    # concise summary must not survive a replaced reply with stale prose.
-    if payload.get("narrativeSummary") is not None:
-        payload["narrativeSummary"] = rendered_message
-    return payload
-
-
-def _log_terminal_render_decision(
-    envelope: TerminalOutcomeEnvelope,
-    *,
-    flag_enabled: bool,
-    replaced: bool,
-    cancelled: bool,
-    product_action: str | None,
-) -> None:
-    # The envelope's own log fields are stamped pre-render, so this is the only
-    # signal that witnesses the render decision in prod.
-    LOG.info(
-        "copilot_terminal_render_decision",
-        flag_enabled=flag_enabled,
-        product_action=product_action,
-        cancelled=cancelled,
-        replaced=replaced,
-        run_verdict=envelope.run_verdict,
-        next_state=envelope.next_state,
-        response_kind=envelope.response_kind,
-        reason_present=bool(envelope.run_display_reason),
-    )
 
 
 def _build_recoverable_route_agent_result(
@@ -1040,14 +935,15 @@ async def _persist_interrupted_turn(
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
     )
     facts = await _marked_superseded(chat, facts)
-    message = render_interrupted_message(facts)
+    message = render_interrupted_message(
+        facts, preserved_draft=_preserved_draft_disposition(draft_present=chat.proposed_workflow is not None)
+    )
     narrative_payload = _with_terminal_narrative_metadata(
         _make_error_narrative_payload(turn_id, None, message),
         # An interrupted turn halted; it did not fail. The FE reads this flag to
         # keep the row out of failure treatment (derivePhases, copilotPhases.ts).
         cancelled=True,
         proposal_disposition=_proposal_disposition(None),
-        terminal_envelope=interrupted_terminal_envelope(facts).model_dump(mode="json"),
     )
     await _persist_turn_messages(
         chat=chat,
@@ -1103,7 +999,14 @@ async def _persist_cancel_turn(
     workflow_applied = False
     canonical_rolled_back = False
     if agent_result is None:
-        user_response = MINIMAL_CANCEL_STOP
+        user_response = cancel_notice(
+            stop_button=cancel_source == "stop_button",
+            # Only a draft that survives the clear below is still awaiting the user.
+            preserved_draft=_preserved_draft_disposition(
+                draft_present=chat.proposed_workflow is not None and keep_pending_proposal
+            ),
+            canonical_rolled_back=False,
+        )
         updated_workflow = None
         updated_global_llm_context = clear_proposed_credential(prior_global_llm_context)
         total_tokens = None
@@ -1121,28 +1024,6 @@ async def _persist_cancel_turn(
             copilot_code_available=code_available or False,
         )
         response_turn_id = turn_id
-        # Nothing was dispatched before the agent started, so zero is a recorded fact here
-        # rather than the absent count the mid-run path reports, and no draft is this turn's.
-        terminal_envelope_model = TerminalOutcomeEnvelope(
-            next_state="stopped",
-            verified=False,
-            response_kind="stopped",
-            blocks_run_this_turn=0,
-            cancel_source=cancel_source,
-        )
-        should_render_terminal_from_envelope = await asyncio.shield(
-            app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)
-        )
-        terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
-        user_response, replaced = render_terminal_message(terminal_envelope_model, user_response, cancelled=True)
-        terminal_envelope = terminal_envelope_model.model_dump(mode="json")
-        _log_terminal_render_decision(
-            terminal_envelope_model,
-            flag_enabled=should_render_terminal_from_envelope,
-            replaced=replaced,
-            cancelled=True,
-            product_action=None,
-        )
         narrative_summary = user_response
         narrative_payload = _make_error_narrative_payload(turn_id, None, user_response)
         if chat.proposed_workflow is not None and not keep_pending_proposal:
@@ -1192,38 +1073,25 @@ async def _persist_cancel_turn(
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
         workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
-        terminal_envelope_result = _finalized_terminal_envelope(
-            agent_result,
-            workflow_applied=workflow_applied,
-            final_message=user_response,
-            response_type=response_type,
-            proposal_disposition=_proposal_disposition(agent_result),
-        )
-        if terminal_envelope_result is None:
-            terminal_envelope = None
-        else:
-            terminal_envelope_model, terminal_envelope = terminal_envelope_result
-            terminal_envelope_model = terminal_envelope_model.model_copy(
-                update={"canonical_rolled_back": canonical_rolled_back, "cancel_source": cancel_source}
+        # An interrupted turn overwrites this notice below with its own, so composing one here
+        # would build a string that never ships.
+        if agent_result.cancelled is True and not record_as_interrupted:
+            user_response = cancel_notice(
+                base=user_response,
+                stop_button=cancel_source == "stop_button",
+                preserved_draft=_preserved_draft_disposition(
+                    agent_result, draft_present=chat.proposed_workflow is not None
+                ),
+                canonical_rolled_back=canonical_rolled_back,
             )
-            # Shielded like the persistence writes above: a cancel landing on
-            # this await must not skip the chat-row persistence that follows.
-            should_render_terminal_from_envelope = await asyncio.shield(
-                app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(organization_id)
-            )
-            terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
-            user_response, replaced = render_terminal_message(terminal_envelope_model, user_response, cancelled=True)
-            terminal_envelope = terminal_envelope_model.model_dump(mode="json")
-            if replaced:
-                narrative_payload = _with_rendered_terminal_text(narrative_payload, rendered_message=user_response)
-                narrative_summary = user_response
-            _log_terminal_render_decision(
-                terminal_envelope_model,
-                flag_enabled=should_render_terminal_from_envelope,
-                replaced=replaced,
-                cancelled=True,
-                product_action=None,
-            )
+        # The reload leg reads the payload text, so it must name the same report the row stores.
+        if narrative_payload is not None and narrative_payload.get("terminalMessage") != user_response:
+            narrative_payload = {
+                **narrative_payload,
+                "terminalMessage": user_response,
+                "narrativeSummary": user_response,
+            }
+            narrative_summary = user_response
 
     if record_as_interrupted:
         facts = await _marked_superseded(
@@ -1235,7 +1103,12 @@ async def _persist_cancel_turn(
                 authored_edits_saved=False if canonical_rolled_back else None,
             ),
         )
-        user_response = render_interrupted_message(facts)
+        user_response = render_interrupted_message(
+            facts,
+            preserved_draft=_preserved_draft_disposition(
+                agent_result, draft_present=chat.proposed_workflow is not None
+            ),
+        )
         turn_outcome = _interrupted_turn_outcome(
             turn_id or response_turn_id,
             idempotency_digest=turn_outcome.idempotency_digest if turn_outcome is not None else None,
@@ -1243,7 +1116,6 @@ async def _persist_cancel_turn(
             effective_mode=effective_mode,
             code_available=code_available,
         )
-        terminal_envelope = interrupted_terminal_envelope(facts).model_dump(mode="json")
         # Hydration prefers narrativeSummary, so a cancel-rendered summary left in place
         # would outlive the reply it was rendered for.
         narrative_summary = user_response
@@ -1258,7 +1130,6 @@ async def _persist_cancel_turn(
         narrative_payload,
         cancelled=True,
         proposal_disposition=proposal_disposition,
-        terminal_envelope=terminal_envelope,
     )
 
     assistant_message = await _persist_turn_messages(
@@ -1293,7 +1164,6 @@ async def _persist_cancel_turn(
                     turn_id=response_turn_id,
                     narrative_summary=narrative_summary,
                     narrative_payload=narrative_payload,
-                    terminal_envelope=terminal_envelope,
                 )
             )
         )
@@ -1383,54 +1253,12 @@ async def _finalise_normal_turn(
     )
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
-    terminal_envelope_result = _finalized_terminal_envelope(
-        agent_result,
-        workflow_applied=workflow_applied,
-        final_message=user_response,
-        response_type=agent_result.response_type,
-        proposal_disposition=proposal_disposition,
-    )
-    narrative_payload = agent_result.narrative_payload
-    narrative_summary = agent_result.narrative_summary
-    if terminal_envelope_result is None:
-        terminal_envelope = None
-    else:
-        terminal_envelope_model, terminal_envelope = terminal_envelope_result
-        should_render_terminal_from_envelope = await app.AGENT_FUNCTION.should_render_copilot_terminal_from_envelope(
-            organization_id
-        )
-        replaced = False
-        if should_render_terminal_from_envelope and chat_request.product_action != "test_end_to_end":
-            # rendered_from_envelope means the envelope is display authority for the FE, not
-            # that this turn's text was replaced.
-            terminal_envelope_model = terminal_envelope_model.model_copy(update={"rendered_from_envelope": True})
-            user_response, replaced = render_terminal_message(
-                terminal_envelope_model,
-                user_response,
-                cancelled=False,
-            )
-            terminal_envelope = terminal_envelope_model.model_dump(mode="json")
-            if replaced:
-                narrative_payload = _with_rendered_terminal_text(
-                    agent_result.narrative_payload,
-                    rendered_message=user_response,
-                )
-                # The frame-level summary is preferred by the FE over the
-                # message on hydration, so it must carry the rendered text too.
-                narrative_summary = user_response
-        _log_terminal_render_decision(
-            terminal_envelope_model,
-            flag_enabled=should_render_terminal_from_envelope,
-            replaced=replaced,
-            cancelled=False,
-            product_action=chat_request.product_action,
-        )
     narrative_payload = _with_terminal_narrative_metadata(
-        narrative_payload,
+        agent_result.narrative_payload,
         cancelled=False,
         proposal_disposition=proposal_disposition,
-        terminal_envelope=terminal_envelope,
     )
+    narrative_summary = agent_result.narrative_summary
 
     assistant_message = await _persist_turn_messages(
         chat=chat,
@@ -1460,7 +1288,6 @@ async def _finalise_normal_turn(
         "turn_id": agent_result.turn_id,
         "narrative_summary": narrative_summary,
         "narrative_payload": narrative_payload,
-        "terminal_envelope": terminal_envelope,
     }
     browser_ablation_metadata = (
         agent_result.browser_ablation_metadata if isinstance(agent_result, AgentResult) else None
