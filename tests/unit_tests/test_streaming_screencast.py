@@ -10,6 +10,7 @@ import pytest
 from fastapi import WebSocketDisconnect
 
 from skyvern.forge.sdk.encrypt.base import TokenDecryptionError
+from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit_tests._stub_streaming import import_with_stubs
 
 screencast = import_with_stubs(
@@ -117,7 +118,7 @@ async def test_wait_for_browser_state_returns_none_on_timeout(monkeypatch: pytes
     resolve_mock = AsyncMock(return_value=browser_state)
     sleep_mock = AsyncMock()
     monkeypatch.setattr(screencast, "_resolve_browser_state", resolve_mock)
-    monkeypatch.setattr(screencast.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(screencast, "asyncio", ScopedAsyncio(sleep=sleep_mock))
 
     result = await screencast.wait_for_browser_state(
         "wr_123",
@@ -140,7 +141,7 @@ async def test_wait_for_browser_state_gives_up_when_the_org_token_cannot_be_decr
     resolve_mock = AsyncMock(side_effect=TokenDecryptionError("Failed to decrypt token"))
     sleep_mock = AsyncMock()
     monkeypatch.setattr(screencast, "_resolve_browser_state", resolve_mock)
-    monkeypatch.setattr(screencast.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(screencast, "asyncio", ScopedAsyncio(sleep=sleep_mock))
 
     result = await screencast.wait_for_browser_state(
         "pbs_1",
@@ -203,7 +204,7 @@ async def test_waiting_out_a_session_holds_one_connection_and_gives_it_back(
         ),
     )
     monkeypatch.setattr(screencast, "app", fake_app)
-    monkeypatch.setattr(screencast.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(screencast, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
 
     result = await screencast.wait_for_browser_state(
         "bs_123", "browser_session", organization_id="o_1", timeout=0.3, poll_interval=0.1
@@ -573,7 +574,7 @@ async def _drive_page_monitor(
     **loop_kwargs: object,
 ) -> asyncio.Task:
     monkeypatch.setattr(screencast, "_resolve_working_page", _scripted_pages(*script))
-    monkeypatch.setattr(screencast.asyncio, "sleep", clock.sleep)
+    monkeypatch.setattr(screencast, "asyncio", ScopedAsyncio(sleep=clock.sleep))
     monkeypatch.setattr(screencast, "time", SimpleNamespace(monotonic=clock.monotonic))
 
     async def _never_finalized() -> bool:
