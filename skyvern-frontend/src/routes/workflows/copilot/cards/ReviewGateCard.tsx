@@ -4,7 +4,11 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 import { humanizeBlockLabel } from "../blockLabel";
 import { everyTestBlockExecuted, hasFailedTestBlock } from "../copilotPhases";
-import { TurnNarrativeState, ranCleanOnCurrentSource } from "../narrativeState";
+import {
+  isBuildTestConnectFailureState,
+  TurnNarrativeState,
+  ranCleanOnCurrentSource,
+} from "../narrativeState";
 import { getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
@@ -264,7 +268,7 @@ export function ReviewGateCard({
               onClick={onTestEndToEnd}
               className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
             >
-              {turn?.terminalEnvelope?.connectFailure
+              {isBuildTestConnectFailureState(turn?.turnFacts?.terminalCause)
                 ? "Retry in a fresh session"
                 : "Test end-to-end"}
             </button>

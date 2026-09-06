@@ -249,12 +249,6 @@ describe("NarrativeView terminal prose", () => {
           responseKind: "clarify",
           responseType: "REPLY",
           terminalMessage: "Which **login** should I use?",
-          terminalEnvelope: {
-            nextState: "awaiting_user_input",
-            renderedFromEnvelope: true,
-            runVerdict: null,
-            runDisplayReason: null,
-          },
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: "The sign-in flow did not reach the expected page.",
@@ -271,19 +265,78 @@ describe("NarrativeView terminal prose", () => {
     expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
   });
 
-  it("leaves the ask untreated until the backend stamps the envelope", () => {
+  it("warns on a reloaded unconfirmed verdict that carries no reason text", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "build",
+          terminalMessage: "I built and tested the navigation block.",
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: "not_demonstrated",
+            runId: "wr_reloaded",
+            runCompleted: true,
+            terminalCause: null,
+            blocksRunThisTurn: 1,
+            ranCleanOnCurrentSource: false,
+            authoredBlockCount: 1,
+            matchingSourceBlockCount: 1,
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Outcome not confirmed")).toBeTruthy();
+    expect(
+      screen.getByText(/the run finished without showing the goal was met/),
+    ).toBeTruthy();
+  });
+
+  it("keeps a reloaded demonstrated run out of the unconfirmed warning", () => {
+    render(
+      <NarrativeView
+        turn={terminalTurn({
+          responseKind: "build",
+          terminalMessage: "I built and tested the navigation block.",
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: "demonstrated",
+            runId: "wr_reloaded",
+            runCompleted: true,
+            terminalCause: null,
+            blocksRunThisTurn: 1,
+            ranCleanOnCurrentSource: true,
+            authoredBlockCount: 1,
+            matchingSourceBlockCount: 1,
+          },
+          blocks: [
+            {
+              workflowRunBlockId: "wrb-open-site",
+              label: "open_site",
+              blockType: "navigation",
+              state: "completed",
+              outcome: "not_demonstrated",
+              lastSeenIteration: 0,
+              activity: [],
+              startedAt: null,
+              endedAt: null,
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.queryByText("Outcome not confirmed")).toBeNull();
+  });
+
+  it("does not give a cancelled turn the question rail", () => {
     render(
       <NarrativeView
         turn={terminalTurn({
           responseKind: "clarify",
-          responseType: "REPLY",
+          responseType: "ASK_QUESTION",
+          cancelled: true,
           terminalMessage: "Which login should I use?",
-          terminalEnvelope: {
-            nextState: "awaiting_user_input",
-            renderedFromEnvelope: false,
-            runVerdict: null,
-            runDisplayReason: null,
-          },
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: "The sign-in flow did not reach the expected page.",
@@ -292,8 +345,8 @@ describe("NarrativeView terminal prose", () => {
       />,
     );
 
-    expect(screen.getByTestId("copilot-detail-prose").className).toContain(
-      "text-foreground",
+    expect(screen.getByTestId("copilot-detail-prose").className).not.toContain(
+      "border-l-2",
     );
   });
 

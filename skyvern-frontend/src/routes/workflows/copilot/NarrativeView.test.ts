@@ -1220,7 +1220,7 @@ describe("humanizeJudgeText", () => {
   });
 
   it("strips the instruction when the backend appends Evidence after it", () => {
-    // terminal_envelope.py appends " Evidence: <blocker_reason>" after the Reason sentence.
+    // Saved rows from before the terminal-envelope removal carry " Evidence: <reason>" after Reason.
     const withEvidence =
       "I could not confirm the goal was met. Reason: " +
       JUDGE_REASON +

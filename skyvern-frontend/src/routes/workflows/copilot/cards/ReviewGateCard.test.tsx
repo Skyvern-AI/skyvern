@@ -194,20 +194,16 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
       <ReviewGateCard
         turn={turn({
           proposalDisposition: "review_untested",
-          terminalEnvelope: {
-            nextState: "stopped",
-            renderedFromEnvelope: false,
-            runVerdict: null,
-            runDisplayReason: null,
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: null,
             runId: null,
-            connectFailure: {
-              state: "already_closed",
-              retryAction: "test_end_to_end",
-              workflowRunId: null,
-              workflowRunBlockId: null,
-              taskId: null,
-              browserSessionId: "pbs_1",
-            },
+            runCompleted: null,
+            terminalCause: "already_closed",
+            blocksRunThisTurn: null,
+            ranCleanOnCurrentSource: false,
+            authoredBlockCount: 0,
+            matchingSourceBlockCount: 0,
           },
         })}
         pending

@@ -109,7 +109,6 @@ import {
   RecordedActionSummary,
   TurnNarrativeState,
   applyNarrativeEvent,
-  awaitsUserInput,
   hydrateHistoryNarrative,
   notConfirmedOutcome,
   parseUtcIsoMs,
@@ -361,15 +360,7 @@ export function ConvoAggregatePill({
   const anyError = turnsWithNarrative.some(
     (m) => m.narrative?.terminal === "error" && !m.narrative?.cancelled,
   );
-  // The ask is pending only while it is the tail of the conversation. Reading
-  // the last narrative-bearing turn instead would strand the pill on a question
-  // that the user's own reply, or a later narration-free turn, already moved
-  // past. findLastTurnIndex skips run_lifecycle lines, which are sender "ai"
-  // with no narrative and must not count as an answer.
-  const lastTurn = messages[findLastTurnIndex(messages)];
-  const awaitingUser =
-    hasPendingQuestion ||
-    (lastTurn?.sender === "ai" && awaitsUserInput(lastTurn.narrative));
+  const awaitingUser = hasPendingQuestion;
   // awaitingUser outranks anyError, which is session-wide: a question asked
   // after a failed build test is what the user acts on next.
   const status = isInFlight
@@ -1633,10 +1624,10 @@ export function WorkflowCopilotChat({
           return hydrated;
         })(),
       }));
-      // A rehydrated turn still owns the run its envelope names, so the
+      // A rehydrated turn still owns the run its records name, so the
       // lifecycle hook keeps announcing nothing about it after a reload.
       for (const message of historyMessages) {
-        const rehydratedRunId = message.narrative?.terminalEnvelope?.runId;
+        const rehydratedRunId = message.narrative?.turnFacts?.runId;
         if (rehydratedRunId) rememberTurnOwnedRun(rehydratedRunId);
       }
       const restoredPendingProposalTurnId = data.proposed_workflow
@@ -3862,13 +3853,11 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
   const lastTurnIndex = findLastTurnIndex(messages);
-  // Same tail rule the session pill uses: the ask is live only while it is the end of the
-  // conversation. The composer is the answer path for anything the card cannot take, so while a
-  // question is pending it says so rather than inviting a new request.
-  const latestTurnIsAsk =
-    questionInteractions.some((item) => item.status === "pending") ||
-    (messages[lastTurnIndex]?.sender === "ai" &&
-      awaitsUserInput(messages[lastTurnIndex]?.narrative));
+  // The composer is the answer path for anything the card cannot take, so while a question
+  // record is still pending it says so rather than inviting a new request.
+  const latestTurnIsAsk = questionInteractions.some(
+    (item) => item.status === "pending",
+  );
   // A bypassed proposal's gate stays attached to its owning turn (not
   // necessarily the last message) so a chip can jump back to it.
   const gateOwnerIndex = pendingProposalTurnId

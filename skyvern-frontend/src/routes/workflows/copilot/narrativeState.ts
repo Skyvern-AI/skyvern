@@ -223,7 +223,7 @@ type BuildTestConnectFailureState =
   | "cdp_connect_failed"
   | "occupied";
 
-function isBuildTestConnectFailureState(
+export function isBuildTestConnectFailureState(
   value: unknown,
 ): value is BuildTestConnectFailureState {
   return (
@@ -232,37 +232,6 @@ function isBuildTestConnectFailureState(
     value === "cdp_connect_failed" ||
     value === "occupied"
   );
-}
-
-// Closed vocabulary of TerminalOutcomeEnvelope.next_state. The envelope's
-// sibling response_kind and user_action_required carry the same bit for a
-// question turn, so only this one is parsed.
-export type TerminalNextState =
-  | "completed"
-  | "proposal_pending"
-  | "awaiting_user_input"
-  | "stopped";
-
-export interface TerminalEnvelopeFacts {
-  nextState: TerminalNextState | null;
-  // The backend stamps this only when the terminal-envelope render flag is on
-  // for the org; until then the envelope is carried but is not display
-  // authority, so no surface may key off it.
-  renderedFromEnvelope: boolean;
-  runVerdict: BlockOutcome | null;
-  runDisplayReason: string | null;
-  // Absent on envelopes persisted before the run id was carried.
-  runId?: string | null;
-  // Absent on envelopes persisted before the role was carried.
-  runOutcomeRole?: RunOutcomeRole | null;
-  connectFailure?: {
-    state: BuildTestConnectFailureState;
-    retryAction: "test_end_to_end";
-    workflowRunId: string | null;
-    workflowRunBlockId: string | null;
-    taskId: string | null;
-    browserSessionId: string | null;
-  } | null;
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
@@ -310,89 +279,6 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
-}
-
-// Envelope dicts are backend model_dump output, so keys stay snake_case.
-// The backend anchors run_verdict from final outcomes only, so "evaluating"
-// is not a wire value here and parses to null like any unknown.
-export function parseTerminalEnvelope(
-  raw: unknown,
-): TerminalEnvelopeFacts | null {
-  if (!raw || typeof raw !== "object") return null;
-  const obj = raw as Record<string, unknown>;
-  const v = obj.run_verdict;
-  const rawConnectFailure = obj.connect_failure;
-  const connectFailure = (() => {
-    if (!rawConnectFailure || typeof rawConnectFailure !== "object")
-      return null;
-    const failure = rawConnectFailure as Record<string, unknown>;
-    const state = failure.state;
-    if (
-      !isBuildTestConnectFailureState(state) ||
-      failure.retry_action !== "test_end_to_end"
-    ) {
-      return null;
-    }
-    const text = (key: string) =>
-      typeof failure[key] === "string" ? (failure[key] as string) : null;
-    return {
-      state,
-      retryAction: "test_end_to_end" as const,
-      workflowRunId: text("workflow_run_id"),
-      workflowRunBlockId: text("workflow_run_block_id"),
-      taskId: text("task_id"),
-      browserSessionId: text("browser_session_id"),
-    };
-  })();
-  const role = obj.run_outcome_role;
-  const nextState = obj.next_state;
-  return {
-    nextState:
-      nextState === "completed" ||
-      nextState === "proposal_pending" ||
-      nextState === "awaiting_user_input" ||
-      nextState === "stopped"
-        ? nextState
-        : null,
-    renderedFromEnvelope: obj.rendered_from_envelope === true,
-    runVerdict:
-      v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
-        ? v
-        : null,
-    runDisplayReason:
-      typeof obj.run_display_reason === "string"
-        ? obj.run_display_reason
-        : null,
-    runId: typeof obj.run_id === "string" ? obj.run_id : null,
-    runOutcomeRole:
-      role === "recorded" ||
-      role === "adjudicated" ||
-      role === "interim_build_test"
-        ? role
-        : null,
-    connectFailure,
-  };
-}
-
-// The one typed source for "this turn ended on the user". The backend derives
-// next_state from response_type == ASK_QUESTION and keeps it through a failed
-// build test, so a question asked after scouting or a run still reads as one.
-// Read-gated: the envelope is display authority only once the backend stamped
-// rendered_from_envelope. A user stop is not an ask -- next_state is derived
-// before the cancel lands, so the cancel path persists awaiting_user_input on a
-// turn nobody is waiting on.
-export function awaitsUserInput(
-  turn:
-    | Pick<TurnNarrativeState, "terminalEnvelope" | "cancelled">
-    | null
-    | undefined,
-): boolean {
-  if (!turn || turn.cancelled) return false;
-  const envelope = turn.terminalEnvelope;
-  return (
-    envelope?.renderedFromEnvelope === true &&
-    envelope.nextState === "awaiting_user_input"
-  );
 }
 
 export interface BlockState {
@@ -482,10 +368,6 @@ export interface TurnNarrativeState {
   // Typed terminal response kind for the turn (TurnOutcome.response_kind).
   // Null on legacy rows and frames from an older backend.
   responseKind: TurnResponseKind | null;
-  // Run-outcome facts from the backend-finalized terminal envelope carried
-  // in the narrative payload. Authoritative once runVerdict is set; null on
-  // rows persisted before the envelope existed.
-  terminalEnvelope: TerminalEnvelopeFacts | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -557,7 +439,6 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   responseType: null,
   proposalDisposition: null,
   responseKind: null,
-  terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -1868,7 +1749,6 @@ export function hydrateNarrativeFromPayload(
     cancelled,
     proposalDisposition,
     responseKind: parseResponseKind(payload.responseKind),
-    terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
     draft,
@@ -1968,28 +1848,22 @@ export interface NotConfirmedOutcome {
   displayReason: string | null;
 }
 
-export function notConfirmedOutcome(
-  turn: Pick<
-    TurnNarrativeState,
-    "terminalEnvelope" | "lastRunOutcome" | "blocks"
-  >,
-): NotConfirmedOutcome | null {
-  // The backend-finalized envelope is authoritative once it carries a run
-  // verdict; the pointer/block inference below only covers rows persisted
-  // before the envelope existed (or envelopes from run-less turns).
-  const envelope = turn.terminalEnvelope;
-  if (
-    envelope !== null &&
-    envelope.runVerdict !== null &&
-    !isInterimOutcome(envelope.runOutcomeRole ?? undefined)
-  ) {
-    return envelope.runVerdict === "not_demonstrated"
-      ? {
-          verdict: "not_demonstrated",
-          displayReason: envelope.runDisplayReason,
-        }
-      : null;
+function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]!;
+    if (
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole)
+    ) {
+      return block;
+    }
   }
+  return null;
+}
+
+export function notConfirmedOutcome(
+  turn: Pick<TurnNarrativeState, "lastRunOutcome" | "turnFacts" | "blocks">,
+): NotConfirmedOutcome | null {
   if (turn.lastRunOutcome !== null) {
     return turn.lastRunOutcome.verdict === "not_demonstrated" &&
       !isInterimOutcome(turn.lastRunOutcome.role)
@@ -1999,19 +1873,22 @@ export function notConfirmedOutcome(
         }
       : null;
   }
-  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
-    const block = turn.blocks[i]!;
-    if (
-      block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole)
-    ) {
-      return {
+  // lastRunOutcome is live-only; a reloaded turn carries the same anchored verdict here.
+  const evaluationState = turn.turnFacts?.evaluationState;
+  if (evaluationState != null) {
+    if (evaluationState !== "not_demonstrated") return null;
+    return {
+      verdict: "not_demonstrated",
+      displayReason: notDemonstratedBlock(turn.blocks)?.outcomeReason ?? null,
+    };
+  }
+  const block = notDemonstratedBlock(turn.blocks);
+  return block === null
+    ? null
+    : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
       };
-    }
-  }
-  return null;
 }
 
 // A deadline exit stamps terminal="error" for budget reasons; that is a halt,

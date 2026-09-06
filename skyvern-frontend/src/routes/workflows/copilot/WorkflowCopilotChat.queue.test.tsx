@@ -1321,9 +1321,14 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
           designActivity: [],
           startedAt: null,
           endedAt: null,
-          terminalEnvelope: {
-            run_verdict: "not_demonstrated",
-            run_display_reason: "The run did not reach the goal.",
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: "not_demonstrated",
+            runId: null,
+            runCompleted: true,
+            terminalCause: null,
+            blocksRunThisTurn: 1,
+            ranCleanOnCurrentSource: false,
           },
         },
       });

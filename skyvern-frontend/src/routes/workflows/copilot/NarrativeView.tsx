@@ -20,7 +20,6 @@ import {
   BlockState,
   RecordedActionSummary,
   TurnNarrativeState,
-  awaitsUserInput,
   formatElapsed,
   humanizeJudgeText,
   isBlockOk,
@@ -37,6 +36,8 @@ import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
 const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+const OUTCOME_NOT_CONFIRMED_REASON =
+  "the run finished without showing the goal was met";
 const QUESTION_PROSE_CLASSES =
   "border-l-2 border-sky-500 pl-3 text-sky-700 dark:text-[#a7ccdd]";
 const TERMINAL_PROSE_GRADIENT_CHARS = 32;
@@ -59,6 +60,13 @@ function truncateOutcomeReason(reason: string): string {
 
 function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
   return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
+}
+
+function isQuestionTurn(turn: TurnNarrativeState): boolean {
+  return (
+    !turn.cancelled &&
+    (turn.responseType === "ASK_QUESTION" || turn.responseKind === "clarify")
+  );
 }
 
 function blockIdentity(block: BlockState): string {
@@ -738,8 +746,7 @@ function FBlockRun({
       ) : null}
       {!open && !expansion && isOutcomeNotShown ? (
         <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
-          Outcome not confirmed — the run finished without showing the goal was
-          met
+          {`Outcome not confirmed — ${OUTCOME_NOT_CONFIRMED_REASON}`}
           {collapsedOutcomeReason
             ? `: ${truncateOutcomeReason(collapsedOutcomeReason)}`
             : "."}
@@ -801,7 +808,10 @@ function FBlockRun({
       ) : null}
       {isOutcomeNotShown || showSeparateOutcomeReason ? (
         <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
-          <span className="text-[11px] font-bold text-amber-700 dark:text-amber-300">
+          <span
+            aria-hidden="true"
+            className="text-[11px] font-bold text-amber-700 dark:text-amber-300"
+          >
             !
           </span>
           <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
@@ -1599,14 +1609,21 @@ function DetailView({
           </div>
         ) : null}
 
-        {collapsedOutcomeReason !== null && outcomeOwnerKey === null ? (
+        {notConfirmedOutcome(turn) !== null && outcomeOwnerKey === null ? (
           <div className="flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
-            <span className="text-[11px] font-bold text-amber-700 dark:text-amber-300">
+            <span
+              aria-hidden="true"
+              className="text-[11px] font-bold text-amber-700 dark:text-amber-300"
+            >
               !
             </span>
             <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
               <span className="font-semibold">Outcome not confirmed</span>
-              {` — ${truncateOutcomeReason(collapsedOutcomeReason)}`}
+              {` — ${
+                collapsedOutcomeReason !== null
+                  ? truncateOutcomeReason(collapsedOutcomeReason)
+                  : OUTCOME_NOT_CONFIRMED_REASON
+              }`}
             </div>
           </div>
         ) : null}
@@ -1622,7 +1639,7 @@ function DetailView({
             data-testid="copilot-detail-prose"
             className={[
               "text-[13px] leading-[1.55]",
-              awaitsUserInput(turn)
+              isQuestionTurn(turn)
                 ? QUESTION_PROSE_CLASSES
                 : "text-foreground dark:text-slate-200",
             ].join(" ")}
@@ -1671,11 +1688,7 @@ function terminalProseTone(turn: TurnNarrativeState): TerminalProseTone | null {
   // A terminal question can follow a partial build or test. Keep recorded work
   // on the expandable evidence path rather than losing it to prose-only chrome.
   if (hasRecordedTerminalEvidence(turn)) return null;
-  if (
-    awaitsUserInput(turn) ||
-    turn.responseKind === "clarify" ||
-    turn.responseType === "ASK_QUESTION"
-  ) {
+  if (isQuestionTurn(turn)) {
     return "question";
   }
   if (
