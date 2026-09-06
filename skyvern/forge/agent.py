@@ -5770,14 +5770,16 @@ class ForgeAgent:
                             step_retry=step.retry_index,
                         )
                         raise e
-                    LOG.error(
+                    # Warning, not error: every caller re-records this with a traceback. agent_step
+                    # logs it at error and fails the step, execute_step turns ScrapingFailed into a
+                    # run failure_reason, and the speculative prefetch swallows it at warning.
+                    LOG.warning(
                         "All scrape attempts failed",
                         total_attempts=len(SCRAPE_TYPE_ORDER),
                         error_type=e.__class__.__name__,
                         url=task.url,
                         step_order=step.order,
                         step_retry=step.retry_index,
-                        exc_info=True,
                     )
                     raise e
 
