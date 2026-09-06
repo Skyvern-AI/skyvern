@@ -122,20 +122,12 @@ export function useRunLifecycleAnnouncements({
   turnOwnedRunIds: { current: Set<string> };
   announce: (message: RunLifecycleMessage) => void;
 }): void {
-  // enabled: false (not just an omitted workflowRunId) stops useWorkflowRunQuery
-  // from falling back to the route's own :workflowRunId and polling a run this
-  // chat renders no line for.
-  const { data } = useWorkflowRunQuery({
-    workflowRunId,
-    enabled: workflowRunId !== undefined,
-  });
+  const { data } = useWorkflowRunQuery({ workflowRunId });
   const seen = useRef(new Map<string, SeenEntry>());
   const [searchParams] = useSearchParams();
   const isBlockRun = searchParams.get("bl") !== null;
 
   useEffect(() => {
-    // Disabling the query above doesn't clear data left over from a prior
-    // enabled fetch, so still gate announcing on our own current input.
     if (!workflowRunId || !data) {
       return;
     }

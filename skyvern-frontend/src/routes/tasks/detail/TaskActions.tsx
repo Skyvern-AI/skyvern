@@ -248,7 +248,7 @@ function TaskActions() {
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
   >({
-    queryKey: ["task", taskId, "steps"],
+    queryKey: ["task", taskId, "steps", task?.status],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client

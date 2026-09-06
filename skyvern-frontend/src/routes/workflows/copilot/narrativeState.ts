@@ -5,8 +5,8 @@
 
 import { buildRevealOffsets } from "./actionReveal";
 import {
+  BudgetExpiryOutcome,
   ConnectedAccountChoice,
-  QuestionPart,
   CopilotResponseType,
   ProposalDisposition,
   RunOutcomeRole,
@@ -23,6 +23,56 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
+
+export interface BudgetExpiryState {
+  budgetExpired: true;
+  source: "deadline" | "max_turns";
+  reportProduced: boolean | null;
+  stagedDraftId: string | null;
+  drainFingerprint: string | null;
+}
+
+function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (
+    value.budgetExpired !== true ||
+    (value.source !== "deadline" && value.source !== "max_turns")
+  ) {
+    return null;
+  }
+  return {
+    budgetExpired: true,
+    source: value.source,
+    reportProduced:
+      typeof value.reportProduced === "boolean" ? value.reportProduced : null,
+    stagedDraftId:
+      typeof value.stagedDraftId === "string" ? value.stagedDraftId : null,
+    drainFingerprint:
+      typeof value.drainFingerprint === "string"
+        ? value.drainFingerprint
+        : null,
+  };
+}
+
+function budgetExpiryFromOutcome(
+  outcome: BudgetExpiryOutcome | null | undefined,
+): BudgetExpiryState | null {
+  if (
+    outcome?.budget_expired !== true ||
+    (outcome.budget_expiry_source !== "deadline" &&
+      outcome.budget_expiry_source !== "max_turns")
+  ) {
+    return null;
+  }
+  return {
+    budgetExpired: true,
+    source: outcome.budget_expiry_source,
+    reportProduced: outcome.budget_expiry_report_produced ?? null,
+    stagedDraftId: outcome.budget_expiry_staged_draft_id ?? null,
+    drainFingerprint: outcome.drain_fingerprint ?? null,
+  };
+}
 
 // A block's recorded actions, fetched from the run timeline while the test run
 // is live (polled from the first frame that carries the run id) and again at
@@ -151,10 +201,27 @@ export function humanizeJudgeText(text: string): string {
   return stripJudgeInstruction(rewritten).replace(/ {2,}/g, " ").trim();
 }
 
+export function terminalNarrativeText(turn: TurnNarrativeState): string {
+  if (turn.budgetExpiry?.reportProduced === false) {
+    const limit =
+      turn.budgetExpiry.source === "deadline" ? "time" : "model-call";
+    const status = `This turn reached its ${limit} limit without producing a report.`;
+    return turn.budgetExpiry.stagedDraftId
+      ? `${status} A draft was staged during this session.`
+      : status;
+  }
+  if (turn.budgetExpiry) {
+    const drainReply = turn.terminalMessage?.trim() || "";
+    if (drainReply) return drainReply;
+  }
+  return turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+}
+
 type BuildTestConnectFailureState =
   | "already_closed"
   | "provisioning_unavailable"
-  | "cdp_connect_failed";
+  | "cdp_connect_failed"
+  | "occupied";
 
 function isBuildTestConnectFailureState(
   value: unknown,
@@ -162,7 +229,8 @@ function isBuildTestConnectFailureState(
   return (
     value === "already_closed" ||
     value === "provisioning_unavailable" ||
-    value === "cdp_connect_failed"
+    value === "cdp_connect_failed" ||
+    value === "occupied"
   );
 }
 
@@ -177,16 +245,14 @@ export type TerminalNextState =
 
 export interface TerminalEnvelopeFacts {
   nextState: TerminalNextState | null;
-  // Server-admitted parts of the model's own question, in the order it asked
-  // them. Optional like connectFailure: absent on an envelope an older backend
-  // wrote, and empty on every turn that did not end on an ASK_QUESTION.
-  questionParts?: QuestionPart[];
   // The backend stamps this only when the terminal-envelope render flag is on
   // for the org; until then the envelope is carried but is not display
   // authority, so no surface may key off it.
   renderedFromEnvelope: boolean;
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
+  // Absent on envelopes persisted before the run id was carried.
+  runId?: string | null;
   // Absent on envelopes persisted before the role was carried.
   runOutcomeRole?: RunOutcomeRole | null;
   connectFailure?: {
@@ -246,30 +312,6 @@ export interface ReviewProjection {
   }>;
 }
 
-// part_id and the choice strings are minted or admitted server-side, so this
-// only has to drop a payload shape an older backend never sends.
-function parseQuestionParts(raw: unknown): QuestionPart[] {
-  if (!Array.isArray(raw)) return [];
-  const parts: QuestionPart[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") continue;
-    const part = entry as Record<string, unknown>;
-    if (typeof part.part_id !== "string" || typeof part.prompt !== "string") {
-      continue;
-    }
-    parts.push({
-      part_id: part.part_id,
-      prompt: part.prompt,
-      choices: Array.isArray(part.choices)
-        ? part.choices.filter(
-            (choice): choice is string => typeof choice === "string",
-          )
-        : [],
-    });
-  }
-  return parts;
-}
-
 // Envelope dicts are backend model_dump output, so keys stay snake_case.
 // The backend anchors run_verdict from final outcomes only, so "evaluating"
 // is not a wire value here and parses to null like any unknown.
@@ -305,7 +347,6 @@ export function parseTerminalEnvelope(
   const role = obj.run_outcome_role;
   const nextState = obj.next_state;
   return {
-    questionParts: parseQuestionParts(obj.question_parts),
     nextState:
       nextState === "completed" ||
       nextState === "proposal_pending" ||
@@ -322,6 +363,7 @@ export function parseTerminalEnvelope(
       typeof obj.run_display_reason === "string"
         ? obj.run_display_reason
         : null,
+    runId: typeof obj.run_id === "string" ? obj.run_id : null,
     runOutcomeRole:
       role === "recorded" ||
       role === "adjudicated" ||
@@ -498,13 +540,15 @@ export interface TurnNarrativeState {
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
+  budgetExpiry: BudgetExpiryState | null;
 }
 
 export interface GoogleConnectionNotice {
   provider: "google";
-  connectionId: string;
+  connectionId: string | null;
   displayName: string | null;
-  condition: "missing" | "unusable";
+  condition: "missing" | "unusable" | "unbound";
+  choices?: ConnectedAccountChoice[];
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -537,6 +581,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   googleConnectionNotices: [],
   review: null,
   turnFacts: null,
+  budgetExpiry: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -665,28 +710,37 @@ export function parseGoogleConnectionNotices(
 ): GoogleConnectionNotice[] {
   if (!Array.isArray(value)) return [];
   const notices: GoogleConnectionNotice[] = [];
-  const seen = new Set<string>();
+  const seen = new Set<string | null>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
     if (
       row.provider !== "google" ||
-      typeof row.connectionId !== "string" ||
-      row.connectionId.length === 0 ||
-      (row.condition !== "missing" && row.condition !== "unusable") ||
-      seen.has(row.connectionId)
+      (row.condition === "unbound"
+        ? row.connectionId !== null
+        : typeof row.connectionId !== "string" ||
+          row.connectionId.length === 0) ||
+      (row.condition !== "missing" &&
+        row.condition !== "unusable" &&
+        row.condition !== "unbound")
     ) {
       continue;
     }
-    seen.add(row.connectionId);
+    const connectionId =
+      row.condition === "unbound" ? null : (row.connectionId as string);
+    if (seen.has(connectionId)) continue;
+    seen.add(connectionId);
     notices.push({
       provider: "google",
-      connectionId: row.connectionId,
+      connectionId,
       displayName:
         typeof row.displayName === "string" && row.displayName.length > 0
           ? row.displayName
           : null,
       condition: row.condition,
+      ...(row.condition === "unbound"
+        ? { choices: parseConnectedAccountChoices(row.choices) }
+        : {}),
     });
   }
   return notices;
@@ -742,6 +796,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   add_block: "Adding block",
   delete_block: "Deleting block",
   request_credential: "Requesting a credential",
+  ask_user: "Asking you",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 
@@ -1769,7 +1824,11 @@ export function hydrateNarrativeFromPayload(
   const turnFacts = parseTurnFacts(payload.turnFacts);
   // A deadline cuts a running block off; that is a stop, so it must not be swept
   // to failed and then read back as the turn having failed.
-  const halted = cancelled || turnFacts?.terminalCause === "deadline_expired";
+  const budgetExpiry = parseBudgetExpiry(payload.budgetExpiry);
+  const halted =
+    cancelled ||
+    turnFacts?.terminalCause === "deadline_expired" ||
+    budgetExpiry !== null;
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
@@ -1842,6 +1901,7 @@ export function hydrateNarrativeFromPayload(
     ),
     review: parseReviewProjection(payload.review),
     turnFacts,
+    budgetExpiry,
   };
 }
 
@@ -1852,10 +1912,10 @@ export function hydrateNarrativeFromPayload(
 export function hydrateHistoryNarrative(
   payload: Record<string, unknown> | null | undefined,
   turnOutcome:
-    | {
+    | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
-      }
+      })
     | null
     | undefined,
 ): TurnNarrativeState | undefined {
@@ -1878,6 +1938,7 @@ export function hydrateHistoryNarrative(
     connectedAccountChoices: hasTurnOutcomeChoices
       ? choices
       : hydrated.connectedAccountChoices,
+    budgetExpiry: hydrated.budgetExpiry ?? budgetExpiryFromOutcome(turnOutcome),
   };
 }
 
@@ -1957,7 +2018,8 @@ export function notConfirmedOutcome(
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
   return (
-    turn.turnFacts?.terminalCause === "deadline_expired" &&
+    (turn.turnFacts?.terminalCause === "deadline_expired" ||
+      turn.budgetExpiry !== null) &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
   );
 }

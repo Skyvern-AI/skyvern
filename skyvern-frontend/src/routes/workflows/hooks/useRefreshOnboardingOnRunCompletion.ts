@@ -1,5 +1,4 @@
 import { useEffect, useRef } from "react";
-import { useAuth } from "@clerk/clerk-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Status } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
@@ -16,7 +15,6 @@ function useRefreshOnboardingOnRunCompletion(
   workflowRun: RunLike | undefined,
 ): void {
   const queryClient = useQueryClient();
-  const { userId } = useAuth();
   const refreshedRunRef = useRef<string | null>(null);
   const retryTimeoutRef = useRef<number | undefined>(undefined);
   const retriedMissingAssignmentRef = useRef(false);
@@ -53,11 +51,18 @@ function useRefreshOnboardingOnRunCompletion(
       if (refreshedRunRef.current !== runId) {
         return;
       }
-      const assignment = queryClient.getQueryData<OnboardingStateResponse>([
-        "userOnboarding",
-        userId,
-      ])?.recovery_guidance_assignment;
-      if (assignment?.eligible_run_id === runId) {
+      // The onboarding provider keys its cache by the cloud user id, but this hook also runs in
+      // OSS where Clerk has no provider. Read the existing query family after invalidation rather
+      // than importing Clerk just to reconstruct a cache key.
+      const hasAssignmentForRun = queryClient
+        .getQueriesData<OnboardingStateResponse>({
+          queryKey: ["userOnboarding"],
+        })
+        .some(
+          ([, data]) =>
+            data?.recovery_guidance_assignment?.eligible_run_id === runId,
+        );
+      if (hasAssignmentForRun) {
         return;
       }
       if (retriedMissingAssignmentRef.current) {
@@ -69,7 +74,7 @@ function useRefreshOnboardingOnRunCompletion(
         void queryClient.invalidateQueries({ queryKey: ["userOnboarding"] });
       }, 4_000);
     });
-  }, [workflowRun, queryClient, userId]);
+  }, [workflowRun, queryClient]);
 }
 
 export { useRefreshOnboardingOnRunCompletion };

@@ -58,9 +58,14 @@ function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
  * block → leaf block, thought → LLM screenshot).
  */
 export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
-  const queryOptions = workflowRunId ? { workflowRunId } : undefined;
+  const queryOptions = { workflowRunId };
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(queryOptions);
-  const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
+  const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
+    useWorkflowRunTimelineQuery(queryOptions);
+  // The timeline payload carries no run id of its own, so keepPreviousData serves
+  // the previous run's timeline on both a switch and a clear.
+  const timeline =
+    !workflowRunId || timelineIsPlaceholder ? undefined : retainedTimeline;
   const [searchParams] = useSearchParams();
   const activeParam = searchParams.get("active");
   // The Overview pane's loop-iteration selection isn't in the URL; read it from the

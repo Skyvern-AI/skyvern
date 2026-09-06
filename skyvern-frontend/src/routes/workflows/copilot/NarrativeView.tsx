@@ -27,6 +27,7 @@ import {
   isInterimOutcome,
   notConfirmedOutcome,
   parseUtcIsoMs,
+  terminalNarrativeText,
   toolActivityDisplayLabel,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
@@ -1613,7 +1614,10 @@ function DetailView({
         {/* terminalProseTone's question branch without its evidence gate: an
             ask that followed a run keeps the rail here, beside the evidence,
             rather than replacing the card with prose-only chrome. */}
-        {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
+        {turn.terminal &&
+        (turn.narrativeSummary ||
+          turn.terminalMessage ||
+          turn.budgetExpiry?.reportProduced === false) ? (
           <div
             data-testid="copilot-detail-prose"
             className={[
@@ -1624,11 +1628,7 @@ function DetailView({
             ].join(" ")}
           >
             <CopilotMarkdown
-              text={humanizeJudgeText(
-                turn.narrativeSummary?.trim() ||
-                  turn.terminalMessage?.trim() ||
-                  "",
-              )}
+              text={humanizeJudgeText(terminalNarrativeText(turn))}
             />
           </div>
         ) : null}
@@ -1779,9 +1779,7 @@ export function NarrativeView({
   workingRowActive,
 }: NarrativeViewProps) {
   const proseTone = terminalProseTone(turn);
-  const proseText = humanizeJudgeText(
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
-  );
+  const proseText = humanizeJudgeText(terminalNarrativeText(turn));
   const activityInteractionRef = useRef<string | null>(null);
 
   if (proseTone !== null && proseText) {

@@ -49,8 +49,11 @@ function WorkflowRunOverview() {
   const activeIteration = parseActiveIterationParam(iterationParam);
   const queryClient = useQueryClient();
   const [vncFailed, setVncFailed] = useState(false);
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunWithWorkflowQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
@@ -84,7 +87,7 @@ function WorkflowRunOverview() {
     setVncFailed(false);
   }, [browserSessionId]);
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return (
       <AspectRatio ratio={16 / 9}>
         <Skeleton className="h-full w-full" />

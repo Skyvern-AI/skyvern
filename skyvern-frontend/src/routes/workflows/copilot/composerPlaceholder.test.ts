@@ -7,7 +7,6 @@ const base = {
   isLoading: false,
   isWaitingForLiveBrowser: false,
   latestTurnIsAsk: false,
-  copilotV2Enabled: true,
 };
 
 describe("composerPlaceholder", () => {

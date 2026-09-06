@@ -15,9 +15,9 @@ import { useStudioRunId } from "./useStudioRunId";
 export function useStudioRunSignals() {
   const urlRunId = useStudioRunId();
   const workflowPermanentId = useWorkflowPermanentId();
-  const { data: urlRun } = useWorkflowRunWithWorkflowQuery(
-    urlRunId ? { workflowRunId: urlRunId } : undefined,
-  );
+  const { data: urlRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: urlRunId,
+  });
   const { data: runs } = useWorkflowRunsQuery({
     workflowPermanentId,
     page: 1,

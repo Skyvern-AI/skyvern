@@ -43,7 +43,9 @@ import { useUpdate } from "../../useUpdate";
 import {
   getAvailableOutputParameterKeys,
   getParentLoopSkipsOnFail,
+  isFirstBrowserTaskBlock,
   isNodeInsideForLoop,
+  urlMayBeGoogleDrive,
 } from "../../workflowEditorUtils";
 
 const urlTooltip =
@@ -136,6 +138,7 @@ function FileDownloadEditorBody({
     edges,
     blockId,
   );
+  const isFirstBrowserTask = isFirstBrowserTaskBlock(nodes, edges, blockId);
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
@@ -143,10 +146,82 @@ function FileDownloadEditorBody({
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     parameterKeys.length > 0 ? parameterKeys[0] : undefined,
   );
+  // Keep an already-selected account editable even once the URL stops looking like a
+  // Drive link, so the field never disappears with a value still attached to the block.
+  const showGoogleDriveSourceAccount =
+    downloadTarget !== "website" &&
+    downloadTarget !== "google_drive" &&
+    (urlMayBeGoogleDrive(url) || Boolean(googleCredentialId));
 
   return (
     <div data-testid="file-download-block-form" className="space-y-4">
       <div className="space-y-4">
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
+            <HelpTooltip content={urlTooltip} />
+          </div>
+          <WorkflowBlockInputTextarea
+            nodeId={blockId}
+            onChange={(next) => update({ url: next })}
+            value={url}
+            placeholder={urlPlaceholder}
+            className="nopan text-xs"
+          />
+          {isFirstBrowserTask && !url.trim() && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              Nothing runs before this block, so it needs a URL to start from.
+            </p>
+          )}
+        </div>
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-tertiary-foreground">
+              Download Goal
+            </Label>
+            <HelpTooltip content={navigationGoalTooltip} />
+          </div>
+          <WorkflowBlockInputTextarea
+            aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
+            nodeId={blockId}
+            onChange={(next) => update({ navigationGoal: next })}
+            value={navigationGoal}
+            placeholder={navigationGoalPlaceholder}
+            className="nopan text-xs"
+          />
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label className="text-xs text-tertiary-foreground">
+              Download Timeout (sec)
+            </Label>
+            <HelpTooltip
+              content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
+            />
+            <Input
+              className="ml-auto w-16 text-right"
+              type="number"
+              min={1}
+              value={downloadTimeout ?? ""}
+              placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
+              onChange={(event) => {
+                // Empty input clears the override; numeric inputs land
+                // verbatim. The previous `if (next) { update(...) }`
+                // silently dropped `0`, so a user typing "0" thinking
+                // "no timeout" got no save and no feedback.
+                if (event.target.value === "") {
+                  update({ downloadTimeout: null });
+                  return;
+                }
+                const next = Number(event.target.value);
+                if (Number.isFinite(next) && next >= 0) {
+                  update({ downloadTimeout: next });
+                }
+              }}
+            />
+          </div>
+        </div>
+
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <Label className="text-sm text-slate-400">Download Target</Label>
@@ -181,49 +256,6 @@ function FileDownloadEditorBody({
             </SelectContent>
           </Select>
         </div>
-
-        {downloadTarget !== "website" && (
-          <DestinationField
-            label="Prompt"
-            help={helpTooltips["fileDownload"]["prompt"]}
-          >
-            <WorkflowBlockInputTextarea
-              nodeId={blockId}
-              onChange={(value) => update({ prompt: value })}
-              value={prompt ?? ""}
-              placeholder={
-                'e.g. Only send the PDF files whose names contain "invoice"'
-              }
-              className="nopan text-xs"
-            />
-            <p className="text-xs text-slate-400">
-              Optional. Leave empty to send all downloaded files.
-            </p>
-          </DestinationField>
-        )}
-
-        {downloadTarget !== "website" && (
-          <DestinationField
-            label={
-              downloadTarget === "google_drive"
-                ? "Google Account"
-                : "Google Drive Source Account (Optional)"
-            }
-            help={
-              downloadTarget === "google_drive"
-                ? "The connected Google account used for Drive downloads and uploads."
-                : "Select a connected Google account to download private Google Drive links before sending the file to this destination."
-            }
-          >
-            <GoogleOAuthCredentialSelector
-              nodeId={blockId}
-              value={googleCredentialId ?? ""}
-              onChange={(value) => update({ googleCredentialId: value })}
-              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
-              optional={downloadTarget !== "google_drive"}
-            />
-          </DestinationField>
-        )}
 
         {downloadTarget === "s3" && (
           <>
@@ -349,17 +381,30 @@ function FileDownloadEditorBody({
         )}
 
         {downloadTarget === "google_drive" && (
-          <DestinationField
-            label="Google Drive Folder ID (Optional)"
-            help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
-          >
-            <WorkflowBlockInputTextarea
-              nodeId={blockId}
-              onChange={(value) => update({ googleDriveFolderId: value })}
-              value={googleDriveFolderId ?? ""}
-              className="nopan text-xs"
-            />
-          </DestinationField>
+          <>
+            <DestinationField
+              label="Google Account"
+              help="The connected Google account used for Drive downloads and uploads."
+            >
+              <GoogleOAuthCredentialSelector
+                nodeId={blockId}
+                value={googleCredentialId ?? ""}
+                onChange={(value) => update({ googleCredentialId: value })}
+                requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              />
+            </DestinationField>
+            <DestinationField
+              label="Google Drive Folder ID (Optional)"
+              help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ googleDriveFolderId: value })}
+                value={googleDriveFolderId ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+          </>
         )}
 
         {downloadTarget === "sftp" && (
@@ -458,66 +503,41 @@ function FileDownloadEditorBody({
           </>
         )}
 
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">URL</Label>
-            <HelpTooltip content={urlTooltip} />
-          </div>
-          <WorkflowBlockInputTextarea
-            nodeId={blockId}
-            onChange={(next) => update({ url: next })}
-            value={url}
-            placeholder={urlPlaceholder}
-            className="nopan text-xs"
-          />
-        </div>
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Download Goal
-            </Label>
-            <HelpTooltip content={navigationGoalTooltip} />
-          </div>
-          <WorkflowBlockInputTextarea
-            aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
-            nodeId={blockId}
-            onChange={(next) => update({ navigationGoal: next })}
-            value={navigationGoal}
-            placeholder={navigationGoalPlaceholder}
-            className="nopan text-xs"
-          />
-        </div>
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Download Timeout (sec)
-            </Label>
-            <HelpTooltip
-              content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
+        {showGoogleDriveSourceAccount && (
+          <DestinationField
+            label="Google Drive Source Account (Optional)"
+            help="Only applies when the URL above is a private Google Drive link: the file is fetched through this connected account instead of the browser."
+          >
+            <GoogleOAuthCredentialSelector
+              nodeId={blockId}
+              value={googleCredentialId ?? ""}
+              onChange={(value) => update({ googleCredentialId: value })}
+              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              optional
             />
-            <Input
-              className="ml-auto w-16 text-right"
-              type="number"
-              min={1}
-              value={downloadTimeout ?? ""}
-              placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
-              onChange={(event) => {
-                // Empty input clears the override; numeric inputs land
-                // verbatim. The previous `if (next) { update(...) }`
-                // silently dropped `0`, so a user typing "0" thinking
-                // "no timeout" got no save and no feedback.
-                if (event.target.value === "") {
-                  update({ downloadTimeout: null });
-                  return;
-                }
-                const next = Number(event.target.value);
-                if (Number.isFinite(next) && next >= 0) {
-                  update({ downloadTimeout: next });
-                }
-              }}
+          </DestinationField>
+        )}
+
+        {downloadTarget !== "website" && (
+          <DestinationField
+            label="Files to Send (Optional)"
+            help={helpTooltips["fileDownload"]["prompt"]}
+          >
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ prompt: value })}
+              value={prompt ?? ""}
+              placeholder={
+                'e.g. Only send the PDF files whose names contain "invoice"'
+              }
+              className="nopan text-xs"
             />
-          </div>
-        </div>
+            <p className="text-xs text-slate-400">
+              Filters the files this block already downloaded. Leave empty to
+              send all of them.
+            </p>
+          </DestinationField>
+        )}
         {!hasInteracted && (
           <div className="workflow-editor-tip rounded-md bg-muted p-2 text-xs text-muted-foreground">
             Once the file is downloaded, this block will complete.

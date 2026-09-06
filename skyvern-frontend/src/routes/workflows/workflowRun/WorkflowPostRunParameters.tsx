@@ -32,8 +32,11 @@ function WorkflowPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunWithWorkflowQuery();
   const parameters = workflowRun?.parameters ?? {};
   const workflow = workflowRun?.workflow;
 
@@ -78,7 +81,7 @@ function WorkflowPostRunParameters() {
     : (workflowRun?.extra_http_headers ?? null);
   const showExtraHttpHeaders = hasExtraHttpHeaders(extraHttpHeaders);
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return <div>Loading workflow inputs...</div>;
   }
 

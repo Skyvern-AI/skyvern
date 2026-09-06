@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
@@ -20,6 +21,13 @@ const resolvedRun = {
   workflow_run_id: "wr_1",
   workflow: { workflow_permanent_id: "wpid_123" },
 };
+
+const { getClientMock, realRunQuery } = vi.hoisted(() => ({
+  getClientMock: vi.fn(),
+  // The stale-URL case drives the real query through a seeded cache; the rest
+  // only need a payload, so they keep the cheaper stub.
+  realRunQuery: { enabled: false },
+}));
 
 const mocks = vi.hoisted(() => ({
   studioFlagState: vi.fn<() => boolean | undefined>(() => true),
@@ -42,12 +50,28 @@ vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
 vi.mock("@/routes/runs/useTaskV2Query", () => ({
   useTaskV2Query: () => mocks.taskV2(),
 }));
-vi.mock("@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: (options?: {
-    workflowRunId?: string;
-    enabled?: boolean;
-  }) => mocks.runQuery(options),
+vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => undefined,
 }));
+vi.mock(
+  "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery")
+      >();
+    return {
+      useWorkflowRunWithWorkflowQuery: (options?: {
+        workflowRunId: string | undefined;
+        enabled?: boolean;
+      }) =>
+        realRunQuery.enabled
+          ? actual.useWorkflowRunWithWorkflowQuery(options)
+          : mocks.runQuery(options),
+    };
+  },
+);
 // The studio shell is stubbed to a marker that echoes the resolved wpid, so we
 // verify both the branch choice and that the provider fed the id through.
 vi.mock("@/routes/workflows/editor/WorkflowEditor", () => ({
@@ -66,15 +90,22 @@ function LocationProbe() {
   );
 }
 
-function renderAt(entry: string) {
-  return render(
+function renderAt(entry: string, client?: QueryClient) {
+  const tree = (
     <MemoryRouter initialEntries={[entry]}>
       <Routes>
         <Route path="/runs/:runId/*" element={<RunRouter />} />
         <Route path="/agents/*" element={<div data-testid="redirected" />} />
       </Routes>
       <LocationProbe />
-    </MemoryRouter>,
+    </MemoryRouter>
+  );
+  return render(
+    client ? (
+      <QueryClientProvider client={client}>{tree}</QueryClientProvider>
+    ) : (
+      tree
+    ),
   );
 }
 
@@ -99,6 +130,11 @@ describe("RunRouter", () => {
     mocks.runQuery.mockReturnValue({ data: resolvedRun, isLoading: false });
   });
 
+  afterEach(() => {
+    realRunQuery.enabled = false;
+    getClientMock.mockReset();
+  });
+
   test("studio on: renders the studio in place under /runs/{wr} (no redirect to /agents)", () => {
     renderAt("/runs/wr_1");
     expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
@@ -121,16 +157,18 @@ describe("RunRouter", () => {
   });
 
   test("studio on: waits out a stale (keepPreviousData) run from a prior URL", () => {
-    // The query still holds the previous run while navigating to wr_1; its
-    // workflow id must not be handed to the studio until the fetch catches up.
-    mocks.runQuery.mockReturnValue({
-      data: {
-        workflow_run_id: "wr_0",
-        workflow: { workflow_permanent_id: "wpid_prev" },
-      },
-      isLoading: false,
+    realRunQuery.enabled = true;
+    getClientMock.mockResolvedValue({ get: () => new Promise(() => {}) });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
     });
-    renderAt("/runs/wr_1");
+    client.setQueryData(["workflowRun", "wr_1"], {
+      workflow_run_id: "wr_0",
+      workflow: { workflow_permanent_id: "wpid_prev" },
+    });
+
+    renderAt("/runs/wr_1", client);
+
     expectCenteredLoadingIndicator();
     expect(screen.queryByTestId("studio")).toBeNull();
   });

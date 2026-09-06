@@ -10,10 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { COPILOT_WORKING_VERBS } from "./workingVerbs";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
   message: string;
@@ -144,7 +141,6 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 type FlagConfig = {
-  copilotV2?: boolean;
   codeBlockMode?: boolean;
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
@@ -152,18 +148,15 @@ type FlagConfig = {
 
 async function renderChat(flags: FlagConfig) {
   const booleanFlags: Record<string, boolean> = {
-    ENABLE_WORKFLOW_COPILOT_V2: flags.copilotV2 ?? false,
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: flags.codeBlockMode ?? false,
     CODE_BLOCK_ACCESS: flags.codeBlockMode ?? false,
   };
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat
-          requiresLiveBrowser={flags.requiresLiveBrowser}
-          isLiveBrowserReady={flags.isLiveBrowserReady}
-        />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat
+        requiresLiveBrowser={flags.requiresLiveBrowser}
+        isLiveBrowserReady={flags.isLiveBrowserReady}
+      />
     </FeatureFlagContext.Provider>,
   );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
@@ -220,7 +213,7 @@ afterEach(() => {
 
 describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   it("defaults straight to Build with code when code-first is accessible", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -232,21 +225,17 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("falls back to plain Build when the code-block flag is off", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: false });
+    await renderChat({ codeBlockMode: false });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-    const pillText = screen.getByRole("button", {
-      name: "Switch mode",
-    }).textContent;
-    expect(pillText).toContain("Build");
-    expect(pillText).not.toContain("Build with code");
+    expect(streamCalls[0]?.body.code_block).toBe(false);
+    expect(screen.queryByRole("button", { name: "Switch mode" })).toBeNull();
   });
 
   it("opens the mode pill as a real Radix menu, not a hand-rolled div", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     const trigger = screen.getByRole("button", { name: "Switch mode" });
     expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
 
@@ -254,18 +243,22 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     });
     expect(await screen.findByRole("menu")).toBeTruthy();
-
-    const askItem = await screen.findByRole("menuitem", { name: "Ask" });
+    expect(screen.queryByRole("menuitem", { name: "Ask" })).toBeNull();
+    expect(
+      screen.getByRole("menuitem", { name: "Build with code" }),
+    ).toBeTruthy();
+    const buildItem = screen.getByRole("menuitem", { name: "Build" });
     await act(async () => {
-      fireEvent.click(askItem);
+      fireEvent.click(buildItem);
     });
-    await submit("what does this workflow do?");
+    await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(streamCalls[0]?.body.mode).toBe("ask");
+    expect(streamCalls[0]?.body.mode).toBe("build");
+    expect(streamCalls[0]?.body.code_block).toBe(false);
   });
 
   it("morphs to stop while running with an empty box, and cancels the run on click", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -305,7 +298,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("arms stop on the first streamed frame even when that frame carries no turn id", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -324,7 +317,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   it("re-arms stop once a turn has streamed nothing for the arming window", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      await renderChat({ copilotV2: true, codeBlockMode: true });
+      await renderChat({ codeBlockMode: true });
       await submit("build me a workflow");
       await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
       expect(screen.getByRole("button", { name: "Starting…" })).toBeTruthy();
@@ -346,7 +339,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     // The arming gate exists so a fast double-click on Send is not "send, then cancel".
     // A block's own cancel is a deliberate gesture, so it must not go dead during that
     // window — a turn hanging before its first frame is when someone reaches for it.
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -361,7 +354,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("hands a queued prompt back to the composer rather than letting the stop auto-fire it", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -388,7 +381,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("flips back to a queueing send when typing mid-run, and queues on click", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -415,7 +408,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("shows a cycling Skyvern verb instead of the prose working line", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -434,7 +427,6 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
 
   it("disables the morph button (not a dead-looking Send) while a prompt waits on the live browser", async () => {
     await renderChat({
-      copilotV2: true,
       codeBlockMode: true,
       requiresLiveBrowser: true,
       isLiveBrowserReady: false,
@@ -469,7 +461,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("embeds the input: idle placeholder matches the mock, textarea borderless inside a focus-within container", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     const ta = textarea();
 
     expect(ta.getAttribute("placeholder")).toBe(
@@ -481,7 +473,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
   });
 
   it("places the mic and send inside the container, with the mic to the right of the input", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await renderChat({ codeBlockMode: true });
     const ta = textarea();
     const container = ta.parentElement as HTMLElement;
     const mic = screen.getByRole("button", { name: "Dictate message" });

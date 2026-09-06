@@ -201,7 +201,10 @@ import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
 
-import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
+import type {
+  CopilotProductAction,
+  WorkflowYAMLConversionResponse,
+} from "../copilot/workflowCopilotTypes";
 import { WorkflowYamlEditor } from "./WorkflowYamlEditor";
 import { YamlModeToggle } from "./YamlModeToggle";
 import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLifecycle";
@@ -211,6 +214,22 @@ import {
   yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
+
+function readCopilotProductAction(value: unknown): CopilotProductAction | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const candidate = value as Partial<CopilotProductAction>;
+  return candidate.kind === "diagnose_run" &&
+    typeof candidate.workflowRunId === "string" &&
+    typeof candidate.nonce === "string"
+    ? {
+        kind: candidate.kind,
+        workflowRunId: candidate.workflowRunId,
+        nonce: candidate.nonce,
+      }
+    : null;
+}
 
 function getAxiosErrorDetail(error: unknown): string | undefined {
   if (!(error instanceof AxiosError)) {
@@ -387,11 +406,18 @@ function Workspace({
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
+    copilotAction?: unknown;
   } | null;
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
       : null;
+  // Identity has to survive re-renders: this gates a timer that re-arms whenever it changes.
+  const copilotActionState = locationState?.copilotAction;
+  const initialCopilotAction = useMemo(
+    () => readCopilotProductAction(copilotActionState),
+    [copilotActionState],
+  );
   const { storedInitialCopilotMessage, clearStoredInitialCopilotMessage } =
     useDiscoverCopilotPromptRecovery({
       shouldRead: searchParams.get("via") === "discover",
@@ -402,7 +428,7 @@ function Workspace({
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
   const handleInitialCopilotMessageConsumed = useCallback(() => {
-    if (!initialCopilotMessage) return;
+    if (!initialCopilotMessage && !initialCopilotAction) return;
     clearStoredInitialCopilotMessage();
     navigate(location.pathname + withoutDiscoverViaParam(location.search), {
       replace: true,
@@ -410,6 +436,7 @@ function Workspace({
     });
   }, [
     initialCopilotMessage,
+    initialCopilotAction,
     clearStoredInitialCopilotMessage,
     location.pathname,
     location.search,
@@ -2894,6 +2921,7 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
+        initialAction={initialCopilotAction ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>

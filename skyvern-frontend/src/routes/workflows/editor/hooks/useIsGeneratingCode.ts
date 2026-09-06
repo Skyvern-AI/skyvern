@@ -11,14 +11,12 @@ type Params = {
   workflowRunId?: string;
 };
 
-export function useIsGeneratingCode({
-  cacheKey,
-  cacheKeyValue,
-  workflowPermanentId,
-  workflowRunId,
-}: Params): boolean {
+export function useIsGeneratingCode(params: Params): boolean {
+  const { cacheKey, cacheKeyValue, workflowPermanentId } = params;
   const { data: workflowRun } = useWorkflowRunQuery(
-    workflowRunId ? { workflowRunId } : undefined,
+    "workflowRunId" in params
+      ? { workflowRunId: params.workflowRunId }
+      : undefined,
   );
   const { data: blockScriptsPublished } = useBlockScriptsQuery({
     cacheKey,

@@ -36,8 +36,11 @@ function DebuggerRunTimeline({
   onActionItemSelected,
   onBlockItemSelected,
 }: Props) {
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
@@ -51,7 +54,7 @@ function DebuggerRunTimeline({
     [workflowRunWithWorkflow],
   );
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return <Skeleton className="h-full w-full" />;
   }
 

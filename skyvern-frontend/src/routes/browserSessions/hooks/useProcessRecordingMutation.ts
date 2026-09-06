@@ -11,10 +11,8 @@ import {
   useRecordingStore,
   type RecordingDraftStep,
 } from "@/store/useRecordingStore";
-import {
-  type WorkflowBlock,
-  type WorkflowParameter,
-} from "@/routes/workflows/types/workflowTypes";
+import { type WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
+import type { RecordedParameter } from "@/store/RecordedBlocksStore";
 import {
   captureRecordBrowser,
   markRecordBrowserProcessed,
@@ -29,7 +27,7 @@ const useProcessRecordingMutation = ({
   browserSessionId: string | null;
   onSuccess?: (args: {
     blocks: Array<WorkflowBlock>;
-    parameters: Array<WorkflowParameter>;
+    parameters: Array<RecordedParameter>;
   }) => void;
 }) => {
   const credentialGetter = useCredentialGetter();
@@ -109,7 +107,7 @@ const useProcessRecordingMutation = ({
           {
             data: {
               blocks: Array<WorkflowBlock>;
-              parameters: Array<WorkflowParameter>;
+              parameters: Array<RecordedParameter>;
             };
           }
         >(`/browser_sessions/${browserSessionId}/process_recording`, {

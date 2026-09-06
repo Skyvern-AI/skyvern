@@ -101,6 +101,7 @@ const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
   "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
 
 function WorkflowRunRightColumn({
+  workflowRunId,
   activeItem,
   activeIteration,
   timeline,
@@ -109,6 +110,7 @@ function WorkflowRunRightColumn({
   onSetActiveIteration,
   onViewScreenshot,
 }: {
+  workflowRunId: string | undefined;
   activeItem: ReturnType<typeof findActiveItem>;
   activeIteration: number | null;
   timeline: NonNullable<ReturnType<typeof useWorkflowRunTimelineQuery>["data"]>;
@@ -123,6 +125,7 @@ function WorkflowRunRightColumn({
       top={
         <div className="min-h-0 w-full overflow-hidden">
           <WorkflowRunTimeline
+            workflowRunId={workflowRunId}
             activeItem={activeItem}
             activeIteration={activeIteration}
             onActionItemSelected={(item) => {
@@ -149,6 +152,7 @@ function WorkflowRunRightColumn({
       bottom={
         <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
           <WorkflowRunBlockDetail
+            workflowRunId={workflowRunId}
             activeItem={activeItem}
             activeIteration={activeIteration}
             timeline={timeline}
@@ -276,7 +280,11 @@ function WorkflowRun() {
     );
   }, [blockScriptsPublished, setHasPublishedCode]);
 
-  const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
+  const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
+    useWorkflowRunTimelineQuery();
+  const workflowRunTimeline = timelineIsPlaceholder
+    ? undefined
+    : retainedTimeline;
   const [replayOpen, setReplayOpen] = useState(false);
 
   const cancelWorkflowMutation = useMutation({
@@ -843,7 +851,6 @@ function WorkflowRun() {
       {WorkflowRunMilestoneCard &&
       workflowRun &&
       !workflowRunIsPlaceholder &&
-      workflowRun.workflow_run_id === workflowRunId &&
       workflowRun.status === Status.Completed ? (
         <WorkflowRunMilestoneCard
           workflowRunId={workflowRun.workflow_run_id}
@@ -943,6 +950,7 @@ function WorkflowRun() {
           <Outlet />
         </div>
         <WorkflowRunRightColumn
+          workflowRunId={workflowRunId}
           activeItem={selection}
           activeIteration={activeIteration}
           timeline={workflowRunTimeline ?? []}

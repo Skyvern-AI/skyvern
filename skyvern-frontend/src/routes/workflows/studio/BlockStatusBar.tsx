@@ -17,9 +17,9 @@ import { useStudioRunId } from "./useStudioRunId";
  */
 export function BlockStatusBar({ blockLabel }: { blockLabel: string }) {
   const runId = useStudioRunId();
-  const { data: timeline } = useWorkflowRunTimelineQuery(
-    runId ? { workflowRunId: runId } : undefined,
-  );
+  const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
+    useWorkflowRunTimelineQuery(runId ? { workflowRunId: runId } : undefined);
+  const timeline = timelineIsPlaceholder ? undefined : retainedTimeline;
   const statusMap = useMemo(() => buildBlockStatusMap(timeline), [timeline]);
   const state = statusMap[blockLabel];
   if (!state || !state.status) {

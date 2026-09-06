@@ -739,8 +739,13 @@ function RecordingPanel({ browserSessionId }: Props) {
               setCredentialModal(null);
             }
           }}
-          onCredentialCreated={() => {
+          onCredentialCreated={(credentialId) => {
             const store = useRecordingStore.getState();
+            // Binds the vault entry to the step so the backend emits a login block
+            // (password/totp/magic link) or a credential-bound action block.
+            store.patchDraftStep(credentialModal.stepId, {
+              credential_id: credentialId,
+            });
             if (credentialModal.url) {
               store.dismissCredentialPromptsForUrl(credentialModal.url);
             } else {

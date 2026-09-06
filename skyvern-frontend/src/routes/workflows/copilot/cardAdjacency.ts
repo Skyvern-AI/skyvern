@@ -8,10 +8,7 @@ const SYNTHETIC_KINDS: ReadonlySet<string> = new Set([
   "status_notice",
 ]);
 
-// The next message a user could have answered with. Raw messages[index + 1] would let a synthetic
-// row appended after an ask read as an answer: the card would go read-only, discarding anything
-// half-typed in its fields, and a real answer arriving later would no longer be the receipt
-// source. Its own module so the chat file keeps exporting only components (Fast Refresh).
+// Account-choice controls and receipts follow conversation messages, skipping display-only rows.
 export function nextAnsweringMessage(
   messages: ChatMessage[],
   index: number,
@@ -23,16 +20,16 @@ export function nextAnsweringMessage(
   return undefined;
 }
 
-// The two adjacency-derived props the question card renders from. Exported as one function so the
-// render and the test share a single source: asserting nextAnsweringMessage alone left both props
-// free to revert to raw adjacency while the tests stayed green.
-export function questionCardAdjacency(
+// The ask a user's message answered. Raw messages[index - 1] would let a synthetic row inserted
+// between an ask and its answer hide the ask, so an account-selection bubble could no longer map
+// its raw connection id to the friendly "Selected …" receipt and would surface the raw id instead.
+export function previousAskingMessage(
   messages: ChatMessage[],
   index: number,
-): { answeredFrom: string | null; hasFollowingMessage: boolean } {
-  const answering = nextAnsweringMessage(messages, index);
-  return {
-    answeredFrom: answering?.sender === "user" ? answering.content : null,
-    hasFollowingMessage: answering !== undefined,
-  };
+): ChatMessage | undefined {
+  for (let prev = index - 1; prev >= 0; prev -= 1) {
+    const candidate = messages[prev];
+    if (!SYNTHETIC_KINDS.has(candidate?.kind ?? "")) return candidate;
+  }
+  return undefined;
 }

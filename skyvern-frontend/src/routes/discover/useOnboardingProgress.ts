@@ -126,7 +126,7 @@ function useOnboardingProgress() {
     ["onboarding-progress", activeUserId],
     getActiveOrgQueryKeyScope(activeOrgId),
   );
-  const { data, isError, refetch } = useQuery<OnboardingProgressV1 | null>({
+  const { data, isError, refetch } = useQuery<OnboardingProgressV1>({
     queryKey,
     queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
@@ -134,7 +134,10 @@ function useOnboardingProgress() {
         "/users/me/onboarding/progress",
         { signal },
       );
-      return parseOnboardingProgress(response.data);
+      const progress = parseOnboardingProgress(response.data);
+      if (progress === null)
+        throw new Error("invalid onboarding progress payload");
+      return progress;
     },
     enabled,
     retry: false,
@@ -151,19 +154,17 @@ function useOnboardingProgress() {
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey, exact: true }),
   });
-  // A failed refetch keeps the last good payload, so a transient error never resets the count.
-  const known = enabled && data !== undefined;
   const status: "disabled" | "loading" | "error" | "ready" = !enabled
     ? flagOff
       ? "disabled"
       : "loading"
-    : known
+    : data !== undefined
       ? "ready"
       : isError
         ? "error"
         : "loading";
   return {
-    progress: known ? data : null,
+    progress: data ?? null,
     status,
     isPending,
     refetch,

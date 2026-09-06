@@ -353,14 +353,13 @@ describe("useRunLifecycleAnnouncements", () => {
     );
   });
 
-  it("does nothing when workflowRunId is undefined, and disables the query instead of letting it fall back to the route", () => {
+  it("does nothing when workflowRunId is undefined, and states that to the query instead of letting it fall back to the route", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
     const { announce } = renderLifecycle({ workflowRunId: undefined });
 
     expect(announce).not.toHaveBeenCalled();
     expect(workflowRunQueryMock).toHaveBeenCalledWith({
       workflowRunId: undefined,
-      enabled: false,
     });
   });
 

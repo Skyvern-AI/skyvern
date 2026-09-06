@@ -45,7 +45,7 @@ type Props = {
   timeline: Array<WorkflowRunTimelineItem>;
   timelineReady?: boolean;
   showDownloadedFiles?: boolean;
-  workflowRunId?: string;
+  workflowRunId: string | undefined;
   onThoughtSelect?: (thought: ObserverThought) => void;
   onViewScreenshot?: (workflowRunBlockId: string) => void;
   // The block the run-level line's headline is actually about, and that
@@ -63,11 +63,11 @@ function BlockDownloadedFiles({
   workflowRunId,
 }: {
   block: WorkflowRunBlock;
-  workflowRunId?: string;
+  workflowRunId: string | undefined;
 }) {
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    workflowRunId ? { workflowRunId } : undefined,
-  );
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId,
+  });
   const files = useMemo(() => {
     const freshUrls = workflowRun?.downloaded_file_urls ?? [];
     const urls = getBlockDownloadedFileUrls(block.output, freshUrls);
@@ -170,9 +170,9 @@ function WorkflowRunBlockDetail({
   // loop the iteration was set for — ignore it to avoid stale labels.
   const effectiveIteration =
     activeItem === null || activeItem === "stream" ? null : activeIteration;
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    workflowRunId ? { workflowRunId } : undefined,
-  );
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId,
+  });
 
   // Cold-start: timeline data hasn't arrived yet. Check data === undefined
   // rather than isLoading because the timeline query is gated on the

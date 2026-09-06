@@ -5,13 +5,11 @@ export function composerPlaceholder({
   isLoading,
   isWaitingForLiveBrowser,
   latestTurnIsAsk,
-  copilotV2Enabled,
 }: {
   queuedPrompt: boolean;
   isLoading: boolean;
   isWaitingForLiveBrowser: boolean;
   latestTurnIsAsk: boolean;
-  copilotV2Enabled: boolean;
 }): string {
   if (queuedPrompt) return "Type to replace the queued message…";
   if (isLoading) return "Type to queue a message…";
@@ -19,7 +17,5 @@ export function composerPlaceholder({
   // While a question is pending the composer is the answer path for anything the card cannot
   // take, so it says so rather than inviting an unrelated new request.
   if (latestTurnIsAsk) return "Answer Copilot…";
-  return copilotV2Enabled
-    ? "Ask Copilot to build or change your workflow…"
-    : "Message Skyvern Copilot, or paste recorded steps…";
+  return "Ask Copilot to build or change your workflow…";
 }

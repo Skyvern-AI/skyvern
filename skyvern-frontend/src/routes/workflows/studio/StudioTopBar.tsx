@@ -310,16 +310,10 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
     data: retainedRun,
     isError: statusUnavailable,
     isPlaceholderData,
-  } = useWorkflowRunWithWorkflowQuery(
-    runId ? { workflowRunId: runId } : undefined,
-  );
-  // keepPreviousData serves the last run's payload whenever the focused run
-  // changes or clears, and clearing it also disables the query — so a retained
-  // "running" payload would otherwise stand forever with no error to notice.
-  const workflowRun =
-    isPlaceholderData || retainedRun?.workflow_run_id !== runId
-      ? undefined
-      : retainedRun;
+  } = useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
+  // The hook withholds another run's payload, but not one retained across an org
+  // switch — that changes the query key while the run id stays the same.
+  const workflowRun = isPlaceholderData ? undefined : retainedRun;
   const activeRunId = workflowRun?.workflow_run_id;
   const running =
     !statusUnavailable &&

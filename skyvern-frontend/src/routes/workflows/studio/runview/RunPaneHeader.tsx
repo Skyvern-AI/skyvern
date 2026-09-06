@@ -54,9 +54,7 @@ export function RunPaneViewToggles() {
   const { runId } = useStudioInspectedRun();
   const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflowRun, isError: statusUnavailable } =
-    useWorkflowRunWithWorkflowQuery(
-      runId ? { workflowRunId: runId } : undefined,
-    );
+    useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
   const view = useRunPaneViewStore((s) => s.view);
   const setView = useRunPaneViewStore((s) => s.setView);
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
@@ -220,9 +218,9 @@ export function RunPaneActions() {
   const compact = useStudioPaneCompact();
   const apiCredential = useApiCredential();
   const { runId } = useStudioInspectedRun();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    runId ? { workflowRunId: runId } : undefined,
-  );
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: runId,
+  });
   const [replayOpen, setReplayOpen] = useState(false);
   if (!workflowRun) {
     return null;

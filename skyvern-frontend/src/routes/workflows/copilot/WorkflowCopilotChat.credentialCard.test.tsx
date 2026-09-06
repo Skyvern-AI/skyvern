@@ -276,9 +276,7 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 async function renderChat() {
   const view = render(<WorkflowCopilotChat docked={false} />);
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 

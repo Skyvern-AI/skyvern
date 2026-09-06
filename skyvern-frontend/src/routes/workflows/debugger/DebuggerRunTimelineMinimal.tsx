@@ -9,13 +9,16 @@ import { WorkflowRunTimelineBlockItemMinimal } from "@/routes/workflows/workflow
 import { cn } from "@/util/utils";
 
 function DebuggerRunTimelineMinimal() {
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return <Skeleton className="h-full w-full" />;
   }
 

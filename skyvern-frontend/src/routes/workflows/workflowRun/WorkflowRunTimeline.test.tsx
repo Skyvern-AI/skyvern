@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
   statusUnavailable: false,
+  timelineQuery: vi.fn(),
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -44,10 +45,10 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   }),
 }));
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
-  useWorkflowRunTimelineQuery: () => ({
-    data: mocks.timeline,
-    isLoading: false,
-  }),
+  useWorkflowRunTimelineQuery: (options?: { workflowRunId?: string }) => {
+    mocks.timelineQuery(options);
+    return { data: mocks.timeline, isLoading: false };
+  },
 }));
 // Radix ScrollArea needs ResizeObserver, which jsdom doesn't provide.
 vi.mock("@/components/ui/scroll-area", () => ({
@@ -153,6 +154,7 @@ function renderTimeline(
 ) {
   return render(
     <WorkflowRunTimeline
+      workflowRunId={undefined}
       activeItem={activeItem}
       hideBorder={options.hideBorder}
       hideHeader={options.hideHeader}
@@ -185,6 +187,7 @@ afterEach(() => {
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
   mocks.statusUnavailable = false;
+  mocks.timelineQuery.mockClear();
 });
 
 describe("WorkflowRunTimeline", () => {
@@ -643,6 +646,7 @@ describe("timeline selection reveal", () => {
 
     rerender(
       <WorkflowRunTimeline
+        workflowRunId={undefined}
         activeItem={child1}
         onLiveStreamSelected={noop}
         onActionItemSelected={noop}
@@ -674,6 +678,7 @@ describe("timeline selection reveal", () => {
     // A different nested selection outranks the old collapse.
     view.rerender(
       <WorkflowRunTimeline
+        workflowRunId={undefined}
         activeItem={child2}
         onLiveStreamSelected={noop}
         onActionItemSelected={noop}
@@ -684,5 +689,33 @@ describe("timeline selection reveal", () => {
     );
 
     expect(screen.getByText("submit_form")).toBeTruthy();
+  });
+});
+
+describe("timeline run resolution", () => {
+  it("states no run rather than deferring to the route when the prop is undefined", () => {
+    renderTimeline(null);
+
+    expect(mocks.timelineQuery).toHaveBeenCalledWith({
+      workflowRunId: undefined,
+    });
+  });
+
+  it("scopes the timeline to an explicit run id prop", () => {
+    render(
+      <WorkflowRunTimeline
+        activeItem={null}
+        workflowRunId="wr_explicit"
+        onLiveStreamSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+        onThoughtItemSelected={noop}
+        onIterationSelected={noop}
+      />,
+    );
+
+    expect(mocks.timelineQuery).toHaveBeenCalledWith({
+      workflowRunId: "wr_explicit",
+    });
   });
 });

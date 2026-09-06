@@ -146,9 +146,7 @@ async function renderChat(props: { docked?: boolean } = {}) {
       portalTarget={portalTarget}
     />,
   );
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 

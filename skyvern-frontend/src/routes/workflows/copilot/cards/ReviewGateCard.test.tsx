@@ -199,6 +199,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
             renderedFromEnvelope: false,
             runVerdict: null,
             runDisplayReason: null,
+            runId: null,
             connectFailure: {
               state: "already_closed",
               retryAction: "test_end_to_end",

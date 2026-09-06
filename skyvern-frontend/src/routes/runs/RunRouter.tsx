@@ -160,22 +160,16 @@ function RunRouter() {
   }
 
   if (renderStudioRun) {
-    // keepPreviousData holds the prior run's response while navigating between
-    // short URLs; wait for the fetch that matches this runId before handing its
-    // workflow id to the studio, so the editor and run panes never mix two runs.
-    const resolvedRun =
-      studioRun?.workflow_run_id === runId ? studioRun : undefined;
-    if (!resolvedRun) {
-      // No matching run data yet. A permanently failed initial fetch (deleted,
-      // foreign-org, or garbage run id) lands on 404 like the legacy run view; a
-      // failed background poll of a live run retains its data, so resolvedRun
-      // stays set above and never flashes 404 over a working view.
+    if (!studioRun) {
+      // A permanently failed initial fetch (deleted, foreign-org, or garbage run
+      // id) lands on 404 like the legacy run view; a failed background poll of a
+      // live run retains its data, so it never flashes 404 over a working view.
       if (studioRunFailed) {
         return <Status404 />;
       }
       return loadingIndicator;
     }
-    const workflowPermanentId = resolvedRun.workflow?.workflow_permanent_id;
+    const workflowPermanentId = studioRun.workflow?.workflow_permanent_id;
     if (!workflowPermanentId) {
       console.error("Workflow permanent ID for run %s not found", runId);
       return <Status404 />;

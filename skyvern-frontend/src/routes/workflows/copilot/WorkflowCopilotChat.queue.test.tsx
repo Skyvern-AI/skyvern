@@ -10,10 +10,7 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getSseClient } from "@/api/sse";
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
@@ -189,55 +186,27 @@ async function renderChat(
 ) {
   const view = render(<WorkflowCopilotChat {...props} />);
   // Let the mount-time chat-history fetch settle.
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
-async function renderChatWithFlags(
-  booleanFlags: Record<string, boolean>,
-  defaultMode: string,
-) {
+async function renderChatWithFlags(booleanFlags: Record<string, boolean>) {
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <FeatureFlagValueContext.Provider value={() => defaultMode}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>,
   );
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(/Message Skyvern Copilot|Ask Copilot/),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
 // Code-block mode is off in the bare harness (no flag provider), so the turns
-// it drives all carry code_block=null; this one opts into the code composer.
+// it drives all explicitly select non-code Build; this one opts into the code composer.
 function renderChatWithCodeMode() {
-  return renderChatWithFlags(
-    {
-      ENABLE_WORKFLOW_COPILOT_V2: true,
-      WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
-      CODE_BLOCK_ACCESS: true,
-    },
-    "build",
-  );
-}
-
-// The mode pill is the one ask/build control that stays mounted through an
-// in-flight turn. Code-block mode is off so switching mode moves only the mode.
-function renderChatWithModePill() {
-  return renderChatWithFlags(
-    {
-      ENABLE_WORKFLOW_COPILOT_V2: true,
-      WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
-      CODE_BLOCK_ACCESS: false,
-    },
-    "build",
-  );
+  return renderChatWithFlags({
+    WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
+    CODE_BLOCK_ACCESS: true,
+  });
 }
 
 function textarea(): HTMLTextAreaElement {
@@ -360,7 +329,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await deliverFirstFrame();
 
     expect(textarea().disabled).toBe(false);
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
   });
 
   it("labels the in-flight follow-up action as the next send", async () => {
@@ -369,15 +338,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await deliverFirstFrame();
 
-    expect(
-      screen.getByText(
-        "Copilot is working. Your next send will wait for the next turn.",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByTestId("copilot-working-status")).toBeTruthy();
     expect(
       screen.getByPlaceholderText("Type to queue a message…"),
     ).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
   });
 
@@ -435,11 +400,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     // The synchronous in-flight ref must prevent a second concurrent stream.
     expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("1 message queued")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(
-      screen.getAllByText("Queued — sends when this turn finishes.").length,
-    ).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Edit queued" })).toBeTruthy();
+      screen.getByRole("button", { name: "Edit queued message" }),
+    ).toBeTruthy();
   });
 
   it("drains the queued message into one new stream after the turn ends", async () => {
@@ -478,7 +443,9 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(textarea().value).toBe("second message");
     expect(textarea().disabled).toBe(false);
     expect(cancelPost).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Queue for next turn" }),
+    ).toBeTruthy();
   });
 
   it("an IME Escape in the composer does not discard the queued message", async () => {
@@ -524,7 +491,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       "/workflow/copilot/cancel",
       expect.anything(),
     );
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     outside.remove();
   });
 
@@ -572,7 +539,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await deliverFirstFrame();
 
-    const stop = screen.getByRole("button", { name: "Cancel run" });
+    const stop = screen.getByRole("button", { name: "Stop" });
     await act(async () => {
       fireEvent.click(stop);
     });
@@ -608,7 +575,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
         await vi.advanceTimersByTimeAsync(600);
       });
       await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
       });
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
@@ -650,7 +617,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
       await deliverFirstFrame();
       await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
       });
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
@@ -1496,36 +1463,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     ).toBe(true);
   });
 
-  it("drains an identical queued prompt when the composer left the mode the turn opened in", async () => {
-    await renderChatWithModePill();
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(
-      (streamCalls[0]!.body as unknown as { mode: string | null }).mode,
-    ).toBe("build");
-
-    await submit("build me a workflow");
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    // Switch the composer to Ask while the turn runs: the queued repeat is now
-    // a question about the same words, not a re-run of the same request.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Ask"));
-    });
-
-    await completeOldestStream("first done");
-
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("build me a workflow");
-    expect(
-      (streamCalls[1]!.body as unknown as { mode: string | null }).mode,
-    ).toBe("ask");
-  });
-
   it("drains a queued block build that repeats the message of the turn in flight", async () => {
     await renderChat();
     await act(async () => {
@@ -1634,9 +1571,7 @@ describe("WorkflowCopilotChat — a stop never replays a queued message", () => 
     await submit("also add a login step");
     expect(screen.getAllByText("also add a login step")).toHaveLength(1);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Cancel run/ }));
-    });
+    await act(async () => useCopilotActionStore.getState().requestCancel());
     // The turn ends only after the stop lands — this is the edge that used to
     // drain the queue and start a whole new build turn.
     await completeOldestStream("stopped");
@@ -1652,7 +1587,7 @@ describe("WorkflowCopilotChat — a stop never replays a queued message", () => 
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await deliverFirstFrame();
 
-    const stop = screen.getByRole("button", { name: /Cancel run/ });
+    const stop = screen.getByRole("button", { name: /Stop/ });
     expect(stop.hasAttribute("disabled")).toBe(false);
 
     await act(async () => {
@@ -1704,9 +1639,7 @@ describe("WorkflowCopilotChat — the composer stays usable while a prompt is pa
       target: { value: "half typed replacement" },
     });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Cancel run/ }));
-    });
+    await act(async () => useCopilotActionStore.getState().requestCancel());
 
     expect(textarea().value).toBe("half typed replacement");
   });

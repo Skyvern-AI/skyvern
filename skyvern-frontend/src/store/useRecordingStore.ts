@@ -134,6 +134,8 @@ export interface RecordingDraftStep {
     | "secret"
     | "magic_link"
     | null;
+  /** Vault credential the user attached to this step; drives login/credential block generation. */
+  credential_id?: string | null;
 }
 
 export interface RecordingInterpretationUpdate {
@@ -176,7 +178,7 @@ export function upsertDraftSteps(
 export type RecordingDraftStepPatch = Partial<
   Pick<
     RecordingDraftStep,
-    "label" | "title" | "navigation_goal" | "url" | "wait_sec"
+    "label" | "title" | "navigation_goal" | "url" | "wait_sec" | "credential_id"
   >
 >;
 

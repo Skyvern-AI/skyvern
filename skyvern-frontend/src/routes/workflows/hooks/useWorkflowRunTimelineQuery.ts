@@ -17,9 +17,13 @@ import {
 // this endpoint; the two must not drift apart or their counts disagree on screen.
 const RUNNING_TIMELINE_REFETCH_INTERVAL_MS = 2500;
 
-function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
+function useWorkflowRunTimelineQuery(options?: {
+  workflowRunId: string | undefined;
+}) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
-  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
+  // Same caller-intent rule as the run hooks this forwards to; `??` here would
+  // resolve a cleared caller id back to the route's run.
+  const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
@@ -58,7 +62,7 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
         params.set("template", "true");
       }
       const { data } = await client.get(
-        `/workflows/${workflowPermanentId}/runs/${workflowRunId}/timeline`,
+        `/workflows/${workflowPermanentId}/runs/${encodeURIComponent(workflowRunId ?? "")}/timeline`,
         { params, signal },
       );
       // axios hands back the raw string when a 2xx body fails JSON.parse, so an

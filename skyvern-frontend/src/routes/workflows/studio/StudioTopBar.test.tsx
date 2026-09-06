@@ -17,18 +17,34 @@ import {
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-const { workflowRunQueryMock, saveWorkflowSpy } = vi.hoisted(() => ({
-  workflowRunQueryMock: vi.fn(),
-  saveWorkflowSpy: vi.fn(() => Promise.resolve()),
-}));
+const { workflowRunQueryMock, saveWorkflowSpy, getClientMock, realRunQuery } =
+  vi.hoisted(() => ({
+    workflowRunQueryMock: vi.fn(),
+    saveWorkflowSpy: vi.fn(() => Promise.resolve()),
+    getClientMock: vi.fn(),
+    // The identity cases drive the real query through a seeded cache; the rest
+    // only need a payload, so they keep the cheaper stub.
+    realRunQuery: { enabled: false },
+  }));
 
-vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: () => workflowRunQueryMock(),
-}));
+vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../hooks/useWorkflowRunWithWorkflowQuery")
+    >();
+  return {
+    useWorkflowRunWithWorkflowQuery: (
+      options?: Parameters<typeof actual.useWorkflowRunWithWorkflowQuery>[0],
+    ) =>
+      realRunQuery.enabled
+        ? actual.useWorkflowRunWithWorkflowQuery(options)
+        : workflowRunQueryMock(),
+  };
+});
 vi.mock("../editor/hooks/useSaveWorkflow", () => ({
   useSaveWorkflow: () => saveWorkflowSpy,
 }));
-vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
+vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
@@ -79,10 +95,13 @@ function LocationProbe() {
   );
 }
 
-function renderAt(path: string, element = <RunStopButton />) {
-  const queryClient = new QueryClient({
+function renderAt(
+  path: string,
+  element = <RunStopButton />,
+  queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  }),
+) {
   return render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={0}>
@@ -128,6 +147,7 @@ function locationState() {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  realRunQuery.enabled = false;
 });
 beforeEach(() => mockRun(Status.Running));
 
@@ -243,20 +263,6 @@ describe("RunStopButton concurrency with a live block run", () => {
   test("no focused run starts fresh", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
     renderAt("/workflows/wpid_1/studio");
-
-    fireEvent.click(screen.getByRole("button", { name: "Run" }));
-
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/agents/wpid_1/run",
-    );
-    expect(locationState()).toBeNull();
-  });
-
-  test("a stale prior run (id mismatches the URL) does not seed a rerun", () => {
-    // keepPreviousData can surface the previously focused run after the URL run
-    // clears/changes; its id no longer matches, so the button stays fresh.
-    mockRun(Status.Completed, { workflow_run_id: "wr_previous" });
-    renderAt("/workflows/wpid_1/studio?wr=wr_1");
 
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
@@ -526,5 +532,60 @@ describe("TitleSection title link + edit affordance", () => {
     expect(button.className).not.toContain("opacity-0");
     expect(button.className).toContain("hover:bg-slate-500/20");
     expect(button.className).not.toContain("border");
+  });
+});
+
+// Seeds the payload a run switch leaves behind: the response cached under the key
+// of the run now being requested, which is what keepPreviousData hands over.
+function seedRetained(
+  client: QueryClient,
+  requestedId: string,
+  runId: string,
+  status: Status,
+) {
+  client.setQueryData(["workflowRun", requestedId], {
+    workflow_run_id: runId,
+    status,
+    parameters: { query: "status report" },
+    task_v2: null,
+    workflow: { deleted_at: null },
+  });
+}
+
+function renderRealRunQueryAt(
+  path: string,
+  seed: (client: QueryClient) => void,
+) {
+  realRunQuery.enabled = true;
+  getClientMock.mockResolvedValue({ get: () => new Promise(() => {}) });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  seed(client);
+  return renderAt(path, <RunStopButton />, client);
+}
+
+describe("RunStopButton against a retained run payload", () => {
+  test("a run other than the one in view leaves no Stop and no rerun to seed", () => {
+    renderRealRunQueryAt("/workflows/wpid_1/studio?wr=wr_1", (client) =>
+      seedRetained(client, "wr_1", "wr_previous", Status.Running),
+    );
+
+    expect(screen.queryByRole("button", { name: /Stop/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+    expect(locationState()).toBeNull();
+  });
+
+  test("the run actually in view still offers Stop", () => {
+    renderRealRunQueryAt("/workflows/wpid_1/studio?wr=wr_1", (client) =>
+      seedRetained(client, "wr_1", "wr_1", Status.Running),
+    );
+
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
   });
 });

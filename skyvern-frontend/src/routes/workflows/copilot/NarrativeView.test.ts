@@ -11,7 +11,9 @@ import {
   hydrateHistoryNarrative,
   hydrateNarrativeFromPayload,
   mapBlockStatus,
+  terminalNarrativeText,
 } from "./narrativeState";
+
 import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
@@ -24,6 +26,61 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
+
+describe("terminalNarrativeText — budget expiry", () => {
+  it("keeps authored drain text unchanged", () => {
+    const turn = {
+      ...EMPTY_NARRATIVE,
+      terminal: "response" as const,
+      narrativeSummary: "Earlier build activity.",
+      terminalMessage: "I saved the useful draft.",
+      budgetExpiry: {
+        budgetExpired: true as const,
+        source: "deadline" as const,
+        reportProduced: true,
+        stagedDraftId: "wf_draft",
+        drainFingerprint: "drain-1",
+      },
+    };
+    expect(terminalNarrativeText(turn)).toBe("I saved the useful draft.");
+  });
+
+  it.each([
+    [
+      "deadline",
+      null,
+      "This turn reached its time limit without producing a report.",
+    ],
+    [
+      "max_turns",
+      null,
+      "This turn reached its model-call limit without producing a report.",
+    ],
+    [
+      "max_turns",
+      "wf_draft",
+      "This turn reached its model-call limit without producing a report. A draft was staged during this session.",
+    ],
+  ] as const)(
+    "renders honest no-report status for %s with draft %s",
+    (source, stagedDraftId, expected) => {
+      const turn: TurnNarrativeState = {
+        ...EMPTY_NARRATIVE,
+        terminal: "error",
+        proposalDisposition: "no_proposal",
+        narrativeSummary: "Earlier build activity.",
+        budgetExpiry: {
+          budgetExpired: true,
+          source,
+          reportProduced: false,
+          stagedDraftId,
+          drainFingerprint: "drain-2",
+        },
+      };
+      expect(terminalNarrativeText(turn)).toBe(expected);
+    },
+  );
+});
 
 const turnStart = (
   overrides: Partial<WorkflowCopilotTurnStartUpdate> = {},

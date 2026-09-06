@@ -63,7 +63,10 @@ function useActions({ id }: Props): {
   const { data: taskActions, isLoading: taskActionsIsLoading } = useQuery<
     Array<ActionsApiResponse>
   >({
-    queryKey: ["tasks", id, "actions"],
+    // The task's status is part of the answer: the poll is cancelled the instant the task query
+    // ticks to a terminal status, and the reader stays mounted through that, so without the status
+    // in the key the final actions the task wrote as it finished are never re-read.
+    queryKey: ["tasks", id, "actions", task?.status],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
@@ -78,7 +81,7 @@ function useActions({ id }: Props): {
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
   >({
-    queryKey: ["task", id, "steps"],
+    queryKey: ["task", id, "steps", task?.status],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client.get(`/tasks/${id}/steps`).then((response) => response.data);

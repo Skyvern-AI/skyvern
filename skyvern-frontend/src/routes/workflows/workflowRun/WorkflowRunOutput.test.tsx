@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   activeItem: null as unknown,
   workflowRun: null as unknown,
   timeline: [] as unknown,
+  timelineIsPlaceholder: false,
 }));
 
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
@@ -34,6 +35,7 @@ vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({
     data: mocks.timeline,
     isLoading: false,
+    isPlaceholderData: mocks.timelineIsPlaceholder,
   }),
 }));
 
@@ -127,6 +129,7 @@ beforeEach(() => {
   mocks.activeItem = null;
   mocks.workflowRun = null;
   mocks.timeline = [];
+  mocks.timelineIsPlaceholder = false;
 });
 
 afterEach(() => {
@@ -172,5 +175,21 @@ describe("WorkflowRunOutput", () => {
     expect(screen.getByText("null")).toBeDefined();
     expect(screen.queryByText("raw_code_output")).toBeNull();
     expect(screen.queryByText('"debug payload"')).toBeNull();
+  });
+});
+
+describe("WorkflowRunOutput with a retained timeline", () => {
+  it("renders no block output while the timeline still belongs to the previous run", () => {
+    mocks.timelineIsPlaceholder = true;
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_retained",
+      block_type: "code",
+      output: { extracted_information: { order_id: "ord_123" } },
+    });
+
+    const { container } = renderWorkflowRunOutput(block);
+
+    expect(container.textContent).toBe("");
+    expect(screen.queryByText('"ord_123"')).toBeNull();
   });
 });

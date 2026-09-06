@@ -9,11 +9,13 @@ import {
   applyNarrativeEvent,
   awaitsUserInput,
   hydrateNarrativeFromPayload,
+  hydrateHistoryNarrative,
   isBlockOk,
   isDeadlineHalt,
   notConfirmedOutcome,
   ranCleanOnCurrentSource,
 } from "./narrativeState";
+
 import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotRunOutcomeUpdate,
@@ -21,6 +23,44 @@ import {
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotTurnStartUpdate,
 } from "./workflowCopilotTypes";
+
+describe("budget expiry narrative", () => {
+  it("hydrates typed status from the terminal payload", () => {
+    const turn = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      terminal: "error",
+      budgetExpiry: {
+        budgetExpired: true,
+        source: "deadline",
+        reportProduced: false,
+        stagedDraftId: "wf_draft",
+        drainFingerprint: "drain-1",
+      },
+    });
+    expect(turn?.budgetExpiry).toEqual({
+      budgetExpired: true,
+      source: "deadline",
+      reportProduced: false,
+      stagedDraftId: "wf_draft",
+      drainFingerprint: "drain-1",
+    });
+  });
+
+  it("grafts persisted expiry facts when the narrative predates them", () => {
+    const turn = hydrateHistoryNarrative(
+      { turnId: "turn-1", terminal: "error" },
+      {
+        budget_expired: true,
+        budget_expiry_source: "max_turns",
+        budget_expiry_report_produced: false,
+        budget_expiry_staged_draft_id: "wf_draft",
+        drain_fingerprint: "drain-2",
+      },
+    );
+    expect(turn?.budgetExpiry?.source).toBe("max_turns");
+    expect(turn?.budgetExpiry?.drainFingerprint).toBe("drain-2");
+  });
+});
 
 const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
@@ -91,6 +131,7 @@ const envelopeFacts = (
   renderedFromEnvelope: false,
   runVerdict: null,
   runDisplayReason: null,
+  runId: null,
   ...facts,
 });
 
@@ -410,10 +451,10 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     })!;
     expect(withEnvelope.terminalEnvelope).toEqual({
       nextState: "stopped",
-      questionParts: [],
       renderedFromEnvelope: false,
       runVerdict: "not_demonstrated",
       runDisplayReason: "Checkout never reached confirmation.",
+      runId: null,
       runOutcomeRole: null,
       connectFailure: null,
     });
@@ -429,10 +470,10 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     })!;
     expect(question.terminalEnvelope).toEqual({
       nextState: "awaiting_user_input",
-      questionParts: [],
       renderedFromEnvelope: true,
       runVerdict: null,
       runDisplayReason: null,
+      runId: null,
       runOutcomeRole: null,
       connectFailure: null,
     });
@@ -464,10 +505,10 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     })!;
     expect(malformed.terminalEnvelope).toEqual({
       nextState: null,
-      questionParts: [],
       renderedFromEnvelope: false,
       runVerdict: null,
       runDisplayReason: null,
+      runId: null,
       runOutcomeRole: null,
       connectFailure: null,
     });
@@ -887,5 +928,30 @@ describe("canonical turn facts — pill and prose over one bundle", () => {
 
     expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+});
+
+describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
+  const BACKEND_AUTHORED_REASON =
+    "Stopped because a newer test in this chat took over the browser.";
+
+  it("shows the backend's run reason back verbatim after a reload", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      terminalEnvelope: {
+        run_verdict: "not_demonstrated",
+        run_display_reason: BACKEND_AUTHORED_REASON,
+        terminal_cause: "occupied",
+      },
+    });
+
+    expect(hydrated).toBeDefined();
+    const outcome = notConfirmedOutcome(hydrated!);
+    expect(outcome?.verdict).toBe("not_demonstrated");
+    expect(outcome?.displayReason).toBe(BACKEND_AUTHORED_REASON);
+    expect(outcome?.displayReason).not.toBe("Cancelled by user.");
   });
 });

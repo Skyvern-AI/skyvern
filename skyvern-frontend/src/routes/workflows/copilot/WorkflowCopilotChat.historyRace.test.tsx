@@ -8,12 +8,13 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+
+import type { QuestionInteraction } from "./workflowCopilotTypes";
 
 type HistoryData = {
+  question_interactions?: QuestionInteraction[];
+  pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
   chat_history: unknown[];
   proposed_workflow: Record<string, unknown> | null;
@@ -238,14 +239,12 @@ function chatUi(props: {
 }) {
   return (
     <FeatureFlagContext.Provider value={(name) => boolFlags.current[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat
-          docked={props.docked ?? false}
-          portalTarget={props.portalTarget}
-          requiresLiveBrowser={props.requiresLiveBrowser}
-          isLiveBrowserReady={props.isLiveBrowserReady}
-        />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat
+        docked={props.docked ?? false}
+        portalTarget={props.portalTarget}
+        requiresLiveBrowser={props.requiresLiveBrowser}
+        isLiveBrowserReady={props.isLiveBrowserReady}
+      />
     </FeatureFlagContext.Provider>
   );
 }
@@ -373,7 +372,7 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
 // load must keep one owner — footer while the bubble exists, else the chip.
 describe("WorkflowCopilotChat — queued prompt survives initial history load (item 2)", () => {
   it("keeps the queued status + Cancel visible after the history load lands", async () => {
-    boolFlags.current = { ENABLE_WORKFLOW_COPILOT_V2: true };
+    boolFlags.current = {};
     await renderChat({ requiresLiveBrowser: true, isLiveBrowserReady: false });
 
     // Queue while the initial history GET is still pending (isLoadingHistory).
@@ -581,6 +580,48 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
 
     await resolveNextHistory(recoveredHistory());
     expect(renderedText()).toContain(capturedAiText);
+  });
+
+  it("can answer a recovered first question whose chat id never arrived", async () => {
+    await startTurn(null);
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    const interaction: QuestionInteraction = {
+      interaction_id: "recovered-question",
+      turn_id: turnId,
+      tool_call_id: "call",
+      status: "pending",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "format",
+          prompt: "Which format?",
+          choices: [{ choice_id: "csv", text: "CSV" }],
+        },
+      ],
+    };
+    await resolveNextHistory({
+      ...recoveredHistory(),
+      chat_history: [],
+      question_interactions: [interaction],
+      pending_question_cancel_token: "stop",
+    });
+    cancelPost.mockResolvedValueOnce({
+      data: { ...interaction, status: "resolved", response: { skipped: true } },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/question-response",
+      {
+        workflow_copilot_chat_id: capturedHistory.workflow_copilot_chat_id,
+        interaction_id: "recovered-question",
+        skipped: true,
+      },
+    );
   });
 
   it("keeps polling while the only assistant row belongs to another turn", async () => {
@@ -1124,41 +1165,32 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
   });
 });
 
-// A mounted assertion, not a helper one. The adjacency helper has its own unit tests, but those
-// stay green if either QuestionPartsCard prop in the JSX reverts to raw messages[index + 1] —
-// verified by mutation, both reverts passed the whole suite. Only rendering the chat catches it.
-describe("WorkflowCopilotChat — question card survives a synthetic row", () => {
-  it("keeps the answer fields live when a lifecycle row lands after the ask", async () => {
+describe("WorkflowCopilotChat — question transport", () => {
+  it("hydrates the persisted question and routes the composer to its interaction", async () => {
     await renderChat();
     await flushHistory(
       historyData({
-        chat_history: [
-          aiHistoryMessage(
-            narrativePayload({
-              turnId: "turn-ask",
-              responseType: "ASK_QUESTION",
-              terminalMessage: "Which store?",
-              narrativeSummary: "Which store?",
-              terminalEnvelope: {
-                next_state: "awaiting_user_input",
-                rendered_from_envelope: true,
-                question_parts: [
-                  { part_id: "p1", prompt: "Which store?", choices: [] },
-                ],
-              },
-            }),
-            "Which store?",
-          ),
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "pending",
+            response: null,
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: null,
+            parts: [{ part_id: "part", prompt: "Which store?", choices: [] }],
+          },
         ],
+        pending_question_cancel_token: "cancel",
+        chat_history: [],
       }),
     );
-
-    // The card's own field, distinct from the composer textarea.
     await waitFor(() =>
-      expect(screen.getByLabelText("Which store?")).toBeTruthy(),
+      expect(
+        screen.getByRole("textbox", { name: "Your response" }),
+      ).toBeTruthy(),
     );
-
-    // A run-lifecycle row is synthetic; it is not the user answering.
     await act(async () => {
       announceRef.current?.({
         id: "lifecycle-1",
@@ -1166,22 +1198,31 @@ describe("WorkflowCopilotChat — question card survives a synthetic row", () =>
         content: "Run started",
         kind: "run_lifecycle",
       });
-      await Promise.resolve();
     });
-
-    expect(screen.getByLabelText("Which store?")).toBeTruthy();
-
-    // Now the real answer arrives AFTER the synthetic row. With raw adjacency the synthetic row
-    // is what the card reads, so no receipt renders and the user's answer is lost from the card.
+    cancelPost.mockResolvedValueOnce({
+      data: {
+        interaction_id: "interaction",
+        turn_id: "turn-ask",
+        tool_call_id: "call",
+        status: "resolved",
+        parts: [],
+        response: { text: "why do you need this?" },
+      },
+    });
     const composer = screen.getByPlaceholderText("Answer Copilot…");
-    fireEvent.change(composer, {
-      target: { value: "Which store? — acme.example" },
-    });
+    fireEvent.change(composer, { target: { value: "why do you need this?" } });
     await act(async () => {
       fireEvent.keyDown(composer, { key: "Enter" });
-      await Promise.resolve();
     });
-
-    await waitFor(() => expect(screen.getByText("acme.example")).toBeTruthy());
+    await waitFor(() => expect(cancelPost).toHaveBeenCalled());
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(cancelPost.mock.calls[0]?.[0]).toBe(
+      "/workflow/copilot/question-response",
+    );
+    expect(cancelPost.mock.calls[0]?.[1]).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+      interaction_id: "interaction",
+      text: "why do you need this?",
+    });
   });
 });

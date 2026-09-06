@@ -8,14 +8,14 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
+  code_block?: boolean | null;
   message: string;
+  mode?: string | null;
   workflow_run_id?: string | null;
+  product_action?: string | null;
 };
 type StreamCall = {
   body: StreamBody;
@@ -142,36 +142,32 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import type { CopilotProductAction } from "./workflowCopilotTypes";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
-  ENABLE_WORKFLOW_COPILOT_V2: true,
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
 };
 
 type ChatProps = {
   workflowRunId?: string | null;
+  initialAction?: CopilotProductAction;
+  requiresLiveBrowser?: boolean;
+  isLiveBrowserReady?: boolean;
+  liveBrowserSessionId?: string | null;
 };
 
 function chatUi(props: ChatProps) {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat {...props} />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat {...props} />
     </FeatureFlagContext.Provider>
   );
 }
 
 async function renderChat(props: ChatProps = {}) {
   const view = render(chatUi(props));
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(
-        /Message Skyvern Copilot|Ask Copilot to build/,
-      ),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -198,6 +194,8 @@ beforeEach(() => {
     workflowPermanentId: "wpid_1",
     workflowRunId: undefined,
   };
+  BOOLEAN_FLAGS.WORKFLOW_COPILOT_CODE_BLOCK_MODE = false;
+  BOOLEAN_FLAGS.CODE_BLOCK_ACCESS = false;
 });
 
 afterEach(() => {
@@ -223,6 +221,134 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_prop_123");
+  });
+
+  it("opens a diagnose_run turn from a typed action, with no user bubble", async () => {
+    await renderChat({
+      workflowRunId: "wr_prop_123",
+      initialAction: {
+        kind: "diagnose_run",
+        workflowRunId: "wr_clicked",
+        nonce: "n1",
+      },
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.product_action).toBe("diagnose_run");
+    expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_clicked");
+    expect(streamCalls[0]?.body.message.trim()).not.toBe("");
+    const echoed = screen.getByText(streamCalls[0]!.body.message);
+    expect(echoed.closest('[role="status"]')).not.toBeNull();
+  });
+
+  it("keeps code authoring enabled for a typed diagnose action on a code workflow", async () => {
+    BOOLEAN_FLAGS.WORKFLOW_COPILOT_CODE_BLOCK_MODE = true;
+    BOOLEAN_FLAGS.CODE_BLOCK_ACCESS = true;
+    const view = await renderChat();
+    expect(
+      screen.getByRole("button", { name: "Switch mode" }).textContent,
+    ).toContain("Build with code");
+
+    view.rerender(
+      chatUi({
+        initialAction: {
+          kind: "diagnose_run",
+          workflowRunId: "wr_clicked",
+          nonce: "n1",
+        },
+      }),
+    );
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.product_action).toBe("diagnose_run");
+    expect(streamCalls[0]?.body.mode).toBe("build");
+    expect(streamCalls[0]?.body.code_block).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "Switch mode" }).textContent,
+    ).toContain("Build with code");
+  });
+
+  it("re-fires on a new action nonce", async () => {
+    const view = await renderChat({
+      initialAction: {
+        kind: "diagnose_run",
+        workflowRunId: "wr_1",
+        nonce: "n1",
+      },
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]?.resolve();
+    });
+
+    view.rerender(
+      chatUi({
+        initialAction: {
+          kind: "diagnose_run",
+          workflowRunId: "wr_2",
+          nonce: "n2",
+        },
+      }),
+    );
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    expect(streamCalls[1]?.body.workflow_run_id).toBe("wr_2");
+    expect(streamCalls[1]?.body.product_action).toBe("diagnose_run");
+  });
+
+  it("still posts the typed action when the live browser was not ready yet", async () => {
+    const props: ChatProps = {
+      initialAction: {
+        kind: "diagnose_run",
+        workflowRunId: "wr_queued",
+        nonce: "n1",
+      },
+      requiresLiveBrowser: true,
+      isLiveBrowserReady: false,
+    };
+    const view = render(chatUi(props));
+    await waitFor(() =>
+      expect(
+        screen.getByText("Diagnose run wr_queued and repair the workflow."),
+      ).toBeTruthy(),
+    );
+    expect(
+      screen.getByText("Prompt queued. Waiting for live browser..."),
+    ).toBeTruthy();
+    expect(postStreaming).not.toHaveBeenCalled();
+
+    view.rerender(
+      chatUi({
+        ...props,
+        isLiveBrowserReady: true,
+        liveBrowserSessionId: "pbs_1",
+      }),
+    );
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.product_action).toBe("diagnose_run");
+    expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_queued");
+  });
+
+  it("renders a persisted product row as an event line, not a user bubble", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat_1",
+      chat_history: [
+        {
+          sender: "product",
+          content: "Diagnose run wr_1 and repair the workflow.",
+          created_at: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    await renderChat({});
+
+    const row = await screen.findByText(
+      "Diagnose run wr_1 and repair the workflow.",
+    );
+    expect(row.closest('[role="status"]')).not.toBeNull();
   });
 
   it("falls back to the route param when no prop is given", async () => {

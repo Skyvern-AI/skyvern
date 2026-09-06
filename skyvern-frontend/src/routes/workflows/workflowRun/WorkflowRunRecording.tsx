@@ -1,13 +1,31 @@
 import { usePostHog } from "posthog-js/react";
 import { ArtifactVideo } from "@/components/ArtifactVideo";
+import { AspectRatio } from "@/components/ui/aspect-ratio";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useFirstParam } from "@/hooks/useFirstParam";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRecordingUrls } from "./recordingUrls";
 
 function WorkflowRunRecording() {
   const postHog = usePostHog();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const {
+    data: workflowRun,
+    isLoading,
+    isPlaceholderData: runIsPlaceholder,
+  } = useWorkflowRunWithWorkflowQuery();
 
   const recordingUrls = getRecordingUrls(workflowRun);
+
+  // isPlaceholderData stays true for as long as the query is disabled, so without
+  // the run-id term a cleared run leaves the skeleton up permanently.
+  if (isLoading || (Boolean(workflowRunId) && runIsPlaceholder)) {
+    return (
+      <AspectRatio ratio={16 / 9}>
+        <Skeleton className="h-full w-full" />
+      </AspectRatio>
+    );
+  }
 
   if (!workflowRun || recordingUrls.length === 0) {
     if (workflowRun?.recording_archived) {

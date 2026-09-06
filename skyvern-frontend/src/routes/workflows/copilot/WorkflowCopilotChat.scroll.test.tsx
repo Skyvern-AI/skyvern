@@ -82,9 +82,7 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 async function renderChat() {
   render(<WorkflowCopilotChat />);
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
 }
 
 beforeEach(() => {

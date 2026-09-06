@@ -64,7 +64,6 @@ import { useStudioPanes } from "../useStudioPanes";
 import { collectBlockPrompts } from "./blockPrompts";
 import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
 import { matchFailureTips } from "./failureTips";
-import { buildRunFixMessage } from "./runFixMessage";
 import { RunInputsSection, type RunInputMeta } from "./RunInputsSection";
 import {
   RunOutputsSection,
@@ -87,7 +86,7 @@ type RunViewProps = {
   // The caller is still resolving which run to show; keep the placeholder in its
   // loading state rather than flashing the "no run yet" empty state.
   runIdPending?: boolean;
-  onFix?: (seedMessage?: string, failingLabel?: string | null) => void;
+  onFix?: (failingLabel?: string | null) => void;
   onRetry?: () => void;
   milestoneRerun?: WorkflowRunMilestoneCardProps["rerun"];
 };
@@ -204,7 +203,7 @@ export function RunView({
 }: RunViewProps) {
   const { workflowRunMilestoneCard: WorkflowRunMilestoneCard } = usePageSlots();
   const { runId: pathRunId } = useParams();
-  const queryOptions = workflowRunId ? { workflowRunId } : undefined;
+  const queryOptions = { workflowRunId };
   // isLoading here, not isPending like RunTab: this query is enabled only once a run
   // id exists, so a disabled query means "no run" → fall through to the empty CTA.
   const {
@@ -213,8 +212,12 @@ export function RunView({
     isPlaceholderData: runIsPlaceholder,
     isError: statusUnavailable,
   } = useWorkflowRunWithWorkflowQuery(queryOptions);
-  const { data: timeline, isPlaceholderData: timelineIsPlaceholder } =
+  const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
     useWorkflowRunTimelineQuery(queryOptions);
+  // The timeline payload carries no run id of its own, so keepPreviousData serves
+  // the previous run's timeline on both a switch and a clear.
+  const timeline =
+    !workflowRunId || timelineIsPlaceholder ? undefined : retainedTimeline;
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
@@ -326,7 +329,13 @@ export function RunView({
   const outcome = runOutcomeFromStatus(workflowRun?.status);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
-  const failed = !statusUnavailable && outcome === "failed" && !canceled;
+  // While a run switch is still serving the previous payload, this status belongs to the old run
+  // but the id in scope is the new one — acting on the pair posts a run that has not failed.
+  const failed =
+    !statusUnavailable &&
+    !runIsPlaceholder &&
+    outcome === "failed" &&
+    !canceled;
   const finalized =
     !statusUnavailable && workflowRun ? statusIsFinalized(workflowRun) : false;
   useLiveClock(Boolean(workflowRun) && !finalized && !statusUnavailable);
@@ -486,11 +495,6 @@ export function RunView({
     pinFrame,
   ]);
 
-  const fixSeedMessage = useMemo(
-    () => buildRunFixMessage(workflowRun?.failure_reason ?? null),
-    [workflowRun?.failure_reason],
-  );
-
   const extractedInformation = useMemo<Record<string, unknown> | null>(() => {
     const outputs = workflowRun?.outputs;
     return isRecord(outputs) && "extracted_information" in outputs
@@ -598,7 +602,12 @@ export function RunView({
   if (!workflowRun) {
     return (
       <RunPlaceholder
-        loading={isLoading || runIdPending || statusUnavailable}
+        loading={
+          isLoading ||
+          runIdPending ||
+          statusUnavailable ||
+          (Boolean(workflowRunId) && runIsPlaceholder)
+        }
       />
     );
   }
@@ -652,7 +661,7 @@ export function RunView({
     <FailureRecoveryActions
       onFix={
         onFix && hasFixAction
-          ? () => onFix(fixSeedMessage, failedBlock?.label ?? null)
+          ? () => onFix(failedBlock?.label ?? null)
           : undefined
       }
       onRetry={onRetry}
@@ -670,7 +679,6 @@ export function RunView({
       {WorkflowRunMilestoneCard &&
       runPaneOpen &&
       !runIsPlaceholder &&
-      workflowRun.workflow_run_id === workflowRunId &&
       workflowRun.status === Status.Completed ? (
         <WorkflowRunMilestoneCard
           workflowRunId={workflowRun.workflow_run_id}

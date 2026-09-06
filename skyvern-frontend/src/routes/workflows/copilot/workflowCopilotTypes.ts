@@ -3,7 +3,12 @@ import {
   WorkflowDefinition,
 } from "@/routes/workflows/types/workflowTypes";
 
-export type WorkflowCopilotChatSender = "user" | "ai";
+export type WorkflowCopilotChatSender = "user" | "ai" | "product";
+export type CopilotProductAction = {
+  kind: "diagnose_run";
+  workflowRunId: string;
+  nonce: string;
+};
 export type ProposalDisposition =
   | "no_proposal"
   | "auto_applicable"
@@ -11,12 +16,52 @@ export type ProposalDisposition =
   | "review_tested";
 export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
-// One thing a terminal ASK_QUESTION asks. `choices` is what the model offered,
-// never the set of answers accepted: the composer always takes free-form text.
+export interface QuestionChoice {
+  choice_id: string;
+  text: string;
+}
+
 export interface QuestionPart {
   part_id: string;
   prompt: string;
-  choices: string[];
+  choices: QuestionChoice[];
+}
+
+export interface QuestionAnswer {
+  part_id: string;
+  choice_id?: string | null;
+  text?: string | null;
+}
+
+export interface QuestionResponse {
+  answers?: QuestionAnswer[];
+  text?: string | null;
+  skipped?: boolean;
+}
+
+export interface QuestionInteraction {
+  interaction_id: string;
+  turn_id: string;
+  tool_call_id: string;
+  parts: QuestionPart[];
+  status: "pending" | "resolved" | "cancelled" | "interrupted";
+  response: QuestionResponse | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface WorkflowCopilotQuestionRequired {
+  type: "question_required";
+  turn_id: string;
+  workflow_copilot_chat_id: string;
+  interactions: QuestionInteraction[];
+  cancel_token: string | null;
+}
+
+export interface WorkflowCopilotQuestionResolved {
+  type: "question_resolved";
+  interaction: QuestionInteraction;
+  continued: boolean;
 }
 
 export interface ConnectedAccountChoice {
@@ -24,6 +69,14 @@ export interface ConnectedAccountChoice {
   name: string;
   state: string;
   email_address?: string | null;
+}
+
+export interface BudgetExpiryOutcome {
+  budget_expired?: boolean;
+  budget_expiry_source?: "deadline" | "max_turns" | null;
+  budget_expiry_report_produced?: boolean | null;
+  budget_expiry_staged_draft_id?: string | null;
+  drain_fingerprint?: string | null;
 }
 
 export interface WorkflowCopilotChat {
@@ -46,6 +99,7 @@ export interface WorkflowCopilotChatMessage {
 }
 
 export interface WorkflowCopilotChatRequest {
+  selected_connected_account_id?: string | null;
   workflow_permanent_id: string;
   workflow_id: string;
   workflow_copilot_chat_id?: string | null;
@@ -54,7 +108,7 @@ export interface WorkflowCopilotChatRequest {
   message: string;
   audio_artifact_id?: string | null;
   workflow_yaml: string;
-  mode?: "ask" | "build" | null;
+  mode?: "build" | null;
   code_block?: boolean | null;
   cancel_token?: string;
   idempotency_key?: string | null;
@@ -63,10 +117,11 @@ export interface WorkflowCopilotChatRequest {
   // sent — context for "this block" references, never a directive.
   selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
-  product_action?: "test_end_to_end" | null;
+  product_action?: "test_end_to_end" | "diagnose_run" | null;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
+  supports_question_tool?: boolean;
 }
 
 export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";
@@ -83,18 +138,22 @@ export interface WorkflowCopilotChatHistoryMessage {
   created_at: string;
   // Typed turn outcome persisted on assistant rows; optional so the FE
   // tolerates an older backend that does not serve it.
-  turn_outcome?: {
-    response_kind?: string | null;
-    connected_account_choices?: ConnectedAccountChoice[] | null;
-    // Server-minted id of the turn that wrote this row; the same id the
-    // turn_start frame carries, so a client can correlate a row to its own send.
-    copilot_turn_id?: string | null;
-    terminal_reason?: string | null;
-  } | null;
+  turn_outcome?:
+    | (BudgetExpiryOutcome & {
+        response_kind?: string | null;
+        connected_account_choices?: ConnectedAccountChoice[] | null;
+        // Server-minted id of the turn that wrote this row; the same id the
+        // turn_start frame carries, so a client can correlate a row to its own send.
+        copilot_turn_id?: string | null;
+        terminal_reason?: string | null;
+      })
+    | null;
   narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotChatHistoryResponse {
+  question_interactions?: QuestionInteraction[];
+  pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
@@ -144,7 +203,8 @@ export type WorkflowCopilotStreamMessageType =
   | "design_end"
   | "workflow_draft"
   | "title_update"
-  | "credential_required";
+  | "credential_required"
+  | "question_required";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";

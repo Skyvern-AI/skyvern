@@ -8,10 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
   message: string;
@@ -160,7 +157,6 @@ import { COPILOT_ACK_LINES } from "./NarrativeView";
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
-  ENABLE_WORKFLOW_COPILOT_V2: true,
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
 };
@@ -168,22 +164,14 @@ const BOOLEAN_FLAGS: Record<string, boolean> = {
 function chatUi() {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>
   );
 }
 
 async function renderChat() {
   const view = render(chatUi());
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(
-        /Message Skyvern Copilot|Ask Copilot to build/,
-      ),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -271,13 +259,13 @@ describe("WorkflowCopilotChat — instant acknowledgement", () => {
     expect(screen.getAllByRole("status")).toHaveLength(1);
   });
 
-  it("REGRESSION: an Ask reply clears the placeholder when the turn completes", async () => {
+  it("REGRESSION: a narrative-less reply clears the placeholder when the turn completes", async () => {
     await renderChat();
     await submit("what does this workflow do?");
     expectSomeAckLine();
 
-    // Ask turns emit no narrative frames; the placeholder clears when the turn
-    // completes (isLoading falls) as the plain reply lands.
+    // Compatibility responses can emit no narrative frames; the placeholder
+    // clears when the turn completes as the plain reply lands.
     await completeStream(0, "It **scrapes** headlines.");
 
     expect(screen.getByText("scrapes", { selector: "strong" })).toBeTruthy();

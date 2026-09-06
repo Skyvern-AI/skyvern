@@ -4324,6 +4324,68 @@ function getAvailableOutputParameterKeys(
   return outputParameterKeys;
 }
 
+// Mirrors google_drive_service.extract_file_reference, which accepts a bare file id as
+// well as a Drive URL, and lowercases the host before comparing it. A templated URL can
+// still resolve to a Drive link at run time, so treat it as a maybe.
+const bareDriveFileId = /^[A-Za-z0-9_-]+$/;
+
+function urlMayBeGoogleDrive(url: string): boolean {
+  const candidate = url.trim();
+  return (
+    candidate.toLowerCase().includes("drive.google.com") ||
+    candidate.includes("{{") ||
+    bareDriveFileId.test(candidate)
+  );
+}
+
+// Mirrors the blocks in block.py that actually reach BaseTaskBlock.execute and so leave
+// a browser page behind. Subclassing BaseTaskBlock is not enough on its own, so two of
+// them are absent: HumanInteractionBlock overrides execute and never calls up, and
+// ValidationBlock terminates at task order 0 rather than running — and when it is not
+// first, whatever browser block preceded it already answers this question.
+function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
+  switch (node.type) {
+    case "task":
+    case "action":
+    case "extraction":
+    case "login":
+    case "url":
+      return true;
+    case "fileDownload":
+      // A Drive source download is fetched through the Drive API and skips
+      // super().execute entirely, so it leaves no page for a later block to
+      // start from. A maybe counts as the Drive path, which keeps the warning.
+      return !(
+        node.data.downloadTarget !== "website" &&
+        Boolean(node.data.googleCredentialId) &&
+        urlMayBeGoogleDrive(node.data.url)
+      );
+    case "navigation":
+      return node.data.engine !== RunEngine.SkyvernV2;
+    case "loop":
+    case "conditional":
+      // A container itself navigates nothing; its children do.
+      return nodes.some(
+        (child) =>
+          child.parentId === node.id && leavesBrowserState(child, nodes),
+      );
+    default:
+      return false;
+  }
+}
+
+function isFirstBrowserTaskBlock(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  return !getPreviousNodeIds(nodes, edges, id).some((nodeId) => {
+    const node = nodes.find((node) => node.id === nodeId);
+    if (!node) return false;
+    return leavesBrowserState(node, nodes);
+  });
+}
+
 function convertParametersToParameterYAML(
   parameters: Array<Exclude<Parameter, OutputParameter>>,
 ): Array<ParameterYAML> {
@@ -5433,6 +5495,8 @@ export {
   getNestingLevel,
   getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
+  isFirstBrowserTaskBlock,
+  urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,

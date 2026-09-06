@@ -6,45 +6,58 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import type { ComponentProps } from "react";
+import type { QuestionInteraction } from "./workflowCopilotTypes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { Status } from "@/api/types";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
-type StreamBody = { message: string; idempotency_key?: string | null };
+type StreamBody = {
+  message: string;
+  mode?: "build";
+  idempotency_key?: string | null;
+  selected_connected_account_id?: string | null;
+};
 type StreamCall = {
   body: StreamBody;
   onMessage: (payload: unknown) => boolean;
   resolve: () => void;
 };
 
-const { streamCalls, postStreaming, historyResponse } = vi.hoisted(() => {
-  const calls: StreamCall[] = [];
-  const streaming = vi.fn(
-    (
-      _path: string,
-      body: StreamBody,
-      onMessage: (payload: unknown) => boolean,
-    ) =>
-      new Promise<void>((resolve) => {
-        calls.push({ body, onMessage, resolve });
-      }),
-  );
-  return {
-    streamCalls: calls,
-    postStreaming: streaming,
-    historyResponse: {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as unknown[],
-        proposed_workflow: null,
-        auto_accept: false,
+const { streamCalls, postStreaming, historyResponse, workflowRunQueryMock } =
+  vi.hoisted(() => {
+    const calls: StreamCall[] = [];
+    const streaming = vi.fn(
+      (
+        _path: string,
+        body: StreamBody,
+        onMessage: (payload: unknown) => boolean,
+      ) =>
+        new Promise<void>((resolve) => {
+          calls.push({ body, onMessage, resolve });
+        }),
+    );
+    return {
+      streamCalls: calls,
+      postStreaming: streaming,
+      historyResponse: {
+        data: {
+          workflow_copilot_chat_id: null as string | null,
+          chat_history: [] as unknown[],
+          proposed_workflow: null,
+          auto_accept: false,
+        } as {
+          workflow_copilot_chat_id: string | null;
+          chat_history: unknown[];
+          proposed_workflow: null;
+          auto_accept: boolean;
+          question_interactions?: QuestionInteraction[];
+        },
       },
-    },
-  };
-});
+      workflowRunQueryMock: vi.fn(),
+    };
+  });
 
 vi.mock("posthog-js/react", () => ({ useFeatureFlagEnabled: () => true }));
 vi.mock("@/api/sse", () => ({
@@ -76,6 +89,23 @@ vi.mock("react-router-dom", async (importOriginal) => {
     }),
   };
 });
+
+vi.mock("./cards/GoogleReconnectCard", () => ({
+  GoogleReconnectCard: ({
+    disabled,
+    onSelect,
+  }: {
+    disabled?: boolean;
+    onSelect?: (id: string) => void;
+  }) => (
+    <div>
+      Connection notice
+      <button disabled={disabled} onClick={() => onSelect?.("goac_notice")}>
+        Select notice account
+      </button>
+    </div>
+  ),
+}));
 
 const saveData = {
   title: "Test WF",
@@ -113,7 +143,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
 }));
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
-  useWorkflowRunQuery: () => ({ data: undefined }),
+  useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
+    workflowRunQueryMock(options),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
@@ -153,15 +184,18 @@ function narrativePayload(includeChoices = true) {
   };
 }
 
-async function renderChat() {
-  render(
+function chatElement(props: ComponentProps<typeof WorkflowCopilotChat> = {}) {
+  return (
     <FeatureFlagContext.Provider value={() => false}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
-    </FeatureFlagContext.Provider>,
+      <WorkflowCopilotChat {...props} />
+    </FeatureFlagContext.Provider>
   );
+}
+
+async function renderChat() {
+  const view = render(chatElement());
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+  return view;
 }
 
 async function submit(message: string) {
@@ -198,11 +232,157 @@ beforeEach(() => {
     proposed_workflow: null,
     auto_accept: false,
   };
+  workflowRunQueryMock.mockReset();
+  workflowRunQueryMock.mockReturnValue({ data: undefined });
 });
 
 afterEach(cleanup);
 
 describe("WorkflowCopilotChat connected account choices", () => {
+  it("renders a readable receipt from notice-only account metadata", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      proposed_workflow: null,
+      auto_accept: false,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Connect",
+          created_at: "2026-08-15T00:00:01Z",
+          narrative_payload: {
+            ...narrativePayload(false),
+            googleConnectionNotices: [
+              {
+                provider: "google",
+                connectionId: null,
+                condition: "unbound",
+                choices,
+              },
+            ],
+          },
+        },
+        {
+          sender: "user",
+          content: "goac_1",
+          created_at: "2026-08-15T00:00:02Z",
+        },
+      ],
+    };
+    await renderChat();
+    expect(
+      screen.getByText("Selected Google Sheets — Connection …goac_1"),
+    ).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    "preserves the question alongside an unbound notice (account question: %s)",
+    async (accountQuestion) => {
+      historyResponse.data = {
+        workflow_copilot_chat_id: "chat-1",
+        proposed_workflow: null,
+        auto_accept: false,
+        question_interactions: [
+          {
+            interaction_id: "range-question",
+            turn_id: "turn-choice",
+            tool_call_id: "ask-range",
+            status: "pending",
+            response: null,
+            created_at: "2026-08-15T00:00:01Z",
+            resolved_at: null,
+            parts: [
+              {
+                part_id: "range",
+                prompt: "Which range?",
+                choices: [
+                  { choice_id: "a", text: "Column A" },
+                  { choice_id: "b", text: "Column B" },
+                ],
+              },
+            ],
+          },
+        ],
+        chat_history: [
+          {
+            sender: "ai",
+            content: "Please choose",
+            created_at: "2026-08-15T00:00:01Z",
+            narrative_payload: {
+              ...narrativePayload(accountQuestion),
+              googleConnectionNotices: [
+                {
+                  provider: "google",
+                  connectionId: null,
+                  condition: "unbound",
+                  choices: [],
+                },
+              ],
+            },
+          },
+        ],
+      };
+      await renderChat();
+      expect(screen.getByText("Connection notice")).toBeTruthy();
+      expect(screen.getByText("Which range?")).toBeTruthy();
+      expect(
+        screen.getByText(
+          "Answer or cancel the pending question before choosing a Google account.",
+        ),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", {
+          name: "Select notice account",
+        }).disabled,
+      ).toBe(true);
+      if (accountQuestion) {
+        expect(screen.getByText("Choose a Google account")).toBeTruthy();
+        expect(
+          screen.getByRole<HTMLButtonElement>("button", {
+            name: /Connection …goac_1/,
+          }).disabled,
+        ).toBe(true);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "preserves queued picker selection unless the user replaces its text (%s)",
+    async (replaceText) => {
+      const view = await renderChat();
+      await finishChoiceAsk();
+      view.rerender(
+        chatElement({ requiresLiveBrowser: true, isLiveBrowserReady: false }),
+      );
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: /Connection …goac_1/ }),
+        );
+      });
+      expect(postStreaming).toHaveBeenCalledTimes(1);
+      if (replaceText) await submit("Read a different sheet");
+      view.rerender(
+        chatElement({
+          requiresLiveBrowser: true,
+          isLiveBrowserReady: true,
+          liveBrowserSessionId: "pbs_ready",
+        }),
+      );
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+      expect(streamCalls[1]?.body.message).toBe(
+        replaceText ? "Read a different sheet" : "goac_1",
+      );
+      expect(streamCalls[1]?.body.selected_connected_account_id).toBe(
+        replaceText ? null : "goac_1",
+      );
+      expect(streamCalls[1]?.body.mode).toBe("build");
+      if (replaceText) expect(streamCalls[1]?.body.idempotency_key).toBeNull();
+      else
+        expect(streamCalls[1]?.body.idempotency_key).toMatch(
+          /^connected-account:/,
+        );
+    },
+  );
+
   it("renders canonical rows and sends one exact active id despite a same-tick double click", async () => {
     await renderChat();
     await finishChoiceAsk();
@@ -219,6 +399,8 @@ describe("WorkflowCopilotChat connected account choices", () => {
 
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(streamCalls[1]?.body.message).toBe("goac_1");
+    expect(streamCalls[1]?.body.selected_connected_account_id).toBe("goac_1");
+    expect(streamCalls[1]?.body.mode).toBe("build");
     expect(streamCalls[1]?.body.idempotency_key).toMatch(
       /^connected-account:turn-choice:goac_1:[0-9a-f-]{36}$/,
     );
@@ -328,6 +510,7 @@ describe("WorkflowCopilotChat connected account choices", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     const secondKey = streamCalls[0]?.body.idempotency_key;
 
+    expect(streamCalls[0]?.body.mode).toBe("build");
     expect(firstKey).toMatch(
       /^connected-account:turn-choice:goac_1:[0-9a-f-]{36}$/,
     );
@@ -506,5 +689,81 @@ describe("WorkflowCopilotChat connected account choices", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.message).toBe("ordinary free text");
     expect(screen.queryByLabelText("Connected Google accounts")).toBeNull();
+  });
+
+  // A run_lifecycle / status_notice row is synthetic — never an answer. When one
+  // trails the account-choice ask, raw messages[index + 1] read it as the user's
+  // pick, disabling the still-live picker and pointing the receipt at a line no
+  // user wrote. The account card must derive adjacency from the same
+  // lifecycle-aware seam the parts card uses.
+  it("keeps the account picker live across a trailing run_lifecycle row and still reads the receipt from the real selection", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      proposed_workflow: null,
+      auto_accept: false,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Which account should I use?",
+          created_at: "2026-08-15T00:00:01Z",
+          narrative_payload: narrativePayload(false),
+          turn_outcome: {
+            response_kind: "clarify",
+            connected_account_choices: choices,
+          },
+        },
+      ],
+    };
+    // A docked chat focused on a live run appends a synthetic run_lifecycle row
+    // right after the ask via useRunLifecycleAnnouncements.
+    workflowRunQueryMock.mockReturnValue({
+      data: {
+        workflow_run_id: "wr_1",
+        status: Status.Running,
+        created_at: "2026-08-15T00:00:00Z",
+        started_at: null,
+        finished_at: null,
+        outputs: null,
+        failure_reason: null,
+      },
+    });
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    render(
+      <FeatureFlagContext.Provider value={() => false}>
+        <WorkflowCopilotChat
+          docked
+          portalTarget={portalTarget}
+          workflowRunId="wr_1"
+        />
+      </FeatureFlagContext.Provider>,
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Connection …goac_1/ }),
+      ).toBeTruthy(),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("Run started — watching it now.")).toBeTruthy(),
+    );
+
+    const row = screen.getByRole<HTMLButtonElement>("button", {
+      name: /Connection …goac_1/,
+    });
+    expect(row.disabled).toBe(false);
+
+    fireEvent.click(row);
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.message).toBe("goac_1");
+    await waitFor(() => expect(screen.getByText("Selected")).toBeTruthy());
+    // The selection bubble sits after the synthetic row, so its friendly receipt
+    // must resolve across it — the transcript must never expose the raw id.
+    await waitFor(() =>
+      expect(
+        screen.getByText("Selected Google Sheets — Connection …goac_1"),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByText("goac_1")).toBeNull();
   });
 });

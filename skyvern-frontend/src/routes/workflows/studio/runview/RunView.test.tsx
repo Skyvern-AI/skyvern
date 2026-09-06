@@ -1080,7 +1080,7 @@ describe("RunView failure presentation", () => {
     expect(within(container).queryByRole("alert")).toBeNull();
   });
 
-  test("Fix passes the failing block's label alongside the seed message", () => {
+  test("Fix passes the failing block's label", () => {
     seedCompletedRun({
       status: Status.Failed,
       failure_reason: "Login page rejected the credentials",
@@ -1101,7 +1101,21 @@ describe("RunView failure presentation", () => {
       within(container).getByRole("button", { name: "Fix with Copilot" }),
     );
 
-    expect(onFix.mock.calls[0]?.[1]).toBe("checkout");
+    expect(onFix.mock.calls[0]?.[0]).toBe("checkout");
+  });
+
+  test("offers no repair while the previous run's payload is still on screen", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Login page rejected the credentials",
+    });
+    mocks.isPlaceholderData = true;
+
+    const { container } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
+
+    expect(
+      within(container).queryByRole("button", { name: "Fix with Copilot" }),
+    ).toBeNull();
   });
 
   test("keeps the technical detail one hover away from the headline", () => {
@@ -1869,5 +1883,51 @@ describe("RunView output signals", () => {
     expect(runView.queryByText("22.9k")).toBeNull();
 
     copilotPortal.remove();
+  });
+});
+
+describe("a run whose payload is still withheld", () => {
+  test("shows the loading placeholder instead of the empty-run CTA", () => {
+    mocks.isPlaceholderData = true;
+    const { container } = renderRunView();
+
+    expect(container.textContent).toContain("Workflow run is loading\u2026");
+    expect(container.textContent).not.toContain(
+      "Run the workflow to watch it live here.",
+    );
+  });
+
+  test("still states the empty-run CTA when no run is being loaded", () => {
+    const { container } = renderRunView();
+
+    expect(container.textContent).toContain(
+      "Run the workflow to watch it live here.",
+    );
+  });
+
+  test("does not paint a retained timeline from the previous run", () => {
+    // The timeline payload carries no run id, so the identity select cannot reach
+    // it — a run switch serves the prior run's rows alongside the new run.
+    seedCompletedRun();
+    mocks.timeline = [
+      buildBlockItem(buildBlock({ label: "PreviousRunBlock" })),
+    ];
+    mocks.isPlaceholderData = true;
+    const { container } = renderRunView();
+
+    expect(container.textContent).not.toContain("PreviousRunBlock");
+  });
+
+  test("states the empty-run CTA once the requested run id is cleared", () => {
+    // A disabled query never fetches again, so isPlaceholderData stays true for
+    // as long as the pane is mounted. Without the run-id term the placeholder
+    // would hold the pane on "loading" permanently.
+    mocks.isPlaceholderData = true;
+    const { container } = renderRunView({ workflowRunId: undefined });
+
+    expect(container.textContent).toContain(
+      "Run the workflow to watch it live here.",
+    );
+    expect(container.textContent).not.toContain("Workflow run is loading…");
   });
 });

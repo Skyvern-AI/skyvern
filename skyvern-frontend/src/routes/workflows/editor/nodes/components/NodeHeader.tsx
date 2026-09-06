@@ -289,13 +289,9 @@ function NodeHeader({
   } = useWorkflowRunQuery({
     workflowRunId: activeWorkflowRunId,
   });
-  // keepPreviousData serves the last run's payload after the target run changes
-  // or clears, and clearing it also disables the query — so a retained
-  // "running" payload would otherwise keep every block's play control inert.
-  const runStateIsLive =
-    !statusUnavailable &&
-    !isPlaceholderData &&
-    workflowRun?.workflow_run_id === activeWorkflowRunId;
+  // The hook withholds another run's payload, but not one retained across an org
+  // switch — that changes the query key while the run id stays the same.
+  const runStateIsLive = !statusUnavailable && !isPlaceholderData;
   const workflowRunIsRunningOrQueued =
     runStateIsLive && workflowRun && statusIsRunningOrQueued(workflowRun);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
@@ -392,10 +388,7 @@ function NodeHeader({
       return;
     }
 
-    if (
-      activeWorkflowRunId === workflowRun?.workflow_run_id &&
-      statusIsFinalized(workflowRun)
-    ) {
+    if (statusIsFinalized(workflowRun)) {
       if (statusIsAFailureType(workflowRun)) {
         toast({
           variant: "destructive",

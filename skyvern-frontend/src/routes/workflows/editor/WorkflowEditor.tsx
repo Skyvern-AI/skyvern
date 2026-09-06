@@ -36,11 +36,9 @@ function WorkflowEditor() {
   // a read-only degraded mode.
   const deepLinkRunId = useStudioRunId();
   const { data: fallbackRun, isLoading: fallbackRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery(
-      studioEnabled && deepLinkRunId
-        ? { workflowRunId: deepLinkRunId }
-        : undefined,
-    );
+    useWorkflowRunWithWorkflowQuery({
+      workflowRunId: studioEnabled ? deepLinkRunId : undefined,
+    });
   const deletedWorkflowSnapshot =
     studioEnabled && workflowQueryFailed && fallbackRun?.workflow?.deleted_at
       ? fallbackRun.workflow

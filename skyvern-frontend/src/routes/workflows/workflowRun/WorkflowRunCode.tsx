@@ -74,9 +74,10 @@ function WorkflowRunCode(props?: Props) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const { toast } = useToast();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
-    props?.workflowRunId ? { workflowRunId: props.workflowRunId } : undefined,
-  );
+  const { data: workflowRun, isPlaceholderData: runIsWithheld } =
+    useWorkflowRunWithWorkflowQuery(
+      props?.workflowRunId ? { workflowRunId: props.workflowRunId } : undefined,
+    );
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
@@ -321,6 +322,7 @@ function WorkflowRunCode(props?: Props) {
     // show a skeleton rather than a premature "no code" message.
     if (
       isGeneratingCode ||
+      runIsWithheld ||
       blockScriptsPendingLoading ||
       blockScriptsPublishedLoading
     ) {
@@ -334,6 +336,11 @@ function WorkflowRunCode(props?: Props) {
   }
 
   if (code.length === 0 && !isGeneratingCode) {
+    // A withheld run leaves workflowPermanentId undefined, which disables both
+    // block-scripts queries — absent code here means unknown, not none.
+    if (runIsWithheld) {
+      return <CodeLoadingSkeleton />;
+    }
     return (
       <div className="flex items-center justify-center bg-slate-elevation3 p-8">
         No code has been generated yet.

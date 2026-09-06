@@ -15,15 +15,53 @@ import { toast } from "@/components/ui/use-toast";
 import { GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import type { GoogleConnectionNotice } from "../narrativeState";
+import { ConnectedAccountChoiceCard } from "./ConnectedAccountChoiceCard";
 
 export function GoogleReconnectCard({
   notice,
+  selectedConnectionId = null,
+  disabled = false,
+  onSelect,
 }: {
   notice: GoogleConnectionNotice;
+  selectedConnectionId?: string | null;
+  disabled?: boolean;
+  onSelect?: (connectionId: string) => void;
 }) {
   const { credentials, isLoading, isFetching, error, startAuthorize } =
-    useGoogleOAuthCredentials({ refetchOnMount: "always" });
+    useGoogleOAuthCredentials({
+      refetchOnMount: notice.condition === "unbound" ? undefined : "always",
+    });
   const [isStarting, setIsStarting] = useState(false);
+  const isUnbound = notice.condition === "unbound";
+  const choices =
+    isLoading || error
+      ? (notice.choices ?? [])
+      : credentials
+          .filter(
+            (credential) =>
+              isGoogleOAuthCredentialActive(credential) &&
+              hasGoogleOAuthCredentialScopes(
+                credential,
+                GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
+              ),
+          )
+          .map((credential) => ({
+            connection_id: credential.id,
+            name: credential.credential_name,
+            state: "active",
+            email_address: credential.email_address ?? null,
+          }));
+  if (isUnbound && choices.length > 0) {
+    return (
+      <ConnectedAccountChoiceCard
+        choices={choices}
+        selectedConnectionId={selectedConnectionId}
+        disabled={disabled || !onSelect}
+        onSelect={(connectionId) => onSelect?.(connectionId)}
+      />
+    );
+  }
   const exactCredential = credentials.find(
     (credential) => credential.id === notice.connectionId,
   );
@@ -76,7 +114,7 @@ export function GoogleReconnectCard({
     if (!authTab) {
       toast({
         title: "Unable to open Google",
-        description: "Allow pop-ups for this site, then try Reconnect again.",
+        description: "Allow pop-ups for this site, then try again.",
         variant: "destructive",
       });
       return;
@@ -88,7 +126,7 @@ export function GoogleReconnectCard({
       const response = await startAuthorize({
         redirect_uri: buildGoogleOAuthRedirectUri(),
         app_origin: getGoogleOAuthAppOrigin(),
-        credential_id: notice.connectionId,
+        ...(notice.connectionId ? { credential_id: notice.connectionId } : {}),
         scope_profile: "google_sheets",
       });
       storeGoogleOAuthIntegrationIdForState(response.state, "google_sheets");
@@ -107,9 +145,15 @@ export function GoogleReconnectCard({
 
   return (
     <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
-      <div className="font-medium">{accountName} needs to be reconnected</div>
+      <div className="font-medium">
+        {isUnbound
+          ? "Connect a Google account"
+          : `${accountName} needs to be reconnected`}
+      </div>
       <div className="mt-1 text-xs text-muted-foreground">
-        The workflow draft was saved, but this Sheets connection is not usable.
+        {isUnbound
+          ? "The workflow draft was saved. Connect an account to use Google Sheets."
+          : "The workflow draft was saved, but this Sheets connection is not usable."}
       </div>
       <button
         type="button"
@@ -117,7 +161,7 @@ export function GoogleReconnectCard({
         disabled={isStarting}
         onClick={() => void reconnect()}
       >
-        {isStarting ? "Opening Google…" : "Reconnect"}
+        {isStarting ? "Opening Google…" : isUnbound ? "Connect" : "Reconnect"}
       </button>
     </div>
   );

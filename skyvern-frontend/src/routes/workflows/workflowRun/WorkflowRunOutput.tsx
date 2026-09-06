@@ -59,10 +59,17 @@ function SummaryDisplay({
 function WorkflowRunOutput() {
   const [searchParams] = useSearchParams();
   const hasExplicitSelection = searchParams.has("active");
-  const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
-    useWorkflowRunTimelineQuery();
+  const {
+    data: retainedTimeline,
+    isLoading: workflowRunTimelineIsLoading,
+    isPlaceholderData: timelineIsPlaceholder,
+  } = useWorkflowRunTimelineQuery();
+  const workflowRunTimeline = timelineIsPlaceholder
+    ? undefined
+    : retainedTimeline;
   const [activeItem] = useActiveWorkflowRunItem();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  const { data: workflowRun, isPlaceholderData: runIsWithheld } =
+    useWorkflowRunWithWorkflowQuery();
   const [blockSummaries, setBlockSummaries] = useState<
     Record<string, { summary: string; identity: string }>
   >({});
@@ -130,7 +137,7 @@ function WorkflowRunOutput() {
     return JSON.stringify(getBlockOutputDisplayValue(activeBlock));
   }, [activeBlock]);
 
-  if (workflowRunTimelineIsLoading) {
+  if (workflowRunTimelineIsLoading || runIsWithheld) {
     return <div>Loading...</div>;
   }
 

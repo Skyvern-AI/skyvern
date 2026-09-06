@@ -44,8 +44,9 @@ import {
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   activeIteration?: number | null;
-  // When set, read this run's timeline instead of the URL's (studio shell).
-  workflowRunId?: string;
+  // The run to read. Stated by every caller so the queries never fall back to a
+  // route id the caller is not looking at.
+  workflowRunId: string | undefined;
   // In the studio the pane already paints this exact surface, so the card would
   // be a box drawn inside its own fill. Legacy sits in a sidebar column on the
   // page background, where the border does separate — so it keeps it.
@@ -155,6 +156,7 @@ function WorkflowRunTimeline({
   const {
     data: workflowRun,
     isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
     isError: statusUnavailable,
   } = useWorkflowRunWithWorkflowQuery({ workflowRunId });
 
@@ -268,7 +270,7 @@ function WorkflowRunTimeline({
     isInitialRenderRef.current = false;
   }, [displayTimeline, workflowRunTimeline]);
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return <Skeleton className="h-full w-full" />;
   }
 
