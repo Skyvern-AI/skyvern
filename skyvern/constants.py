@@ -20,6 +20,9 @@ ERROR_CODE_REASONING_MAX_LENGTH = 2000
 INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
+# Bounded attempts to close a crashed tab. Anything that waits on that close derives its budget from
+# this and BROWSER_PAGE_CLOSE_TIMEOUT rather than restating the count.
+CRASHED_PAGE_CLOSE_ATTEMPTS = 2
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
 # Independent budget for disabling the download interceptor during close(). Kept well below
 # BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly

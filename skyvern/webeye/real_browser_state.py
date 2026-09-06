@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+import weakref
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Literal
@@ -16,6 +17,7 @@ from skyvern.constants import (
     BROWSER_CLOSE_TIMEOUT,
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
+    CRASHED_PAGE_CLOSE_ATTEMPTS,
     NAVIGATION_MAX_RETRY_TIME,
 )
 from skyvern.exceptions import (
@@ -83,6 +85,10 @@ class RealBrowserState(BrowserState):
         # so the pin is dropped.
         self.__active_page_known_pages: set[Page] = set()
         self.pw = pw
+        self._disconnect_listener_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
+        self._disconnect_listener_browser: Browser | None = None
+        self._crash_listener_pages: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
@@ -110,10 +116,20 @@ class RealBrowserState(BrowserState):
         self.last_navigation_status: int | None = None
         self._ever_connected = browser_context is not None
         self._close_requested = False
-        self._disconnect_listener_context: BrowserContext | None = None
-        self._disconnect_listener_browser: Browser | None = None
         if browser_context is not None:
             self._register_disconnect_listeners(browser_context)
+
+    @property
+    def browser_context(self) -> BrowserContext | None:
+        return self._browser_context
+
+    @browser_context.setter
+    def browser_context(self, context: BrowserContext | None) -> None:
+        # Every attachment must arm crash reaping, including swaps made from outside this class:
+        # an unwatched crashed tab keeps winning get_working_page and strands every later attach.
+        self._browser_context = context
+        if context is not None:
+            self._watch_context_for_crashes(context)
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
@@ -181,7 +197,12 @@ class RealBrowserState(BrowserState):
         pages = self.browser_context.pages
         for page in pages:
             if page != cur_page:
-                if discard_orphaned_videos:
+                # Every crashed page keeps its recording, not just the working one: a crashed tab can
+                # still be here with its close in flight or timed out, and there is no way to tell
+                # from here which one the run was driving. That keeps a spurious second RECORDING for
+                # a crashed non-working tab, which is the cheaper of the two errors — the other is
+                # deleting the recording of the run that just crashed.
+                if discard_orphaned_videos and page not in self._crashed_pages:
                     # Tombstone before any await: set_popup_video_listener's registration for
                     # this same page may still be in flight, and must observe the tombstone
                     # whenever it resolves rather than re-appending after we remove it below.
@@ -390,7 +411,8 @@ class RealBrowserState(BrowserState):
         pages = [
             http_page
             for http_page in self.browser_context.pages
-            if (
+            if http_page not in self._crashed_pages
+            and (
                 http_page.url == "about:blank"
                 or http_page.url == ":"  # sometimes the page url is ":", which is the blank page
                 or http_page.url == "chrome-error://chromewebdata/"
@@ -531,26 +553,80 @@ class RealBrowserState(BrowserState):
             page = await self.__assert_page()
         return page
 
-    def _register_disconnect_listeners(self, context: BrowserContext) -> None:
-        if context is not getattr(self, "_disconnect_listener_context", None):
+    def _watch_context_for_crashes(self, context: BrowserContext) -> None:
+        if context not in self._disconnect_listener_contexts:
             try:
                 context.on("close", self._on_browser_context_closed)
-                self._disconnect_listener_context = context
+                context.on("page", self._watch_page_for_crash)
+                self._disconnect_listener_contexts.add(context)
             except Exception:
                 LOG.debug("Failed to register browser context disconnect listener", exc_info=True)
 
+        # The "page" event only fires for tabs opened after registration, and both call sites can
+        # attach to a context that already has pages.
+        try:
+            for existing_page in list(context.pages):
+                self._watch_page_for_crash(existing_page)
+        except Exception:
+            LOG.debug("Failed to sweep existing pages for crash listeners", exc_info=True)
+
+    def _register_disconnect_listeners(self, context: BrowserContext) -> None:
+        self._watch_context_for_crashes(context)
         try:
             browser = context.browser
         except Exception:
             LOG.debug("Failed to read browser for disconnect listener registration", exc_info=True)
             return
-        if browser is None or browser is getattr(self, "_disconnect_listener_browser", None):
+        if browser is None or browser is self._disconnect_listener_browser:
             return
         try:
             browser.on("disconnected", self._on_browser_disconnected)
             self._disconnect_listener_browser = browser
         except Exception:
             LOG.debug("Failed to register browser disconnect listener", exc_info=True)
+
+    def _watch_page_for_crash(self, page: Page) -> None:
+        if page in self._crash_listener_pages:
+            return
+        try:
+            page.on("crash", self._on_page_crashed)
+            self._crash_listener_pages.add(page)
+        except Exception:
+            LOG.debug("Failed to register page crash listener", exc_info=True)
+
+    def _on_page_crashed(self, page: Page) -> None:
+        # A crashed tab stays in context.pages and keeps winning get_working_page, so later operations
+        # and CDP attaches land on a dead target. Closing it lets _reopen_lost_working_page recover.
+        LOG.warning("Page crashed; closing the crashed tab so a replacement can be opened", url=page.url)
+        # Recorded before the close is scheduled: the close is a detached task, and until it lands the
+        # crashed page is still in context.pages. Callers in that window must not be handed it.
+        self._crashed_pages.add(page)
+        try:
+            task = asyncio.get_running_loop().create_task(self._close_crashed_page(page))
+        except RuntimeError:
+            LOG.debug("No running event loop to close the crashed page on", exc_info=True)
+            return
+        self._own_detached_task(task, "close_crashed_page")
+
+    async def _close_crashed_page(self, page: Page) -> None:
+        # The crash event fires once. Excluding the page from selection keeps this process healthy, but
+        # only closing the target unblocks later CDP attaches, so a hung close is retried up to
+        # CRASHED_PAGE_CLOSE_ATTEMPTS before the target is reported stranded. Bounded by racing the
+        # close rather than by asyncio.timeout, for the reason _run_bounded_detachable already
+        # documents: a Playwright close can ignore the cancel a timeout delivers, and that would look
+        # like success here and skip the retry. A close that raises has finished, so it is not retried.
+        for _ in range(CRASHED_PAGE_CLOSE_ATTEMPTS):
+            closing = asyncio.ensure_future(page.close())
+            done, _pending = await asyncio.wait({closing}, timeout=BROWSER_PAGE_CLOSE_TIMEOUT)
+            if closing not in done:
+                closing.cancel()
+                self._own_detached_task(closing, "close_crashed_page_attempt")
+                continue
+            error = closing.exception() if not closing.cancelled() else None
+            if error is not None:
+                LOG.warning("Error while closing a crashed page", url=page.url, error_type=type(error).__name__)
+            return
+        LOG.warning("Timeout closing a crashed page; the target stays stranded", url=page.url)
 
     def _on_browser_context_closed(self, context: BrowserContext) -> None:
         if context is not self.browser_context:
@@ -562,7 +638,7 @@ class RealBrowserState(BrowserState):
         )
 
     def _on_browser_disconnected(self, browser: Browser) -> None:
-        if browser is not getattr(self, "_disconnect_listener_browser", None):
+        if browser is not self._disconnect_listener_browser:
             return
         self._record_disconnect(
             "browser_disconnected_event",
