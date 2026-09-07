@@ -340,6 +340,46 @@ secrets of at least five characters are also masked inside larger strings. Deriv
 or transformed values may no longer match. Do not expose credentials through output
 or errors. Opaque credential containment is tracked separately in SKY-11771.
 
+Code blocks can search the web with the `search_web` helper. Use it to find
+candidate sites, such as companies, suppliers, or listings, instead of scraping
+a search engine's result page yourself:
+
+```python
+observation = await search_web("industrial pump suppliers in Ohio", max_results=10)
+for result in observation["results"]:
+    print(result["title"], result["url"], result["snippet"])
+```
+
+`query` must be a non-empty string. `max_results` is optional, defaults to 10,
+and must be a positive integer; invalid values raise `ValueError`. The search
+runs through the run's own browser, so calling `search_web` while the run
+browser is not open raises `RuntimeError`.
+
+`search_web` returns an observation dict rather than a bare result list:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `results` | list | Up to `max_results` entries, each with `title`, `url`, and `snippet` |
+| `provider` | string | Search provider the deployment is configured with |
+| `http_status` | int or null | Status the search page was served with; `null` when none was reported |
+| `error_kind` | string or null | Exception class name when the fetch itself failed, otherwise `null` |
+| `page_title` | string | Title of the page that was served |
+| `extracted_count` | int | Results found on the page before any were withheld |
+| `withheld_count` | int | Results withheld because their destination is not allowed |
+| `capture_truncated` | boolean | `true` when the page was too large to read in full |
+
+Read the observation before treating an empty `results` list as "no matches".
+A non-2xx `http_status` or a non-null `error_kind` means the fetch failed and
+says nothing about whether matches exist. An `extracted_count` of 0 on a
+successful fetch means the page carried no results, which is a refusal page as
+often as a genuine miss; `page_title` usually says which. A `withheld_count`
+greater than 0 with an empty `results` list means the page had results that
+were filtered, not that the query found nothing.
+
+Self-hosted deployments have no search provider configured. There,
+`search_web` returns empty `results` with `error_kind` set to
+`"not_configured"`.
+
 <Frame>
 <img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
 </Frame>
