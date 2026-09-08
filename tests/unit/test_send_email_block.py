@@ -6,23 +6,33 @@
 - SKY-14062: optional custom SMTP settings (custom_smtp_*) route the block through the
   user's SMTP server; when absent the default platform sender path is unchanged, and the
   custom password is never echoed in error messages.
+- SKY-15585: one Recipients entry may hold several comma- or semicolon-separated addresses
+  (a workflow parameter substituted into the editor's comma-separated field); both mail
+  blocks deliver to every address, and an invalid one fails the block without being echoed.
 """
 
 from __future__ import annotations
 
+import pickle
 import re
 import smtplib
 import ssl
+import traceback
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from email.message import EmailMessage
-from unittest.mock import MagicMock, patch
+from functools import partial
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import libcst as cst
 import pytest
+from email_validator import EmailUndeliverableError, validate_email
 
 from skyvern.core.script_generations.generate_script import _build_send_email_statement
 from skyvern.exceptions import BlockedHost, UnresolvableHost
-from skyvern.forge.sdk.api.email import send, validate_recipients
+from skyvern.forge import app
+from skyvern.forge.sdk.api.email import InvalidEmailRecipient, send, validate_recipients
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomSMTPAuthenticationFailed,
     CustomSMTPConnectionFailed,
@@ -30,7 +40,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     NoValidEmailRecipient,
 )
-from skyvern.forge.sdk.workflow.models.block import SendEmailBlock, _send_via_custom_smtp
+from skyvern.forge.sdk.workflow.models.block import HumanInteractionBlock, SendEmailBlock, _send_via_custom_smtp
 from skyvern.forge.sdk.workflow.models.parameter import (
     PLATFORM_SMTP_AWS_KEYS,
     UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
@@ -38,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     ParameterType,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
 from skyvern.schemas.workflows import (
     HumanInteractionBlockYAML,
@@ -718,10 +729,102 @@ def test_validate_recipients_rejects_an_empty_list() -> None:
         validate_recipients([])
 
 
-def test_send_email_block_still_raises_its_own_error_for_no_valid_recipients() -> None:
-    block = _send_email_block(recipients=[])
+@pytest.mark.parametrize("recipients", [[], ["", " , ; "]])
+def test_send_email_block_still_raises_its_own_error_for_no_valid_recipients(recipients: list[str]) -> None:
+    block = _send_email_block(recipients=recipients)
     with pytest.raises(NoValidEmailRecipient):
         block.get_real_email_recipients(_run_context())
+
+
+@pytest.fixture
+def offline_address_validation() -> Iterator[None]:
+    # email_validator resolves MX records by default; unit tests must not touch DNS.
+    with patch("skyvern.forge.sdk.api.email.validate_email", partial(validate_email, check_deliverability=False)):
+        yield
+
+
+def _workflow_run_context(values: dict[str, str]) -> WorkflowRunContext:
+    context = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        workflow_run_id="wr_1",
+        aws_client=MagicMock(),
+    )
+    context.values.update(values)
+    return context
+
+
+@pytest.mark.asyncio
+async def test_send_delivers_to_every_address_in_a_joined_recipients_entry(offline_address_validation: None) -> None:
+    transport = AsyncMock(return_value=True)
+    with patch("skyvern.forge.sdk.api.email._send", transport):
+        await send(
+            sender="sender@example.com",
+            subject="subject",
+            recipients=["first@example.com, second@example.com; third@example.com ", " "],
+            body="body",
+        )
+    assert transport.call_args.kwargs["message"]["To"] == "first@example.com, second@example.com, third@example.com"
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_block_notifies_every_address_in_a_comma_joined_parameter(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    block = HumanInteractionBlock(
+        label="approve",
+        output_parameter=_output_parameter("approve"),
+        recipients=["{{ notify_to }}"],
+    )
+    context = _workflow_run_context({"notify_to": "first@example.com, second@example.com, third@example.com"})
+    monkeypatch.setattr(HumanInteractionBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context))
+    database = MagicMock()
+    database.observer.update_workflow_run_block = AsyncMock()
+    database.workflow_runs.update_workflow_run = AsyncMock()
+    database.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+    # Any status other than paused ends the block's wait loop on its first check.
+    database.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(status=WorkflowRunStatus.completed))
+    monkeypatch.setattr(app, "DATABASE", database)
+    transport = AsyncMock(return_value=True)
+
+    with patch("skyvern.forge.sdk.api.email._send", transport):
+        result = await block.execute("wr_1", "wrb_1", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    assert transport.call_args.kwargs["message"]["To"] == "first@example.com, second@example.com, third@example.com"
+    persisted = database.observer.update_workflow_run_block.call_args_list[0].kwargs
+    assert persisted["recipients"] == ["first@example.com", "second@example.com", "third@example.com"]
+
+
+def test_send_email_block_resolves_a_joined_entry_to_every_address(offline_address_validation: None) -> None:
+    block = _send_email_block(recipients=["lead@example.com", "notify_to"])
+    context = _run_context(values={"notify_to": "first@example.com; second@example.com"})
+    context.has_parameter.side_effect = lambda key: key == "notify_to"
+
+    assert block.get_real_email_recipients(context) == ["lead@example.com", "first@example.com", "second@example.com"]
+
+
+def test_send_email_block_fails_instead_of_dropping_an_invalid_recipient(offline_address_validation: None) -> None:
+    block = _send_email_block(recipients=["lead@example.com, second.approver@example"])
+    with pytest.raises(InvalidEmailRecipient) as excinfo:
+        block.get_real_email_recipients(_run_context())
+
+    assert (excinfo.value.position, excinfo.value.total) == (2, 2)
+    assert "second.approver" not in str(excinfo.value)
+
+
+def test_undeliverable_recipient_error_never_carries_the_domain_into_a_logged_traceback() -> None:
+    domain = "secret-person.example"
+    undeliverable = EmailUndeliverableError(f"The domain name {domain} does not exist.")
+    recipients = [f"approver@{domain}"]
+    with patch("skyvern.forge.sdk.api.email.validate_email", side_effect=undeliverable):
+        with pytest.raises(InvalidEmailRecipient) as excinfo:
+            validate_recipients(recipients)
+
+    assert str(excinfo.value) == "recipient 1 of 1 has a domain that does not accept email"
+    assert domain not in "".join(traceback.format_exception(excinfo.value))
+    assert str(pickle.loads(pickle.dumps(excinfo.value))) == str(excinfo.value)
 
 
 def test_converted_definition_carries_the_provisioned_parameters() -> None:

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools.blocks import WORKFLOW_KNOWLEDGE_TOPIC_HEADERS
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime_authoring_repair
 from skyvern.forge.sdk.copilot.agent import (
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _prior_run_debug_text,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    SOLVER_ATTEMPT_KEY,
     BuildTestEvidencePacket,
     RecordedBuildTestOutcome,
     recorded_outcome_from_run_blocks_result,
@@ -40,11 +42,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    _MAX_ITEMS,
     DiagnosisFailureType,
     RepairNextAction,
+    author_time_levers,
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
+from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
@@ -60,9 +65,11 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
+from skyvern.forge.sdk.copilot.tools.run_execution import finalize_build_test_result
 from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
@@ -567,6 +574,37 @@ def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_pa
     assert repair_context.page_result_summaries == ["No matching records"]
     assert repair_context.page_action_summaries == ["Next page"]
     assert "case=secret" not in repair_context.model_dump_json()
+
+
+def test_the_repair_carrier_never_smuggles_per_block_run_facts_past_the_packet() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_result = _failed_run_result()
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search",
+        "page_title": "Search results",
+        "result_containers": [{"selector": "#results", "text_excerpt": "No matching records"}],
+    }
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "observed_block_end_urls": {"run_search": "https://example.test/results?q=widget"},
+            "per_block_action_observations": {"run_search": ["click completed code_line=4"]},
+        },
+    }
+
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    assert "observed_block_end_urls" not in CodeAuthoringRepairContext.model_fields
+    assert "per_block_action_observations" not in CodeAuthoringRepairContext.model_fields
+    assert "results?q=widget" not in json.dumps(result["data"]["authoring_repair_context"])
 
 
 def test_post_run_observation_is_false_when_all_four_summary_collections_are_empty() -> None:
@@ -4090,6 +4128,44 @@ async def test_obstruction_only_packet_survives_the_automatic_post_run_capture(
     assert stored["page_obstructions"] == packet["page_obstructions"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete", [False, True])
+async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces_context(monkeypatch, complete):
+    ctx = _ctx()
+    registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_secret",
+        parameters={"password": "inline-secret-sentinel"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=complete,
+    )
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_sibling",
+        parameters={},
+        contains_sensitive_values=False,
+        contains_all_sensitive_values=True,
+    )
+    packet = _obstruction_only_page_evidence()
+    packet["title"] = "inline-secret-sentinel"
+    read = AsyncMock(return_value=(packet, "pbs_run", None, SimpleNamespace(b64="secret-pixels")))
+    enqueue = MagicMock()
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
+    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", enqueue)
+    await run_execution_module._capture_and_store_post_run_page(
+        ctx,
+        run_session_id="pbs_run",
+        run_id="wr_secret",
+        current_url="https://example.test/statements",
+        origin_redaction_registry=registry,
+    )
+    enqueue.assert_not_called()
+    if complete:
+        assert ctx.composition_page_evidence is not None
+        assert "inline-secret-sentinel" not in str(ctx.composition_page_evidence)
+    else:
+        read.assert_not_called()
+    assert ctx.origin_run_redaction_registry.workflow_run_id == "wr_sibling"
+
+
 def test_dispatched_terminal_capture_admits_an_obstruction_only_packet() -> None:
     packet = _obstruction_only_page_evidence()
 
@@ -4608,3 +4684,435 @@ def test_a_select_on_a_real_option_still_leads_the_summary_cap() -> None:
 
     assert repair_context is not None
     assert repair_context.page_form_summaries[0] == "Departure month select Jan"
+
+
+def _challenge_run_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_recourse",
+            "overall_status": "failed",
+            "failure_reason": "Extracted data reported anti-bot blocker: Verify you are human",
+            "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
+            "blocks": [],
+        },
+    }
+
+
+def _solve_captcha_block(status: str) -> dict[str, Any]:
+    return {
+        "label": "search",
+        "block_type": "CODE",
+        "status": "failed",
+        "action_trace": [
+            {"action": "goto_url", "status": "completed", "code_line": 1},
+            {"action": "solve_captcha", "status": status, "code_line": 4, "response": "Captcha not solved in time"},
+        ],
+    }
+
+
+def _resolve_solver_for(ctx: CopilotContext, available: bool, url: str = "https://records.example.com/search") -> None:
+    ctx.captcha_solver_available = available
+    ctx.captcha_solver_available_for_url = url
+    ctx.composition_page_evidence = {"current_url": url}
+
+
+def test_challenge_contract_carries_solver_effects_and_every_lever_unordered() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, True)
+    result = _challenge_run_result()
+    result["data"]["blocks"] = [_solve_captcha_block("failed")]
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_available is True
+    assert contract.challenge.solver_attempted is True
+    assert contract.challenge.solver_result == "failed"
+    assert contract.challenge.solver_failure == "Captcha not solved in time"
+    assert sorted(lever.mechanism for lever in contract.levers) == [
+        "browser_profile",
+        "captcha_solver",
+        "credential_totp_or_inbox",
+        "human_interaction",
+        "proxy_location",
+    ]
+    assert all(lever.knowledge_topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS for lever in contract.levers)
+    assert next(lever for lever in contract.levers if lever.mechanism == "captcha_solver").availability == "available"
+    assert contract.to_trace_data()["challenge_solver_result"] == "failed"
+
+
+def test_a_recorded_history_without_a_solve_row_reads_not_attempted() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, False)
+    result = _challenge_run_result()
+    result["data"]["blocks"] = [{"label": "search", "block_type": "CODE", "status": "failed", "action_trace": []}]
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.challenge is not None
+    assert contract.challenge.solver_result == "not_attempted"
+    assert next(lever for lever in contract.levers if lever.mechanism == "captcha_solver").availability == "unavailable"
+
+
+def test_a_run_with_no_recorded_action_history_reads_unresolved() -> None:
+    """The optional action lookup swallows its failures, so an absent history proves nothing."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_challenge_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    # Unknown, not "never ran": the boolean must not out-assert the result.
+    assert contract.challenge.solver_attempted is None
+    assert contract.challenge.solver_result == "unresolved"
+
+
+def test_availability_falls_back_to_the_run_result_url_when_no_page_evidence_was_stored() -> None:
+    """Composition evidence is only stored under the code-only policy; the run's own URL stands in."""
+    url = "https://records.example.com/search"
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.captcha_solver_available = True
+    ctx.captcha_solver_available_for_url = url
+    result = _challenge_run_result()
+    result["data"]["current_url"] = url
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_available is True
+
+
+def test_availability_resolved_for_another_page_is_not_reported_here() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.captcha_solver_available = True
+    ctx.captcha_solver_available_for_url = "https://records.example.com/search"
+    ctx.composition_page_evidence = {"current_url": "https://other.example.com/gate"}
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_challenge_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_available is None
+    assert next(lever for lever in contract.levers if lever.mechanism == "captcha_solver").availability == "unresolved"
+
+
+def test_missing_credential_contract_carries_credential_and_pause_levers_without_a_challenge() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_credential",
+                "overall_status": "failed",
+                "skip_reason": "workflow_credential_inputs_unbound",
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.challenge is None
+    assert [lever.mechanism for lever in contract.levers] == ["credential_totp_or_inbox", "human_interaction"]
+    assert all(lever.knowledge_topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS for lever in contract.levers)
+
+
+def test_repairable_block_failure_carries_no_challenge_or_levers() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_repairable",
+                "overall_status": "failed",
+                "failure_reason": "Element not found",
+                "blocks": [{"label": "search", "block_type": "ACTION", "status": "failed"}],
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.challenge is None
+    assert contract.levers == []
+    assert contract.to_trace_data()["levers"] == []
+
+
+def test_finalized_packet_carries_the_contract_challenge_and_levers() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.captcha_solver_available = True
+    result = _challenge_run_result()
+    result["data"]["blocks"] = [_solve_captcha_block("completed")]
+
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result, workflow_updated=True)
+
+    packet = result["data"][BUILD_TEST_PACKET_KEY]
+    assert packet["challenge"]["solver_result"] == "attempted"
+    assert sorted(lever["mechanism"] for lever in packet["levers"]) == [
+        "browser_profile",
+        "captcha_solver",
+        "credential_totp_or_inbox",
+        "human_interaction",
+        "proxy_location",
+    ]
+    assert "fact" not in packet["levers"][0]
+    assert any("does not by itself mean the challenge cleared" in notice for notice in packet["challenge_notices"])
+    assert any("get_workflow_knowledge" in notice for notice in packet["challenge_notices"])
+
+
+def test_the_production_capture_reads_the_traces_it_then_strips() -> None:
+    """Drives the production unit: reordering the capture after the pop fails this."""
+    from skyvern.forge.sdk.copilot.tools import run_execution
+
+    results = [
+        {
+            "label": "search",
+            "block_type": "CODE",
+            "status": "failed",
+            "action_trace": [{"action": "solve_captcha", "status": "failed", "response": "not solved in time"}],
+        }
+    ]
+
+    captured = run_execution._capture_solver_facts_and_strip_traces(results)
+
+    assert captured == {"attempted": True, "result": "failed", "failure": "not solved in time"}
+    assert "action_trace" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_availability_lookup_leaves_the_solver_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restoring `available = False` on the exception path must fail this."""
+    from unittest.mock import AsyncMock
+
+    from skyvern.forge.sdk.copilot.tools import run_execution
+
+    ctx = _ctx()
+    ctx.composition_page_evidence = {"current_url": "https://records.example.com/search"}
+    monkeypatch.setattr(
+        run_execution.app.AGENT_FUNCTION,
+        "captcha_solving_available",
+        AsyncMock(side_effect=RuntimeError("provider down")),
+    )
+
+    await run_execution._resolve_captcha_solver_availability(ctx)
+
+    assert ctx.captcha_solver_available is None
+
+
+def test_a_custom_proxy_lever_never_serializes_its_url() -> None:
+    """A custom proxy is a dict whose URL can embed credentials; the lever names its shape only."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.effective_workflow_proxy_location = {"url": "http://user:hunter2@proxy.example.com:8080"}
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_challenge_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    proxy_lever = next(lever for lever in contract.levers if lever.mechanism == "proxy_location")
+    assert proxy_lever.availability == "custom proxy"
+    assert "hunter2" not in json.dumps(contract.model_dump(mode="json"))
+
+
+def test_a_completed_solve_row_is_never_reported_as_a_cleared_challenge() -> None:
+    """The runtime's no-solver fallback returns ActionSuccess, so `completed` means the step ran."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.captcha_solver_available = False
+    result = _challenge_run_result()
+    result["data"]["blocks"] = [_solve_captcha_block("completed")]
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_attempted is True
+    assert contract.challenge.solver_result == "attempted"
+
+
+def test_solver_facts_survive_the_packet_dropping_per_block_action_traces() -> None:
+    """The run path strips action_trace before the contract is built, so the facts ride on the result."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.captcha_solver_available = True
+    result = _challenge_run_result()
+    stripped = _solve_captcha_block("failed")
+    stripped.pop("action_trace")
+    result["data"]["blocks"] = [stripped]
+    result["data"][SOLVER_ATTEMPT_KEY] = {
+        "attempted": True,
+        "result": "failed",
+        "failure": "Captcha not solved in time",
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_attempted is True
+    assert contract.challenge.solver_result == "failed"
+    assert contract.challenge.solver_failure == "Captcha not solved in time"
+
+
+def test_a_no_proxy_run_never_reports_the_solver_as_available() -> None:
+    """The vendor drops the solver extension on a session with no proxy, so the org-level yes
+    does not describe this run's browser."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, True)
+    ctx.effective_workflow_proxy_location = ProxyLocation.NONE
+    result = _challenge_run_result()
+    result["data"]["blocks"] = [_solve_captcha_block("failed")]
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_available is None
+    assert next(lever for lever in contract.levers if lever.mechanism == "captcha_solver").availability == "unresolved"
+    assert contract.challenge.solver_result == "failed"
+
+
+def test_the_credential_lever_reads_the_approval_the_request_policy_actually_holds() -> None:
+    """Approvals live on the request policy; reading a field the context does not have reported
+    every chat as having approved nothing."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, True)
+    ctx.request_policy.selected_connected_account_id = "conn_records_login"
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_challenge_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    credential_lever = next(lever for lever in contract.levers if lever.mechanism == "credential_totp_or_inbox")
+    assert credential_lever.availability == "credential approved this chat"
+
+
+def test_author_time_levers_carry_the_same_inventory_without_a_run() -> None:
+    ctx = _ctx()
+    ctx.captcha_solver_available = None
+
+    levers = author_time_levers(ctx)
+
+    assert sorted(lever.mechanism for lever in levers) == [
+        "browser_profile",
+        "captcha_solver",
+        "credential_totp_or_inbox",
+        "human_interaction",
+        "proxy_location",
+    ]
+    assert next(lever for lever in levers if lever.mechanism == "captcha_solver").availability == "unresolved"
+
+
+def test_shadow_ineligible_finalize_carries_no_challenge_or_levers() -> None:
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    result = _challenge_run_result()
+
+    finalize_build_test_result(
+        ctx,
+        source_tool="get_run_results",
+        result=result,
+        diagnosis_shadow_eligible=False,
+    )
+
+    assert "challenge" not in result["data"][BUILD_TEST_PACKET_KEY]
+    assert result["data"][BUILD_TEST_PACKET_KEY]["levers"] == []
+
+
+def test_a_run_past_the_block_cap_keeps_the_failing_block_the_run_stopped_on() -> None:
+    blocks = [{"label": f"step_{index}", "status": "completed"} for index in range(20)]
+    blocks.append({"label": "select_first_result", "status": "failed", "failure_reason": "no result row"})
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "data": {"workflow_run_id": "wr_cap", "overall_status": "failed", "blocks": blocks},
+        },
+        ctx=_ctx(),
+    )
+    assert contract.diagnosis_input.failed_block_labels == ["select_first_result"]
+
+
+def test_a_failure_before_the_block_cap_is_still_named_by_the_contract() -> None:
+    blocks: list[dict[str, object]] = [
+        {"label": "search_directory", "status": "failed", "failure_reason": "search stalled"}
+    ]
+    blocks += [{"label": f"step_{index}", "status": "completed"} for index in range(25)]
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "data": {"workflow_run_id": "wr_early", "overall_status": "failed", "blocks": blocks},
+        },
+        ctx=_ctx(),
+    )
+    assert contract.diagnosis_input.failed_block_labels == ["search_directory"]
+
+
+def test_a_run_that_fails_many_blocks_cannot_grow_the_contract_row_list() -> None:
+    blocks: list[dict[str, object]] = [
+        {"label": f"early_fail_{index}", "status": "failed", "failure_reason": "stalled"} for index in range(80)
+    ]
+    blocks += [{"label": f"step_{index}", "status": "completed"} for index in range(20)]
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "data": {"workflow_run_id": "wr_wide", "overall_status": "failed", "blocks": blocks},
+        },
+        ctx=_ctx(),
+    )
+    assert len(contract.diagnosis_input.failed_block_labels) <= _MAX_ITEMS
+    assert contract.diagnosis_input.failed_block_labels

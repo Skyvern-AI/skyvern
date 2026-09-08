@@ -409,6 +409,16 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert recorded[2].element_id == "#go"
 
 
+def test_recording_page_keeps_raw_page_behind_private_seam() -> None:
+    # The safety validator only refuses underscore-prefixed access, so the raw Playwright page must be
+    # reachable ONLY through a private seam -- never a public attribute a snippet could read to bypass the
+    # recording/credential guards. The private seam returns the exact wrapped page for a page-scoped lifecycle.
+    raw_page = FakePage()
+    recording_page = RecordingPage(raw_page)
+    assert not hasattr(recording_page, "underlying_page")
+    assert recording_page._underlying_page is raw_page
+
+
 @pytest.mark.asyncio
 async def test_page_evaluate_records_execute_js_action() -> None:
     page = RecordingPage(FakePage())
@@ -939,6 +949,32 @@ async def test_filter_locator_chain_click_is_recorded() -> None:
     await page.get_by_role("button", name="Go").filter(has_text="Submit").click()
     recorded = page.recorded_actions()
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
+
+
+@pytest.mark.asyncio
+async def test_locator_valued_chain_keeps_native_argument_without_leaking_it_into_recording_metadata() -> None:
+    class LocatorValuedChain(FakeLocator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.locator_argument: Any = None
+
+        def locator(self, selector_or_locator: Any, **kwargs: Any) -> LocatorValuedChain:
+            self.locator_argument = selector_or_locator
+            assert kwargs == {"has_text": "Current"}
+            return self
+
+    raw_parent = LocatorValuedChain()
+    raw_child = FakeLocator()
+    recorder = _Recorder()
+    parent = RecordingLocator(raw_parent, recorder, "body")
+    child = RecordingLocator(raw_child, recorder, ".card")
+
+    await parent.locator(child, has_text="Current").click()
+
+    assert raw_parent.locator_argument is raw_child
+    recorded = recorder.actions
+    assert [action.action_type for action in recorded] == [ActionType.CLICK]
+    assert recorded[0].description == "locator.click"
 
 
 _ACTIONABILITY_ERROR = (

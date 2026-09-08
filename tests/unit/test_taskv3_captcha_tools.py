@@ -9,8 +9,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.forge import app
 from skyvern.forge.taskv3 import captcha_tools
+from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError
+from tests.unit.conftest import ScopeRecordingAgentFunction
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -164,3 +167,58 @@ async def test_solve_captcha_provider_raising_is_error_not_crash(monkeypatch: py
     result = await tools[0].handler({})
     assert result.status == "error"
     ladder.assert_not_awaited()
+
+
+class _MarkerOnlyLocator:
+    def __init__(self, count: int) -> None:
+        self._count = count
+
+    async def count(self) -> int:
+        return self._count
+
+
+class _MarkerOnlyPage:
+    """Only the generic CAPTCHA marker selector matches: the real ladder detects a challenge, finds no
+    checkbox/anchor/recaptcha arm, and raises CaptchaChallengeUnsolvedError."""
+
+    def __init__(self) -> None:
+        self.url = "https://app.example/login"
+        self.frames: list[Any] = []
+
+    def locator(self, selector: str) -> _MarkerOnlyLocator:
+        return _MarkerOnlyLocator(1 if selector == captcha_solver_module._CAPTCHA_MARKER_SELECTOR else 0)
+
+    async def wait_for_timeout(self, _milliseconds: int) -> None:
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_capped_solve_never_enters_lifecycle_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each real solve opens the shared lifecycle scope once; once the failure cap trips, the tool
+    # fast-fails BEFORE the ladder, so the vendor lifecycle is never entered again.
+    agent_function = ScopeRecordingAgentFunction(record_arms=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(_MarkerOnlyPage()), organization_id="o_1")
+    handler = tools[0].handler
+
+    for _ in range(captcha_tools._MAX_SOLVE_ATTEMPTS):
+        result = await handler({})
+        assert result.status == "error"
+    assert agent_function.events == ["enter", "exit"] * captcha_tools._MAX_SOLVE_ATTEMPTS
+
+    events_at_cap = list(agent_function.events)
+    result = await handler({})
+    assert result.status == "ok"  # steer-away, not another solver run
+    assert agent_function.events == events_at_cap  # no further enter/exit
+
+
+@pytest.mark.asyncio
+async def test_page_unavailable_never_enters_lifecycle_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A missing page fast-fails before the ladder, so the vendor lifecycle is never armed.
+    agent_function = ScopeRecordingAgentFunction(record_arms=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(None), organization_id="o_1")
+
+    result = await tools[0].handler({})
+    assert result.status == "error"
+    assert agent_function.events == []

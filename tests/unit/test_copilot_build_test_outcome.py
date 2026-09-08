@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,12 +27,18 @@ from skyvern.forge.sdk.copilot.agent import (
 from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _EXECUTED_CALL_REF_LIMIT,
+    BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
+    BLOCK_FACT_URL_MAX_CHARS,
+    OBSERVED_BLOCK_END_URLS_EMPTY,
+    OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
+    OBSERVED_BLOCK_END_URLS_WITHHELD,
     BuildTestConnectFailure,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
     BuildTestPacketDownload,
     BuildTestPacketFailure,
     BuildTestPacketLocatorObservation,
+    BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
     BuildTestPacketUnfinishedItem,
@@ -39,6 +46,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     bind_post_run_page_evidence,
+    coerce_block_end_urls,
     observed_value_extraction_scaffold_lines,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
@@ -55,6 +63,9 @@ from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
+    _compact_packet_for_aggregate_limit,
+    _compacted_newest_labelled,
+    labelled_url_screen_reasons,
     project_build_test_packet_for_llm,
     project_direct_test_handoff_packet_for_llm,
     sanitize_tool_result_for_llm,
@@ -69,7 +80,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _carry_unresolved_failure_into_result,
     _failed_block_code,
     _failing_code_line,
-    _first_failed_result,
+    _newest_failed_result,
     _record_run_blocks_result,
     _recorded_run_block_result,
     _run_blocks_and_collect_debug,
@@ -83,17 +94,23 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
     HANDBACK_WORKFLOW_YAML,
+    SEARCH_THEN_SELECT_WORKFLOW_YAML,
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    install_get_run_results_harness,
     install_run_blocks_harness,
     make_copilot_ctx,
     make_stub_html_artifact,
     page_only_failed_block,
     passing_run,
+    run_result_action_row,
+    run_result_block_row,
     same_run_page_evidence,
     straight_line_login_yaml,
     terminal_extraction_block,
@@ -1454,7 +1471,9 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     )
     monkeypatch.setattr(run_execution_module, "app", fake_app)
 
-    async def attach_trace(blocks: object, results: list[dict[str, object]], organization_id: str) -> None:
+    async def attach_trace(
+        blocks: object, results: list[dict[str, object]], organization_id: str, include_completed: bool = False
+    ) -> None:
         results[0]["action_trace"] = [{"code_line": 7, "action": "evaluate"}]
 
     monkeypatch.setattr(run_execution_module, "_attach_action_traces", attach_trace)
@@ -2725,7 +2744,7 @@ def test_failed_block_code_reads_the_definition_not_the_run_rows() -> None:
     )
     run_rows = [{"label": "ok_block", "status": "completed"}, {"label": "read_value", "status": "failed"}]
 
-    assert _failed_block_code(workflow, _first_failed_result(run_rows)) == 'page.locator("button.old")'
+    assert _failed_block_code(workflow, _newest_failed_result(run_rows)) == 'page.locator("button.old")'
 
 
 def test_failed_block_code_uses_failed_result_row_order_not_definition_order() -> None:
@@ -2741,13 +2760,13 @@ def test_failed_block_code_uses_failed_result_row_order_not_definition_order() -
     assert (
         _failed_block_code(
             workflow,
-            _first_failed_result([{"label": "finally", "status": "failed"}, {"label": "main", "status": "failed"}]),
+            _newest_failed_result([{"label": "main", "status": "failed"}, {"label": "finally", "status": "failed"}]),
         )
         == 'page.locator("#finally")'
     )
 
 
-def test_failed_block_code_does_not_skip_a_nullable_label_to_later_failed_row() -> None:
+def test_failed_block_code_does_not_skip_a_nullable_label_to_an_earlier_failed_row() -> None:
     workflow = SimpleNamespace(
         workflow_definition={
             "blocks": [
@@ -2756,11 +2775,11 @@ def test_failed_block_code_does_not_skip_a_nullable_label_to_later_failed_row() 
             ]
         }
     )
-    failed_rows = [{"label": None, "status": "failed"}, {"label": "finally", "status": "failed"}]
+    failed_rows = [{"label": "finally", "status": "failed"}, {"label": None, "status": "failed"}]
 
-    selected = _first_failed_result(failed_rows)
+    selected = _newest_failed_result(failed_rows)
 
-    assert selected is failed_rows[0]
+    assert selected is failed_rows[-1]
     assert _failed_block_code(workflow, selected) is None
 
 
@@ -2773,10 +2792,10 @@ def test_nullable_label_sequence_keeps_packet_metadata_and_locator_evidence_on_s
         }
     )
     failed_rows = [
-        {"label": None, "status": "failed", "failure_reason": "unlabeled failed"},
         {"label": "finally", "status": "failed", "failure_reason": "finally failed"},
+        {"label": None, "status": "failed", "failure_reason": "unlabeled failed"},
     ]
-    selected = _first_failed_result(failed_rows)
+    selected = _newest_failed_result(failed_rows)
     result = _failed_run_result(None)
     data = result["data"]
     assert isinstance(data, dict)
@@ -2795,7 +2814,7 @@ def test_nullable_label_sequence_keeps_packet_metadata_and_locator_evidence_on_s
     assert packet.failure.locator_observations == []
 
 
-def test_failure_label_trace_and_locators_share_the_first_failed_result_row() -> None:
+def test_failure_label_trace_and_locators_share_the_newest_failed_result_row() -> None:
     result = _failed_run_result(
         [
             {
@@ -2809,8 +2828,8 @@ def test_failure_label_trace_and_locators_share_the_first_failed_result_row() ->
     data = result["data"]
     assert isinstance(data, dict)
     data["blocks"] = [
-        {"label": "finally", "status": "failed", "failure_reason": "finally failed"},
         {"label": "main", "status": "failed", "failure_reason": "main failed"},
+        {"label": "finally", "status": "failed", "failure_reason": "finally failed"},
     ]
     data["action_trace_summary"] = ["finally line 7 failed"]
     data["failing_code_line"] = 7
@@ -2828,7 +2847,7 @@ def test_failed_block_code_is_none_when_nothing_failed() -> None:
     workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "a", "block_type": "code", "code": "pass"}]})
 
     results = [{"label": "a", "status": "completed"}]
-    assert _failed_block_code(workflow, _first_failed_result(results)) is None
+    assert _failed_block_code(workflow, _newest_failed_result(results)) is None
 
 
 def test_authored_literal_selectors_are_ordered_by_source_position() -> None:
@@ -2925,6 +2944,42 @@ def test_browser_operation_failure_projects_same_row_run_and_block_identity() ->
     projected = project_build_test_packet_for_llm(packet)
     assert projected.failure is not None
     assert projected.failure.failed_operation == outcome.failed_operation
+
+
+def test_a_run_with_two_failed_blocks_reports_the_newest_failure() -> None:
+    """``data['blocks']`` is chronological, so on a continue-on-failure run the packet names the
+    failure the run stopped on rather than an earlier one it survived."""
+    result = _failed_run_result(None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["workflow_run_id"] = "wr_two_failures"
+    data["blocks"] = [
+        {
+            "workflow_run_block_id": "wrb_search",
+            "label": "run_search",
+            "status": "failed",
+            "failure_reason": "search submit never navigated",
+            "error_codes": ["browser_operation_failed"],
+        },
+        {
+            "workflow_run_block_id": "wrb_select",
+            "label": "select_first_result",
+            "status": "failed",
+            "failure_reason": "result locator never appeared",
+            "error_codes": ["browser_operation_failed"],
+        },
+    ]
+
+    outcome = recorded_outcome_from_run_blocks_result(result)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result, recorded_outcome=outcome)
+
+    assert outcome is not None
+    assert outcome.failed_operation is not None
+    assert outcome.failed_operation.workflow_run_block_id == "wrb_select"
+    assert outcome.failed_operation.block_label == "select_first_result"
+    assert packet.failure is not None
+    assert packet.failure.block_label == "select_first_result"
+    assert packet.failure.reason == "result locator never appeared"
 
 
 def test_browser_operation_packet_uses_same_run_recorded_outcome_as_its_authority() -> None:
@@ -4009,18 +4064,18 @@ def test_native_actions_bound_the_global_newest_slice_before_chronological_rende
     results = [
         {
             "action_trace": [
-                {"action": "click", "status": "completed"},
-                {"action": "scroll", "status": "completed"},
-                {"action": "wait", "status": "completed"},
-                {"action": "hover", "status": "completed"},
-            ]
-        },
-        {
-            "action_trace": [
                 {"action": "select_option", "status": "completed"},
                 {"action": "input_text", "status": "completed"},
                 {"action": "goto_url", "status": "completed"},
                 {"action": "reload_page", "status": "completed"},
+            ]
+        },
+        {
+            "action_trace": [
+                {"action": "click", "status": "completed"},
+                {"action": "scroll", "status": "completed"},
+                {"action": "wait", "status": "completed"},
+                {"action": "hover", "status": "completed"},
             ]
         },
     ]
@@ -5121,8 +5176,10 @@ async def test_failed_run_still_records_the_failure_and_marks_the_post_run_page(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("challenge", [False, True])
 async def test_enrichment_facts_still_land_on_the_recorded_outcome_and_agree_with_history(
     monkeypatch: pytest.MonkeyPatch,
+    challenge: bool,
 ) -> None:
     ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
     evidence = same_run_page_evidence()
@@ -5134,8 +5191,26 @@ async def test_enrichment_facts_still_land_on_the_recorded_outcome_and_agree_wit
         result_data["current_url"] = "https://example.com/done"
         result_data["post_run_page_evidence"] = evidence
         result_data["post_run_page_capture"] = {"status": "captured"}
+        if challenge:
+            monkeypatch.setattr(
+                run_execution_module,
+                "_terminal_challenge_evidence",
+                lambda *_args, **_kwargs: run_execution_module.TerminalChallengeEvidence(
+                    source="artifact",
+                    reason="Browser challenge",
+                    challenge_evidence_source="artifact",
+                    workflow_run_id="wr_paused",
+                    block_labels=("extract_heading",),
+                ),
+            )
         return "https://example.com/done", evidence
 
+    streamed = []
+
+    async def capture_outcome(*_args, **kwargs):
+        streamed.append(kwargs)
+
+    monkeypatch.setattr(run_execution_module, "_send_run_outcome_update", capture_outcome)
     monkeypatch.setattr(run_execution_module, "_attach_post_run_browser_enrichment", _enrichment)
     monkeypatch.setattr(
         run_execution_module.app.AGENT_FUNCTION,
@@ -5145,9 +5220,14 @@ async def test_enrichment_facts_still_land_on_the_recorded_outcome_and_agree_wit
     counts = count_record_and_send(monkeypatch)
 
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
-    await _verify_and_record_run_blocks_result(ctx, result, 0.0)
+    returned = await _verify_and_record_run_blocks_result(ctx, result, 0.0)
 
+    assert result["ok"] is not challenge
+    assert streamed[0]["verdict"] == ctx.last_run_outcome.verdict
+    if challenge:
+        assert streamed[0]["verdict"] == "not_demonstrated"
     outcome = ctx.latest_recorded_build_test_outcome
+    assert returned is outcome
     assert outcome is not None
     assert ctx.captcha_solver_available is True
     assert ctx.captcha_solver_available_for_url == "https://example.com/done"
@@ -5190,9 +5270,10 @@ async def test_failed_run_known_only_by_its_page_is_graded_after_enrichment(
     counts = count_record_and_send(monkeypatch)
 
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
-    await _verify_and_record_run_blocks_result(ctx, result, 0.0)
+    returned = await _verify_and_record_run_blocks_result(ctx, result, 0.0)
 
     outcome = ctx.latest_recorded_build_test_outcome
+    assert returned is outcome
     assert outcome is not None, "the run's failure was lost because the page was unknown at record time"
     assert outcome.verdict == "repairable_failure", outcome
     assert outcome.page_evidence_refs, outcome
@@ -5237,6 +5318,7 @@ async def test_watchdog_paused_result_is_recorded_before_the_captcha_probe(
         await _verify_and_record_run_blocks_result(ctx, result, 0.0)
 
     assert len(observed_at_probe) == 1
+    assert result.execution.build_outcome is observed_at_probe[0]
     at_probe = observed_at_probe[0]
     assert at_probe is not None and at_probe.workflow_run_id == "wr_paused"
     assert at_probe.verdict == "not_authoritative"
@@ -5842,3 +5924,802 @@ async def test_budget_denied_dispatch_preserves_prior_run_through_public_tool(
     assert ctx.latest_diagnosis_repair_contract is previous_diagnosis
     assert result == {"ok": False, "data": {"budget_expired": True, "run_dispatched": False, "source": "deadline"}}
     dispatch.assert_not_awaited()
+
+
+def _two_block_search_failure_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_two_block",
+            "overall_status": "failed",
+            "browser_session_id": "pbs_new_session",
+            "run_detached_from_chat": False,
+            "requested_block_labels": ["run_search", "select_first_result"],
+            "executed_block_labels": ["run_search", "select_first_result"],
+            "failing_code_line": 9,
+            "blocks": [
+                {"label": "select_first_result", "status": "failed", "failure_reason": "TimeoutError: waiting"},
+                {"label": "run_search", "status": "completed"},
+            ],
+            "action_trace_summary": ["click failed code_line=9"],
+        },
+    }
+
+
+def test_failed_two_block_run_keeps_predecessor_page_state_and_final_action_in_the_packet() -> None:
+    result = _two_block_search_failure_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["observed_block_end_urls"] = {"run_search": "https://fixture.test/results/widget"}
+    data["per_block_action_observations"] = {
+        "run_search": ["click completed code_line=4"],
+        "select_first_result": ["wait failed code_line=9"],
+    }
+    data["action_observations"] = ["click completed code_line=4", "wait failed code_line=9"]
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), result))
+
+    assert projected.run.workflow_run_id == "wr_two_block"
+    assert projected.observed_block_end_urls == {"run_search": "https://fixture.test/results/widget"}
+    assert projected.per_block_action_observations["run_search"] == ["click completed code_line=4"]
+    assert projected.per_block_action_observations["select_first_result"] == ["wait failed code_line=9"]
+    assert "click completed code_line=4" in projected.action_observations
+    assert projected.failure is not None
+    assert projected.failure.block_label == "select_first_result"
+    assert projected.failure.failing_line == 9
+
+
+def test_new_session_run_leaves_the_predecessor_page_state_unavailable_instead_of_a_warm_result() -> None:
+    warm_url = "https://fixture.test/warm-results/stale"
+    ctx = make_copilot_ctx()
+    ctx.verified_prefix_block_end_urls = {"run_search": warm_url}
+    ctx.verified_prefix_block_end_session_id = "pbs_warm_session"
+
+    this_run = _two_block_search_failure_result()
+    this_run_data = this_run["data"]
+    assert isinstance(this_run_data, dict)
+    this_run_data["observed_block_end_urls"] = {"run_search": "https://fixture.test/this-run-results/widget"}
+    this_run_data["action_observations"] = ["wait failed code_line=9"]
+    filled = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(ctx, this_run))
+
+    assert filled.observed_block_end_urls == {"run_search": "https://fixture.test/this-run-results/widget"}
+    assert filled.run.browser_session_id == "pbs_new_session" != ctx.verified_prefix_block_end_session_id
+
+    unrecorded = _two_block_search_failure_result()
+    unrecorded_data = unrecorded["data"]
+    assert isinstance(unrecorded_data, dict)
+    unrecorded_data["action_observations"] = ["wait failed code_line=9"]
+    projected = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(ctx, unrecorded))
+
+    assert projected.observed_block_end_urls == {}
+    assert warm_url not in json.dumps(projected.model_dump(mode="json"))
+    assert OBSERVED_BLOCK_END_URLS_EMPTY in projected.omission_notices
+
+
+def test_the_projection_separates_a_withheld_url_map_from_one_that_was_never_recorded() -> None:
+    ctx = make_copilot_ctx()
+
+    never_recorded = project_build_test_packet_for_llm(
+        build_test_evidence_packet(ctx, _two_block_search_failure_result())
+    )
+
+    assert OBSERVED_BLOCK_END_URLS_EMPTY in never_recorded.omission_notices
+
+    sensitive = _two_block_search_failure_result()
+    sensitive_data = sensitive["data"]
+    assert isinstance(sensitive_data, dict)
+    sensitive_data["block_fact_omission_notices"] = [OBSERVED_BLOCK_END_URLS_WITHHELD]
+
+    withheld = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, sensitive))
+
+    assert OBSERVED_BLOCK_END_URLS_WITHHELD in withheld.omission_notices
+    assert not any("no per-block end URL was recorded" in notice for notice in withheld.omission_notices)
+
+
+def test_the_direct_handoff_keeps_a_withheld_url_map_from_being_reported_as_never_recorded() -> None:
+    sensitive = _two_block_search_failure_result()
+    sensitive_data = sensitive["data"]
+    assert isinstance(sensitive_data, dict)
+    sensitive_data["block_fact_omission_notices"] = [OBSERVED_BLOCK_END_URLS_WITHHELD]
+
+    projected = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), sensitive))
+
+    assert OBSERVED_BLOCK_END_URLS_WITHHELD in projected.omission_notices
+    assert not any("no per-block end URL was recorded" in notice for notice in projected.omission_notices)
+
+
+def test_a_full_url_map_gives_way_before_the_workflow_readback_the_repair_turn_needs() -> None:
+    result = _two_block_search_failure_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    long_url = "https://fixture.test/results?q=" + "w" * 1900
+    data["observed_block_end_urls"] = {f"block_{index}": f"{long_url}&n={index}" for index in range(12)}
+    workflow_yaml = "workflow_definition:\n" + ("  - block: x\n    code: |\n      " + "y" * 90 + "\n") * 280
+    ctx = make_copilot_ctx()
+    ctx.persisted_workflow_yaml = workflow_yaml
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+
+    assert projected.canonical_workflow_yaml is not None
+    assert len(projected.canonical_workflow_yaml) == 30_000
+    assert list(projected.observed_block_end_urls) == ["block_10", "block_11"]
+    assert any("observed_block_end_urls shortened" in notice for notice in projected.omission_notices)
+
+
+def test_the_projection_refuses_an_over_long_failure_final_url_rather_than_cutting_it() -> None:
+    over_long = "https://fixture.test/results?q=" + "w" * BLOCK_FACT_URL_MAX_CHARS
+    packet = build_test_evidence_packet(make_copilot_ctx(), _two_block_search_failure_result())
+    assert packet.failure is not None
+    packet = packet.model_copy(update={"failure": packet.failure.model_copy(update={"final_url": over_long})})
+
+    projected = project_build_test_packet_for_llm(packet)
+
+    assert projected.failure is not None
+    assert projected.failure.final_url is None
+    assert any(
+        "failure.final_url omitted: the recorded URL exceeded" in notice for notice in projected.omission_notices
+    )
+    assert over_long[:200] not in json.dumps(projected.model_dump(mode="json"), ensure_ascii=False)
+
+
+def test_the_direct_handoff_names_both_the_blocks_it_omitted_and_the_ones_it_reduced() -> None:
+    result = _two_block_search_failure_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["observed_block_end_urls"] = {
+        "run_search": "https://svc:hunter2@fixture.test/directory/results",
+        "select_first_result": "https://fixture.test/directory/results?q=cardiology",
+    }
+
+    projected = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), result))
+
+    assert projected.observed_block_end_urls == {"select_first_result": "https://fixture.test/directory/results"}
+    assert "hunter2" not in json.dumps(projected.model_dump(mode="json"), ensure_ascii=False)
+    assert (
+        "observed_block_end_urls omitted block(s) for the direct test handoff: "
+        "run_search: the recorded URL carried credentials in its host."
+    ) in projected.omission_notices
+    assert (
+        "observed_block_end_urls reduced block(s) to their path for the direct test handoff: "
+        "select_first_result: the recorded URL carried a query or fragment."
+    ) in projected.omission_notices
+
+
+def test_the_direct_handoff_does_not_report_an_all_filtered_url_map_as_never_recorded() -> None:
+    result = _two_block_search_failure_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["observed_block_end_urls"] = {"run_search": "about:blank"}
+
+    projected = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), result))
+
+    assert projected.observed_block_end_urls == {}
+    assert any(
+        "no recorded per-block end URL reduced to a reportable origin" in notice
+        for notice in projected.omission_notices
+    )
+    assert not any("no per-block end URL was recorded" in notice for notice in projected.omission_notices)
+
+
+SECRET_BEARING_EXTRACTION_YAML = """
+title: extraction example
+workflow_definition:
+  parameters:
+    - parameter_type: aws_secret
+      key: site_password
+      aws_key: SKYVERN_SITE_PASSWORD
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_credential_bearing_run_mints_no_per_block_end_url_for_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_failed_block(*, workflow_yaml: str) -> dict[str, Any]:
+        harness = await install_run_blocks_harness(
+            monkeypatch,
+            workflow_yaml=workflow_yaml,
+            polled_status="failed",
+            terminal_blocks=[
+                terminal_extraction_block("failed", final_url="https://fixture.test/results/widget"),
+            ],
+        )
+        ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+        ctx.staged_workflow = harness["workflow"]
+        ctx.frontier_resume_session_id = "pbs_run"
+        return await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    ordinary = await run_failed_block(workflow_yaml=HANDBACK_WORKFLOW_YAML)
+    credential_bearing = await run_failed_block(workflow_yaml=SECRET_BEARING_EXTRACTION_YAML)
+
+    assert ordinary["data"]["observed_block_end_urls"] == {"extract_heading": "https://fixture.test/results/widget"}
+    assert "observed_block_end_urls" not in credential_bearing["data"]
+    assert credential_bearing["data"]["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
+
+
+SEARCH_SELECT_BLOCK_TRACES: dict[str, list[dict[str, Any]]] = {
+    "select_first_result": [{"action": "wait", "status": "failed", "code_line": 9}],
+    "run_search": [{"action": "click", "status": "completed", "code_line": 4}],
+    "open_search": [{"action": "input_text", "status": "completed", "code_line": 2}],
+}
+
+
+def _stamp_block_traces(results: list[dict[str, Any]]) -> None:
+    """Stamp each block's trace by label, so no assertion below rides on the producer's list order."""
+    for result in results:
+        trace = SEARCH_SELECT_BLOCK_TRACES.get(str(result.get("label") or ""))
+        if trace is not None:
+            result["action_trace"] = [dict(entry) for entry in trace]
+
+
+@pytest.mark.asyncio
+async def test_prior_run_hydration_mints_per_block_facts_and_drops_the_urls_for_a_credential_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def read_prior_run(*, workflow_parameters: list[dict[str, str]]) -> dict[str, Any]:
+        async def stamp_traces(
+            _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+        ) -> None:
+            _stamp_block_traces(results)
+
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[
+                run_result_block_row("select_first_result", "failed", "https://fixture.test/results/widget"),
+                run_result_block_row("run_search", "completed", "https://fixture.test/results/widget/page-1"),
+            ],
+            workflow_parameters=workflow_parameters,
+            attach_action_traces=stamp_traces,
+        )
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+        assert isinstance(result["data"], dict)
+        return result["data"]
+
+    ordinary = await read_prior_run(workflow_parameters=[])
+    credential_bearing = await read_prior_run(
+        workflow_parameters=[{"parameter_type": "aws_secret", "key": "site_password"}]
+    )
+
+    assert ordinary["observed_block_end_urls"] == {
+        "run_search": "https://fixture.test/results/widget/page-1",
+        "select_first_result": "https://fixture.test/results/widget",
+    }
+    assert ordinary["per_block_action_observations"]["run_search"] == ["click completed code_line=4"]
+    assert ordinary["per_block_action_observations"]["select_first_result"] == ["wait failed code_line=9"]
+    assert "block_fact_omission_notices" not in ordinary
+    assert "observed_block_end_urls" not in credential_bearing
+    assert credential_bearing["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
+
+
+@pytest.mark.asyncio
+async def test_prior_run_hydration_keeps_the_predecessor_final_action_from_the_real_action_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            run_result_block_row(
+                "select_first_result", "failed", "https://fixture.test/results/widget", task_id="tsk_select"
+            ),
+            run_result_block_row(
+                "run_search", "completed", "https://fixture.test/results/widget/page-1", task_id="tsk_search"
+            ),
+        ],
+        recent_actions=[
+            run_result_action_row("tsk_select", ActionType.WAIT, ActionStatus.failed, code_line=9),
+            run_result_action_row("tsk_search", ActionType.CLICK, ActionStatus.completed),
+        ],
+    )
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    data = result["data"]
+
+    assert isinstance(data, dict)
+    assert data["per_block_action_observations"]["run_search"] == ["click completed"]
+    assert data["per_block_action_observations"]["select_first_result"] == ["wait failed code_line=9"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_two_block_run_hands_the_predecessor_page_state_to_the_repair_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML,
+        polled_status="failed",
+        terminal_blocks=[
+            terminal_extraction_block(
+                "failed", label="select_first_result", final_url="https://fixture.test/results/widget"
+            ),
+            terminal_extraction_block(
+                "completed", label="run_search", final_url="https://fixture.test/results/widget/page-1"
+            ),
+        ],
+    )
+
+    async def stamp_traces(
+        _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+    ) -> None:
+        _stamp_block_traces(results)
+
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", stamp_traces)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["run_search", "select_first_result"], "parameters": {}}, ctx
+    )
+    data = result["data"]
+
+    assert {"observed_block_end_urls", "per_block_action_observations"} <= set(data)
+    assert data["observed_block_end_urls"]["run_search"] == "https://fixture.test/results/widget/page-1"
+    assert data["per_block_action_observations"]["run_search"] == ["click completed code_line=4"]
+    assert data["per_block_action_observations"]["select_first_result"] == ["wait failed code_line=9"]
+    assert ctx.verified_prefix_block_end_urls == {}
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+
+    assert projected.observed_block_end_urls["run_search"] == "https://fixture.test/results/widget/page-1"
+    assert projected.per_block_action_observations["run_search"] == ["click completed code_line=4"]
+
+
+OPEN_SEARCH_SELECT_WORKFLOW_YAML = """
+title: open then search then select
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: extraction
+      label: open_search
+      url: https://fixture.test
+      data_extraction_goal: Extract the search form.
+    - block_type: extraction
+      label: run_search
+      data_extraction_goal: Extract the search results.
+    - block_type: extraction
+      label: select_first_result
+      data_extraction_goal: Extract the selected result.
+"""
+
+EXECUTION_ORDERED_LABELS = ["open_search", "run_search", "select_first_result"]
+
+
+@pytest.mark.asyncio
+async def test_the_live_run_path_orders_per_block_facts_so_the_newest_bound_keeps_the_failing_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=OPEN_SEARCH_SELECT_WORKFLOW_YAML,
+        polled_status="failed",
+        terminal_blocks=[
+            terminal_extraction_block(
+                "failed", label="select_first_result", final_url="https://fixture.test/results/widget"
+            ),
+            terminal_extraction_block("completed", label="run_search", final_url="https://fixture.test/search"),
+            terminal_extraction_block("completed", label="open_search", final_url="https://fixture.test/"),
+        ],
+    )
+
+    async def stamp_traces(
+        _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+    ) -> None:
+        _stamp_block_traces(results)
+
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", stamp_traces)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": list(EXECUTION_ORDERED_LABELS), "parameters": {}}, ctx
+    )
+    data = result["data"]
+
+    assert list(data["observed_block_end_urls"]) == EXECUTION_ORDERED_LABELS
+    assert list(data["per_block_action_observations"]) == EXECUTION_ORDERED_LABELS
+
+    compacted = _compact_packet_for_aggregate_limit(build_test_evidence_packet(ctx, result), [])
+
+    assert compacted.observed_block_end_urls["select_first_result"] == "https://fixture.test/results/widget"
+    assert "open_search" not in compacted.observed_block_end_urls
+
+
+@pytest.mark.asyncio
+async def test_the_prior_run_hydration_path_orders_per_block_facts_the_same_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stamp_traces(
+        _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+    ) -> None:
+        _stamp_block_traces(results)
+
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            run_result_block_row("select_first_result", "failed", "https://fixture.test/results/widget"),
+            run_result_block_row("run_search", "completed", "https://fixture.test/search"),
+            run_result_block_row("open_search", "completed", "https://fixture.test/"),
+        ],
+        attach_action_traces=stamp_traces,
+    )
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    data = result["data"]
+    assert isinstance(data, dict)
+
+    assert list(data["observed_block_end_urls"]) == EXECUTION_ORDERED_LABELS
+    assert list(data["per_block_action_observations"]) == EXECUTION_ORDERED_LABELS
+
+
+TWO_FAILURE_BLOCK_TRACES: dict[str, list[dict[str, Any]]] = {
+    "select_first_result": [{"action": "wait", "status": "failed", "code_line": 9}],
+    "run_search": [{"action": "click", "status": "failed", "code_line": 4}],
+}
+
+
+async def _stamp_two_failure_traces(
+    _rows: object, results: list[dict[str, Any]], _org: str, include_completed: bool = False
+) -> None:
+    for result in results:
+        trace = TWO_FAILURE_BLOCK_TRACES.get(str(result.get("label") or ""))
+        if trace is not None:
+            result["action_trace"] = [dict(entry) for entry in trace]
+
+
+@pytest.mark.asyncio
+async def test_the_live_run_path_attributes_a_two_failure_run_to_the_newest_failed_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=OPEN_SEARCH_SELECT_WORKFLOW_YAML,
+        polled_status="failed",
+        terminal_blocks=[
+            terminal_extraction_block(
+                "failed", label="select_first_result", final_url="https://fixture.test/results/widget"
+            ),
+            terminal_extraction_block("failed", label="run_search", final_url="https://fixture.test/search"),
+            terminal_extraction_block("completed", label="open_search", final_url="https://fixture.test/"),
+        ],
+    )
+    monkeypatch.setattr(run_execution_module, "_attach_action_traces", _stamp_two_failure_traces)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": list(EXECUTION_ORDERED_LABELS), "parameters": {}}, ctx
+    )
+    data = result["data"]
+
+    assert data["failing_code_line"] == 9
+    assert data["action_trace_summary"] == ["wait failed code_line=9"]
+    packet = build_test_evidence_packet(ctx, result)
+    assert packet.failure is not None
+    assert packet.failure.block_label == "select_first_result"
+
+
+@pytest.mark.asyncio
+async def test_the_prior_run_hydration_path_attributes_a_two_failure_run_to_the_newest_failed_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            run_result_block_row("select_first_result", "failed", "https://fixture.test/results/widget"),
+            run_result_block_row("run_search", "failed", "https://fixture.test/search"),
+            run_result_block_row("open_search", "completed", "https://fixture.test/"),
+        ],
+        attach_action_traces=_stamp_two_failure_traces,
+    )
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    data = result["data"]
+    assert isinstance(data, dict)
+
+    assert data["failing_code_line"] == 9
+    assert data["action_trace_summary"] == ["wait failed code_line=9"]
+    packet = build_test_evidence_packet(make_copilot_ctx(), result)
+    assert packet.failure is not None
+    assert packet.failure.block_label == "select_first_result"
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_every_end_url_is_refused_is_not_also_reported_as_never_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            run_result_block_row("select_first_result", "failed", "https://user:hunter2@fixture.test/results"),
+            run_result_block_row("run_search", "completed", "https://user:hunter2@fixture.test/search"),
+        ],
+    )
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    data = result["data"]
+    assert isinstance(data, dict)
+
+    assert "observed_block_end_urls" not in data
+    assert OBSERVED_BLOCK_END_URLS_UNREPORTABLE in data["block_fact_omission_notices"]
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), result))
+
+    assert OBSERVED_BLOCK_END_URLS_EMPTY not in projected.omission_notices
+
+
+def test_the_screened_blocks_notice_stays_inside_the_budget_of_the_map_it_describes() -> None:
+    entries = [(f"block_{index:03d}", "the recorded URL carried a query or fragment") for index in range(200)]
+
+    rendered = labelled_url_screen_reasons(entries)
+
+    assert len(rendered) <= BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS + len(
+        "; and 200 older block(s) left unnamed at the notice budget"
+    )
+    assert "block_199" in rendered
+    assert rendered.endswith("older block(s) left unnamed at the notice budget")
+
+
+@pytest.mark.asyncio
+async def test_the_run_results_labels_and_blocks_come_back_newest_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The repository hands the run's rows back newest-first, and the packet keeps the tail of every
+    list built from them: reported in repository order, a bound drops the failing block instead."""
+    predecessors = [f"step_{index}" for index in range(14)]
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[run_result_block_row("select_first_result", "failed", "https://fixture.test/results")]
+        + [
+            run_result_block_row(label, "completed", f"https://fixture.test/{label}")
+            for label in reversed(predecessors)
+        ],
+    )
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    data = result["data"]
+    assert isinstance(data, dict)
+
+    executed_last = predecessors + ["select_first_result"]
+    assert data["executed_block_labels"] == executed_last
+    assert data["requested_block_labels"] == executed_last
+    assert [block["label"] for block in data["blocks"]] == executed_last
+    assert list(data["observed_block_end_urls"])[-1] == "select_first_result"
+
+
+def test_a_long_failing_block_cannot_erase_the_predecessor_blocks_final_action() -> None:
+    results = [
+        {
+            "label": "run_search",
+            "action_trace": [
+                {"action": "click", "status": "completed", "code_line": 4},
+                {"action": "input_text", "status": "completed", "code_line": 3},
+            ],
+        },
+        {
+            "label": "select_first_result",
+            "action_trace": [{"action": "wait", "status": "failed", "code_line": 9}]
+            + [{"action": "click", "status": "completed", "code_line": 7} for _ in range(5)],
+        },
+    ]
+
+    assert run_execution_module._retained_action_observations(results) == [
+        "click completed code_line=4",
+        "click completed code_line=7",
+        "click completed code_line=7",
+        "click completed code_line=7",
+        "click completed code_line=7",
+        "wait failed code_line=9",
+    ]
+    assert run_execution_module._retained_action_observations_by_label(results) == {
+        "run_search": ["click completed code_line=4"],
+        "select_first_result": [
+            "click completed code_line=7",
+            "click completed code_line=7",
+            "click completed code_line=7",
+            "click completed code_line=7",
+            "wait failed code_line=9",
+        ],
+    }
+
+
+def test_a_seven_block_run_reserves_the_newest_predecessors_and_leaves_the_failing_block_one_slot() -> None:
+    results = [
+        {
+            "label": f"predecessor_{index}",
+            "action_trace": [
+                {"action": "click", "status": "completed", "code_line": index},
+                {"action": "input_text", "status": "completed", "code_line": index + 100},
+            ],
+        }
+        for index in range(6, 0, -1)
+    ] + [
+        {
+            "label": "select_first_result",
+            "action_trace": [{"action": "wait", "status": "failed", "code_line": 90}]
+            + [{"action": "click", "status": "completed", "code_line": 91} for _ in range(4)],
+        }
+    ]
+
+    by_label = run_execution_module._retained_action_observations_by_label(results)
+
+    assert by_label["select_first_result"] == ["wait failed code_line=90"]
+    assert by_label["predecessor_1"] == ["click completed code_line=1"]
+    assert by_label["predecessor_5"] == ["click completed code_line=5"]
+    assert "predecessor_6" not in by_label
+    assert len(run_execution_module._retained_action_observations(results)) == 6
+
+
+def test_predecessor_blocks_the_action_budget_drops_are_named_in_an_omission_notice() -> None:
+    results = [
+        {
+            "label": f"predecessor_{index}",
+            "action_trace": [{"action": "click", "status": "completed", "code_line": index}],
+        }
+        for index in range(1, 8)
+    ] + [
+        {
+            "label": "select_first_result",
+            "action_trace": [{"action": "wait", "status": "failed", "code_line": 90}],
+        }
+    ]
+    data: dict[str, Any] = {}
+
+    run_execution_module._attach_block_fact_projection(
+        data,
+        [],
+        run_execution_module._retained_action_observations_by_label(results),
+        unreported_predecessor_labels=run_execution_module._unreported_predecessor_labels(results),
+        sensitive_origin_run=False,
+    )
+
+    assert "predecessor_1" not in data["per_block_action_observations"]
+    assert "predecessor_2" not in data["per_block_action_observations"]
+    notice = next(notice for notice in data["block_fact_omission_notices"] if "predecessor block(s)" in notice)
+    assert "2 predecessor block(s)" in notice
+    assert "predecessor_1" in notice
+    assert "predecessor_2" in notice
+
+
+def test_a_label_a_loop_reused_keeps_its_newest_end_url_at_the_newest_end_of_a_bound() -> None:
+    rows = [
+        run_result_block_row("loop_body", "completed", "https://fixture.test/item/1"),
+        run_result_block_row("open_search", "completed", "https://fixture.test/"),
+        run_result_block_row("loop_body", "failed", "https://fixture.test/item/9"),
+    ]
+
+    end_urls = run_execution_module._block_end_urls_by_label(rows)
+
+    assert list(end_urls) == ["open_search", "loop_body"]
+    assert end_urls["loop_body"] == "https://fixture.test/item/9"
+    notices: list[str] = []
+    kept = _compacted_newest_labelled(list(end_urls.items()), 1, field_name="observed_block_end_urls", notices=notices)
+    assert kept == [("loop_body", "https://fixture.test/item/9")]
+    assert any("dropped the oldest block(s) open_search" in notice for notice in notices)
+
+
+def test_a_label_a_loop_reused_keeps_its_newest_action_observations_at_the_newest_end() -> None:
+    results = [
+        {"label": "loop_body", "action_trace": [{"action": "click", "status": "completed", "code_line": 1}]},
+        {"label": "open_search", "action_trace": [{"action": "click", "status": "completed", "code_line": 2}]},
+        {"label": "loop_body", "action_trace": [{"action": "wait", "status": "failed", "code_line": 3}]},
+    ]
+
+    by_label = run_execution_module._retained_action_observations_by_label(results)
+
+    assert list(by_label) == ["open_search", "loop_body"]
+    assert by_label["loop_body"] == ["click completed code_line=1", "wait failed code_line=3"]
+
+
+def test_a_repeated_block_label_reports_the_status_of_its_newest_recorded_row() -> None:
+    data = {
+        "blocks": [
+            {"label": "loop_body", "status": "completed"},
+            {"label": "loop_body", "status": "failed"},
+        ],
+        "registered_output_parameter_values": [
+            {
+                "workflow_run_id": "wr-1",
+                "block_label": "loop_body",
+                "output_parameter_key": "picked",
+                "value": {"name": "row-9"},
+            }
+        ],
+    }
+
+    outputs = run_execution_module._packet_registered_outputs(make_copilot_ctx(), data, "wr-1", [])
+
+    assert [(output.label, output.status) for output in outputs] == [("loop_body", "failed")]
+
+
+def test_every_packet_rendering_keeps_the_newest_per_block_facts_and_says_what_it_dropped() -> None:
+    unbounded = build_test_evidence_packet(make_copilot_ctx(), _two_block_search_failure_result()).model_copy(
+        update={
+            "observed_block_end_urls": {f"block_{index}": f"https://fixture.test/{index}" for index in range(30)},
+            "per_block_action_observations": {
+                f"block_{index}": [f"click completed code_line={line}" for line in range(20)] for index in range(30)
+            },
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(unbounded)
+
+    assert len(projected.observed_block_end_urls) == 12
+    assert projected.observed_block_end_urls["block_29"] == "https://fixture.test/29"
+    assert "block_17" not in projected.observed_block_end_urls
+    assert len(projected.per_block_action_observations) == 12
+    assert projected.per_block_action_observations["block_29"] == [
+        f"click completed code_line={line}" for line in range(14, 20)
+    ]
+    assert any("18 oldest block(s) omitted" in notice for notice in projected.omission_notices)
+    assert any("oldest observation(s) omitted" in notice for notice in projected.omission_notices)
+
+    compact_notices: list[str] = []
+    compacted = _compact_packet_for_aggregate_limit(unbounded, compact_notices)
+
+    assert list(compacted.observed_block_end_urls) == ["block_28", "block_29"]
+    assert compacted.per_block_action_observations["block_29"] == ["click completed code_line=19"]
+    assert any("observed_block_end_urls shortened at the aggregate packet limit" in n for n in compact_notices)
+
+
+def test_an_over_long_page_state_url_is_refused_rather_than_cut() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), _two_block_search_failure_result()).model_copy(
+        update={
+            "page_state": BuildTestPacketPageState(
+                current_url="https://fixture.test/results?q=" + "u" * 3000,
+                observed_after_workflow_run=True,
+            )
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(packet)
+
+    assert projected.page_state is not None
+    assert projected.page_state.current_url is None
+    assert any("exceeded 2000 characters" in notice for notice in projected.omission_notices)
+
+
+def test_an_over_long_end_url_is_refused_rather_than_cut_into_a_page_the_run_never_reached() -> None:
+    notices: list[str] = []
+
+    coerced = coerce_block_end_urls(
+        {
+            "run_search": "https://fixture.test/results?q=" + "u" * 3000,
+            "select_first_result": "https://fixture.test/results/widget",
+        },
+        notices,
+    )
+
+    assert coerced == {"select_first_result": "https://fixture.test/results/widget"}
+    assert any("exceeded 2000 characters" in notice for notice in notices)
+
+
+def test_direct_test_handoff_keeps_same_origin_pages_apart_but_still_drops_a_query() -> None:
+    result = _two_block_search_failure_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["observed_block_end_urls"] = {
+        "run_search": "https://fixture.test/results/widget",
+        "select_first_result": "https://fixture.test/records/1842",
+    }
+
+    projected = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), result))
+
+    assert projected.observed_block_end_urls == {
+        "run_search": "https://fixture.test/results/widget",
+        "select_first_result": "https://fixture.test/records/1842",
+    }
+
+    query_bearing = _two_block_search_failure_result()
+    query_bearing_data = query_bearing["data"]
+    assert isinstance(query_bearing_data, dict)
+    query_bearing_data["observed_block_end_urls"] = {"run_search": "https://fixture.test/results?session_id=abc123"}
+
+    reduced = project_direct_test_handoff_packet_for_llm(build_test_evidence_packet(make_copilot_ctx(), query_bearing))
+
+    assert reduced.observed_block_end_urls == {"run_search": "https://fixture.test/results"}
+    assert "abc123" not in json.dumps(reduced.model_dump(mode="json"))

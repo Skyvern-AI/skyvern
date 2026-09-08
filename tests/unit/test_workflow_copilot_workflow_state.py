@@ -4,11 +4,22 @@ import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.code_block_steps import fill_code_block_error_code_mappings_in_yaml
-from skyvern.forge.sdk.routes.workflow_copilot import _ensure_copilot_workflow_yaml, _workflow_to_copilot_yaml
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.tools.run_execution import _workflow_from_prior_draft
+from skyvern.forge.sdk.routes.workflow_copilot import (
+    _ensure_copilot_workflow_yaml,
+    _prior_copilot_workflow_yaml,
+    _workflow_to_copilot_yaml,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from tests.copilot_policy_support import (
+    SCREEN_INTERRUPTED_DRAFT_YAML,
+    SCREEN_INTERRUPTED_LABELS,
+    screen_interrupted_proposal,
+)
 
 
 def _output_parameter(now: datetime) -> OutputParameter:
@@ -158,3 +169,28 @@ def test_code_block_regeneration_honors_explicit_manifest_removal(explicit_remov
     block = yaml.safe_load(result)["workflow_definition"]["blocks"][0]
     assert "error_code_mapping" in block
     assert block["error_code_mapping"] == explicit_removal
+
+
+@pytest.mark.asyncio
+async def test_screen_interrupted_candidate_prior_draft_resolves_every_requested_label(
+    no_saved_workflow: None,
+) -> None:
+    retained_yaml = _prior_copilot_workflow_yaml(
+        proposed_workflow=screen_interrupted_proposal(),
+        persisted_workflow_yaml=None,
+    )
+    ctx = CopilotContext(
+        organization_id="o_test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=None,
+        prior_copilot_workflow_yaml=retained_yaml or "",
+    )
+
+    resolved = await _workflow_from_prior_draft(ctx, SCREEN_INTERRUPTED_LABELS)
+
+    assert retained_yaml == SCREEN_INTERRUPTED_DRAFT_YAML
+    assert resolved is not None
+    assert [block.label for block in resolved.workflow_definition.blocks] == SCREEN_INTERRUPTED_LABELS

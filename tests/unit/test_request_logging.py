@@ -483,6 +483,20 @@ class TestSanitizeBody:
         assert result == REDACTED
 
     @pytest.mark.parametrize(
+        "content_type",
+        ["application/json", "multipart/form-data; boundary=recipe-boundary"],
+    )
+    def test_recipe_apply_request_body_fully_redacted(self, content_type: str) -> None:
+        request = _make_request("POST", "/v1/recipes/jobs/apply")
+        body = b'{"username":"customer-login","2fa_identifier":"otp@example.com","password":"secret"}'
+
+        result = _sanitize_body(request, body, content_type)
+
+        assert result == REDACTED
+        assert "customer-login" not in result
+        assert "otp@example.com" not in result
+
+    @pytest.mark.parametrize(
         "path",
         [
             "/v1/workflow/copilot/chat-post",

@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
 import structlog
@@ -45,7 +45,7 @@ from skyvern.webeye.actions.handler import (
     _remove_download_listener,
     handle_download_file_action,
 )
-from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
+from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess, StaleActionAbort
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import BlobActionFreshness
@@ -1613,11 +1613,9 @@ async def test_handle_action_crdownload_signal_enters_completion_before_reportin
     assert "report.pdf.crdownload" not in results[-1].downloaded_files
 
 
-@pytest.mark.asyncio
-async def test_handle_action_aborted_download_is_reported_as_failure_not_success() -> None:
+async def _run_aborted_download() -> list:
     # The browser deletes the partial file when it aborts a transfer, so the settle sees the same
-    # empty directory a completed download leaves behind. Reporting success here tells the agent the
-    # file arrived, and it retries the already-consumed link instead of regenerating it.
+    # empty directory a completed download leaves behind.
     now = datetime.now(UTC)
     organization = make_organization(now)
     task, step, page, browser_state, scraped_page, action = _make_download_click_context(
@@ -1666,11 +1664,35 @@ async def test_handle_action_aborted_download_is_reported_as_failure_not_success
                 ),
                 timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
+    return results
+
+
+@pytest.mark.asyncio
+async def test_handle_action_aborted_download_is_reported_as_failure_not_success() -> None:
+    # The browser deletes the partial file when it aborts a transfer, so the settle sees the same
+    # empty directory a completed download leaves behind. Reporting success here tells the agent the
+    # file arrived, and it retries the already-consumed link instead of regenerating it.
+    results = await _run_aborted_download()
 
     assert results[-1].success is False
     assert results[-1].download_triggered is True
     assert not results[-1].downloaded_files
     assert "canceled" in (results[-1].exception_message or "")
+    assert results[-1].download_failure_status is None
+
+
+@pytest.mark.asyncio
+async def test_aborted_download_stamps_observed_failure_status() -> None:
+    # The partial file credited download_triggered, then the browser aborted the transfer and deleted
+    # it, so no artifact is saved. An admitted xhr/fetch request observed a server 500; the aborted
+    # ActionFailure must carry that status as evidence rather than dropping it.
+    with _forced_observed_failure_status(500):
+        results = await _run_aborted_download()
+
+    assert results[-1].success is False
+    assert results[-1].download_triggered is True
+    assert not results[-1].downloaded_files
+    assert results[-1].download_failure_status == 500
 
 
 @pytest.mark.asyncio
@@ -3779,12 +3801,9 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
     assert span_attrs["download_signal_elapsed_seconds"] == 1.2
 
 
-@pytest.mark.asyncio
-async def test_observed_download_zero_artifacts_reports_needs_followup() -> None:
-    # A download event was observed and credited (download_triggered=True), but finalization saved no
-    # file and the browser reported no abort reason. Returning a plain success implies a file exists;
-    # the action must instead flag needs_followup so the agent keeps trying rather than declaring the
-    # goal complete against a file that was never captured.
+async def _run_observed_download_zero_artifacts() -> list:
+    # A download event is observed and credited (download_triggered=True), but finalization saves no
+    # file and the browser reports no abort reason.
     now = datetime.now(UTC)
     organization = make_organization(now)
     task = make_task(
@@ -3867,12 +3886,35 @@ async def test_observed_download_zero_artifacts_reports_needs_followup() -> None
                 page=page,
                 action=action,
             )
+    return results
+
+
+@pytest.mark.asyncio
+async def test_observed_download_zero_artifacts_reports_needs_followup() -> None:
+    # A download event was observed and credited (download_triggered=True), but finalization saved no
+    # file and the browser reported no abort reason. Returning a plain success implies a file exists;
+    # the action must instead flag needs_followup so the agent keeps trying rather than declaring the
+    # goal complete against a file that was never captured.
+    results = await _run_observed_download_zero_artifacts()
 
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files is None
     assert isinstance(results[-1], ActionSuccess)
     assert results[-1].needs_followup is True
     assert results[-1].followup_message is not None
+    assert results[-1].download_failure_status is None
+
+
+@pytest.mark.asyncio
+async def test_observed_but_empty_download_stamps_observed_failure_status() -> None:
+    # The download event only credited the attempt; finalization saved no file. An admitted xhr/fetch
+    # request observed a server 500, so the credited-but-empty result must carry that status as evidence.
+    with _forced_observed_failure_status(500):
+        results = await _run_observed_download_zero_artifacts()
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files is None
+    assert results[-1].download_failure_status == 500
 
 
 @pytest.mark.asyncio
@@ -7220,3 +7262,187 @@ async def test_explicit_download_marker_popup_recorded_as_claim(tmp_path: Path) 
     assert any(candidate is marker_popup for candidate in claims), (
         "explicit-download marker popup must be recorded as a task-scoped claim"
     )
+
+
+@contextlib.contextmanager
+def _forced_observed_failure_status(status: int | None) -> Iterator[None]:
+    """Force every ScopedXhrDownloadCapture to report a fixed observed status.
+
+    The observer's own recording logic (action-window admission and status-allowlist gating) is
+    covered in test_scoped_xhr_download_capture; here we isolate the download-flow stamp wiring —
+    whether the not-triggered branch copies the observer's status onto the click result and action.
+    """
+    with patch.object(
+        ScopedXhrDownloadCapture,
+        "observed_download_failure_status",
+        new_callable=PropertyMock,
+        return_value=status,
+    ):
+        yield
+
+
+async def _run_download_click_to_not_triggered(
+    tmp_path: Path, *, forced_status: int | None
+) -> tuple[list, ClickAction]:
+    now = datetime.now(UTC)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=make_organization(now), page_url="https://example.com/downloads"
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+    page.context._skyvern_cdp_download_active = False
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    browser_state.navigate_to_url = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with (
+        _forced_observed_failure_status(forced_status),
+        patch.object(ActionHandler, "_handle_action", side_effect=AsyncMock(return_value=[ActionSuccess()])),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
+        patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        results = await ActionHandler.handle_action(
+            scraped_page=scraped_page, task=task, step=step, page=page, action=action
+        )
+    return results, action
+
+
+@pytest.mark.asyncio
+async def test_download_not_triggered_stamps_observed_failure_status(tmp_path: Path) -> None:
+    results, action = await _run_download_click_to_not_triggered(tmp_path, forced_status=500)
+
+    assert not results[-1].download_triggered
+    assert results[-1].download_failure_status == 500
+
+
+@pytest.mark.asyncio
+async def test_download_not_triggered_without_observed_status_leaves_evidence_unset(tmp_path: Path) -> None:
+    results, action = await _run_download_click_to_not_triggered(tmp_path, forced_status=None)
+
+    assert not results[-1].download_triggered
+    assert results[-1].download_failure_status is None
+
+
+@pytest.mark.asyncio
+async def test_cdp_finish_error_preserves_observed_failure_status(tmp_path: Path) -> None:
+    # The no-file path stamps download_failure_status=500 onto the result, then a CDP finish error
+    # replaces results[-1] with a fresh ActionFailure. That replacement must carry the already-stamped
+    # status forward rather than dropping it.
+    with patch(
+        "skyvern.webeye.actions.handler.finish_requested_download_for_context",
+        return_value={"reasoning": "cdp download finish error"},
+    ):
+        results, _ = await _run_download_click_to_not_triggered(tmp_path, forced_status=500)
+
+    assert isinstance(results[-1], ActionFailure)
+    assert results[-1].download_failure_status == 500
+
+
+@pytest.mark.asyncio
+async def test_cdp_finish_error_leaves_status_none_when_unobserved(tmp_path: Path) -> None:
+    with patch(
+        "skyvern.webeye.actions.handler.finish_requested_download_for_context",
+        return_value={"reasoning": "cdp download finish error"},
+    ):
+        results, _ = await _run_download_click_to_not_triggered(tmp_path, forced_status=None)
+
+    assert isinstance(results[-1], ActionFailure)
+    assert results[-1].download_failure_status is None
+
+
+@pytest.mark.asyncio
+async def test_successful_download_never_stamps_observed_failure_status() -> None:
+    # Even with an admitted xhr/fetch request during the download action having returned a 5xx, a real
+    # file download credited by the handler must report success with no failure-status evidence: the
+    # observer's status is only consulted on the no-file path, which a successful download never reaches.
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]))
+    with _forced_observed_failure_status(500):
+        results, action = await _run_download_action_with_provider_source(
+            source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+        )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == action.downloaded_files == ["local.pdf"]
+    assert results[-1].download_failure_status is None
+
+
+async def _run_download_click_with_status_published_during_teardown(
+    tmp_path: Path,
+    inner_result: list | None = None,
+) -> tuple[list, MagicMock]:
+    """Drive a no-file download click where the observed 5xx is published only during finally teardown.
+
+    Models the race: an admitted xhr/fetch response resolves while an early finally await runs, so the
+    observer records its status after the in-body no-file branch but before ``disable()`` removes the
+    listener. A single post-teardown stamp is the only reader that can still see it.
+    """
+    now = datetime.now(UTC)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=make_organization(now), page_url="https://example.com/downloads"
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+    page.context._skyvern_cdp_download_active = False
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    browser_state.navigate_to_url = AsyncMock()
+
+    xhr_capture = MagicMock(has_in_flight_requests=False)
+    xhr_capture.observed_download_failure_status = None
+    xhr_capture.drain = AsyncMock(return_value=True)
+
+    async def _publish_status_mid_teardown(*args: object, **kwargs: object) -> None:
+        # The observer is still attached during this cleanup await, so a late response can land now.
+        assert xhr_capture.disable.call_count == 0
+        xhr_capture.observed_download_failure_status = 500
+
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with (
+        patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=xhr_capture),
+        patch(
+            "skyvern.webeye.actions.handler._close_eager_capture_then_teardown_retention",
+            new=AsyncMock(side_effect=_publish_status_mid_teardown),
+        ),
+        patch.object(
+            ActionHandler,
+            "_handle_action",
+            side_effect=AsyncMock(return_value=inner_result if inner_result is not None else [ActionSuccess()]),
+        ),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(tmp_path)),
+        patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch("skyvern.webeye.actions.handler.app", mock_app),
+    ):
+        results = await ActionHandler.handle_action(
+            scraped_page=scraped_page, task=task, step=step, page=page, action=action
+        )
+    return results, xhr_capture
+
+
+@pytest.mark.asyncio
+async def test_status_published_during_teardown_is_stamped_after_observer_disabled(tmp_path: Path) -> None:
+    results, xhr_capture = await _run_download_click_with_status_published_during_teardown(tmp_path)
+
+    assert xhr_capture.disable.called
+    assert not results[-1].download_triggered
+    assert results[-1].download_failure_status == 500
+
+
+@pytest.mark.asyncio
+async def test_stale_action_abort_never_stamps_observed_failure_status(tmp_path: Path) -> None:
+    # A StaleActionAbort means the download action was NOT executed; a passively observed 5xx belongs to
+    # unrelated traffic and must not be stamped onto it, even though the per-action observer is fresh.
+    results, xhr_capture = await _run_download_click_with_status_published_during_teardown(
+        tmp_path, inner_result=[StaleActionAbort()]
+    )
+
+    assert xhr_capture.disable.called
+    assert isinstance(results[-1], StaleActionAbort)
+    assert results[-1].download_failure_status is None

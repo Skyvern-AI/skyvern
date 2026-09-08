@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     grade_fallback_floor_reached_end_state_criteria,
 )
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
@@ -44,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.block import _register_code_block_secret
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
     make_completion_criterion,
+    make_copilot_ctx,
 )
 from tests.unit.copilot_test_helpers import make_stub_artifact as _artifact
 from tests.unit.copilot_test_helpers import make_stub_html_artifact as _html_artifact
@@ -525,9 +527,9 @@ _HTML_NO_VALUE = (
 _HTML_SCRAPE_PREACTION = "<html><body><main><p>SCRAPEONLYTOKEN loading form</p></main></body></html>"
 
 
-def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> SimpleNamespace:
+def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> CopilotContext:
     baseline = {"visible_text_excerpt": pre_run_prose} if pre_run_prose is not None else None
-    return SimpleNamespace(
+    return make_copilot_ctx(
         composition_page_evidence=baseline,
         pre_run_page_reference=None,
         workflow_verification_evidence=SimpleNamespace(),
@@ -541,7 +543,7 @@ def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> S
     )
 
 
-def _snapshot_from_ctx(ctx: SimpleNamespace, run_id: str) -> RunEvidenceSnapshot:
+def _snapshot_from_ctx(ctx: CopilotContext, run_id: str) -> RunEvidenceSnapshot:
     block_outputs: dict[str, object] = {}
     block_output_sources: dict[str, EvidenceSourceKind] = {}
     completion_module._bind_independent_post_run_page_evidence(ctx, run_id, block_outputs, block_output_sources)

@@ -3,23 +3,37 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot import output_utils as output_utils_module
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestEvidencePacket,
+    BuildTestPacketRun,
+    BuildTestPacketScreenshot,
+)
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.output_utils import (
+    _AGGREGATE_LIMIT_RESULT_SUMMARY_MAX_ITEMS,
+    _BUILD_TEST_ACTION_TRACE_MAX_ITEMS,
+    _BUILD_TEST_LABEL_MAX_ITEMS,
     _BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
+    _BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    BUILD_TEST_PACKET_KEY,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     _sanitize_failure_text,
     build_run_blocks_response,
     format_tool_result_for_user,
+    iter_failure_reasons,
     looks_like_workflow_yaml_in_chat,
     mark_mcp_result_untrusted_for_llm,
     parse_final_response,
     sanitize_tool_result_for_llm,
+    screened_recorded_url,
     summarize_tool_result,
     summarize_tool_result_detail,
     truncate_output,
@@ -427,6 +441,295 @@ def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
     assert len(json.dumps(projected)) <= 47_000
 
 
+def test_a_three_block_packet_over_the_aggregate_limit_names_the_block_it_dropped() -> None:
+    summaries = ["s" * 400 for _ in range(10)]
+    page_state = {
+        "current_url": "https://fixture.test/results",
+        "observed_after_workflow_run": True,
+        "form_summaries": summaries,
+        "result_summaries": summaries,
+        "action_summaries": summaries,
+        "challenge_summaries": summaries,
+        "obstruction_summaries": summaries,
+    }
+    labels = ["open_search", "run_search", "select_first_result"]
+    packet = {
+        "contract_version": "build_test_evidence_packet_v1",
+        "canonical_workflow_source": "unavailable",
+        "canonical_workflow_yaml_complete": False,
+        "attempted_block_labels": list(labels),
+        "executed_block_labels": list(labels),
+        "run": {"workflow_run_id": "wr-1", "status": "failed"},
+        "failure": {
+            "block_label": "select_first_result",
+            "reason": "r" * 1_300,
+            "page_state": dict(page_state),
+        },
+        "page_state": dict(page_state),
+        "observed_block_end_urls": {label: "https://fixture.test/" + "u" * 1_900 for label in labels},
+        "per_block_action_observations": {label: ["click completed " + "c" * 280] * 6 for label in labels},
+        "registered_outputs": [
+            {"label": f"out_{index}", "status": "completed", "output": "v" * 1_300} for index in range(13)
+        ],
+        "unfinished_items": [
+            {
+                "kind": "unverified_block",
+                "label": f"block_{index}",
+                "output_path": "p" * 200,
+                "reason_code": "c" * 200,
+            }
+            for index in range(25)
+        ],
+        "screenshot": {"present": False},
+        "omission_notices": [],
+    }
+
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {"ok": False, "data": {"build_test_packet": packet}},
+    )
+    projected = sanitized["data"]["build_test_packet"]
+    notices = projected["omission_notices"]
+    withheld = "shortened at the aggregate packet limit: dropped the oldest block(s) open_search."
+
+    assert any("repeated packet facts shortened further" in notice for notice in notices)
+    assert not any("canonical_workflow_yaml shortened further" in notice for notice in notices)
+    assert list(projected["observed_block_end_urls"]) == ["run_search", "select_first_result"]
+    assert list(projected["per_block_action_observations"]) == ["run_search", "select_first_result"]
+    assert f"observed_block_end_urls {withheld}" in notices
+    assert f"per_block_action_observations {withheld}" in notices
+
+
+def _direction_probe_packet(
+    summaries: list[str], chronological: list[str], *, over_aggregate_limit: bool = False
+) -> dict[str, object]:
+    page_state = {
+        "current_url": "https://fixture.test/results",
+        "observed_after_workflow_run": True,
+        "form_summaries": list(summaries),
+        "result_summaries": list(summaries),
+        "action_summaries": list(summaries),
+        "challenge_summaries": list(summaries),
+        "obstruction_summaries": list(summaries),
+    }
+    return {
+        "contract_version": "build_test_evidence_packet_v1",
+        "canonical_workflow_source": "unavailable",
+        "canonical_workflow_yaml_complete": False,
+        "attempted_block_labels": list(chronological),
+        "executed_block_labels": list(chronological),
+        "run": {"workflow_run_id": "wr-direction", "status": "failed"},
+        "failure": {
+            "block_label": chronological[-1],
+            "reason": "locator never appeared",
+            "action_trace": list(chronological),
+            "page_state": dict(page_state),
+        },
+        "page_state": dict(page_state),
+        "action_observations": list(chronological),
+        "registered_outputs": (
+            [{"label": f"out_{index}", "status": "completed", "output": "v" * 1_300} for index in range(13)]
+            if over_aggregate_limit
+            else []
+        ),
+        "unfinished_items": (
+            [
+                {
+                    "kind": "unverified_block",
+                    "label": f"block_{index}",
+                    "output_path": "p" * 200,
+                    "reason_code": "c" * 200,
+                }
+                for index in range(25)
+            ]
+            if over_aggregate_limit
+            else []
+        ),
+        "screenshot": {"present": False},
+        "omission_notices": [],
+    }
+
+
+def _projected_direction_probe(packet: dict[str, object]) -> dict[str, Any]:
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {"ok": False, "data": {"build_test_packet": packet}},
+    )
+    return sanitized["data"]["build_test_packet"]
+
+
+def test_a_secret_bearing_recorded_url_is_refused_rather_than_shown_redacted() -> None:
+    packet = _direction_probe_packet(["summary_0"], ["open_search", "select_first_result"])
+    failure = packet["failure"]
+    assert isinstance(failure, dict)
+    failure["final_url"] = "https://fixture.test/callback?access_token=abcdef1234567890xyz"
+    page_state = packet["page_state"]
+    assert isinstance(page_state, dict)
+    page_state["current_url"] = "https://fixture.test/login?token=*****"
+
+    projected = _projected_direction_probe(packet)
+
+    assert projected["failure"].get("final_url") is None
+    assert projected["page_state"].get("current_url") is None
+    assert "abcdef1234567890xyz" not in json.dumps(projected)
+    assert (
+        "failure.final_url omitted: the recorded URL carried masked or secret material."
+        in (projected["omission_notices"])
+    )
+    assert (
+        "page_state.current_url omitted: the recorded URL carried masked or secret material."
+        in (projected["omission_notices"])
+    )
+
+
+PACKET_URL_FIELDS = ["failure.final_url", "page_state.current_url", "page_state.current_origin"]
+
+QUERY_BEARING_PACKET_URL_CASES = [
+    ("https://fixture.test/directory/results?access_code=4A0XF9&q=cardiology", "4A0XF9"),
+    ("https://fixture.test/callback#session_id=abc123&state=xyz", "abc123"),
+]
+
+
+@pytest.mark.parametrize("field", PACKET_URL_FIELDS)
+@pytest.mark.parametrize(("query_bearing", "secret"), QUERY_BEARING_PACKET_URL_CASES)
+def test_a_query_bearing_recorded_url_is_reduced_to_its_path_on_every_packet_url_field(
+    field: str, query_bearing: str, secret: str
+) -> None:
+    packet = _direction_probe_packet(["summary_0"], ["open_search", "select_first_result"])
+    section, key = field.split(".")
+    holder = packet[section]
+    assert isinstance(holder, dict)
+    holder[key] = query_bearing
+
+    projected = _projected_direction_probe(packet)
+
+    assert projected[section].get(key) == query_bearing.split("?", 1)[0].split("#", 1)[0]
+    assert secret not in json.dumps(projected)
+    assert (
+        f"{field} reduced to its path: the recorded URL carried a query or fragment." in (projected["omission_notices"])
+    )
+
+
+@pytest.mark.parametrize("field", PACKET_URL_FIELDS)
+def test_a_userinfo_bearing_recorded_url_is_omitted_from_every_packet_url_field(field: str) -> None:
+    packet = _direction_probe_packet(["summary_0"], ["open_search", "select_first_result"])
+    section, key = field.split(".")
+    holder = packet[section]
+    assert isinstance(holder, dict)
+    holder[key] = "https://svc:hunter2@fixture.test/directory/results"
+
+    projected = _projected_direction_probe(packet)
+
+    assert projected[section].get(key) is None
+    assert "hunter2" not in json.dumps(projected)
+    assert f"{field} omitted: the recorded URL carried credentials in its host." in (projected["omission_notices"])
+
+
+@pytest.mark.parametrize("field", PACKET_URL_FIELDS)
+def test_a_non_http_recorded_url_is_omitted_from_every_packet_url_field(field: str) -> None:
+    packet = _direction_probe_packet(["summary_0"], ["open_search", "select_first_result"])
+    section, key = field.split(".")
+    holder = packet[section]
+    assert isinstance(holder, dict)
+    holder[key] = "about:blank"
+
+    projected = _projected_direction_probe(packet)
+
+    assert projected[section].get(key) is None
+    assert "about:blank" not in json.dumps(projected)
+    assert f"{field} omitted: the recorded URL named no reportable http origin." in (projected["omission_notices"])
+
+
+QUERY_CASES_COSTING_THE_QUERY = [
+    "access_code=4A0XF9",
+    "SAMLResponse=AAAA",
+    "sid=abc123",
+    "zip_code=90210&specialty=cardiology",
+    "promocode=SAVE10",
+    "q=cardiology&page=2",
+]
+
+
+@pytest.mark.parametrize("query", QUERY_CASES_COSTING_THE_QUERY)
+def test_a_recorded_url_costs_its_query_whatever_the_parameter_is_named(query: str) -> None:
+    """The screen never reads the parameter names: a credential-bearing query and an ordinary
+    search query are both dropped, so no maintained key vocabulary decides what the model sees."""
+    reported, reason = screened_recorded_url(f"https://fixture.test/directory/results?{query}")
+
+    assert reported == "https://fixture.test/directory/results"
+    assert reason == "the recorded URL carried a query or fragment"
+
+
+def test_a_fragment_costs_the_recorded_url_its_fragment() -> None:
+    reported, reason = screened_recorded_url("https://fixture.test/directory/results#first-result")
+
+    assert reported == "https://fixture.test/directory/results"
+    assert reason == "the recorded URL carried a query or fragment"
+
+
+def test_a_recorded_url_without_a_query_or_fragment_is_reported_whole() -> None:
+    url = "https://fixture.test/directory/results/westvale-clinic"
+
+    assert screened_recorded_url(url) == (url, None)
+
+
+def test_a_credential_in_the_netloc_costs_the_whole_recorded_url() -> None:
+    reported, reason = screened_recorded_url("https://svc:hunter2@fixture.test/directory/results")
+
+    assert reported is None
+    assert reason == "the recorded URL carried credentials in its host"
+
+
+def test_page_state_summaries_keep_the_leading_entries_their_producer_front_loads() -> None:
+    """``_runtime_form_summaries`` and ``_runtime_action_summaries`` put the fields that observed
+    something and the submit controls first, so dropping the head discards the repair-critical ones."""
+    summaries = [f"summary_{index}" for index in range(_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS + 4)]
+    packet = _direction_probe_packet(summaries, ["open_search", "run_search", "select_first_result"])
+
+    projected = _projected_direction_probe(packet)
+
+    kept = projected["page_state"]["form_summaries"]
+    assert kept == summaries[:_BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS]
+    assert any(
+        n.startswith("page_state.form_summaries shortened") and "4 newest item(s) omitted" in n
+        for n in projected["omission_notices"]
+    )
+
+    over_limit = _direction_probe_packet(
+        [f"summary_{index} " + "s" * 400 for index in range(10)], list("abc"), over_aggregate_limit=True
+    )
+    compacted = _projected_direction_probe(over_limit)
+
+    assert any("repeated packet facts shortened further" in n for n in compacted["omission_notices"])
+    assert [value.split()[0] for value in compacted["page_state"]["result_summaries"]] == [
+        f"summary_{index}" for index in range(_AGGREGATE_LIMIT_RESULT_SUMMARY_MAX_ITEMS)
+    ]
+
+
+def test_chronological_packet_lists_keep_their_newest_entries() -> None:
+    chronological = [f"step_{index}" for index in range(_BUILD_TEST_LABEL_MAX_ITEMS + 3)]
+    packet = _direction_probe_packet([f"summary_{index}" for index in range(3)], chronological)
+
+    projected = _projected_direction_probe(packet)
+
+    assert projected["attempted_block_labels"] == chronological[-_BUILD_TEST_LABEL_MAX_ITEMS:]
+    assert projected["executed_block_labels"] == chronological[-_BUILD_TEST_LABEL_MAX_ITEMS:]
+    assert projected["action_observations"] == chronological[-_BUILD_TEST_ACTION_TRACE_MAX_ITEMS:]
+    assert projected["failure"]["action_trace"] == chronological[-_BUILD_TEST_ACTION_TRACE_MAX_ITEMS:]
+    assert any(
+        n.startswith("action_observations shortened") and "21 oldest item(s) omitted" in n
+        for n in projected["omission_notices"]
+    )
+
+    over_limit = _direction_probe_packet(["s" * 400 for _ in range(10)], chronological, over_aggregate_limit=True)
+    compacted = _projected_direction_probe(over_limit)
+
+    assert any("repeated packet facts shortened further" in n for n in compacted["omission_notices"])
+    assert compacted["action_observations"] == chronological[-2:]
+    assert compacted["failure"]["action_trace"] == chronological[-2:]
+    assert compacted["executed_block_labels"] == chronological[-12:]
+
+
 def test_sanitize_build_test_packet_projection_failure_keeps_tool_result_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -609,6 +912,25 @@ class TestSanitization:
         assert "artifacts" not in sanitized
         assert "sdk_equivalent" not in sanitized.get("data", {})
         assert sanitized["data"]["observed_wait_ms"] == 121595
+
+    def test_the_raw_solver_rows_never_reach_the_model(self) -> None:
+        """The dict spells an unresolved lookup as `attempted: false`; only the packet's tri-state
+        projection may reach the model."""
+        from skyvern.forge.sdk.copilot.build_test_outcome import SOLVER_ATTEMPT_KEY
+        from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+
+        result = {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_challenge",
+                SOLVER_ATTEMPT_KEY: {"attempted": False, "result": "unresolved"},
+            },
+        }
+
+        sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+
+        assert SOLVER_ATTEMPT_KEY not in sanitized.get("data", {})
+        assert "attempted" not in json.dumps(sanitized)
 
     def test_workflow_key_stripped(self) -> None:
         from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
@@ -1900,3 +2222,123 @@ class TestStagedWriteSummaryFrame:
         assert summarize_tool_result("update_workflow", {"ok": True, "data": {"block_count": 5}}) == (
             "Workflow updated (5 blocks)"
         )
+
+
+def _packet_result_with_raw_block_facts() -> dict[str, object]:
+    packet = BuildTestEvidencePacket(
+        canonical_workflow_source="unavailable",
+        run=BuildTestPacketRun(workflow_run_id="wr_block_facts", status="failed"),
+        screenshot=BuildTestPacketScreenshot(present=False),
+        action_observations=["click completed code_line=4"],
+        observed_block_end_urls={"run_search": "https://fixture.test/results?q=widget"},
+        per_block_action_observations={"run_search": ["click completed code_line=4"]},
+    )
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_block_facts",
+            "action_observations": ["click completed code_line=4"],
+            "action_trace_summary": ["click failed"],
+            "observed_block_end_urls": {"run_search": "https://fixture.test/results?q=widget"},
+            "per_block_action_observations": {"run_search": ["click completed code_line=4"]},
+            BUILD_TEST_PACKET_KEY: packet.model_dump(mode="json", exclude_none=True),
+        },
+    }
+
+
+def test_bounded_packet_is_the_only_block_fact_surface_the_provider_sees() -> None:
+    sanitized = sanitize_tool_result_for_llm("run_blocks", _packet_result_with_raw_block_facts())
+
+    data = sanitized["data"]
+    assert "observed_block_end_urls" not in data
+    assert "per_block_action_observations" not in data
+    assert data[BUILD_TEST_PACKET_KEY]["observed_block_end_urls"] == {
+        "run_search": "https://fixture.test/results?q=widget"
+    }
+
+
+def test_failed_packet_projection_drops_the_raw_block_facts_with_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(output_utils_module, "project_build_test_packet_for_llm", _explode)
+
+    sanitized = sanitize_tool_result_for_llm("run_blocks", _packet_result_with_raw_block_facts())
+
+    data = sanitized["data"]
+    assert BUILD_TEST_PACKET_KEY not in data
+    assert "observed_block_end_urls" not in data
+    assert "per_block_action_observations" not in data
+    assert "fixture.test" not in json.dumps(sanitized)
+
+
+def test_block_facts_keep_their_newest_entries_and_say_so_when_no_packet_reaches_the_provider() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_no_packet",
+            "action_trace_summary": ["click failed"],
+            "observed_block_end_urls": {
+                **{f"block_{index}": f"https://fixture.test/{index}" for index in range(29)},
+                "select_first_result": "https://fixture.test/results?q=" + "u" * 3000,
+            },
+            "per_block_action_observations": {
+                f"block_{index}": [f"click completed code_line={line} " + "x" * 500 for line in range(20)]
+                for index in range(30)
+            },
+        },
+    }
+
+    data = sanitize_tool_result_for_llm("run_blocks", result)["data"]
+
+    assert len(data["observed_block_end_urls"]) == 12
+    assert data["observed_block_end_urls"]["block_28"] == "https://fixture.test/28"
+    assert "block_16" not in data["observed_block_end_urls"]
+    assert "select_first_result" not in data["observed_block_end_urls"]
+    assert data["per_block_action_observations"]["block_29"][-1].startswith("click completed code_line=19")
+    assert all(len(values) <= 6 for values in data["per_block_action_observations"].values())
+    assert all(
+        len(observation) <= 300 for values in data["per_block_action_observations"].values() for observation in values
+    )
+    notices = data["block_fact_omission_notices"]
+    assert any("exceeded 2000 characters" in notice for notice in notices)
+    assert any("oldest block(s) omitted" in notice for notice in notices)
+
+
+def test_a_block_whose_observations_all_filtered_out_is_named_rather_than_shown_empty() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_empty_block",
+            "action_trace_summary": ["click failed"],
+            "per_block_action_observations": {
+                "run_search": ["click completed code_line=4"],
+                "select_first_result": ["", None],
+                "open_search": "not a list",
+            },
+        },
+    }
+
+    data = sanitize_tool_result_for_llm("run_blocks", result)["data"]
+
+    assert data["per_block_action_observations"] == {"run_search": ["click completed code_line=4"]}
+    assert (
+        "per_block_action_observations omitted 2 block(s): no recorded observation was reportable."
+        in data["block_fact_omission_notices"]
+    )
+
+
+def test_the_reported_failure_reason_is_the_one_the_run_stopped_on() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "blocks": [
+                {"label": "search_directory", "status": "failed", "failure_reason": "search stalled"},
+                {"label": "select_first_result", "status": "failed", "failure_reason": "no result row"},
+            ]
+        },
+    }
+
+    assert next(iter_failure_reasons(result), None) == "no result row"

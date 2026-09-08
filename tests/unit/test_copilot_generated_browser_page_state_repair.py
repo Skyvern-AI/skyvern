@@ -12,21 +12,24 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _declared_path_returned_empty_scalar,
+    recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_run_blocks_result,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import (
+    _compact_packet_for_aggregate_limit,
     project_build_test_packet_for_llm,
     project_direct_test_handoff_packet_for_llm,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
+    record_pending_runtime_authoring_repair_context,
     repair_page_evidence_is_admissible,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _failure_action_trace_summary,
-    _first_failed_result,
+    _newest_failed_result,
     build_test_evidence_packet,
 )
 
@@ -42,6 +45,41 @@ _COMPLETED_PATH = "visitors"
 _CONSENT_PACKET_PATH = Path(__file__).resolve().parent / "fixtures/copilot/consent_cover_repair/packet.json"
 _CONSENT_BLOCK_LABEL = "extract_order_documents"
 _CONSENT_LAYER_TEXT = "Terms of Service"
+_CANDIDATE_RUN_ID = "wr_candidate_price_scope"
+_CANDIDATE_LABEL = "choose_candidate"
+# A container carries a table's rows or a text block's excerpt and never both: every producer sets
+# one in its table branch and the other in the else, and the structured path mirrors that payload.
+_CANDIDATE_TABLE_ROWS = ["Aurora list 100 now 80", "Basalt list 120 now 90"]
+_CANDIDATE_REGION_CONTAINERS: list[dict[str, object]] = [{"sample_rows": list(_CANDIDATE_TABLE_ROWS)}]
+_CANDIDATE_SPREAD_CONTAINERS: list[dict[str, object]] = [
+    {"sample_rows": ["Aurora list 100", "Aurora now 80", "Aurora size M"]},
+    {"sample_rows": ["Basalt list 120", "Basalt now 90"]},
+    {"text_excerpt": "Season promotions 10 off any clearance item"},
+]
+_CANDIDATE_SPREAD_SUMMARIES = [
+    "Aurora list 100",
+    "Basalt list 120",
+    "Season promotions 10 off any clearance item",
+    "Aurora now 80",
+    "Basalt now 90",
+    "Aurora size M",
+]
+_CANDIDATE_WRONG_OUTPUT: dict[str, object] = {
+    "chosen": "Aurora",
+    "now_amount": 10.0,
+    "sale_score": 0,
+    "candidates": [
+        {"identity": "Aurora", "list_amount": 100.0, "now_amount": 80.0},
+        {"identity": "Basalt", "list_amount": None, "now_amount": 90.0},
+    ],
+}
+
+
+_FAILED_LABEL = "read_visitors"
+_FAILED_ACTION = "wait failed code_line=7"
+_PREDECESSOR_LABEL = "open_dashboard"
+_PREDECESSOR_END_URL = "https://analytics.fixture.test/dashboard?range=30d"
+_PREDECESSOR_FINAL_ACTION = "click completed code_line=4"
 
 
 def _copilot_context() -> CopilotContext:
@@ -117,6 +155,49 @@ def test_generated_browser_repair_keeps_run_visible_scalar_in_ordinary_repair(at
     assert f'"workflow_run_id": "{_RUN_ID}"' in ordinary_repair_input
     assert f'"browser_session_id": "{_RUN_BROWSER_SESSION_ID}"' in ordinary_repair_input
     assert _RENDERED_SCALAR in ordinary_repair_input
+
+
+def _two_block_generated_browser_failure() -> dict[str, object]:
+    result = _generated_browser_failure()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks.append(
+        {
+            "workflow_run_block_id": "wrb_open_dashboard",
+            "label": _PREDECESSOR_LABEL,
+            "block_type": "code",
+            "status": "completed",
+        }
+    )
+    data["requested_block_labels"] = [_PREDECESSOR_LABEL, _FAILED_LABEL]
+    data["executed_block_labels"] = [_PREDECESSOR_LABEL, _FAILED_LABEL]
+    data["observed_block_end_urls"] = {_PREDECESSOR_LABEL: _PREDECESSOR_END_URL}
+    data["per_block_action_observations"] = {
+        _PREDECESSOR_LABEL: [_PREDECESSOR_FINAL_ACTION],
+        _FAILED_LABEL: [_FAILED_ACTION],
+    }
+    data["action_observations"] = [_PREDECESSOR_FINAL_ACTION, _FAILED_ACTION]
+    return result
+
+
+def test_two_block_repair_input_names_the_page_the_predecessor_block_ended_on() -> None:
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(_copilot_context(), _two_block_generated_browser_failure())
+    ).model_dump(mode="json", exclude_none=True)
+    repair_input = _build_user_context(
+        workflow_yaml="",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text=_prior_run_debug_text(packet),
+        user_message="Repair the recorded two-block failure.",
+    )
+
+    assert f'"{_PREDECESSOR_LABEL}": "{_PREDECESSOR_END_URL}"' in repair_input
+    assert _PREDECESSOR_FINAL_ACTION in repair_input
+    assert _FAILED_ACTION in repair_input
+    assert f'"block_label": "{_FAILED_LABEL}"' in repair_input
 
 
 def test_scalar_only_run_visible_evidence_is_admitted_but_not_sent_to_direct_test_handoff() -> None:
@@ -218,7 +299,7 @@ def _variant_repair_input(block_type: str, failed_entry_extra: dict[str, object]
     assert isinstance(data, dict)
     blocks = data["blocks"]
     assert isinstance(blocks, list)
-    data["action_trace_summary"] = _failure_action_trace_summary(_first_failed_result(blocks))
+    data["action_trace_summary"] = _failure_action_trace_summary(_newest_failed_result(blocks))
     packet = project_build_test_packet_for_llm(build_test_evidence_packet(_copilot_context(), result)).model_dump(
         mode="json", exclude_none=True
     )
@@ -288,3 +369,170 @@ def test_consent_cover_run_facts_reach_ordinary_repair() -> None:
     assert "goto_url completed" in repair_input
     assert "Failed to execute code block. Reason: TimeoutError" in repair_input
     assert _CONSENT_LAYER_TEXT in repair_input
+
+
+def _candidate_scope_page_evidence(containers: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "workflow_run_id": _CANDIDATE_RUN_ID,
+        "source_browser_session_id": _RUN_BROWSER_SESSION_ID,
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+        "current_url": "https://catalog.fixture.test/results",
+        "page_title": "Matching items",
+        "visible_text_excerpt": "Matching items",
+        "result_containers": containers,
+    }
+
+
+def _candidate_scope_failure(containers: list[dict[str, object]] | None = None) -> dict[str, object]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": _CANDIDATE_RUN_ID,
+            "browser_session_id": _RUN_BROWSER_SESSION_ID,
+            "overall_status": "failed",
+            "requested_block_labels": [_CANDIDATE_LABEL],
+            "executed_block_labels": [_CANDIDATE_LABEL],
+            "blocks": [
+                {
+                    "workflow_run_block_id": "wrb_candidate_scope",
+                    "label": _CANDIDATE_LABEL,
+                    "block_type": "code",
+                    "status": "failed",
+                    "failure_reason": "chose a candidate from a page-wide amount",
+                    "error_codes": ["user_code_error"],
+                    "output": _CANDIDATE_WRONG_OUTPUT,
+                },
+            ],
+            "post_run_page_evidence": _candidate_scope_page_evidence(
+                _CANDIDATE_REGION_CONTAINERS if containers is None else containers
+            ),
+        },
+    }
+
+
+def _candidate_scope_result_summaries(result: dict[str, object]) -> list[str]:
+    packet = project_build_test_packet_for_llm(build_test_evidence_packet(_copilot_context(), result))
+    assert packet.failure is not None
+    assert packet.failure.page_state is not None
+    return packet.failure.page_state.result_summaries
+
+
+def test_candidate_price_scope_projects_every_candidate_row_of_the_result_table() -> None:
+    summaries = _candidate_scope_result_summaries(_candidate_scope_failure())
+
+    assert summaries == _CANDIDATE_TABLE_ROWS
+
+
+def test_candidate_price_scope_keeps_the_wrong_output_and_an_absent_value_absent() -> None:
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(_copilot_context(), _candidate_scope_failure())
+    )
+
+    registered = [output for output in packet.registered_outputs if output.label == _CANDIDATE_LABEL]
+    assert len(registered) == 1
+    assert registered[0].output == _CANDIDATE_WRONG_OUTPUT
+    assert isinstance(registered[0].output, dict)
+    candidates = registered[0].output["candidates"]
+    assert isinstance(candidates, list)
+    assert isinstance(candidates[1], dict)
+    assert candidates[1]["list_amount"] is None
+
+    repair_input = _build_user_context(
+        workflow_yaml="",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text=_prior_run_debug_text(packet.model_dump(mode="json", exclude_none=True)),
+        user_message="Compare each candidate on its own amounts.",
+    )
+
+    assert '"list_amount": null' in repair_input
+    assert "chose a candidate from a page-wide amount" in repair_input
+
+
+def test_candidate_price_scope_survives_the_aggregate_packet_limit() -> None:
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(_copilot_context(), _candidate_scope_failure(_CANDIDATE_SPREAD_CONTAINERS))
+    )
+    compacted = _compact_packet_for_aggregate_limit(packet, [])
+
+    assert compacted.failure is not None
+    assert compacted.failure.page_state is not None
+    assert compacted.failure.page_state.result_summaries == _CANDIDATE_SPREAD_SUMMARIES
+
+
+def test_candidate_price_scope_aggregate_limit_stays_bounded_across_many_regions() -> None:
+    regions = ["Aurora", "Basalt", "Cobalt", "Dune"]
+    containers: list[dict[str, object]] = [
+        {"sample_rows": [f"{region} rank {rank} " + "attribute " * 30 for rank in range(3)]} for region in regions
+    ]
+    packet = project_build_test_packet_for_llm(
+        build_test_evidence_packet(_copilot_context(), _candidate_scope_failure(containers))
+    )
+    compacted = _compact_packet_for_aggregate_limit(packet, [])
+
+    assert compacted.failure is not None
+    assert compacted.failure.page_state is not None
+    summaries = compacted.failure.page_state.result_summaries
+    assert len(summaries) == 6
+    assert all(any(summary.startswith(region) for summary in summaries) for region in regions)
+
+
+def test_candidate_price_scope_keeps_every_region_in_the_recorded_outcome_page_refs() -> None:
+    ctx = _copilot_context()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
+        block_label=_CANDIDATE_LABEL,
+        reason_code="runtime_block_failure",
+        workflow_run_id=_CANDIDATE_RUN_ID,
+    )
+    ctx.composition_page_evidence = _candidate_scope_page_evidence(_CANDIDATE_SPREAD_CONTAINERS)
+
+    finalized = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert finalized is not None
+    refs = recorded_outcome_from_authoring_repair_context(finalized).page_evidence_refs
+    assert "result:Basalt list 120" in refs
+    assert "result:Basalt now 90" in refs
+
+    prompt = _code_authoring_repair_context_prompt(ctx)
+    assert "Aurora now 80" in prompt
+    assert "Basalt now 90" in prompt
+
+
+def test_candidate_price_scope_long_region_cannot_starve_a_later_region() -> None:
+    summaries = _candidate_scope_result_summaries(
+        _candidate_scope_failure(
+            [
+                {"sample_rows": [f"Aurora detail {index}" for index in range(9)]},
+                {"sample_rows": ["Basalt list 120", "Basalt now 90"]},
+                {"text_excerpt": "Season promotions 10 off any clearance item"},
+            ]
+        )
+    )
+
+    assert "Basalt list 120" in summaries
+    assert "Basalt now 90" in summaries
+    assert "Season promotions 10 off any clearance item" in summaries
+    assert not [summary for summary in summaries if "omitted" in summary]
+
+
+def test_runtime_repair_context_names_the_failure_the_run_stopped_on() -> None:
+    ctx = _copilot_context()
+    record_pending_runtime_authoring_repair_context(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": _RUN_ID,
+                "blocks": [
+                    {"label": "search_directory", "status": "failed", "failure_reason": "search stalled"},
+                    {"label": "select_first_result", "status": "failed", "failure_reason": "no result row"},
+                ],
+            },
+        },
+    )
+
+    pending = ctx.pending_code_authoring_runtime_repair_context
+    assert pending is not None
+    assert pending.block_label == "select_first_result"

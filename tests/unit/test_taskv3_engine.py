@@ -30,6 +30,7 @@ from skyvern.forge.taskv3.engine import (
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
+from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import LoopOutcome, SemanticCommitStats, ToolResult, ToolSpec, _ProgressEvidence
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
@@ -1212,7 +1213,7 @@ def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
         add_assistant_prefix=False,
         reasoning_effort="high",
     )
-    assert engine_mod._reasoning_effort_with_summary(caller) is None
+    assert reasoning_effort_with_summary(caller) is None
 
 
 def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:

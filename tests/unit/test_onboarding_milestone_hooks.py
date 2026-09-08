@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import params as fastapi_params
@@ -86,6 +86,10 @@ class TestWorkflowSaveHookFires:
             organization_id="o_123",
             edited_by="u_456",
             workflow_permanent_id="wpid_123",
+            workflow=ANY,
+            version=ANY,
+            status=ANY,
+            actor_user_id=ANY,
         )
 
     @pytest.mark.asyncio
@@ -120,6 +124,10 @@ class TestWorkflowSaveHookFires:
             organization_id="o_123",
             edited_by=None,
             workflow_permanent_id="wpid_123",
+            workflow=ANY,
+            version=ANY,
+            status=ANY,
+            actor_user_id=ANY,
         )
 
 
