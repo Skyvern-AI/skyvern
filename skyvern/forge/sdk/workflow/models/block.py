@@ -254,6 +254,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
+from skyvern.utils import vslm_filter
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
@@ -11532,6 +11533,20 @@ class FileParserBlock(Block):
             self._bound_extraction_input_tokens,
             content_str,
         )
+
+        # Only plain prose is worth filtering; list content arrives as JSON rows
+        # (CSV/Excel/OCR), which a sentence classifier cannot read.
+        if settings.ENABLE_VSLM_TEXT_FILTER and not isinstance(content, list):
+            content_str, vslm_stats = await vslm_filter.filter_text_for_relevance(
+                content_str, vslm_filter.schema_to_query(schema_to_use)
+            )
+            LOG.info(
+                "vslm_text_filter",
+                file_url=self.file_url,
+                workflow_run_block_id=workflow_run_block_id,
+                call_site="file_parser",
+                **vslm_stats.as_log_fields(),
+            )
 
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use

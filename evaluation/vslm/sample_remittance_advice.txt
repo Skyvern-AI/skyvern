@@ -1,0 +1,10 @@
+REMITTANCE ADVICE
+Invoice #: 88213-B
+Bill to: Northwind Trading Company, 4400 Harbor Point Road, Suite 220
+The total amount due is $48,215.60, payable within 30 days of the invoice date.
+Remittance should reference purchase order PO-77213 to ensure correct application.
+A late payment fee of 1.5% per month applies to balances outstanding after the due date.
+This document and any attachments are confidential and intended solely for the addressee.
+Please retain this document for your records.
+The audit committee reviewed the quarterly attestation package on March 5, 2026.
+Questions regarding this notice should be directed to the address on the reverse side.

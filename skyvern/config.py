@@ -1216,5 +1216,15 @@ class Settings(BaseSettings):
         else:
             return self.EXECUTE_ALL_STEPS
 
+    # --- ZettaQuant V-SLM relevance filter (evaluation) ---
+    # Off by default; the filter fails open so a vendor outage cannot block extraction.
+    ENABLE_VSLM_TEXT_FILTER: bool = False
+    ZQ_API_KEY: str = ""
+    ZQ_BASE_URL: str = "https://api.zettaquant.ai"
+    VSLM_AGENT: str = "general_context_agent"
+    VSLM_TIMEOUT_SECONDS: float = 30.0
+    VSLM_MAX_ATTEMPTS: int = 3
+    VSLM_BACKOFF_SECONDS: float = 0.5
+
 
 settings = Settings()

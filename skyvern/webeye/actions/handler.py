@@ -138,6 +138,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils import vslm_filter
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
@@ -13825,6 +13826,19 @@ async def extract_information_for_navigation_goal(
     local_datetime_str = datetime.now(context.tz_info).isoformat()
 
     extracted_text_for_prompt = scraped_page_refreshed.extracted_text if task.include_extracted_text else None
+
+    if extracted_text_for_prompt and settings.ENABLE_VSLM_TEXT_FILTER:
+        goal_for_filter = task.data_extraction_goal or task.navigation_goal
+        extracted_text_for_prompt, vslm_stats = await vslm_filter.filter_text_for_relevance(
+            extracted_text_for_prompt, goal_for_filter
+        )
+        LOG.info(
+            "vslm_text_filter",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            call_site="extract_information",
+            **vslm_stats.as_log_fields(),
+        )
 
     previous_info_capped = truncate_previous_extracted_information(task.extracted_information)
     capped_schema = truncate_extraction_schema(task.extracted_information_schema)
