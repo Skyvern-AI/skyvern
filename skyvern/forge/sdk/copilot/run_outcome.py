@@ -31,6 +31,7 @@ TERMINAL_CHALLENGE_FAILURE_CATEGORY_MIN_CONFIDENCE = 0.7
 _INTERIM_RUN_OUTCOME_ROLE: RunOutcomeRole = "interim_build_test"
 
 _DISPLAY_REASON_MAX_CHARS = 160
+_DISPLAY_REASON_ELISION = "..."
 
 
 @dataclass(frozen=True)
@@ -47,12 +48,94 @@ class RecordedRunOutcome:
     role: RunOutcomeRole = "recorded"
 
 
+def _net_error_spans(text: str) -> list[tuple[int, int]]:
+    prefix = "net::ERR_"
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    while (start := text.find(prefix, search_from)) >= 0:
+        suffix_start = start + len(prefix)
+        end = suffix_start
+        while end < len(text) and (text[end] == "_" or "A" <= text[end] <= "Z" or "0" <= text[end] <= "9"):
+            end += 1
+        left_is_identifier = start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_")
+        right_is_identifier = end < len(text) and (text[end].isalnum() or text[end] == "_")
+        if end > suffix_start and not left_is_identifier and not right_is_identifier:
+            spans.append((start, end))
+        search_from = max(end, suffix_start)
+    return spans
+
+
+def _protected_machine_spans(text: str) -> list[tuple[int, int]]:
+    spans = [
+        (match.start(), match.end())
+        for match in URL_CANDIDATE_RE.finditer(text)
+        if url_origin(match.group(0)) == match.group(0)
+    ]
+    spans.extend(_net_error_spans(text))
+    return sorted(spans)
+
+
+def _span_intersecting_cut(spans: Sequence[tuple[int, int]], cut: int) -> tuple[int, int] | None:
+    return next((span for span in spans if span[0] < cut < span[1]), None)
+
+
+def _prefix_with_elision(
+    text: str,
+    *,
+    cut: int,
+    spans: Sequence[tuple[int, int]],
+    max_chars: int,
+) -> str:
+    suffix = f" {_DISPLAY_REASON_ELISION}"
+    cut = min(cut, max_chars - len(suffix))
+    while intersected_span := _span_intersecting_cut(spans, cut):
+        cut = intersected_span[0]
+    prefix = text[:cut].rstrip()
+    return f"{prefix}{suffix}" if prefix else _DISPLAY_REASON_ELISION
+
+
+def _elide_protected_span(
+    text: str,
+    *,
+    span: tuple[int, int],
+    spans: Sequence[tuple[int, int]],
+    max_chars: int,
+) -> str:
+    token = text[span[0] : span[1]]
+    separator = f" {_DISPLAY_REASON_ELISION} "
+    prefix_budget = max_chars - len(separator) - len(token)
+    if prefix_budget <= 0:
+        marked_token = f"{_DISPLAY_REASON_ELISION} {token}"
+        if len(marked_token) <= max_chars:
+            return marked_token
+        return _prefix_with_elision(text, cut=span[0], spans=spans, max_chars=max_chars)
+
+    cut = prefix_budget
+    while intersected_span := _span_intersecting_cut(spans, cut):
+        cut = intersected_span[0]
+    prefix = text[:cut].rstrip()
+    if not prefix:
+        return f"{_DISPLAY_REASON_ELISION} {token}"
+    return f"{prefix}{separator}{token}"
+
+
+def _elide_protected_machine_span(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+
+    spans = _protected_machine_spans(text)
+    intersected_span = _span_intersecting_cut(spans, max_chars)
+    if intersected_span is None:
+        return text[:max_chars]
+    return _elide_protected_span(text, span=intersected_span, spans=spans, max_chars=max_chars)
+
+
 def run_outcome_display_reason(text: str | None) -> str | None:
     if not isinstance(text, str) or not text.strip():
         return None
     reason = redact_raw_secrets_for_prompt(" ".join(text.split()))
     reason = URL_CANDIDATE_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", reason)
-    return reason[:_DISPLAY_REASON_MAX_CHARS]
+    return _elide_protected_machine_span(reason, _DISPLAY_REASON_MAX_CHARS)
 
 
 def trusted_terminal_challenge_category_name(entry: Mapping[str, Any]) -> str | None:

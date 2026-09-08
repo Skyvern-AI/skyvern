@@ -169,8 +169,23 @@ class Frame:
                 found.append(handle)
         return found
 
-    def locator(self, selector: str) -> Locator:
-        return Locator(self, selector)
+    def locator(
+        self,
+        selector: str,
+        *,
+        has_text: str | None = None,
+        has_not_text: str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+    ) -> Locator:
+        return Locator(
+            self,
+            selector,
+            has_text=has_text,
+            has_not_text=has_not_text,
+            has=has,
+            has_not=has_not,
+        )
 
     def frame_locator(self, selector: str) -> FrameLocator:
         return FrameLocator(self, selector)
@@ -706,8 +721,22 @@ class Page:
     async def query_selector_all(self, selector: str) -> list[ElementHandle]:
         return await self.main_frame.query_selector_all(selector)
 
-    def locator(self, selector: str) -> Locator:
-        return self.main_frame.locator(selector)
+    def locator(
+        self,
+        selector: str,
+        *,
+        has_text: str | None = None,
+        has_not_text: str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+    ) -> Locator:
+        return self.main_frame.locator(
+            selector,
+            has_text=has_text,
+            has_not_text=has_not_text,
+            has=has,
+            has_not=has_not,
+        )
 
     def frame_locator(self, selector: str) -> FrameLocator:
         return self.main_frame.frame_locator(selector)

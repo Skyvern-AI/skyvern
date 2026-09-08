@@ -7,6 +7,7 @@ offers, and the reason callers use locators instead of handles.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from skyvern.webeye.skycdp.errors import CdpError, CdpTimeoutError
@@ -40,8 +41,22 @@ class FrameLocator:
     def frame_locator(self, selector: str) -> FrameLocator:
         return FrameLocator(self, selector)
 
-    def locator(self, selector: str) -> Locator:
-        return Locator(self, selector)
+    def locator(
+        self,
+        selector_or_locator: str | Locator,
+        *,
+        has_text: str | None = None,
+        has_not_text: str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+    ) -> Locator:
+        return Locator(self, []).locator(
+            selector_or_locator,
+            has_text=has_text,
+            has_not_text=has_not_text,
+            has=has,
+            has_not=has_not,
+        )
 
     async def resolve_frame(self) -> Frame:
         parent = self._source
@@ -300,25 +315,71 @@ def _split_selector_chain(selector: str) -> list[str]:
     return [part for part in parts if part] or [selector.strip()]
 
 
-# Walks a locator chain inside the page: each step queries within the previous step's matches, and a
-# step carrying an index narrows to exactly that match (negative counts from the end) before the next
-# step runs. Returning either the count or one element from the same walk keeps the two consistent.
-_RESOLVE_JS = f"""
+# Walks a locator chain inside the page. Query, filter, and index operations remain separate so each
+# action replays their original order and nested-locator filters can resolve relative to a candidate.
+# Returning either the count or one element from the same walk keeps the two consistent.
+_RESOLVE_JS = rf"""
 (spec) => {{
   {_QUERY_ALL_JS}
-  let current = [document];
-  for (const step of spec.steps) {{
-    let next = [];
-    for (const root of current) {{
-      next = next.concat(__queryAll(root, step.selector));
+  // Match the pinned Playwright 1.58 text normalization, including invisible separators.
+  const normFilterText = (s) => s.replaceAll('\u200b', '').replaceAll('\u00ad', '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const filterText = (el) => {{
+    if (el.ownerDocument?.head?.contains(el)) return '';
+    if (el.tagName === 'INPUT' && (el.type === 'button' || el.type === 'submit')) return el.value || '';
+    if (/^(SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName)) return '';
+    let text = '';
+    for (const child of el.childNodes) {{
+      if (child.nodeType === 3) text += child.nodeValue;
+      else if (child.nodeType === 1) text += filterText(child);
     }}
-    next = Array.from(new Set(next));
-    if (step.index !== null && step.index !== undefined) {{
-      const at = step.index < 0 ? next.length + step.index : step.index;
-      next = at >= 0 && at < next.length ? [next[at]] : [];
+    if (el.shadowRoot) {{
+      for (const child of el.shadowRoot.childNodes) {{
+        if (child.nodeType === 3) text += child.nodeValue;
+        else if (child.nodeType === 1) text += filterText(child);
+      }}
     }}
-    current = next;
-  }}
+    return text;
+  }};
+  const resolve = (roots, operations) => {{
+    let current = roots;
+    for (const operation of operations) {{
+      if (operation.kind === 'query') {{
+        let next = [];
+        for (const root of current) {{
+          next = next.concat(__queryAll(root, operation.selector));
+        }}
+        current = Array.from(new Set(next));
+        continue;
+      }}
+      if (operation.kind === 'filter') {{
+        current = current.filter((candidate) => {{
+          const text = normFilterText(filterText(candidate));
+          if (operation.has_text !== null && !text.includes(normFilterText(operation.has_text))) return false;
+          if (operation.has_not_text !== null && text.includes(normFilterText(operation.has_not_text))) return false;
+          if (operation.has !== null && resolve([candidate], operation.has).length === 0) return false;
+          if (operation.has_not !== null && resolve([candidate], operation.has_not).length !== 0) return false;
+          return true;
+        }});
+        continue;
+      }}
+      if (operation.kind === 'within') {{
+        let next = [];
+        for (const root of current) {{
+          next = next.concat(resolve([root], operation.locator));
+        }}
+        current = Array.from(new Set(next));
+        continue;
+      }}
+      if (operation.kind === 'nth') {{
+        const at = operation.index < 0 ? current.length + operation.index : operation.index;
+        current = at >= 0 && at < current.length ? [current[at]] : [];
+        continue;
+      }}
+      throw new Error('unsupported locator operation: ' + operation.kind);
+    }}
+    return current;
+  }};
+  const current = resolve([document], spec.steps);
   if (spec.mode === 'count') return current.length;
   const at = spec.index < 0 ? current.length + spec.index : spec.index;
   return current[at] || null;
@@ -326,53 +387,165 @@ _RESOLVE_JS = f"""
 """
 
 
-class Locator:
-    """A selector chain plus an optional index at the tail.
+@dataclass(frozen=True, slots=True)
+class _LocatorOperation:
+    kind: str
+    selector: str | None = None
+    index: int | None = None
+    has_text: str | None = None
+    has_not_text: str | None = None
+    has: tuple[_LocatorOperation, ...] | None = None
+    has_not: tuple[_LocatorOperation, ...] | None = None
+    locator: tuple[_LocatorOperation, ...] | None = None
 
-    The chain is kept as a list of (selector, index) steps rather than one concatenated string. Two
-    reasons: `a, b` is a selector list whose meaning changes entirely under concatenation
-    (`"a, b div"` is not `"(a, b) div"`), and an index taken partway along the chain has to narrow
-    *that* step rather than the whole thing -- `nth(1).locator("span")` means the spans inside the
-    second match, not the second span overall.
+
+def _query_operations(selector: str) -> list[_LocatorOperation]:
+    if not isinstance(selector, str):
+        raise TypeError("selector must be a string")
+    return [_LocatorOperation(kind="query", selector=part) for part in _split_selector_chain(selector)]
+
+
+def _validate_text_filter(name: str, value: str | None) -> None:
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{name} must be a string or None")
+
+
+def _frame_source_identity(source: Frame | FrameLocator) -> tuple[Any, ...]:
+    if isinstance(source, FrameLocator):
+        return ("frame_locator", _frame_source_identity(source._source), source._selector)
+    return ("frame", id(source))
+
+
+class Locator:
+    """A lazy sequence of query, filter, and index operations.
+
+    Operations stay structured so text and nested-locator filters never become selector syntax, and
+    order remains meaningful: ``nth(0).filter(...)`` is not ``filter(...).nth(0)``.
     """
 
     def __init__(
         self,
         frame: Frame | FrameLocator,
-        selector: str | list[tuple[str, int | None]],
+        selector: str | list[_LocatorOperation],
         *,
         index: int | None = None,
+        has_text: str | None = None,
+        has_not_text: str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
     ) -> None:
         # A locator built from a FrameLocator does not know its frame yet: the iframe chain has to be
         # walked at action time, not at construction, because the frames may not exist yet and the
         # caller builds the chain synchronously.
         self._frame_source = frame
         if isinstance(selector, str):
-            chain = _split_selector_chain(selector)
-            self._steps: list[tuple[str, int | None]] = [(part, None) for part in chain[:-1]] + [(chain[-1], index)]
+            self._steps = _query_operations(selector)
         else:
             self._steps = list(selector)
-            if index is not None:
-                head, _ = self._steps[-1]
-                self._steps[-1] = (head, index)
+        if any(value is not None for value in (has_text, has_not_text, has, has_not)):
+            self._steps.append(self._filter_operation(has_text, has_not_text, has, has_not))
+        if index is not None:
+            self._steps.append(_LocatorOperation(kind="nth", index=index))
 
     def __repr__(self) -> str:
-        return "<Locator " + " >> ".join(f"{sel}" + ("" if i is None else f"[{i}]") for sel, i in self._steps) + ">"
+        return f"<Locator {self._selector}>"
 
     @property
     def _selector(self) -> str:
         """A human-readable rendering of the chain, for error messages only."""
-        return " >> ".join(sel + ("" if i is None else f"[{i}]") for sel, i in self._steps)
+        parts = []
+        for operation in self._steps:
+            if operation.kind == "query":
+                parts.append(operation.selector or "")
+            elif operation.kind == "filter":
+                parts.append("filter(...)")
+            elif operation.kind == "within":
+                parts.append("locator(...)")
+            else:
+                parts.append(f"nth({operation.index})")
+        return " >> ".join(parts)
 
     @property
     def _index(self) -> int | None:
-        return self._steps[-1][1]
+        tail = self._steps[-1]
+        return tail.index if tail.kind == "nth" else None
 
     # -- narrowing ----------------------------------------------------------
 
-    def locator(self, selector: str) -> Locator:
-        chained = [(part, None) for part in _split_selector_chain(selector)]
-        return Locator(self._frame_source, [*self._steps, *chained])
+    def locator(
+        self,
+        selector_or_locator: str | Locator,
+        *,
+        has_text: str | None = None,
+        has_not_text: str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+    ) -> Locator:
+        if isinstance(selector_or_locator, Locator):
+            self._ensure_compatible(selector_or_locator)
+            chained = [_LocatorOperation(kind="within", locator=tuple(selector_or_locator._steps))]
+        else:
+            chained = _query_operations(selector_or_locator)
+        return Locator(
+            self._frame_source,
+            [*self._steps, *chained],
+            has_text=has_text,
+            has_not_text=has_not_text,
+            has=has,
+            has_not=has_not,
+        )
+
+    def filter(
+        self,
+        *,
+        has_text: str | None = None,
+        has_not_text: str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        visible: bool | None = None,
+    ) -> Locator:
+        if visible is not None:
+            raise TypeError("SkyCDP Locator.filter does not support visible")
+        return Locator(
+            self._frame_source,
+            [*self._steps, self._filter_operation(has_text, has_not_text, has, has_not)],
+        )
+
+    def _filter_operation(
+        self,
+        has_text: str | None,
+        has_not_text: str | None,
+        has: Locator | None,
+        has_not: Locator | None,
+    ) -> _LocatorOperation:
+        _validate_text_filter("has_text", has_text)
+        _validate_text_filter("has_not_text", has_not_text)
+        if has is not None:
+            self._ensure_compatible(has)
+        if has_not is not None:
+            self._ensure_compatible(has_not)
+        return _LocatorOperation(
+            kind="filter",
+            has_text=has_text or None,
+            has_not_text=has_not_text or None,
+            has=tuple(has._steps) if has is not None else None,
+            has_not=tuple(has_not._steps) if has_not is not None else None,
+        )
+
+    def _ensure_compatible(self, other: Locator) -> None:
+        # Ancestor FrameLocator sources provide relative selector operations in the outer frame.
+        # Descendant/sibling sources would require entering a different frame, which this resolver
+        # cannot do inside a candidate. Both locators retain their frame objects, so id reuse is
+        # impossible while their identities are compared here.
+        inner_identity = _frame_source_identity(other._frame_source)
+        candidate_source: Frame | FrameLocator = self._frame_source
+        while True:
+            if _frame_source_identity(candidate_source) == inner_identity:
+                return
+            if not isinstance(candidate_source, FrameLocator):
+                break
+            candidate_source = candidate_source._source
+        raise ValueError("inner locator must belong to the same frame or frame-locator source")
 
     def nth(self, index: int) -> Locator:
         return Locator(self._frame_source, self._steps, index=index)
@@ -401,7 +574,22 @@ class Locator:
         return int(await frame.evaluate(_RESOLVE_JS, {"steps": self._encoded_steps(), "mode": "count"}))
 
     def _encoded_steps(self) -> list[dict[str, Any]]:
-        return [{"selector": sel, "index": idx} for sel, idx in self._steps]
+        def encode(operation: _LocatorOperation) -> dict[str, Any]:
+            if operation.kind == "query":
+                return {"kind": "query", "selector": operation.selector}
+            if operation.kind == "nth":
+                return {"kind": "nth", "index": operation.index}
+            if operation.kind == "within":
+                return {"kind": "within", "locator": [encode(item) for item in operation.locator or ()]}
+            return {
+                "kind": "filter",
+                "has_text": operation.has_text,
+                "has_not_text": operation.has_not_text,
+                "has": [encode(item) for item in operation.has] if operation.has is not None else None,
+                "has_not": [encode(item) for item in operation.has_not] if operation.has_not is not None else None,
+            }
+
+        return [encode(operation) for operation in self._steps]
 
     async def element_handle(self, timeout: float | None = None) -> ElementHandle:
         """`timeout` is milliseconds, as Playwright's is."""

@@ -2182,6 +2182,25 @@ async def skyvern_press_key(
     )
 
 
+_ORPHANED_WAITERS: set[asyncio.Task[Any]] = set()
+
+
+def _release_waiter(task: asyncio.Task[Any]) -> None:
+    # An abandoned waiter that does not end cancelled reported something other than the cancellation it
+    # was sent, which the engine in use does not do. Selectors stay out of the log.
+    was_abandoned = task in _ORPHANED_WAITERS
+    _ORPHANED_WAITERS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if was_abandoned:
+        LOG.warning(
+            "Browser wait selector task did not end cancelled",
+            error_type=type(error).__name__ if error is not None else None,
+            orphaned_waiters=len(_ORPHANED_WAITERS),
+        )
+
+
 async def _wait_for_either_selector(
     page: Any,
     selectors: tuple[str, str],
@@ -2196,9 +2215,23 @@ async def _wait_for_either_selector(
     tasks = {asyncio.create_task(page.wait_for_selector(sel, state=state, timeout=timeout)): sel for sel in selectors}
     pending = set(tasks)
     last_error: BaseException | None = None
+    loop = asyncio.get_running_loop()
+    # A waiter whose driver call never returns would otherwise outlast the timeout the caller declared,
+    # so the wait carries that declared bound itself rather than trusting each waiter to honour it.
+    deadline = loop.time() + timeout / 1000
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # A page that simply has neither state reaches here too, so this records the bound
+                # being spent rather than anything going wrong.
+                LOG.info(
+                    "Browser wait ended on its declared timeout",
+                    pending_waiters=len(pending),
+                    timeout_ms=timeout,
+                )
+                break
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             for task in sorted(done, key=lambda settled: selectors.index(tasks[settled])):
                 error = task.exception()
                 if error is None:
@@ -2211,11 +2244,14 @@ async def _wait_for_either_selector(
                     last_error = error
         return None, last_error
     finally:
+        # Awaiting a loser whose driver call ignores cancellation would hold the answer forever, so
+        # the callback reaps it whenever it settles and the set keeps it alive until then. A call
+        # that never settles stays registered, and loop shutdown will still block gathering it.
         for task in tasks:
             task.cancel()
-        # asyncio.wait does not reap its children: drain every task so none outlives the call and
-        # no exception is left unretrieved.
-        await asyncio.gather(*tasks, return_exceptions=True)
+            if not task.done():
+                _ORPHANED_WAITERS.add(task)
+            task.add_done_callback(_release_waiter)
 
 
 async def skyvern_wait(
@@ -2444,8 +2480,14 @@ async def skyvern_wait_for_either_state(
             timing_ms=timer.timing_ms,
             error=make_error(
                 ErrorCode.TIMEOUT,
-                _exception_message(failure) if failure else f"Neither selector reached {state!r}",
-                "The page settled into neither state; both selectors may be wrong for this page",
+                _exception_message(failure)
+                if failure
+                else f"Neither {selector_a!r} nor {selector_b!r} reached {state!r} within {timeout}ms",
+                # The declared bound expires while both waiters are still outstanding whether the page
+                # simply lacks these states or the driver stopped answering, so neither is named here.
+                "Neither state was confirmed before the timeout elapsed"
+                if failure is None
+                else "The page settled into neither state; both selectors may be wrong for this page",
                 details=_exception_details(failure) if failure else None,
             ),
         )

@@ -521,6 +521,25 @@ class WorkflowsRepository(BaseRepository):
                 )
             return None
 
+    @db_operation("get_workflow_permanent_id_created_at")
+    async def get_workflow_permanent_id_created_at(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> datetime | None:
+        """Return the earliest version timestamp for a workflow permanent ID.
+
+        Deleted versions remain part of the permanent ID's history, so this query
+        intentionally does not apply the usual soft-delete filter.
+        """
+        async with self.Session() as session:
+            return await session.scalar(
+                select(func.min(WorkflowModel.created_at)).where(
+                    WorkflowModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowModel.organization_id == organization_id,
+                )
+            )
+
     @db_operation("get_workflow_versions_by_permanent_id")
     async def get_workflow_versions_by_permanent_id(
         self,

@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field, field_validator
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
-from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTENDED_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
@@ -96,6 +96,20 @@ class UpdateBrowserSessionRequest(BaseModel):
     generate_browser_profile: bool = Field(
         description="Enable or disable saving this session's browser profile when it ends. Can be toggled while "
         "the session is still alive; the value is read at session teardown.",
+    )
+
+
+class ExtendBrowserSessionRequest(BaseModel):
+    # No pydantic `le=` bound: the route grants what remains under MAX_EXTENDED_TIMEOUT and returns a warning
+    # on the response instead of failing the request with pydantic's 422.
+    additional_minutes: int = Field(
+        description=(
+            "Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total "
+            f"lifetime of {MAX_EXTENDED_TIMEOUT} minutes ({MAX_EXTENDED_TIMEOUT // 60} hours) counted from when it "
+            "started; a request for more than the remaining headroom is granted the remainder and the response "
+            "carries a warning."
+        ),
+        ge=1,
     )
 
 

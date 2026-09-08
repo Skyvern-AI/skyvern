@@ -462,6 +462,7 @@ class StructuredContext(BaseModel):
                 "run_blocks_and_collect_debug",
                 "update_and_run_blocks",
                 "edit_block_and_run",
+                "test_workflow_from_blank_browser",
                 "get_run_results",
             ):
                 self.decisions_made.append(f"{tool}: {summary}")
@@ -477,6 +478,7 @@ class StructuredContext(BaseModel):
                 "run_blocks_and_collect_debug",
                 "update_and_run_blocks",
                 "edit_block_and_run",
+                "test_workflow_from_blank_browser",
                 "get_run_results",
             ):
                 preview = output[:300] if len(output) > 300 else output
@@ -922,6 +924,9 @@ class AgentResult:
     workflow_was_persisted: bool = False
     # Route nulls any persisted proposed_workflow when this is set.
     clear_proposed_workflow: bool = False
+    # Set when request policy barred this turn from authoring; the route's own
+    # proposal-clearing branches must not retire a draft such a turn never saw.
+    authoring_barred: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
@@ -964,6 +969,9 @@ class AgentResult:
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     # Internal eval-only metadata. The normal response schema never serializes this field.
     browser_ablation_metadata: BrowserAblationMetadata | None = None
+    # None when the turn never reached the agent loop, so a terminal frame built without a
+    # context leaves the client's rendered plan untouched instead of clearing it.
+    work_plan: list[str] | None = None
 
 
 @dataclass(frozen=True)

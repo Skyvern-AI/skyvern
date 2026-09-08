@@ -54,7 +54,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -661,11 +661,14 @@ async def _create_workflow_block_run_and_task(
 
     workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
+    task: Task | None = None
+    step: Step | None = None
+    task_id: str | None = None
+    step_id: str | None = None
+
     try:
         # Create workflow run block with appropriate parameters based on block type
         # TODO: support engine in the future
-        task_id = None
-        step_id = None
 
         # Create task for task-based blocks
         if block_type in SCRIPT_TASK_BLOCKS:
@@ -699,28 +702,79 @@ async def _create_workflow_block_run_and_task(
 
             task_id = task.task_id
 
-            # create a single step for the task
+            # Create the step in the only state from which recipe admission can
+            # atomically claim execution authority.
             step = await app.DATABASE.tasks.create_step(
                 task_id=task_id,
                 order=0,
                 retry_index=0,
                 organization_id=organization_id,
-                status=StepStatus.running,
+                status=StepStatus.created,
                 created_by=created_by,
             )
             step_id = step.step_id
-            # reset the action order to 0
-            context.action_order = 0
-            await _create_video_artifact(
-                task=task,
-                step=step,
-            )
-
-            # Update workflow run block with task_id
+            # Persist task authority before recipe classification or admission.
             await app.DATABASE.observer.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task_id,
                 organization_id=organization_id,
+            )
+
+    except Exception as e:
+        if getattr(e, "status_code", None) == 402:
+            raise
+        trigger_type = context.trigger_type
+        if trigger_type is None:
+            try:
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+            except Exception as trigger_lookup_error:
+                LOG.warning(
+                    "Failed to resolve workflow run trigger after task/step creation failure",
+                    workflow_run_id=workflow_run_id,
+                    error=str(trigger_lookup_error),
+                    exc_info=True,
+                )
+                raise e from trigger_lookup_error
+            trigger_type = workflow_run.trigger_type if workflow_run else None
+        if is_job_recipe_workflow_run_trigger_type(trigger_type):
+            raise e
+        LOG.warning(
+            "Failed to create workflow block run and task",
+            error=str(e),
+            block_type=block_type,
+            workflow_run_id=context.workflow_run_id,
+            exc_info=True,
+        )
+        return None, None, None
+
+    # Resolve recipe authority immediately after task and step persistence.
+    # Keep this outside generic creation catches so denial or lookup failures
+    # cannot be converted into the sentinel that permits cached execution.
+    recipe_admission_required = False
+    if task is not None and step is not None:
+        recipe_admission_required = await app.AGENT_FUNCTION.is_recipe_step_attempt(task, step)
+        if recipe_admission_required:
+            admitted = await app.AGENT_FUNCTION.admit_recipe_step_attempt(task, step, is_cached=True)
+            if not admitted:
+                raise RuntimeError("Recipe step was not admitted")
+
+    try:
+        if task is not None and step is not None:
+            # Reset the action order only after recipe admission has committed.
+            context.action_order = 0
+            if not recipe_admission_required:
+                step = await app.DATABASE.tasks.update_step(
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=StepStatus.running,
+                )
+            await _create_video_artifact(
+                task=task,
+                step=step,
             )
 
         await _take_workflow_run_block_screenshot(
@@ -735,9 +789,9 @@ async def _create_workflow_block_run_and_task(
         # so no explicit clear is needed between sequential blocks.
         context.workflow_run_block_id = workflow_run_block_id
 
-        return workflow_run_block_id, task_id, step_id
-
     except Exception as e:
+        if getattr(e, "status_code", None) == 402:
+            raise
         LOG.warning(
             "Failed to create workflow block run and task",
             error=str(e),
@@ -746,6 +800,8 @@ async def _create_workflow_block_run_and_task(
             exc_info=True,
         )
         return None, None, None
+
+    return workflow_run_block_id, task_id, step_id
 
 
 async def _create_video_artifact(

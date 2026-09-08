@@ -48,6 +48,16 @@ class RevocableCiphertext:
 
 
 class MicrosoftOAuthRepository(BaseRepository):
+    @db_operation("get_credential_state")
+    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
+        async with self.Session() as session:
+            return await session.scalar(
+                select(MicrosoftOAuthCredentialModel.state).where(
+                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                    MicrosoftOAuthCredentialModel.id == credential_id,
+                )
+            )
+
     @db_operation("insert_pending_credential")
     async def insert_pending_credential(
         self,
@@ -181,6 +191,18 @@ class MicrosoftOAuthRepository(BaseRepository):
                     MicrosoftOAuthCredentialModel.organization_id == organization_id,
                     MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
                 )
+                .order_by(MicrosoftOAuthCredentialModel.created_at.desc())
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [MicrosoftOAuthCredentialBase.model_validate(r, from_attributes=True) for r in rows]
+
+    @db_operation("list_for_org")
+    async def list_for_org(self, organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
+        """Return every credential row for the organization, regardless of state."""
+        async with self.Session() as session:
+            stmt = (
+                select(MicrosoftOAuthCredentialModel)
+                .where(MicrosoftOAuthCredentialModel.organization_id == organization_id)
                 .order_by(MicrosoftOAuthCredentialModel.created_at.desc())
             )
             rows = (await session.execute(stmt)).scalars().all()

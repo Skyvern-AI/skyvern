@@ -1,8 +1,9 @@
 import asyncio
 import time
 import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Annotated, Sequence
+from typing import Annotated
 
 import jwt
 import structlog
@@ -161,6 +162,8 @@ async def get_current_org(
         str | None,
         Header(alias=POSTHOG_ATTRIBUTION_HEADER, include_in_schema=False),
     ] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Organization:
     if not x_api_key and not authorization:
         raise HTTPException(
@@ -169,7 +172,12 @@ async def get_current_org(
         )
     organization = None
     if x_api_key:
-        organization = await get_current_org_cached(x_api_key, app.DATABASE)
+        organization = await get_current_org_cached(
+            x_api_key,
+            app.DATABASE,
+            user_agent=user_agent,
+            fern_language=x_fern_language,
+        )
     elif authorization:
         organization = await authenticate_helper(
             authorization,
@@ -215,13 +223,20 @@ def apply_request_org_context(organization: Organization) -> None:
 
 async def get_current_org_with_api_key(
     x_api_key: Annotated[str | None, Header()] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Organization:
     if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    return await get_current_org_cached(x_api_key, app.DATABASE)
+    return await get_current_org_cached(
+        x_api_key,
+        app.DATABASE,
+        user_agent=user_agent,
+        fern_language=x_fern_language,
+    )
 
 
 def credential_route_token_types() -> tuple[OrganizationAuthTokenType, ...]:
@@ -235,6 +250,9 @@ async def _get_current_org_for_token_types(
     x_api_key: str | None,
     authorization: str | None,
     token_types: Sequence[OrganizationAuthTokenType],
+    *,
+    user_agent: str | None = None,
+    fern_language: str | None = None,
 ) -> Organization:
     if authorization:
         try:
@@ -251,6 +269,8 @@ async def _get_current_org_for_token_types(
         x_api_key,
         app.DATABASE,
         token_types=token_types,
+        user_agent=user_agent,
+        fern_language=fern_language,
     )
     apply_request_org_context(validation.organization)
     return validation.organization
@@ -266,6 +286,8 @@ async def get_current_org_for_credential_routes(
         ),
     ] = None,
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Organization:
     """Credential-bearing routes: a full API token or an interactive session in cloud.
 
@@ -276,6 +298,8 @@ async def get_current_org_for_credential_routes(
         x_api_key,
         authorization,
         credential_route_token_types(),
+        user_agent=user_agent,
+        fern_language=x_fern_language,
     )
 
 
@@ -283,11 +307,15 @@ async def get_current_org_with_api_token(
     organization_id: str,
     x_api_key: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Organization:
     current_org = await _get_current_org_for_token_types(
         x_api_key,
         authorization,
         (OrganizationAuthTokenType.api,),
+        user_agent=user_agent,
+        fern_language=x_fern_language,
     )
     if organization_id != current_org.organization_id:
         raise HTTPException(
@@ -360,6 +388,8 @@ async def get_current_user_id(
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
     x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> str:
     # Try authorization header first, but only if the authentication function is configured
     if authorization and app.authenticate_user_function:
@@ -367,7 +397,12 @@ async def get_current_user_id(
 
     # Fall back to API key + skyvern-ui user agent
     if x_api_key and x_user_agent == SKYVERN_UI_USER_AGENT:
-        organization = await get_current_org_cached(x_api_key, app.DATABASE)
+        organization = await get_current_org_cached(
+            x_api_key,
+            app.DATABASE,
+            user_agent=user_agent,
+            fern_language=x_fern_language,
+        )
         if organization:
             return f"{organization.organization_id}_user"
 
@@ -381,6 +416,8 @@ async def get_current_user_id_or_none(
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
     x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> str | None:
     """Best-effort caller resolution for write attribution; never rejects the request."""
     try:
@@ -388,10 +425,17 @@ async def get_current_user_id_or_none(
             authorization=authorization,
             x_api_key=x_api_key,
             x_user_agent=x_user_agent,
+            user_agent=user_agent,
+            x_fern_language=x_fern_language,
         )
         # Org auth prefers x-api-key while the user comes from the bearer; only stamp verified members of the key org.
         if user_id and authorization and x_api_key and app.authenticate_user_function:
-            key_org = await get_current_org_cached(x_api_key, app.DATABASE)
+            key_org = await get_current_org_cached(
+                x_api_key,
+                app.DATABASE,
+                user_agent=user_agent,
+                fern_language=x_fern_language,
+            )
             is_member = await app.AGENT_FUNCTION.validate_user_organization_membership(
                 user_id=user_id,
                 organization_id=key_org.organization_id,
@@ -474,10 +518,65 @@ def _validate_token_expiry_before_cache(payload: dict[str, object] | None) -> No
     _validate_token_expiry(token_payload)
 
 
+_api_key_validation_hook_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _run_api_key_validated_hook(
+    organization_id: str,
+    token: OrganizationAuthToken,
+    user_agent: str | None,
+    fern_language: str | None,
+) -> None:
+    token_id: str | None = None
+    try:
+        token_id = token.id
+        await app.AGENT_FUNCTION.on_api_key_validated(
+            organization_id=organization_id,
+            token_id=token_id,
+            user_agent=user_agent,
+            fern_language=fern_language,
+        )
+    except Exception:
+        LOG.debug(
+            "API key lifecycle analytics hook failed",
+            organization_id=organization_id,
+            token_id=token_id,
+            exc_info=True,
+        )
+
+
+def _schedule_api_key_validated_hook(
+    organization_id: str,
+    token: OrganizationAuthToken,
+    user_agent: str | None,
+    fern_language: str | None,
+) -> None:
+    hook_coroutine = _run_api_key_validated_hook(
+        organization_id,
+        token,
+        user_agent,
+        fern_language,
+    )
+    try:
+        task = asyncio.create_task(hook_coroutine)
+    except Exception:
+        hook_coroutine.close()
+        LOG.debug(
+            "Could not schedule API key lifecycle analytics hook",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return
+    _api_key_validation_hook_tasks.add(task)
+    task.add_done_callback(_api_key_validation_hook_tasks.discard)
+
+
 async def resolve_org_from_api_key(
     x_api_key: str,
     db: AgentDB,
     token_types: Sequence[OrganizationAuthTokenType] = (OrganizationAuthTokenType.api,),
+    user_agent: str | None = None,
+    fern_language: str | None = None,
 ) -> ApiKeyValidationResult:
     """Decode and validate the API key against the database."""
     try:
@@ -556,6 +655,14 @@ async def resolve_org_from_api_key(
             detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings",
         )
 
+    if api_key_db_obj.token_type == OrganizationAuthTokenType.api:
+        _schedule_api_key_validated_hook(
+            organization.organization_id,
+            api_key_db_obj,
+            user_agent,
+            fern_language,
+        )
+
     return ApiKeyValidationResult(
         organization=organization,
         payload=api_key_data,
@@ -577,7 +684,13 @@ def _get_current_org_cache_lock(cache_key: _CurrentOrgCacheKey) -> asyncio.Lock:
     return lock
 
 
-async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
+async def _get_current_org_cached(
+    x_api_key: str,
+    db: AgentDB,
+    *,
+    user_agent: str | None = None,
+    fern_language: str | None = None,
+) -> Organization:
     """Validate API-key authentication and cache successful results for one minute."""
     cache_key = (x_api_key, db)
     try:
@@ -592,7 +705,12 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
             pass
 
         invalidation_generation = _current_org_cache_invalidation_generation
-        validation = await resolve_org_from_api_key(x_api_key, db)
+        validation = await resolve_org_from_api_key(
+            x_api_key,
+            db,
+            user_agent=user_agent,
+            fern_language=fern_language,
+        )
 
         if invalidation_generation == _current_org_cache_invalidation_generation:
             _current_org_cache[cache_key] = validation.organization
@@ -603,7 +721,13 @@ def _claims_ui_session(payload: dict[str, object] | None) -> bool:
     return payload is not None and payload.get("token_type") == OrganizationAuthTokenType.ui_session.value
 
 
-async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
+async def get_current_org_cached(
+    x_api_key: str,
+    db: AgentDB,
+    *,
+    user_agent: str | None = None,
+    fern_language: str | None = None,
+) -> Organization:
     payload = _decode_token_before_cache(x_api_key)
     _validate_token_expiry_before_cache(payload)
     if _claims_ui_session(payload):
@@ -611,10 +735,17 @@ async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
             x_api_key,
             db,
             token_types=(OrganizationAuthTokenType.ui_session,),
+            user_agent=user_agent,
+            fern_language=fern_language,
         )
         organization = validation.organization
     else:
-        organization = await _get_current_org_cached(x_api_key, db)
+        organization = await _get_current_org_cached(
+            x_api_key,
+            db,
+            user_agent=user_agent,
+            fern_language=fern_language,
+        )
     apply_request_org_context(organization)
     return organization
 
@@ -644,13 +775,20 @@ async def get_current_caller_context(
     x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> CallerContext:
     """Resolve the caller identity for write-attribution. Mirrors get_current_org's
     x-api-key-first precedence and OTEL side effects."""
     # x-api-key path FIRST — mirrors get_current_org so clients with both
     # headers (valid key + stale JWT) keep authenticating via the key.
     if x_api_key:
-        organization = await get_current_org_cached(x_api_key, app.DATABASE)
+        organization = await get_current_org_cached(
+            x_api_key,
+            app.DATABASE,
+            user_agent=user_agent,
+            fern_language=x_fern_language,
+        )
         apply_request_org_context(organization)
         # x-user-agent is spoofable and is NOT an access-control check —
         # it only flips set_by attribution from API_KEY to USER. Real auth

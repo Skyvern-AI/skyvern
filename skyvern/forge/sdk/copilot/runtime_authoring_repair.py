@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    MAX_RESULT_CONTAINERS,
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
     has_bounded_page_schema,
@@ -35,6 +36,10 @@ _RUNTIME_AUTHORING_REASON_CODE = "runtime_block_failure"
 _MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
+# Shared across result regions rather than spent on one, and tied to the scrape's region cap so no
+# region can be dropped before its first item is projected. At the cap a page gets one item per
+# region, which is the ceiling of this allocation.
+_RUNTIME_RESULT_SUMMARY_MAX_ITEMS = MAX_RESULT_CONTAINERS
 _OBSERVED_STATE_MAX_CHARS = 60
 _RENDERED_VALUE_EXCERPT_MAX_CHARS = 300
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
@@ -259,22 +264,34 @@ def _runtime_action_summaries(navigation_targets: Any, clickable_controls: Any) 
     return merged[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
+def _region_fair_summaries(regions: list[list[str]], max_items: int) -> list[str]:
+    """Order rank by rank across regions so a long region cannot evict a later one, and every
+    downstream prefix of this list stays as evenly spread as its length allows. The sibling
+    `_balanced_by_region` walks the same way but returns document order whenever the input fits its
+    cap, which would leave the narrower slices downstream taking a region-major prefix."""
+    depth = max((len(region) for region in regions), default=0)
+    ranked = [region[rank] for rank in range(depth) for region in regions if rank < len(region)]
+    return ranked[:max_items]
+
+
 def _runtime_result_summaries(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    summaries: list[str] = []
+    regions: list[list[str]] = []
     for container in value:
         if not isinstance(container, dict):
             continue
+        region: list[str] = []
         primary = _runtime_summary_entry(container, ("text_excerpt",))
         if primary:
-            summaries.append(primary)
+            region.append(primary)
         for row in container.get("sample_rows") or []:
             summary = _bounded_runtime_text(row, 80)
             if summary:
-                summaries.append(summary)
-                break
-    return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
+                region.append(summary)
+        if region:
+            regions.append(region)
+    return _region_fair_summaries(regions, _RUNTIME_RESULT_SUMMARY_MAX_ITEMS)
 
 
 def _raw_obstruction_entries(evidence: dict[str, Any]) -> tuple[list[Any], list[str]]:
@@ -492,11 +509,13 @@ def _post_run_terminal_page_evidence(evidence: dict[str, Any]) -> bool:
     return has_indicators and has_interactive_controls
 
 
-def _first_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
+def _newest_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The run's newest failed block. ``blocks`` arrives chronologically, so the newest failure is
+    the last match: repair context has to name the failure the run stopped on."""
     blocks = data.get("blocks")
     if not isinstance(blocks, list):
         return None
-    for block in blocks:
+    for block in reversed(blocks):
         if not isinstance(block, dict):
             continue
         status = str(block.get("status") or "").lower()
@@ -517,7 +536,7 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
     if not isinstance(run_id, str) or not run_id:
         clear_runtime_authoring_repair_context(copilot_ctx)
         return
-    block = _first_runtime_failed_block(data)
+    block = _newest_runtime_failed_block(data)
     failure_reason = ""
     block_label = _bounded_runtime_text(data.get("frontier_start_label"), 80)
     failed_block_status = _bounded_runtime_text(data.get("overall_status"), 40)

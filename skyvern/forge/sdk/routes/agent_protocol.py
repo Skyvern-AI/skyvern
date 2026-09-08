@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import random
 import time
 import unicodedata
@@ -65,7 +64,10 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import (
+    OrganizationAuthTokenType,
+    is_job_recipe_workflow_run_trigger_type,
+)
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
     TagValueAlreadyExists,
@@ -1022,6 +1024,7 @@ async def create_workflow(
 async def create_workflow_from_prompt(
     raw_request: Request,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
@@ -1080,6 +1083,8 @@ async def create_workflow_from_prompt(
             task_version=task_version,
             extracted_information_schema=request.extracted_information_schema,
             generate_script=bool(request.generate_script),
+            actor_user_id=user_id,
+            created_via="prompt",
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
@@ -1089,19 +1094,10 @@ async def create_workflow_from_prompt(
 
 
 async def _validate_file_size(file: UploadFile) -> UploadFile:
-    try:
-        file.file.seek(0, 2)  # Move the pointer to the end of the file
-        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
-        file.file.seek(0)  # Reset the pointer back to the beginning
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
-
-    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
-        )
-    return file
+    return await uploaded_file_service.validate_file_size(
+        file,
+        max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+    )
 
 
 @legacy_base_router.post(
@@ -1210,6 +1206,7 @@ async def import_workflow_from_pdf(
     file: UploadFile = Depends(_validate_file_size),
     folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
@@ -1256,6 +1253,9 @@ async def import_workflow_from_pdf(
                 organization=current_org,
                 request=WorkflowCreateYAMLRequest.model_validate(result),
                 workflow_permanent_id=empty_workflow.workflow_permanent_id,
+                created_by=user_id,
+                edited_by=user_id,
+                created_via="pdf",
             )
 
             # Update v1 status to published (v1 won't show in list since v2 is latest version)
@@ -3945,7 +3945,12 @@ async def retry_workflow_run(
     )
 
     context = skyvern_context.ensure_context()
-    trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
+    original_trigger_type = getattr(original_workflow_run, "trigger_type", None)
+    trigger_type = (
+        original_trigger_type
+        if is_job_recipe_workflow_run_trigger_type(original_trigger_type)
+        else workflow_run_trigger_type_from_user_agent(x_user_agent)
+    )
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=original_workflow_run.workflow_permanent_id,
@@ -5699,31 +5704,17 @@ async def upload_file(
 ) -> UploadFileResponse:
     # Validated before the upload so a rejected retention period never leaves bytes behind.
     try:
-        uploaded_file_service.resolve_expires_at(retention_days)
+        uploaded_file, presigned_url = await uploaded_file_service.save_uploaded_file(
+            file=file,
+            organization_id=current_org.organization_id,
+            retention_days=retention_days,
+        )
     except uploaded_file_service.InvalidRetentionPeriod as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-
-    file_id = uploaded_file_service.generate_upload_id()
-    # The id is embedded in the stored filename (not the record) so two uploads of the same
-    # original filename on the same day get distinct storage keys instead of overwriting
-    # each other's object; record_upload still stores the caller's original filename.
-    storage_filename = f"{file_id}_{os.path.basename(file.filename)}" if file.filename else file_id
-    uris = await app.STORAGE.save_legacy_file(
-        organization_id=current_org.organization_id, filename=storage_filename, fileObj=file.file
-    )
-    if not uris:
-        raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
-    presigned_url, uploaded_s3_uri = uris
-    uploaded_file = await uploaded_file_service.record_upload(
-        file_id=file_id,
-        organization_id=current_org.organization_id,
-        storage_uri=uploaded_s3_uri,
-        filename=file.filename or "",
-        size_bytes=file.size,
-        retention_days=retention_days,
-    )
+    except uploaded_file_service.UploadStorageError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     return UploadFileResponse(
-        s3_uri=uploaded_s3_uri,
+        s3_uri=uploaded_file.storage_uri,
         presigned_url=presigned_url,
         file_id=uploaded_file.file_id,
         expires_at=uploaded_file.expires_at,

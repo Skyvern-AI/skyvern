@@ -247,6 +247,20 @@ _DISPATCHER_OWNED_INPUT_EXCEPTIONS = (
 )
 
 
+def _terminal_action_status(results: list[ActionResult]) -> ActionStatus:
+    if not results:
+        return ActionStatus.failed
+
+    terminal_result = results[-1]
+    if isinstance(terminal_result, ActionSuccess):
+        return ActionStatus.completed
+    if isinstance(terminal_result, ActionAbort):
+        if terminal_result.desired_state_reached or terminal_result.setup_performed:
+            return ActionStatus.completed
+        return ActionStatus.skipped
+    return ActionStatus.failed
+
+
 async def _totp_window_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
@@ -3698,6 +3712,10 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
+# Upstream HTTP statuses that count as download-failure evidence; adjacent 5xx (501/505/507/...) are excluded.
+_OBSERVED_DOWNLOAD_FAILURE_STATUSES = frozenset({500, 502, 503, 504})
+
+
 class ScopedXhrDownloadCapture:
     """Install on a page before a download action; remove after the polling window.
 
@@ -3709,7 +3727,12 @@ class ScopedXhrDownloadCapture:
     (e.g. target="_blank" links) so XHR responses on child tabs are captured.
     """
 
-    def __init__(self, page: Page, download_dir: Path, timeout_seconds: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
+    def __init__(
+        self,
+        page: Page,
+        download_dir: Path,
+        timeout_seconds: float = BROWSER_DOWNLOAD_TIMEOUT,
+    ) -> None:
         self._page = page
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
@@ -3718,6 +3741,10 @@ class ScopedXhrDownloadCapture:
         self._capture_responses = False
         self._active = False
         self._accept_new_requests = False
+        # Passive, site-agnostic status observation: records only a server 5xx integer status for any
+        # admitted xhr/fetch request during this download action. No URL, host, header, body, or other
+        # request detail is ever retained.
+        self._observed_download_failure_status: int | None = None
         # Response-body drain count is separate from request-lifecycle tracking for the bounded wait extension.
         self._in_flight = 0
         self._response_tasks: set[asyncio.Task[None]] = set()
@@ -3730,6 +3757,10 @@ class ScopedXhrDownloadCapture:
     @property
     def has_in_flight_requests(self) -> bool:
         return bool(self._in_flight_requests)
+
+    @property
+    def observed_download_failure_status(self) -> int | None:
+        return self._observed_download_failure_status
 
     def _on_request(self, request: Request) -> None:
         redirected_from_admitted_request = request.redirected_from in self._admitted_requests
@@ -3776,11 +3807,32 @@ class ScopedXhrDownloadCapture:
         return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
 
     def _on_response_event(self, response: Response) -> None:
+        self._observe_download_failure_status(response)
+        if not self._capture_responses:
+            return
         self._in_flight += 1
         self._drained.clear()
         task = asyncio.create_task(self._on_response(response))
         self._response_tasks.add(task)
         task.add_done_callback(self._on_response_done)
+
+    def _observe_download_failure_status(self, response: Response) -> None:
+        """Record a server 5xx status for any admitted xhr/fetch request during this download action.
+
+        Runs on Playwright's event loop for every response while the capture is attached, including the
+        CDP-interceptor lane where response-body capture is off. Stores only the integer status and only
+        when the request was admitted for this action window. Retains nothing else — no URL, host, or
+        header — and never raises into the event loop.
+        """
+        try:
+            if response.request not in self._admitted_requests:
+                return
+            status = response.status
+            if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
+                return
+            self._observed_download_failure_status = status
+        except Exception:
+            return
 
     def _on_response_done(self, task: asyncio.Task[None]) -> None:
         self._response_tasks.discard(task)
@@ -3874,15 +3926,15 @@ class ScopedXhrDownloadCapture:
         self._extra_pages.append(page)
 
     def _attach_page(self, page: Page) -> None:
-        if self._capture_responses:
-            page.on("response", self._on_response_event)
+        # The response listener always attaches for passive 5xx status observation; on the CDP lane
+        # body capture stays gated off inside _on_response_event.
+        page.on("response", self._on_response_event)
         page.on("request", self._on_request)
         page.on("requestfinished", self._on_request_finished)
         page.on("requestfailed", self._on_request_finished)
 
     def _detach_page(self, page: Page) -> None:
-        if self._capture_responses:
-            page.remove_listener("response", self._on_response_event)
+        page.remove_listener("response", self._on_response_event)
         page.remove_listener("request", self._on_request)
         page.remove_listener("requestfinished", self._on_request_finished)
         page.remove_listener("requestfailed", self._on_request_finished)
@@ -4773,6 +4825,9 @@ class ActionHandler:
                     download_triggered = True
 
             if not download_triggered:
+                # No file arrived. Any passively observed server 5xx is stamped once in the finally
+                # block after the observer is disabled and drained, so a request admitted before the
+                # wait ended but resolved during teardown is still credited.
                 if action.errors:
                     results[-1] = ActionFailure(
                         Exception("; ".join(error.reasoning for error in action.errors)),
@@ -4903,6 +4958,21 @@ class ActionHandler:
                 finally:
                     if staging_dir.exists():
                         shutil.rmtree(staging_dir, ignore_errors=True)
+            # Single authoritative stamp, taken only after the observer is detached and drained so a
+            # request that resolved during the cleanup awaits before disable() is not missed. Gated on
+            # final artifact truth: a saved file never carries a failure status. A StaleActionAbort is
+            # excluded because that action never executed -- a passively observed 5xx belongs to unrelated
+            # traffic, not to a download this action never made. Placed before
+            # finish_requested_download_for_context so its result replacement preserves the stamp.
+            if (
+                "results" in locals()
+                and results
+                and not isinstance(results[-1], StaleActionAbort)
+                and not results[-1].downloaded_files
+            ):
+                observed_failure_status = xhr_capture.observed_download_failure_status
+                if observed_failure_status is not None:
+                    results[-1].download_failure_status = observed_failure_status
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -4940,10 +5010,12 @@ class ActionHandler:
 
             download_error = finish_requested_download_for_context(page.context, requested_download_token)
             if download_error is not None and "results" in locals() and results:
+                preserved_download_failure_status = results[-1].download_failure_status
                 results[-1] = ActionFailure(
                     Exception(download_error["reasoning"]),
                     download_triggered=download_triggered,
                 )
+                results[-1].download_failure_status = preserved_download_failure_status
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
@@ -5100,12 +5172,11 @@ class ActionHandler:
             actions_result.append(ActionFailure(e))
         finally:
             tool_result_content = ""
+            action.status = _terminal_action_status(actions_result)
 
             if actions_result and isinstance(actions_result[-1], ActionSuccess):
-                action.status = ActionStatus.completed
                 tool_result_content = "Tool executed successfully"
             elif actions_result and isinstance(actions_result[-1], ActionAbort):
-                action.status = ActionStatus.skipped
                 if isinstance(actions_result[-1], StaleActionAbort):
                     # The action did NOT run (its target went stale). Tell the tool caller the truth so
                     # the next planning turn re-observes, rather than reporting a false success.
@@ -5117,7 +5188,6 @@ class ActionHandler:
                 # either actions_result is empty or the last action is a failure
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
-                action.status = ActionStatus.failed
 
             _emit_tel_input_outcome(action, actions_result)
 
@@ -5770,7 +5840,7 @@ async def _drive_grid_row_selection(
         return None
     if await _grid_row_reached_state(element, desired_state):
         LOG.info("Grid row reached the desired selection state", action=action, desired_state=desired_state)
-        return [ActionAbort()]
+        return [ActionAbort(desired_state_reached=True)]
     LOG.warning(
         "Grid row selection did not reach the desired state, continuing the normal click",
         element_id=element.get_id(),
@@ -5799,23 +5869,29 @@ async def _checkbox_live_state(element: SkyvernElement, grid_state: _GridRowSele
         return None
 
 
-async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
-    """Read one generic, live observable of a control's selected/checked state, or None when no
-    boolean observable is readable (unknown control, malformed value, or a detached/unreadable
-    element) so the caller falls open to an ordinary click. Native radio inputs report through
-    is_checked(); a checkbox reports its grid row's selection when it is a grid row-selection control
-    (native `checked` can diverge from app row selection) and otherwise its native is_checked(); other
-    controls expose an exact aria-checked/aria-pressed/aria-selected boolean read live. Role only
-    chooses which observable to read and whether a bare aria-selected value is trustworthy; it never
-    implies desired intent."""
+class _EffectiveClickState(NamedTuple):
+    checked: bool | None
+    control_type: str | None
+
+
+async def _resolve_live_click_state(element: SkyvernElement) -> _EffectiveClickState:
+    """Read one generic, live selected/checked state and control type snapshot.
+    ``checked`` is None when no boolean observable is readable (unknown control, malformed value,
+    or a detached/unreadable element), so the caller falls open to an ordinary click. Native radio
+    inputs report through is_checked(); a checkbox reports its grid row's selection when it is a
+    grid row-selection control (native ``checked`` can diverge from app row selection) and otherwise
+    its native is_checked(); other controls expose an exact aria-checked/aria-pressed/aria-selected
+    boolean read live. Role only chooses which observable to read and whether a bare aria-selected
+    value is trustworthy; it never implies desired intent."""
     try:
         if element.get_tag_name() == "input":
             input_type = (await element.get_attr("type") or "").strip().casefold()
             if input_type == "checkbox":
-                return await _checkbox_live_state(element, (await _read_grid_row_selection(element)).state)
+                checked = await _checkbox_live_state(element, (await _read_grid_row_selection(element)).state)
+                return _EffectiveClickState(checked=checked, control_type=input_type)
             if input_type == "radio":
-                return await element.is_checked()
-            return None
+                return _EffectiveClickState(checked=await element.is_checked(), control_type=input_type)
+            return _EffectiveClickState(checked=None, control_type=input_type)
         for aria_attr in ("aria-checked", "aria-pressed", "aria-selected"):
             parsed = _parse_aria_boolean(await element.get_attr(aria_attr, mode="dynamic"))
             if parsed is None:
@@ -5823,12 +5899,16 @@ async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
             if aria_attr == "aria-selected" and parsed and await _is_single_select_option_highlight(element):
                 # A single-select option's aria-selected="true" is a keyboard highlight, not committed
                 # state, so leave it unreadable and let the physical click commit the selection.
-                return None
-            return parsed
-        return None
+                return _EffectiveClickState(checked=None, control_type=None)
+            return _EffectiveClickState(checked=parsed, control_type=None)
+        return _EffectiveClickState(checked=None, control_type=None)
     except Exception:
         LOG.debug("Failed to read live selected state; continuing with an ordinary click", element_id=element.get_id())
-        return None
+        return _EffectiveClickState(checked=None, control_type=None)
+
+
+async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
+    return (await _resolve_live_click_state(element)).checked
 
 
 async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Locator | None:
@@ -5847,26 +5927,33 @@ async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Loc
     return None
 
 
-async def _set_native_checkbox_state(element: SkyvernElement, should_check: bool) -> bool:
-    """Drive a native checkbox/radio input to ``should_check`` and report whether the final state
-    matches. Sets through the input, falling back to a visible associated label when the input is
+class NativeSetOutcome(StrEnum):
+    VERIFIED = "verified"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
+async def _set_native_checkbox_state(element: SkyvernElement, should_check: bool) -> NativeSetOutcome:
+    """Drive a native checkbox/radio input to ``should_check`` and verify the resulting state.
+    Sets through the input, falling back to a visible associated label when the input is
     hidden/non-actionable (skipping a label that forwards its click to an interactive descendant)."""
     locator = element.get_locator()
     try:
         if await locator.is_checked(timeout=settings.BROWSER_ACTION_TIMEOUT_MS) == should_check:
-            return True
+            return NativeSetOutcome.VERIFIED
     except Exception:
         # Keep moving: check()/uncheck() are state-setting operations for actionable inputs,
         # and the label fallback below verifies the final state for hidden inputs.
         LOG.warning("Failed to read checkbox state before setting it", element_id=element.get_id(), exc_info=True)
 
+    input_set_failed = False
     try:
         if should_check:
             await element.check()
         else:
             await element.uncheck()
-        return True
     except Exception:
+        input_set_failed = True
         LOG.warning(
             "Failed to set checkbox state through input, trying associated label",
             element_id=element.get_id(),
@@ -5874,22 +5961,46 @@ async def _set_native_checkbox_state(element: SkyvernElement, should_check: bool
             exc_info=True,
         )
 
+    try:
+        verified_state = await locator.is_checked(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.warning(
+            "Failed to verify checkbox state after setting it",
+            element_id=element.get_id(),
+            should_check=should_check,
+            exc_info=True,
+        )
+        return NativeSetOutcome.UNKNOWN
+    if verified_state == should_check:
+        return NativeSetOutcome.VERIFIED
+    if not input_set_failed:
+        return NativeSetOutcome.MISMATCH
+
     label_locator = await _get_associated_checkbox_label_locator(element)
     if label_locator is None:
-        return False
+        return NativeSetOutcome.MISMATCH
 
     try:
         if not await label_locator.is_visible():
-            return False
+            return NativeSetOutcome.MISMATCH
         if await SkyvernElement._label_click_forwards_to_descendant(label_locator, fail_closed=True):
             LOG.warning(
                 "Associated checkbox label contains an interactive descendant",
                 element_id=element.get_id(),
                 should_check=should_check,
             )
-            return False
+            return NativeSetOutcome.MISMATCH
+    except Exception:
+        LOG.warning(
+            "Failed to inspect associated checkbox label before setting state",
+            element_id=element.get_id(),
+            should_check=should_check,
+            exc_info=True,
+        )
+        return NativeSetOutcome.MISMATCH
+
+    try:
         await label_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-        return await locator.is_checked(timeout=settings.BROWSER_ACTION_TIMEOUT_MS) == should_check
     except Exception:
         LOG.warning(
             "Failed to set checkbox state through associated label",
@@ -5897,7 +6008,18 @@ async def _set_native_checkbox_state(element: SkyvernElement, should_check: bool
             should_check=should_check,
             exc_info=True,
         )
-        return False
+
+    try:
+        verified_state = await locator.is_checked(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.warning(
+            "Failed to verify checkbox state after setting it through associated label",
+            element_id=element.get_id(),
+            should_check=should_check,
+            exc_info=True,
+        )
+        return NativeSetOutcome.UNKNOWN
+    return NativeSetOutcome.VERIFIED if verified_state == should_check else NativeSetOutcome.MISMATCH
 
 
 _LABEL_CONTROL_STATE_JS = r"""
@@ -5911,14 +6033,19 @@ _LABEL_CONTROL_STATE_JS = r"""
         if (controls.length !== 1 || control !== controls[0]) return null;
     }
     if (control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")) {
-        return control.checked;
+        return {checked: control.checked, type: control.type};
     }
     return null;
 }
 """
 
 
-async def _read_label_control_state(label: SkyvernElement) -> bool | None:
+class _LabelControlState(NamedTuple):
+    checked: bool
+    control_type: str
+
+
+async def _read_label_control_state(label: SkyvernElement) -> _LabelControlState | None:
     """Read the live checked state of a label's bound control the way browser label activation
     resolves it, via the browser's own ``HTMLLabelElement.control``. For an explicit ``for=`` label
     the id-referenced labelable element is used directly (a for= label never falls back to
@@ -5936,19 +6063,57 @@ async def _read_label_control_state(label: SkyvernElement) -> bool | None:
             element_id=label.get_id(),
         )
         return None
-    return state if isinstance(state, bool) else None
+    if not isinstance(state, dict):
+        return None
+    checked = state.get("checked")
+    control_type = state.get("type")
+    if not isinstance(checked, bool) or not isinstance(control_type, str):
+        return None
+    control_type = control_type.strip().casefold()
+    if control_type not in ("checkbox", "radio"):
+        return None
+    return _LabelControlState(checked=checked, control_type=control_type)
 
 
-async def _resolve_effective_click_state(element: SkyvernElement, dom: DomUtil) -> bool | None:
-    """Live selected/checked state of the control a click on ``element`` actually toggles: the
-    element's own observable, or, for a <label>, its spec-bound control (mapped explicit for=
-    control first, else the in-page label.control read). None = unreadable; callers fall open."""
+async def _resolve_effective_click_state(element: SkyvernElement, dom: DomUtil) -> _EffectiveClickState:
+    """Read the selected/checked state and control type for the control a click on ``element`` actually
+    toggles. For a <label>, use its spec-bound control (mapped explicit for= control first, else the
+    in-page label.control read). Both fields come from the same effective-control resolution."""
     if element.get_tag_name() != "label":
-        return await _resolve_live_selected_state(element)
+        return await _resolve_live_click_state(element)
     control = await element.find_label_for(dom)
     if control is not None:
-        return await _resolve_live_selected_state(control)
-    return await _read_label_control_state(element)
+        return await _resolve_live_click_state(control)
+    label_control_state = await _read_label_control_state(element)
+    if label_control_state is None:
+        return _EffectiveClickState(checked=None, control_type=None)
+    return _EffectiveClickState(
+        checked=label_control_state.checked,
+        control_type=label_control_state.control_type,
+    )
+
+
+def _radio_uncheck_failure(action: actions.ClickAction) -> ActionFailure:
+    return ActionFailure(
+        FailToClick(
+            action.element_id,
+            msg="Radio is already selected and cannot be unchecked by clicking it; select another option in the group instead",
+        )
+    )
+
+
+def _unverified_native_set_failure(action: actions.ClickAction) -> ActionFailure:
+    return ActionFailure(
+        FailToClick(
+            action.element_id,
+            msg="Could not verify the control state after setting it; not clicking again because a second click could toggle it back",
+        )
+    )
+
+
+def _is_impossible_radio_uncheck(desired_state: bool | None, state: _EffectiveClickState) -> bool:
+    """Return whether a desired-state click asks a checked radio to become unchecked."""
+    return desired_state is False and state.checked is True and state.control_type == "radio"
 
 
 async def _apply_label_desired_click_state(
@@ -5956,22 +6121,25 @@ async def _apply_label_desired_click_state(
 ) -> list[ActionResult] | None:
     """A <label> click forwards activation to its spec-bound control, so observe that control's
     live state rather than the label's (labels carry no checked/selected observable). Suppress the
-    redundant click when the bound control already holds the desired state; on a mismatch, or when
-    no bound control resolves or its state is unreadable, fall through to a single ordinary label
-    click, whose forwarding performs the one toggle. The control is resolved deterministically via
-    the spec-defined association (explicit for=-id, else the wrapped labelable descendant read
-    in-page); state is never driven through the label."""
-    control_state = await _resolve_effective_click_state(label, dom)
-    if control_state is None:
+    redundant click when the bound control already holds the desired state; fail a checked radio
+    requested to be unchecked; otherwise, on a mismatch or when no bound control resolves or its
+    state is unreadable, fall through to a single ordinary label click, whose forwarding performs
+    the one toggle. The control is resolved deterministically via the spec-defined association
+    (explicit for=-id, else the wrapped labelable descendant read in-page); state is never driven
+    through the label."""
+    state = await _resolve_effective_click_state(label, dom)
+    if _is_impossible_radio_uncheck(desired_state, state):
+        return [_radio_uncheck_failure(action)]
+    if state.checked is None:
         LOG.info("Label click has no readable bound-control state, continuing the normal click", action=action)
         return None
-    if control_state == desired_state:
+    if state.checked == desired_state:
         LOG.info(
             "Label's bound control already in the desired state, suppressing the redundant click",
             action=action,
             desired_state=desired_state,
         )
-        return [ActionAbort()]
+        return [ActionAbort(desired_state_reached=True)]
     LOG.info(
         "Label's bound control differs from the desired state, continuing with a single normal click",
         action=action,
@@ -5988,8 +6156,9 @@ async def _apply_checkbox_desired_click_state(
     row-selection checkbox drives app row selection through its selection cell -- a native set flips
     ``checked`` while the row stays unselected, the divergence this guards against -- so it is recovered
     on the cell and never check()/uncheck(). Returns [ActionAbort()] only from a positively-proven state,
-    or None to fall through to a single ordinary click. Invariants: absence of a positive selected signal
-    (UNMARKED) never suppresses a needed click; the cell is driven ONLY from a positively-readable start
+    [ActionFailure()] when a native set cannot be verified, or None to fall through to a single ordinary
+    click. Invariants: absence of a positive selected signal (UNMARKED) never suppresses a needed click;
+    the cell is driven ONLY from a positively-readable start
     (UNSELECTED to select, SELECTED to deselect) whose result the drive can then read, and only when no
     OTHER row of the grid holds a readable selection, so a recovery can never clear another row's
     selection; a drive aborts only after a positively-readable post-state; and an UNMARKED row -- no
@@ -5999,16 +6168,19 @@ async def _apply_checkbox_desired_click_state(
     state = grid.state
 
     if state is _GridRowSelection.NOT_GRID_ROW:
-        native = await _checkbox_live_state(element, state)
-        if native is None:
+        native_state = await _checkbox_live_state(element, state)
+        if native_state is None:
             LOG.info("No readable selected state, continuing the normal click", action=action)
             return None
-        if native == desired_state:
+        if native_state == desired_state:
             LOG.info("Control already in the desired state, suppressing the redundant click", action=action)
-            return [ActionAbort()]
+            return [ActionAbort(desired_state_reached=True)]
         LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
-        if await _set_native_checkbox_state(element, should_check=desired_state):
-            return [ActionAbort()]
+        set_outcome = await _set_native_checkbox_state(element, should_check=desired_state)
+        if set_outcome is NativeSetOutcome.VERIFIED:
+            return [ActionAbort(desired_state_reached=True)]
+        if set_outcome is NativeSetOutcome.UNKNOWN:
+            return [_unverified_native_set_failure(action)]
         LOG.warning("Failed to set the native control to the desired state, continuing the normal click", action=action)
         return None
 
@@ -6021,10 +6193,10 @@ async def _apply_checkbox_desired_click_state(
     positively_unselected = state is _GridRowSelection.UNSELECTED
     if positively_selected and desired_state:
         LOG.info("Row already selected, suppressing the redundant click", action=action)
-        return [ActionAbort()]
+        return [ActionAbort(desired_state_reached=True)]
     if positively_unselected and not desired_state:
         LOG.info("Row already unselected, suppressing the redundant click", action=action)
-        return [ActionAbort()]
+        return [ActionAbort(desired_state_reached=True)]
 
     if not desired_state:
         # Deselect intent. Only a positively-SELECTED row is driven off its selection; an UNMARKED row is
@@ -6041,7 +6213,7 @@ async def _apply_checkbox_desired_click_state(
             native_checked = None
         if native_checked is False:
             LOG.info("Unmarked row with the box positively off already matches desired unselected", action=action)
-            return [ActionAbort()]
+            return [ActionAbort(desired_state_reached=True)]
         LOG.info("Unmarked row can't be proven unselected, continuing the normal click", action=action)
         return None
 
@@ -6077,34 +6249,42 @@ async def _apply_desired_click_state(
 ) -> list[ActionResult] | None:
     """Drive a selectable control to an explicit terminal state idempotently. Returns
     [ActionAbort()] to suppress the physical click -- when the control already matches the desired
-    state, or after a native checkbox/radio is set here -- or None to fall through to a single
-    ordinary click when the live state is unreadable (fail open) or a custom control must be clicked
-    once to change. Never converts an explicit desired_state=False into a check."""
+    state, or after a native checkbox/radio is set here. It returns an ActionFailure when a checked
+    radio cannot satisfy desired_state=False or a native set cannot be verified safely; otherwise it
+    returns None to fall through to a single ordinary click when the live state is unreadable (fail
+    open) or a custom control must be clicked once to change. Never converts an explicit
+    desired_state=False into a check."""
+    element_type: str | None = None
     if element.get_tag_name() == "label":
         return await _apply_label_desired_click_state(action, element, desired_state, dom)
-    if element.get_tag_name() == "input" and await _input_type_or_none(element) == "checkbox":
+    if element.get_tag_name() == "input":
+        element_type = await _input_type_or_none(element)
+    if element_type == "checkbox":
         return await _apply_checkbox_desired_click_state(action, element, desired_state)
-    live_state = await _resolve_live_selected_state(element)
-    if live_state is None:
+    state = await _resolve_live_click_state(element)
+    if state.checked is None:
         LOG.info("No readable selected state, continuing the normal click", action=action)
         return None
-    if live_state == desired_state:
+    if state.checked == desired_state:
         LOG.info(
             "Control already in the desired state, suppressing the redundant click",
             action=action,
             desired_state=desired_state,
         )
-        return [ActionAbort()]
+        return [ActionAbort(desired_state_reached=True)]
     if element.get_tag_name() == "input":
         # Only a native radio reaches here (checkbox is handled above; a non-toggle input has no
-        # readable state and already fell open), and a radio can't be turned off by clicking it -- only
-        # selecting another radio in the group clears it -- so skip the doomed uncheck() on desired=False.
-        if not desired_state:
-            LOG.info("A radio can't be unchecked in place, continuing with a single normal click", action=action)
-            return None
+        # readable state and already fell open). The guard below rejects a checked radio requested
+        # to be unchecked.
+        if _is_impossible_radio_uncheck(desired_state, state):
+            LOG.info("A radio can't be unchecked in place, failing the action", action=action)
+            return [_radio_uncheck_failure(action)]
         LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
-        if await _set_native_checkbox_state(element, should_check=desired_state):
-            return [ActionAbort()]
+        set_outcome = await _set_native_checkbox_state(element, should_check=desired_state)
+        if set_outcome is NativeSetOutcome.VERIFIED:
+            return [ActionAbort(desired_state_reached=True)]
+        if set_outcome is NativeSetOutcome.UNKNOWN:
+            return [_unverified_native_set_failure(action)]
         LOG.warning("Failed to set the native control to the desired state, continuing the normal click", action=action)
         return None
     LOG.info(
@@ -6866,8 +7046,10 @@ _UI_SELECT_STATE_JS = """
   const owned = (n) => n.closest('.ui-select-container') === container;
   const rows = [...container.querySelectorAll('.ui-select-choices-row')].filter((r) => owned(r) && r.getClientRects().length > 0);
   const isDisabled = (r) => r.hasAttribute('disabled') || r.classList.contains('disabled') || r.classList.contains('select2-disabled') || (r.hasAttribute('aria-disabled') && (r.getAttribute('aria-disabled') || '').trim().toLowerCase() !== 'false');
-  const matches = [...container.querySelectorAll('.ui-select-match-text, .select2-chosen, .ui-select-match-item, .ui-select-match')].filter((m) => owned(m) && m.getClientRects().length > 0).slice(0, 20).map((m) => (m.textContent || '').trim());
-  return { enabledRowCount: rows.filter((r) => !isDisabled(r)).length, firstVisibleEnabled: rows.length > 0 && !isDisabled(rows[0]), firstVisibleLabel: rows.length > 0 ? (rows[0].textContent || '').trim() : '', choicesOpen: rows.length > 0 || [...container.querySelectorAll('.ui-select-choices')].some((c) => owned(c) && c.getClientRects().length > 0), matchTexts: matches, searchValue: typeof el.value === 'string' ? el.value : '' };
+  const ownedMatches = [...container.querySelectorAll('.ui-select-match-text, .select2-chosen, .ui-select-match-item, .ui-select-match')].filter((m) => owned(m));
+  const matches = ownedMatches.filter((m) => m.getClientRects().length > 0).slice(0, 20).map((m) => (m.textContent || '').trim());
+  const latentMatches = ownedMatches.map((m) => (m.textContent || '').trim());
+  return { enabledRowCount: rows.filter((r) => !isDisabled(r)).length, firstVisibleEnabled: rows.length > 0 && !isDisabled(rows[0]), firstVisibleLabel: rows.length > 0 ? (rows[0].textContent || '').trim() : '', choicesOpen: rows.length > 0 || [...container.querySelectorAll('.ui-select-choices')].some((c) => owned(c) && c.getClientRects().length > 0), matchTexts: matches, latentMatchTexts: latentMatches, searchValue: typeof el.value === 'string' ? el.value : '' };
 }
 """
 
@@ -6879,21 +7061,31 @@ def _ui_select_commit_result(
     candidate: str,
     text: str,
 ) -> ActionResult | None:
-    """Adjudicate a ui-select Enter from the same-owner post-settle state: ``ActionSuccess`` (with evidence) only
-    on a proven commit (choices closed + search emptied + a match display for the candidate); ``None`` on a proven
-    clean no-op (byte-identical to pre-Enter) → fall through; else ``NoAvailableOptionFoundForCustomSelection``."""
+    """On a commit-shaped close (choices closed + search emptied) return ``ActionSuccess`` when a visible owner match
+    equals the candidate label (arm 1) or is genuinely new versus the pre-Enter latent baseline (arm 2); return
+    ``None`` on a byte-identical clean no-op, else ``NoAvailableOptionFoundForCustomSelection``."""
     if isinstance(post, dict) and not post.get("choicesOpen") and post.get("searchValue") == "":
+
+        def _accept(observed: object) -> ActionResult:
+            result = ActionSuccess(
+                committed_option=_truncate_select_shadow_field(candidate),
+                committed_value=_truncate_select_shadow_field(str(observed)),
+            )
+            action.set_has_mini_agent()
+            if action.stop_batch_after_dropdown_select:
+                result.skip_remaining_actions = True
+            return result
+
+        observed_matches = post.get("matchTexts") or []
         normalized_candidate = _normalize_select_shadow_text(candidate)
-        for observed in post.get("matchTexts") or []:
+        for observed in observed_matches:
             if normalized_candidate and _normalize_select_shadow_text(observed) == normalized_candidate:
-                result = ActionSuccess(
-                    committed_option=_truncate_select_shadow_field(candidate),
-                    committed_value=_truncate_select_shadow_field(str(observed)),
-                )
-                action.set_has_mini_agent()
-                if action.stop_batch_after_dropdown_select:
-                    result.skip_remaining_actions = True
-                return result
+                return _accept(observed)
+        latent = {_normalize_select_shadow_text(baseline) for baseline in (pre.get("latentMatchTexts") or [])}
+        for observed in observed_matches:
+            normalized_observed = _normalize_select_shadow_text(observed)
+            if normalized_observed and normalized_observed not in latent:
+                return _accept(observed)
     if (
         isinstance(post, dict)
         and post.get("choicesOpen")
@@ -6976,12 +7168,7 @@ def _emit_tel_input_outcome(
     try:
         with contained_effect("emit tel input outcome"):
             final_result = results[-1] if results else None
-            if isinstance(final_result, ActionSuccess):
-                terminal_result = ActionStatus.completed.value
-            elif isinstance(final_result, ActionAbort):
-                terminal_result = ActionStatus.skipped.value
-            else:
-                terminal_result = ActionStatus.failed.value
+            terminal_result = _terminal_action_status(results).value
             if exception_type is None and final_result is not None:
                 exception_type = final_result.exception_type
             LOG.info(

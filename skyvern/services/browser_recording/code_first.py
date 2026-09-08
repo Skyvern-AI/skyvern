@@ -24,6 +24,7 @@ from skyvern.services.browser_recording.types import (
     ActionClick,
     ActionHover,
     ActionInputText,
+    ActionPressKey,
     ActionUrlChange,
     ActionWait,
     RecordingDraftStep,
@@ -119,7 +120,7 @@ def segment_actions(pairs: list[ActionDraftPair]) -> list[RecordingSegment]:
                 segments[-1].source_url = url
             continue
 
-        if isinstance(action, (ActionClick, ActionInputText)):
+        if isinstance(action, (ActionClick, ActionInputText, ActionPressKey)):
             last_interactive_end = action.timestamp_end
 
         segments[-1].pairs.append((action, draft))
@@ -153,6 +154,10 @@ def _interaction_for_action(action: Action) -> dict[str, t.Any] | None:
         if (target.input_type or "").lower() != "password":
             interaction["typed_value"] = action.input_value
         return interaction
+    if isinstance(action, ActionPressKey):
+        # Not in _REQUIRED_LOCATOR_TOOLS: an unlocatable press falls back to
+        # page.keyboard.press, which is still deterministic replay.
+        return {"tool_name": "press_key", "key": action.key, **base}
     if isinstance(action, ActionWait):
         return {"tool_name": "wait", "duration_ms": action.duration_ms}
     return None

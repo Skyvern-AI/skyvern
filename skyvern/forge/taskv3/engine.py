@@ -2,7 +2,7 @@
 
 This is the platform-agnostic core of the native (non-Bun) engine. Given a page provider
 (resolved fresh on every tool call, not a page bound once) and an ``LLMCaller``, it runs
-one persistent conversation that perceives via ``observe`` and acts by selector until the
+one persistent conversation that perceives via ``observe`` and acts by ref until the
 model calls ``finish``. Callers (the run/step dispatch) own browser acquisition, the
 concrete LLMCaller, and mapping the returned ``LoopOutcome`` onto the task's status/output.
 
@@ -32,6 +32,8 @@ from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.taskv3.goal_composition import build_user_prompt
+from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
@@ -86,14 +88,14 @@ PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have
 SYSTEM_PROMPT = """You are an autonomous web agent completing a browser task. You drive the browser ONLY through the provided tools; nothing about the page is shown to you unless you call a tool.
 
 How to work:
-- Perceive with `observe`: it returns the page's visible interactive elements, each with a CSS selector, label, type, current value, and (for selects) options. Call it once per page state and act from that snapshot; re-observe only after the page changes.
-- Act by CSS selector: `type`, `select_option`, `select_combobox`, `click`, `press_key`, `scroll`, `wait`, `navigate`, `file_upload`.
+- Perceive with `observe`: it returns the page's visible interactive elements, each line starting with its address `ref=N`, then a label, type, current value, and (for selects) options. Call it once per page state and act from that snapshot; re-observe only after the page changes.
+- Act by ref: pass the printed `ref=N` exactly as printed as the `selector` argument of `type`, `select_option`, `select_combobox`, `click`, `hover`, `press_key`, `scroll`, `wait`, `file_upload`, `get_html`. A real CSS selector is still accepted, for the rare element only `get_html` revealed.
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
 - Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys yourself. If `select_combobox` returns an error, the field is genuinely unfilled — try a fuller value or report it; never treat it as done.
-- `observe` already gives you everything you need to fill a field (selector, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER call it twice for the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is.
+- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER call it twice for the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
-- Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its selectors before doing anything else.
+- Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its refs before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
 
 Rules:
@@ -158,53 +160,6 @@ def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | 
             return None
         return value if isinstance(value, dict) else {"task_data": value}
     return {"task_data": navigation_payload}
-
-
-def _build_user_prompt(goal: str, parameters: dict[str, Any] | None, starting_url: str | None) -> str:
-    parts = [goal.strip()]
-    if starting_url:
-        parts.append(f"\nYou start on: {starting_url}")
-    if parameters:
-        parts.append("\nData provided for this task:\n" + json.dumps(parameters, indent=2, default=str))
-    return "\n".join(parts)
-
-
-def _build_call_kwargs(step: Any, llm_caller: Any) -> dict[str, Any] | None:
-    # Asking here rather than only letting the LLM layer drop it keeps the run's own telemetry
-    # honest: a run that reports tool_choice in effect has to have actually sent it.
-    call_kwargs: dict[str, Any] = {}
-    if step is not None:
-        call_kwargs["step"] = step
-    if settings.TASK_V3_TOOL_CHOICE_REQUIRED and llm_caller.supports_tool_choice():
-        call_kwargs["tool_choice"] = "required"
-    reasoning_with_summary = _reasoning_effort_with_summary(llm_caller)
-    if reasoning_with_summary is not None:
-        call_kwargs["reasoning_effort"] = reasoning_with_summary
-    return call_kwargs or None
-
-
-def _reasoning_effort_with_summary(llm_caller: Any) -> dict[str, str] | None:
-    """A call-level reasoning_effort override that adds a summary request, for Task V3 loop calls
-    only: `{"effort": <the effort the config would otherwise send>, "summary": "auto"}`. Passed as
-    an LLMCaller.call() kwarg, which is applied after (and so wins over) the config-derived
-    parameters -- this never changes how hard the model reasons, only whether litellm's
-    chat->responses bridge joins a readable summary into message.reasoning_content.
-
-    Only gpt-5.6 models routed through that bridge accept the dict form; a plain dict sent to any
-    other model 400s ("Unknown parameter: 'reasoning'" observed), so this is gated to those models
-    and returns None otherwise -- surfacing the provider's reasoning summary where available, since
-    a continuation turn's tool call often carries empty message.content and no summary either.
-    """
-    llm_config = getattr(llm_caller, "llm_config", None)
-    if llm_config is None:
-        return None
-    effort = getattr(llm_config, "reasoning_effort", None)
-    # The caller-level check also covers the raw-client dispatch branches (custom/BYO models),
-    # which never bridge regardless of the model's name.
-    bridge_check = getattr(llm_caller, "uses_openai_responses_bridge", None)
-    if effort is None or bridge_check is None or not bridge_check():
-        return None
-    return {"effort": effort, "summary": "auto"}
 
 
 async def run_task_v3_agent_loop(
@@ -355,7 +310,7 @@ async def run_task_v3_agent_loop(
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
+            user_prompt=build_user_prompt(goal, refs.masked, starting_url),
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
@@ -363,7 +318,7 @@ async def run_task_v3_agent_loop(
             max_action_steps_ceiling=max_action_steps_ceiling,
             prompt_name=prompt_name,
             organization_id=organization_id,
-            call_kwargs=_build_call_kwargs(step, llm_caller),
+            call_kwargs=build_call_kwargs(step, llm_caller),
             should_cancel=should_cancel,
             on_action_round=on_action_round,
             on_pre_action=on_pre_action,

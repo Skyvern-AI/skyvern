@@ -54,7 +54,7 @@ SCOUT_INTERACTION_EVIDENCE_TOOL = "scout_interaction"
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
-_MAX_RESULT_CONTAINERS = 8
+MAX_RESULT_CONTAINERS = 8
 # The cap _schema_text applies to a relation's value; at it, the text is a prefix, not the value.
 _MAX_RELATION_VALUE_CHARS = 240
 _MAX_KEY_VALUE_RELATIONS = 24
@@ -3336,7 +3336,7 @@ def parse_composition_html(
         class_text = " ".join(class_value) if isinstance(class_value, list) else str(class_value)
         result_identity = f"{node_id} {class_text}".lower()
         if tag_name == "table" or any(hint in result_identity for hint in _RESULT_CONTAINER_HINTS):
-            if len(result_containers) >= _MAX_RESULT_CONTAINERS:
+            if len(result_containers) >= MAX_RESULT_CONTAINERS:
                 result_containers_truncated = True
                 break
             result_containers.append(_result_container_entry(node, soup=soup))
@@ -3665,7 +3665,7 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return containers
     for node in value:
-        if len(containers) >= _MAX_RESULT_CONTAINERS:
+        if len(containers) >= MAX_RESULT_CONTAINERS:
             break
         if not isinstance(node, dict):
             continue

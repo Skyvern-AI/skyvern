@@ -42,6 +42,12 @@ class BrowserOperation:
         return self.retirement.reason
 
 
+@dataclass(frozen=True)
+class BrowserSessionExtension:
+    session: PersistentBrowserSession
+    granted_minutes: int
+
+
 class PersistentSessionsManager(Protocol):
     """Protocol defining the interface for persistent browser session management."""
 
@@ -207,6 +213,16 @@ class PersistentSessionsManager(Protocol):
         self, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
     ) -> PersistentBrowserSession:
         """Renew a session or close it if renewal fails."""
+        ...
+
+    async def extend_session(
+        self, session_id: str, organization_id: str, additional_minutes: int
+    ) -> BrowserSessionExtension:
+        """Grant a live session more lifetime, clamped to what remains under the maximum extended lifetime.
+
+        Raises BrowserSessionNotExtendable when the session has ended, is about to expire, is already at
+        the maximum lifetime, or runs on infrastructure whose deadline is fixed at creation.
+        """
         ...
 
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:

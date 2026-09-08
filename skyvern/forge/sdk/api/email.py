@@ -1,9 +1,10 @@
 import asyncio
+import re
 import smtplib
 from email.message import EmailMessage
 
 import structlog
-from email_validator import EmailNotValidError, validate_email
+from email_validator import EmailNotValidError, EmailSyntaxError, EmailUndeliverableError, validate_email
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
@@ -11,6 +12,31 @@ LOG = structlog.get_logger()
 
 # Per-op socket timeout so the executor thread cannot linger past an outer asyncio cancel.
 _SMTP_SOCKET_TIMEOUT_SECONDS = 10
+
+# The workflow editor only splits a comma-separated Recipients field client-side, so a workflow
+# parameter substituted into that field arrives at runtime as one comma- or semicolon-joined entry.
+_RECIPIENT_SEPARATORS = re.compile(r"[,;]")
+
+
+class InvalidEmailRecipient(ValueError):
+    def __init__(self, position: int, total: int, reason: str) -> None:
+        super().__init__(position, total, reason)
+        self.position = position
+        self.total = total
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return f"recipient {self.position} of {self.total} {self.reason}"
+
+
+def _rejection_reason(ex: EmailNotValidError) -> str:
+    # The validator's own message embeds the domain or fragments of the address, so only the
+    # failure class reaches failure_reason and logs.
+    if isinstance(ex, EmailUndeliverableError):
+        return "has a domain that does not accept email"
+    if isinstance(ex, EmailSyntaxError):
+        return "is not a well-formed email address"
+    return "is not a valid email address"
 
 
 def _send_blocking(
@@ -65,15 +91,23 @@ async def _send(*, message: EmailMessage) -> bool:
     return True
 
 
+def normalize_recipients(recipients: list[str]) -> list[str]:
+    return [
+        address
+        for entry in recipients
+        for address in (part.strip() for part in _RECIPIENT_SEPARATORS.split(entry))
+        if address
+    ]
+
+
 def validate_recipients(recipients: list[str]) -> None:
     if not recipients:
         raise ValueError("recipient list cannot be empty")
-    for recipient in recipients:
+    for position, recipient in enumerate(recipients, start=1):
         try:
             validate_email(recipient)
         except EmailNotValidError as ex:
-            # Do not echo the address; callers log downstream and we avoid PII leakage.
-            raise ValueError("invalid email address") from ex
+            raise InvalidEmailRecipient(position, len(recipients), _rejection_reason(ex)) from None
 
 
 async def build_message(
@@ -101,6 +135,7 @@ async def send(
     recipients: list[str],
     body: str | None = None,
 ) -> bool:
+    recipients = normalize_recipients(recipients)
     validate_recipients(recipients)
 
     message = await build_message(

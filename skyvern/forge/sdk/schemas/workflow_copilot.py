@@ -58,11 +58,17 @@ class WorkflowCopilotChat(BaseModel):
     pending_turns: dict[str, CopilotPendingTurn] = Field(
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
 
     @field_validator("pending_turns", mode="before")
     @classmethod
     def _default_pending_turns(cls, value: dict[str, Any] | None) -> dict[str, Any]:
         return value or {}
+
+    @field_validator("work_plan", mode="before")
+    @classmethod
+    def _default_work_plan(cls, value: list[str] | None) -> list[str]:
+        return value or []
 
     created_at: datetime = Field(..., description="When the chat was created")
     modified_at: datetime = Field(..., description="When the chat was last modified")
@@ -280,6 +286,7 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
 
 
 class WorkflowCopilotChatSummary(BaseModel):
@@ -377,6 +384,13 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     narrative_payload: TurnNarrativePayload | None = Field(
         None,
         description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
+    )
+    work_plan: list[str] | None = Field(
+        None,
+        description=(
+            "Latest work plan the copilot model wrote, as of this turn's end. An empty list means the "
+            "model cleared it; None means this frame carries no snapshot and clients keep what they have."
+        ),
     )
 
 

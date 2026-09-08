@@ -1626,7 +1626,24 @@ class BrowserSessionOwnershipConflict(SkyvernHTTPException):
 
 class BrowserSessionNotRenewable(SkyvernException):
     def __init__(self, reason: str, browser_session_id: str) -> None:
+        self.reason = reason
+        self.browser_session_id = browser_session_id
         super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
+
+
+class BrowserSessionNotExtendable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        self.reason = reason
+        self.browser_session_id = browser_session_id
+        super().__init__(f"Browser session {browser_session_id} cannot be extended: {reason}")
+
+
+class BrowserSessionExtensionUnconfirmed(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        self.browser_session_id = browser_session_id
+        super().__init__(
+            f"Browser session {browser_session_id} was signalled to extend, but its new budget could not be confirmed."
+        )
 
 
 class MissingBrowserAddressError(SkyvernException):

@@ -148,6 +148,12 @@ class StateMachineInputText(StateMachine):
         return action
 
     def on_action(self, action: Action, current_actions: list[Action]) -> bool:
+        if action.kind == ActionKind.PRESS_KEY:
+            # A keypress during a fill (Escape to dismiss a dropdown, Ctrl+V to paste) is part of
+            # filling the field, not the end of it; resetting here would discard the whole fill.
+            # Enter is unaffected: emit() has already reset by the time this runs.
+            return True
+
         if action.kind == ActionKind.CLICK:
             # NOTE(jdo): skipping self.reset here; a focus event on an element can often be followed by a
             # click event, and the identity doesn't always match due to nesting. I think a more precise

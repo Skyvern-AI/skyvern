@@ -42,6 +42,7 @@ _SENSITIVE_ENDPOINTS = {
     "PUT /api/v1/google/oauth/config",
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
+    "POST /v1/recipes/jobs/apply",
     # Copilot messages may contain credentials before the route's semantic
     # safety screen runs. The request audit keeps endpoint metadata while the
     # body stays opaque; the route persists only its canonical redacted form.

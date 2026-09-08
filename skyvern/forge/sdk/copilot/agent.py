@@ -200,7 +200,6 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
-from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -231,6 +230,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_budget_expiry,
     with_copilot_code_mode_diagnostics,
 )
+from skyvern.forge.sdk.copilot.work_plan import hydrate_work_plan, work_plan_prompt
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     redact_credentials_in_workflow_yaml,
     runner_code_block_associations,
@@ -1251,7 +1251,7 @@ def _build_dynamic_system_prompt(
             + (_runtime_verification_evidence_prompt(ctx) if include_runtime_verification_evidence else "")
             + (_recorded_build_test_outcome_prompt(ctx) if include_recorded_build_test_outcome else "")
             + _code_authoring_repair_context_prompt(ctx)
-            + todo_list_prompt(ctx)
+            + work_plan_prompt(ctx.work_plan)
         )
         if config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
             dynamic_context = f"{dynamic_context}\n\n{_render_code_only_browser_authoring_prompt()}"
@@ -1466,11 +1466,22 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             )
 
         failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
+        if not failure_summary.endswith("..."):
+            failure_summary = failure_summary.rstrip(".")
+        contract = ctx.latest_diagnosis_repair_contract
+        recorded_run = f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}."
+        if contract is not None and (contract.challenge is not None or contract.levers):
+            # The packet carried the wall's effects and levers, so the model's own reply names what
+            # the product can do; the harness only keeps the recorded-run sentence in front of it,
+            # which states the failure before anything the model wrote. Judging that prose for
+            # contradictions is the model's jurisdiction and the eval's bar, not a harness matcher.
+            model_reply = user_response.strip()
+            if model_reply:
+                return f"{recorded_run} {model_reply}".rstrip() + keep_draft_affordance
+            follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
+            return f"{recorded_run}{follow_up}{keep_draft_affordance}"
         follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
-        return (
-            f"I created {draft_phrase} and tested it, but the test failed. "
-            f"Failure: {failure_summary}.{follow_up}{keep_draft_affordance}"
-        )
+        return f"{recorded_run}{follow_up}{keep_draft_affordance}"
 
     if ctx.last_test_ok is None and block_count is not None and ctx.last_workflow is not None:
         if policy is not None and policy.raw_secret_handling == "redacted_draft":
@@ -1897,6 +1908,7 @@ def _make_agent_result(
     if ctx is not None:
         result.resolved_model = ctx.resolved_model
         result.clear_persisted_completion_contract = ctx.clear_persisted_completion_contract
+        result.work_plan = ctx.work_plan if ctx.work_plan is None else list(ctx.work_plan)
         if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION:
             result.browser_ablation_metadata = {
                 "eval_mode": CopilotEvalMode.BROWSER_ABLATION.value,
@@ -2529,6 +2541,7 @@ def _verified_terminal_preserve_result(
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         clear_proposed_workflow=False,
+        authoring_barred=result.authoring_barred,
         total_tokens=result.total_tokens,
         cancelled=result.cancelled,
         proposal_disposition="review_tested",
@@ -2660,7 +2673,8 @@ def _finalize_result_with_blocker_override(
         response_type=rendered_resp_type,
         workflow_yaml=preserved_workflow_yaml if preserve_draft else None,
         workflow_was_persisted=result.workflow_was_persisted,
-        clear_proposed_workflow=not preserve_draft,
+        clear_proposed_workflow=not preserve_draft and not result.authoring_barred,
+        authoring_barred=result.authoring_barred,
         total_tokens=result.total_tokens,
         cancelled=result.cancelled,
         proposal_disposition="review_untested" if preserved_proposal else "no_proposal",
@@ -4209,7 +4223,11 @@ def _build_request_policy_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=(not outcome_fully_verified(ctx)),
+            # A turn barred from authoring has no standing to retire the proposal it never saw.
+            # Only a safety block clears allow_update_workflow; wiring a non-safety reason into
+            # it would silently start preserving proposals for the wrong reason.
+            clear_proposed_workflow=(policy.allow_update_workflow and not outcome_fully_verified(ctx)),
+            authoring_barred=not policy.allow_update_workflow,
             proposal_disposition="no_proposal",
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
@@ -4957,6 +4975,7 @@ async def _run_copilot_turn_impl(
         },
     )
     await restore_pending_workflow_proposal(ctx)
+    await hydrate_work_plan(ctx)
     chat_request.workflow_yaml = ctx.workflow_yaml
     safe_workflow_yaml = redact_raw_secrets_for_prompt(ctx.workflow_yaml or "")
     # Before the turn acts: a repair opened about a failed run inherits that run's identity and the

@@ -373,6 +373,9 @@ class AgentContext:
     stream: EventSourceStream
     persisted_workflow_yaml: str | None = None
     api_key: str | None = None
+    # The model's own plan for this chat, written and replaced only by set_work_plan. None until
+    # hydration runs, which is how an error-path context stays distinguishable from a cleared plan.
+    work_plan: list[str] | None = None
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None

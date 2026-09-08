@@ -24,12 +24,14 @@ import binascii
 import errno
 import hashlib
 import inspect
+import io
 import os
 import re
 import stat
 import threading
 import time
 import uuid
+import zipfile
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
@@ -308,6 +310,36 @@ def redacted_exception_origin(error: BaseException) -> str:
     return f"{module if isinstance(module, str) else code.co_filename}:{code.co_name}:{traceback.tb_lineno}"
 
 
+def _redacted_request_origin(url: str) -> str:
+    """Reduce a request URL to ``scheme://host`` for logging.
+
+    authRequired events carry the full request URL, which on the download path can be a signed
+    URL whose query and userinfo are credentials. Uses ``hostname`` (not ``netloc``) so any
+    ``user:pass@`` userinfo and the port are dropped along with the path, query, and fragment.
+    Never raises: a non-string (e.g. a null ``url``), malformed URL, or bad port yields a
+    placeholder rather than an exception, since callers rely on this for failure attribution.
+    """
+    if not isinstance(url, str):
+        # ``urlparse`` raises TypeError/AttributeError on non-strings, which ``except ValueError``
+        # below would not catch; a malformed CDP event can carry a non-string ``request.url``.
+        return "<non-string>"
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme
+        host = parsed.hostname
+    except ValueError:
+        return "<unparseable>"
+    if host and ":" in host:
+        # ``hostname`` strips the brackets from an IPv6 literal; restore them so the origin is
+        # a valid, unambiguous ``scheme://[addr]`` rather than ``scheme://addr:with:colons``.
+        host = f"[{host}]"
+    if scheme and host:
+        return f"{scheme}://{host}"
+    if host:
+        return host
+    return "<unknown>"
+
+
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
     """Convert CDP header list [{name, value}] to a lowercase-keyed dict (last value wins)."""
     result: dict[str, str] = {}
@@ -463,6 +495,91 @@ def _payload_is_html_login_masquerade(data: bytes, content_type: str, filename: 
     # saving the HTML is honest, not corrupt.
     normalized_ct = _normalized_content_type(content_type)
     return bool(normalized_ct) and "html" not in normalized_ct
+
+
+# Signatures / container structure that identify each validated download type. A body lacking them
+# cannot be that type, so saving it under the claimed name yields an unopenable "successful" file.
+_PDF_HEADER = b"%PDF-"
+_UTF8_BOM = b"\xef\xbb\xbf"
+_OLE_COMPOUND_FILE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # legacy Excel .xls and other OLE docs
+
+# Exactly one canonical format per download; the filename extension wins over Content-Type. Only
+# these formats are validated. CSV is deliberately absent: it has no reliable signature, so
+# validating it would risk false positives on legitimate downloads.
+_DOWNLOAD_FORMAT_BY_EXTENSION = {".pdf": "pdf", ".xlsx": "xlsx", ".xls": "xls", ".zip": "zip"}
+_DOWNLOAD_FORMAT_BY_CONTENT_TYPE = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-excel": "xls",
+    "application/zip": "zip",
+    "application/x-zip-compressed": "zip",
+}
+
+
+def _looks_like_pdf(data: bytes) -> bool:
+    """True when the ``%PDF-`` header is at the start, after an optional single UTF-8 BOM.
+
+    Anchored rather than a substring scan, so an HTML or JSON error page that merely mentions the
+    marker is rejected. Mirrors skyvern/webeye/actions/handler.py ``_looks_like_pdf``.
+    """
+    header = data[len(_UTF8_BOM) :] if data[: len(_UTF8_BOM)] == _UTF8_BOM else data
+    return header[: len(_PDF_HEADER)] == _PDF_HEADER
+
+
+def _is_valid_zip(data: bytes) -> bool:
+    """True when the bytes are a structurally valid ZIP archive (including an empty archive)."""
+    return zipfile.is_zipfile(io.BytesIO(data))
+
+
+def _is_valid_xlsx(data: bytes) -> bool:
+    """True when the bytes are a ZIP whose central directory holds the OOXML spreadsheet core parts."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = set(archive.namelist())
+    except (zipfile.BadZipFile, OSError, ValueError, NotImplementedError):
+        # Parsing untrusted bytes fails closed to "not XLSX" rather than escaping the download guard:
+        # BadZipFile (bad structure), OSError (I/O), ValueError (covers UnicodeDecodeError from a
+        # UTF-8-flagged non-UTF-8 entry name), NotImplementedError (out-of-range extract_version).
+        return False
+    return "[Content_Types].xml" in names and "xl/workbook.xml" in names
+
+
+_DOWNLOAD_FORMAT_VALIDATORS: dict[str, Callable[[bytes], bool]] = {
+    "pdf": _looks_like_pdf,
+    "xls": lambda data: data.startswith(_OLE_COMPOUND_FILE_MAGIC),
+    "zip": _is_valid_zip,
+    "xlsx": _is_valid_xlsx,
+}
+
+
+def _claimed_download_format(content_type: str, filename: str) -> str | None:
+    """The single validated format a download claims. A filename extension is authoritative: when
+    present it names the type by itself, so a non-validated extension such as ``.csv`` is never
+    revalidated via Content-Type (e.g. a CSV served as ``application/vnd.ms-excel`` must not be
+    checked as XLS). Content-Type is consulted only for a nameless/extensionless download. Returns
+    None when nothing recognized is claimed."""
+    suffix = Path(filename).suffix.lower()
+    if suffix:
+        return _DOWNLOAD_FORMAT_BY_EXTENSION.get(suffix)
+    return _DOWNLOAD_FORMAT_BY_CONTENT_TYPE.get(_normalized_content_type(content_type))
+
+
+def _payload_contradicts_claimed_type(data: bytes, content_type: str, filename: str) -> bool:
+    """True when a download's bytes cannot be the type it claims to be.
+
+    Catches masquerades that would otherwise be written as a "successful" but unopenable file: an
+    HTML session-gate page returned for a binary download, and a body whose bytes fail the signature
+    or container structure of the type it names (PDF, XLSX, legacy XLS, or ZIP; e.g. a JSON error
+    envelope answered HTTP 200 under a ``.pdf``). A payload that claims no recognized type, or whose
+    bytes satisfy the claim, is left untouched so ordinary downloads and honestly-typed files are
+    unaffected. CSV is intentionally not validated (no reliable signature).
+    """
+    if _payload_is_html_login_masquerade(data, content_type, filename):
+        return True
+    fmt = _claimed_download_format(content_type, filename)
+    if fmt is None:
+        return False
+    return not _DOWNLOAD_FORMAT_VALIDATORS[fmt](data)
 
 
 def normalize_download_filename(filename: str, content_type: str = "") -> str:
@@ -845,6 +962,49 @@ class CDPDownloadInterceptor:
         self._run_download_file_count -= 1
         return True
 
+    def _existing_file_is_identical(self, save_path: Path, data: bytes | bytearray) -> bool:
+        """True when ``save_path`` is a single-link regular file inside the pinned directory whose size and bytes both match ``data``.
+
+        Opened O_NOFOLLOW; a symlink, hard link, or size mismatch is rejected before any content read, and
+        the read is bounded to ``len(data)`` so an oversized collision can't bypass the size limit —
+        matching the confinement ``_publish_confined_temporary_file`` enforces.
+        """
+        expected_identity = self._download_directory_identities.get(save_path.parent)
+        if expected_identity is None:
+            return False
+        try:
+            directory_fd = self._open_download_directory(save_path.parent)
+        except OSError:
+            return False
+        try:
+            directory_stat = os.fstat(directory_fd)
+            if (directory_stat.st_dev, directory_stat.st_ino) != expected_identity:
+                return False
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            file_descriptor = os.open(save_path.name, flags, dir_fd=directory_fd)
+            try:
+                existing = os.fdopen(file_descriptor, "rb")
+            except BaseException:
+                os.close(file_descriptor)
+                raise
+            with existing:
+                existing_stat = os.fstat(existing.fileno())
+                if (
+                    not stat.S_ISREG(existing_stat.st_mode)
+                    or existing_stat.st_nlink != 1
+                    or existing_stat.st_size != len(data)
+                ):
+                    return False
+                return existing.read(len(data)) == bytes(data)
+        except OSError:
+            return False
+        finally:
+            os.close(directory_fd)
+
+    def _discard_duplicate_download(self, attempt: _DownloadAttempt) -> None:
+        """Release the duplicate's file slot with no capture failure; its bytes stay charged to the run budget so identical replays still hit MAX_RUN_DOWNLOAD_BYTES."""
+        self._release_download_file_slot(attempt)
+
     def publish_download_bytes(
         self,
         data: bytes | bytearray,
@@ -861,6 +1021,15 @@ class CDPDownloadInterceptor:
             return None
         try:
             save_path, _ = self._resolve_save_path(suggested_filename, content_type)
+            scope_active = self._artifact_scope_is_active(self._artifact_scope_generation)
+            if scope_active and self._existing_file_is_identical(save_path, data):
+                self._discard_duplicate_download(attempt)
+                LOG.info(
+                    "CDP download deduplicated; identical file already saved",
+                    save_path_fp=diagnostic_fingerprint(str(save_path)),
+                    size=len(data),
+                )
+                return save_path
             self._atomically_write_bytes(save_path, data, self._artifact_scope_generation)
         except (OSError, ValueError, _DownloadScopeInvalidated):
             self._record_download_failure(attempt, "capture_failed")
@@ -1048,7 +1217,7 @@ class CDPDownloadInterceptor:
         # TODO: implement proper filename dedup (e.g., content hash or UUID suffix)
         if save_path.exists():
             LOG.warning(
-                "Download filename collision; write will fail closed",
+                "Download filename collision detected; caller will deduplicate or fail closed",
                 filename_fp=diagnostic_fingerprint(filename),
                 save_path_fp=diagnostic_fingerprint(str(save_path)),
             )
@@ -1733,21 +1902,35 @@ class CDPDownloadInterceptor:
             return
 
         normalized_filename = normalize_download_filename(response_filename, content_type)
-        if _payload_is_html_login_masquerade(data, content_type, normalized_filename):
+        if _payload_contradicts_claimed_type(data, content_type, normalized_filename):
             # A browser-context fetch preserves same-origin session/request state; retain the
-            # masquerade guard if recovery is unavailable or returns HTML.
+            # guard if recovery is unavailable or also contradicts the claimed type.
             if artifact_scope_generation is None:
                 artifact_scope_generation = self._artifact_scope_generation
-            recovered = await self._fetch_download_bytes_in_page(url, recovery_allowance_bytes=remaining_run_bytes)
+            recovered = await self._fetch_download_bytes_in_page(
+                url, content_type, normalized_filename, recovery_allowance_bytes=remaining_run_bytes
+            )
             if not self._artifact_scope_is_active(artifact_scope_generation):
                 return
-            if recovered is not None and not _body_starts_with_html(recovered):
+            if recovered is not None and not _payload_contradicts_claimed_type(
+                recovered, content_type, normalized_filename
+            ):
                 # The masquerade bytes were reserved above; release them before reserving the real
                 # payload so this attempt is charged against the run-size budget only once.
                 self._run_download_bytes -= len(data)
                 if not self._reserve_download_bytes(attempt, len(recovered)):
                     return
                 save_path, filename = self._resolve_save_path(suggested_filename)
+                if self._existing_file_is_identical(save_path, recovered):
+                    self._discard_duplicate_download(attempt)
+                    LOG.info(
+                        "CDP download deduplicated; identical file already saved",
+                        filename_fp=diagnostic_fingerprint(filename),
+                        size=len(recovered),
+                        save_path_fp=diagnostic_fingerprint(str(save_path)),
+                        download_index=self._download_index,
+                    )
+                    return
                 self._atomically_write_bytes(save_path, recovered, artifact_scope_generation)
                 LOG.info(
                     "CDP download saved (in-page same-origin fetch)",
@@ -1760,19 +1943,33 @@ class CDPDownloadInterceptor:
                 self._record_download_saved(attempt)
                 return
             LOG.error(
-                "Direct download returned an HTML page for a non-HTML file; not saving "
-                "(likely an unauthenticated fetch landing on a login/session-gate page)",
+                "Direct download payload does not match its claimed type; not saving "
+                "(an error page or session-gate response returned in place of the file)",
                 suggested_filename_fp=diagnostic_fingerprint(normalized_filename),
                 content_type=content_type,
+                claimed_format=_claimed_download_format(content_type, normalized_filename),
+                is_html_masquerade=_payload_is_html_login_masquerade(data, content_type, normalized_filename),
                 size=len(data),
             )
             self._record_download_failure(attempt, "capture_failed")
             return
 
         save_path, filename = self._resolve_save_path(response_filename, content_type)
-
         if artifact_scope_generation is None:
             artifact_scope_generation = self._artifact_scope_generation
+
+        scope_active = self._artifact_scope_is_active(artifact_scope_generation)
+        if scope_active and self._existing_file_is_identical(save_path, data):
+            self._discard_duplicate_download(attempt)
+            LOG.info(
+                "CDP download deduplicated; identical file already saved",
+                filename_fp=diagnostic_fingerprint(filename),
+                size=len(data),
+                save_path_fp=diagnostic_fingerprint(str(save_path)),
+                download_index=self._download_index,
+            )
+            return
+
         self._atomically_write_bytes(save_path, data, artifact_scope_generation)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -1809,9 +2006,14 @@ class CDPDownloadInterceptor:
         return "; ".join(parts)
 
     async def _fetch_download_bytes_in_page(
-        self, url: str, recovery_allowance_bytes: int | None = None
+        self, url: str, content_type: str = "", filename: str = "", recovery_allowance_bytes: int | None = None
     ) -> bytes | None:
-        """Read bytes through a same-origin HTTPS browser-context fetch, failing closed."""
+        """Read bytes through a same-origin HTTPS browser-context fetch, failing closed.
+
+        Returns the first page whose body satisfies the download's claimed type (the same predicate
+        the save guard applies), so when a download click opened a popup, a page still showing an
+        error envelope does not mask the real file another page holds.
+        """
         if self._browser_context is None:
             return None
         if urlparse(url).scheme.lower() != "https":
@@ -1854,7 +2056,11 @@ class CDPDownloadInterceptor:
                 except Exception:
                     LOG.debug("same-origin download recovery failed for browser page", exc_info=True)
                     continue
-                if data is not None and not _body_starts_with_html(data):
+                if (
+                    data is not None
+                    and not _body_starts_with_html(data)
+                    and not _payload_contradicts_claimed_type(data, content_type, filename)
+                ):
                     return data
         finally:
             for marker in call_owned_recovery_markers:
@@ -1925,6 +2131,17 @@ class CDPDownloadInterceptor:
         save_path, filename = self._resolve_save_path(suggested_filename)
         if artifact_scope_generation is None:
             artifact_scope_generation = self._artifact_scope_generation
+        scope_active = self._artifact_scope_is_active(artifact_scope_generation)
+        if scope_active and self._existing_file_is_identical(save_path, data):
+            self._discard_duplicate_download(attempt)
+            LOG.info(
+                "CDP download deduplicated; identical file already saved",
+                filename_fp=diagnostic_fingerprint(filename),
+                size=len(data),
+                save_path_fp=diagnostic_fingerprint(str(save_path)),
+                download_index=self._download_index,
+            )
+            return
         self._atomically_write_bytes(save_path, data, artifact_scope_generation)
         self._downloaded_urls.add(url)
         LOG.info(
@@ -2121,12 +2338,26 @@ class CDPDownloadInterceptor:
         and the request hasn't already been retried (to prevent infinite loops when credentials
         are rejected). All other auth challenges are cancelled to prevent hanging.
         """
+        # ``requestId`` is read off the event dict (never raises) and the attribution fields start at
+        # safe defaults, so the except block can always attribute the failure. The nested authChallenge
+        # /request extraction runs inside the try: a malformed event (either field null) raises there and
+        # is caught into the attributed error log below, rather than escaping to _cdp_handler_done's
+        # unattributed warning.
+        request_id = event.get("requestId")
+        source = ""
+        request_origin = "<unknown>"
+
         try:
-            request_id = event["requestId"]
+            # Reduce a present request URL to its origin first: a malformed ``authChallenge`` (null) raises
+            # during source extraction below, and computing the origin beforehand keeps a usable, redacted
+            # origin in the attributed error log instead of collapsing it to the placeholder.
+            request_origin = _redacted_request_origin(event.get("request", {}).get("url", ""))
             auth_challenge = event.get("authChallenge", {})
             source = auth_challenge.get("source", "")
-            url = event.get("request", {}).get("url", "<unknown>")
-
+            if request_id is None:
+                # A challenge with no requestId cannot be answered (continueWithAuth needs it);
+                # fail into the attributed error log rather than sending a malformed response.
+                raise KeyError("requestId")
             # Defensive: this handler is only registered when credentials are present,
             # but we still check to guard against future refactors.
             attempts = self._auth_attempts.get(request_id, 0)
@@ -2134,8 +2365,8 @@ class CDPDownloadInterceptor:
                 self._auth_attempts[request_id] = attempts + 1
                 LOG.info(
                     "CDP proxy auth challenge received, providing credentials",
-                    url=url,
-                    origin=auth_challenge.get("origin", ""),
+                    request_origin=request_origin,
+                    challenge_origin=_redacted_request_origin(auth_challenge.get("origin", "")),
                 )
                 await cdp_session.send(
                     "Fetch.continueWithAuth",
@@ -2154,15 +2385,15 @@ class CDPDownloadInterceptor:
                 if attempts >= 1:
                     LOG.warning(
                         "CDP proxy auth credentials rejected, cancelling to prevent retry loop",
-                        url=url,
-                        source=source,
+                        request_origin=request_origin,
+                        challenge_source=source,
                         attempts=attempts,
                     )
                 else:
                     LOG.warning(
                         "CDP auth challenge received, cancelling (non-proxy or no credentials)",
-                        url=url,
-                        source=source,
+                        request_origin=request_origin,
+                        challenge_source=source,
                     )
                 await cdp_session.send(
                     "Fetch.continueWithAuth",
@@ -2174,8 +2405,19 @@ class CDPDownloadInterceptor:
         except Exception as e:
             LOG.error(
                 "Error handling CDP auth challenge",
-                error=str(e),
-                exc_info=True,
+                # ``cdp_request_id``, not ``request_id``: the ``add_log_context`` processor
+                # overwrites ``request_id`` with the inherited run context after the kwargs merge,
+                # so a per-challenge value logged under that key is silently replaced in production
+                # (concurrent challenges would all collapse to the same context id). A distinct key
+                # survives the merge and keeps each failing challenge attributable.
+                cdp_request_id=request_id,
+                # ``challenge_source``, not ``source``: ``escape_reserved_log_keys`` rewrites the reserved
+                # ``source`` key to ``event_source`` under JSON_LOGGING (production), so the authored name
+                # would not be the queryable field. A non-reserved key lands unchanged.
+                challenge_source=source,
+                request_origin=request_origin,
+                error_type=type(e).__name__,
+                error_origin=redacted_exception_origin(e),
             )
 
     async def _handle_request_paused(

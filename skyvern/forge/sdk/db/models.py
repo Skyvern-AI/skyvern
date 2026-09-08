@@ -1421,7 +1421,8 @@ class PersistentBrowserSessionModel(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     # Last client CDP command seen by the proxy; drives activity-based lease renewal so an
-    # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT).
+    # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT, or by an
+    # extended budget up to MAX_EXTENDED_TIMEOUT).
     last_activity_at = Column(DateTime, nullable=True)
     # Set when a close is requested, so the session activity can observe it without waiting for the
     # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
@@ -1791,6 +1792,7 @@ class WorkflowCopilotChatModel(Base):
     proposed_workflow = Column(JSON, nullable=True)
     auto_accept = Column(Boolean, nullable=True, default=False)
     pending_turns = Column(JSON, nullable=True)
+    work_plan = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
