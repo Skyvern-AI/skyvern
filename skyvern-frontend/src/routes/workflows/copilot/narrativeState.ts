@@ -640,6 +640,7 @@ export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
   "run_blocks_and_collect_debug",
+  "test_workflow_from_blank_browser",
 ]);
 
 // Tool names we never surface in the user-facing activity log. Internal
@@ -678,6 +679,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   delete_block: "Deleting block",
   request_credential: "Requesting a credential",
   ask_user: "Asking you",
+  set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 

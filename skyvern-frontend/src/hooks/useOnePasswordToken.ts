@@ -4,7 +4,7 @@ import { useCredentialGetter } from "./useCredentialGetter";
 import {
   CreateOnePasswordTokenRequest,
   CreateOnePasswordTokenResponse,
-  OnePasswordTokenApiResponse,
+  OnePasswordTokenStatus,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
 import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
@@ -14,17 +14,19 @@ export function useOnePasswordToken() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
-  const { data: onePasswordToken, isLoading } =
-    useQuery<OnePasswordTokenApiResponse | null>({
-      queryKey: ["onePasswordToken"],
-      queryFn: async () => {
-        const client = await getClient(credentialGetter, "sans-api-v1");
-        return await client
-          .get("/credentials/onepassword/get")
-          .then((response) => response.data.token)
-          .catch(() => null);
-      },
-    });
+  const {
+    data: onePasswordStatus,
+    isLoading,
+    isError,
+  } = useQuery<OnePasswordTokenStatus>({
+    queryKey: ["onePasswordStatus"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return await client
+        .get("/credentials/onepassword/status")
+        .then((response) => response.data as OnePasswordTokenStatus);
+    },
+  });
 
   const createOrUpdateTokenMutation = useMutation({
     mutationFn: async (data: CreateOnePasswordTokenRequest) => {
@@ -34,7 +36,7 @@ export function useOnePasswordToken() {
         .then((response) => response.data as CreateOnePasswordTokenResponse);
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["onePasswordToken"] });
+      void queryClient.invalidateQueries({ queryKey: ["onePasswordStatus"] });
       void queryClient.invalidateQueries({ queryKey: ["onepasswordItems"] });
       toast({
         title: "Success",
@@ -57,15 +59,17 @@ export function useOnePasswordToken() {
 
   const clearTokenMutation = useClearOrganizationAuthToken({
     providerPath: "onepassword",
-    queryKey: "onePasswordToken",
+    queryKey: "onePasswordStatus",
     invalidateQueryKeys: ["onepasswordItems"],
+    setQueryDataOnSuccess: false,
     successDescription: "1Password service account token cleared successfully",
     errorDescription: "Failed to clear 1Password token",
   });
 
   return {
-    onePasswordToken,
+    onePasswordStatus,
     isLoading,
+    isError,
     createOrUpdateToken: createOrUpdateTokenMutation.mutate,
     isUpdating: createOrUpdateTokenMutation.isPending,
     clearToken: clearTokenMutation.mutate,

@@ -20,7 +20,11 @@ import {
   resolveScreenshotBlockId,
 } from "../workflowRun/workflowTimelineUtils";
 import { type HeroSelection } from "./runview/HeroScreenshot";
-import { buildFilmstrip, runOutcomeFromStatus } from "./runProjections";
+import {
+  buildFilmstrip,
+  resolveLandingSelectionId,
+  runOutcomeFromStatus,
+} from "./runProjections";
 
 export type RunVisuals = {
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow | undefined;
@@ -89,9 +93,12 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   );
 
   const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
-  const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
   const scrubbing = activeParam != null && activeParam !== "stream";
-  const selectedFrameId = scrubbing ? activeParam : (lastFrame?.id ?? null);
+  const landingSelectionId = useMemo(
+    () => resolveLandingSelectionId(frames, timeline, finalized),
+    [frames, timeline, finalized],
+  );
+  const selectedFrameId = scrubbing ? activeParam : landingSelectionId;
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
   const activeItem = useMemo(

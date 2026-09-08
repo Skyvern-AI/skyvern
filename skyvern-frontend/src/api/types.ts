@@ -245,10 +245,18 @@ export type ApiKeyApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordTokenSource = "organization" | "instance_default";
+
+export type OnePasswordTokenStatus = {
+  configured: boolean;
+  source: OnePasswordTokenSource | null;
+  instance_default_available: boolean;
+  modified_at: string | null;
+};
+
 export type OnePasswordTokenApiResponse = {
   id: string;
   organization_id: string;
-  token: string;
   created_at: string;
   modified_at: string;
   token_type: string;
@@ -266,6 +274,7 @@ export type OnePasswordItemApiResponse = {
 
 export type OnePasswordItemsApiResponse = {
   configured: boolean;
+  source: OnePasswordTokenSource | null;
   items: Array<OnePasswordItemApiResponse>;
 };
 

@@ -146,6 +146,19 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
   child_exited: INFRASTRUCTURE,
   child_no_request: INFRASTRUCTURE,
   child_malformed_request: INFRASTRUCTURE,
+  parameter_transfer_failed: {
+    ...INFRASTRUCTURE,
+    title: "The block's inputs could not be transferred",
+    guidance:
+      "The block's inputs could not be transferred to the sandbox safely. This is a Skyvern-side transport fault, not your code — retry, and reach out if it keeps happening.",
+  },
+  parameter_limit_exceeded: {
+    kind: "limit",
+    title: "The block's inputs are too large to transfer",
+    guidance:
+      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Have an earlier block pass in less data.",
+    recovery: "fix",
+  },
   unspecified: {
     kind: "user-code",
     title: "The code block failed",

@@ -91,12 +91,23 @@ function OnePasswordItemSelector({
             Couldn&apos;t load 1Password items. Enter a value manually instead.
           </div>
         )}
-        {!isError && !data?.configured && (
-          <div className="px-2 py-1.5 text-xs text-muted-foreground">
-            Connect 1Password in Settings to list items
-          </div>
-        )}
-        {!isError && data?.configured && visibleItems.length === 0 && (
+        {!isError &&
+          data?.source === "instance_default" &&
+          visibleItems.length === 0 && (
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">
+              Using the instance default 1Password account. Items cannot be
+              listed here; enter the vault ID and item ID manually.
+            </div>
+          )}
+        {!isError &&
+          data?.configured === false &&
+          data?.source === null &&
+          visibleItems.length === 0 && (
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">
+              Connect 1Password in Settings to list items
+            </div>
+          )}
+        {!isError && data?.configured === true && visibleItems.length === 0 && (
           <div className="px-2 py-1.5 text-xs text-muted-foreground">
             No 1Password items found
           </div>
