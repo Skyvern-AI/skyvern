@@ -3784,6 +3784,109 @@
         ]
       }
     },
+    "/v1/browser_sessions/{browser_session_id}/extend": {
+      "post": {
+        "tags": [
+          "Browser Sessions"
+        ],
+        "summary": "Extend a session",
+        "description": "Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.",
+        "operationId": "extend_browser_session_v1_browser_sessions__browser_session_id__extend_post",
+        "parameters": [
+          {
+            "name": "browser_session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser session. browser_session_id starts with `pbs_`",
+              "examples": [
+                "pbs_123456"
+              ],
+              "title": "Browser Session Id"
+            },
+            "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtendBrowserSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully extended browser session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserSessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "409": {
+            "description": "Conflict - the browser session has ended, is about to expire, is already at its maximum lifetime, or runs on infrastructure whose lifetime is fixed at creation"
+          },
+          "202": {
+            "description": "Accepted - the extension was requested but its effect could not be confirmed yet. The body carries the session as last recorded and a `warning`; read `timeout` back with a GET rather than retrying, because each retry adds again."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "extend_browser_session",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.extend_browser_session(browser_session_id=\"pbs_123\", additional_minutes=30)\nprint(browser_session.timeout)  # the session's new total budget in minutes\n"
+              },
+              {
+                "sdk": "curl",
+                "code": "curl -X POST https://api.skyvern.com/v1/browser_sessions/pbs_123/extend \\\n  -H \"x-api-key: YOUR_API_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"additional_minutes\": 30}'\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/browser_sessions/{browser_session_id}": {
       "patch": {
         "tags": [
@@ -12458,6 +12561,21 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "ExtendBrowserSessionRequest": {
+        "properties": {
+          "additional_minutes": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Additional Minutes",
+            "description": "Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning."
+          }
+        },
+        "type": "object",
+        "required": [
+          "additional_minutes"
+        ],
+        "title": "ExtendBrowserSessionRequest"
       },
       "Extensions": {
         "type": "string",
