@@ -759,6 +759,8 @@ async def test_script_create_site_stamps_the_script_run_marker(scoped_context: S
         )
         mock_app.DATABASE.tasks.create_step = AsyncMock(return_value=SimpleNamespace(step_id="stp_script_marker"))
         mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
+        mock_app.AGENT_FUNCTION.is_recipe_step_attempt = AsyncMock(return_value=False)
+        mock_app.DATABASE.tasks.update_step = AsyncMock(return_value=SimpleNamespace(step_id="stp_script_marker"))
 
         block_id, task_id, step_id = await script_service._create_workflow_block_run_and_task(
             block_type=BlockType.NAVIGATION,

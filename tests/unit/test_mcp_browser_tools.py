@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections.abc import Awaitable, Iterator
+from enum import Enum
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
@@ -3752,21 +3754,35 @@ async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPat
     assert result["artifacts"] == [artifact.to_dict()]
 
 
+class _WaiterKind(Enum):
+    """Waiter shapes a delay cannot express: settling before the first suspension point, and ignoring
+    cancellation the way a driver call that never returns does."""
+
+    SETTLES_ON_FIRST_STEP = "settles_on_first_step"
+    IGNORES_CANCELLATION = "ignores_cancellation"
+
+
 def _either_wait_page(
     monkeypatch: pytest.MonkeyPatch,
-    outcomes: dict[str, float | Exception],
-) -> list[asyncio.Task]:
+    outcomes: dict[str, float | Exception | _WaiterKind | None],
+) -> asyncio.Event:
     """Fake a page whose per-selector waits resolve after a delay, raise, or time out: an outcome of
     None means the selector never appears, so that waiter times out the way Playwright's does. Returns
-    the waiter tasks so a caller can assert the tool drained them.
+    the event that releases any waiter configured to ignore cancellation.
     """
-    waiters: list[asyncio.Task] = []
+    release = asyncio.Event()
 
     async def wait_for_selector(selector: str, timeout: float = 30000, **_: object) -> SimpleNamespace:
-        task = asyncio.current_task()
-        if task is not None:
-            waiters.append(task)
         outcome = outcomes.get(selector)
+        if outcome is _WaiterKind.SETTLES_ON_FIRST_STEP:
+            return SimpleNamespace(selector=selector)
+        if outcome is _WaiterKind.IGNORES_CANCELLATION:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+            raise mcp_browser.PlaywrightTimeoutError(f"Wedged waiter released for {selector}")
         if isinstance(outcome, Exception):
             raise outcome
         if outcome is None:
@@ -3776,7 +3792,35 @@ def _either_wait_page(
         return SimpleNamespace(selector=selector)
 
     _action_page(monkeypatch, wait_for_selector=AsyncMock(side_effect=wait_for_selector))
-    return waiters
+    return release
+
+
+@pytest.fixture(autouse=True)
+def _clear_orphaned_waiters() -> Iterator[None]:
+    """A waiter that ignores cancellation is only discarded through the loop, and pytest-asyncio closes
+    the loop first, so without this every wedged fake outlives its own test."""
+    yield
+    mcp_browser._ORPHANED_WAITERS.clear()
+
+
+async def _drain_released_waiters(release: asyncio.Event, held: set[asyncio.Task]) -> None:
+    release.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not held & mcp_browser._ORPHANED_WAITERS:
+            return
+
+
+async def _answer_within(call: Awaitable[dict[str, Any]], seconds: float = 5) -> dict[str, Any]:
+    """Await a wait-tool call under a bound that cannot itself be absorbed. ``wait_for`` enforces its
+    deadline by cancelling, so a regression that swallows cancellation would hang the run instead of
+    failing it."""
+    pending = asyncio.ensure_future(call)
+    settled, _ = await asyncio.wait({pending}, timeout=seconds)
+    if not settled:
+        pending.cancel()
+        raise AssertionError(f"wait tool did not answer within {seconds}s")
+    return pending.result()
 
 
 @pytest.mark.asyncio
@@ -3828,6 +3872,129 @@ async def test_wait_for_either_state_reports_the_observed_failed_wait_duration(
     assert result["data"]["observed_wait_ms"] >= 1000
     assert result["data"]["source_url"] == "https://example.test/two-factor"
     assert result["data"]["result_url"] == "https://example.test/two-factor"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_answers_while_the_losing_waiter_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The declared timeout is 120s and the losing waiter never unwinds, so anything the caller can act
+    on has to come back without it, and a waiter that answers late is only reportable once it settles."""
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        mcp_browser.LOG, "warning", lambda event, **fields: warnings.append((event, fields)), raising=False
+    )
+    release = _either_wait_page(monkeypatch, {"#login": 0.01, "#home": _WaiterKind.IGNORES_CANCELLATION})
+    before = set(mcp_browser._ORPHANED_WAITERS)
+
+    result = await _answer_within(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["matched_selector"] == "#login"
+    assert result["data"]["matched"] == "selector_a"
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    held = mcp_browser._ORPHANED_WAITERS - before
+    assert len(held) == 1
+    assert warnings == []
+
+    await _drain_released_waiters(release, held)
+
+    assert held & mcp_browser._ORPHANED_WAITERS == set()
+    settled = [fields for event, fields in warnings if "did not end cancelled" in event]
+    assert len(settled) == 1
+    assert set(settled[0]) == {"error_type", "orphaned_waiters"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_times_out_while_the_losing_waiter_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(mcp_browser.LOG, "warning", lambda event, **fields: warnings.append(event), raising=False)
+    release = _either_wait_page(monkeypatch, {"#login": None, "#home": _WaiterKind.IGNORES_CANCELLATION})
+
+    result = await _answer_within(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=1000)
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
+    # A page missing both states and a driver that stopped answering both land here, so the report
+    # names the elapsed bound and the selectors it waited on rather than a cause it cannot see.
+    assert result["error"]["message"] == "Neither '#login' nor '#home' reached 'visible' within 1000ms"
+    assert result["error"]["hint"] == "Neither state was confirmed before the timeout elapsed"
+    # No driver exception was ever constructed on this path, so the field that would name one stays empty.
+    assert result["error"]["details"] == {}
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
+    assert result["data"]["selector_a"] == "#login"
+    assert result["data"]["selector_b"] == "#home"
+
+    await _drain_released_waiters(release, set(mcp_browser._ORPHANED_WAITERS))
+
+    # Both losers were abandoned at the deadline; only the one that did not end cancelled is worth
+    # reporting, so the selector that unwound normally must leave nothing behind.
+    assert [event for event in warnings if "did not end cancelled" in event] == [
+        "Browser wait selector task did not end cancelled"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_prefers_the_declared_first_of_a_winning_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both waiters win in the same batch, so only the declared-first ordering decides the answer and
+    neither task is left registered."""
+    _either_wait_page(
+        monkeypatch,
+        {"#login": _WaiterKind.SETTLES_ON_FIRST_STEP, "#home": _WaiterKind.SETTLES_ON_FIRST_STEP},
+    )
+    before = set(mcp_browser._ORPHANED_WAITERS)
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home")
+
+    assert result["data"]["matched_selector"] == "#login"
+    assert result["data"]["matched"] == "selector_a"
+    assert mcp_browser._ORPHANED_WAITERS - before == set()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_keeps_a_raisers_error_over_a_silent_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selector that raises settles long before the declared bound, so its error is the one on hand
+    when the wait gives up and the caller learns what was actually wrong."""
+    _either_wait_page(monkeypatch, {"#login": ValueError("bad selector"), "#home": None})
+
+    result = await _answer_within(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=1000)
+    )
+
+    assert result["ok"] is False
+    assert "bad selector" in result["error"]["message"]
+    assert result["error"]["hint"] == "The page settled into neither state; both selectors may be wrong for this page"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_propagates_caller_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = _either_wait_page(monkeypatch, {"#login": None, "#home": _WaiterKind.IGNORES_CANCELLATION})
+    pending_call = asyncio.ensure_future(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+    )
+    await asyncio.sleep(0.05)
+
+    pending_call.cancel()
+
+    # Bounding this with wait_for would cancel the call to enforce its own deadline, and a wait that
+    # absorbs cancellation absorbs that one too, so the guard has to observe without cancelling.
+    settled, _ = await asyncio.wait({pending_call}, timeout=5)
+    assert settled, "cancelling the caller did not unwind the wait"
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending_call
+    await _drain_released_waiters(release, set(mcp_browser._ORPHANED_WAITERS))
 
 
 @pytest.mark.asyncio

@@ -231,6 +231,24 @@ def test_shim_overrides_proposal_even_when_pre_override_result_carries_workflow(
     assert overridden.workflow_yaml is None
 
 
+@pytest.mark.parametrize(("authoring_barred", "expected_clear"), [(False, True), (True, False)])
+def test_shim_carries_authoring_barred_forward(authoring_barred: bool, expected_clear: bool) -> None:
+    ctx = _ctx()
+    ctx.blocker_signal = _signal()
+    result = AgentResult(
+        user_response="clarification from a turn that never authored",
+        updated_workflow=None,
+        global_llm_context=None,
+        clear_proposed_workflow=False,
+        authoring_barred=authoring_barred,
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden.authoring_barred is authoring_barred
+    assert overridden.clear_proposed_workflow is expected_clear
+
+
 def test_blocker_signal_wins_over_demonstrated_recorded_outcome() -> None:
     ctx = _ctx()
     ctx.blocker_signal = _signal(user_facing="I need one more detail before I can continue.")

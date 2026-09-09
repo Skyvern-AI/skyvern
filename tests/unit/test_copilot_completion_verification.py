@@ -4159,6 +4159,36 @@ async def test_non_fallback_offline_judge_does_not_fire_interactive_barrier(monk
 
 
 @pytest.mark.asyncio
+async def test_a_work_plan_naming_the_requested_output_changes_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    judged_prompts: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict:
+        judged_prompts.append(prompt)
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
+
+    _patch_completion_handler(monkeypatch, handler)
+
+    async def verify(work_plan: list[str]) -> CompletionVerificationResult:
+        ctx = _ctx_with_blocks("extraction")
+        ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "the confirmation code is returned")])
+        ctx.work_plan = work_plan
+        verification = await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic())
+        assert verification is not None
+        return verification
+
+    without_plan = await verify([])
+    plan = ["the confirmation code is returned", "reach the payment step"]
+    with_plan = await verify(plan)
+
+    assert with_plan.is_fully_satisfied() is False
+    assert with_plan == without_plan
+    assert with_plan.to_trace_data() == without_plan.to_trace_data()
+    assert len(judged_prompts) == 2
+    assert judged_prompts[1] == judged_prompts[0]
+    assert "reach the payment step" not in judged_prompts[1]
+
+
+@pytest.mark.asyncio
 async def test_validation_classification_block_output_satisfies_without_judge_unknown_veto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

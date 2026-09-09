@@ -8522,6 +8522,8 @@ class WorkflowService:
         task_version: Literal["v1", "v2"] = "v1",
         extracted_information_schema: dict[str, Any] | list | str | None = None,
         generate_script: bool = False,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -8663,6 +8665,18 @@ class WorkflowService:
             ai_fallback=ai_fallback,
             generate_script_on_terminal=generate_script,
         )
+
+        if status == WorkflowStatus.published:
+            self._schedule_workflow_saved_hook_best_effort(
+                organization_id=new_workflow.organization_id,
+                edited_by=actor_user_id,
+                workflow_permanent_id=new_workflow.workflow_permanent_id,
+                workflow=new_workflow,
+                version=new_workflow.version,
+                status=new_workflow.status,
+                actor_user_id=actor_user_id,
+                created_via=created_via,
+            )
 
         return new_workflow
 
@@ -8867,16 +8881,67 @@ class WorkflowService:
         organization_id: str,
         edited_by: str | None,
         workflow_permanent_id: str,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> None:
-        task = asyncio.create_task(
-            app.AGENT_FUNCTION.on_workflow_saved(
+        hook_kwargs: dict[str, Any] = {
+            "organization_id": organization_id,
+            "edited_by": edited_by,
+            "workflow_permanent_id": workflow_permanent_id,
+            "workflow": workflow,
+            "version": version,
+            "status": status,
+            "actor_user_id": actor_user_id,
+        }
+        if created_via is not None:
+            hook_kwargs["created_via"] = created_via
+        try:
+            hook_coroutine = app.AGENT_FUNCTION.on_workflow_saved(**hook_kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            hook_coroutine = app.AGENT_FUNCTION.on_workflow_saved(
                 organization_id=organization_id,
                 edited_by=edited_by,
                 workflow_permanent_id=workflow_permanent_id,
-            ),
-        )
+            )
+        task = asyncio.create_task(hook_coroutine)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _schedule_workflow_saved_hook_best_effort(
+        self,
+        *,
+        organization_id: str,
+        edited_by: str | None,
+        workflow_permanent_id: str,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
+    ) -> None:
+        try:
+            self.schedule_workflow_saved_hook(
+                organization_id=organization_id,
+                edited_by=edited_by,
+                workflow_permanent_id=workflow_permanent_id,
+                workflow=workflow,
+                version=version,
+                status=status,
+                actor_user_id=actor_user_id,
+                created_via=created_via,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to schedule workflow saved hook",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                exc_info=True,
+            )
 
     async def update_workflow_definition(
         self,
@@ -8912,6 +8977,7 @@ class WorkflowService:
         edited_by: str | None | object = _UNSET,
         notify_workflow_saved: bool = True,
         preserve_completion_contract: bool = True,
+        created_via: str | None = None,
     ) -> Workflow:
         if workflow_definition is not None:
             if organization_id is not None:
@@ -8990,10 +9056,15 @@ class WorkflowService:
             )
 
         if notify_workflow_saved:
-            self.schedule_workflow_saved_hook(
+            self._schedule_workflow_saved_hook_best_effort(
                 organization_id=updated_workflow.organization_id,
                 edited_by=cast("str | None", edited_by) if edited_by is not _UNSET else None,
                 workflow_permanent_id=updated_workflow.workflow_permanent_id,
+                workflow=updated_workflow,
+                version=updated_workflow.version,
+                status=updated_workflow.status,
+                actor_user_id=cast("str | None", edited_by) if edited_by is not _UNSET else updated_workflow.edited_by,
+                created_via=created_via,
             )
 
         return updated_workflow
@@ -12235,6 +12306,7 @@ class WorkflowService:
         delete_script: bool,
         created_by: str | None,
         edited_by: str | None,
+        created_via: str | None = None,
     ) -> Workflow:
         organization_id = organization.organization_id
         await self._validate_and_normalize_credential_rotation_parameters(
@@ -12277,10 +12349,15 @@ class WorkflowService:
             )
             await app.DATABASE.workflow_params.save_workflow_definition_parameters(workflow_definition.parameters)
 
-        self.schedule_workflow_saved_hook(
+        self._schedule_workflow_saved_hook_best_effort(
             organization_id=organization_id,
             edited_by=edited_by,
             workflow_permanent_id=workflow_permanent_id,
+            workflow=created_workflow,
+            version=created_workflow.version,
+            status=created_workflow.status,
+            actor_user_id=edited_by,
+            created_via=created_via,
         )
         await self.maybe_delete_cached_code(
             created_workflow,
@@ -12300,6 +12377,7 @@ class WorkflowService:
         edited_by: str | None = None,
         new_workflow_permanent_id: str | None = None,
         resolved_title: str | None = None,
+        created_via: str | None = None,
     ) -> Workflow:
         organization_id = organization.organization_id
         title = resolved_title
@@ -12320,6 +12398,7 @@ class WorkflowService:
                 delete_script=delete_script,
                 created_by=created_by,
                 edited_by=edited_by,
+                created_via=created_via,
             )
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
@@ -12457,6 +12536,7 @@ class WorkflowService:
                 description=request.description,
                 workflow_definition=workflow_definition,
                 edited_by=edited_by,
+                created_via=created_via,
             )
 
             await self.maybe_delete_cached_code(

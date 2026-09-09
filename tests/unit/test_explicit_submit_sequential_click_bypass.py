@@ -19,13 +19,13 @@ import pytest
 import skyvern.webeye.actions.handler as handler_module
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.models import StepStatus
-from skyvern.webeye.actions.actions import ClickAction
+from skyvern.webeye.actions.actions import ActionStatus, ActionType, ClickAction
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     handle_click_action,
     handle_sequential_click_with_submit_bypass,
 )
-from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.actions.responses import ActionAbort, ActionSuccess
 from skyvern.webeye.utils.dom import SkyvernElement
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -667,6 +667,31 @@ class TestHandleActionPublicPathFalseClickBypass:
         scraped_page = MagicMock()
         scraped_page.id_to_element_dict = {"E1": {"id": "E1"}}
         return scraped_page
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("actions_result", "expected_status"),
+        [
+            ([ActionAbort(desired_state_reached=True)], ActionStatus.completed),
+            ([ActionAbort()], ActionStatus.skipped),
+            ([ActionSuccess()], ActionStatus.completed),
+        ],
+    )
+    async def test_handle_action_persists_terminal_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        actions_result: list,
+        expected_status: ActionStatus,
+    ) -> None:
+        task, step = self._context()
+        action = ClickAction(element_id="E1", download=False)
+        self._wire_action_wrapper(monkeypatch)
+        click_handler = AsyncMock(return_value=actions_result)
+        monkeypatch.setitem(ActionHandler._handled_action_types, ActionType.CLICK, click_handler)
+
+        await ActionHandler.handle_action(self._scraped_page(), task, step, _FakePage(), action)
+
+        assert action.status is expected_status
 
     @pytest.mark.asyncio
     async def test_grace_zero_same_page_download_bypasses_sequential(self, monkeypatch: pytest.MonkeyPatch) -> None:

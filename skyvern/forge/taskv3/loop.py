@@ -322,32 +322,46 @@ def telemetry_hash(salt: str, *parts: str) -> str:
 # The value shape observe()'s enrichment mints ('t' + monotonic counter, optional '-<n>'
 # disambiguator — tools._OBSERVE_JS): identity handles, not page semantics, and a node-replacing
 # framework re-mints them on every read, so hashed raw they hide a frozen page from the stall
-# guard. Page-authored data-tv3 values (any other shape) are page content and stay significant.
-# An opaque-id alias attribute (tools._mask_aliases) is a handle of the same kind.
-_TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"|data-tv3-ref="(?:\d+|\?)"')
+# guard. Page-authored data-tv3 values (any other shape) are page content and stay significant,
+# as is a page-authored data-tv3-ref: observe addresses by a server-held ref, never by an
+# attribute, so nothing in the markup with that name is a handle this engine minted.
+_TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"')
 
 # get_html truncates to a fixed budget before the loop ever sees the content, so a marker the cut
 # leaves open at the tail has no closing quote for the pattern above and its churning digits would
 # be the one leak that survives canonicalization. The lookahead assumes the truncation notice itself
 # carries no quote character, and this sub must run AFTER closed markers are rewritten to the
 # quote-bearing placeholder — either broken silently brings the leak back.
-_TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)|data-tv3-ref="[\d?]*(?=[^"]*\Z)')
+_TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)')
+
+
+# observe prints its own address as `ref=N` at the head of each element line. The number is
+# engine-minted identity, not page semantics: a framework that remounts a control between readings
+# gives the replacement a new one, so hashed raw they hide a semantically frozen page from the stall
+# guard -- the same reason the marker values above are canonicalized. Anchored at line start, so it
+# can only take the address, never a value further along the line; the caller scopes it to
+# observe's own payload so page-authored bytes from get_html are never subject to it.
+_TV3_REF_ADDRESS_RE = re.compile(r"^ref=\d+", re.MULTILINE)
 
 
 _PERCEPTION_URL_LINE_RE = re.compile(r"^url=\S+", flags=re.MULTILINE)
 
 
-def _canonical_perception_content(content: str) -> str:
-    closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', content)
+def _canonical_perception_content(content: str, *, is_observe: bool = False) -> str:
+    # The ref pass is scoped to observe's own payload, not to every compactable result: get_html
+    # returns page-authored bytes, and a page can write a line that opens `ref=<digits>` there. The
+    # marker passes below are attribute-shaped and page-authored values in that shape stay significant.
+    addressed = _TV3_REF_ADDRESS_RE.sub("ref=*", content) if is_observe else content
+    closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', addressed)
     return _TV3_MARKER_CUT_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*', closed)
 
 
-def _content_only_perception(content: str) -> str:
+def _content_only_perception(content: str, *, is_observe: bool = False) -> str:
     # The URL is a hint, not content: history.pushState moves it without changing the document. The
     # full canonicalization (URL included) keeps clearing the repeat guards — a wizard whose pages
     # differ only by URL must survive — but budget-extension evidence hashes THIS, so a URL flip
     # alone can never earn budget.
-    return _PERCEPTION_URL_LINE_RE.sub("url=*", _canonical_perception_content(content))
+    return _PERCEPTION_URL_LINE_RE.sub("url=*", _canonical_perception_content(content, is_observe=is_observe))
 
 
 # How many recent states a probe remembers. This length IS the longest oscillation period that can
@@ -2632,7 +2646,9 @@ async def run_agent_tool_loop(
             attribution: dict[str, Any] = {"action_key_hash": telemetry_hash(telemetry_salt, *action_key)}
             content_digest: str | None = None
             if spec is not None and spec.compactable and result.status == "ok":
-                content_digest = hashlib.sha256(_canonical_perception_content(result.content).encode()).hexdigest()
+                content_digest = hashlib.sha256(
+                    _canonical_perception_content(result.content, is_observe=tool_name == "observe").encode()
+                ).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
                 attribution["probe_first_time"] = st.perception.first_time(action_key)
                 # Emitted on its own record, never folded into the one above: the tool-call record's
@@ -2751,7 +2767,9 @@ async def run_agent_tool_loop(
                     action_key,
                     tool_name,
                     attribution,
-                    content_only_digest=hashlib.sha256(_content_only_perception(result.content).encode()).hexdigest(),
+                    content_only_digest=hashlib.sha256(
+                        _content_only_perception(result.content, is_observe=tool_name == "observe").encode()
+                    ).hexdigest(),
                     refresh_pending=refresh_pending,
                 )
                 st.stall_nudges_due.extend(nudges_due)

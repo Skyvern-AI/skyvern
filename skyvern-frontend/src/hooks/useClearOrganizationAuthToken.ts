@@ -8,6 +8,7 @@ type ClearOrganizationAuthTokenOptions = {
   providerPath: string;
   queryKey: string;
   invalidateQueryKeys?: string[];
+  setQueryDataOnSuccess?: boolean;
   successDescription: string;
   errorDescription: string;
 };
@@ -16,6 +17,7 @@ export function useClearOrganizationAuthToken({
   providerPath,
   queryKey,
   invalidateQueryKeys,
+  setQueryDataOnSuccess = true,
   successDescription,
   errorDescription,
 }: ClearOrganizationAuthTokenOptions) {
@@ -33,7 +35,9 @@ export function useClearOrganizationAuthToken({
         );
     },
     onSuccess: () => {
-      queryClient.setQueryData([queryKey], null);
+      if (setQueryDataOnSuccess) {
+        queryClient.setQueryData([queryKey], null);
+      }
       queryClient.invalidateQueries({ queryKey: [queryKey] });
       (invalidateQueryKeys ?? []).forEach((key) => {
         queryClient.invalidateQueries({ queryKey: [key] });

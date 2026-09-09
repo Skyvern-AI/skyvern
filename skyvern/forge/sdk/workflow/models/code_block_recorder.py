@@ -539,8 +539,18 @@ class RecordingLocator:
     def _skyvern_page_operation_argument(self) -> Any:
         return self.__locator
 
-    def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
-        return RecordingLocator(self.__locator.locator(selector, **kwargs), self.__recorder, selector)
+    def locator(self, selector_or_locator: str | Locator | RecordingLocator, **kwargs: Any) -> RecordingLocator:
+        native_argument = (
+            selector_or_locator._skyvern_page_operation_argument()
+            if isinstance(selector_or_locator, RecordingLocator)
+            else selector_or_locator
+        )
+        recording_selector = selector_or_locator if isinstance(selector_or_locator, str) else None
+        return RecordingLocator(
+            self.__locator.locator(native_argument, **kwargs),
+            self.__recorder,
+            recording_selector,
+        )
 
     @property
     def first(self) -> RecordingLocator:
@@ -710,6 +720,16 @@ class RecordingPage:
             strategy_aware_typing=strategy_aware_typing,
             playwright_input_defaults=playwright_input_defaults,
         )
+
+    @property
+    def _underlying_page(self) -> Page:
+        """The raw Playwright page this proxy wraps, for trusted platform consumers only.
+
+        Private (like the other ``_``-prefixed platform methods here) so the code-block safety validator's
+        refusal of underscore-prefixed access keeps authored snippets from reaching the unrecorded page
+        behind the recording and credential guards; a caller reaches it only after ``isinstance``.
+        """
+        return self.__page
 
     def recorded_actions(self) -> list[Action]:
         return list(self.__recorder.actions)

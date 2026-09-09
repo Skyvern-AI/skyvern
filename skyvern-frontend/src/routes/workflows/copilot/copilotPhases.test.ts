@@ -117,22 +117,28 @@ describe("derivePhases — bucket split keeps update_workflow in Draft (Codex ca
 });
 
 describe("derivePhases — composite scoped edit and run", () => {
-  it("reaches Test on a terminal composite call even before block rows hydrate", () => {
-    const rows = derivePhases(
-      turn({
-        designEnded: true,
-        designActivity: [
-          entry({
-            id: "1",
-            kind: "tool_call",
-            toolName: "edit_block_and_run",
-          }),
-        ],
-      }),
-    );
+  it.each(["edit_block_and_run", "test_workflow_from_blank_browser"])(
+    "places %s activity in Test before block rows hydrate",
+    (toolName) => {
+      const rows = derivePhases(
+        turn({
+          designEnded: true,
+          designActivity: [
+            entry({
+              id: "1",
+              kind: "tool_call",
+              toolName,
+            }),
+          ],
+        }),
+      );
 
-    expect(phase(rows, "test").status).not.toBe("pending");
-  });
+      expect(phase(rows, "test").entries.map((e) => e.id)).toEqual(["1"]);
+      if (toolName === "edit_block_and_run") {
+        expect(phase(rows, "test").status).not.toBe("pending");
+      }
+    },
+  );
 });
 
 describe("derivePhases — bucket split", () => {

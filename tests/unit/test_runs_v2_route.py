@@ -7,6 +7,7 @@ import orjson
 import pytest
 from fastapi import BackgroundTasks, HTTPException
 
+from skyvern.constants import SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes import agent_protocol
@@ -209,8 +210,31 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
     )
 
 
+@pytest.mark.parametrize(
+    ("original_trigger_type", "x_user_agent", "expected_trigger"),
+    [
+        (WorkflowRunTriggerType.api, None, WorkflowRunTriggerType.api),
+        (WorkflowRunTriggerType.api, SKYVERN_UI_USER_AGENT, WorkflowRunTriggerType.manual),
+        (WorkflowRunTriggerType.api, SKYVERN_MCP_USER_AGENT, WorkflowRunTriggerType.mcp),
+        (
+            WorkflowRunTriggerType.job_recipe_apply,
+            None,
+            WorkflowRunTriggerType.job_recipe_apply,
+        ),
+        (
+            WorkflowRunTriggerType.job_recipe_extract,
+            None,
+            WorkflowRunTriggerType.job_recipe_extract,
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+    original_trigger_type: WorkflowRunTriggerType,
+    x_user_agent: str | None,
+    expected_trigger: WorkflowRunTriggerType,
+) -> None:
     created_at = datetime(2026, 4, 1, tzinfo=timezone.utc)
     original_run = SimpleNamespace(
         workflow_run_id="wr_original",
@@ -236,6 +260,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         debug_session_id=None,
         code_gen=None,
         ignore_inherited_workflow_system_prompt=True,
+        trigger_type=original_trigger_type,
     )
     retried_run = SimpleNamespace(
         workflow_run_id="wr_retry",
@@ -300,7 +325,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         caller=caller,
         x_api_key="api-key",
         x_max_steps_override=10,
-        x_user_agent="skyvern-ui",
+        x_user_agent=x_user_agent,
     )
 
     mock_workflow_runs.get_workflow_run.assert_awaited_once_with(
@@ -334,7 +359,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     assert call_kwargs["max_steps"] == 10
     assert call_kwargs["api_key"] == "api-key"
     assert call_kwargs["request_id"] == "req_123"
-    assert call_kwargs["trigger_type"] == WorkflowRunTriggerType.manual
+    assert call_kwargs["trigger_type"] == expected_trigger
     assert call_kwargs["ignore_inherited_workflow_system_prompt"] is True
     assert call_kwargs["tag_write_context"].caller_id == "user_123"
     assert call_kwargs["tag_write_context"].source == TagSource.MANUAL
@@ -355,6 +380,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     assert call_kwargs["workflow_request"].run_metadata == {"env": "prod"}
 
     assert response.run_id == "wr_retry"
+    assert response.run_id != original_run.workflow_run_id
     assert response.run_request is not None
     assert response.run_request.workflow_id == "wpid_123"
     assert response.run_request.title == "Original workflow title"

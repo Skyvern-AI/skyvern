@@ -12,6 +12,7 @@ from skyvern.services.browser_recording.types import (
     ActionHover,
     ActionInputText,
     ActionKind,
+    ActionPressKey,
     ActionTarget,
     ActionUrlChange,
     ActionWait,
@@ -48,6 +49,17 @@ def make_input(ts: float, value: str, url: str = START_URL, **target_kwargs) -> 
         timestamp_end=ts,
         url=url,
         input_value=value,
+    )
+
+
+def make_press_key(ts: float, key: str, url: str = START_URL, **target_kwargs) -> ActionPressKey:
+    return ActionPressKey(
+        kind=ActionKind.PRESS_KEY.value,
+        target=make_target(**target_kwargs),
+        timestamp_start=ts,
+        timestamp_end=ts,
+        url=url,
+        key=key,
     )
 
 
@@ -450,3 +462,33 @@ async def test_process_code_first_prefers_draft_overlay_over_drafts_to_blocks(
     assert blocks[0].block_type == "code"
     assert "#keep" in blocks[0].code
     assert "#delete" not in blocks[0].code
+
+
+def test_enter_submit_emits_a_press_and_keeps_its_navigation_in_segment() -> None:
+    actions: list[Action] = [
+        make_input(1000, "boots", selector="#search"),
+        make_press_key(1100, "Enter", selector="#search"),
+        make_url_change(1600, "https://example.com/results"),
+        make_click(2600, url="https://example.com/results", selector="#first"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    assert len(blocks) == 1
+    assert 'await page.locator("#search").press("Enter")' in blocks[0].code
+    assert "results" not in blocks[0].code
+
+
+def test_press_key_without_a_locator_falls_back_to_the_keyboard() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#menu"),
+        make_press_key(2000, "Escape"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    assert 'await page.keyboard.press("Escape")' in blocks[0].code

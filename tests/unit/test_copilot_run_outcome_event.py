@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -116,7 +116,7 @@ workflow_definition:
 
 
 def _run_block(label: str, status: str, **fields: Any) -> WorkflowRunBlock:
-    now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 30, tzinfo=UTC)
     return WorkflowRunBlock(
         workflow_run_block_id=f"wrb_{label}",
         workflow_run_id="wr_test",
@@ -136,13 +136,13 @@ async def test_watchdog_receipts_carry_why_a_block_failed(monkeypatch: pytest.Mo
 
     async def get_workflow_run_blocks(**_kwargs: Any) -> list[WorkflowRunBlock]:
         return [
+            _run_block("waiting", "queued"),
             _run_block(
                 "ran",
                 "failed",
                 failure_reason="CodeBlock failed with NameError at line 2: name 'total' is not defined.",
                 error_codes=["user_code_error"],
             ),
-            _run_block("waiting", "queued"),
         ]
 
     monkeypatch.setattr(
@@ -151,7 +151,7 @@ async def test_watchdog_receipts_carry_why_a_block_failed(monkeypatch: pytest.Mo
         SimpleNamespace(get_workflow_run_blocks=get_workflow_run_blocks),
     )
 
-    receipts = await _recorded_watchdog_block_receipts("wr_test", "org")
+    _rows, receipts = await _recorded_watchdog_block_receipts("wr_test", "org")
 
     assert [receipt["status"] for receipt in receipts] == ["failed", "queued"]
     assert receipts[0]["block_type"] == "CODE"
@@ -707,11 +707,190 @@ async def test_same_run_recorded_operation_remains_packet_authority_after_raw_re
 
 def test_display_reason_collapses_whitespace_and_caps_length() -> None:
     assert run_outcome_display_reason("  a\n  b  ") == "a b"
+    at_limit = "x" * 160
+    assert run_outcome_display_reason(at_limit) == at_limit
     long_text = "x" * 500
     capped = run_outcome_display_reason(long_text)
-    assert capped is not None and len(capped) == 160
+    assert capped == "x" * 160
     assert run_outcome_display_reason("   ") is None
     assert run_outcome_display_reason(None) is None
+
+
+def test_display_reason_preserves_playwright_error_code_crossing_character_limit() -> None:
+    error_code = "net::ERR_TUNNEL_CONNECTION_FAILED"
+    leading_context = (
+        "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES): Failed to execute code block. "
+        "Reason: Error: Page.goto: retry exhausted: "
+    )
+    reason = f"{leading_context}{error_code} at https://example.com/path Call log: navigating to the target"
+    old_clamp = reason[:160]
+
+    assert 0 < 160 - len(leading_context) < len(error_code)
+    assert old_clamp.endswith(error_code[: 160 - len(leading_context)])
+    assert error_code not in old_clamp
+
+    display_reason = run_outcome_display_reason(reason)
+
+    assert display_reason is not None
+    assert display_reason.endswith(error_code)
+    assert display_reason.rsplit(" ... ", maxsplit=1)[-1] == error_code
+    assert len(display_reason) <= 160
+
+
+def test_display_reason_adaptively_preserves_long_url_origin_crossing_character_limit() -> None:
+    origin = f"https://{'a' * 48}.{'b' * 48}.example.com"
+    leading_context = "Navigation failed after the browser followed the redirect chain: "
+    normalized_reason = f"{leading_context}{origin}"
+    old_clamp = normalized_reason[:160]
+
+    assert len(origin) > (160 - len(" ... ")) // 2
+    assert 0 < 160 - len(leading_context) < len(origin)
+    assert old_clamp.endswith(origin[: 160 - len(leading_context)])
+    assert origin not in old_clamp
+
+    display_reason = run_outcome_display_reason(f"{normalized_reason}/path/to/failure")
+
+    assert display_reason is not None
+    assert display_reason.endswith(origin)
+    assert display_reason != origin
+    assert " ... " in display_reason
+    assert len(display_reason) <= 160
+
+
+def test_display_reason_relocation_does_not_sever_an_earlier_error_code() -> None:
+    error_code = "net::ERR_TUNNEL_CONNECTION_FAILED"
+    leading_context = "Navigation failed: "
+    between_tokens = " while retrying the redirected request at "
+    origin = f"https://{'a' * 42}.{'b' * 41}.example.com"
+    normalized_reason = f"{leading_context}{error_code}{between_tokens}{origin}"
+    origin_start = normalized_reason.index(origin)
+    relocated_cut = 160 - len(" ... ") - len(origin)
+
+    assert 0 < 160 - origin_start < len(origin)
+    assert len(leading_context) < relocated_cut < len(leading_context) + len(error_code)
+
+    display_reason = run_outcome_display_reason(f"{normalized_reason}/failure")
+
+    assert display_reason == f"{leading_context.rstrip()} ... {origin}"
+    assert error_code not in display_reason
+    assert "net::ERR_" not in display_reason
+
+
+def test_display_reason_does_not_relocate_error_prefix_with_identifier_suffix() -> None:
+    leading_context = f"{'x' * 148} "
+    invalid_token = "net::ERR_FOObar"
+    valid_token = "net::ERR_FOO"
+    invalid_reason = f"{leading_context}{invalid_token} trailing"
+    valid_reason = f"{leading_context}{valid_token} trailing"
+    valid_display_reason = run_outcome_display_reason(valid_reason)
+
+    assert run_outcome_display_reason(invalid_reason) == invalid_reason[:160]
+    assert valid_display_reason is not None
+    assert valid_display_reason != valid_reason[:160]
+    assert valid_display_reason.endswith(valid_token)
+
+
+def test_display_reason_does_not_relocate_error_prefix_with_identifier_prefix() -> None:
+    leading_context = "x" * 149
+    invalid_token = "xnet::ERR_ABC"
+    valid_token = "net::ERR_ABC"
+    invalid_reason = f"{leading_context}{invalid_token} trailing"
+    valid_reason = f"{leading_context} {valid_token} trailing"
+    valid_display_reason = run_outcome_display_reason(valid_reason)
+
+    assert run_outcome_display_reason(invalid_reason) == invalid_reason[:160]
+    assert valid_display_reason is not None
+    assert valid_display_reason != valid_reason[:160]
+    assert valid_display_reason.endswith(valid_token)
+
+
+@pytest.mark.parametrize(
+    ("token_length", "expected_kind"),
+    [(154, "prefix_and_token"), (155, "token"), (156, "token"), (157, "prefix"), (159, "prefix"), (160, "prefix")],
+)
+def test_display_reason_reserves_marker_at_protected_token_budget_boundaries(
+    token_length: int, expected_kind: str
+) -> None:
+    error_code = f"net::ERR_{'A' * (token_length - len('net::ERR_'))}"
+    leading_context = "context: "
+    reason = f"{leading_context}{error_code} trailing"
+
+    display_reason = run_outcome_display_reason(reason)
+
+    assert display_reason is not None
+    assert len(display_reason) <= 160
+    assert "..." in display_reason
+    if expected_kind == "prefix_and_token":
+        assert display_reason.startswith(leading_context[:1])
+        assert display_reason.endswith(error_code)
+    elif expected_kind == "token":
+        assert display_reason == f"... {error_code}"
+    else:
+        assert display_reason == f"{leading_context.rstrip()} ..."
+        assert error_code not in display_reason
+
+
+@pytest.mark.parametrize(
+    "protected_token",
+    [f"net::ERR_{'A' * 170}", f"https://{'a' * 170}.example.com"],
+)
+def test_display_reason_keeps_safe_prose_when_intersected_token_is_oversize(protected_token: str) -> None:
+    leading_context = "Failure remained actionable after retries: "
+    reason = f"{leading_context}{protected_token} trailing"
+
+    assert run_outcome_display_reason(reason) == f"{leading_context.rstrip()} ..."
+
+
+def test_display_reason_does_not_sever_earlier_span_when_omitting_oversize_token() -> None:
+    leading_context = "x" * 145
+    earlier_origin = "http://a.co"
+    error_code = f"net::ERR_{'A' * 170}"
+    reason = f"{leading_context} {earlier_origin} {error_code} trailing"
+
+    display_reason = run_outcome_display_reason(reason)
+
+    assert display_reason == f"{leading_context} ..."
+    assert earlier_origin not in display_reason
+    assert "net::ERR_" not in display_reason
+
+
+def test_display_reason_marks_elision_when_relocation_leaves_no_safe_prefix() -> None:
+    earlier_origin = f"https://{'a' * 128}.com"
+    target_origin = "https://target.test"
+    reason = f"{earlier_origin} {'x' * 8} {target_origin}/failure"
+
+    assert len(earlier_origin) == 140
+    assert reason.index(target_origin) == 150
+    assert run_outcome_display_reason(reason) == f"... {target_origin}"
+
+
+def test_display_reason_returns_marker_when_oversize_token_has_no_safe_prefix() -> None:
+    error_code = f"net::ERR_{'A' * 170}"
+
+    assert run_outcome_display_reason(f"{error_code} trailing") == "..."
+
+
+@pytest.mark.parametrize("protected_token", ["https://example.com", "net::ERR_CONNECTION_REFUSED"])
+def test_display_reason_only_relocates_boundaries_inside_protected_tokens(protected_token: str) -> None:
+    token_positions = {
+        "before": 160,
+        "inside": 159,
+        "after": 160 - len(protected_token),
+    }
+
+    for relation, token_start in token_positions.items():
+        leading_context = f"{'x' * (token_start - 1)} "
+        normalized_reason = f"{leading_context}{protected_token} trailing"
+        old_clamp = normalized_reason[:160]
+        display_reason = run_outcome_display_reason(normalized_reason)
+
+        assert display_reason is not None
+        assert len(display_reason) <= 160
+        if relation == "inside":
+            assert old_clamp.endswith(protected_token[:1])
+            assert display_reason.endswith(protected_token)
+        else:
+            assert display_reason == old_clamp
 
 
 def test_display_reason_redacts_secrets_and_url_credentials() -> None:

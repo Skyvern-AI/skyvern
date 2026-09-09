@@ -42,6 +42,7 @@ from skyvern.forge.sdk.services.credentials import (
     extract_onepassword_upstream_5xx_status,
     normalize_totp_config,
 )
+from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -980,17 +981,21 @@ class WorkflowRunContext:
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
-        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
-            organization.organization_id,
-            OrganizationAuthTokenType.onepassword_service_account.value,
+        resolution = await resolve_onepassword_token(organization.organization_id)
+        LOG.info(
+            "1Password token resolved for workflow run",
+            organization_id=organization.organization_id,
+            workflow_run_id=self.workflow_run_id,
+            source=resolution.source,
+            policy_mode=resolution.policy_mode,
+            denied_reason=resolution.denied_reason,
         )
-        token = settings.OP_SERVICE_ACCOUNT_TOKEN
-        if org_auth_token:
-            token = org_auth_token.token
-        if not token:
+
+        if resolution.token is None:
             raise ValueError(
-                "OP_SERVICE_ACCOUNT_TOKEN environment variable not set and no valid 1Password service account token found. Please go to the settings and add your 1Password service account token."
+                "1Password is not configured for this organization. Add a 1Password service account token in Settings."
             )
+        token = resolution.token
 
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")

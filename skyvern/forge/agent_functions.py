@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
 
@@ -948,6 +949,12 @@ class AgentFunction:
     def credential_routes_accept_ui_session(self) -> bool:
         return True
 
+    async def is_onepassword_instance_default_allowed(self, organization_id: str) -> bool:
+        return True
+
+    def onepassword_instance_default_policy_mode(self) -> str:
+        return "unrestricted"
+
     def supports_sequential_credentials(self) -> bool:
         """Whether this deployment can execute credentials marked run_sequentially."""
         return False
@@ -1480,6 +1487,22 @@ class AgentFunction:
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
 
+    async def admit_recipe_step_attempt(
+        self,
+        task: Task,
+        step: Step,
+        *,
+        is_cached: bool,
+    ) -> bool:
+        """Atomically admit a cloud recipe step; OSS has no recipe billing."""
+        del task, step, is_cached
+        return False
+
+    async def is_recipe_step_attempt(self, task: Task, step: Step) -> bool:
+        """Return persisted recipe authority; OSS has no recipe billing."""
+        del task, step
+        return False
+
     async def validate_block_execution(
         self, block: BlockTypeVar, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None
     ) -> None:
@@ -1776,6 +1799,28 @@ class AgentFunction:
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
+
+    def captcha_solver_lifecycle_scope(self, page: Page | RecordingPage) -> AbstractAsyncContextManager[None]:
+        """Async scope entered exactly once around a captcha-solve ladder invocation.
+
+        A deployment can bind a page-scoped solver lifecycle for the duration of the solve and always
+        release it on exit; the OSS base is a no-op so a self-hosted build behaves exactly as before.
+        """
+        return nullcontext()
+
+    def resolve_captcha_solver_extension_timeout(self, page: Page | RecordingPage, default_timeout: float) -> float:
+        """The wait budget for the direct ladder's solver-extension arm, resolved inside the solver scope.
+
+        OSS returns the ladder's own default unchanged. A deployment whose solver runs a longer out-of-band
+        verification while engaged overrides this to widen the window so a slow legitimate solve is not cut off.
+        """
+        return default_timeout
+
+    async def is_captcha_solver_completion_confirmed(self, page: Page | RecordingPage, default_result: bool) -> bool:
+        """Confirm a direct-ladder arm's own success verdict against a deployment's completion truth; OSS
+        returns it unchanged. A vendor override narrows it (a token seeded while the challenge is still open
+        is not yet a real completion) so the solver scope is not disarmed early."""
+        return default_result
 
     async def resolve_google_credential_id(self, organization_id: str, credential_id: str) -> str:
         """Accept a Google connection name or account email wherever a credential id is expected.
@@ -2701,9 +2746,15 @@ class AgentFunction:
         organization_id: str,
         edited_by: str | None,
         workflow_permanent_id: str | None = None,
+        *,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> None:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
-        return None
+        return
 
     async def on_workflow_run_completed(
         self,
@@ -2714,7 +2765,7 @@ class AgentFunction:
         workflow_run: WorkflowRun | None = None,
     ) -> None:
         """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
-        return None
+        return
 
     async def on_task_completed(
         self,
@@ -2736,9 +2787,33 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
         credential_type: CredentialType,
+        actor_user_id: str | None = None,
+        vault: str | None = None,
     ) -> None:
         """Fired after a credential is persisted. Overrides must be best-effort and never raise."""
-        return None
+        return
+
+    async def on_api_key_validated(
+        self,
+        organization_id: str,
+        token_id: str,
+        user_agent: str | None = None,
+        fern_language: str | None = None,
+    ) -> None:
+        """Fired after an API key is successfully validated. Overrides must be best-effort."""
+        return
+
+    async def on_integration_connected(
+        self,
+        organization_id: str,
+        provider: str,
+        credential_id: str,
+        is_reconnect: bool,
+        actor_user_id: str | None,
+        connected_at: datetime | None = None,
+    ) -> None:
+        """Fired after an OAuth credential is durably promoted. Overrides must be best-effort."""
+        return
 
     async def on_run_created(
         self,
@@ -2749,7 +2824,7 @@ class AgentFunction:
         caller_type: CallerType,
     ) -> None:
         """Fired after any run type is created; run_type is attribution only. Overrides must be best-effort."""
-        return None
+        return
 
     async def on_workflow_run_terminal(
         self,
@@ -2759,4 +2834,4 @@ class AgentFunction:
         status: WorkflowRunStatus,
     ) -> None:
         """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
-        return None
+        return

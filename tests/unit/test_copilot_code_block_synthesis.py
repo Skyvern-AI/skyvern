@@ -1435,6 +1435,29 @@ class TestParamKeySafety:
         assert "fill(str(page))" not in result.code
         assert "fill(str(page_field))" in result.code
 
+    @pytest.mark.parametrize(
+        ("name", "expected_key"),
+        [("Round", "round_field"), ("Abs", "abs_field")],
+        ids=["round", "abs"],
+    )
+    def test_numeric_builtin_names_are_reserved(self, name: str, expected_key: str) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector=f'role=textbox[name="{name}"]',
+                    source_url="https://example.com/",
+                    typed_length=4,
+                    role="textbox",
+                    accessible_name=name,
+                )
+            ]
+        )
+
+        assert result is not None
+        assert result.parameters == [{"key": expected_key}]
+        assert f"fill(str({expected_key}))" in result.code
+
     def test_leading_digit_name_is_valid_identifier(self) -> None:
         result = synthesize_code_block(
             [

@@ -1,0 +1,96 @@
+{
+  "source": "build_workflow_run_status_response and the run-timeline flattener, captured before the projection change",
+  "workflow_run_id": "wr_557490972913685478",
+  "status": "completed",
+  "outputs": {
+    "code_block_1_output": {
+      "result": "redacted"
+    },
+    "code_block_2_output": {
+      "result": "redacted"
+    },
+    "extracted_information": {
+      "result": null
+    }
+  },
+  "errors": [],
+  "downloaded_files": [],
+  "webhook_failure_reason": null,
+  "blocks": [
+    {
+      "workflow_run_block_id": "wrb_557490994388522006",
+      "block_type": "code",
+      "label": "code_block_2",
+      "status": "completed",
+      "modified_at": "2026-07-31T07:49:48.468668",
+      "created_at": "2026-07-31T07:49:47.185731",
+      "actions": []
+    },
+    {
+      "workflow_run_block_id": "wrb_557490972913685488",
+      "block_type": "code",
+      "label": "code_block_1",
+      "status": "completed",
+      "modified_at": "2026-07-31T07:49:47.164605",
+      "created_at": "2026-07-31T07:49:42.126520",
+      "actions": [
+        {
+          "action_id": "act_557490990093554702",
+          "action_type": "click",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 6,
+          "screenshot_artifact_id": "a_557490990093554704"
+        },
+        {
+          "action_id": "act_557490985798587402",
+          "action_type": "input_text",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 5,
+          "screenshot_artifact_id": "a_557490990093554700"
+        },
+        {
+          "action_id": "act_557490985798587398",
+          "action_type": "input_text",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 4,
+          "screenshot_artifact_id": "a_557490985798587400"
+        },
+        {
+          "action_id": "act_557490981503620098",
+          "action_type": "input_text",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 3,
+          "screenshot_artifact_id": "a_557490985798587396"
+        },
+        {
+          "action_id": "act_557490981503620094",
+          "action_type": "input_text",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 2,
+          "screenshot_artifact_id": "a_557490981503620096"
+        },
+        {
+          "action_id": "act_557490977208652794",
+          "action_type": "click",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 1,
+          "screenshot_artifact_id": "a_557490981503620092"
+        },
+        {
+          "action_id": "act_557490972913685494",
+          "action_type": "goto_url",
+          "status": "completed",
+          "step_id": "stp_557490972913685492",
+          "action_order": 0,
+          "screenshot_artifact_id": "a_557490977208652792"
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
+from tests.unit.conftest import ScopeRecordingAgentFunction
 
 
 class FakeLocator:
@@ -763,3 +764,95 @@ async def test_token_arm_skipped_when_ladder_budget_exhausted(monkeypatch: pytes
         await solve_challenge_ladder(page)
 
     agent_function.solve_recaptcha_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ladder_wraps_solve_in_neutral_lifecycle_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The direct callers (Task V3, code blocks) reach the vendor solver only through this scope, so it
+    # must open once, resolve the extension window INSIDE the open scope, arm the solver, then close —
+    # the ordering that lets a deployment widen the window for a solver it armed on scope entry.
+    agent_function = ScopeRecordingAgentFunction(auto_solve=True)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    assert await solve_challenge_ladder(FakePage(hcaptcha=True)) is True
+    assert agent_function.events == ["enter", "resolve", "solve", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_ladder_lifecycle_scope_closes_when_challenge_unsolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Even when every arm fails and the ladder raises, the scope must still close on the way out so a
+    # vendor solver is never left armed past the solve.
+    agent_function = ScopeRecordingAgentFunction(auto_solve=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    with pytest.raises(CaptchaChallengeUnsolvedError):
+        await solve_challenge_ladder(FakePage(hcaptcha=True, recaptcha=True))
+
+    assert agent_function.events[0] == "enter"
+    assert agent_function.events[-1] == "exit"
+    assert "solve" in agent_function.events
+
+
+@pytest.mark.parametrize("default_timeout", [12.0, 90.0])
+def test_base_resolver_returns_default_extension_timeout_unchanged(default_timeout: float) -> None:
+    # OSS has no background solver: the resolver hands the ladder's own default (generic 12 / hCaptcha 90) back.
+    assert AgentFunction().resolve_captcha_solver_extension_timeout(object(), default_timeout) == default_timeout
+
+
+class _SlowExtensionSolverAgent(AgentFunction):
+    """A solver whose extension arm outlasts the generic bound; the resolver decides whether it gets room to
+    finish. ``resolved=None`` returns the default unchanged (an unarmed/OSS deployment)."""
+
+    def __init__(self, *, resolved: float | None) -> None:
+        self._resolved = resolved
+
+    def resolve_captcha_solver_extension_timeout(self, page: object, default_timeout: float) -> float:
+        return default_timeout if self._resolved is None else self._resolved
+
+    async def auto_solve_captchas(self, page: object) -> bool:
+        await asyncio.sleep(0.05)
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("resolved", "solved"), [(0.5, True), (None, False)])
+async def test_ladder_honors_resolved_extension_timeout(
+    monkeypatch: pytest.MonkeyPatch, resolved: float | None, solved: bool
+) -> None:
+    # Generic bound shrunk below the solve time: only the deployment-resolved (widened) window lets the slow
+    # solver finish; the default cuts it off and the ladder raises. A ladder ignoring the resolver fails here.
+    monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", _SlowExtensionSolverAgent(resolved=resolved))
+    if solved:
+        assert await solve_challenge_ladder(FakePage(turnstile=True)) is True
+    else:
+        with pytest.raises(CaptchaChallengeUnsolvedError):
+            await solve_challenge_ladder(FakePage(turnstile=True))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirm", "expected_events"),
+    [
+        (True, ["enter", "confirm", "exit"]),
+        (False, ["enter", "confirm", "resolve", "solve", "exit"]),
+    ],
+)
+async def test_ladder_anchor_completion_gate_runs_inside_scope(
+    monkeypatch: pytest.MonkeyPatch, confirm: bool, expected_events: list[str]
+) -> None:
+    # The anchor arm's checked+fresh-token exit is gated by is_captcha_solver_completion_confirmed, probed
+    # INSIDE the open scope: confirmed exits at the anchor; unconfirmed falls through to the extension solver.
+    agent_function = ScopeRecordingAgentFunction(auto_solve=True, confirm=confirm)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    anchor = FakeLocator(count=1)
+    parent_frame = FakePage(token_values=["", "opaque-token"])
+    page = FakePage(
+        recaptcha=True,
+        frames=[
+            FakeFrame(url="https://www.google.com/recaptcha/api2/anchor", anchor=anchor, parent_frame=parent_frame)
+        ],
+    )
+
+    assert await solve_challenge_ladder(page) is True
+    assert agent_function.events == expected_events

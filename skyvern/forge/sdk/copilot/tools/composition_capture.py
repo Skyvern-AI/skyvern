@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     unresolved_requested_targets,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import author_time_levers
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _requested_output_labels_by_path
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
@@ -1425,6 +1426,7 @@ async def _inspect_page_for_composition_under_custody(
             )
     else:
         copilot_ctx.composition_page_evidence = evidence
+    _attach_author_time_levers(copilot_ctx, evidence)
 
     if not bypass_budget_for_post_run_current_page:
         copilot_ctx.page_inspection_calls_this_turn += 1
@@ -1487,3 +1489,13 @@ async def _inspect_page_for_composition_under_custody(
             captured_at=visual_fallback_frame.captured_at,
         )
     return result
+
+
+def _attach_author_time_levers(copilot_ctx: Any, evidence: dict[str, Any]) -> None:
+    """A wall seen before any run gets the same lever inventory the run contract carries."""
+    challenge_state = evidence.get("challenge_state")
+    if not isinstance(challenge_state, dict) or challenge_state.get("detected") is not True:
+        return
+    challenge_state["levers"] = [
+        lever.model_dump(mode="json", exclude_none=True) for lever in author_time_levers(copilot_ctx)
+    ]

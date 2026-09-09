@@ -47,6 +47,8 @@ class WorkflowRunTriggerType(StrEnum):
     - api: Direct API call to the run endpoint
     - scheduled: Triggered by a cron schedule
     - webhook: Triggered by an external system via the webhook endpoint
+    - job_recipe_extract: Launched by a job recipe extract request
+    - job_recipe_apply: Launched by a job recipe apply request
     """
 
     manual = "manual"
@@ -54,6 +56,8 @@ class WorkflowRunTriggerType(StrEnum):
     api = "api"
     scheduled = "scheduled"
     webhook = "webhook"
+    job_recipe_extract = "job_recipe_extract"
+    job_recipe_apply = "job_recipe_apply"
 
 
 MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
@@ -66,3 +70,15 @@ MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
 
 def is_manual_like_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
     return trigger_type in MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES
+
+
+JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
+    {
+        WorkflowRunTriggerType.job_recipe_extract,
+        WorkflowRunTriggerType.job_recipe_apply,
+    }
+)
+
+
+def is_job_recipe_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
+    return trigger_type in JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES

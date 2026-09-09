@@ -71,7 +71,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamResponseUpdate,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
-from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
+from tests.copilot_policy_support import authoring_barred_policy, screen_interrupted_proposal
+from tests.unit.conftest import make_copilot_context
+from tests.unit.copilot_route_test_support import (
+    install_fake_create,
+    setup_new_copilot_mocks,
+    terminal_narrative_payload,
+)
 
 
 @pytest.fixture
@@ -242,22 +248,7 @@ def _turn_facts(**overrides: Any) -> dict[str, Any]:
 
 
 def _narrative_payload() -> dict[str, Any]:
-    return {
-        "turnId": "turn-1",
-        "turnIndex": 0,
-        "mode": "build",
-        "designStarted": True,
-        "designEnded": True,
-        "draft": None,
-        "blocks": [],
-        "terminal": "response",
-        "terminalMessage": "done",
-        "narrativeSummary": "done",
-        "priorBlockCount": None,
-        "designActivity": [],
-        "startedAt": None,
-        "endedAt": None,
-    }
+    return terminal_narrative_payload()
 
 
 @pytest.mark.asyncio
@@ -1294,6 +1285,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         proposal_disposition="auto_applicable",
         turn_outcome=None,
@@ -1458,6 +1450,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -1538,6 +1531,7 @@ async def test_v2_route_never_persists_unscreened_user_message(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -1595,6 +1589,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -1666,6 +1661,7 @@ async def test_pre_agent_config_error_uses_default_turn_index_during_recovery(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -1727,6 +1723,7 @@ async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pendi
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -1760,6 +1757,65 @@ async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pendi
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert not clear_calls, f"keep_pending_proposal=True must survive restore-driven recovery, got {update_calls!r}"
+
+
+@pytest.mark.asyncio
+async def test_route_error_on_a_barred_turn_keeps_the_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    # Route-level pin: the route must forward authoring_barred into the recovery
+    # rebuild. Asserting only inside _build_recoverable_route_agent_result leaves
+    # the route's decision to supply it free to be deleted.
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=screen_interrupted_proposal(),
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    policy = await authoring_barred_policy("screen_unavailable", ctx=make_copilot_context(), organization_id="org-1")
+    agent_result = agent_module._build_request_policy_clarification_result(
+        policy,
+        prior_global_llm_context=None,
+        prior_workflow_yaml=None,
+        ctx=make_copilot_context(),
+    )
+    assert agent_result.authoring_barred is True
+
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise RuntimeError("post-agent route boom")
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assert len(finalise_results) == 2
+    assert finalise_results[1].authoring_barred is True
+    assert finalise_results[1].clear_proposed_workflow is False
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert not [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
 
 
 @pytest.mark.asyncio
@@ -1800,6 +1856,7 @@ async def test_route_error_honors_real_agent_explicit_clear_despite_keep_pending
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=True,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -1876,6 +1933,7 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         has_staged_proposal=True,
         proposal_disposition="auto_applicable",
@@ -1939,6 +1997,7 @@ async def test_finalise_normal_turn_clears_stale_proposal_when_rollback_itself_f
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -2005,6 +2064,7 @@ async def test_route_error_recovery_clears_stale_proposal_when_its_own_rollback_
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -2081,6 +2141,7 @@ async def test_route_error_before_write_keeps_older_proposal_despite_attempted_f
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         has_staged_proposal=False,
         proposal_disposition="review_untested",
@@ -2151,6 +2212,7 @@ async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_p
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         has_staged_proposal=False,
         proposal_disposition="review_untested",
@@ -2266,6 +2328,7 @@ async def test_proposed_workflow_cleared_on_restore(
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=clear_proposed_flag,
+        authoring_barred=False,
         resolved_model=None,
         proposal_disposition="auto_applicable",
         turn_outcome=None,
@@ -2360,6 +2423,7 @@ async def test_verified_code_only_fix_stays_pending_without_auto_accept(
         workflow_yaml="title: Applied",
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         proposal_disposition="auto_applicable",
         has_staged_proposal=True,
@@ -2426,6 +2490,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         response_type="ASK_QUESTION",
         output_policy_diagnostics={
@@ -2497,6 +2562,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(
         workflow_yaml="title: WIP",
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         proposal_disposition="review_untested",
         total_tokens=42,
@@ -2570,6 +2636,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         updated_workflow=SimpleNamespace(title="built", model_dump=lambda mode: {"title": "built"}),
         workflow_yaml="title: built\n",
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         proposal_disposition="review_tested",
         cancelled=False,
@@ -2592,6 +2659,7 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
     fields: dict[str, object] = dict(
         updated_workflow=None,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         proposal_disposition="review_untested",
         cancelled=False,
@@ -2855,6 +2923,98 @@ async def test_persist_state_auto_applicable_without_staged_commit_still_protect
     )
 
     app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["screen_unavailable", "raw_secret"])
+@pytest.mark.parametrize("auto_accept_unvalidated", [False, True])
+async def test_persist_state_authoring_barred_turn_preserves_proposal_bytes(
+    monkeypatch: pytest.MonkeyPatch, kind: str, auto_accept_unvalidated: bool
+) -> None:
+    proposal = screen_interrupted_proposal()
+    if auto_accept_unvalidated:
+        proposal["_copilot_unvalidated"] = True
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=auto_accept_unvalidated,
+        proposed_workflow=proposal,
+    )
+    original = json.dumps(proposal, sort_keys=True)
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    policy = await authoring_barred_policy(kind, ctx=make_copilot_context(), organization_id="org-1")
+    assert policy.allow_update_workflow is False
+
+    agent_result = agent_module._build_request_policy_clarification_result(
+        policy,
+        prior_global_llm_context=None,
+        prior_workflow_yaml=None,
+        ctx=make_copilot_context(),
+    )
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    assert agent_result.authoring_barred is True
+    assert agent_result.clear_proposed_workflow is False
+    app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+    assert json.dumps(chat.proposed_workflow, sort_keys=True) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authoring_barred", [False, True])
+async def test_persist_state_recovered_result_honors_authoring_barred(
+    monkeypatch: pytest.MonkeyPatch, authoring_barred: bool
+) -> None:
+    proposal = screen_interrupted_proposal()
+    proposal["_copilot_unvalidated"] = True
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=True,
+        proposed_workflow=proposal,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    recovered, _ = workflow_copilot_route._build_recoverable_route_agent_result(
+        RuntimeError("provider blew up mid-turn"),
+        workflow_modified=False,
+        clear_proposed_workflow=True,
+        authoring_barred=authoring_barred,
+        global_llm_context=None,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, recovered, restored=False)
+
+    assert recovered.authoring_barred is authoring_barred
+    assert recovered.clear_proposed_workflow is not authoring_barred
+    assert (chat.proposed_workflow is None) is not authoring_barred
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["screen_unavailable", "raw_secret"])
+async def test_barred_clarification_result_is_never_cancelled(kind: str) -> None:
+    """The cancel handler clears a proposal without consulting ``authoring_barred``.
+
+    It is only unreachable for a barred turn because such a turn is never marked
+    cancelled, so that is pinned here rather than left to the reader.
+    """
+    policy = await authoring_barred_policy(kind, ctx=make_copilot_context(), organization_id="org-1")
+
+    agent_result = agent_module._build_request_policy_clarification_result(
+        policy,
+        prior_global_llm_context=None,
+        prior_workflow_yaml=None,
+        ctx=make_copilot_context(),
+    )
+
+    assert agent_result.authoring_barred is True
+    assert getattr(agent_result, "cancelled", False) is False
 
 
 _NOW = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
@@ -3742,6 +3902,7 @@ async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,
@@ -4145,6 +4306,7 @@ def _diagnose_run_mocks(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        authoring_barred=False,
         resolved_model=None,
         turn_outcome=None,
         cancelled=False,

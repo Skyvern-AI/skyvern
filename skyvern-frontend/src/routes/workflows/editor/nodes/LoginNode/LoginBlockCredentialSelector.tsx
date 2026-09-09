@@ -262,6 +262,7 @@ function LoginBlockCredentialSelector({
       ),
     [onePasswordItemsQuery.data],
   );
+  const onePasswordItemsSource = onePasswordItemsQuery.data?.source;
 
   const selectedSkyvernCredentialParameter = useMemo(() => {
     if (!value) return undefined;
@@ -1300,6 +1301,23 @@ function LoginBlockCredentialSelector({
             : "h-auto min-h-10 w-full",
         }}
       />
+      {onePasswordItemsQuery.isError ? (
+        <p className="mt-2 text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
+          Couldn&apos;t load 1Password items. Check the 1Password token in
+          Settings.
+        </p>
+      ) : onePasswordItemsSource === "instance_default" ? (
+        <p className="mt-2 text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
+          Using the instance default 1Password account. Items cannot be listed
+          here; add a 1Password credential parameter with the vault and item IDs
+          instead.
+        </p>
+      ) : onePasswordItemsQuery.data?.configured === false &&
+        onePasswordItemsSource === null ? (
+        <p className="mt-2 text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
+          Connect 1Password in Settings to use 1Password items.
+        </p>
+      ) : null}
       {fallbackMode ? (
         <p className="mt-2 text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
           Credential rotation can&apos;t be combined with fallback credentials.

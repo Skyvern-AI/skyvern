@@ -944,7 +944,12 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         AsyncMock(return_value=False),
     )
 
-    async def _attach_trace(_blocks: list[object], results: list[dict[str, object]], _organization_id: str) -> None:
+    async def _attach_trace(
+        _blocks: list[object],
+        results: list[dict[str, object]],
+        _organization_id: str,
+        include_completed: bool = False,
+    ) -> None:
         results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": 4}]
 
     monkeypatch.setattr(run_execution, "_attach_action_traces", _attach_trace)

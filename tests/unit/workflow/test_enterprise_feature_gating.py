@@ -180,6 +180,7 @@ def test_collects_gated_model_on_split_pdf_block() -> None:
         ("claude-opus-4-7", "Anthropic Claude 4.7 Opus"),
         ("claude-opus-4-8", "Anthropic Claude 4.8 Opus"),
         ("claude-fable-5", "Anthropic Claude Fable 5"),
+        ("claude-fable-5-1", "Anthropic Claude Fable 5.1"),
         ("claude-opus-5", "Anthropic Claude Opus 5"),
     ],
 )

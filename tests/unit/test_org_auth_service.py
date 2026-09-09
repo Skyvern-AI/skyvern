@@ -279,7 +279,7 @@ async def test_get_current_org_cached_coalesces_concurrent_cache_misses(monkeypa
     release_validation = asyncio.Event()
     resolve_calls = 0
 
-    async def resolve_api_key(_api_key: str, _db: object) -> SimpleNamespace:
+    async def resolve_api_key(_api_key: str, _db: object, **_: object) -> SimpleNamespace:
         nonlocal resolve_calls
         resolve_calls += 1
         validation_started.set()
@@ -312,7 +312,7 @@ async def test_get_current_org_cached_does_not_recache_after_invalidation_during
     release_validation = asyncio.Event()
     resolve_calls = 0
 
-    async def resolve_api_key(_api_key: str, _db: object) -> SimpleNamespace:
+    async def resolve_api_key(_api_key: str, _db: object, **_: object) -> SimpleNamespace:
         nonlocal resolve_calls
         resolve_calls += 1
         if resolve_calls == 1:
@@ -1053,7 +1053,7 @@ async def test_basic_auth_header_is_not_treated_as_a_skyvern_token(
 async def test_basic_auth_header_does_not_shadow_a_valid_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     organization = _make_org("org-basic-with-key")
 
-    async def resolve(x_api_key: str, db: object) -> Organization:
+    async def resolve(x_api_key: str, db: object, **_: object) -> Organization:
         return organization
 
     monkeypatch.setattr(org_auth_service, "get_current_org_cached", resolve)

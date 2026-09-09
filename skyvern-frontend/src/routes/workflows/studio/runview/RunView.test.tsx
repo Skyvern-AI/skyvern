@@ -44,6 +44,7 @@ import type {
 import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
 import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneViewToggles } from "./RunPaneHeader";
+import capturedRun from "../__fixtures__/completed-code-block-run.json";
 import { RunView } from "./RunView";
 
 const mocks = vi.hoisted(() => ({
@@ -712,7 +713,7 @@ describe("RunView view toggles", () => {
     expect(scope.getByText("No inputs for this run")).not.toBeNull();
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
-    expect(scope.getByText("No outputs for this run")).not.toBeNull();
+    expect(scope.getByText("No output captured for this run")).not.toBeNull();
   });
 
   test("definition block prompts count as run inputs", () => {
@@ -1711,9 +1712,11 @@ describe("RunView timeline → editor jump", () => {
       {},
       "/?wr=wr_1&active=wrb_jump&panes=editor,overview",
     );
-    // The row's name is its index glued to the sr-only action type.
+    // The row's name is its status glyph label, index, and sr-only action type.
     fireEvent.click(
-      within(container).getByRole("button", { name: /^#1\s*Click$/ }),
+      within(container).getByRole("button", {
+        name: /^completed\s*#1\s*Click$/,
+      }),
     );
 
     expect(focusBlock).toHaveBeenCalledWith("node-jump");
@@ -1805,7 +1808,7 @@ describe("RunView output signals", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
 
-    expect(scope.queryByText("No outputs for this run")).toBeNull();
+    expect(scope.queryByText("No output captured for this run")).toBeNull();
     expect(scope.getByText("Run outputs")).not.toBeNull();
     expect(scope.getAllByText("get_stars_output").length).toBeGreaterThan(0);
     expect(scope.getByText("22600")).not.toBeNull();
@@ -1832,7 +1835,7 @@ describe("RunView output signals", () => {
     const scope = within(container);
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
-    expect(scope.getByText("No outputs for this run")).not.toBeNull();
+    expect(scope.getByText("No output captured for this run")).not.toBeNull();
     expect(scope.queryByText("Errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
   });
@@ -1878,7 +1881,7 @@ describe("RunView output signals", () => {
     );
     fireEvent.click(runView.getByRole("button", { name: "Outputs" }));
 
-    expect(runView.getByText("No outputs for this run")).not.toBeNull();
+    expect(runView.getByText("No output captured for this run")).not.toBeNull();
     expect(runView.queryByText(corroboratingProse)).toBeNull();
     expect(runView.queryByText("22.9k")).toBeNull();
 
@@ -1929,5 +1932,117 @@ describe("a run whose payload is still withheld", () => {
       "Run the workflow to watch it live here.",
     );
     expect(container.textContent).not.toContain("Workflow run is loading…");
+  });
+});
+
+describe("finished-run landing", () => {
+  const lastExecuted = capturedRun.blocks[0]!;
+  const actionBearing = capturedRun.blocks[1]!;
+
+  function seedCapturedCodeBlockRun(status: Status) {
+    mocks.timeline = capturedRun.blocks.map((block) =>
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: block.workflow_run_block_id,
+          block_type: "code",
+          label: block.label,
+          status: block.status as Status,
+          created_at: block.created_at,
+          modified_at: block.modified_at,
+          actions: block.actions.map((captured) =>
+            buildAction({
+              action_id: captured.action_id,
+              action_order: captured.action_order ?? 0,
+              step_id: captured.step_id ?? "step_default",
+              screenshot_artifact_id: captured.screenshot_artifact_id,
+            }),
+          ),
+        }),
+      ),
+    );
+    mocks.workflowRun = {
+      workflow_run_id: capturedRun.workflow_run_id,
+      status,
+      failure_reason: status === Status.Failed ? "the run failed" : null,
+      downloaded_file_urls: [],
+      downloaded_files: [],
+      errors: capturedRun.errors,
+      outputs: capturedRun.outputs,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  test("a completed run opens on its outputs and pins the block that finished last", async () => {
+    seedCapturedCodeBlockRun(Status.Completed);
+    renderRunView({}, "/?wr=wr_1");
+
+    await waitFor(() => {
+      expect(useRunViewStore.getState().pinnedFrameId).toBe(
+        lastExecuted.workflow_run_block_id,
+      );
+    });
+    expect(useRunPaneViewStore.getState().view).toBe("outputs");
+    expect(useRunViewStore.getState().pinnedFrameId).not.toBe(
+      actionBearing.actions[actionBearing.actions.length - 1]!.action_id,
+    );
+  });
+
+  // A deep link names what to show. Switching the pane off it would restore the
+  // selection and then hide it, so the URL and the pane disagree.
+  test.each([
+    [
+      "?active=",
+      `/?wr=wr_1&active=${capturedRun.blocks[1]!.actions[0]!.action_id}`,
+    ],
+    ["?bl=", "/?wr=wr_1&bl=code_block_2"],
+  ])(
+    "a completed run deep-linked with %s stays on the timeline",
+    async (_label, route) => {
+      seedCapturedCodeBlockRun(Status.Completed);
+      renderRunView({}, route);
+
+      await waitFor(() => {
+        expect(mocks.workflowRun).toBeDefined();
+      });
+      expect(useRunPaneViewStore.getState().view).toBe("timeline");
+    },
+  );
+
+  test("a failed run stays on the timeline so its failure stays on screen", async () => {
+    seedCapturedCodeBlockRun(Status.Failed);
+    renderRunView({}, "/?wr=wr_1");
+
+    await waitFor(() => {
+      expect(useRunViewStore.getState().pinnedFrameId).not.toBeNull();
+    });
+    expect(useRunPaneViewStore.getState().view).toBe("timeline");
+  });
+
+  test("a completed run with nothing to show says so rather than opening an empty pane", async () => {
+    seedCompletedRun({ outputs: null, errors: [{}] });
+    const { container } = renderRunView({}, "/?wr=wr_1");
+
+    await waitFor(() => {
+      expect(useRunPaneViewStore.getState().view).toBe("timeline");
+    });
+    act(() => {
+      useRunPaneViewStore.getState().setView("outputs");
+    });
+    expect(container.textContent).toContain("No output captured for this run");
+    expect(container.textContent).not.toContain("Errors");
+  });
+
+  test("a run whose status could not be loaded says so instead of loading forever", () => {
+    mocks.statusUnavailable = true;
+    mocks.workflowRun = undefined;
+    const { container } = renderRunView();
+
+    expect(container.textContent).toContain("This run could not be loaded.");
+    expect(container.textContent).not.toContain("Workflow run is loading…");
+    expect(container.textContent).not.toContain(
+      "No output captured for this run",
+    );
   });
 });

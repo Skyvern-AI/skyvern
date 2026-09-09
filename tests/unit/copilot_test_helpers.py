@@ -35,6 +35,8 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Workflo
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 
 DISPATCHED_LOGIN_GATE_HTML = (
     "<html><head><title>Sign in</title></head><body><main>"
@@ -132,6 +134,100 @@ def _fake_workflow_run(status: str) -> SimpleNamespace:
     )
 
 
+def install_get_run_results_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    blocks: list[MagicMock],
+    run_status: str = "failed",
+    dispatch_to_worker: bool = True,
+    workflow_parameters: list[dict[str, str]] | None = None,
+    attach_action_traces: Callable[..., Awaitable[None]] | None = None,
+    recent_actions: list[MagicMock] | None = None,
+) -> SimpleNamespace:
+    """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with."""
+    run = SimpleNamespace(
+        status=run_status,
+        workflow_permanent_id="wpid-1",
+        workflow_id="wf-1",
+        failure_reason=None,
+        browser_session_id="pbs-1",
+    )
+    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=workflow_parameters or []))
+
+    class _AppStub:
+        class DATABASE:
+            class workflow_runs:
+                get_workflow_run = AsyncMock(return_value=run)
+
+            class workflows:
+                get_workflow = AsyncMock(return_value=None)
+                get_workflow_for_workflow_run = AsyncMock(return_value=workflow)
+
+            class observer:
+                get_workflow_run_blocks = AsyncMock(return_value=blocks)
+
+            class tasks:
+                get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
+
+        class AGENT_FUNCTION:
+            should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=dispatch_to_worker)
+
+    monkeypatch.setattr(run_execution_module, "app", _AppStub())
+    if attach_action_traces is not None:
+        monkeypatch.setattr(run_execution_module, "_attach_action_traces", attach_action_traces)
+    monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
+    monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", AsyncMock(return_value={}))
+    monkeypatch.setattr(run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None))
+    return SimpleNamespace(
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+        copilot_total_timeout_exceeded=False,
+        last_run_blocks_workflow_run_id=None,
+        dispatched_run_ids_this_turn=set(),
+    )
+
+
+def run_result_action_row(
+    task_id: str,
+    action_type: ActionType,
+    status: ActionStatus,
+    *,
+    code_line: int | None = None,
+) -> MagicMock:
+    action = MagicMock()
+    action.task_id = task_id
+    action.step_id = f"stp_{task_id}"
+    action.action_type = action_type
+    action.status = status
+    action.reasoning = None
+    action.element_id = None
+    action.response = None
+    action.output = {"code_line": code_line} if code_line is not None else None
+    return action
+
+
+def run_result_block_row(
+    label: str,
+    status: str,
+    final_url: str | None = None,
+    *,
+    failure_reason: str | None = None,
+    error_codes: list[str] | None = None,
+    task_id: str | None = None,
+) -> MagicMock:
+    row = MagicMock()
+    row.label = label
+    row.block_type = SimpleNamespace(name="code")
+    row.status = status
+    row.failure_reason = failure_reason
+    row.error_codes = error_codes or []
+    row.output = None
+    row.task_id = task_id
+    row.final_url = final_url
+    row.workflow_run_block_id = f"wrb_{label}"
+    return row
+
+
 async def install_run_blocks_harness(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -139,6 +235,7 @@ async def install_run_blocks_harness(
     polled_status: str,
     dispatch_to_worker: bool = False,
     terminal_blocks: list[WorkflowRunBlock] | None = None,
+    recent_actions: list[MagicMock] | None = None,
 ) -> dict[str, Any]:
     """Stub the collaborators an inline ``_run_blocks_and_collect_debug`` call reaches, with the
     polled run parked on ``polled_status`` so the watchdog decides the exit."""
@@ -167,6 +264,7 @@ async def install_run_blocks_harness(
     persisted_workflow_params = [p for p in workflow.workflow_definition.parameters if isinstance(p, WorkflowParameter)]
     database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
     database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
+    database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
     monkeypatch.setattr(forge_app, "DATABASE", database)
 
@@ -256,20 +354,46 @@ workflow_definition:
 """
 
 
-def terminal_extraction_block(status: str) -> WorkflowRunBlock:
+def terminal_extraction_block(
+    status: str,
+    *,
+    final_url: str | None = None,
+    label: str = "extract_heading",
+    failure_reason: str | None = None,
+    task_id: str | None = None,
+) -> WorkflowRunBlock:
     return WorkflowRunBlock(
-        label="extract_heading",
+        label=label,
         block_type=BlockType.EXTRACTION,
         status=status,
+        final_url=final_url,
+        task_id=task_id,
         failure_reason=(
-            'Timeout exceeded: waiting for locator("#heading") to be visible' if status == "failed" else None
+            (failure_reason or 'Timeout exceeded: waiting for locator("#heading") to be visible')
+            if status == "failed"
+            else None
         ),
-        workflow_run_block_id="wrb_extract_heading",
+        workflow_run_block_id=f"wrb_{label}",
         workflow_run_id="wr_paused",
         organization_id="org-1",
         created_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
         modified_at=datetime(2026, 4, 21, 12, 5, tzinfo=UTC),
     )
+
+
+SEARCH_THEN_SELECT_WORKFLOW_YAML = """
+title: search then select
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: extraction
+      label: run_search
+      url: https://fixture.test
+      data_extraction_goal: Extract the search results.
+    - block_type: extraction
+      label: select_first_result
+      data_extraction_goal: Extract the selected result.
+"""
 
 
 def page_only_failed_block() -> WorkflowRunBlock:

@@ -56,6 +56,15 @@ def test_merge_turn_summary_caps_activity(
         assert getattr(capped[-1], last_value_attr) == expected_last_value
 
 
+def test_blank_browser_run_survives_context_roundtrip() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary(
+        [{"tool": "test_workflow_from_blank_browser", "summary": "Login failed", "output_preview": "Missing login"}]
+    )
+    restored = StructuredContext.from_json_str(ctx.to_json_str())
+    assert restored.decisions_made == ["test_workflow_from_blank_browser: Login failed", "  output: Missing login"]
+
+
 def test_merge_turn_summary_records_resolved_credential_ids() -> None:
     ctx = StructuredContext()
     activity = [

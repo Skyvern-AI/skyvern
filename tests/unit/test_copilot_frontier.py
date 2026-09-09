@@ -1000,6 +1000,61 @@ def test_block_end_urls_keep_only_rows_that_can_anchor_a_resumed_frontier() -> N
     }
 
 
+def test_the_model_visible_end_urls_refuse_what_the_terminal_url_screen_refuses() -> None:
+    rows = [
+        _FakeRunBlockRow("login_to_site", "https://app.example.com/dashboard?token=*****"),
+        _FakeRunBlockRow("open_long_page", "https://app.example.com/" + "u" * 2100),
+        _FakeRunBlockRow("inspect_summary", "https://app.example.com/dashboard/logs"),
+    ]
+
+    anchors = tools._block_end_urls_by_label(rows)
+    visible = run_execution_module._model_visible_block_end_urls(rows)
+
+    assert set(anchors) == {"login_to_site", "open_long_page", "inspect_summary"}
+    assert visible == {"inspect_summary": "https://app.example.com/dashboard/logs"}
+
+
+def test_the_model_visible_end_urls_drop_every_query_and_refuse_a_rewritten_one() -> None:
+    rows = [
+        _FakeRunBlockRow("run_search", "https://app.example.com/directory/results?access_code=4A0XF9&q=cardiology"),
+        _FakeRunBlockRow("open_session", "https://app.example.com/home?access_token=abcdef1234567890xyz"),
+        _FakeRunBlockRow("browse_area", "https://app.example.com/directory?zip_code=90210&specialty=cardiology"),
+        _FakeRunBlockRow("inspect_summary", "https://app.example.com/dashboard/logs"),
+    ]
+    notices: list[str] = []
+
+    visible = run_execution_module._model_visible_block_end_urls(rows, notices)
+
+    assert visible == {
+        "run_search": "https://app.example.com/directory/results",
+        "browse_area": "https://app.example.com/directory",
+        "inspect_summary": "https://app.example.com/dashboard/logs",
+    }
+    assert notices == [
+        ("observed_block_end_urls omitted block(s): open_session: the recorded URL carried masked or secret material."),
+        (
+            "observed_block_end_urls reduced block(s) to their path: browse_area: the recorded URL carried a query "
+            "or fragment; run_search: the recorded URL carried a query or fragment."
+        ),
+    ]
+
+
+def test_the_model_visible_end_urls_refuse_a_userinfo_credential_whole() -> None:
+    rows = [
+        _FakeRunBlockRow("run_search", "https://svc:hunter2@app.example.com/directory/results?q=cardiology"),
+        _FakeRunBlockRow("browse_area", "https://app.example.com/directory/listings"),
+    ]
+    notices: list[str] = []
+
+    visible = run_execution_module._model_visible_block_end_urls(rows, notices)
+
+    assert visible == {"browse_area": "https://app.example.com/directory/listings"}
+    assert "hunter2" not in json.dumps(visible)
+    assert notices == [
+        "observed_block_end_urls omitted block(s): run_search: the recorded URL carried credentials in its host.",
+    ]
+
+
 def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() -> None:
     old = _FakeDefinition([_FakeBlock("click", "action", {"selector": "#a"}), _FakeBlock("download", "download_to_s3")])
     new = _FakeDefinition([_FakeBlock("click", "action", {"selector": "#b"}), _FakeBlock("download", "download_to_s3")])
@@ -3012,13 +3067,16 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
         block_outputs_to_seed: dict[str, Any] | None = None,
         frontier_start_label: str | None = None,
         force_fresh_session: bool = False,
+        execution_snapshot: Any = None,
+        explicit_blank: bool = False,
+        use_ephemeral_inputs: bool = True,
     ) -> dict[str, Any]:
         captured["requested"] = list(params["block_labels"])
         captured["has_staged_proposal"] = ctx.has_staged_proposal
         captured["executed"] = list(labels_to_execute or [])
         captured["frontier_start_label"] = frontier_start_label
         captured["force_fresh_session"] = force_fresh_session
-        captured["provenance"] = ctx.frontier_start_provenance or "unanchored"
+        captured["explicit_blank"] = explicit_blank
         return {"ok": True, "data": {}}
 
     async def _fake_verify(copilot_ctx: Any, result: dict[str, Any], handler_start: float) -> None:
@@ -3039,7 +3097,7 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
     assert captured["frontier_start_label"] == "open"
     assert captured["force_fresh_session"] is True
     assert captured["has_staged_proposal"] is True
-    assert captured["provenance"] == "initial"
+    assert captured["explicit_blank"] is True
 
 
 @pytest.mark.asyncio

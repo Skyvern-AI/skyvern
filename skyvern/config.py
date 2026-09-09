@@ -1143,6 +1143,18 @@ class Settings(BaseSettings):
                 "label": "Anthropic Claude Fable 5",
             }
 
+        # Anthropic Claude Fable 5.1: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-fable-5-1"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5.1_FABLE_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Fable 5.1",
+            }
+        else:
+            mapping["claude-fable-5-1"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5.1_FABLE",
+                "label": "Anthropic Claude Fable 5.1",
+            }
+
         # Anthropic Claude Opus 5: prefer Bedrock when enabled, fall back to direct API
         if self.ENABLE_BEDROCK_ANTHROPIC:
             mapping["claude-opus-5"] = {

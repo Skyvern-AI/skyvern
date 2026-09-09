@@ -108,3 +108,30 @@ it("rejects a date-only completion timestamp", () => {
   track.items[0]!.completed_at = "2026-09-01";
   expect(parseOnboardingTrack(track)).toBeNull();
 });
+
+// Reject malformed or contradictory server payloads before any surface renders.
+it.each([
+  ["null envelope", null],
+  ["wrong version", { ...validTrack(), version: "unknown" }],
+  ["unknown state", { ...validTrack(), state: "unknown" }],
+  ["unknown arm", { ...validTrack(), arm: "unknown" }],
+  ["missing items", { ...validTrack(), items: null }],
+  [
+    "non-object row",
+    { ...validTrack(), items: [null, ...validTrack().items.slice(1)] },
+  ],
+  ["incomplete completed state", { ...validTrack(), state: "completed" }],
+  [
+    "complete active state",
+    {
+      ...validTrack(),
+      completed_count: 8,
+      items: validTrack().items.map((item) => ({
+        ...item,
+        completed_at: "2026-09-01T00:00:00Z",
+      })),
+    },
+  ],
+])("rejects %s", (_, payload) => {
+  expect(parseOnboardingTrack(payload)).toBeNull();
+});

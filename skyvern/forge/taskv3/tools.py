@@ -24,7 +24,6 @@ import unicodedata
 import weakref
 from collections import deque
 from enum import Enum
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple
 
 import structlog
@@ -91,10 +90,9 @@ _RENDERED_TEXT_CUT = (
 def _escape_tags_in_text(text: str) -> str:
     """Neutralize start tags in a rendered-text result.
 
-    The alias layer's tag scanner runs over every page-content result and a page controls every byte
-    of its text, so a page printing `<input id="...">` as visible text would be handed the alias meant
-    for a real element. Only `<` is escaped: masking matches a selector by its literal spelling, so
-    escaping `"` or `&` would hide a quoted one from the pass that owns it.
+    A page controls every byte of its own visible text, so one printing `<input id="...">` as text
+    would otherwise hand the model something that reads as page structure in the one result that
+    carries none. Only `<` is escaped: `"` and `&` are ordinary text here.
     """
     return text.replace("<", "&lt;")
 
@@ -106,480 +104,17 @@ def _escape_tags_in_text(text: str) -> str:
 # observe / menu-opening click / look.
 _TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act|-sugg)?="[^"\\]+"\]$')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
-# transposed pair sends every later call to a selector that matches nothing. observe hands such a
-# selector out under a short alias instead, resolved back before any handler sees it.
+# transposed pair sends every later call to a selector that matches nothing. observe addresses its
+# own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
 _OPAQUE_ID_RUN_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]*[a-f])[0-9a-f]{12,}", re.I
 )
-# Lenient on purpose: the model may tag-qualify or unquote the handle; the number is what names it.
-_ALIAS_SELECTOR_RE = re.compile(r'^\s*[a-z]*\[data-tv3-ref=["\']?(\d+|\?)["\']?\]\s*$', re.I)
-# The attribute a raw value shared by more than one alias renders as: relabeling it to either alias
-# would hand the model a handle for the other instance, and "?" never resolves.
-_REDACTED_REF_ATTR = 'data-tv3-ref="?"'
-# Written only by this masking layer, never by a page: any pre-existing copy in fetched markup or an
-# exception message is stripped before it can be mistaken for one this layer minted. Captures the
-# value so a dedupe pass can tell a redacted "?" apart from a usable ref without a second regex.
-_DATA_TV3_REF_ATTR_RE = re.compile(r'\s+data-tv3-ref="([^"]*)"')
-# The same attribute left unterminated by a truncation: dropping it would eat the text the cut
-# appended after it, so it is defused in place instead (see `_strip_page_refs`).
-_CUT_TV3_REF_ATTR_RE = re.compile(r'\s+data-tv3-ref="(?=[^"]*\Z)')
-
-
-def _strip_page_refs(tag: str) -> str:
-    """Remove every data-tv3-ref a page wrote in ONE start tag. A cut one keeps its bytes but gains a
-    leading `?`, so the handle it spoofs resolves to no alias."""
-    return _CUT_TV3_REF_ATTR_RE.sub(r"\g<0>?", _DATA_TV3_REF_ATTR_RE.sub("", tag))
-
-
-# Precompiled so `_first_start_tag_span` can resume with `Pattern.search(text, pos)` (absolute
-# indices, no copy) instead of re.search on a freshly sliced `text[pos:]` each call.
-_START_TAG_OPEN_RE = re.compile(r"<[A-Za-z]")
-
-
-def _first_start_tag_span(text: str, pos: int = 0) -> tuple[int, int] | None:
-    # A start tag begins at `<` immediately followed by a letter: a closing tag or comment never
-    # anchors it, but prose naming a real tag (Playwright's "not a <select> element") does. Use
-    # `_owned_start_tag_span` when the span must actually carry an owned identity attribute; `>` is
-    # legal unescaped inside a quoted attribute value, so the tag ends at the first `>` outside quotes.
-    match = _START_TAG_OPEN_RE.search(text, pos)
-    if match is None:
-        return None
-    start = match.start()
-    quote: str | None = None
-    for i in range(start + 1, len(text)):
-        ch = text[i]
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in "\"'":
-            quote = ch
-        elif ch == ">":
-            return start, i
-    # No `>` at all: a tag a truncation or Playwright's `…` elision left open still spans to the end
-    # of the text, so a cut can never carry an identity attribute past the span-scoped masking passes.
-    return start, len(text)
-
-
-# A `<` inside a comment, CDATA section or raw-text element is page content, not markup: rewriting
-# there would corrupt the source `get_html` returns verbatim, so every element below (each of which
-# serializes its text children unescaped) is jumped over whole. `plaintext` has no end tag while
-# parsing, but the fragment serialization `get_html` reads still emits a `</plaintext>` closer.
-_RAW_TEXT_TAGS = (
-    "script",
-    "style",
-    "textarea",
-    "title",
-    "iframe",
-    "noscript",
-    "xmp",
-    "noembed",
-    "noframes",
-    "plaintext",
-)
-_SKIP_REGION_OPEN_RE = re.compile(r"<!--|<!\[CDATA\[|<[A-Za-z]")
-_TAG_NAME_RE = re.compile(r"<([A-Za-z][^\s/>]*)")
-_RAW_TEXT_CLOSE_RES = {name: re.compile(r"</" + name + r"\s*>", re.IGNORECASE) for name in _RAW_TEXT_TAGS}
-
-
-def _start_tag_spans(text: str) -> list[tuple[int, int]]:
-    """Every start-tag span in `text`, left to right; each search resumes from the previous span's end
-    via `pos`, so no suffix of `text` is ever copied — O(n) total, not O(n) per tag. Comment, CDATA and
-    raw-text regions are jumped over whole, so their contents are never mistaken for tags."""
-    spans: list[tuple[int, int]] = []
-    pos = 0
-    while pos < len(text):
-        opener = _SKIP_REGION_OPEN_RE.search(text, pos)
-        if opener is None:
-            break
-        if opener.group(0) in ("<!--", "<![CDATA["):
-            closer = "-->" if opener.group(0) == "<!--" else "]]>"
-            closed_at = text.find(closer, opener.end())
-            pos = len(text) if closed_at < 0 else closed_at + len(closer)
-            continue
-        span = _first_start_tag_span(text, opener.start())
-        if span is None:
-            break
-        start, end = span
-        spans.append((start, end))
-        pos = end
-        name = _TAG_NAME_RE.match(text, start)
-        tag_name = name.group(1).lower() if name is not None else ""
-        if tag_name in _RAW_TEXT_TAGS and not text[start:end].endswith("/"):
-            close_re = _RAW_TEXT_CLOSE_RES.get(tag_name)
-            close = close_re.search(text, end) if close_re is not None else None
-            pos = len(text) if close is None else close.end()
-    return spans
-
-
-def _map_start_tags(text: str, fn: Callable[[str, int], str]) -> str:
-    """Apply `fn(tag, start)` to each start-tag span in `text` only; everything between/outside spans
-    (prose, page text, an error message with no markup at all) passes through untouched. `start` is the
-    span's absolute offset, so a caller can tell one particular tag apart from every other one."""
-    out: list[str] = []
-    pos = 0
-    for start, end in _start_tag_spans(text):
-        out.append(text[pos:start])
-        out.append(fn(text[start:end], start))
-        pos = end
-    out.append(text[pos:])
-    return "".join(out)
-
-
-# The identity attributes observe's naturalSelector names, and the only ones whose value is a
-# selector a model can copy: a raw sitting in any of them has to be masked, whichever one the emitted
-# selector happened to use.
-_IDENTITY_ATTRS = ("id", "name", "data-testid")
-# CSS string escapes, as observe's `attr()` writes them (`\` and `"`) and as CSS.escape would: a hex
-# escape may swallow one following whitespace character, which is part of the escape, not the value.
-_CSS_ESCAPE_RE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\f\r]?|(.))", re.S)
-
-
-def _decode_css_escapes(value: str) -> str:
-    """The DOM attribute value a selector's quoted component spells: `[id="a\\"b"]` names `a"b`."""
-
-    def _decoded(match: re.Match[str]) -> str:
-        if match.group(1) is None:
-            return match.group(2)
-        code = int(match.group(1), 16)
-        return "\ufffd" if code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF else chr(code)
-
-    return _CSS_ESCAPE_RE.sub(_decoded, value)
-
-
-def _css_escape_attr_value(value: str) -> str:
-    """The spelling observe's `attr()` renders, which is also what Playwright's call log quotes."""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _serialize_attr_value(value: str) -> str:
-    """The spelling markup carries. Measured against real Chromium: an attribute value escapes these
-    three and nothing else — `<` and `>` are escaped in TEXT nodes, and stay literal in a value."""
-    return value.replace("&", "&amp;").replace('"', "&quot;").replace("\u00a0", "&nbsp;")
-
-
-@lru_cache(maxsize=1024)
-def _markup_spellings(raw: str) -> tuple[str, ...]:
-    """The only spelling a start tag can carry. Context-specific on purpose: the DOM ids `q&<uuid>`
-    and the literal `q&amp;<uuid>` share a spelling once the spellings are pooled, and an owner
-    matching markup by that pool would claim the other one's tag."""
-    return (_serialize_attr_value(raw),)
-
-
-@lru_cache(maxsize=1024)
-def _selector_spellings(raw: str) -> tuple[str, ...]:
-    """The spellings a selector quoted in an error message carries: CSS-escaped, as observe's `attr()`
-    writes it, and escaped a second time, which is what the call log's `locator("…")` line renders."""
-    once = _css_escape_attr_value(raw)
-    spellings = {once, _css_escape_attr_value(once)}
-    return tuple(sorted(spellings, key=lambda spelling: (-len(spelling), spelling)))
-
-
-@lru_cache(maxsize=1024)
-def _token_spellings(real: str) -> tuple[str, ...]:
-    """Every spelling of an emitted selector a tool's own text can carry: the selector itself, and the
-    one `{selector!r}` writes -- repr doubles a backslash and escapes the quote it wraps with, so a
-    selector holding `"` or `\\` is a substring of neither the raw one nor a CSS-escaped one. Taken
-    from repr itself, not rebuilt: a hand-built variant also spells the call log's nested escaping,
-    whose own pass writes the alias escaped to match, and would win the substitution from it."""
-    spellings = {real, repr(real)[1:-1]}
-    return tuple(sorted(spellings, key=lambda spelling: (-len(spelling), spelling)))
-
-
-@lru_cache(maxsize=1024)
-def _raw_spellings(raw: str) -> tuple[str, ...]:
-    """Every spelling any context can carry, for the two passes that are deliberately context-free:
-    the last-resort scrub and the leak check's no-run fallback. Longest first, so a substring pass
-    never lets a shorter spelling eat a longer one."""
-    spellings = {raw, *_markup_spellings(raw), *_selector_spellings(raw)}
-    return tuple(sorted(spellings, key=lambda spelling: (-len(spelling), spelling)))
-
-
-def _text_holds_raw(text: str, raw: str) -> bool:
-    return any(spelling in text for spelling in _raw_spellings(raw))
-
-
-def _text_holds_markup(text: str, raw: str) -> bool:
-    return any(spelling in text for spelling in _markup_spellings(raw))
-
-
-def _text_holds_selector(text: str, raw: str) -> bool:
-    return any(spelling in text for spelling in _selector_spellings(raw))
-
-
-@lru_cache(maxsize=1024)
-def _raw_opaque_runs(raw: str) -> tuple[str, ...]:
-    """The uuid/hex runs that made the value worth aliasing: they hold no character any escaping
-    layer rewrites, so every spelling of the value — modeled here or not — still contains them."""
-    return tuple(_OPAQUE_ID_RUN_RE.findall(raw))
-
-
-@lru_cache(maxsize=1024)
-def _bare_value_spellings(raw: str) -> tuple[str, ...]:
-    """What a tagless mention in an error message carries: the value itself, and its opaque runs —
-    the part that survives an escaping no pass models."""
-    spellings = {raw, *_raw_opaque_runs(raw)}
-    return tuple(sorted(spellings, key=lambda spelling: (-len(spelling), spelling)))
-
-
-def _text_holds_opaque_run(text: str, raw: str) -> bool:
-    """Spelling-independent presence test, for deciding whether masking actually got everything."""
-    runs = _raw_opaque_runs(raw)
-    return any(run in text for run in runs) if runs else _text_holds_raw(text, raw)
-
-
-# One start-tag attribute, quote-aware: a value ends at its own quote, or at whitespace when unquoted.
-_START_TAG_ATTR_RE = re.compile(r"""(?<=\s)([^\s=/<>"']+)\s*=\s*("[^"]*"|'[^']*'|[^\s"'<>=]+)""")
-
-
-def _blank_page_attr_values(tag: str) -> str:
-    def _blanked(match: re.Match[str]) -> str:
-        if match.group(1).lower() in _IDENTITY_ATTRS:
-            return match.group(0)
-        return match.group(1) + '=""'
-
-    return _START_TAG_ATTR_RE.sub(_blanked, tag)
-
-
-def _leak_check_text(text: str) -> str:
-    """`text` reduced to the places masking owns -- prose, selector text, bare mentions and the
-    identity attributes (matched case-insensitively) -- with every other start-tag attribute value
-    blanked. A raw id in a `for=`, `href=` or `aria-*` value is a page value masking deliberately
-    keeps, so its presence there is not evidence masking missed one."""
-    return _map_start_tags(text, lambda tag, _start: _blank_page_attr_values(tag))
-
-
-@lru_cache(maxsize=4096)
-def _identity_attr_re(attr: str, raw: str, with_space: bool = False) -> re.Pattern[str]:
-    """`attr="<raw>"` as markup spells it, left-boundary anchored so `id="R"` never matches inside
-    `data-testid="R"`. `with_space` consumes the attribute's own leading whitespace, for a drop."""
-    values = "|".join(re.escape(spelling) for spelling in _markup_spellings(raw))
-    return re.compile((r"\s+" if with_space else r"(?<=\s)") + re.escape(attr) + '="(?:' + values + ')"')
-
-
-def _tag_carries_raw(tag: str, attr: str, raw: str) -> bool:
-    return _identity_attr_re(attr, raw).search(tag) is not None
-
-
-def _owned_start_tag_span(text: str, owners: dict[tuple[str, str], set[str]]) -> tuple[int, int] | None:
-    # The requested element's own tag: the first start tag that actually carries one of the owned
-    # identity attributes, not merely the first `<letter` — prose like "not a <select> element" never
-    # qualifies, since it names no owned attribute. Left-boundary anchored like `plain_pattern` below:
-    # a bare substring test would let `id="R"` match inside `data-testid="R"` on an earlier tag.
-    for start, end in _start_tag_spans(text):
-        tag = text[start:end]
-        if any(_tag_carries_raw(tag, attr, raw) for attr, raw in owners):
-            return start, end
-    return None
-
-
-# Playwright's call log renders the element the locator actually resolved to on this line and only
-# there; an outerHTML anywhere else in a message is some other element, whatever the call asked for.
-_RESOLVED_TARGET_RE = re.compile(r"resolved to\s+(?:[a-z]+\s+)*$")
-
-
-def _names_resolved_target(text: str, owners: dict[tuple[str, str], set[str]]) -> bool:
-    span = _owned_start_tag_span(text, owners)
-    return span is not None and _RESOLVED_TARGET_RE.search(text[: span[0]]) is not None
-
-
-def _dedupe_single_tag_refs(tag: str, own_ref: str | None = None) -> str:
-    # Position-first-wins would let a redacted "?" (written for a raw value shared by several aliases)
-    # evict a real, usable handle that happens to sit later in the same tag; keep `own_ref` (the handle
-    # the caller queried with) if the tag carries it, else the first non-"?" ref, else the first "?",
-    # and drop every other data-tv3-ref in the tag.
-    matches = list(_DATA_TV3_REF_ATTR_RE.finditer(tag))
-    if len(matches) <= 1:
-        return tag
-    keeper_start = next(
-        (m.start() for m in matches if own_ref is not None and m.group(1) == own_ref),
-        next((m.start() for m in matches if m.group(1) != "?"), matches[0].start()),
-    )
-
-    def _drop_non_keeper(match: re.Match[str]) -> str:
-        return match.group(0) if match.start() == keeper_start else ""
-
-    return _DATA_TV3_REF_ATTR_RE.sub(_drop_non_keeper, tag)
-
-
-# An identity attribute a truncation cut mid-value has no closing quote, so the whole-attribute
-# rewrite below can never match it; only a tag left unterminated can hold one, since a span that
-# ended at `>` has balanced quotes.
-_CUT_IDENTITY_ATTR_RE = re.compile(r'\s(id|name|data-testid)="([^"]*)\Z')
-# Shortest raw head that names its owner: a shorter fragment identifies no element, and matching on
-# it would rewrite unrelated ids that merely open the same way.
-_CUT_RAW_PREFIX_MIN = 8
-
-
-def _shared_prefix_len(text: str, other: str) -> int:
-    limit = min(len(text), len(other))
-    length = 0
-    while length < limit and text[length] == other[length]:
-        length += 1
-    return length
-
-
-def _shared_raw_prefix(value: str, raw: str) -> tuple[int, int]:
-    """The longest prefix `value` shares with the markup spelling of `raw`, and that spelling's
-    length. A cut value is markup, so only that spelling can be a prefix of it."""
-    best = (0, 0)
-    for spelling in _markup_spellings(raw):
-        shared = _shared_prefix_len(value, spelling)
-        if shared > best[0]:
-            best = (shared, len(spelling))
-    return best
-
-
-def _prefix_run_start(raw: str) -> int:
-    """Index of the first opaque run in `raw`'s markup spelling, or 0 when it holds none — the offset
-    a shared prefix must clear before any of it counts toward `_CUT_RAW_PREFIX_MIN`."""
-    match = _OPAQUE_ID_RUN_RE.search(_markup_spellings(raw)[0])
-    return match.start() if match is not None else 0
-
-
-def _prefix_owners(value: str, owners: dict[tuple[str, str], set[str]]) -> set[tuple[str, str]]:
-    """The owner(s) a cut-mid-value attribute head plausibly names: only the raw(s) sharing the
-    LONGEST prefix with `value` at or above `_CUT_RAW_PREFIX_MIN`, and only when whatever follows
-    that shared prefix in `value` is empty or opens with the elision marker "…" — get_html's
-    truncation notice and Playwright's own elision both start with it, so anything else there is
-    real page content proving `value` is a different id that merely opens the same way. When the raw
-    holds an opaque run, the shared prefix must reach `_CUT_RAW_PREFIX_MIN` chars into that run, not
-    merely share the raw's constant lead-in (`question_`), which names no owner on its own."""
-    head = 0
-    matched: set[tuple[str, str]] = set()
-    for key in owners:
-        shared, _raw_len = _shared_raw_prefix(value, key[1])
-        if shared < _prefix_run_start(key[1]) + _CUT_RAW_PREFIX_MIN:
-            continue
-        suffix = value[shared:]
-        if suffix and not suffix.startswith("…"):
-            continue
-        if shared < head:
-            continue
-        if shared > head:
-            head, matched = shared, {key}
-        else:
-            matched.add(key)
-    return matched
-
-
-def _cut_value_owners(attr: str, value: str, owners: dict[tuple[str, str], set[str]]) -> set[tuple[str, str]]:
-    """Candidates restricted to owners minted for the SAME attribute the cut left open: a shared id
-    prefix is ordinary, so a cut inside `name="…"` matched against an `id` owner would stamp a clean,
-    resolvable handle for a different element."""
-    return _prefix_owners(value, {key: aliases for key, aliases in owners.items() if key[0] == attr})
-
-
-def _cut_value_foreign_owners(attr: str, value: str, owners: dict[tuple[str, str], set[str]]) -> set[tuple[str, str]]:
-    return _prefix_owners(value, {key: aliases for key, aliases in owners.items() if key[0] != attr})
-
-
-def _mask_cut_identity_attr(
-    tag: str,
-    owners: dict[tuple[str, str], set[str]],
-    own_alias: str | None,
-    ambiguous: set[tuple[str, str]],
-) -> str:
-    """Rewrite the head of a raw value a cut left unterminated to the open marker shape loop.py
-    canonicalizes (`data-tv3-ref="<n>` with no closing quote), keeping whatever the cut appended
-    after it (the truncation notice) byte-exact."""
-    match = _CUT_IDENTITY_ATTR_RE.search(tag)
-    if match is None:
-        return tag
-    attr, value = match.group(1), match.group(2)
-    matched = _cut_value_owners(attr, value, owners)
-    # The head names an owned raw, but only under a DIFFERENT attribute: no alias here would resolve
-    # to the element this fragment belongs to, so it is redacted rather than relabeled or left bare.
-    foreign = _cut_value_foreign_owners(attr, value, owners) if not matched else set()
-    if not matched and not foreign:
-        return tag
-    head = _shared_raw_prefix(value, next(iter(matched or foreign))[1])[0]
-    if not matched:
-        return f"{tag[: match.start()]} {_REDACTED_REF_ATTR[:-1]}{value[head:]}"
-    aliases = {alias for key in matched for alias in owners[key]}
-    ref = next(iter(aliases))[1:-1] if len(aliases) == 1 and not matched & ambiguous else _REDACTED_REF_ATTR
-    if own_alias is not None and own_alias in aliases:
-        ref = own_alias[1:-1]
-    return f"{tag[: match.start()]} {ref[:-1]}{value[head:]}"
-
-
-def _ambiguous_owners(
-    text: str,
-    owners: dict[tuple[str, str], set[str]],
-    absent_alias: str | None,
-    distinct_tags: bool = False,
-) -> set[tuple[str, str]]:
-    """Owner keys no single tag of `text` can claim: a raw more than one start tag carries names no one
-    element, so its alias is rendered only on the tag proven to be the requested one. `absent_alias`
-    counts as a carrier — its element's own tag exists (get_html returned its inner HTML) but is not
-    shown, so a tag here holding that raw is some other element. `distinct_tags` collapses repeated
-    identical tag text to one carrier, for a call log that reprints the same resolved-to element on
-    every retry; real markup leaves it False, since two identical tags there are duplicate elements."""
-    counts: dict[tuple[str, str], int] = {}
-    for key, aliases in owners.items():
-        if absent_alias is not None and absent_alias in aliases:
-            counts[key] = 1
-    seen_tags: set[str] = set()
-    for start, end in _start_tag_spans(text):
-        tag = text[start:end]
-        if distinct_tags:
-            if tag in seen_tags:
-                continue
-            seen_tags.add(tag)
-        cut = _CUT_IDENTITY_ATTR_RE.search(tag)
-        # A cut left the value unterminated: `_mask_cut_identity_attr` still rewrites its head, using
-        # the same longest-match arbitration, so the tag carries at most one owner here too.
-        cut_owners = _cut_value_owners(cut.group(1), cut.group(2), owners) if cut is not None else set()
-        # Counted per (attribute, raw): a tag is a carrier of an owner only when it holds that
-        # owner's OWN attribute, so a radio group sharing one `name` does not make every sibling a
-        # carrier of the first option's `id`. The mirrored attribute is still dropped below.
-        for key in owners:
-            if _tag_carries_raw(tag, key[0], key[1]) or key in cut_owners:
-                counts[key] = counts.get(key, 0) + 1
-    return {key for key, count in counts.items() if count > 1}
-
-
-def _mask_identity_attrs(
-    tag: str,
-    owners: dict[tuple[str, str], set[str]],
-    own_alias: str | None,
-    ambiguous: set[tuple[str, str]],
-) -> str:
-    """Rewrite a whole `id="<raw>"` (name, data-testid) attribute in ONE start tag to the alias
-    attribute. A raw value that more than one alias names, or that more than one tag of the answer
-    carries (`ambiguous`), is redacted instead, except in the requested element's own tag
-    (`own_alias` set), whose first occurrence renders the requested alias."""
-    for (attr, raw), aliases in owners.items():
-        if not _text_holds_markup(tag, raw):
-            continue
-        plain_pattern = _identity_attr_re(attr, raw)
-        if len(aliases) == 1 and (attr, raw) not in ambiguous:
-            tag = plain_pattern.sub(next(iter(aliases))[1:-1], tag)
-            continue
-        first = plain_pattern.search(tag)
-        if first is not None and own_alias is not None and own_alias in aliases:
-            tag = tag[: first.start()] + own_alias[1:-1] + plain_pattern.sub(_REDACTED_REF_ATTR, tag[first.end() :])
-        else:
-            tag = plain_pattern.sub(_REDACTED_REF_ATTR, tag)
-    # id/name mirroring is ordinary in form markup, and the attribute the emitted selector did NOT
-    # name is just as copyable a selector; it is dropped whole, leaving the one ref written above.
-    for raw in {raw for _attr, raw in owners}:
-        if not _text_holds_markup(tag, raw):
-            continue
-        for attr in _IDENTITY_ATTRS:
-            if (attr, raw) not in owners:
-                tag = _identity_attr_re(attr, raw, True).sub("", tag)
-    return _mask_cut_identity_attr(tag, owners, own_alias, ambiguous)
-
-
-# Every identity attribute an emitted selector names (id, name, data-testid — the attributes
-# observe's naturalSelector minds), wherever it sits in the compound: each one is masked out of
-# results and markup, so the value that triggered the alias never reaches the transcript.
-# The `#id` capture accepts exactly what `CSS.escape` leaves untouched — ASCII word characters, the
-# hyphen, and anything non-ASCII — since observe emits the bare `#` form only when that escape is a
-# no-op. A `\s` cutoff would stop at U+00A0 and mint no owner for an id holding one.
-_SELECTOR_ID_COMPONENTS_RE = re.compile(
-    r'\[(id|name|data-testid)="((?:[^"\\]|\\.)*)"\]|(#)((?:[A-Za-z0-9_-]|[^\x00-\x7f])+)'
-)
+# What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
+# prints `ref=12` and that exact string is the selector argument, so "copy it as printed" has one
+# reading. Deliberately not an attribute-selector shape and deliberately not bracketed -- the ref
+# namespace is a server-side table, and accepting a `[ref=12]` form would let a page that authors a
+# `ref` attribute collide with it, which is the wrong-element class this addressing exists to close.
+_REF_SELECTOR_RE = re.compile(r"^\s*ref=(\d+)\s*$")
 # Whitespace outside a quoted attribute value is a combinator: only hostAnchored composes selectors
 # that way, while a natural `[name="first name"]` keeps its single round trip.
 _TV3_QUOTED_VALUE_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
@@ -2537,8 +2072,8 @@ _LOOK_ENUM_JS = (
         let named = '';
         if (el.labels) { for (const l of el.labels) { named = (l.innerText || '').trim(); if (named) break; } }
         placeholder = (el.getAttribute('placeholder') || '').trim().replace(/\s+/g, ' ').slice(0, 2000);
-        // An opaque `name` is the identity observe hands out under an alias, not a label: printing
-        // it here would give the model the raw id back, in the one tool result masking never scans.
+        // An opaque `name` is an identity, not a label: printing it here would hand the model a raw
+        // id to retype, in a legend whose whole point is that it addresses by number instead.
         const nm = el.getAttribute('name') || '';
         label = (el.getAttribute('aria-label') || named || placeholder || valuable
           || el.innerText || el.getAttribute('title') || (_OPAQUE.test(nm) ? '' : nm) || '')
@@ -5650,6 +5185,16 @@ async () => {
     // repeats; a field's own control is the only thing a wrapper holds.
     const captioned = rec.tag === 'input' && /^(?:submit|button|reset|image)$/.test(rec.type || '');
     if ((rec.tag === 'input' && !captioned) || rec.tag === 'select' || rec.tag === 'textarea') labelOfControl.set(el, rec.label.slice(0, 140).replace(/\s+/g, ' ').trim());
+    // The element rides on its OWN record, under a name generated for this call in Python. There is
+    // then no second structure to misalign: every manipulation of `out` below carries each element
+    // with its own record. A rec->element lookup, or a parallel array, would each be an INDEPENDENT
+    // source of the pairing -- free to answer with a same-tag decoy for the record whose digest line
+    // the model reads, without disturbing the digest at all. The name stops a page that PRE-DEFINES
+    // an accessor for it -- nothing more: `out.push(rec)` below hands the record itself to a
+    // page-controlled function, which can enumerate it and transpose the element with another
+    // record's, whatever the property is called. What closes that is the act-time check in
+    // _resolve_ref, which requires the element the record NAMES to be the one carrying the act token.
+    rec[__OBSERVE_EL_KEY__] = el;
     out.push(rec);
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
@@ -6011,14 +5556,70 @@ async () => {
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
 
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  // Ref identity. The same NODE keeps the same ref across observe() calls, so a frozen page renders an
+  // identical digest and a ref read earlier still names the element it described. Held in a WeakMap,
+  // never an attribute: nothing lands in the markup for a page to plant, echo back, or collide with.
+  let refsFresh = false;
+  if (!(window.__tv3_refs instanceof WeakMap)) { window.__tv3_refs = new WeakMap(); window.__tv3_ref_next = 1; refsFresh = true; }
+  if (typeof window.__tv3_ref_next !== 'number' || !isFinite(window.__tv3_ref_next)) window.__tv3_ref_next = 1;
+  // Only the ref NUMBER goes through these, never the pairing: a page that polluted the prototype
+  // before this ran owns whatever they return, so Python treats the ids as untrusted -- it rejects a
+  // repeat or a tag change within one reading and mints its own.
+  const _wmGet = WeakMap.prototype.get, _wmSet = WeakMap.prototype.set;
+  // Defined, not assigned: `outEls[k] = el` is a [[Set]] and would invoke an inherited accessor a
+  // page had installed for that index, which discriminates -- it can swap an Element while leaving
+  // `out`'s own record writes alone. defineProperty creates an own property and never calls a setter.
+  // ACCEPTED RESIDUAL: a page that replaced Object.defineProperty ITSELF before this ran can still
+  // substitute here. Closing it means capturing pristine intrinsics from an init script at context
+  // creation, and add_init_script is a known anti-bot detection surface in this stack (see the
+  // hCaptcha note in the cloud browser factory, where its one use is flag-gated to non-hCaptcha sites
+  // for exactly that reason). Adding that surface to every run to close one targeted vector is the
+  // wrong trade under an anti-bot-first priority. The structural answer below it is running observe
+  // in an isolated world, which is a separate change.
+  const outEls = [];
+  for (let k = 0; k < out.length; k++) {
+    const rec = out[k];
+    const el = rec[__OBSERVE_EL_KEY__] || null;
+    delete rec[__OBSERVE_EL_KEY__];
+    Object.defineProperty(outEls, String(k), { value: el, enumerable: true, configurable: true });
+    let r = null;
+    if (el) {
+      try { r = _wmGet.call(window.__tv3_refs, el); } catch (e) { r = null; }
+      if (typeof r !== 'number') {
+        r = window.__tv3_ref_next++;
+        try { _wmSet.call(window.__tv3_refs, el, r); } catch (e) { r = null; }
+      }
+    }
+    rec.ref = typeof r === 'number' ? r : null;
+  }
+  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  return __OBSERVE_RETURN__;
 }
 """
 )
 
 
+def _observe_js_returning(expression: str, retain_width: int) -> str:
+    # Fresh per call and generated HERE, not in the page: the record property the element rides on
+    # cannot be targeted by a page that poisoned Object.prototype before this script ran, because the
+    # name did not exist then. Same principle as the act token.
+    key = f'"__tv3el_{secrets.token_hex(8)}"'
+    return (
+        _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
+        .replace("__OBSERVE_RETURN__", expression, 1)
+        .replace("__OBSERVE_EL_KEY__", key)
+    )
+
+
 def observe_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
-    return _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
+    return _observe_js_returning("payload", retain_width)
+
+
+def observe_handles_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
+    # One evaluate for the digest AND the live elements behind it, handed back on the returned object
+    # rather than through a global: `els[N]` is the element `elements[N]` describes, it is read in the
+    # same continuation that built it, and a page cannot define an accessor to intercept a local.
+    return _observe_js_returning("{ json: payload, els: outEls }", retain_width)
 
 
 _OBSERVE_JS = observe_js()
@@ -6432,6 +6033,10 @@ def build_browser_tools(
         window = opaque_url_echo_window(opaque_refs.refs.values()) if opaque_refs is not None else 0
         return observe_js(max(OBSERVE_RETAIN_WIDTH_MIN, OBSERVE_FIELD_DISPLAY_MAX + window))
 
+    def _observe_handles_js() -> str:
+        window = opaque_url_echo_window(opaque_refs.refs.values()) if opaque_refs is not None else 0
+        return observe_handles_js(max(OBSERVE_RETAIN_WIDTH_MIN, OBSERVE_FIELD_DISPLAY_MAX + window))
+
     def _resolve_text(text: str) -> str:
         # Workflow credential values reach the model only as secret placeholders; resolve them to the
         # real value at fill time (the same boundary the step engine uses). Fail open to the literal.
@@ -6457,247 +6062,19 @@ def build_browser_tools(
     # Unguessable by the page, so a planted data-tv3-act cannot be adopted as an element identity.
     _act_prefix = f"a{secrets.token_hex(4)}"
     _act_token_re = re.compile(re.escape(_act_prefix) + r"[0-9]+")
-    # Opaque-id aliases, run-scoped and stable: the same emitted selector maps to the same alias for
-    # the whole run, like opaque_url_ tokens, so the model never handles the raw identifier.
-    _alias_for_selector: dict[str, str] = {}
-    _selector_for_alias: dict[str, str] = {}
-
-    def _alias_for(selector: str) -> str:
-        if not _OPAQUE_ID_RUN_RE.search(selector):
-            return selector
-        alias = _alias_for_selector.get(selector)
-        if alias is None:
-            alias = f'[data-tv3-ref="{len(_alias_for_selector) + 1}"]'
-            _alias_for_selector[selector] = alias
-            _selector_for_alias[alias] = selector
-        return alias
-
-    def _alias_components(real: str) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        for m in _SELECTOR_ID_COMPONENTS_RE.finditer(real):
-            attr = "id" if m.group(3) else m.group(1)
-            # Keyed by the DOM value, never the selector's spelling of it: `[id="a\"b"]` and the
-            # markup's `id="a&quot;b"` are the same attribute, and only the value joins them.
-            raw = m.group(4) if m.group(3) else _decode_css_escapes(m.group(2))
-            if raw and _OPAQUE_ID_RUN_RE.search(raw):
-                out.append((attr, raw))
-        return out
-
-    def _alias_owners() -> dict[tuple[str, str], set[str]]:
-        owners: dict[tuple[str, str], set[str]] = {}
-        for real, alias in _alias_for_selector.items():
-            for component in _alias_components(real):
-                owners.setdefault(component, set()).add(alias)
-        return owners
-
-    def _mask_aliases(
-        text: str,
-        markup: bool = False,
-        own_alias: str | None = None,
-        absent_alias: str | None = None,
-        distinct_tags: bool = False,
-    ) -> str:
-        # data-tv3-ref is never a legitimate page attribute (only this layer writes it), so any
-        # pre-existing copy is stripped up front — otherwise a page could spoof the owner loop below
-        # into dropping a real handle instead of minting one. Scoped to start tags only: a model's own
-        # selector echoed back verbatim in an error string (no markup, no `<`) is not touched.
-        text = _map_start_tags(text, lambda tag, _start: _strip_page_refs(tag))
-        # The emitted selector -> its alias only as a whole token (never inside an attribute value or a
-        # longer identifier) and never in markup, where the rewritten attribute IS the handle; the
-        # same raw id also sits in hrefs, style rules and prose, and rewriting those corrupts what the
-        # model reads. Every spelling of every selector, longest first, so a host-anchored one is not
-        # half-masked by its host's and a repr'd one is not missed for the spelling it is not.
-        if not markup:
-            tokens = [
-                (spelling, alias) for real, alias in _alias_for_selector.items() for spelling in _token_spellings(real)
-            ]
-            for spelling, alias in sorted(tokens, key=lambda pair: (-len(pair[0]), pair[0])):
-                if spelling in text:
-                    text = re.sub(r"(?<![\w#.\-])(?<!=[\"'])" + re.escape(spelling) + r"(?![\w\-])", alias, text)
-        # The identity-attribute rewrite runs INSIDE start tags only: an `id="<raw>"` sitting in a
-        # script body, a CSS rule, a comment or a text node is page content, and rewriting it there
-        # corrupts what get_html returns verbatim. The requested element's own tag is located by the
-        # attribute it actually owns (not merely the first `<letter`) and matched by its offset.
-        owners = _alias_owners()
-        ambiguous = _ambiguous_owners(text, owners, absent_alias, distinct_tags=distinct_tags)
-        own_span = _owned_start_tag_span(text, owners)
-        own_start = own_span[0] if own_span is not None else None
-        own_match = _ALIAS_SELECTOR_RE.match(own_alias) if own_alias is not None else None
-        own_ref = own_match.group(1) if own_match is not None else None
-        # A tag can carry two opaque identities (id + data-testid), each minted its own alias above;
-        # every start tag is collapsed to at most one data-tv3-ref, the caller's own where it has it.
-        return _map_start_tags(
-            text,
-            lambda tag, start: _dedupe_single_tag_refs(
-                _mask_identity_attrs(tag, owners, own_alias if start == own_start else None, ambiguous),
-                own_ref if start == own_start else None,
-            ),
-        )
-
-    def _holds_owned_run(scoped: str) -> bool:
-        """Keyed on the opaque run, not on the spellings the masking passes enumerate: a detector that
-        shared their blind spot would call a spelling nobody modeled clean and re-raise it verbatim.
-        Every aliased selector's own run counts, not only the runs of the identity components parsed
-        out of it -- a selector shape that parses to no component still hands the model an alias;
-        `scoped` must already be `_leak_check_text`ed."""
-        if any(_text_holds_opaque_run(scoped, raw) for _attr, raw in _alias_owners()):
-            return True
-        return any(run in scoped for real in _alias_for_selector for run in _OPAQUE_ID_RUN_RE.findall(real))
-
-    def _leaks_owned_raw(text: str) -> bool:
-        return _holds_owned_run(_leak_check_text(text))
-
-    def _scrub_owned_spellings(text: str) -> str:
-        spellings = sorted(
-            {spelling for _attr, raw in _alias_owners() for spelling in _raw_spellings(raw)},
-            key=len,
-            reverse=True,
-        )
-        for spelling in spellings:
-            text = text.replace(spelling, f"[{_REDACTED_REF_ATTR}]")
-        return text
-
-    def _withheld_text(text: str, outcome: str) -> str:
-        """Last resort for a message masking could not clean: every spelling of every owned raw is
-        replaced outright, and a message that STILL names one is dropped rather than let through."""
-        # The scrub reaches page attribute values too, which is harmless here because it runs only
-        # once the gate has already fired on an occurrence masking owns; the completeness check below
-        # scopes first, since scrubbing a value can leave markup no attribute scan can read.
-        if _holds_owned_run(_scrub_owned_spellings(_leak_check_text(text))):
-            return f"browser tool {outcome}; details withheld because they name a masked element"
-        return _scrub_owned_spellings(text)
-
-    def _withheld_error(text: str) -> RuntimeError:
-        return RuntimeError(_withheld_text(text, "failed"))
-
-    def _mask_exception_text(text: str, own_alias: str | None = None) -> str:
-        # An error is not page content: whatever raw value survives the token/attribute masking
-        # (Playwright's call log quotes the resolved locator and the target's outerHTML) is replaced
-        # outright, so the transcript never sees the identifier the alias exists to hide.
-        if own_alias is not None and not _names_resolved_target(text, _alias_owners()):
-            # Only the "locator resolved to <...>" line is known to render the element this call
-            # acted on; any other tag may be a sibling that merely shares the raw id, so redact.
-            own_alias = None
-        text = _mask_aliases(text, own_alias=own_alias, distinct_tags=True)
-        # Playwright escapes a nested selector's quotes, so the exact-token pass above misses it;
-        # replace the whole `#raw`/`tag[attr="raw"]` component before the bare-value fallback below.
-        # A component is selector text, so only the CSS spellings can appear in it — the markup one
-        # belongs to the outerHTML the call log renders, which the start-tag pass above already took.
-        for (attr, raw), aliases in _alias_owners().items():
-            if not _text_holds_selector(text, raw):
-                continue
-            alias = next(iter(aliases)) if len(aliases) == 1 else f"[{_REDACTED_REF_ATTR}]"
-            alternatives = []
-            for spelling in _selector_spellings(raw):
-                alternatives.append(
-                    r"(?:[A-Za-z][\w-]*)?\[" + re.escape(attr) + r'=\\?["\']' + re.escape(spelling) + r'\\?["\']\]'
-                )
-                if attr == "id":
-                    alternatives.append(r"#" + re.escape(spelling) + r"(?![\w-])")
-            component_re = re.compile("|".join(alternatives))
-
-            def _replace_component(m: re.Match[str], alias: str = alias) -> str:
-                return alias.replace('"', '\\"') if "\\" in m.group(0) else alias
-
-            text = component_re.sub(_replace_component, text)
-        by_spelling: dict[str, set[str]] = {}
-        for (_attr, raw), aliases in _alias_owners().items():
-            for spelling in _bare_value_spellings(raw):
-                by_spelling.setdefault(spelling, set()).update(aliases)
-        # Longest spelling first, and boundary-anchored: an id that is a literal prefix of another
-        # aliased id (a common child-id convention, e.g. `X` / `X-listbox`) must not swallow the
-        # longer one. A spelling more than one alias can name — a shared raw, or an opaque run two
-        # aliased ids both embed — is redacted here even when own_alias is known: a bare, tagless
-        # mention names no element, so it is not evidence of which one is being talked about.
-        for spelling, aliases in sorted(by_spelling.items(), key=lambda kv: -len(kv[0])):
-            if spelling not in text:
-                continue
-            replacement = next(iter(aliases)) if len(aliases) == 1 else f"[{_REDACTED_REF_ATTR}]"
-            text = re.sub(r"(?<![\w-])" + re.escape(spelling) + r"(?![\w-])", replacement, text)
-        return text
-
-    def _with_alias_resolution(name: str, handler: ToolHandler) -> ToolHandler:
-        markup = name == "get_html"
-
-        async def wrapped(args: dict[str, Any]) -> ToolResult:
-            selector = args.get("selector")
-            alias_match = _ALIAS_SELECTOR_RE.match(selector) if isinstance(selector, str) else None
-            own_alias: str | None = None
-            if alias_match:
-                own_alias = f'[data-tv3-ref="{alias_match.group(1)}"]'
-                real = _selector_for_alias.get(own_alias)
-                if real is None:
-                    return ToolResult.error(
-                        f"{alias_match.group(0).strip()} is not a selector from the latest observe — re-observe and "
-                        "use a selector from the new observation"
-                    )
-                args = {**args, "selector": real}
-            try:
-                result = await handler(args)
-            except Exception as exc:
-                # Re-raised as the SAME type: a raise softened into ToolResult.error would read as a
-                # tool outcome to the wrappers and the loop, not as the failure it is.
-                if not _alias_for_selector:
-                    raise
-                masked_text = _mask_exception_text(str(exc), own_alias=own_alias)
-                if _leaks_owned_raw(masked_text):
-                    # Nothing the structured passes model reaches this occurrence (an id embedded in
-                    # a longer token, a spelling they miss); scrub it, or say nothing at all.
-                    raise _withheld_error(masked_text).with_traceback(exc.__traceback__) from None
-                if masked_text == str(exc):
-                    raise
-                masked_exc: BaseException
-                try:
-                    masked_exc = type(exc)(masked_text)
-                except Exception:
-                    # A constructor that rejects a lone masked message (needs more args, validates what
-                    # it is given): mutate in place instead, so the raise is still the original failure.
-                    exc.args = (masked_text,)
-                    masked_exc = exc
-                if _leaks_owned_raw(str(masked_exc)):
-                    # A custom __str__ can compose from attributes the masking never touched. The raw
-                    # value must not reach the transcript, even at the cost of the exception's type.
-                    raise _withheld_error(masked_text).with_traceback(exc.__traceback__) from None
-                raise masked_exc.with_traceback(exc.__traceback__) from None
-            if _alias_for_selector and isinstance(result.content, str):
-                page_content = markup and result.status == "ok"
-                # get_html's text format returns rendered text, which has no attribute a handle could
-                # go on: a selector printed there is prose the whole-token pass owns, not markup where
-                # the rewritten attribute would be the handle.
-                is_markup = page_content and not (result.data or {}).get("rendered_text")
-                if result.status != "ok":
-                    # A failure result is prose, not page content, and reaches the model exactly as a
-                    # raise does: it gets the same passes, including the ones a whole-token match
-                    # misses (a selector quoted by repr or by Playwright's call log).
-                    masked = _mask_exception_text(result.content, own_alias=own_alias)
-                else:
-                    # The caller's handle goes on the returned tag only when the handler reports it is
-                    # the requested element's own outer HTML; inner HTML may open with a descendant
-                    # that happens to share the raw id, and stamping the handle there aims the next
-                    # action at the container instead.
-                    own_tag_returned = is_markup and (result.data or {}).get("markup_scope") == "outer"
-                    # Its own tag is absent from a container's inner HTML but the element still exists,
-                    # so a tag here carrying its raw id is a descendant that merely shares it: redact,
-                    # never relabel, however few aliases that raw has.
-                    absent_alias = own_alias if is_markup and not own_tag_returned else None
-                    masked = _mask_aliases(
-                        result.content,
-                        markup=is_markup,
-                        own_alias=own_alias if own_tag_returned else None,
-                        absent_alias=absent_alias,
-                    )
-                if not page_content and _leaks_owned_raw(masked):
-                    # get_html's page content is exempt, markup and rendered text alike: a raw id in an
-                    # href, a script, prose or visible text is content it returns on purpose. Elsewhere
-                    # only the text is dropped, never the status — an outcome reported as its opposite
-                    # sends the model to redo a committed side effect.
-                    masked = _withheld_text(masked, "failed" if result.status != "ok" else "succeeded")
-                if masked != result.content:
-                    result = ToolResult(result.status, masked, result.data, result.screenshots)
-            return result
-
-        return wrapped
-
+    # Per-run observe manifest: public ref -> {handle, tag}. Replaced wholesale by each observe (the
+    # previous handles are disposed), so a ref the page no longer lists fails closed with a re-observe
+    # error instead of resolving to whatever now occupies its place.
+    _observe_manifest: dict[int, dict[str, Any]] = {}
+    _ref_seq = [0]
+    # The page-side WeakMap id -> (public ref, tag) it was issued for. The map lives in the page's
+    # realm, so it is not trusted for identity: an id that comes back describing a different tag is a
+    # different element and gets a NEW public ref rather than inheriting the old one's.
+    _public_ref_for_js: dict[int, tuple[int, str]] = {}
+    # The document the current manifest was read from. A reading describes ONE document; after a
+    # navigation every handle in it is dead, and re-querying a remembered selector would resolve it
+    # against a page the model never saw.
+    _observe_document: list[str] = []
     _look_count = [0]  # per-run look() invocations, capped at _LOOK_MAX_PER_RUN
     # The (canonical URL, filled-field count) of the last same-URL reload the destructive-nav guard
     # refused. A repeat to that URL confirms intent and is allowed — but only if the at-risk state has
@@ -6747,14 +6124,104 @@ def build_browser_tools(
         # the driver also rewrites some unrelated protocol errors into this message.
         return "execution context was destroyed" in str(exc).lower()
 
+    async def _read_observation(page: Any) -> tuple[dict[str, Any], list[Any]]:
+        payload = await page.evaluate_handle(_observe_handles_js())
+        # Each get_property is its own remote-object reference, and observe runs on nearly every turn:
+        # dropping them on the floor accumulates two orphans per call for the life of the document.
+        holders: list[Any] = [payload]
+        try:
+            json_handle = await payload.get_property("json")
+            holders.append(json_handle)
+            raw = await json_handle.json_value()
+            els_handle = await payload.get_property("els")
+            holders.append(els_handle)
+            props = await els_handle.get_properties()
+        finally:
+            for holder in holders:
+                try:
+                    await holder.dispose()
+                except Exception:
+                    pass
+        handles: list[Any] = []
+        for i in range(len(props)):
+            prop = props.get(str(i))
+            element = prop.as_element() if prop is not None else None
+            if element is None and prop is not None:
+                try:
+                    await prop.dispose()
+                except Exception:
+                    pass
+            handles.append(element)
+        return (json.loads(raw) if isinstance(raw, str) else raw), handles
+
     async def observe(_args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
             return error
-        # Bound the one perception call so a wedged page can't hang the turn indefinitely.
-        raw = await asyncio.wait_for(page.evaluate(_observe_js()), timeout=30)
-        data = json.loads(raw) if isinstance(raw, str) else raw
+        # Bound the whole acquisition -- the digest AND the handles behind it -- so a wedged page
+        # can't hang the turn indefinitely on a later round trip the first bound never covered.
+        data, handles = await asyncio.wait_for(_read_observation(page), timeout=30)
         elements = data.get("elements", [])
+        if len(handles) != len(elements):
+            # Both come from the same array in the same evaluate, so a length split means the page's
+            # realm rewrote one of them. Pair nothing rather than pair by guesswork: the reading still
+            # reaches the model, and every ref in it fails closed instead of naming the wrong element.
+            LOG.warning(
+                "taskv3 observe could not pair its reading with live elements",
+                elements=len(elements),
+                handles=len(handles),
+            )
+            for _unpaired in handles:
+                if _unpaired is None:
+                    continue
+                try:
+                    await _unpaired.dispose()
+                except Exception:
+                    pass
+            handles = [None] * len(elements)
+        if data.get("refsFresh"):
+            # A fresh document restarted the page-side numbering, so no id it hands back can be one an
+            # earlier document was issued.
+            _public_ref_for_js.clear()
+        # Carried over only for the elements THIS reading still lists. The manifest is replaced
+        # wholesale below, so an entry for an element the reading dropped names a ref no longer
+        # resolvable anyway -- keeping it would grow this map for the life of a page that never
+        # navigates. Bounded by observe's own element budget, not by an eviction rule of its own, so
+        # no ref the current reading carries can be evicted out from under the model.
+        _carried = dict(_public_ref_for_js)
+        _public_ref_for_js.clear()
+        for _old in _observe_manifest.values():
+            _old_handle = _old.get("handle")
+            if _old_handle is None:
+                continue
+            try:
+                await _old_handle.dispose()
+            except Exception:
+                pass
+        _observe_manifest.clear()
+        _observe_document[:] = [canonical_url(await _url(page))]
+        _seen_js: set[int] = set()
+        for _idx, e in enumerate(elements):
+            _tag = str(e.get("tag") or "")
+            _js_ref = e.get("ref")
+            _js_ref = _js_ref if isinstance(_js_ref, int) and not isinstance(_js_ref, bool) else None
+            _prior = _carried.get(_js_ref) if _js_ref is not None else None
+            # A repeated id within one reading, or one that now describes a different tag, is not the
+            # element it was issued for: mint a new public ref rather than let two digest lines share
+            # one, or let a remembered ref inherit a replacement.
+            if _prior is None or _prior[1] != _tag or _js_ref in _seen_js:
+                _ref_seq[0] += 1
+                _public = _ref_seq[0]
+            else:
+                _public = _prior[0]
+            if _js_ref is not None:
+                _public_ref_for_js[_js_ref] = (_public, _tag)
+                _seen_js.add(_js_ref)
+            e["ref"] = _public
+            # The selector rides along as the RE-RESOLVE path, not as an address: a framework that
+            # replaces its nodes on every render detaches the handle, where the selector observe
+            # computed for that element still names it. See _resolve_ref.
+            _observe_manifest[_public] = {"handle": handles[_idx], "tag": _tag, "selector": e.get("selector") or ""}
         omitted_anonymous = data.get("unnamedAnonymous") or 0
         omitted_duplicated = data.get("unnamedDuplicated") or 0
         omitted_unverifiable = data.get("unnamedUnverifiable") or 0
@@ -6978,8 +6445,7 @@ def build_browser_tools(
             elif e.get("role"):
                 kind += "/" + _digest_token(e["role"], 40)
             lines.append(
-                f"[{_alias_for(e['selector'])}] {kind} "
-                f"{_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])!r}{extra}"
+                f"ref={e['ref']} {kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])!r}{extra}"
             )
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
@@ -7003,8 +6469,8 @@ def build_browser_tools(
         return ToolResult.ok(_mask_refs("\n".join(lines)), data={"count": len(elements), "summary": summary})
 
     async def _rendered_text_result(page: Any, selector: str | None) -> ToolResult:
-        # A text result carries no start tags of the page's own, so the one thing the alias layer
-        # must know is that this is prose: rendered_text routes it to the whole-token pass.
+        # rendered_text marks this result as prose rather than markup, which is what tells a reader
+        # of `data` that its content carries no start tags of the page's own.
         target = page
         if selector:
             target = await page.query_selector(selector)
@@ -7030,22 +6496,19 @@ def build_browser_tools(
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
             return ToolResult.error(f'unknown format {args.get("format")!r}: use "html" or "text"')
-        # Whether the requested element's OWN start tag is in the answer. The alias masking layer may
-        # only stamp the caller's handle on a tag it knows is that element's, never on a descendant.
-        markup_scope = "document"
+        # Whether the requested element's OWN start tag is in the answer, rather than only its
+        # descendants': `inner` markup opens with a child, which is a different element.
         if selector:
             el = await page.query_selector(selector)
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}")
             html = await el.inner_html()
-            markup_scope = "inner"
             if not html:
                 # Void/leaf elements have no inner HTML; their own tag+attributes are the answer,
                 # not an empty string the model can't distinguish from a missing element. Best
                 # effort: a navigation between the two reads must not turn "" into a tool error.
                 try:
                     html = await el.evaluate("el => el.outerHTML")
-                    markup_scope = "outer"
                 except Exception:
                     html = ""
         else:
@@ -7061,8 +6524,8 @@ def build_browser_tools(
         html = _mask_refs(html)
         if len(html) > HTML_MAX_CHARS:
             cut = _MARKUP_CUT if selector else _PAGE_MARKUP_CUT
-            return ToolResult.ok(html[:HTML_MAX_CHARS] + cut, data={"markup_scope": markup_scope})
-        return ToolResult.ok(html, data={"markup_scope": markup_scope})
+            return ToolResult.ok(html[:HTML_MAX_CHARS] + cut)
+        return ToolResult.ok(html)
 
     async def _unreachable_error(selector: str) -> ToolResult:
         # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
@@ -9893,6 +9356,69 @@ def build_browser_tools(
         legend = header + "\n" + "\n".join(lines)
         return ToolResult.ok(legend, data=renumbered, screenshots=[annotated])
 
+    async def _holders(page: Any, selector: str) -> int:
+        """How many elements the engine sees for `selector`, without leaking the handles it made.
+
+        Every identity judgement on the act path is a COUNT, and these run on every act rather than
+        once per document, so the probes cannot be left to the document's lifetime to clean up.
+        """
+        found: list[Any] = []
+        try:
+            found = list(await page.query_selector_all(selector))
+            return len(found)
+        finally:
+            for probe in found:
+                try:
+                    await probe.dispose()
+                except Exception:
+                    pass
+
+    async def _resolve_handle_selector(page: Any, handle: Any) -> str | None:
+        """A live element handle -> a selector this run's tools act through, or None when the
+        element no longer holds one alone. Shared by mark=N and ref=N so both inherit the same
+        server-side identity checks."""
+        # Every judgement below is made HERE, not in the page's realm. The read goes through
+        # Playwright's accessor, the format is matched against this run's own pattern, and the
+        # holder count comes from Playwright's engine -- so a page that patches its own RegExp,
+        # getAttribute or querySelectorAll cannot talk this into adopting a value it planted.
+        token = ""
+        try:
+            existing = await handle.get_attribute("data-tv3-act")
+        except Exception:
+            existing = None
+        if existing and _act_token_re.fullmatch(existing):
+            try:
+                # An inherited token is not an identity: cloneNode copies the attribute, so a
+                # duplicated control arrives already wearing one. Keep it only while its holder is
+                # alone -- counted by the engine that pierces open shadow roots, which is the domain
+                # the click gate and the in-flight probe both resolve in.
+                if await _holders(page, f'{_ACT_SELECTOR_PREFIX}{existing}"]') == 1:
+                    token = existing
+            except Exception:
+                token = ""
+        if not token:
+            # Never reissued, so no two elements can share one and no tag left on a page the run
+            # navigated away from can match a later selector.
+            _act_seq[0] += 1
+            minted = f"{_act_prefix}{_act_seq[0]}"
+            try:
+                if not bool(await handle.evaluate(_ACT_WRITE_HANDLE_JS, minted)):
+                    return None
+                # Read back through Playwright: a page that hijacks setAttribute can put the token
+                # on an element of its choosing, and an unverified write would hand back a selector
+                # naming that one instead of this. Confirming this element carries it is necessary
+                # but not sufficient -- the same trap can write it to a decoy AS WELL -- so the
+                # engine also has to agree the token has exactly one holder. This resolver must
+                # never hand back an ambiguous selector, whatever the callers downstream check.
+                if await handle.get_attribute("data-tv3-act") != minted:
+                    return None
+                if await _holders(page, f'{_ACT_SELECTOR_PREFIX}{minted}"]') != 1:
+                    return None
+            except Exception:
+                return None
+            token = minted
+        return f'{_ACT_SELECTOR_PREFIX}{token}"]'
+
     async def _resolve_mark(page: Any, mark: int) -> tuple[str | None, ToolResult | None]:
         # Turn mark=N into a selector the existing click/type handlers act through. Resolution is the
         # SAME live element handle look retained (Playwright's engine, which pierces open shadow), tagged
@@ -9913,47 +9439,10 @@ def build_browser_tools(
         )
         if handle is None:
             return None, stale
-        # Every judgement below is made HERE, not in the page's realm. The read goes through
-        # Playwright's accessor, the format is matched against this run's own pattern, and the
-        # holder count comes from Playwright's engine -- so a page that patches its own RegExp,
-        # getAttribute or querySelectorAll cannot talk this into adopting a value it planted.
-        token = ""
-        try:
-            existing = await handle.get_attribute("data-tv3-act")
-        except Exception:
-            existing = None
-        if existing and _act_token_re.fullmatch(existing):
-            try:
-                # An inherited token is not an identity: cloneNode copies the attribute, so a
-                # duplicated control arrives already wearing one. Keep it only while its holder is
-                # alone -- counted by the engine that pierces open shadow roots, which is the domain
-                # the click gate and the in-flight probe both resolve in.
-                if len(await page.query_selector_all(f'{_ACT_SELECTOR_PREFIX}{existing}"]')) == 1:
-                    token = existing
-            except Exception:
-                token = ""
-        if not token:
-            # Never reissued, so no two elements can share one and no tag left on a page the run
-            # navigated away from can match a later selector.
-            _act_seq[0] += 1
-            minted = f"{_act_prefix}{_act_seq[0]}"
-            try:
-                if not bool(await handle.evaluate(_ACT_WRITE_HANDLE_JS, minted)):
-                    return None, stale
-                # Read back through Playwright: a page that hijacks setAttribute can put the token
-                # on an element of its choosing, and an unverified write would hand back a selector
-                # naming that one instead of this. Confirming this element carries it is necessary
-                # but not sufficient -- the same trap can write it to a decoy AS WELL -- so the
-                # engine also has to agree the token has exactly one holder. This resolver must
-                # never hand back an ambiguous selector, whatever the callers downstream check.
-                if await handle.get_attribute("data-tv3-act") != minted:
-                    return None, stale
-                if len(await page.query_selector_all(f'{_ACT_SELECTOR_PREFIX}{minted}"]')) != 1:
-                    return None, stale
-            except Exception:
-                return None, stale
-            token = minted
-        return f'{_ACT_SELECTOR_PREFIX}{token}"]', None
+        selector = await _resolve_handle_selector(page, handle)
+        if selector is None:
+            return None, stale
+        return selector, None
 
     def _with_act_by_mark(handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
@@ -9984,10 +9473,170 @@ def build_browser_tools(
 
         return wrapped
 
+    async def _resolve_ref(page: Any, ref: int) -> tuple[str | None, ToolResult | None]:
+        # ref=N names an element by the live handle observe retained for it, not by anything the page
+        # wrote or could write, so a re-render that only replaces the NODE cannot re-aim it.
+        #
+        # The whole decision, exhaustively -- it is written out because three separate defects have
+        # come from patching one more case of it, twice introducing the next. Every row has a test
+        # that reds when its action is flipped (see the M-block in the lane's red-proofs record):
+        #
+        #   ref not in the LATEST reading .................. error, never another entry     [M1]
+        #   handle live + alone + tag ok + names-the-holder . act on the handle
+        #   handle live + alone + tag or holder mismatch .... stale error, NEVER re-resolve [M2]
+        #   handle absent / detached / no longer alone ...... re-resolve, and only here:
+        #       remembered names exactly 1 + tag ok ......... act on the replacement
+        #       0 matches, >1, tag mismatch, token fails .... stale error                   [M4]
+        #
+        # and names-the-holder, which decides whether the record's own selector still points at this
+        # handle -- the one check that ties the HANDLE back to the LINE:
+        #
+        #   composed query matches exactly 1 ............... the record's element IS this handle
+        #   remembered names nothing ....................... a stale selector is not evidence; the
+        #                                                    live handle stands                [M3]
+        #   remembered names something that is not it ...... a swap; refuse
+        #
+        # The "never re-resolve while live" row is the one that is easy to get wrong: the remembered
+        # selector can drift onto another live element on its own (a positional tail behind a newly
+        # inserted sibling), and adopting what it now names would swap a correct live element for a
+        # different one. A stale error costs a re-observe; that is bounded by the same turn budget as
+        # any other failing tool call, so even a page that provokes it forever terminates.
+        entry = _observe_manifest.get(ref)
+        if entry is None:
+            return None, ToolResult.error(
+                f"ref={ref} is not a ref from the latest observe — re-observe and use a ref from the new observation"
+            )
+        stale = ToolResult.error(
+            f"ref={ref} no longer points to an element on the page — it moved or the page re-rendered "
+            "since observe(). Call observe() again and act on a fresh ref.",
+            data={"page_state_changed": True},
+        )
+        expected = str(entry.get("tag") or "").lower()
+        remembered = str(entry.get("selector") or "")
+
+        async def _tagged_right(candidate: Any) -> bool:
+            # The digest line the model read named a tag; an element answering to a different one is
+            # a replacement, whatever the page's own bookkeeping says the ref still means.
+            try:
+                return not expected or str(await candidate.evaluate("(el) => el.tagName") or "").lower() == expected
+            except Exception:
+                return False
+
+        async def _names_the_holder(act_selector: str) -> bool:
+            # Ties the handle back to the LINE. Every other check here validates the HANDLE, which is
+            # exactly what a page that transposed the element between two records survives: the digest
+            # reads true and a different element is actuated. The record's own selector IS the line's
+            # identity, so the element it names must be the one now carrying this act token -- one
+            # composed query, resolved by Playwright's engine and never in the page's realm. That is
+            # what re-establishes correspondence outside the page world, so which intrinsic was
+            # poisoned to break the pairing stops mattering -- for every form but one.
+            #
+            # KNOWN RESIDUAL (SKY-15812), shipped deliberately at v1-parity rather than closed here:
+            # both operands of this check ride the same record across the same page-controlled
+            # `out.push`, so a page that transposes the element AND the selector TOGETHER keeps them
+            # consistent and this agrees. Closing it needs an operand the record never carried, i.e.
+            # running observe in an isolated world -- shared browser setup for v1, v2, MCP and
+            # cached-script execution, so it is its own change. It is not a regression: v1 mints its
+            # identity with a page-world setAttribute, keeps only the selector STRING, and resolves at
+            # act time on count()==1 with no comparison of the resolved node to what the model was
+            # shown -- the same class, with none of the three checks here. Pinned by
+            # test_a_coupled_transposition_is_the_one_form_still_open_and_this_pins_it.
+            if not remembered:
+                return True
+            try:
+                if await _holders(page, f"{remembered}{act_selector}") == 1:
+                    return True
+                # A remembered selector that names NOTHING is simply stale -- a marker the page moved
+                # or rolled back, an id it dropped. It is not evidence about the handle, which is live
+                # and alone, so the handle stands. Only a selector naming something that is NOT this
+                # handle is evidence of a swap.
+                return await _holders(page, remembered) == 0
+            except Exception:
+                return False
+
+        handle = entry.get("handle")
+        if handle is not None:
+            live = await _resolve_handle_selector(page, handle)
+            if live is not None:
+                # The handle is still on the page and alone, so it IS the identity. A mismatch here is
+                # refused rather than re-resolved: the remembered selector can drift off a live element
+                # on its own (a positional tail behind a newly inserted sibling), and adopting whatever
+                # it now names would swap a correct live element for a different one -- the very
+                # wrong-element commit the check above exists to prevent.
+                if await _tagged_right(handle) and await _names_the_holder(live):
+                    return live, None
+                return None, stale
+
+        # A ref is scoped to the document it was read from. Without this, a navigation the model never
+        # re-observed after leaves every handle dead and sends the fallback below to re-query the
+        # remembered selector in the NEW document, where a unique same-tag look-alike would be adopted
+        # as the element the model chose on the old page.
+        if _observe_document and _observe_document[0] != canonical_url(await _url(page)):
+            return None, stale
+        # Only now, with NO usable handle -- detached, or no longer alone on the page -- re-resolve.
+        # Never with a live one: that is what would let a drifted selector displace a correct element.
+        # A component that rebuilt itself between the reading and the act leaves a detached handle
+        # behind while the selector observe computed for that element still names it -- and a rebuild between observe and act is the ordinary case on a reactive page,
+        # not an edge one. The replacement is adopted only when the engine agrees the selector names
+        # exactly ONE element and that element answers to the tag the model was shown; anything else
+        # is an ambiguity this must never resolve for the model, so it errors instead.
+        if not remembered:
+            return None, stale
+        try:
+            matches = await page.query_selector_all(remembered)
+        except Exception:
+            return None, stale
+        selector = None
+        if len(matches) == 1 and await _tagged_right(matches[0]):
+            selector = await _resolve_handle_selector(page, matches[0])
+        if selector is None:
+            for spare in matches:
+                try:
+                    await spare.dispose()
+                except Exception:
+                    pass
+            return None, stale
+        if handle is not None:
+            try:
+                await handle.dispose()
+            except Exception:
+                pass
+        entry["handle"] = matches[0]
+        return selector, None
+
+    def _with_ref_resolution(handler: ToolHandler) -> ToolHandler:
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            selector = args.get("selector")
+            match = _REF_SELECTOR_RE.match(selector) if isinstance(selector, str) else None
+            if match is None:
+                return await handler(args)
+            page, error = await _resolve_page()
+            if error is not None:
+                return error
+            ref = int(match.group(1))
+            resolved, ref_error = await _resolve_ref(page, ref)
+            if ref_error is not None:
+                return ref_error
+            # In place, for the same reason act-by-mark does it: the persisted action's element_id,
+            # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
+            args["selector"] = resolved
+            durable = str((_observe_manifest.get(ref) or {}).get("selector") or "")
+            try:
+                return await handler(args)
+            finally:
+                # ...but those readers run turns LATER, and the act token is a stamp on one node: a
+                # control the page REPLACES after the act -- a submit button swapped for its
+                # "Submitting" version -- carries it away, and the in-flight probe fails open on a
+                # selector that resolves to nothing. Hand them back an address that re-resolves.
+                if durable:
+                    args["selector"] = durable
+
+        return wrapped
+
     tools = [
         _spec(
             "observe",
-            'Snapshot the page\'s visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. A selector printed as [data-tv3-ref="N"] is a short handle for a control whose real id is long and opaque; copy it exactly as printed. [data-tv3-ref="?"] in get_html output or an error message marks an element whose id several handles share and is not usable as a selector; act through the observe-printed handle instead. Also reports cross-origin iframes present (host + captcha signature); their contents cannot be observed or reached by selector. Call once per page, then act by selector.',
+            "Snapshot the page's visible interactive elements (raw DOM) with a handle, label, type, value, and options for each. Each element line starts with its address, `ref=N`; pass that exact string (e.g. ref=12, no brackets) as the selector argument of click/hover/type/select_option/etc to act on it. A ref names the element this reading described and keeps working while that element is on the page, including across a re-render that replaces it. If it becomes ambiguous or is gone, the tool errors instead of acting on something else — re-observe and use a ref from the new reading. Also reports cross-origin iframes present (host + captcha signature); their contents cannot be observed or reached. Call once per page, then act by ref.",
             _obj({}),
             observe,
         ),
@@ -9998,7 +9647,10 @@ def build_browser_tools(
             f"are capped at {HTML_MAX_CHARS} chars and say when they were cut.",
             _obj(
                 {
-                    "selector": {"type": "string", "description": "CSS selector; omit for whole page"},
+                    "selector": {
+                        "type": "string",
+                        "description": "observe ref (e.g. ref=12) or CSS selector; omit for whole page",
+                    },
                     "format": {
                         "type": "string",
                         "enum": ["html", "text"],
@@ -10020,7 +9672,7 @@ def build_browser_tools(
         ),
         _spec(
             "click",
-            "Click an element by CSS selector (or by mark=N from the last look()). If the click opens a "
+            "Click an element by its observe ref (e.g. ref=12), a CSS selector, or mark=N from the last look(). If the click opens a "
             'menu of options, the result lists them with [data-tv3-menu="N"] selectors — click one of '
             "those to select (verified: you get a loud error, not a silent no-op, if the selection does "
             "not commit; do not blindly repeat a failed click). If the click triggers a file download, "
@@ -10038,13 +9690,13 @@ def build_browser_tools(
         ),
         _spec(
             "hover",
-            "Hover over an element by CSS selector (e.g. to open a hover menu).",
+            "Hover over an element by its observe ref (e.g. ref=12) or a CSS selector (e.g. to open a hover menu).",
             _obj({"selector": {"type": "string"}}, ["selector"]),
             hover,
         ),
         _spec(
             "type",
-            "Type text into an input/textarea by CSS selector (or by mark=N from the last look()); "
+            "Type text into an input/textarea by its observe ref (e.g. ref=12), a CSS selector, or mark=N from the last look(); "
             "clears first by default.",
             _obj(
                 {
@@ -10112,7 +9764,7 @@ def build_browser_tools(
         _spec("navigate", "Navigate the browser to a URL.", _obj({"url": {"type": "string"}}, ["url"]), navigate),
         _spec(
             "file_upload",
-            "Upload a file (local path or URL) into a file input by CSS selector.",
+            "Upload a file (local path or URL) into a file input by its observe ref (e.g. ref=12) or a CSS selector.",
             _obj({"selector": {"type": "string"}, "file": {"type": "string"}}, ["selector", "file"]),
             file_upload,
         ),
@@ -10144,9 +9796,7 @@ def build_browser_tools(
             # Outside preflight (it builds its action from the normalized selector), inside act_by_mark
             # (mark=N resolves to a selector first), so every selector tool inherits the guard.
             diagnose = _diagnose_inert_target if _tool_spec.name in _INERT_DIAGNOSIS_TOOL_NAMES else None
-            _tool_spec.handler = _with_alias_resolution(
-                _tool_spec.name, _with_selector_guard(_tool_spec.handler, diagnose)
-            )
+            _tool_spec.handler = _with_ref_resolution(_with_selector_guard(_tool_spec.handler, diagnose))
         if _tool_spec.name in ("click", "type"):
             # OUTERMOST wrapper: resolve mark=N to a selector before preflight builds its action from
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)

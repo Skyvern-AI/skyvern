@@ -510,6 +510,9 @@ class Processor:
             sm.Hover(),
             sm.InputText(),
             sm.Select(),
+            # After InputText: an Enter that submits a field must record as the fill
+            # followed by the keypress, not replace it.
+            sm.PressKey(),
             sm.UrlChange(),
             sm.Wait(),
         ]
@@ -612,7 +615,7 @@ class Processor:
             action_kind = action.kind.value
 
             match action.kind:
-                case ActionKind.CLICK | ActionKind.HOVER | ActionKind.INPUT_TEXT:
+                case ActionKind.CLICK | ActionKind.HOVER | ActionKind.INPUT_TEXT | ActionKind.PRESS_KEY:
                     task = asyncio.create_task(self.create_action_block(action))
                     tasks.append(task)
                 case ActionKind.URL_CHANGE:

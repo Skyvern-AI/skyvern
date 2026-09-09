@@ -34,6 +34,7 @@ from skyvern.services.browser_recording.service import (
     deterministic_input_text_parameter_key,
     summarize_exfiltrated_recording_events,
 )
+from skyvern.services.browser_recording.state_machines.press_key import playwright_key
 from skyvern.services.browser_recording.types import (
     ActionClick,
     ActionInputText,
@@ -41,6 +42,7 @@ from skyvern.services.browser_recording.types import (
     ActionTarget,
     ActionUrlChange,
     ActionWait,
+    EventModifiers,
     ExfiltratedCdpEvent,
     ExfiltratedConsoleEvent,
     ExfiltratedEventCdpParams,
@@ -921,9 +923,20 @@ def test_decompress_returns_bytes_for_valid_payload() -> None:
     assert processor.decompress(payload) == raw
 
 
-def make_keydown_event(target: dict[str, t.Any], timestamp: float, key: str = "a") -> ExfiltratedConsoleEvent:
+def make_keydown_event(
+    target: dict[str, t.Any],
+    timestamp: float,
+    key: str = "a",
+    modifiers: dict[str, bool] | None = None,
+) -> ExfiltratedConsoleEvent:
     return make_console_event(
-        params={"type": "keydown", "key": key, "target": target, "timestamp": timestamp},
+        params={
+            "type": "keydown",
+            "key": key,
+            "target": target,
+            "timestamp": timestamp,
+            "modifiers": modifiers or {},
+        },
         timestamp=timestamp,
     )
 
@@ -1100,7 +1113,7 @@ def test_password_submitted_with_enter_still_emits_input_text() -> None:
     )
     actions = processor.events_to_actions(events)
 
-    assert len(actions) == 1
+    assert [a.kind for a in actions] == [ActionKind.INPUT_TEXT, ActionKind.PRESS_KEY]
     action = actions[0]
     assert isinstance(action, ActionInputText)
     assert action.input_value == ""
@@ -1453,6 +1466,38 @@ def test_select_placeholder_row_records_nothing() -> None:
     assert actions == []
 
 
+def test_enter_in_a_field_records_the_fill_and_the_submitting_keypress() -> None:
+    target = {"id": "search", "skyId": "sky-1", "tagName": "INPUT", "text": ["Search"], "value": "boots"}
+
+    events = [
+        make_console_event(params={"type": "focus", "target": target, "timestamp": 1000.0}, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="b"),
+        make_keydown_event(target=target, timestamp=1200.0, key="Enter"),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.INPUT_TEXT, ActionKind.PRESS_KEY]
+    assert actions[0].input_value == "boots"
+    assert actions[1].key == "Enter"
+
+
+def test_typing_a_character_records_no_keypress() -> None:
+    target = {"id": "search", "skyId": "sky-1", "tagName": "INPUT", "text": ["Search"], "value": "b"}
+
+    events = [
+        make_console_event(params={"type": "focus", "target": target, "timestamp": 1000.0}, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="b"),
+        make_keydown_event(target=target, timestamp=1200.0, key="o"),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert actions == []
+
+
 def test_secret_select_keeps_its_step_with_a_blank_value() -> None:
     """A card-expiry month is usually a <select autocomplete="cc-exp-month">.
 
@@ -1555,3 +1600,111 @@ def test_labelled_select_keeps_its_field_label() -> None:
 
     assert step.title == "Fill 'Country'"
     assert deterministic_input_text_parameter_key(actions[0]) == "country"
+
+
+def test_modifier_shortcut_records_as_a_playwright_key_expression() -> None:
+    target = {"id": "doc", "skyId": "sky-2", "tagName": "BODY", "text": []}
+
+    events = [make_keydown_event(target=target, timestamp=1000.0, key="s", modifiers={"meta": True})]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert len(actions) == 1
+    assert actions[0].kind == ActionKind.PRESS_KEY
+    assert actions[0].key == "Meta+s"
+
+
+@pytest.mark.parametrize(
+    ("key", "modifiers", "expected"),
+    [
+        ("Enter", {}, "Enter"),
+        ("Escape", {}, "Escape"),
+        ("Tab", {}, None),
+        ("a", {}, None),
+        (None, {}, None),
+        ("Control", {"ctrl": True}, None),
+        ("a", {"ctrl": True}, "Control+a"),
+        ("ArrowLeft", {"alt": True, "meta": True}, "Alt+Meta+ArrowLeft"),
+        # Shift is already folded into KeyboardEvent.key for character keys.
+        ("S", {"shift": True}, None),
+        # ...but not into named keys, where it changes what the key does.
+        ("Enter", {"shift": True}, "Shift+Enter"),
+        ("T", {"ctrl": True, "shift": True}, "Control+T"),
+        ("Tab", {"ctrl": True, "shift": True}, "Control+Shift+Tab"),
+        # Shift alone never promotes focus/selection noise into a gesture.
+        ("Tab", {"shift": True}, None),
+        ("ArrowLeft", {"shift": True}, None),
+        # Alt composes: KeyboardEvent.key is the composed character, not a shortcut.
+        ("@", {"ctrl": True, "alt": True}, None),
+        ("\u20ac", {"ctrl": True, "alt": True}, None),
+        ("\u2122", {"alt": True}, None),
+        # Alt with a named key is still a real shortcut.
+        ("ArrowLeft", {"alt": True}, "Alt+ArrowLeft"),
+    ],
+)
+def test_playwright_key_expressions(key: str | None, modifiers: dict[str, bool], expected: str | None) -> None:
+    assert playwright_key(key, EventModifiers(**modifiers)) == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "modifiers", "expected_key"),
+    [
+        ("Escape", {}, "Escape"),
+        ("v", {"ctrl": True}, "Control+v"),
+        ("a", {"ctrl": True}, "Control+a"),
+    ],
+)
+def test_keypress_mid_fill_keeps_the_input_text(key: str, modifiers: dict[str, bool], expected_key: str) -> None:
+    """A keypress that is part of filling a field must not discard the fill.
+
+    events_to_actions calls on_action on every machine after any emission, and the
+    input-text machine resets on anything but a click. Enter survives only because emit()
+    already reset; every other key would take the whole fill with it.
+    """
+    target = {"id": "search", "skyId": "sky-1", "tagName": "INPUT", "text": ["Search"], "value": "boots"}
+
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="b"),
+        make_keydown_event(target=target, timestamp=1200.0, key=key, modifiers=modifiers),
+        make_blur_event(target=target, timestamp=1300.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    # press_key lands first because the input-text machine only emits on blur.
+    assert [a.kind for a in actions] == [ActionKind.PRESS_KEY, ActionKind.INPUT_TEXT]
+    assert actions[0].key == expected_key
+    assert actions[1].input_value == "boots"
+
+
+def test_altgr_composed_character_records_only_the_fill() -> None:
+    """Typing an AltGr-composed character must not become a keypress step.
+
+    On a German layout "@" is AltGr+Q, which the browser reports as ctrl+alt with the
+    composed character in KeyboardEvent.key. Emitting a press for it would both fabricate a
+    Control+Alt+@ replay step and, via the input-text machine's on_action reset, take the
+    whole email field with it.
+    """
+    target = {
+        "id": "email",
+        "skyId": "sky-email",
+        "tagName": "INPUT",
+        "text": ["Email"],
+        "value": "a@b.de",
+    }
+
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="a"),
+        make_keydown_event(target=target, timestamp=1200.0, key="@", modifiers={"ctrl": True, "alt": True}),
+        make_blur_event(target=target, timestamp=1300.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [a.kind for a in actions] == [ActionKind.INPUT_TEXT]
+    assert actions[0].input_value == "a@b.de"

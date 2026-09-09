@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -31,8 +31,9 @@ type Props = {
 export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
   const [showToken, setShowToken] = useState(false);
   const {
-    onePasswordToken,
+    onePasswordStatus,
     isLoading,
+    isError,
     createOrUpdateToken,
     isUpdating,
     clearToken,
@@ -42,18 +43,25 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
     defaultValues: {
-      token: onePasswordToken?.token || "",
+      token: "",
     },
   });
   const isMutating = isUpdating || isClearing;
-
-  useEffect(() => {
-    form.reset({ token: onePasswordToken?.token || "" });
-  }, [form, onePasswordToken?.token]);
+  const isOrganizationSource =
+    !isError && onePasswordStatus?.source === "organization";
+  const isInstanceDefaultSource =
+    !isError && onePasswordStatus?.source === "instance_default";
+  const isNotConfigured =
+    !isError &&
+    onePasswordStatus?.configured === false &&
+    onePasswordStatus.source === null;
 
   const onSubmit = (data: FormData) => {
     createOrUpdateToken(data, {
-      onSuccess: () => onSuccess?.(),
+      onSuccess: () => {
+        form.reset({ token: "" });
+        onSuccess?.();
+      },
     });
   };
 
@@ -72,29 +80,42 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
             Skyvern reads login items from the vaults this token can access.
           </p>
         </div>
-        {onePasswordToken && (
+        {isOrganizationSource && (
           <div className="flex items-center gap-2">
             <span className="text-sm text-muted-foreground">Status:</span>
-            <span
-              className={`text-sm ${onePasswordToken.valid ? "text-green-600" : "text-red-600"}`}
-            >
-              {onePasswordToken.valid ? "Active" : "Inactive"}
-            </span>
+            <span className="text-sm text-green-600">Active</span>
+            {onePasswordStatus.modified_at ? (
+              <span className="text-sm text-muted-foreground">
+                Last modified{" "}
+                {new Date(onePasswordStatus.modified_at).toLocaleDateString()}
+              </span>
+            ) : null}
           </div>
         )}
       </div>
 
-      {/* Mounted only once the token query settles, and remounted when the org
+      {/* Mounted only once the status query settles, and remounted when the org
           flips between configured and not, so defaultOpen reads a settled value
           rather than the always-undefined first render. The placeholder holds
           the collapsed height meanwhile so the panel does not jump. */}
       {isLoading ? (
         <Skeleton className="h-[38px] w-full rounded-md" />
+      ) : isError ? (
+        <p className="text-sm text-muted-foreground">
+          Could not load the 1Password status.
+        </p>
       ) : (
         <OnePasswordSetupGuide
-          key={onePasswordToken ? "configured" : "unconfigured"}
-          defaultOpen={!onePasswordToken}
+          key={onePasswordStatus?.source ?? "not_configured"}
+          defaultOpen={isNotConfigured}
         />
+      )}
+
+      {isInstanceDefaultSource && (
+        <p className="text-sm text-muted-foreground">
+          Using the instance default 1Password account. Add your own service
+          account token to override it.
+        </p>
       )}
 
       <Form {...form}>
@@ -138,39 +159,34 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
             <Button type="submit" disabled={isLoading || isMutating}>
               {isUpdating ? "Updating..." : "Update Token"}
             </Button>
-            {onePasswordToken && (
-              <ClearCredentialDialog
-                label="Clear Token"
-                title="Clear 1Password token?"
-                description="Workflows that use 1Password credentials will no longer be able to resolve them until a new service account token is added."
-                disabled={isLoading || isMutating}
-                isPending={isClearing}
-                onConfirm={() => clearToken()}
-              />
-            )}
-            {onePasswordToken && (
-              <div className="text-sm text-muted-foreground">
-                Last updated:{" "}
-                {new Date(onePasswordToken.modified_at).toLocaleDateString()}
+            {isOrganizationSource && (
+              <div className="space-y-1">
+                <ClearCredentialDialog
+                  label="Clear Token"
+                  title="Clear 1Password token?"
+                  description={
+                    onePasswordStatus.instance_default_available
+                      ? "Workflows will use the instance default 1Password account after the token is cleared."
+                      : "Workflows that use 1Password credentials will no longer be able to resolve them until a new service account token is added."
+                  }
+                  disabled={isLoading || isMutating}
+                  isPending={isClearing}
+                  onConfirm={() =>
+                    clearToken(undefined, {
+                      onSuccess: () => form.reset({ token: "" }),
+                    })
+                  }
+                />
+                <div className="text-sm text-muted-foreground">
+                  {onePasswordStatus.instance_default_available
+                    ? "Clearing this token returns this organization to the instance default 1Password account."
+                    : "Clearing this token disables 1Password for this organization."}
+                </div>
               </div>
             )}
           </div>
         </form>
       </Form>
-
-      {onePasswordToken && (
-        <div className="rounded-md bg-muted p-4">
-          <h4 className="mb-2 text-sm font-medium">Token Information</h4>
-          <div className="space-y-1 text-sm text-muted-foreground">
-            <div>ID: {onePasswordToken.id}</div>
-            <div>Type: {onePasswordToken.token_type}</div>
-            <div>
-              Created:{" "}
-              {new Date(onePasswordToken.created_at).toLocaleDateString()}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

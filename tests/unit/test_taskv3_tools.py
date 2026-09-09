@@ -29,18 +29,14 @@ import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
 from skyvern.forge.taskv3.loop import SemanticCommitStats
 from skyvern.forge.taskv3.tools import (
-    _ALIAS_SELECTOR_RE,
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
     _annotate_screenshot,
-    _css_escape_attr_value,
-    _first_start_tag_span,
     _invalid_selector_result,
     _is_host_anchored_selector,
     _normalize_selector,
-    _text_holds_opaque_run,
 )
 from skyvern.forge.taskv3.tools import _upload_submit_delay as _REAL_UPLOAD_SUBMIT_DELAY
 from skyvern.forge.taskv3.tools import (
@@ -205,6 +201,39 @@ class _FakeRequest:
         self.post_data: str | None = None
 
 
+class _FakeObserveElementProperty:
+    """Stand-in for the Playwright JSHandle property `_read_observation` calls `.as_element()` on."""
+
+    def __init__(self, element: Any) -> None:
+        self._element = element
+
+    def as_element(self) -> Any:
+        return self._element
+
+
+class _FakeObservePayload:
+    """Stand-in for the JSHandle `page.evaluate_handle` returns: a `json` property (the digest data)
+    and an `els` property (one live element per entry, paired by index). `_FakePage.evaluate` already
+    returns the canned digest JSON regardless of the JS it's handed, so this just wraps that JSON plus
+    a same-length handles list in the shape `_read_observation` unwraps."""
+
+    def __init__(self, data: dict[str, Any], handles: list[Any]) -> None:
+        self._data = data
+        self._handles = handles
+
+    async def get_property(self, name: str) -> Any:
+        return self if name == "json" else self
+
+    async def json_value(self) -> Any:
+        return self._data
+
+    async def get_properties(self) -> dict[str, _FakeObserveElementProperty]:
+        return {str(i): _FakeObserveElementProperty(h) for i, h in enumerate(self._handles)}
+
+    async def dispose(self) -> None:
+        return None
+
+
 class _FakeElement:
     def __init__(self, page: Any = None) -> None:
         self.calls: list[tuple[str, Any]] = []
@@ -270,6 +299,14 @@ class _FakePage:
     async def eval_on_selector(self, selector: str, js: str) -> str:
         # Field-type probe: report a non-typeahead type so legacy tests exercise the plain fill path.
         return "password"
+
+    async def evaluate_handle(self, js: str) -> _FakeObservePayload:
+        # observe() reads through evaluate_handle (json digest + one live handle per element, paired
+        # by index) rather than plain evaluate. These fixtures only assert on the digest text, never
+        # act through a ref afterward, so a same-length list of None handles is enough to pair.
+        raw = await self.evaluate(js)
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return _FakeObservePayload(data, [None] * len(data.get("elements", [])))
 
     async def hover(self, selector: str, timeout: int | None = None) -> None:
         self.calls.append(("hover", {"selector": selector}))
@@ -383,6 +420,18 @@ def _tool(tools, name):
     return next(t for t in tools if t.name == name)
 
 
+def _ref_line(content: str, needle: str) -> str:
+    """The `ref=N` address observe() printed for the digest line containing `needle` (its label,
+    tag, or other rendered text). Raises if no line matches, so a rewritten fixture that stops
+    producing the expected line fails loudly instead of silently returning nothing to act on."""
+    for line in content.splitlines():
+        if needle in line:
+            m = re.match(r"^ref=(\d+)", line)
+            if m:
+                return f"ref={m.group(1)}"
+    raise AssertionError(f"no digest line for {needle!r} in:\n{content}")
+
+
 @pytest.fixture(autouse=True)
 def _fast_upload_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     # file_upload now settles + delays after an upload. The settle reuses v1's _wait_for_upload_processing
@@ -421,30 +470,53 @@ async def test_tool_set_and_no_task_ecosystem_tools() -> None:
     assert not ({"act", "extract", "validate", "login", "run_task"} & names)
 
 
+@_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_renders_selectors_labels_options() -> None:
-    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
-    r = await _tool(tools, "observe").handler({})
+    html = (
+        "<!doctype html><html><body><form>"
+        '<label for="first">First name</label><input id="first" required>'
+        '<label for="country">Country</label>'
+        '<select id="country"><option value="us">United States</option><option value="ca">Canada</option></select>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
     assert r.status == "ok"
-    assert "#first" in r.content and "First name" in r.content
-    assert "#country" in r.content and "United States" in r.content
-    assert "*required" in r.content
+    assert _ref_line(r.content, "First name") and "*required" in r.content
+    assert _ref_line(r.content, "Country") and "United States" in r.content
 
 
+@_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_renders_checkbox_checked_state() -> None:
     # observe must surface checked-state so a required consent box can be re-verified.
-    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
-    r = await _tool(tools, "observe").handler({})
-    assert "#agree" in r.content and "checked=" in r.content
+    html = (
+        "<!doctype html><html><body><form>"
+        '<label for="agree">I agree</label><input id="agree" type="checkbox">'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+    assert _ref_line(r.content, "I agree") and "checked=" in r.content
 
 
+@_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_renders_group_context() -> None:
     # Controls whose meaning lives in surrounding text (radio/checkbox groups, weak labels) carry a
     # `group` field with the question text, so the agent can answer without fetching raw HTML.
-    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
-    r = await _tool(tools, "observe").handler({})
+    html = (
+        "<!doctype html><html><body>"
+        '<div class="form-group">Consent: I agree to the terms'
+        '<input id="agree" type="checkbox"></div>'
+        "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
     assert "group=" in r.content
     assert "Consent: I agree to the terms" in r.content
 
@@ -5383,10 +5455,12 @@ async def test_click_on_a_marker_the_page_cloned_never_silently_lands_on_the_clo
                 ".setAttribute('data-tv3', 't0')"
             )
         else:
-            observed = await _tool(tools, "observe").handler({})
-            line = next(ln for ln in observed.content.splitlines() if "Remove Alpha" in ln)
-            selector = line[1 : line.index("] ")]
-            assert selector.startswith('[data-tv3="'), f"fixture must force a minted marker, got {line!r}"
+            # The raw (page-side) minted marker, not observe()'s ref: this test pins the selector
+            # guard a raw CSS selector still goes through, unaffected by ref addressing.
+            data = await _observe_data(page)
+            element = next(e for e in data["elements"] if e.get("label") == "Remove Alpha")
+            selector = element["selector"]
+            assert selector.startswith('[data-tv3="'), f"fixture must force a minted marker, got {selector!r}"
         await page.evaluate("() => window.__cloneRow()")
         assert await page.locator(selector).count() == 2, "fixture is not armed: the clone must carry the marker"
         assert await page.locator(selector).first.text_content() == "Remove Beta"
@@ -5436,10 +5510,12 @@ async def test_click_on_a_marker_the_page_destroyed_still_fails_loud() -> None:
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        observed = await _tool(tools, "observe").handler({})
-        line = next(ln for ln in observed.content.splitlines() if "Remove Alpha" in ln)
-        selector = line[1 : line.index("] ")]
-        assert selector.startswith('[data-tv3="'), line
+        # The raw (page-side) minted marker, not observe()'s ref: this test pins the selector guard
+        # a raw CSS selector still goes through, unaffected by ref addressing.
+        data = await _observe_data(page)
+        element = next(e for e in data["elements"] if e.get("label") == "Remove Alpha")
+        selector = element["selector"]
+        assert selector.startswith('[data-tv3="'), selector
         await page.evaluate(
             "() => { const r = document.getElementById('rows'); r.innerHTML = "
             "'<div class=\"row\"><span>Alpha</span><button>Remove Alpha</button></div>'; }"
@@ -6008,11 +6084,12 @@ async def test_observe_lists_hidden_native_select_with_visible_label() -> None:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "#country" in r.content
+        assert _ref_line(r.content, "Country")
         assert "United States" in r.content
         assert "hidden-native" in r.content
-        assert "#ghost" not in r.content
-        assert "#visible-text" not in r.content
+        # #ghost, #nolabel and #visible-text carry no readable name: the header count (not a
+        # selector substring, since none is printed anymore) is what proves they were dropped.
+        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "3"
 
 
 @_skip_no_browser
@@ -6026,8 +6103,8 @@ async def test_observe_enumerates_controls_inside_open_shadow_roots() -> None:
         assert r.status == "ok"
         assert "First name*" in r.content, "a component's control with its own id is enumerated"
         # `Continue` is rendered by a component whose inner <button> has no id/name of its own. It is
-        # named through its host (`#btn-continue button`) rather than by writing into the root.
-        assert "[#btn-continue button] button/button 'Continue'" in r.content
+        # named through its host (anchored, not anonymous), so it still gets a ref.
+        assert re.search(r"^ref=\d+ button/button 'Continue'$", r.content, re.M)
         assert "not listed" not in r.content
         # and it still reports the light-DOM chrome it always could see
         assert "Apply With Partner" in r.content
@@ -6094,10 +6171,11 @@ async def test_observe_names_anonymous_shadow_hosted_controls_through_their_host
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_refuses_a_host_anchored_selector_the_page_has_since_cloned() -> None:
-    # A host-anchored selector's tail is a tag, a class or a position, not an identity: a re-render
-    # that prepends a sibling makes the same string denote two controls, and Playwright's non-strict
-    # click would silently take the first. The executor's own count is the only one that can see
-    # across the shadow boundary, so it is what gates the click -- whatever the anchor's spelling.
+    # A host-anchored CSS selector's tail is a tag, a class or a position, not an identity: a
+    # re-render that prepends a sibling used to make the same string denote two controls. A ref
+    # closes that off differently -- it resolves through the SAME live handle observe retained, so
+    # the clone (a distinct node the handle was never bound to) can never be the one it acts on,
+    # whatever the sibling shape now matches.
     async with _live_page(
         """<x-card id="card"></x-card><x-anon></x-anon>
         <script>
@@ -6117,8 +6195,11 @@ async def test_click_refuses_a_host_anchored_selector_the_page_has_since_cloned(
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        selectors = re.findall(r"^\[(.*)\] button/submit 'Save'$", r.content, re.M)
-        assert len(selectors) == 2, r.content
+        refs = re.findall(r"^ref=(\d+) button/submit 'Save'$", r.content, re.M)
+        assert len(refs) == 2, r.content
+        # The digest no longer prints these, but the model can still hand one back from get_html or an
+        # earlier transcript, so the executor's own cross-root count still has to refuse it.
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
         assert any(sel.startswith("#card ") for sel in selectors), selectors
         await page.evaluate("window.__clone()")
         for sel in selectors:
@@ -6135,6 +6216,12 @@ async def test_click_refuses_a_host_anchored_selector_the_page_has_since_cloned(
                 assert cr.status == "error", (tool_name, cr.content)
                 assert "matches 2 elements" in cr.content, (tool_name, cr.content)
         assert await page.evaluate("window.__clicked") == []
+        # A ref has no such spelling to go ambiguous: it resolves through the SAME live handle observe
+        # retained, and the clone is a node that handle was never bound to.
+        for ref in refs:
+            cr = await _tool(tools, "click").handler({"selector": f"ref={ref}"})
+            assert cr.status == "ok", cr.content
+        assert await page.evaluate("window.__clicked") == ["save", "save"]
 
 
 @_skip_no_browser
@@ -6176,7 +6263,7 @@ async def test_a_control_anchored_on_a_host_that_is_itself_a_control_is_dropped_
         # Positive control: without the theft the same control IS anchored on its host's marker.
         await page.evaluate("document.querySelector('x-peer').remove()")
         again = await _tool(tools, "observe").handler({})
-        assert re.search(r"^\[\[data-tv3=\"t\d+\"\] button\] button/button 'Go'$", again.content, re.M), again.content
+        assert re.search(r"^ref=\d+ button/button 'Go'$", again.content, re.M), again.content
 
 
 @_skip_no_browser
@@ -6198,8 +6285,8 @@ async def test_a_nested_host_with_a_reused_id_is_anchored_through_its_own_host()
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "[#o1 #inner button] button/button 'Go o1'" in r.content, r.content
-        assert "[#o2 #inner button] button/button 'Go o2'" in r.content, r.content
+        assert re.search(r"^ref=\d+ button/button 'Go o1'$", r.content, re.M), r.content
+        assert re.search(r"^ref=\d+ button/button 'Go o2'$", r.content, re.M), r.content
         assert "not listed" not in r.content
 
 
@@ -6288,10 +6375,12 @@ async def test_an_ordinary_control_replaced_by_a_later_host_marking_is_not_liste
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "[#pay]" not in r.content, r.content
+        assert "Pay now" not in r.content, r.content
         assert "Late" in r.content, r.content
         again = await _tool(tools, "observe").handler({})
-        assert "[#pay] input/checkbox 'Pay now' value='on' checked=False" in again.content, again.content
+        assert re.search(r"^ref=\d+ input/checkbox 'Pay now' value='on' checked=False$", again.content, re.M), (
+            again.content
+        )
 
 
 def test_host_anchored_selector_detection_ignores_whitespace_inside_quoted_values() -> None:
@@ -6327,30 +6416,6 @@ def test_opaque_id_run_re_matches_hex_runs_and_uuids() -> None:
         assert _OPAQUE_ID_RUN_RE.search(value), value
     for value in ("123456789012", "abc123def45", ""):
         assert not _OPAQUE_ID_RUN_RE.search(value), value
-
-
-def test_alias_selector_re_is_lenient_on_shape_but_strict_on_content() -> None:
-    for accepted, number in (
-        ('[data-tv3-ref="3"]', "3"),
-        ("input[data-tv3-ref='3']", "3"),
-        ("[data-tv3-ref=3]", "3"),
-        ('  [data-tv3-ref="3"]  ', "3"),
-        # "?" is the redaction handle (a raw id shared by more than one alias): it must parse the
-        # same as a numbered alias so _with_alias_resolution can refuse it explicitly, not crash on it.
-        ('[data-tv3-ref="?"]', "?"),
-        ("input[data-tv3-ref='?']", "?"),
-    ):
-        match = _ALIAS_SELECTOR_RE.match(accepted)
-        assert match is not None, accepted
-        assert match.group(1) == number, accepted
-    for rejected in (
-        '[data-tv3-ref="1"] input',
-        '[data-tv3-ref=""]',
-        '[data-tv3="t1"]',
-        '[data-tv3-ref="??"]',
-        '[data-tv3-ref="1?"]',
-    ):
-        assert _ALIAS_SELECTOR_RE.match(rejected) is None, rejected
 
 
 class _FakeAliasElement(_FakeElement):
@@ -6397,122 +6462,6 @@ class _FakeAliasPage(_FakePage):
         return self.element
 
 
-@pytest.mark.asyncio
-async def test_get_html_writes_one_data_tv3_ref_when_a_tag_carries_two_opaque_identities() -> None:
-    # An element can carry both an id and a data-testid, aliased across separate observes; the
-    # rewrite must not stamp two data-tv3-ref attributes onto its one start tag.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_testid = "testid_27d588c3-b57f-5d51-a36c-2f6c94365d76"
-    page = _FakeAliasPage(f'<input id="{raw_id}" data-testid="{raw_testid}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})
-    page.selector = f'[data-testid="{raw_testid}"]'
-    second = await _tool(tools, "observe").handler({})
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert alias_match is not None, second.content
-    alias = alias_match.group(1)
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert raw_testid not in html_result.content, html_result.content
-    assert html_result.content.count('data-tv3-ref="') == 1, html_result.content
-    # The survivor is the handle the caller queried with, not whichever ref sits first in the tag.
-    assert alias[1:-1] in html_result.content, html_result.content
-    assert "  " not in html_result.content, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_mask_aliases_drops_second_attribute_without_touching_an_unrelated_double_space() -> None:
-    # The drop must consume only the dropped attribute's own leading whitespace: an unrelated
-    # attribute's own double space (aria-label here) must survive, and no double space must appear
-    # where the dropped attribute used to sit — a global " {2,}" collapse would break both.
-    raw_id = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_testid = "field_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(
-        f'<input aria-label="Step  1" id="{raw_id}" data-testid="{raw_testid}" type="text">',
-        selector=f"#{raw_id}",
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})
-    page.selector = f'[data-testid="{raw_testid}"]'
-    second = await _tool(tools, "observe").handler({})
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert alias_match is not None, second.content
-    alias = alias_match.group(1)
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert html_result.content == f'<input aria-label="Step  1" {alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_mask_exception_text_aliases_the_own_tags_id_when_an_earlier_alias_precedes_it() -> None:
-    # own_tag_has_ref must be computed on the tag's own span, not a byte-0 prefix of the message: an
-    # earlier line's already-aliased token must not make the tag below it look like it has a ref,
-    # which previously dropped that tag's id instead of aliasing it.
-    prior_raw = "prior_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    own_raw = "own_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-
-    class _RaisingPriorMentionPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                f'waiting for locator("#{prior_raw}") to be {state}\n'
-                f'  - locator resolved to visible <input id="{own_raw}" type="text"/>'
-            )
-
-    page = _RaisingPriorMentionPage(f'<input id="{prior_raw}" type="text">', selector=f"#{prior_raw}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    await _tool(tools, "observe").handler({})  # mints alias 1 for prior_raw
-
-    page.element = _FakeAliasElement(f'<input id="{own_raw}" type="text">', page)
-    page.selector = f"#{own_raw}"
-    second = await _tool(tools, "observe").handler({})  # mints alias 2 for own_raw
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert alias_match is not None, second.content
-    own_alias = alias_match.group(1)
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": own_alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert prior_raw not in message, message
-    assert own_raw not in message, message
-    assert f'<input {own_alias[1:-1]} type="text"/>' in message, message
-
-
-@pytest.mark.asyncio
-async def test_two_different_elements_sharing_a_duplicated_raw_id_get_two_aliases() -> None:
-    # naturalSelector renders each of two same-id elements tag-qualified (button[id=raw],
-    # input[id=raw]); collapsing them onto one alias would hand the model's next action to
-    # whichever element observe happened to emit last.
-    raw_id = "q_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    button_selector = f'button[id="{raw_id}"]'
-    input_selector = f'input[id="{raw_id}"]'
-    page = _FakeAliasPage(
-        f'<button id="{raw_id}">Alpha button</button>',
-        selector=button_selector,
-        tag="button",
-        extra_elements=[("input", input_selector, f'<input id="{raw_id}" type="text">')],
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    result = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', result.content)
-    assert len(aliases) == 2, result.content
-    button_alias, input_alias = aliases
-    assert button_alias != input_alias, result.content
-
-    button_html = await _tool(tools, "get_html").handler({"selector": button_alias})
-    input_html = await _tool(tools, "get_html").handler({"selector": input_alias})
-    assert "Alpha button" in button_html.content, button_html.content
-    assert "Alpha button" not in input_html.content, input_html.content
-    assert page.calls[-2] == ("query_selector", {"selector": button_selector})
-    assert page.calls[-1] == ("query_selector", {"selector": input_selector})
-
-
 class _RaisingAliasPage(_FakeAliasPage):
     async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
         # Mirrors Playwright's own call-log rendering: the resolved locator nests inside an outer
@@ -6521,588 +6470,9 @@ class _RaisingAliasPage(_FakeAliasPage):
         raise TimeoutError(f'waiting for locator("{escaped}") to be {state}')
 
 
-@pytest.mark.asyncio
-async def test_mask_exception_text_survives_playwright_escaped_quotes_around_the_selector() -> None:
-    # A bare-value replace inside the escaped span left `#[data-tv3-ref="?"]` garbage instead of a
-    # clean alias, corrupting the instruction rather than leaking the raw id.
-    raw_id = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    real_selector = f'[data-tv3="t2"] #{raw_id}'
-    page = _RaisingAliasPage(f'<input id="{raw_id}" type="text">', selector=real_selector)
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert alias_match is not None, observed.content
-    alias = alias_match.group(1)
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert "#[data-tv3" not in message, message
-    assert alias in message, message
-
-
-@pytest.mark.asyncio
-async def test_mask_exception_text_redacts_a_raw_id_aliased_under_two_attribute_keys() -> None:
-    # The same raw value can be minted as an alias under `id` (one observe) and `data-testid`
-    # (another observe); a bare occurrence in an error message is ambiguous between the two and must
-    # redact to "?" rather than one attribute key's alias silently winning.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})
-    page.selector = f'[data-testid="{raw_id}"]'
-    await _tool(tools, "observe").handler({})
-
-    async def _raise_bare(selector: str, state: str = "visible", timeout: int | None = None) -> None:
-        raise TimeoutError(f"element {raw_id} did not settle")
-
-    page.wait_for_selector = _raise_bare  # type: ignore[method-assign]
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": "#dummy", "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert '[data-tv3-ref="?"]' in message, message
-
-
-@pytest.mark.asyncio
-async def test_mask_exception_text_aliases_the_own_tag_when_its_raw_id_is_shared() -> None:
-    # A raw id shared by two aliases (two elements aliased under the same attribute) is ambiguous in
-    # general, but the tag on the call log's "locator resolved to" line IS the element this call
-    # acted on, so it must still render the CALLING alias, not "?".
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    button_selector = f'button[id="{raw_id}"]'
-    input_selector = f'input[id="{raw_id}"]'
-
-    class _RaisingSharedIdPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                "locator.wait_for: Timeout 300ms exceeded.\n"
-                "Call log:\n"
-                f'  - locator resolved to <input id="{raw_id}" type="text"/>'
-            )
-
-    page = _RaisingSharedIdPage(
-        f'<button id="{raw_id}">Alpha button</button>',
-        selector=button_selector,
-        tag="button",
-        extra_elements=[("input", input_selector, f'<input id="{raw_id}" type="text">')],
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert len(aliases) == 2, observed.content
-    _button_alias, input_alias = aliases
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": input_alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert f'<input {input_alias[1:-1]} type="text"/>' in message, message
-    assert '[data-tv3-ref="?"]' not in message, message
-
-
-@pytest.mark.asyncio
-async def test_mask_exception_text_redacts_a_shared_raw_id_the_call_log_did_not_resolve_to() -> None:
-    # Only Playwright's "locator resolved to <...>" line renders the element the call actually acted
-    # on. A tag quoted anywhere else may be a sibling that merely shares the raw id, so the calling
-    # alias is not evidence of identity and the shared raw must be redacted.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    button_selector = f'button[id="{raw_id}"]'
-    input_selector = f'input[id="{raw_id}"]'
-
-    class _RaisingUnresolvedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(f'element is not stable: <input id="{raw_id}" type="text"/>')
-
-    page = _RaisingUnresolvedPage(
-        f'<button id="{raw_id}">Alpha button</button>',
-        selector=button_selector,
-        tag="button",
-        extra_elements=[("input", input_selector, f'<input id="{raw_id}" type="text">')],
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert len(aliases) == 2, observed.content
-    _button_alias, input_alias = aliases
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": input_alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert input_alias[1:-1] not in message, message
-    assert '<input data-tv3-ref="?" type="text"/>' in message, message
-
-
-@pytest.mark.asyncio
-async def test_get_html_does_not_stamp_a_container_alias_on_an_inner_html_descendant() -> None:
-    # get_html returns a container's INNER html, so the container's own tag is absent. A descendant
-    # that shares its raw id must not be handed the container's handle: the model would act on what
-    # it reads as the input and hit the container instead.
-    raw_id = "q_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    container_selector = f'div[id="{raw_id}"]'
-    input_selector = f'input[id="{raw_id}"]'
-
-    class _ContainerElement(_FakeAliasElement):
-        async def inner_html(self) -> str:
-            return f'<input id="{raw_id}" type="text">'
-
-    page = _FakeAliasPage(
-        f'<div id="{raw_id}"></div>',
-        selector=container_selector,
-        tag="div",
-        extra_elements=[("input", input_selector, f'<input id="{raw_id}" type="text">')],
-    )
-    page.element = _ContainerElement(f'<div id="{raw_id}"></div>', page)
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert len(aliases) == 2, observed.content
-    container_alias, _input_alias = aliases
-
-    html_result = await _tool(tools, "get_html").handler({"selector": container_alias})
-    assert html_result.status == "ok", html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert container_alias[1:-1] not in html_result.content, html_result.content
-    assert html_result.content == '<input data-tv3-ref="?" type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_inner_redacts_a_descendant_sharing_the_containers_id_with_one_alias() -> None:
-    # Only the container was observed, so its raw id has ONE alias. Its own tag is still absent from an
-    # inner read, so the descendant carrying that id is a different element: redact, never relabel.
-    raw_id = "q_16c477b2-a46f-4c40-925b-1e5b83254c65"
-
-    class _ContainerElement(_FakeAliasElement):
-        async def inner_html(self) -> str:
-            return f'<input id="{raw_id}" type="text">'
-
-    page = _FakeAliasPage(f'<div id="{raw_id}"></div>', selector=f'div[id="{raw_id}"]', tag="div")
-    page.element = _ContainerElement(f'<div id="{raw_id}"></div>', page)
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert len(aliases) == 1, observed.content
-
-    html_result = await _tool(tools, "get_html").handler({"selector": aliases[0]})
-    assert html_result.status == "ok", html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert html_result.content == '<input data-tv3-ref="?" type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_document_redacts_a_raw_id_two_tags_carry_and_keeps_a_single_tag_one() -> None:
-    # A raw id that two start tags of the answer carry names neither of them, however many aliases it
-    # has; one that exactly one tag carries stays the actionable handle it was minted for.
-    shared_raw = "dup_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    lone_raw = "lone_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-    document = f'<div id="{shared_raw}"><input id="{shared_raw}" type="text"><input id="{lone_raw}" type="text"></div>'
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(f'<div id="{shared_raw}"></div>', selector=f'div[id="{shared_raw}"]', tag="div")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})
-    page.selector = f"#{lone_raw}"
-    lone_alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert shared_raw not in html_result.content, html_result.content
-    assert html_result.content.count('data-tv3-ref="?"') == 2, html_result.content
-    assert f'<input {lone_alias[1:-1]} type="text">' in html_result.content, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_document_redacts_two_byte_identical_tags_the_same_as_two_distinct_ones() -> None:
-    # Two identical `<input id="<raw>">` tags in real markup are genuinely duplicate elements, unlike
-    # a call log reprinting one retry line; get_html must keep counting them as two separate carriers.
-    shared_raw = "dup_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    tag = f'<input id="{shared_raw}" type="text">'
-    document = f"<div>{tag}{tag}</div>"
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(tag, selector=f"#{shared_raw}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    await _tool(tools, "observe").handler({})
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert shared_raw not in html_result.content, html_result.content
-    assert html_result.content.count('data-tv3-ref="?"') == 2, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_leaves_script_and_comment_contents_byte_for_byte() -> None:
-    # `<...>` inside a script or a comment is source text, not markup: the page-ref strip and the
-    # per-tag dedupe must not rewrite it, while a real tag beside it is still aliased and deduped.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_testid = "testid_27d588c3-b57f-5d51-a36c-2f6c94365d76"
-    script = '<script>var s = \'<input data-tv3-ref="1" data-tv3-ref="2">\';</script>'
-    comment = '<!-- <input data-tv3-ref="9" data-tv3-ref="8"> -->'
-
-    class _ContainerElement(_FakeAliasElement):
-        async def inner_html(self) -> str:
-            return f'{script}{comment}<input id="{raw_id}" data-testid="{raw_testid}" type="text">'
-
-    page = _FakeAliasPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    first = await _tool(tools, "observe").handler({})
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', first.content)
-    assert alias_match is not None, first.content
-    id_alias = alias_match.group(1)
-    page.selector = f'[data-testid="{raw_testid}"]'
-    second = await _tool(tools, "observe").handler({})
-    testid_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert testid_match is not None, second.content
-    testid_alias = testid_match.group(1)
-
-    page.element = _ContainerElement("<div></div>", page)
-    html_result = await _tool(tools, "get_html").handler({"selector": id_alias})
-    assert html_result.status == "ok", html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert raw_testid not in html_result.content, html_result.content
-    # The queried id is the container's, and its own tag is absent from an inner read, so this
-    # descendant renders the alias minted for its own data-testid instead.
-    assert html_result.content == f'{script}{comment}<input {testid_alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_leaves_an_id_attribute_written_as_page_text_byte_for_byte() -> None:
-    # A literal `id="<raw>"` inside a script body or a comment is page content, not markup: the
-    # identity-attribute rewrite must not reach it, while the real tag beside it is still aliased.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    inner_raw = "inner_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-    script = f"<script>var s = '<input id=\"{inner_raw}\">';</script>"
-    comment = f'<!-- <input id="{inner_raw}"> -->'
-
-    class _ContainerElement(_FakeAliasElement):
-        async def inner_html(self) -> str:
-            return f'{script}{comment}<input id="{inner_raw}" type="text">'
-
-    page = _FakeAliasPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert alias_match is not None, observed.content
-    alias = alias_match.group(1)
-    page.selector = f"#{inner_raw}"
-    second = await _tool(tools, "observe").handler({})
-    inner_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert inner_match is not None, second.content
-    inner_alias = inner_match.group(1)
-
-    page.element = _ContainerElement("<div></div>", page)
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert inner_raw not in html_result.content.replace(script, "").replace(comment, ""), html_result.content
-    assert html_result.content == f'{script}{comment}<input {inner_alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_leaves_iframe_noscript_and_plaintext_bodies_byte_for_byte() -> None:
-    # These elements serialize their text children unescaped too, so a tag-looking string inside one is
-    # page content; `plaintext` has no end tag at all, so everything after it is text to the end.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    inner_raw = "inner_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-    iframe = f'<iframe><input id="{inner_raw}" type="text"></iframe>'
-    noscript = f'<noscript><input id="{inner_raw}" type="text"></noscript>'
-    plaintext = f'<plaintext><input id="{inner_raw}" type="text">'
-
-    class _ContainerElement(_FakeAliasElement):
-        async def inner_html(self) -> str:
-            return f'{iframe}{noscript}<input id="{inner_raw}" type="text">{plaintext}'
-
-    page = _FakeAliasPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-    page.selector = f"#{inner_raw}"
-    inner_alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    page.element = _ContainerElement("<div></div>", page)
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    expected = f'{iframe}{noscript}<input {inner_alias[1:-1]} type="text">{plaintext}'
-    assert html_result.content == expected, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_mask_exception_text_does_not_let_a_shorter_raw_id_swallow_a_longer_one() -> None:
-    # A raw id that is a literal prefix of another aliased raw id (a common child-id convention,
-    # `X` / `X-listbox`) must not have its bare-value replacement swallow the longer id and leave a
-    # dangling suffix that names the wrong handle.
-    raw = "q_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_listbox = f"{raw}-listbox"
-    page = _FakeAliasPage(f'<input id="{raw}" type="text">', selector=f"#{raw}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})  # mints alias 1 for raw
-    page.element = _FakeAliasElement(f'<ul id="{raw_listbox}"></ul>', page)
-    page.selector = f"#{raw_listbox}"
-    second = await _tool(tools, "observe").handler({})  # mints alias 2 for raw_listbox
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert alias_match is not None, second.content
-    listbox_alias = alias_match.group(1)
-
-    async def _raise_bare(selector: str, state: str = "visible", timeout: int | None = None) -> None:
-        raise TimeoutError(f"element {raw_listbox} did not settle")
-
-    page.wait_for_selector = _raise_bare  # type: ignore[method-assign]
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": "#dummy", "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert message == f"element {listbox_alias} did not settle", message
-    assert raw_listbox not in message, message
-    assert raw not in message, message
-    assert "-listbox" not in message, message
-
-
-@pytest.mark.asyncio
-async def test_mask_exception_text_does_not_anchor_on_a_prose_tag_name() -> None:
-    # A raised message can name a real tag in prose before the actual element's tag (Playwright's own
-    # "Element is not a <select> element"); that must not be mistaken for the start tag and rob the
-    # real tag below it of its one-data-tv3-ref-per-tag collapse.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_testid = "testid_27d588c3-b57f-5d51-a36c-2f6c94365d76"
-
-    class _RaisingSelectPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                "Element is not a <select> element\n"
-                "Call log:\n"
-                f'  - locator resolved to <input id="{raw_id}" data-testid="{raw_testid}" type="text"/>'
-            )
-
-    page = _RaisingSelectPage(f'<input id="{raw_id}" data-testid="{raw_testid}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})
-    page.selector = f'[data-testid="{raw_testid}"]'
-    await _tool(tools, "observe").handler({})
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": "#dummy", "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert raw_testid not in message, message
-    assert message.count('data-tv3-ref="') == 1, message
-
-
-@pytest.mark.asyncio
-async def test_get_html_dedupes_every_start_tag_not_only_the_containers_own() -> None:
-    # A container's inner_html can carry a descendant tag with two opaque identity attributes; the
-    # one-ref-per-tag collapse must hold for that tag too, not only the container's own.
-    raw_div = "container_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_testid = "testid_27d588c3-b57f-5d51-a36c-2f6c94365d76"
-    page = _FakeAliasPage("<div></div>", selector=f"#{raw_div}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    div_result = await _tool(tools, "observe").handler({})
-    div_alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', div_result.content)
-    assert div_alias_match is not None, div_result.content
-    div_alias = div_alias_match.group(1)
-
-    page.selector = f"#{raw_id}"
-    await _tool(tools, "observe").handler({})
-    page.selector = f'[data-testid="{raw_testid}"]'
-    await _tool(tools, "observe").handler({})
-
-    page.element = _FakeAliasElement(
-        f'<div id="{raw_div}"><input id="{raw_id}" data-testid="{raw_testid}"></div>', page
-    )
-
-    html_result = await _tool(tools, "get_html").handler({"selector": div_alias})
-    assert html_result.status == "ok", html_result.content
-    assert raw_div not in html_result.content, html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert raw_testid not in html_result.content, html_result.content
-    assert html_result.content.count('data-tv3-ref="') == 2, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_strips_a_page_supplied_data_tv3_ref_before_aliasing() -> None:
-    # data-tv3-ref is never a legitimate page attribute; a page-authored copy must not survive into
-    # the result or make the drop rule mistake the requested element's real handle for a duplicate.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(f'<input data-tv3-ref="9" id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert alias_match is not None, observed.content
-    alias = alias_match.group(1)
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert 'data-tv3-ref="9"' not in html_result.content, html_result.content
-    assert html_result.content == f'<input {alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_keeps_a_usable_ref_over_an_earlier_redacted_one_in_the_same_tag() -> None:
-    # A tag can carry a shared/redacted "?" attribute before its own single-alias one; the dedupe pass
-    # is position-first-wins, so the "?" must not evict the requested handle just by sitting first.
-    shared_raw = "shared_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    own_raw = "own_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(
-        f'<input data-testid="{shared_raw}" id="{own_raw}" type="text">',
-        selector=f'[data-testid="{shared_raw}"]',
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})  # alias 1 for shared_raw
-    page.selector = f'.wrap [data-testid="{shared_raw}"]'
-    await _tool(tools, "observe").handler({})  # alias 2, same component -> shared_raw is redacted
-    page.selector = f"#{own_raw}"
-    third = await _tool(tools, "observe").handler({})  # alias 3 for own_raw
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', third.content)
-    assert alias_match is not None, third.content
-    own_alias = alias_match.group(1)
-
-    html_result = await _tool(tools, "get_html").handler({"selector": own_alias})
-    assert html_result.status == "ok", html_result.content
-    assert own_raw not in html_result.content, html_result.content
-    assert shared_raw not in html_result.content, html_result.content
-    assert html_result.content == f'<input {own_alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_owned_start_tag_span_requires_a_boundary_not_a_bare_substring() -> None:
-    # `id="R"` is a substring of `data-testid="R"`; without a left boundary an earlier tag's
-    # unrelated, never-aliased attribute wrongly anchors the "own" span instead of the real owner.
-    raw = "q_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(f'<div data-testid="{raw}"><input id="{raw}" type="text"></div>', selector=f"#{raw}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    await _tool(tools, "observe").handler({})  # alias 1 for raw, via id
-    page.selector = f".wrap #{raw}"
-    second = await _tool(tools, "observe").handler({})  # alias 2, same component -> raw is redacted
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', second.content)
-    assert alias_match is not None, second.content
-    alias = alias_match.group(1)
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    # The wrapper's mirrored data-testid is dropped (an owned raw in any identity attribute is a
-    # copyable selector); the anchoring is what puts the caller's own handle on the input, not the div.
-    assert html_result.content == f'<div><input {alias[1:-1]} type="text"></div>', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_error_does_not_strip_a_bracketless_selector_the_model_echoed_back() -> None:
-    # The up-front data-tv3-ref strip is meant for markup, not for the model's own arguments flowing
-    # back through an error message: a dropped-bracket handle like `input data-tv3-ref="1"` must be
-    # echoed unchanged, not silently rewritten into a different, plausible-looking selector.
-    class _NoMatchPage(_FakeAliasPage):
-        async def query_selector(self, selector: str) -> Any:
-            self.calls.append(("query_selector", {"selector": selector}))
-            return None
-
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _NoMatchPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    await _tool(tools, "observe").handler({})
-
-    malformed = 'input data-tv3-ref="1"'
-    result = await _tool(tools, "get_html").handler({"selector": malformed})
-    assert result.status == "error", result.content
-    assert result.content == f"no element for selector {malformed!r}", result.content
-
-
-@pytest.mark.asyncio
-async def test_a_raise_whose_constructor_rejects_the_masked_message_keeps_its_type() -> None:
-    # A constructor can reject the masked message with anything, not only TypeError. Letting that
-    # escape would replace the real browser failure with the masking layer's own error.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-
-    class _ValidatingError(Exception):
-        def __init__(self, message: str) -> None:
-            if "data-tv3-ref" in message:
-                raise ValueError("messages may not name a ref")
-            super().__init__(message)
-
-    class _RaisingValidatingPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise _ValidatingError(f'locator resolved to <input id="{raw_id}" type="text"/>')
-
-    page = _RaisingValidatingPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(_ValidatingError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert alias[1:-1] in message, message
-
-
-@pytest.mark.asyncio
-async def test_a_raise_whose_str_ignores_its_args_is_replaced_rather_than_leaked() -> None:
-    # Masking rewrites the message, but a custom __str__ can compose from an attribute neither the
-    # reconstruction nor the args mutation touches: the raw value costs the type, not the transcript.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-
-    class _AttributeMessageError(Exception):
-        def __init__(self, message: str, detail: str) -> None:
-            super().__init__(message, detail)
-            self._message = message
-
-        def __str__(self) -> str:
-            return self._message
-
-    class _RaisingAttributePage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise _AttributeMessageError(f'locator resolved to <input id="{raw_id}" type="text"/>', "detail")
-
-    page = _RaisingAttributePage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(Exception) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert alias[1:-1] in message, message
-    assert isinstance(exc_info.value, RuntimeError), type(exc_info.value)
-
-
 def _markup_cut_inside(tag: str, cut_offset: int) -> str:
     """Markup long enough that get_html's 20000-char truncation lands `cut_offset` chars into `tag`."""
     return "y" * (20000 - cut_offset) + tag + "</form>"
-
-
-def _observed_alias(observed: Any) -> str:
-    alias_match = re.search(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert alias_match is not None, observed.content
-    return alias_match.group(1)
 
 
 class _FakeAliasTextPage(_FakeAliasPage):
@@ -7118,542 +6488,10 @@ class _FakeAliasTextPage(_FakeAliasPage):
         return await super().evaluate(js)
 
 
-@pytest.mark.asyncio
-async def test_get_html_text_format_aliases_a_printed_selector_without_withholding_the_page() -> None:
-    # Prose: the whole-token pass owns a selector spelling; the page stays exempt from the withhold
-    # gate because a value it prints for the user to read is content get_html returns on purpose.
-    raw = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasTextPage(f'<input id="{raw}" type="text">', f"#{raw}", f"Reference #{raw} - quote it")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    r = await _tool(tools, "get_html").handler({"format": "text"})
-    assert r.status == "ok", r.content
-    assert r.content == f"Reference {alias} - quote it", r.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_text_format_masks_a_quoted_selector_the_page_prints() -> None:
-    # A quoted spelling is matched literally by the pass that masks it, which is why text is never
-    # quote-escaped: doing so would hide this one and leave the raw it names standing.
-    raw = "3f2e1d0c-9b8a-4756-8c4d-2e1f0a9b8c7d"
-    page = _FakeAliasTextPage(
-        f'<input data-testid="{raw}" type="text">', f'[data-testid="{raw}"]', f'Use [data-testid="{raw}"] here'
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    r = await _tool(tools, "get_html").handler({"format": "text"})
-    assert r.content == f"Use {alias} here", r.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_text_format_does_not_stamp_a_handle_on_a_start_tag_the_page_prints() -> None:
-    # A tag in rendered text is text the page displayed, not an element. Unescaped it reaches the tag
-    # scanner, which would hand it a real element's handle.
-    raw = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasTextPage(f'<input id="{raw}" type="text">', f"#{raw}", f'Copy: <input id="{raw}">')
-    tools = build_browser_tools(_fixed_page_provider(page))
-    await _tool(tools, "observe").handler({})
-
-    r = await _tool(tools, "get_html").handler({"format": "text"})
-    assert "data-tv3-ref=" not in r.content, r.content
-    assert r.content.startswith("Copy: &lt;input"), r.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_masks_an_id_in_a_start_tag_the_truncation_cut_open() -> None:
-    # get_html truncates before the wrapper masks: a tag the cut leaves without a `>` is still a start
-    # tag, or the span-scoped rewrite skips it and the raw id reaches the transcript verbatim.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    tag = f'<input id="{raw_id}" type="text">'
-    page = _FakeAliasPage(_markup_cut_inside(tag, tag.index("type") + 2), selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    tail = html_result.content[-200:]
-    assert html_result.status == "ok", tail
-    assert raw_id not in html_result.content, tail
-    assert tail.endswith(f"<input {alias[1:-1]} ty…[truncated at 20000 chars]"), tail
-
-
-@pytest.mark.asyncio
-async def test_get_html_masks_a_raw_id_the_truncation_cut_mid_value() -> None:
-    # The cut can land inside the raw value itself, leaving an unterminated attribute no whole-value
-    # rewrite can match; the head of the raw must not survive as a readable fragment. 20 chars in
-    # reaches 14 chars into the opaque run past the 6-char `field_` prefix, clearing the 8-char floor.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    tag = f'<input id="{raw_id}" type="text">'
-    page = _FakeAliasPage(_markup_cut_inside(tag, tag.index(raw_id) + 20), selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    tail = html_result.content[-200:]
-    assert html_result.status == "ok", tail
-    assert raw_id[:9] not in html_result.content, tail
-    assert tail.endswith(f"<input {alias[1:-2]}…[truncated at 20000 chars]"), tail
-
-
-@pytest.mark.asyncio
-async def test_get_html_denies_a_page_supplied_ref_in_a_start_tag_the_truncation_cut_open() -> None:
-    # A page-planted data-tv3-ref inside the cut tag would hand the model a spoofed handle for
-    # whatever element alias 9 really names — whether the cut leaves that attribute whole or open.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    tag = f'<input data-tv3-ref="9" id="{raw_id}" type="text">'
-    page = _FakeAliasPage(_markup_cut_inside(tag, tag.index("type") + 2), selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    tail = html_result.content[-200:]
-    assert html_result.status == "ok", tail
-    assert raw_id not in html_result.content, tail
-    assert tail.endswith(f"<input {alias[1:-1]} ty…[truncated at 20000 chars]"), tail
-
-    page.element = _FakeAliasElement(_markup_cut_inside(tag, tag.index('"9"') + 2), page)
-    cut_ref = await _tool(tools, "get_html").handler({"selector": alias})
-    assert 'data-tv3-ref="9' not in cut_ref.content, cut_ref.content[-200:]
-
-
-@pytest.mark.asyncio
-async def test_get_html_closes_plaintext_and_still_masks_what_follows_it() -> None:
-    # `plaintext` has no end tag in HTML *parsing*, but the fragment-serialization algorithm the
-    # browser actually writes still emits `</plaintext>`; treating it as unterminated let everything
-    # after it -- an aliased input and a page-planted ref -- reach the transcript unmasked.
-    container_raw = "container_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    body_raw = "field_9f8e1234-a46f-4c40-925b-1e5b83254c65"
-    tail_raw = "tail_27d588c3-b57f-5d51-a36c-2f6c94365d76"
-    plaintext = f"<plaintext>legacy {body_raw} still here</plaintext>"
-
-    page = _FakeAliasPage(f'<div id="{container_raw}"></div>', selector=f'div[id="{container_raw}"]', tag="div")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-    page.selector = f"#{tail_raw}"
-    page.element = _FakeAliasElement(f'<input id="{tail_raw}" type="text">', page)
-    tail_alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    class _PlaintextContainer(_FakeAliasElement):
-        async def inner_html(self) -> str:
-            return f'{plaintext}<input id="{tail_raw}" data-tv3-ref="1" type="text">'
-
-    page.element = _PlaintextContainer(f'<div id="{container_raw}"></div>', page)
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    expected = f'{plaintext}<input {tail_alias[1:-1]} type="text">'
-    assert html_result.content == expected, html_result.content
-    assert body_raw in html_result.content, html_result.content  # unaliased plaintext body, verbatim
-    assert tail_raw not in html_result.content, html_result.content
-    assert html_result.content.count('data-tv3-ref="') == 1, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_document_keeps_prefix_sharing_handles_usable_past_an_unrelated_cut() -> None:
-    # A cut id that merely shares its owners' constant prefix (`question_` -- 9 chars, common on ATS
-    # forms) must not redact every same-prefix alias; only a genuine truncated fragment of one of them
-    # should count as a carrier. This cut diverges from all three right after the shared prefix, so it
-    # names none of them.
-    raw1 = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw2 = "question_27d588c3-b57f-5d51-a36c-2f6c94365d76"
-    raw3 = "question_38e699d4-c68f-6e62-b47d-3f7da5476e87"
-    cut_raw = "question_zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
-    document = (
-        f'<input id="{raw1}" type="text">'
-        f'<input id="{raw2}" type="text">'
-        f'<input id="{raw3}" type="text">'
-        f'<input id="{cut_raw}'
-    )
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(f'<input id="{raw1}" type="text">', selector=f"#{raw1}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    aliases = []
-    for raw in (raw1, raw2, raw3):
-        page.selector = f"#{raw}"
-        page.element = _FakeAliasElement(f'<input id="{raw}" type="text">', page)
-        aliases.append(_observed_alias(await _tool(tools, "observe").handler({})))
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert raw1 not in html_result.content, html_result.content
-    assert raw2 not in html_result.content, html_result.content
-    assert raw3 not in html_result.content, html_result.content
-    assert 'data-tv3-ref="?"' not in html_result.content, html_result.content
-    for alias in aliases:
-        assert f'<input {alias[1:-1]} type="text">' in html_result.content, html_result.content
-    assert html_result.content.endswith(f'<input id="{cut_raw}'), html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_rejects_a_punctuation_divergent_truncation_cut() -> None:
-    # The byte right after the shared `question_` prefix is `.`, not a word character or hyphen -- the
-    # old arbitration let that through as a cut of the real owner and stamped its alias on it.
-    raw = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    cut_raw = "question_.other-27d588c3-b57f-5d51-a36c-2f6c94365d76"
-    owned_tag = f'<input id="{raw}" type="text">'
-    cut_tag = f'<input id="{cut_raw}" type="text">'
-    cut_offset = cut_tag.index(cut_raw) + len("question_.other-") + len(owned_tag)
-    document = owned_tag + _markup_cut_inside(cut_tag, cut_offset)
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(owned_tag, selector=f"#{raw}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({})
-    tail = html_result.content[-200:]
-    assert html_result.status == "ok", tail
-    assert tail.endswith('<input id="question_.other-' + taskv3_tools._PAGE_MARKUP_CUT), tail
-    assert f'<input {alias[1:-1]} type="text">' in html_result.content, html_result.content
-    assert 'data-tv3-ref="?"' not in html_result.content, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_leaves_a_prefix_only_cut_bare_when_its_owner_is_outside_the_container() -> None:
-    # Sharing only the constant `question_` lead-in (0 run chars) is not evidence of ownership; the
-    # owner's own tag lives outside this container, so the cut must get no handle and no redaction.
-    owner_raw = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    cut_tag = '<input id="question_other-99999999-9999-9999-9999-999999999999" type="text">'
-    cut_offset = cut_tag.index("question_") + len("question_")
-    document = _markup_cut_inside(cut_tag, cut_offset)
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(f'<input id="{owner_raw}" type="text">', selector=f"#{owner_raw}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    await _tool(tools, "observe").handler({})
-
-    html_result = await _tool(tools, "get_html").handler({})
-    tail = html_result.content[-200:]
-    assert html_result.status == "ok", tail
-    assert owner_raw not in html_result.content, html_result.content
-    assert 'data-tv3-ref="?' not in html_result.content, html_result.content
-    assert tail.endswith('<input id="question_' + taskv3_tools._PAGE_MARKUP_CUT), tail
-
-
-@pytest.mark.parametrize(
-    ("selector_value", "serialized_value"),
-    [
-        ("q&5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b", "q&amp;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"),
-        ('q\\"5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b', "q&quot;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_get_html_masks_an_id_whose_markup_spelling_differs_from_the_selectors(
-    selector_value: str, serialized_value: str
-) -> None:
-    # observe escapes an identity value for CSS (`\"`) while the browser escapes it for HTML
-    # (`&amp;`, `&quot;`): an owner keyed on either spelling alone leaves the other one readable.
-    page = _FakeAliasPage(f'<input id="{serialized_value}" type="text">', selector=f'[id="{selector_value}"]')
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert "5e4d3c2b" not in html_result.content, html_result.content
-    assert html_result.content == f'<input {alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_gives_each_of_two_colliding_ids_its_own_handle() -> None:
-    # Two DOM ids collide across spellings: `q&<uuid>` serializes exactly as the literal
-    # `q&amp;<uuid>` is spelled. Matching markup by the union of spellings lets the literal owner --
-    # observed first here -- claim the other element's tag, so the answer hands the model a handle
-    # that resolves to its sibling.
-    amp_raw = "q&5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"
-    literal_raw = "q&amp;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"
-    document = (
-        '<input id="q&amp;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b" type="text">'
-        '<input id="q&amp;amp;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b" type="text">'
-    )
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(
-        f'<input id="{literal_raw}" type="text">',
-        selector=f'[id="{literal_raw}"]',
-        extra_elements=[("input", f'[id="{amp_raw}"]', f'<input id="{amp_raw}" type="text">')],
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert len(aliases) == 2, observed.content
-    literal_alias, amp_alias = aliases
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert "5e4d3c2b" not in html_result.content, html_result.content
-    assert 'data-tv3-ref="?"' not in html_result.content, html_result.content
-    expected = f'<input {amp_alias[1:-1]} type="text"><input {literal_alias[1:-1]} type="text">'
-    assert html_result.content == expected, html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_masks_an_id_holding_an_angle_bracket() -> None:
-    # Measured against real Chromium: an attribute value escapes `&`, `"` and U+00A0 only, so an id
-    # holding `<` reaches markup literally. Teaching the serializer to escape it as `&lt;` would make
-    # the one spelling markup is matched by a form no page ever emits, and the id would go unmasked.
-    raw_id = "l<5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"
-    page = _FakeAliasPage(f'<input id="{raw_id}" type="text">', selector=f'[id="{raw_id}"]')
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert "5e4d3c2b" not in html_result.content, html_result.content
-    assert html_result.content == f'<input {alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_masks_an_id_whose_bare_selector_holds_a_non_breaking_space() -> None:
-    # `CSS.escape` is a no-op for U+00A0, so observe emits it inside a bare `#id`. A component
-    # capture that stops at any Python `\s` reads that selector as `#n`, mints no owner at all, and
-    # leaves the run for the leak check to never see either.
-    raw_id = "n\u00a05e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"
-    page = _FakeAliasPage(
-        '<input id="n&nbsp;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b" type="text">',
-        selector=f"#{raw_id}",
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert "5e4d3c2b" not in html_result.content, html_result.content
-    assert html_result.content == f'<input {alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.parametrize(
-    ("selector_value", "serialized_value"),
-    [
-        ("q&5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b", "q&amp;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"),
-        ('q\\"5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b', "q&quot;5e4d3c2b-1a09-4f8e-9d7c-6b5a4e3d2c1b"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_raised_error_masks_an_escaped_id_in_both_the_locator_line_and_the_outer_html(
-    selector_value: str, serialized_value: str
-) -> None:
-    # Playwright's call log renders the selector CSS-escaped and the resolved element HTML-escaped:
-    # the raw has to be recognized in both spellings, or the timeout message publishes it.
-    class _RaisingEscapedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                f'waiting for locator("[id=\\"{selector_value}\\"]") to be {state}\n'
-                f'  - locator resolved to visible <input id="{serialized_value}" type="text"/>'
-            )
-
-    page = _RaisingEscapedPage(f'<input id="{serialized_value}" type="text">', selector=f'[id="{selector_value}"]')
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert "5e4d3c2b" not in message, message
-    assert f'<input {alias[1:-1]} type="text"/>' in message, message
-
-
-@pytest.mark.asyncio
-async def test_a_raw_no_masking_pass_can_reach_is_scrubbed_rather_than_re_raised() -> None:
-    # A message deriving from an attribute can embed the raw inside a longer token, where every
-    # boundary-anchored pass declines it; re-raising that text hands the transcript the identifier.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-
-    class _DerivedMessageError(Exception):
-        def __init__(self, detail: str) -> None:
-            super().__init__("browser call failed")
-            self._detail = detail
-
-        def __str__(self) -> str:
-            return f"cache_{self._detail}_miss"
-
-    class _RaisingDerivedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise _DerivedMessageError(raw_id)
-
-    page = _RaisingDerivedPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(Exception) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert "16c477b2" not in message, message
-    assert isinstance(exc_info.value, RuntimeError), type(exc_info.value)
-    assert message == 'cache_[data-tv3-ref="?"]_miss', message
-
-
 _QUOTED_RAW_ID = 'qt"9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60'
 _QUOTED_RAW_SERIALIZED = "qt&quot;9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60"
 _QUOTED_RAW_CSS_ESCAPED = r"qt\"9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60"
 _QUOTED_RAW_DOUBLY_ESCAPED = r"qt\\\"9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60"
-
-
-def test_text_holds_opaque_run_sees_a_spelling_no_pass_enumerates() -> None:
-    # The run is uuid/hex only, so no escaping layer can respell it: every rendering of the value,
-    # including a percent-encoding nothing models, still contains it.
-    for spelling in (
-        _QUOTED_RAW_ID,
-        _QUOTED_RAW_SERIALIZED,
-        _QUOTED_RAW_CSS_ESCAPED,
-        _QUOTED_RAW_DOUBLY_ESCAPED,
-        "qt%229f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60",
-    ):
-        assert _text_holds_opaque_run(f'waiting for locator("[id={spelling}]")', _QUOTED_RAW_ID), spelling
-    assert not _text_holds_opaque_run('waiting for locator("[data-tv3-ref=\\"1\\"]")', _QUOTED_RAW_ID)
-    # A value with no opaque run at all has nothing to key on and falls back to the spellings.
-    assert _text_holds_opaque_run("id is a&amp;b", "a&b")
-    assert not _text_holds_opaque_run("id is c&d", "a&b")
-
-
-@pytest.mark.asyncio
-async def test_a_raise_masks_the_call_logs_doubly_escaped_selector() -> None:
-    # Playwright's call log re-escapes the already CSS-escaped selector it quotes, so an id holding a
-    # `"` arrives in a spelling the singly-escaped one is no substring of.
-    class _RaisingDoublyEscapedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                r'waiting for locator("[id=\"qt\\\"9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60\"]") to be hidden'
-            )
-
-    page = _RaisingDoublyEscapedPage(
-        f'<input id="{_QUOTED_RAW_SERIALIZED}" type="text">',
-        selector=f'[id="{_QUOTED_RAW_CSS_ESCAPED}"]',
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert "9f8e7d6c" not in message, message
-    escaped_alias = alias.replace('"', '\\"')
-    assert f'locator("{escaped_alias}")' in message, message
-
-
-@pytest.mark.asyncio
-async def test_a_spelling_no_pass_models_is_withheld_rather_than_re_raised() -> None:
-    # The masking passes work from an enumerated spelling list, so one nobody thought of (a
-    # percent-encoded quote here) survives them: the leak check has to see the run itself.
-    class _RaisingPercentEncodedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError("navigation to /apply#qt%229f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60 was interrupted")
-
-    page = _RaisingPercentEncodedPage(
-        f'<input id="{_QUOTED_RAW_SERIALIZED}" type="text">',
-        selector=f'[id="{_QUOTED_RAW_CSS_ESCAPED}"]',
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(Exception) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert "9f8e7d6c" not in message, message
-    assert isinstance(exc_info.value, RuntimeError), type(exc_info.value)
-    assert message == "browser tool failed; details withheld because they name a masked element", message
-
-
-@pytest.mark.asyncio
-async def test_a_raise_naming_an_alias_that_parsed_to_no_component_is_withheld() -> None:
-    # An alias is minted for any selector holding an opaque run, but the owners masking works from are
-    # the identity components parsed out of that selector. A shape that parses to none still hands the
-    # model a handle, and the gate has to see its run anyway or the raise goes out verbatim.
-    raw = "16c477b2-a46f-4c40-925b-1e5b83254c65"
-
-    class _RaisingUnparsedSelectorPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(f'waiting for locator("[aria-controls=\\"{raw}\\"]") to be {state}')
-
-    page = _RaisingUnparsedSelectorPage(
-        f'<input aria-controls="{raw}" type="text">', selector=f'[aria-controls="{raw}"]'
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(Exception) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw not in message, message
-    assert isinstance(exc_info.value, RuntimeError), type(exc_info.value)
-    assert message == "browser tool failed; details withheld because they name a masked element", message
-
-
-@pytest.mark.asyncio
-async def test_a_raise_keeps_its_diagnostic_when_the_run_repeats_only_in_a_page_attribute() -> None:
-    # Every hinted field a component library renders points an `aria-describedby` at an element named
-    # from the same per-field uuid, and masking deliberately leaves that value alone as page content.
-    # Withholding the whole message over an occurrence no masking pass owns costs the diagnostic for
-    # the failure and hides nothing: the run is still readable on the page either way.
-    run = "16c477b2-a46f-4c40-925b-1e5b83254c65"
-    raw_id = f"field_{run}"
-    hint = f"hint-{run}"
-
-    class _RaisingHintedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                f'waiting for locator("#{raw_id}") to be {state}\n'
-                f'  - locator resolved to <input aria-describedby="{hint}" id="{raw_id}" type="text"/>'
-            )
-
-    page = _RaisingHintedPage(f'<input aria-describedby="{hint}" id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert "withheld" not in message, message
-    assert raw_id not in message, message
-    assert f'locator("{alias}") to be hidden' in message, message
-    assert f'resolved to <input aria-describedby="{hint}" {alias[1:-1]} type="text"/>' in message, message
-
-
-@pytest.mark.asyncio
-async def test_a_raise_is_still_withheld_when_the_run_sits_in_another_elements_id() -> None:
-    # The same run inside an `id` is a selector the model can copy, whichever element carries it, and
-    # this one belongs to no alias so no masking pass rewrites it. Scoping the gate to the places
-    # masking owns must not stop covering identity attributes.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-
-    class _RaisingWrappedPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            raise TimeoutError(
-                f'waiting for locator("#{raw_id}") to be {state}\n'
-                f'  - locator resolved to <input id="{raw_id}" type="text"/>\n'
-                f'  - inside <div id="wrapper-16c477b2-a46f-4c40-925b-1e5b83254c65">'
-            )
-
-    page = _RaisingWrappedPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(Exception) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert "16c477b2" not in message, message
-    assert message == "browser tool failed; details withheld because they name a masked element", message
 
 
 class _VanishedAliasPage(_FakeAliasPage):
@@ -7663,28 +6501,6 @@ class _VanishedAliasPage(_FakeAliasPage):
     async def query_selector(self, selector: str) -> Any:
         self.calls.append(("query_selector", {"selector": selector}))
         return None
-
-
-@pytest.mark.parametrize("tool_name", ["get_html", "file_upload"])
-@pytest.mark.parametrize(
-    "raw_value",
-    ['qt"9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60', "qt\\9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e60"],
-)
-@pytest.mark.asyncio
-async def test_an_error_result_masks_a_selector_python_repr_re_escaped(tool_name: str, raw_value: str) -> None:
-    # `{selector!r}` doubles a backslash and escapes the quote repr wraps with, so an id holding `"`
-    # or `\` reaches the result in a spelling the stored selector is no substring of.
-    selector = f'[id="{_css_escape_attr_value(raw_value)}"]'
-    page = _VanishedAliasPage(f'<input id="{raw_value.replace(chr(34), "&quot;")}" type="text">', selector=selector)
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    args = {"selector": alias} if tool_name == "get_html" else {"selector": alias, "file": "/tmp/cv.pdf"}
-    result = await _tool(tools, tool_name).handler(args)
-
-    assert result.status == "error", result.content
-    assert "9f8e7d6c" not in result.content, result.content
-    assert alias in result.content, result.content
 
 
 # An owned id spelled by repr in a page-controlled fragment of a tool message: the escape's own
@@ -7724,201 +6540,6 @@ class _AliasTypeaheadPage(_FakeAliasPage):
         if "'unprobeable'" in js:
             return ""
         return await super().evaluate(js)
-
-
-@pytest.mark.parametrize(
-    ("suggestion_text", "committed", "status", "outcome"),
-    [
-        (_NBSP_RAW_ID, "", "error", "failed"),
-        ("Acme", _NBSP_RAW_ID, "ok", "succeeded"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_result_in_a_spelling_no_pass_models_is_withheld_without_moving_its_status(
-    monkeypatch: pytest.MonkeyPatch, suggestion_text: str, committed: str, status: str, outcome: str
-) -> None:
-    # A tool message quotes page-controlled text, which can spell an owned run in a form no pass
-    # models; the text drops, but the status must not, or a committed side effect reads as failed.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
-    page = _AliasTypeaheadPage(
-        f'<input id="{_NBSP_RAW_ID}" type="text">',
-        f'[id="{_NBSP_RAW_ID}"]',
-        suggestion_text=suggestion_text,
-        committed=committed,
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    result = await _tool(tools, "select_combobox").handler({"selector": alias, "value": "Acme"})
-
-    assert result.status == status, result.content
-    assert "9f8e7d6c" not in result.content, result.content
-    assert result.content == f"browser tool {outcome}; details withheld because they name a masked element"
-
-
-@pytest.mark.asyncio
-async def test_a_raise_keeps_its_alias_on_every_retry_of_an_identical_resolved_to_line() -> None:
-    # Playwright's call log reprints the SAME resolved-to line on every retry of a timeout; counting
-    # each repetition as its own carrier judged the raw ambiguous and redacted every line past the
-    # first to "?", even though it is one element, not several.
-    raw_id = "field_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    resolved_line = f'  - locator resolved to <input id="{raw_id}" type="text"/>'
-
-    class _RaisingRetryingPage(_FakeAliasPage):
-        async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
-            lines = "\n".join(resolved_line for _ in range(5))
-            raise TimeoutError(f'waiting for locator("#{raw_id}") to be {state}\n{lines}')
-
-    page = _RaisingRetryingPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    with pytest.raises(TimeoutError) as exc_info:
-        await _tool(tools, "wait").handler({"selector": alias, "state": "hidden", "timeout_ms": 300})
-
-    message = str(exc_info.value)
-    assert raw_id not in message, message
-    assert '[data-tv3-ref="?"]' not in message, message
-    assert message.count(f'resolved to <input {alias[1:-1]} type="text"/>') == 5, message
-
-
-@pytest.mark.asyncio
-async def test_get_html_redacts_a_cut_value_only_a_different_attributes_owner_matches() -> None:
-    # The cut reaches 11 chars into the id's opaque run, past `_CUT_RAW_PREFIX_MIN`. With the id's own
-    # tag past the cut, nothing arbitrates a `name` fragment matched to it, and the answer redacts.
-    raw_id = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    document = f'<p>intro</p><select name="{raw_id[:20]}'
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert "question_" not in html_result.content, html_result.content
-    assert alias[1:-2] not in html_result.content, html_result.content
-    assert html_result.content.endswith('<select data-tv3-ref="?'), html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_keeps_a_cut_handle_for_an_owner_of_the_same_attribute() -> None:
-    # The attribute restriction must not cost the case it was built around: a cut 11 chars into the
-    # run inside `name="…"`, whose owner was minted from a `name` selector, still renders its handle.
-    raw_name = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    document = f'<p>intro</p><select name="{raw_name[:20]}'
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(f'<select name="{raw_name}"></select>', selector=f'select[name="{raw_name}"]', tag="select")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert "question_" not in html_result.content, html_result.content
-    assert html_result.content.endswith(f"<select {alias[1:-2]}"), html_result.content
-
-
-@pytest.mark.asyncio
-async def test_get_html_drops_an_identity_attribute_mirroring_the_aliased_raw() -> None:
-    # `<input id="R" name="R">` is ordinary form markup: masking only the attribute the emitted
-    # selector named leaves `[name="R"]` standing, a selector the model can copy.
-    raw_id = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(f'<input id="{raw_id}" name="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    html_result = await _tool(tools, "get_html").handler({"selector": alias})
-    assert html_result.status == "ok", html_result.content
-    assert raw_id not in html_result.content, html_result.content
-    assert html_result.content == f'<input {alias[1:-1]} type="text">', html_result.content
-
-
-@pytest.mark.asyncio
-async def test_resolving_an_alias_leaves_the_callers_args_untouched() -> None:
-    # loop.py prints `args["selector"]` back to the model in its stall nudge and its batch-skip line,
-    # and reads it again to arm the submit watch; both are safe only while de-aliasing writes the
-    # real selector into a copy the caller never sees.
-    raw_id = "question_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    page = _FakeAliasPage(f'<input id="{raw_id}" type="text">', selector=f"#{raw_id}")
-    tools = build_browser_tools(_fixed_page_provider(page))
-    alias = _observed_alias(await _tool(tools, "observe").handler({}))
-
-    args = {"selector": alias}
-    result = await _tool(tools, "get_html").handler(args)
-
-    assert result.status == "ok", result.content
-    assert args == {"selector": alias}
-
-
-@pytest.mark.asyncio
-async def test_get_html_keeps_the_first_radios_handle_when_the_group_shares_one_name() -> None:
-    # An ordinary radio group: every option carries the group's `name`, and the first option's `id`
-    # IS that name. Counting carriers per raw across all identity attributes makes the second option
-    # a carrier of the first option's id owner, which redacts the first option's handle to "?" and
-    # leaves the model no way to pick it.
-    raw_id = "radio_16c477b2-a46f-4c40-925b-1e5b83254c65"
-    other_id = f"{raw_id}-2"
-    document = (
-        f'<input id="{raw_id}" name="{raw_id}" type="radio" value="1">'
-        f'<input id="{other_id}" name="{raw_id}" type="radio" value="2">'
-    )
-
-    class _DocumentPage(_FakeAliasPage):
-        async def content(self) -> str:
-            return document
-
-    page = _DocumentPage(
-        f'<input id="{raw_id}" name="{raw_id}" type="radio" value="1">',
-        selector=f"#{raw_id}",
-        extra_elements=[("input", f"#{other_id}", f'<input id="{other_id}" name="{raw_id}" type="radio" value="2">')],
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-
-    observed = await _tool(tools, "observe").handler({})
-    aliases = re.findall(r'\[(\[data-tv3-ref="\d+"\])\]', observed.content)
-    assert len(aliases) == 2, observed.content
-    first, second = aliases
-
-    html_result = await _tool(tools, "get_html").handler({})
-    assert html_result.status == "ok", html_result.content
-    assert "16c477b2" not in html_result.content, html_result.content
-    assert 'data-tv3-ref="?"' not in html_result.content, html_result.content
-    # The mirrored `name` is still dropped from both options: it is as copyable a selector as the id.
-    assert "name=" not in html_result.content, html_result.content
-    expected = f'<input {first[1:-1]} type="radio" value="1"><input {second[1:-1]} type="radio" value="2">'
-    assert html_result.content == expected, html_result.content
-
-
-def test_first_start_tag_span_is_quote_aware_and_tag_scoped() -> None:
-    # `>` is legal unescaped inside a quoted attribute value, so the tag's real end is the first `>`
-    # OUTSIDE quotes — a naive text.find(">") would stop inside the attribute value instead.
-    double_quoted = '<input aria-label="a > b" id="x">TAIL'
-    span = _first_start_tag_span(double_quoted)
-    assert span is not None
-    assert double_quoted[span[1] :] == ">TAIL"
-
-    single_quoted = "<input aria-label='a > b' id=\"x\">TAIL"
-    span = _first_start_tag_span(single_quoted)
-    assert span is not None
-    assert single_quoted[span[1] :] == ">TAIL"
-
-    assert _first_start_tag_span("no angle brackets here") is None
-
-    # A `<` not immediately followed by a letter (prose, a closing tag) never anchors the span; the
-    # span starts at the real tag, not at byte 0 of the message.
-    prose_then_tag = 'a < b, mentioned earlier <input id="x">TAIL'
-    span = _first_start_tag_span(prose_then_tag)
-    assert span is not None
-    assert prose_then_tag[span[0] : span[1]] == '<input id="x"'
 
 
 @_skip_no_browser
@@ -7969,9 +6590,11 @@ async def test_an_ordinary_control_mutated_in_place_by_a_later_host_marking_is_n
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "[#pay]" not in r.content, r.content
+        assert "Pay now" not in r.content, r.content
         again = await _tool(tools, "observe").handler({})
-        assert "[#pay] input/checkbox 'Pay now' value='on' checked=False" in again.content, again.content
+        assert re.search(r"^ref=\d+ input/checkbox 'Pay now' value='on' checked=False$", again.content, re.M), (
+            again.content
+        )
 
 
 @_skip_no_browser
@@ -8075,7 +6698,7 @@ async def test_a_named_control_inside_a_component_keeps_its_own_record_when_the_
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "[#own-id] button/button 'Named'" in r.content, r.content
+        assert re.search(r"^ref=\d+ button/button 'Named'$", r.content, re.M), r.content
         assert "'Anchored'" in r.content, r.content
 
 
@@ -8099,7 +6722,7 @@ async def test_a_control_whose_caption_updates_on_its_own_stays_listed() -> None
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "[#resend] button/button 'Resend in " in r.content, r.content
+        assert re.search(r"^ref=\d+ button/button 'Resend in \d+s'$", r.content, re.M), r.content
 
 
 @_skip_no_browser
@@ -8144,9 +6767,9 @@ async def test_an_aria_widget_whose_state_a_later_marking_flipped_is_not_listed_
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "[#tos]" not in r.content, r.content
+        assert "div/switch" not in r.content, r.content
         again = await _tool(tools, "observe").handler({})
-        assert "[#tos] div/switch '' checked=False" in again.content, again.content
+        assert re.search(r"^ref=\d+ div/switch '' checked=False$", again.content, re.M), again.content
 
 
 @_skip_no_browser
@@ -8201,7 +6824,7 @@ async def test_a_control_whose_name_a_later_marking_rewrote_is_not_listed_under_
         r = await _tool(tools, "observe").handler({})
         assert "'Pay now'" not in r.content, r.content
         again = await _tool(tools, "observe").handler({})
-        assert "[#act] button/button 'Delete account'" in again.content, again.content
+        assert re.search(r"^ref=\d+ button/button 'Delete account'$", again.content, re.M), again.content
 
 
 @_skip_no_browser
@@ -8211,9 +6834,11 @@ async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "#agree" in r.content
+        assert _ref_line(r.content, "I agree")
         assert "hidden-native" in r.content
-        assert "#nolabel" not in r.content
+        # #nolabel carries no readable name: the header count (not a selector substring, since none
+        # is printed anymore) is what proves it was dropped.
+        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "3"
 
 
 @_skip_no_browser
@@ -8859,9 +7484,14 @@ async def test_a_component_that_mirrors_its_id_inward_is_named_by_its_tag() -> N
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert '[input[id="first-name-input"]]' in r.content, r.content
+        # The mirrored id would otherwise make the bare `#first-name-input` selector match twice and
+        # drop the field entirely; naming the tag keeps it listed as exactly one control.
+        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "1", r.content
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
+        assert selectors == ['input[id="first-name-input"]'], selectors
         assert await page.locator("#first-name-input").count() == 2, "fixture must reproduce the mirror"
-        await _tool(tools, "click").handler({"selector": 'input[id="first-name-input"]'})
+        ref = re.search(r"^ref=(\d+)", r.content, re.M).group(1)
+        await _tool(tools, "click").handler({"selector": f"ref={ref}"})
         # Only the inner input carries a listener, so this receipt cannot be produced by a click
         # that landed on the host instead.
         assert await page.evaluate("() => window.hits") == ["inner:INPUT"]
@@ -9777,11 +8407,11 @@ async def test_observe_bounds_hidden_natives_and_points_file_inputs_at_file_uplo
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        listed = [line for line in r.content.splitlines() if line.startswith("[") and "hidden-native" in line]
+        listed = [line for line in r.content.splitlines() if line.startswith("ref=") and "hidden-native" in line]
         assert len(listed) == 40
         assert "note: 40 native control(s)" in r.content
         assert "could not be described" in r.content  # the overflow is disclosed, not silently dropped
-        cv_line = next(line for line in listed if "[#cv]" in line)
+        cv_line = next(line for line in listed if "'Resume'" in line)
         assert "file_upload" in cv_line and "click" not in cv_line
 
 
@@ -9903,11 +8533,11 @@ async def test_a_shared_marker_is_not_reused_when_the_document_itself_cannot_be_
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        selectors = [m.group(1) for m in (re.match(r"^\[(.*?)\] ", ln) for ln in r.content.splitlines()) if m]
-        assert len(selectors) == len(set(selectors)), f"two lines share a selector:\n{r.content}"
-        element_lines = [ln for ln in r.content.splitlines() if ln.startswith("[")]
-        target = next(sel for sel, ln in zip(selectors, element_lines) if "Delete account" in ln)
-        await _tool(tools, "click").handler({"selector": target})
+        # Selector uniqueness is a property of the internal mint, which the digest no longer prints:
+        # read the raw per-element selectors. Acting still goes through the ref the model was given.
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
+        assert len(selectors) == len(set(selectors)), f"two elements share a selector:\n{selectors}"
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "Delete account")})
         assert await page.evaluate("() => window.hits") == ["Delete account"]
 
 
@@ -9987,11 +8617,11 @@ async def test_a_marker_the_page_carries_twice_is_never_reused_however_the_check
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        selectors = [m.group(1) for m in (re.match(r"^\[(.*?)\] ", ln) for ln in r.content.splitlines()) if m]
-        assert len(selectors) == len(set(selectors)), f"two lines share a selector:\n{r.content}"
-        element_lines = [ln for ln in r.content.splitlines() if ln.startswith("[")]
-        target = next(sel for sel, ln in zip(selectors, element_lines) if "Delete account" in ln)
-        await _tool(tools, "click").handler({"selector": target})
+        # Selector uniqueness is a property of the internal mint, which the digest no longer prints:
+        # read the raw per-element selectors. Acting still goes through the ref the model was given.
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
+        assert len(selectors) == len(set(selectors)), f"two elements share a selector:\n{selectors}"
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "Delete account")})
         assert await page.evaluate("() => window.hits") == ["Delete account"]
 
 
@@ -10019,11 +8649,11 @@ async def test_a_marker_this_call_minted_is_not_evidence_the_page_carried_it() -
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        selectors = [m.group(1) for m in (re.match(r"^\[(.*?)\] ", ln) for ln in r.content.splitlines()) if m]
-        assert len(selectors) == len(set(selectors)), f"two lines share a selector:\n{r.content}"
-        element_lines = [ln for ln in r.content.splitlines() if ln.startswith("[")]
-        target = next(sel for sel, ln in zip(selectors, element_lines) if "Delete account" in ln)
-        await _tool(tools, "click").handler({"selector": target})
+        # Selector uniqueness is a property of the internal mint, which the digest no longer prints:
+        # read the raw per-element selectors. Acting still goes through the ref the model was given.
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
+        assert len(selectors) == len(set(selectors)), f"two elements share a selector:\n{selectors}"
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "Delete account")})
         assert await page.evaluate("() => window.hits") == ["Delete account"]
 
 
@@ -10125,7 +8755,7 @@ async def test_a_selector_that_uniquely_resolves_to_a_different_element_is_refus
         )
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        form_line = next(ln for ln in r.content.splitlines() if ln.startswith("[") and "form/" in ln)
+        form_line = next(ln for ln in r.content.splitlines() if ln.startswith("ref=") and "form/" in ln)
         assert "[object HTMLInputElement]" not in form_line, form_line
 
 
@@ -10144,11 +8774,12 @@ async def test_a_tag_qualified_id_only_narrows_what_the_bare_id_already_matched(
         r.innerHTML = '<input id="mirrored" style="width:80px;height:20px">';
         </script>"""
     ) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "observe").handler({})
-        emitted = [m.group(1) for m in (re.match(r"^\[(.*?)\] ", line) for line in r.content.splitlines()) if m]
+        # A property of the internal selector mint, not of anything observe() still hands the model
+        # (the digest addresses by ref now): read the raw per-element selector the JS layer computes.
+        data = await _observe_data(page)
+        emitted = [e["selector"] for e in data["elements"]]
         qualified = [s for s in emitted if s.startswith("input[id=")]
-        assert qualified, r.content
+        assert qualified, emitted
         for sel in qualified:
             raw = sel[len('input[id="') : -2]
             assert await page.locator(sel).count() == 1, f"{sel} must identify exactly one element"
@@ -10156,7 +8787,7 @@ async def test_a_tag_qualified_id_only_narrows_what_the_bare_id_already_matched(
                 f"#{raw} was unambiguous; the bare id should have been used"
             )
         # An id that already resolves uniquely is still emitted bare, so qualifying is a fallback.
-        assert "[#unique-one]" in r.content, r.content
+        assert "#unique-one" in emitted, emitted
 
 
 @_skip_no_browser
@@ -10204,10 +8835,8 @@ async def test_observe_selector_for_shadow_element_round_trips_and_is_stable() -
         first = await _tool(tools, "observe").handler({})
         again = await _tool(tools, "observe").handler({})
         assert first.content == again.content, "an unchanged page must observe byte-identically"
-        line = next(ln for ln in first.content.splitlines() if "First name*" in ln)
-        selector = line[1 : line.index("] ")]
-        assert selector == "#first-name", line
-        clicked = await _tool(tools, "click").handler({"selector": selector})
+        ref = _ref_line(first.content, "First name*")
+        clicked = await _tool(tools, "click").handler({"selector": ref})
         assert clicked.status == "ok", clicked.content
 
 
@@ -10280,7 +8909,7 @@ async def test_observe_does_not_manufacture_blind_spots_from_decorative_componen
         )
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "#go" in r.content
+        assert _ref_line(r.content, "'Go'")
         assert "deco-divider" not in r.content
         assert "my-sealed" not in r.content, "a closed root must not be reported: we cannot tell it from decoration"
         assert "sealed-field" not in r.content, "and we genuinely cannot see inside it"
@@ -10347,12 +8976,14 @@ async def test_component_controls_are_listed_in_document_order() -> None:
           .attachShadow({mode: 'open'}).innerHTML = leaf + '<input id="f_a1" type="text">';
         </script>"""
     ) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "observe").handler({})
-        selectors = re.findall(r"^\[(.*?)\] ", r.content, re.M)
+        # The order property lives in the JS walk that produces the elements list; observe() assigns
+        # refs to that same list by a plain enumerate, so this order is exactly what the digest lines
+        # come out in too.
+        data = await _observe_data(page)
+        selectors = [e["selector"] for e in data["elements"]]
         # Light DOM first by construction, then every root depth-first in document order -- so a
         # component's own control precedes its nested child's, and both precede the next sibling's.
-        assert selectors == ["#applicant-email", "#f_a", "#f_a1", "#f_b", "#f_c"], r.content
+        assert selectors == ["#applicant-email", "#f_a", "#f_a1", "#f_b", "#f_c"], selectors
 
 
 @_skip_no_browser
@@ -10417,22 +9048,26 @@ async def test_observe_enumerates_aria_widget_roles() -> None:
         header = r.content.splitlines()[0]
         assert header.startswith("url="), header
         assert "url=about:blank" in header and "title=''" in header, header
-        listed = {ln.split("]")[0].lstrip("["): ln for ln in r.content.splitlines() if ln.startswith("[")}
-        for selector in ("#lb", "#sw-on", "#sw-off", "#sb", "#tab-on", "#tab-off"):
-            assert selector in listed, f"{selector} should be enumerable by its ARIA role"
+        # Elements have no natural selector of their own to key by anymore; each has a distinct label,
+        # so key on that instead.
+        listed = {
+            m.group(1): ln for ln in r.content.splitlines() for m in [re.match(r"^ref=\d+ \S+ '([^']*)'", ln)] if m
+        }
+        for label in ("United States", "Remote OK", "Relocate", "Years", "Experience", "Education"):
+            assert label in listed, f"{label!r} should be enumerable by its ARIA role"
         # Enumerating the proxy is only half of it: an ON switch and an OFF one that read identically
         # invite toggling the wrong way and calling it success.
-        assert "switch" in listed["#sw-on"] and "checked=True" in listed["#sw-on"]
-        assert "switch" in listed["#sw-off"] and "checked=False" in listed["#sw-off"]
-        assert "selected=True" in listed["#tab-on"] and "selected=False" in listed["#tab-off"]
+        assert "switch" in listed["Remote OK"] and "checked=True" in listed["Remote OK"]
+        assert "switch" in listed["Relocate"] and "checked=False" in listed["Relocate"]
+        assert "selected=True" in listed["Experience"] and "selected=False" in listed["Education"]
         # The element has no text of its own, so a 3 on this line can only have come from
         # aria-valuenow — with text content, the label satisfied the assertion and the production
         # branch could be deleted with the suite still green.
-        assert "spinbutton" in listed["#sb"] and "value='3'" in listed["#sb"]
-        assert "listbox" in listed["#lb"]
+        assert "spinbutton" in listed["Years"] and "value='3'" in listed["Years"]
+        assert "listbox" in listed["United States"]
         # role=textbox on a plain div names a control type_text cannot fill; the fillable ones are
         # already matched as [contenteditable=true].
-        assert "#tb" not in listed
+        assert "Notes" not in listed
 
 
 @_skip_no_browser
@@ -10463,16 +9098,19 @@ async def test_observe_survives_named_getter_clobbering_while_piercing() -> None
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "#real" in r.content, "a hostile form must not cost the shadow-hosted control"
+        assert _ref_line(r.content, "Real field"), "a hostile form must not cost the shadow-hosted control"
+        # These properties belong to the JS walk's own selector mint, no longer anything the digest
+        # still shows the model (it addresses by ref now); read the raw per-element selectors.
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
         # The nodeType===11 guard: form.shadowRoot is the <fieldset>, and a walk that trusted it
         # would enumerate the decoy's contents a SECOND time, through a root that is not a root —
         # the duplicate losing its natural selector to a minted marker.
-        assert r.content.count("#inside-the-decoy") == 1, "the decoy must be listed once, by its id"
-        assert "data-tv3=" not in r.content, "no element here needs a minted marker"
+        assert selectors.count("#inside-the-decoy") == 1, "the decoy must be listed once, by its id"
+        assert not any(s.startswith('[data-tv3="') for s in selectors), "no element here needs a minted marker"
         # The walk's own try/catch: one element whose shadowRoot accessor raises must cost that
         # element, not every control on the page.
-        assert "#thrower" in r.content, "the element whose accessor raises is still itself listable"
-        assert r.content.count("[#") >= 3, "a raising accessor must not empty the element list"
+        assert "#thrower" in selectors, "the element whose accessor raises is still itself listable"
+        assert len(selectors) >= 3, "a raising accessor must not empty the element list"
 
 
 @_skip_no_browser
@@ -10505,7 +9143,7 @@ async def test_observe_element_choice_survives_a_page_that_overrides_matches() -
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "#go" in r.content
+        assert _ref_line(r.content, "'Go'")
         assert "] html " not in r.content and "] body " not in r.content
 
 
@@ -10530,7 +9168,7 @@ async def test_observe_discloses_elements_dropped_by_the_budget() -> None:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert "exceeded the element budget" in r.content
-        assert "#submit-application" in r.content, "light-DOM controls are not crowded out by components"
+        assert _ref_line(r.content, "Submit Application"), "light-DOM controls are not crowded out by components"
         # The clause the budget ruling actually added: the model is told WHAT the budget starved, not
         # just that it starved something. Without it, "N more elements" reads as more of the same.
         note = next(ln for ln in r.content.splitlines() if "element budget" in ln)
@@ -10543,8 +9181,8 @@ async def test_aria_labelledby_names_and_routes_a_skinned_checkbox() -> None:
     async with _content_page(_ARIA_LABELLEDBY_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        line = next(ln for ln in r.content.splitlines() if "[#consent]" in ln)
-        assert "I consent" in line and "hidden-native" in line
+        line = next(ln for ln in r.content.splitlines() if "I consent" in ln)
+        assert "hidden-native" in line
         r = await _tool(tools, "click").handler({"selector": "#consent"})
         assert r.status == "ok" and "toggled directly" in r.content  # a span is a name, not a click proxy
         assert await page.eval_on_selector("#consent", "el => el.checked") is True
@@ -10592,10 +9230,11 @@ async def test_minted_marker_does_not_collide_with_one_planted_in_a_shadow_root(
              document.querySelector cannot see. -->
         <button style="width:120px;height:20px">Real Button</button>"""
     ) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "observe").handler({})
-        line = next(ln for ln in r.content.splitlines() if "Real Button" in ln)
-        selector = line[1 : line.index("] ")]
+        # A property of the internal selector mint (collision-avoidance across shadow roots the
+        # digest no longer shows the model), not of the ref layer: read the raw per-element selector.
+        data = await _observe_data(page)
+        element = next(e for e in data["elements"] if e.get("label") == "Real Button")
+        selector = element["selector"]
         assert await page.locator(selector).count() == 1
         assert await page.locator(selector).first.inner_text() == "Real Button"
 
@@ -10624,10 +9263,10 @@ async def test_click_refuses_a_skinned_checkbox_once_its_proxy_stops_rendering()
     async with _content_page(_COLLAPSED_PANEL_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r_open = await _tool(tools, "observe").handler({})
-        assert "#terms" in r_open.content  # listed while the panel is open
+        assert _ref_line(r_open.content, "Accept terms")  # listed while the panel is open
         await page.evaluate("window.__collapse()")
         r_closed = await _tool(tools, "observe").handler({})
-        assert "#terms" not in r_closed.content  # observe refuses it once collapsed
+        assert "Accept terms" not in r_closed.content  # observe refuses it once collapsed
         start = time.monotonic()
         r = await _tool(tools, "click").handler({"selector": "#terms"})
         assert time.monotonic() - start < 10
@@ -10743,9 +9382,13 @@ async def test_observe_discloses_controls_it_cannot_name_inside_components() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         first = await _tool(tools, "observe").handler({})
         assert first.status == "ok"
-        assert "#light-ok" in first.content
+        assert _ref_line(first.content, "Light Button")
         assert "Inner Go" not in first.content
-        assert "data-tv3=" not in first.content, "no marker may be written inside a component"
+        # "no marker may be written inside a component" is a property of the internal selector mint,
+        # no longer anything the digest shows the model; read the raw per-element selectors.
+        assert not any(e["selector"].startswith('[data-tv3="') for e in (await _observe_data(page))["elements"]), (
+            "no marker may be written inside a component"
+        )
         assert (
             "1 control(s) inside components are not listed because we have no selector that "
             "identifies them: 1 have no id, name or data-testid of their own"
@@ -10766,7 +9409,7 @@ async def test_observe_discloses_controls_it_cannot_name_inside_components() -> 
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "[#inner-named]" in r.content
+        assert _ref_line(r.content, "Named")
         assert "not listed because we have no selector" not in r.content
 
 
@@ -10847,7 +9490,7 @@ async def test_a_page_cannot_forge_an_element_line_into_the_observe_payload() ->
                 # the model reading this payload, and splitting on \n alone would miss the forgery.
                 header, *rest = r.content.splitlines()
                 claimed = int(header.split("(")[1].split(" ")[0])
-                element_lines = [ln for ln in rest if ln.startswith("[")]
+                element_lines = [ln for ln in rest if ln.startswith("ref=")]
                 assert len(element_lines) == claimed, (
                     f"{label}/{nl}: header says {claimed}, {len(element_lines)} printed"
                 )
@@ -10867,10 +9510,14 @@ async def test_switch_state_is_reported_only_when_the_page_states_it() -> None:
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        listed = {ln.split("]")[0].lstrip("["): ln for ln in r.content.splitlines() if ln.startswith("[")}
-        assert "checked=" not in listed["#unset"], listed["#unset"]
-        assert "checked=" not in listed["#mixed"], listed["#mixed"]
-        assert "checked=True" in listed["#on"], listed["#on"]
+        # Elements have no natural selector of their own to key by anymore; each has a distinct
+        # label, so key on that instead.
+        listed = {
+            m.group(1): ln for ln in r.content.splitlines() for m in [re.match(r"^ref=\d+ \S+ '([^']*)'", ln)] if m
+        }
+        assert "checked=" not in listed["Email"], listed["Email"]
+        assert "checked=" not in listed["Partial"], listed["Partial"]
+        assert "checked=True" in listed["Remote"], listed["Remote"]
 
 
 @_skip_no_browser
@@ -10879,7 +9526,7 @@ async def test_hidden_select_digest_names_select_option_alone_and_click_refuses_
     async with _content_page(_HIDDEN_NATIVE_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        line = next(ln for ln in r.content.splitlines() if "[#country]" in ln)
+        line = next(ln for ln in r.content.splitlines() if "'Country'" in ln)
         assert "select_option" in line and "click" not in line
         start = time.monotonic()
         rc = await _tool(tools, "click").handler({"selector": "#country"})
@@ -10925,14 +9572,14 @@ async def test_observe_line_count_matches_its_header_across_hostile_attribute_va
             r = await _tool(tools, "observe").handler({})
             header, *rest = r.content.splitlines()
             claimed = int(header.split("(")[1].split(" ")[0])
-            element_lines = [ln for ln in rest if ln.startswith("[")]
+            element_lines = [ln for ln in rest if ln.startswith("ref=")]
             assert len(element_lines) == claimed, (
                 f"{nl}: header says {claimed}, {len(element_lines)} printed:\n{r.content}"
             )
             # Containing the text is fine and expected — inside a repr the newline shows as \n and
             # cannot end a line. What must never happen is a LINE that starts with the forged
             # selector, which is what the model reads as "here is a control you can click".
-            assert not [ln for ln in element_lines if ln.startswith("[#forged]")], f"{nl}: {r.content}"
+            assert not [ln for ln in r.content.splitlines() if ln.startswith("[#forged]")], f"{nl}: {r.content}"
 
 
 @_skip_no_browser
@@ -10960,12 +9607,12 @@ async def test_observe_tag_field_survives_a_tag_name_holding_a_line_separator() 
         r = await _tool(tools, "observe").handler({})
         header, *rest = r.content.splitlines()
         claimed = int(header.split("(")[1].split(" ")[0])
-        # The split half of a forged tag line does not start with "[", so counting only lines that do
+        # The split half of a forged tag line does not start with "ref=", so counting only those
         # would miss it — this fixture has exactly one element and no other notes, so the whole
         # payload must be exactly header + one line, not header + a split remainder.
         assert len(r.content.splitlines()) == 1 + claimed, f"claimed {claimed} from {made!r}:\n{r.content!r}"
-        assert rest == [ln for ln in rest if ln.startswith("[")], rest
-        assert any("#weird-tag" in ln for ln in rest), r.content
+        assert rest == [ln for ln in rest if ln.startswith("ref=")], rest
+        assert any("'Go'" in ln for ln in rest), r.content
         assert chr(0x2028) not in r.content, r.content
 
 
@@ -10986,12 +9633,14 @@ async def test_a_planted_marker_cannot_steer_a_click_to_a_decoy() -> None:
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        line = next(ln for ln in r.content.splitlines() if "Real Button" in ln)
-        selector = line[1 : line.index("] ")]
-        # The duplicated value must not be reused for either element.
-        assert selector != '[data-tv3="t0"]', line
-        assert await page.locator(selector).count() == 1, selector
-        await _tool(tools, "click").handler({"selector": selector})
+        ref = _ref_line(r.content, "Real Button")
+        # mintOn's own dedup, no longer anything the digest shows the model: the duplicated value
+        # must not have been reused for the raw selector either.
+        element = next(e for e in (await _observe_data(page))["elements"] if e.get("label") == "Real Button")
+        assert element["selector"] != '[data-tv3="t0"]', element
+        assert await page.locator(element["selector"]).count() == 1, element
+        # The decisive check: acting by ref never lands on the decoy, whatever mintOn computed.
+        await _tool(tools, "click").handler({"selector": ref})
         assert await page.evaluate("() => window.hits") == ["Real Button"]
 
 
@@ -11053,10 +9702,8 @@ async def test_shadow_control_with_an_id_is_observable_and_clickable_end_to_end(
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        line = next(ln for ln in r.content.splitlines() if "Apply" in ln)
-        selector = line[1 : line.index("] ")]
-        assert selector == "#inner-btn", line
-        clicked = await _tool(tools, "click").handler({"selector": selector})
+        ref = _ref_line(r.content, "Apply")
+        clicked = await _tool(tools, "click").handler({"selector": ref})
         assert clicked.status == "ok", clicked.content
         # The inner element received it, and the light-DOM control did not.
         assert await page.evaluate("() => window.hits") == ["inner-btn"]
@@ -11098,7 +9745,11 @@ async def test_one_unreadable_root_does_not_cost_every_selector_on_the_page() ->
         # would still see a collision in there — so falling back to markers is correct. What must NOT
         # happen is a fresh marker every turn, which is what disables the stall terminator.
         assert first.content == again.content, f"payload churned:\n{first.content}\n---\n{again.content}"
-        assert "data-tv3=" in first.content, first.content
+        # "falls back to a minted marker" is a property of the internal selector mint, no longer
+        # anything the digest shows the model; read the raw per-element selectors.
+        assert any(e["selector"].startswith('[data-tv3="') for e in (await _observe_data(page))["elements"]), (
+            first.content
+        )
         # The condition itself must be disclosed too, not just its consequence (markers instead of
         # ids) — a reader who never sees this note has no way to tell the page just has few ids.
         assert (
@@ -11184,11 +9835,11 @@ async def test_observe_lists_hidden_natives_inside_open_shadow_roots_by_either_l
         tagged = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
         assert len(tagged) == 2, r.content
         # <label for> inside the same root: the platform scopes .labels for us.
-        assert any("sr-country" in ln and "Shipping Country" in ln for ln in tagged), tagged
+        assert any("Shipping Country" in ln for ln in tagged), tagged
         # aria-labelledby is an IDREF we resolve ourselves. Resolved against the document it finds
         # nothing, so the control reads as unlabelled and is dropped at zero size -- listed nowhere
         # and counted as no omission.
-        assert any("sr-terms" in ln and "Accept Terms" in ln for ln in tagged), tagged
+        assert any("Accept Terms" in ln for ln in tagged), tagged
         assert "note: 2 native control(s) hidden behind styled proxies" in r.content
 
 
@@ -11263,10 +9914,6 @@ async def test_hidden_native_note_counts_only_the_controls_it_actually_listed() 
         # rather than counted as listed: the note claims what it printed, not what it walked.
         assert "reused by another instance of the same component" in r.content
         assert "portfolio" not in r.content, r.content
-
-
-def _printed_selectors(content: str) -> list[str]:
-    return re.findall(r"^\[(.*?)\] ", content, re.M)
 
 
 # Two instances of one component, each holding a control under the same id. Shadow encapsulation
@@ -11694,9 +10341,9 @@ async def test_a_shadow_selector_is_never_handed_out_when_it_would_denote_a_sibl
         r = await _tool(tools, "observe").handler({})
         assert "Real Control" not in r.content, r.content
         assert "identifier we cannot render safely" in r.content, r.content
-        line = next(ln for ln in r.content.splitlines() if "Decoy" in ln)
-        selector = line[1 : line.index("] ")]
-        assert await page.locator(selector).first.inner_text() == "Decoy"
+        ref = _ref_line(r.content, "Decoy")
+        text = await _tool(tools, "get_html").handler({"selector": ref, "format": "text"})
+        assert text.status == "ok" and text.content.strip() == "Decoy", text.content
 
 
 # The seam between the two shipped halves: a styled listbox proxy AND the hidden native it writes
@@ -11739,6 +10386,397 @@ _PROXY_MENU_IN_SHADOW_HTML = """
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_looks_bracketed_legend_number_is_not_an_address_the_selector_argument_accepts() -> None:
+    # Two surfaces, deliberately: look() draws `[N]` and tells the model to act with mark=N, a
+    # separate INTEGER argument, while the digest's address is the string `ref=N` passed as
+    # `selector`. Nothing bracketed is ever a selector, so a legend number copied into `selector`
+    # must not become a ref -- otherwise the bracket ambiguity removed from the digest would live on
+    # here instead. It falls through as ordinary CSS and fails loudly.
+    async with _content_page(
+        """<button id="go" style="width:80px;height:20px">Go</button>
+        <script>window.hits = []; document.getElementById('go').addEventListener('click',
+          () => window.hits.push('go'));</script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        assert _ref_line(observed.content, "'Go'") == "ref=1", observed.content
+
+        looked = await _tool(tools, "look").handler({})
+        assert re.search(r"^\[1\] ", looked.content, re.M), looked.content
+
+        borrowed = await _tool(tools, "click").handler({"selector": "[1]"})
+        assert borrowed.status == "error", borrowed.content
+        assert await page.evaluate("() => window.hits") == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_address_observe_prints_is_byte_identical_to_the_argument_the_tools_accept() -> None:
+    # The alias this replaced was copied WITH its brackets, so a model told to "copy it as printed"
+    # will do exactly that. If the digest ever prints a form the resolver does not accept, the string
+    # falls through as CSS -- failing outright, or worse matching a page-authored attribute of the
+    # same name. One shape, both directions.
+    from skyvern.forge.taskv3.tools import _REF_SELECTOR_RE  # noqa: PLC0415
+
+    async with _content_page('<button id="go" style="width:80px;height:20px">Go</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        line = next(ln for ln in r.content.splitlines() if "'Go'" in ln)
+        printed = line.split(" ", 1)[0]
+
+        assert _REF_SELECTOR_RE.match(printed), f"observe printed {printed!r}, which no tool accepts"
+        clicked = await _tool(tools, "click").handler({"selector": printed})
+        assert clicked.status == "ok", clicked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_control_replaced_by_the_act_leaves_bookkeeping_an_address_that_re_resolves() -> None:
+    # The submit watch's in-flight probe, the repeat guard's key and the nudge all read the caller's
+    # args AFTER dispatch, and turns later. The act token is a stamp on ONE node, so a control the
+    # page replaces as it acts -- a submit button swapped for its "Submitting" version -- carries it
+    # away; the probe fails open on a selector that resolves to nothing, which is exactly how a
+    # submission still in flight reads as settled. What those readers get back has to re-resolve.
+    async with _live_page(
+        """<button id="send" style="width:120px;height:24px">Send</button>
+        <script>
+        window.hits = [];
+        document.getElementById('send').addEventListener('click', () => {
+          window.hits.push('send');
+          const old = document.getElementById('send');
+          const fresh = document.createElement('button');
+          fresh.id = 'send';
+          fresh.textContent = 'Submitting';
+          fresh.style.cssText = 'width:120px;height:24px';
+          old.parentNode.insertBefore(fresh, old);
+          old.remove();
+        });
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        args = {"selector": _ref_line(r.content, "'Send'")}
+
+        clicked = await _tool(tools, "click").handler(args)
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.hits") == ["send"]
+
+        assert await page.locator(args["selector"]).count() == 1, args["selector"]
+        assert await page.locator(args["selector"]).first.inner_text() == "Submitting", args["selector"]
+
+
+# Three ways a page can try to break the pairing between a digest LINE and the handle acted through,
+# each pre-poisoning a different intrinsic before observe runs. They are grouped because they are one
+# class, not three bugs: any page-controlled dispatch standing between the record and its element is
+# an INDEPENDENT source of the pairing, free to answer with a same-tag decoy for the line the model
+# reads while leaving the digest itself untouched. Each one is RED-proven against the build it defeats
+# -- restore that build and the click lands on Beta while the digest still says Alpha.
+_PAIRING_ATTACKS = {
+    # Defeats a rec->element lookup (`Map.prototype.get.call(elOfRec, rec)`).
+    "map_get": """
+      const realGet = Map.prototype.get;
+      Map.prototype.get = function (k) {
+        const v = realGet.call(this, k);
+        return v && v.nodeType === 1 ? beta : v;
+      };""",
+    # Defeats a parallel array kept in lockstep by `outEls.push(el)`: discriminating on the argument
+    # corrupts every element push while leaving every record push -- the digest -- alone.
+    "discriminating_push": """
+      const realPush = Array.prototype.push;
+      Array.prototype.push = function (x) { return realPush.call(this, x && x.nodeType === 1 ? beta : x); };""",
+    # Defeats carrying the element ON its record: `out.push(rec)` hands the record itself to a
+    # page-controlled function, which enumerates it, finds the element-valued property whatever it is
+    # named, and TRANSPOSES it with another record's. The per-call key does not help -- unguessability
+    # stops mattering once the object carrying the element is passed to the attacker.
+    "transposing_push": """
+      const realPush = Array.prototype.push;
+      let held = null;
+      Array.prototype.push = function (x) {
+        if (x && typeof x === 'object' && x.nodeType === undefined) {
+          for (const k of Object.getOwnPropertyNames(x)) {
+            let v; try { v = x[k]; } catch (e) { continue; }
+            if (v && v.nodeType === 1) {
+              if (held === null) { held = { rec: x, key: k, el: v }; }
+              else { try { x[k] = held.el; held.rec[held.key] = v; } catch (e) {} held = null; }
+              break;
+            }
+          }
+        }
+        return realPush.call(this, x);
+      };""",
+    # The transposition again, with everything the ACT-TIME line->handle check could plausibly touch
+    # poisoned to lie in the attacker's favour. This is the case that earns the class-level claim: the
+    # check re-establishes correspondence in PLAYWRIGHT's realm, so main-world pollution cannot reach
+    # it, whichever intrinsic was chosen.
+    "transpose_and_poison_the_check": """
+      const realPush2 = Array.prototype.push;
+      let held2 = null;
+      Array.prototype.push = function (x) {
+        if (x && typeof x === 'object' && x.nodeType === undefined) {
+          for (const k of Object.getOwnPropertyNames(x)) {
+            let v; try { v = x[k]; } catch (e) { continue; }
+            if (v && v.nodeType === 1) {
+              if (held2 === null) { held2 = { rec: x, key: k, el: v }; }
+              else { try { x[k] = held2.el; held2.rec[held2.key] = v; } catch (e) {} held2 = null; }
+              break;
+            }
+          }
+        }
+        return realPush2.call(this, x);
+      };
+      const alpha = document.getElementById('alpha');
+      Element.prototype.matches = function () { return true; };
+      Element.prototype.closest = function () { return this; };
+      const qsa = Document.prototype.querySelectorAll;
+      Document.prototype.querySelectorAll = function (sel) {
+        try { if (String(sel).indexOf('data-tv3-act') !== -1) return qsa.call(this, '#alpha'); } catch (e) {}
+        return qsa.call(this, sel);
+      };
+      const qs = Document.prototype.querySelector;
+      Document.prototype.querySelector = function (sel) {
+        try { if (String(sel).indexOf('data-tv3-act') !== -1) return alpha; } catch (e) {}
+        return qs.call(this, sel);
+      };
+      const realGetAttr = Element.prototype.getAttribute;
+      Element.prototype.getAttribute = function (n) {
+        return n === 'data-tv3-act' ? (this.__forced || realGetAttr.call(this, n)) : realGetAttr.call(this, n);
+      };
+      const realSetAttr = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function (n, v) {
+        if (n === 'data-tv3-act') { this.__forced = v; try { beta.__forced = v; } catch (e) {} }
+        return realSetAttr.call(this, n, v);
+      };
+      Object.defineProperty(Node.prototype, 'isConnected', { configurable: true, get() { return true; } });""",
+    # Defeats a plain `outEls[k] = el` extraction: a [[Set]] finds the inherited accessor.
+    "discriminating_index_setter": """
+      for (let i = 0; i < 40; i++) {
+        Object.defineProperty(Array.prototype, String(i), {
+          configurable: true,
+          get() { return undefined; },
+          set(v) {
+            Object.defineProperty(this, String(i), {
+              value: v && v.nodeType === 1 ? beta : v, writable: true, enumerable: true, configurable: true,
+            });
+          },
+        });
+      }""",
+}
+
+
+# The one form of the transposition that is NOT closed, kept executable rather than described in
+# prose. Both operands of the act-time line->handle check -- the element and the record's own
+# `selector` -- ride the same record across the same page-controlled `out.push`, so moving them
+# TOGETHER keeps them consistent: the check compares Beta-selector against Beta-element, agrees, and
+# passes, while the digest (which renders neither) still reads Alpha. Closing it needs an operand the
+# record never carried, which means running observe in an isolated world; see the residual note in
+# `_names_the_holder` and cloud_docs/task-v3/GOTCHAS.md.
+_COUPLED_TRANSPOSITION = """
+  const realPush = Array.prototype.push;
+  let held = null;
+  Array.prototype.push = function (x) {
+    if (x && typeof x === 'object' && x.nodeType === undefined && typeof x.selector === 'string') {
+      let elKey = null;
+      for (const k of Object.getOwnPropertyNames(x)) {
+        let v; try { v = x[k]; } catch (e) { continue; }
+        if (v && v.nodeType === 1) { elKey = k; break; }
+      }
+      if (elKey) {
+        if (held === null) { held = { rec: x, key: elKey, el: x[elKey], sel: x.selector }; }
+        else {
+          try {
+            const el2 = x[elKey], sel2 = x.selector;
+            x[elKey] = held.el; x.selector = held.sel;
+            held.rec[held.key] = el2; held.rec.selector = sel2;
+          } catch (e) {}
+          held = null;
+        }
+      }
+    }
+    return realPush.call(this, x);
+  };"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_coupled_transposition_is_the_one_form_still_open_and_this_pins_it() -> None:
+    """Pins a KNOWN-OPEN residual by asserting what the engine does today, deliberately.
+
+    An xfail would be the natural shape, but pytest reports xfail as a SKIP in the JUnit report and
+    the browser gate (`dev_scripts/ci/assert_no_skips.py`) fails on any skip -- measured, not assumed.
+    So the residual is pinned as a passing assertion instead: it documents the hole where a reader
+    will look for it, and it goes RED the day the hole closes, which is the reminder to invert it.
+
+    WHEN THE ISOLATED WORLD LANDS, invert this to `== ["alpha"]` and delete this docstring.
+    """
+    async with _live_page(
+        """<button id="alpha" style="width:90px;height:22px">Alpha</button>
+        <button id="beta" style="width:90px;height:22px">Beta</button>
+        <script>
+        window.hits = [];
+        for (const b of document.querySelectorAll('button'))
+          b.addEventListener('click', (e) => window.hits.push(e.currentTarget.id));
+        """
+        + _COUPLED_TRANSPOSITION
+        + """
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'Alpha'")})
+
+        # Both operands of the act-time check moved together, so it compared Beta against Beta and
+        # agreed. This is the residual, stated as the executable fact it is.
+        assert await page.evaluate("() => window.hits") == ["beta"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attack", sorted(_PAIRING_ATTACKS), ids=sorted(_PAIRING_ATTACKS))
+async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(attack: str) -> None:
+    # The perceive->act identity invariant: whatever the page does to the intrinsics, the element the
+    # engine acts on is the one the line the model read described. Failing closed is allowed -- acting
+    # on Beta is not, because that is a wrong-element commit the PAGE chose.
+    async with _live_page(
+        """<button id="alpha" style="width:90px;height:22px">Alpha</button>
+        <button id="beta" style="width:90px;height:22px">Beta</button>
+        <script>
+        window.hits = [];
+        for (const b of document.querySelectorAll('button'))
+          b.addEventListener('click', (e) => window.hits.push(e.currentTarget.id));
+        const beta = document.getElementById('beta');
+        """
+        + _PAIRING_ATTACKS[attack]
+        + """
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        # Non-vacuous: the attack must not simply hide Alpha, or there would be nothing to mis-address.
+        alpha_ref = _ref_line(r.content, "'Alpha'")
+
+        clicked = await _tool(tools, "click").handler({"selector": alpha_ref})
+        hits = await page.evaluate("() => window.hits")
+        assert "beta" not in hits, (attack, clicked.content, r.content)
+        if clicked.status == "ok":
+            assert hits == ["alpha"], (attack, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_that_collapses_every_ref_id_onto_one_cannot_make_two_lines_share_a_ref() -> None:
+    # Ref ids are minted in the page's own realm (a WeakMap, so nothing lands in the markup), which
+    # means the page can lie about them: patching WeakMap.prototype.get makes every element claim the
+    # same id. Two digest lines sharing one ref would send an act to whichever the map wrote last --
+    # a wrong-element commit chosen by the page. The executor mints its own number on a repeat, so
+    # the lie costs the page nothing and buys it nothing.
+    async with _live_page(
+        """<button id="alpha" style="width:80px;height:20px">Alpha</button>
+        <button id="beta" style="width:80px;height:20px">Beta</button>
+        <script>
+        window.hits = [];
+        for (const b of document.querySelectorAll('button'))
+          b.addEventListener('click', (e) => window.hits.push(e.currentTarget.id));
+        WeakMap.prototype.get = function () { return 1; };
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        refs = re.findall(r"^ref=(\d+) ", r.content, re.M)
+        assert len(refs) == 2, r.content
+        assert len(set(refs)) == 2, r.content
+
+        for ref in refs:
+            await _tool(tools, "click").handler({"selector": f"ref={ref}"})
+        assert sorted(await page.evaluate("() => window.hits")) == ["alpha", "beta"], r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_ref_does_not_survive_a_navigation_onto_a_same_tag_lookalike() -> None:
+    # A reading describes ONE document. After a navigation the model never re-observed, every handle
+    # in the manifest is dead and the re-resolve would re-query the remembered selector in the NEW
+    # document -- adopting a unique same-tag look-alike there as the element the model chose on the
+    # old page. The ref is scoped to its document so that fails closed instead.
+    async with _live_page('<button id="go" style="width:90px;height:22px">Go</button>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        ref = _ref_line(r.content, "'Go'")
+
+        await page.goto("data:text/html,<button id='go' style='width:90px;height:22px'>Elsewhere</button>")
+        assert await page.locator("#go").count() == 1, "fixture must offer exactly one look-alike"
+
+        acted = await _tool(tools, "click").handler({"selector": ref})
+        assert acted.status == "error", acted.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_live_handle_is_never_displaced_by_a_selector_that_drifted_onto_another_element() -> None:
+    # The re-resolve exists for a DETACHED handle. Reaching for it while the handle is still live is
+    # how a drifted selector displaces a correct element: the identity observe retained is right there
+    # and answering, and the page has since pointed that selector at something else. Acting on the
+    # something else is the wrong-element commit, so the ref refuses instead. (A positional tail behind
+    # a newly inserted sibling drifts the same way; moving an id is just the deterministic form.)
+    async with _live_page(
+        """<button id="go" style="width:90px;height:22px">Real</button>
+        <button id="other" style="width:90px;height:22px">Other</button>
+        <script>
+        window.hits = [];
+        for (const b of document.querySelectorAll('button'))
+          b.addEventListener('click', (e) => window.hits.push(e.currentTarget.textContent));
+        window.__drift = () => {
+          document.getElementById('go').removeAttribute('id');
+          document.getElementById('other').id = 'go';
+        };
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        ref = _ref_line(r.content, "'Real'")
+
+        await page.evaluate("() => window.__drift()")
+        assert await page.locator("#go").count() == 1, "fixture must leave the selector naming ONE element"
+        assert await page.locator("#go").first.text_content() == "Other", "and that element must be the other one"
+
+        acted = await _tool(tools, "click").handler({"selector": ref})
+        assert "Other" not in await page.evaluate("() => window.hits"), acted.content
+        assert acted.status == "error", acted.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_ref_whose_element_was_rebuilt_into_twins_is_refused_rather_than_guessed() -> None:
+    # The re-resolve path's own guard. A rebuild detaches the handle, and the selector observe
+    # remembered for that element is what finds the replacement -- but only while it names ONE. Here
+    # the rebuild leaves two twins under the same id, and picking either is the wrong-element commit
+    # this addressing exists to prevent, so the ref errors and nothing on the page is touched.
+    async with _live_page(
+        """<div id="wrap"><button id="go" style="width:80px;height:20px">Go</button></div>
+        <script>
+        window.hits = [];
+        document.getElementById('go').addEventListener('click', () => window.hits.push('one'));
+        window.__dup = () => {
+          const w = document.getElementById('wrap');
+          w.innerHTML = '<button id="go" style="width:80px;height:20px">Go</button>'
+                      + '<button id="go" style="width:80px;height:20px">Go</button>';
+          for (const b of w.querySelectorAll('#go')) b.addEventListener('click', () => window.hits.push('twin'));
+        };
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        ref = _ref_line(r.content, "'Go'")
+        await page.evaluate("window.__dup()")
+        assert await page.locator("#go").count() == 2, "fixture must arm the ambiguity"
+
+        cr = await _tool(tools, "click").handler({"selector": ref})
+        assert cr.status == "error", cr.content
+        assert "re-render" in cr.content or "re-observe" in cr.content, cr.content
+        assert await page.evaluate("() => window.hits") == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_control_in_a_repeated_component_is_addressed_through_its_host() -> None:
     # The gap this closes: both instances are correctly refused a flat selector (the id names two
     # elements), which left them with no selector at all and therefore unreachable by every tool.
@@ -11749,20 +10787,24 @@ async def test_a_control_in_a_repeated_component_is_addressed_through_its_host()
         assert await page.locator("#apply").count() == 2, "fixture must reproduce the reused id"
 
         r = await _tool(tools, "observe").handler({})
-        selectors = _printed_selectors(r.content)
-        assert len(selectors) == 2, r.content
-        for sel in selectors:
-            assert await page.locator(sel).count() == 1, f"{sel} must denote exactly one element"
+        refs = re.findall(r"^ref=(\d+) button/submit 'Apply'$", r.content, re.M)
+        assert len(refs) == 2, r.content
 
-        # Pick the instance the digest attributes to the SECOND host, and re-render it before acting:
-        # a mechanism that is correct only until the component rebuilds passes a fixture that never
-        # rebuilds, and fails in production.
-        chosen = next(s for s in selectors if "fld-b" in s)
+        for ref in refs:
+            await _tool(tools, "click").handler({"selector": f"ref={ref}"})
+        # Each ref must denote exactly one instance: two clicks land two distinct receipts, never the
+        # same instance twice.
+        assert sorted(await page.evaluate("() => window.hits")) == ["a-v1", "b-v1"], refs
+
+        # Pick the instance observe listed SECOND (document order: fld-a then fld-b), and re-render
+        # it before acting again: a mechanism that is correct only until the component rebuilds
+        # passes a fixture that never rebuilds, and fails in production.
+        chosen = refs[1]
         await page.evaluate("() => { window.build('fld-b', 'b-v2'); window.hits = []; }")
 
-        await _tool(tools, "click").handler({"selector": chosen})
+        await _tool(tools, "click").handler({"selector": f"ref={chosen}"})
         # The twin carries the same listener, so its silence is the discriminating half of this proof,
-        # and the v2 token is what shows the selector re-resolved to the rebuilt node.
+        # and the v2 token is what shows the ref re-resolved to the rebuilt node.
         assert await page.evaluate("() => window.hits") == ["b-v2"], chosen
 
 
@@ -11778,9 +10820,10 @@ async def test_a_host_anchored_control_is_driven_rather_than_reported_gone() -> 
         r = await _tool(tools, "observe").handler({})
         listed = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
         assert len(listed) == 3, r.content
-        assert "[#dz-b #resume]" in r.content, r.content
+        # dz-b's own dropzone, distinguished from dz-a's identical-shaped one by its label.
+        chosen = _ref_line(r.content, "Upload cover letter")
+        assert any("hidden-native" in ln for ln in listed if chosen in ln), r.content
 
-        chosen = next(s for s in _printed_selectors(r.content) if "dz-b" in s)
         started = time.monotonic()
         cr = await _tool(tools, "click").handler({"selector": chosen})
         assert cr.status == "error"
@@ -11808,15 +10851,18 @@ async def test_a_host_anchored_selector_counts_what_the_host_slots_as_well_as_wh
         tools = build_browser_tools(_fixed_page_provider(page))
         assert await page.locator("#host-one #dup").count() == 2, "fixture must arm the slotted twin"
         r = await _tool(tools, "observe").handler({})
-        selectors = _printed_selectors(r.content)
         # Armed on the DIGEST too, not only on the fixture: the property below is quantified over what
-        # was printed, so an empty or collapsed digest would satisfy it without protecting anything.
-        # The light-DOM twin is still named, and the one under the host is refused AND said to be.
-        assert len(selectors) == 1, r.content
-        assert "#host-one #dup" not in r.content, r.content
+        # was actually listed, so an empty or collapsed digest would satisfy it without protecting
+        # anything. The light-DOM twin is still named, and the one under the host is refused AND said
+        # to be.
+        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "1", r.content
         assert "reused by another instance of the same component" in r.content, r.content
+        # Whatever selector the internal mint fell back to for the one control it DID list (no longer
+        # anything the digest shows the model), it must genuinely denote only that element.
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
+        assert len(selectors) == 1, selectors
         for sel in selectors:
-            assert await page.locator(sel).count() == 1, f"{sel} denotes more than one element: {r.content}"
+            assert await page.locator(sel).count() == 1, f"{sel} denotes more than one element: {selectors}"
 
 
 @_skip_no_browser
@@ -11841,7 +10887,8 @@ async def test_file_upload_reaches_the_dropzone_of_the_instance_it_was_given(
     async with _content_page(_SHARED_ID_DROPZONES_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        chosen = next(s for s in _printed_selectors(r.content) if "dz-b" in s)
+        # dz-b's own dropzone, distinguished from dz-a's identical-shaped one by its label.
+        chosen = _ref_line(r.content, "Upload cover letter")
 
         ur = await _tool(tools, "file_upload").handler({"selector": chosen, "file": "https://example.test/cv.pdf"})
         assert ur.status == "ok", ur.content
@@ -11893,7 +10940,11 @@ async def test_a_typeahead_in_a_repeated_component_is_not_reported_as_unfilled()
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        chosen = next(s for s in _printed_selectors(r.content) if "f2" in s)
+        # Neither input has a label of its own; document order (f1 then f2) is what distinguishes
+        # them, and observe assigns refs to that same order.
+        refs = re.findall(r"^ref=(\d+) input/text ''", r.content, re.M)
+        assert len(refs) == 2, r.content
+        chosen = f"ref={refs[1]}"
 
         tr = await _tool(tools, "type").handler({"selector": chosen, "text": "Lisbon"})
         landed = await page.evaluate(
@@ -11944,7 +10995,11 @@ async def test_a_component_typeahead_that_rejects_the_value_still_fails_loudly()
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        chosen = next(s for s in _printed_selectors(r.content) if "f2" in s)
+        # Neither input has a label of its own; document order (f1 then f2) is what distinguishes
+        # them, and observe assigns refs to that same order.
+        refs = re.findall(r"^ref=(\d+) input/text ''", r.content, re.M)
+        assert len(refs) == 2, r.content
+        chosen = f"ref={refs[1]}"
 
         tr = await _tool(tools, "type").handler({"selector": chosen, "text": "Lisbon"})
         assert (
@@ -11963,7 +11018,7 @@ async def test_pierced_probes_and_hidden_native_listing_agree_on_the_shadow_host
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
         # The hidden-native half still reaches the <select> through the root.
-        assert any("[hidden-native" in ln and "sr-country" in ln for ln in r.content.splitlines()), r.content
+        assert any("[hidden-native" in ln and "Shipping Country" in ln for ln in r.content.splitlines()), r.content
 
         # The pierced reaction probes see the rows the component rendered into its own root.
         opened = await _tool(tools, "click").handler({"selector": "#sr-proxy"})
@@ -12208,8 +11263,7 @@ async def test_observe_omits_an_unlabeled_aria_hidden_tabindex_negative_text_inp
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok", r.content
-        assert "#address" in r.content
-        assert "#phantom" not in r.content
+        assert _ref_line(r.content, "Address")
         assert "2 unreachable input(s) omitted" in r.content
         # An omitted control is never handed out, so no marker may be left on it either.
         assert await page.evaluate("() => document.querySelectorAll('[aria-hidden=\"true\"][data-tv3]').length") == 0
@@ -12234,8 +11288,7 @@ async def test_observe_still_lists_aria_hidden_tabindex_negative_text_input_when
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok", r.content
-        assert "#promo" in r.content
-        assert "Promo code" in r.content
+        assert _ref_line(r.content, "Promo code")
 
 
 # A consent wall is the common shape of a layer that covers a whole form: a fixed, view-sized
@@ -15487,8 +14540,7 @@ async def test_observe_names_a_field_by_its_label_not_its_placeholder() -> None:
     async with _content_page(_LABELED_INPUT_WITH_FORMAT_PLACEHOLDER_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-    line = next(ln for ln in r.content.splitlines() if ln.startswith("[#start]"))
-    assert "Date Available *" in line
+    line = next(ln for ln in r.content.splitlines() if "Date Available *" in ln)
     assert "dd/mm/yyyy" in line  # the format hint is what makes the value typeable
 
 
@@ -15521,8 +14573,8 @@ async def test_look_legend_masks_a_minted_url_carried_by_a_placeholder() -> None
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_look_legend_does_not_name_a_control_by_an_opaque_name_attribute() -> None:
-    # observe hands this control out under an alias because its `name` is opaque, and look is not a
-    # wrapped tool -- so a legend that falls back to that attribute hands the raw id straight back.
+    # observe addresses this control by a ref, never by its opaque `name`; look is a separate tool
+    # with its own legend, so one that falls back to that attribute hands the raw id straight back.
     raw = "a1b2c3d4e5f60011"
     html = f'<form><input type="text" name="{raw}"><input type="text" name="city" aria-label="City"></form>'
     async with _content_page(html) as page:
@@ -15530,7 +14582,7 @@ async def test_look_legend_does_not_name_a_control_by_an_opaque_name_attribute()
         observed = await _tool(tools, "observe").handler({})
         looked = await _tool(tools, "look").handler({})
 
-    assert 'data-tv3-ref="' in observed.content, observed.content
+    assert re.search(r"^ref=\d+ ", observed.content, re.MULTILINE), observed.content
     assert raw not in observed.content, observed.content
     assert raw not in looked.content, looked.content
     # A name that is not opaque is still a usable last-resort label.
@@ -16065,7 +15117,9 @@ async def test_observe_masks_a_minted_url_longer_than_its_display_caps(carrier: 
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(url))
         r = await _tool(tools, "observe").handler({})
-    line = next(ln for ln in r.content.splitlines() if ln.startswith("[#doc]") or "spinbutton" in ln)
+    # Every fixture above renders exactly one interactive element (the field named "doc", or the
+    # bare spinbutton), so the one digest element line is unambiguous without a natural selector.
+    line = next(ln for ln in r.content.splitlines() if ln.startswith("ref="))
     assert _LONG_SIGNED_REF_ARTIFACT not in r.content
     assert "opaque_url_" in (r.content if carrier.startswith("alert") else line)
 
@@ -16109,7 +15163,7 @@ _CROSS_ROOT_LABEL_HTML = """<!doctype html><html><body>
 
 
 def _text_input_lines(content: str) -> list[str]:
-    return [ln for ln in content.splitlines() if ln.startswith("[") and "input/text" in ln]
+    return [ln for ln in content.splitlines() if ln.startswith("ref=") and "input/text" in ln]
 
 
 @_skip_no_browser
@@ -16238,19 +15292,16 @@ async def test_observe_reads_a_slot_holding_label_as_its_painted_text() -> None:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
     lines = _text_input_lines(r.content)
-
-    def line_for(id_: str) -> str:
-        found = [ln for ln in lines if ln.split("] ")[0].endswith("#" + id_)]
-        assert found, (id_, lines)
-        return found[0]
-
-    assert "'Company *'" in line_for("n"), lines
-    assert "'Name Optional'" in line_for("b"), lines
-    assert "'City *'" in line_for("ct"), lines
-    assert "'Full caption'" in line_for("v"), lines
-    assert "'Caption Required'" in line_for("r"), lines
-    assert "'Default caption'" in line_for("fbi"), lines
-    assert "'Real caption'" in line_for("ng"), lines
+    content = "\n".join(lines)
+    # Each fixture below crafts a label distinct from every other, so finding the phrase anywhere
+    # among the text-input lines is exactly as discriminating as finding it by the field's id.
+    assert "'Company *'" in content, lines
+    assert "'Name Optional'" in content, lines
+    assert "'City *'" in content, lines
+    assert "'Full caption'" in content, lines
+    assert "'Caption Required'" in content, lines
+    assert "'Default caption'" in content, lines
+    assert "'Real caption'" in content, lines
 
 
 # SKY-15216: a virtualized button-anchored listbox, modeled on a downshift-style intl-phone country
@@ -16572,7 +15623,7 @@ async def test_observe_marks_button_listbox_anchor_as_combobox() -> None:
     async with _content_page(_VIRTUALIZED_BUTTON_LISTBOX_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-    line = next(ln for ln in r.content.splitlines() if "[#cc]" in ln)
+    line = next(ln for ln in r.content.splitlines() if "Select country calling code:" in ln)
     assert "[autocomplete→use select_combobox]" in line, line
 
 
@@ -18491,9 +17542,9 @@ async def test_combobox_wrapper_around_a_real_input_is_not_a_click_to_open_ancho
     async with _content_page(_WRAPPED_INPUT_COMBOBOX_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         observed = await _tool(tools, "observe").handler({})
-        wrapper_line = next(ln for ln in observed.content.splitlines() if "[#combo]" in ln)
+        wrapper_line = next(ln for ln in observed.content.splitlines() if "div/combobox" in ln)
         assert "use select_combobox" not in wrapper_line, wrapper_line
-        assert any("[#combo-input]" in ln for ln in observed.content.splitlines()), observed.content
+        assert any("input/text" in ln for ln in observed.content.splitlines()), observed.content
         r = await _tool(tools, "select_combobox").handler({"selector": "#combo-input", "value": "United States"})
         assert r.status == "ok", r.content
         value = await page.eval_on_selector("#combo-input", "el => el.value")
@@ -19441,7 +18492,7 @@ async def test_type_on_haspopup_menu_button_is_not_routed_to_picker() -> None:
         clicked = await page.evaluate("() => window.__deleteClicked === true")
         assert clicked is False, content
         observed = await _tool(tools, "observe").handler({})
-    line = next(ln for ln in observed.content.splitlines() if "[#act]" in ln)
+    line = next(ln for ln in observed.content.splitlines() if "'Actions'" in ln)
     assert "use select_combobox" not in line, line
 
 

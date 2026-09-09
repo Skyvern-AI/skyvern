@@ -766,6 +766,28 @@ blocks:
     positive_descriptor: "Approve order"
     negative_descriptor: "Cancel"
 
+** CAPTCHA SOLVER (captcha_solver) **
+
+Purpose: The managed captcha solver is a product capability, enabled by default for cloud organizations; it can be turned off per browser session under "Captcha Solver", and an organization-level kill switch exists on the platform side. It clears Cloudflare Turnstile and hCaptcha challenges through the solver extension and mints reCAPTCHA v2/v3 tokens. It cannot clear a widget the page never renders, an IP-reputation block ("unusual traffic", "access denied"), a DataDome or Akamai deny page, or an account security prompt ("verify it's you", authenticator codes).
+
+How a run reaches it:
+- Task-shaped blocks (navigation, login, action) invoke the solver automatically when a challenge is detected.
+- A code block invokes it only when its code calls the builtin `await solve_captcha(page)`; nothing runs the solver for a code block otherwise. A failed solve raises inside the code block and the run's action trace records a `solve_captcha` action with status `failed`.
+
+Reading the run: the build-test packet's `challenge` record says whether the solver is available for this organization (`solver_available`), whether this run invoked it (`solver_attempted`, absent when unknown), and what happened (`solver_result`: failed, attempted, not_attempted, or unresolved). "not_attempted" on a code block means the code never called the builtin, not that the product declined. "attempted" means the solve step ran and returned without an error, which is not the same as the challenge clearing: when no solver handles the page the call still reports success. "unresolved" means the run's action history was unavailable, so whether the solver ran is unknown and should not be stated either way. `solver_available` is resolved per page, and is absent when it was only resolved for a different URL.
+
+** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **
+
+Purpose: A workflow's `proxy_location` chooses the network exit the browser uses (for example RESIDENTIAL, or a country-specific residential pool); a browser profile carries a persisted, fingerprint-aligned session. These are the levers for walls that key on network identity rather than a widget: "your IP address is blocked", "unusual traffic" rate limits, or a challenge page whose widget never renders. They do not solve an interactive captcha and do not bypass account security.
+
+Structure:
+proxy_location: <ProxyLocation>          # Top-level workflow field, set at authoring time; the copilot can change it on the draft
+browser_profile_id: <id>                 # Optional: reuse a saved browser profile (session cookies, fingerprint) across runs
+
+Notes:
+- Changing `proxy_location` takes effect on the next run; a block cannot change its own exit mid-run.
+- Ask which region the site serves before choosing a country pool; a mismatch between proxy region and account region is itself a signal some sites block on.
+
 ** TEXT PROMPT BLOCK (text_prompt) **
 
 Purpose: Process text with LLM. This is the "Text Prompt Block" in the UI.

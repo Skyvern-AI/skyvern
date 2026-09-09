@@ -397,8 +397,21 @@ def cache_key(api_key: str) -> str:
     return hash_api_key_for_cache(api_key)
 
 
-async def validate_mcp_api_key(api_key: str) -> MCPAPIKeyValidation:
+async def validate_mcp_api_key(
+    api_key: str,
+    *,
+    user_agent: str | None = None,
+    fern_language: str | None = None,
+) -> MCPAPIKeyValidation:
     """Validate API key and return caller organization + token type."""
+    if user_agent is None or fern_language is None:
+        try:
+            request = get_http_request()
+        except RuntimeError:
+            request = None
+        if request is not None:
+            user_agent = user_agent or request.headers.get("user-agent")
+            fern_language = fern_language or request.headers.get("x-fern-language")
     key = cache_key(api_key)
 
     # Check cache first.
@@ -427,6 +440,8 @@ async def validate_mcp_api_key(api_key: str) -> MCPAPIKeyValidation:
                 api_key,
                 get_auth_db(),
                 token_types=_MCP_ALLOWED_TOKEN_TYPES,
+                user_agent=user_agent,
+                fern_language=fern_language,
             )
             caller_validation = MCPAPIKeyValidation(
                 organization_id=validation.organization.organization_id,
@@ -694,7 +709,14 @@ class MCPAPIKeyMiddleware:
                 response = _unauthorized_response(_EMPTY_BEARER_MESSAGE)
                 await response(scope, receive, send)
                 return
-            await self._handle_bearer(scope, receive, send, bearer_token)
+            await self._handle_bearer(
+                scope,
+                receive,
+                send,
+                bearer_token,
+                user_agent=request.headers.get("user-agent"),
+                fern_language=request.headers.get("x-fern-language"),
+            )
             return
 
         api_key = request.headers.get(API_KEY_HEADER)
@@ -707,9 +729,25 @@ class MCPAPIKeyMiddleware:
             await response(scope, receive, send)
             return
 
-        await self._handle_api_key(scope, receive, send, api_key)
+        await self._handle_api_key(
+            scope,
+            receive,
+            send,
+            api_key,
+            user_agent=request.headers.get("user-agent"),
+            fern_language=request.headers.get("x-fern-language"),
+        )
 
-    async def _handle_bearer(self, scope: Scope, receive: Receive, send: Send, bearer_token: str) -> None:
+    async def _handle_bearer(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        bearer_token: str,
+        *,
+        user_agent: str | None,
+        fern_language: str | None,
+    ) -> None:
         """Validate Bearer token, resolve org API key, and forward the request.
 
         Tries Clerk OAuth token validation first, then falls back to treating
@@ -748,7 +786,11 @@ class MCPAPIKeyMiddleware:
 
         # Fall back: treat Bearer value as a raw API key
         try:
-            validation = await validate_mcp_api_key(bearer_token)
+            validation = await validate_mcp_api_key(
+                bearer_token,
+                user_agent=user_agent,
+                fern_language=fern_language,
+            )
         except HTTPException as e:
             if e.status_code in {401, 403}:
                 if oauth_service_error is not None:
@@ -778,10 +820,23 @@ class MCPAPIKeyMiddleware:
             api_key=bearer_token,
         )
 
-    async def _handle_api_key(self, scope: Scope, receive: Receive, send: Send, api_key: str) -> None:
+    async def _handle_api_key(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        api_key: str,
+        *,
+        user_agent: str | None,
+        fern_language: str | None,
+    ) -> None:
         """Validate x-api-key header and forward the request (original flow)."""
         try:
-            validation = await validate_mcp_api_key(api_key)
+            validation = await validate_mcp_api_key(
+                api_key,
+                user_agent=user_agent,
+                fern_language=fern_language,
+            )
         except HTTPException as e:
             if e.status_code in {401, 403}:
                 response = _unauthorized_response(_INVALID_API_KEY_MESSAGE, include_oauth_challenge=False)

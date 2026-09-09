@@ -61,6 +61,16 @@ class RevocableCiphertext:
 class GoogleOAuthRepository(BaseRepository):
     """All DB access for Google OAuth credentials. Owns session lifecycle."""
 
+    @db_operation("get_credential_state")
+    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
+        async with self.Session() as session:
+            return await session.scalar(
+                select(GoogleOAuthCredentialModel.state).where(
+                    GoogleOAuthCredentialModel.organization_id == organization_id,
+                    GoogleOAuthCredentialModel.id == credential_id,
+                )
+            )
+
     @db_operation("insert_pending_credential")
     async def insert_pending_credential(
         self,
@@ -317,6 +327,18 @@ class GoogleOAuthRepository(BaseRepository):
                     GoogleOAuthCredentialModel.organization_id == organization_id,
                     GoogleOAuthCredentialModel.state == STATE_ACTIVE,
                 )
+                .order_by(GoogleOAuthCredentialModel.created_at.desc())
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [GoogleOAuthCredentialBase.model_validate(r, from_attributes=True) for r in rows]
+
+    @db_operation("list_for_org")
+    async def list_for_org(self, organization_id: str) -> list[GoogleOAuthCredentialBase]:
+        """Return every credential row for the organization, regardless of state."""
+        async with self.Session() as session:
+            stmt = (
+                select(GoogleOAuthCredentialModel)
+                .where(GoogleOAuthCredentialModel.organization_id == organization_id)
                 .order_by(GoogleOAuthCredentialModel.created_at.desc())
             )
             rows = (await session.execute(stmt)).scalars().all()
